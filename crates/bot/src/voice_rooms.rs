@@ -44,6 +44,10 @@ use two_bot_core::{
         parse_detail_level, resolve_log_target, should_log, DetailLevel, LogTarget,
         LoggingCandidates, LoggingSettings, RepeatLedger,
     },
+    voice_ownership::{
+        decide_ownership, OwnershipDecision, OwnershipError, OwnershipRequest, RoomActor,
+        RoomMember, RoomOwnership,
+    },
     voice_rooms::{
         category_full_message, is_usable_channel_name, voice_commands, ActionQueue, CreatorChannel,
         NewRoomSpec, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, RoomPosition,
@@ -101,6 +105,13 @@ pub trait RoomPersistence: Send + Sync {
         channel: Snowflake,
     ) -> impl Future<Output = Result<Option<CreatorChannel>, StoreError>> + Send;
     fn persist(&self, room: &VoiceRoom) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// Persist a V2 caretaker/command handoff on an already-tracked room.
+    /// Returns `Ok(true)` when the row existed, `Ok(false)` when the tracked
+    /// row has no database counterpart (deleted out-of-band).
+    fn update_ownership(
+        &self,
+        room: &VoiceRoom,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
     /// The guild's V10b controls; an unconfigured guild reads as the defaults.
     fn access_controls(
         &self,
@@ -182,6 +193,17 @@ impl RoomPersistence for PgRoomStore {
             return Err(StoreError::Conflict);
         }
         Ok(())
+    }
+
+    async fn update_ownership(&self, room: &VoiceRoom) -> Result<bool, StoreError> {
+        self.update_ownership(
+            room.guild_id,
+            room.channel_id,
+            room.owner_id,
+            room.original_creator_id,
+        )
+        .await
+        .map_err(store_error)
     }
 
     async fn access_controls(&self, guild: Snowflake) -> Result<AccessControls, StoreError> {
@@ -475,6 +497,19 @@ struct MemberState {
     channel_id: Option<Snowflake>,
     bot: Option<bool>,
     transition: u64,
+    /// Wall-clock millis when the current continuous stay in `channel_id`
+    /// began. Leave/rejoin resets it; same-channel updates keep it. This is
+    /// the V2 caretaker ordering source ("longest-present member").
+    joined_at_ms: u64,
+}
+
+/// Wall-clock millis for V2 tenure stamps. Coarse ordering only: equal
+/// stamps fall back to ascending member id in `decide_ownership`.
+fn wall_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Default)]
@@ -543,6 +578,24 @@ impl LiveState {
         ids.sort_unstable();
         ids
     }
+
+    /// Current occupants of one room as a V2 ownership snapshot. Unknown
+    /// identity counts as human, matching [`LiveState::humans`]: never treat
+    /// incomplete bot data as a bot.
+    fn ownership_snapshot(&self, channel: Snowflake) -> Vec<RoomMember> {
+        let mut members: Vec<RoomMember> = self
+            .members
+            .iter()
+            .filter(|(_, member)| member.channel_id == Some(channel))
+            .map(|(member_id, member)| RoomMember {
+                member_id: *member_id,
+                joined_at_ms: member.joined_at_ms,
+                is_bot: member.bot == Some(true),
+            })
+            .collect();
+        members.sort_by_key(|member| member.member_id);
+        members
+    }
 }
 
 /// Shared with the gateway, not locked across network/database awaits.
@@ -576,6 +629,11 @@ impl LiveGuild {
             .into_iter()
             .map(|channel| (channel.id.get(), channel))
             .collect();
+        // One shared stamp: bootstrap order is unknown, so tenure ties
+        // break by member id until transitions establish real seniority.
+        // A snapshot rebuild resets tenure — tenure is continuous tracked
+        // presence in this session, not a durable fact.
+        let published_at_ms = wall_ms();
         live.members = snapshot
             .members
             .into_iter()
@@ -586,6 +644,7 @@ impl LiveGuild {
                         channel_id: Some(member.channel_id),
                         bot: member.bot,
                         transition: 0,
+                        joined_at_ms: published_at_ms,
                     },
                 )
             })
@@ -687,6 +746,18 @@ impl LiveGuild {
         channel: Option<Snowflake>,
         bot: Option<bool>,
     ) -> Option<JoinTicket> {
+        self.voice_update_at(member, channel, bot, wall_ms())
+    }
+
+    /// Deterministic tenure seam: `voice_update` stamps the wall clock;
+    /// tests pin `now_ms` to control caretaker ordering.
+    fn voice_update_at(
+        &self,
+        member: Snowflake,
+        channel: Option<Snowflake>,
+        bot: Option<bool>,
+        now_ms: u64,
+    ) -> Option<JoinTicket> {
         let mut live = self.inner.write().expect("live voice lock");
         if let Some(previous) = live.members.get_mut(&member) {
             if previous.channel_id == channel {
@@ -703,6 +774,7 @@ impl LiveGuild {
                 channel_id: channel,
                 bot,
                 transition,
+                joined_at_ms: now_ms,
             },
         );
         channel.filter(|_| live.ready).map(|creator_id| JoinTicket {
@@ -1142,6 +1214,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return;
         }
         let mut empty = Vec::new();
+        let mut occupied = Vec::new();
         for channel in self.rooms.keys().copied() {
             if !live.channels.contains_key(&channel) {
                 self.queue.resume(self.live.guild_id, channel);
@@ -1168,14 +1241,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 continue;
             }
             self.queue.resume(self.live.guild_id, channel);
-            if live.humans(channel) == 0
-                && !self.moves.contains_key(&channel)
-                && !self
+            let move_pending = self.moves.contains_key(&channel)
+                || self
                     .uncertain_moves
                     .get(&channel)
-                    .is_some_and(|ticket| live.ticket_valid(*ticket))
-            {
+                    .is_some_and(|ticket| live.ticket_valid(*ticket));
+            if live.humans(channel) == 0 && !move_pending {
                 empty.push(channel);
+            } else if live.humans(channel) > 0 && !move_pending {
+                occupied.push(channel);
             }
         }
         let mut view_syncs = Vec::new();
@@ -1242,6 +1316,191 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         member_id,
                     },
                 );
+            }
+        }
+        for channel in occupied {
+            self.apply_succession(channel);
+        }
+    }
+
+    /// V2 caretaker succession: when the tracked owner is gone but humans
+    /// remain, hand the room to the longest-present occupant (spec
+    /// `docs/voice-rooms.md` §V2). The worker row updates first so the next
+    /// tick is idempotent; the queued [`RoomAction::UpdateOwnership`] persists
+    /// the handoff. Skipped while the owner's move is still in flight and
+    /// while occupancy is uncertain after a successful move.
+    fn apply_succession(&mut self, channel: Snowflake) {
+        if self.moves.contains_key(&channel) {
+            return;
+        }
+        let (room, occupants) = {
+            let live = self.live.inner.read().expect("live voice lock");
+            if !live.ready {
+                return;
+            }
+            let Some(room) = self.rooms.get(&channel).cloned() else {
+                return;
+            };
+            if self
+                .uncertain_moves
+                .get(&channel)
+                .is_some_and(|ticket| live.ticket_valid(*ticket))
+            {
+                return;
+            }
+            (room, live.ownership_snapshot(channel))
+        };
+        if occupants.is_empty()
+            || occupants
+                .iter()
+                .any(|member| member.member_id == room.owner_id)
+        {
+            return;
+        }
+        let ownership = RoomOwnership {
+            owner_id: room.owner_id,
+            original_creator_id: room.original_creator_id,
+        };
+        let next = match decide_ownership(ownership, &occupants, OwnershipRequest::Reconcile) {
+            Ok(OwnershipDecision::Changed { next, .. }) => next,
+            Ok(_) => return,
+            Err(error) => {
+                warn!(channel_id = channel, %error, "voice succession refused");
+                return;
+            }
+        };
+        let mut updated = room;
+        updated.owner_id = next.owner_id;
+        updated.original_creator_id = next.original_creator_id;
+        self.rooms.insert(channel, updated);
+        self.queue.enqueue(
+            self.live.guild_id,
+            RoomAction::UpdateOwnership {
+                channel_id: channel,
+                owner_id: next.owner_id,
+                original_creator_id: next.original_creator_id,
+            },
+        );
+    }
+
+    /// V2 ownership command (`/reclaim`, `/transfer`), serialized in the guild
+    /// actor: resolve the caller's current room, decide with the pure core,
+    /// apply the handoff to the worker row and persist it through the urgent
+    /// [`RoomAction::UpdateOwnership`] lane. Returns the ephemeral reply text.
+    /// Refusals change nothing. Both commands act on the caller's current
+    /// room, except an admin invoking `/transfer` without a tracked room of
+    /// their own, who may name any occupied room by its recipient. A
+    /// membership racing the decision heals on the next `reconcile`
+    /// succession pass; a retried interaction replays safely (reclaim is
+    /// idempotent, a former owner's transfer replay fails authorization), so
+    /// no interaction-ID dedupe is needed here.
+    fn apply_ownership(
+        &mut self,
+        actor_id: Snowflake,
+        is_admin: bool,
+        command: OwnershipCommand,
+    ) -> String {
+        if self.halted {
+            return "Voice rooms are paused: Discord refused the bot credential. \
+                    Fix the token, then restart the bot."
+                .to_owned();
+        }
+        let request = match command {
+            OwnershipCommand::Reclaim => OwnershipRequest::Reclaim {
+                member_id: actor_id,
+            },
+            OwnershipCommand::Transfer { target_id } => OwnershipRequest::Transfer {
+                actor: RoomActor {
+                    member_id: actor_id,
+                    is_admin,
+                },
+                target_id,
+            },
+        };
+        let (channel, room, occupants) = {
+            let live = self.live.inner.read().expect("live voice lock");
+            if !live.ready {
+                return "The voice worker isn't warmed up yet — try again in a moment.".to_owned();
+            }
+            // Admins may use owner commands in any room: an admin invoking
+            // `/transfer` with no tracked room of their own falls back to the
+            // recipient's room (for example, an admin parked in an untracked
+            // channel). Ordinary members only ever act on the room they are
+            // in, so any untracked-channel failure is reported as-is.
+            let own = live
+                .members
+                .get(&actor_id)
+                .and_then(|member| member.channel_id);
+            let channel = match (own, command, is_admin) {
+                (Some(channel), _, _) if self.rooms.contains_key(&channel) => Some(channel),
+                (Some(_), OwnershipCommand::Reclaim, _) => own,
+                (Some(_), OwnershipCommand::Transfer { .. }, false) => own,
+                (_, OwnershipCommand::Transfer { target_id }, true) => live
+                    .members
+                    .get(&target_id)
+                    .and_then(|member| member.channel_id),
+                (None, _, _) => None,
+            };
+            let Some(channel) = channel else {
+                return match command {
+                    OwnershipCommand::Reclaim => {
+                        "You need to be in a voice room to use /reclaim.".to_owned()
+                    }
+                    OwnershipCommand::Transfer { .. } => {
+                        "You need to be in a voice room to use /transfer.".to_owned()
+                    }
+                };
+            };
+            let Some(room) = self.rooms.get(&channel).cloned() else {
+                return "That voice channel isn't a temporary room I manage.".to_owned();
+            };
+            (channel, room, live.ownership_snapshot(channel))
+        };
+        let ownership = RoomOwnership {
+            owner_id: room.owner_id,
+            original_creator_id: room.original_creator_id,
+        };
+        let was_creator = room.original_creator_id == actor_id;
+        let next = match decide_ownership(ownership, &occupants, request) {
+            Ok(OwnershipDecision::Unchanged(_)) => {
+                return match command {
+                    OwnershipCommand::Reclaim => {
+                        "You're already the owner of this room.".to_owned()
+                    }
+                    OwnershipCommand::Transfer { target_id } => {
+                        format!("Ownership is already with <@{target_id}>.")
+                    }
+                };
+            }
+            Ok(OwnershipDecision::Changed { next, .. }) => next,
+            Ok(OwnershipDecision::EmptyRoom) | Err(OwnershipError::EmptyRoom) => {
+                return "There's nobody in this room right now.".to_owned();
+            }
+            Err(error) => return ownership_refusal(error),
+        };
+        let mut updated = room;
+        updated.owner_id = next.owner_id;
+        updated.original_creator_id = next.original_creator_id;
+        self.rooms.insert(channel, updated);
+        // The occupants snapshot just proved this room needs no succession, so
+        // any lingering post-move uncertainty is stale — clear it so the next
+        // reconcile (and the persisted handoff) stop skipping this channel.
+        self.uncertain_moves.remove(&channel);
+        self.queue.enqueue(
+            self.live.guild_id,
+            RoomAction::UpdateOwnership {
+                channel_id: channel,
+                owner_id: next.owner_id,
+                original_creator_id: next.original_creator_id,
+            },
+        );
+        match command {
+            OwnershipCommand::Reclaim if was_creator => {
+                "You're the owner of this room again.".to_owned()
+            }
+            OwnershipCommand::Reclaim => "The room's owner is gone, so it's yours now.".to_owned(),
+            OwnershipCommand::Transfer { target_id } => {
+                format!("Transferred ownership of this room to <@{target_id}>.")
             }
         }
     }
@@ -2038,6 +2297,57 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 )
                 .await;
             }
+            RoomAction::UpdateOwnership {
+                channel_id,
+                owner_id,
+                original_creator_id,
+            } => {
+                // No Discord write: the worker row already carries this
+                // handoff. A stale action (a newer succession moved the row,
+                // or the room was forgotten) persists nothing.
+                let Some(room) = self.rooms.get(&channel_id).cloned() else {
+                    self.queue.mark_succeeded(&action);
+                    return true;
+                };
+                if room.owner_id != owner_id || room.original_creator_id != original_creator_id {
+                    self.queue.mark_succeeded(&action);
+                    return true;
+                }
+                match self.store.update_ownership(&room).await {
+                    Ok(true) => {
+                        self.queue.mark_succeeded(&action);
+                    }
+                    Ok(false) => {
+                        // Tracked but no database row (deleted out-of-band):
+                        // never retry a write that cannot land. The handoff
+                        // stays in the worker row and surfaces below.
+                        self.record(LifecycleFailure::Persistence {
+                            channel_id: Some(channel_id),
+                            error: StoreError::Conflict,
+                        });
+                        self.queue.mark_succeeded(&action);
+                    }
+                    Err(StoreError::CredentialRefused) => {
+                        self.record(LifecycleFailure::Persistence {
+                            channel_id: Some(channel_id),
+                            error: StoreError::CredentialRefused,
+                        });
+                        self.halted = true;
+                        self.queue.mark_succeeded(&action);
+                    }
+                    Err(error) => {
+                        self.record(LifecycleFailure::Persistence {
+                            channel_id: Some(channel_id),
+                            error,
+                        });
+                        self.queue.mark_failed(
+                            action,
+                            "voice-room persistence unavailable".to_owned(),
+                            elapsed_ms(now_ms, started),
+                        );
+                    }
+                }
+            }
             RoomAction::KickMember {
                 channel_id,
                 member_id,
@@ -2465,6 +2775,15 @@ enum ActorCommand {
     AccessChanged(AccessControls),
     /// One-shot worker snapshot for `/setup` (room count, failures, halt).
     Status(oneshot::Sender<WorkerStatus>),
+    /// V2 ownership command (`/reclaim`, `/transfer`): the worker resolves
+    /// the caller's current room, decides via the pure core, applies the
+    /// handoff and replies with the user-facing text.
+    Ownership {
+        actor_id: Snowflake,
+        is_admin: bool,
+        command: OwnershipCommand,
+        reply: oneshot::Sender<String>,
+    },
     /// V4: start a vote-kick; the reply carries the vote state or the refusal.
     KickStart {
         vote_id: Snowflake,
@@ -2480,6 +2799,16 @@ enum ActorCommand {
         ballot: VoteBallot,
         reply: oneshot::Sender<KickReply>,
     },
+}
+
+/// A V2 ownership command from an interaction. `Reclaim` takes the caller's
+/// room back as its original creator (or claims one whose owner is gone);
+/// `Transfer` hands the caller's room to an occupant and makes them the
+/// remembered creator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnershipCommand {
+    Reclaim,
+    Transfer { target_id: Snowflake },
 }
 
 pub type KickReply = Result<VoteKickUpdate, KickRefusal>;
@@ -2617,6 +2946,32 @@ where
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         actor.tx.send(ActorCommand::Status(reply)).ok()?;
+        inbox.await.ok()
+    }
+
+    /// Run one V2 ownership command (`/reclaim`, `/transfer`) on the live
+    /// worker and return the ephemeral reply text. The decision, worker-row
+    /// update and urgent persistence enqueue happen together in the guild
+    /// actor. `None` when the guild has no actor yet (before the first
+    /// GuildCreate) or its inbox already drained.
+    pub async fn run_ownership(
+        &self,
+        guild: Snowflake,
+        actor_id: Snowflake,
+        is_admin: bool,
+        command: OwnershipCommand,
+    ) -> Option<String> {
+        let actor = self.live_actor(guild)?;
+        let (reply, inbox) = oneshot::channel();
+        actor
+            .tx
+            .send(ActorCommand::Ownership {
+                actor_id,
+                is_admin,
+                command,
+                reply,
+            })
+            .ok()?;
         inbox.await.ok()
     }
 
@@ -2896,6 +3251,14 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
                 failures: worker.failures().iter().map(failure_line).collect(),
                 halted: worker.halted(),
             });
+        }
+        ActorCommand::Ownership {
+            actor_id,
+            is_admin,
+            command,
+            reply,
+        } => {
+            let _ = reply.send(worker.apply_ownership(actor_id, is_admin, command));
         }
         ActorCommand::KickStart {
             vote_id,
@@ -3239,6 +3602,13 @@ pub enum VoiceCommand {
         channel_id: Snowflake,
         request: TextChannelsRequest,
     },
+    /// Original creator (or a member whose room owner is gone) claims the room.
+    Reclaim,
+    /// Owner (or admin) hands the room to an occupant, who becomes the
+    /// remembered creator.
+    Transfer {
+        target_id: Snowflake,
+    },
     Access(AccessAction),
     Logging(LoggingAction),
 }
@@ -3330,12 +3700,47 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
                 request,
             })
         }
+        "reclaim" => Some(VoiceCommand::Reclaim),
+        "transfer" => {
+            // The `member` option is required at registration, so Discord
+            // always sends it; zero means a malformed payload and refuses
+            // with "choose a member" in the handler, never silence.
+            let target_id = command
+                .options
+                .iter()
+                .find(|option| option.name == "member")
+                .and_then(|option| match &option.value {
+                    CommandOptionValue::User(id) => Some(id.get()),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            Some(VoiceCommand::Transfer { target_id })
+        }
         "access" => Some(VoiceCommand::Access(parse_access_action(&command.options))),
         "logging" => Some(VoiceCommand::Logging(parse_logging_action(
             &command.options,
         ))),
         _ => None,
     }
+}
+
+/// Invoking member id plus effective Manage Channels authority, from the
+/// interaction payload (guild `member.user`, else the top-level user).
+/// `None` when Discord sent no identifiable invoker — the handler refuses
+/// closed rather than acting as nobody.
+fn interaction_actor(interaction: &Interaction) -> Option<(Snowflake, bool)> {
+    let user = interaction
+        .member
+        .as_ref()
+        .and_then(|member| member.user.as_ref())
+        .or(interaction.user.as_ref())?;
+    let is_admin = is_voice_admin(
+        interaction
+            .member
+            .as_ref()
+            .and_then(|member| member.permissions),
+    );
+    Some((user.id.get(), is_admin))
 }
 
 fn parse_logging_action(options: &[CommandDataOption]) -> LoggingAction {
@@ -3438,6 +3843,8 @@ impl VoiceCommand {
             Self::Invite => "invite",
             Self::TextChannels { .. } => "textchannels",
             Self::Access(_) => "access",
+            Self::Reclaim => "reclaim",
+            Self::Transfer { .. } => "transfer",
             Self::Logging(_) => "logging",
         }
     }
@@ -3733,6 +4140,35 @@ fn create_error_text(error: RoomHttpError) -> String {
     }
 }
 
+/// Translate a V2 ownership refusal into the ephemeral reply text (spec
+/// `docs/voice-rooms.md` §V2 accept lines). Refusals change nothing: the
+/// caller decides again on the next attempt.
+fn ownership_refusal(error: OwnershipError) -> String {
+    match error {
+        OwnershipError::NotOriginalCreator => {
+            "Only the original creator can reclaim this room while its owner is still here."
+                .to_owned()
+        }
+        OwnershipError::NotOwner => {
+            "Only the room owner or an admin can transfer this room.".to_owned()
+        }
+        OwnershipError::ActorNotInRoom => {
+            "You need to be in the room to use this command.".to_owned()
+        }
+        OwnershipError::TargetNotInRoom => "The transfer recipient must be in the room.".to_owned(),
+        OwnershipError::BotActor | OwnershipError::BotTarget => {
+            "Bots can't own temporary rooms.".to_owned()
+        }
+        OwnershipError::InvalidMemberId
+        | OwnershipError::DuplicateMember(_)
+        | OwnershipError::BotOwnership
+        | OwnershipError::EmptyRoom => {
+            "Something's off with this room's membership data — leave and rejoin, then try again."
+                .to_owned()
+        }
+    }
+}
+
 /// Handle one interaction, replying exactly once. Returns true when the
 /// interaction was a voice command (even when refused); false means another
 /// slice owns it. `reply` performs the single response attempt.
@@ -3919,6 +4355,54 @@ where
                     },
                 },
             };
+            reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::Reclaim => {
+            let Some((actor_id, is_admin)) = interaction_actor(interaction) else {
+                reply(ephemeral_response(
+                    "I couldn't tell who invoked /reclaim — try again.",
+                ))
+                .await;
+                return true;
+            };
+            let text = runtime
+                .run_ownership(guild_id, actor_id, is_admin, OwnershipCommand::Reclaim)
+                .await
+                .unwrap_or_else(|| {
+                    "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+                });
+            reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::Transfer { target_id } => {
+            let Some((actor_id, is_admin)) = interaction_actor(interaction) else {
+                reply(ephemeral_response(
+                    "I couldn't tell who invoked /transfer — try again.",
+                ))
+                .await;
+                return true;
+            };
+            // Zero is a malformed payload, not a member (parse default): fail
+            // closed before touching the worker.
+            if target_id == 0 {
+                reply(ephemeral_response(
+                    "Choose a member in the room to transfer to.",
+                ))
+                .await;
+                return true;
+            }
+            let text = runtime
+                .run_ownership(
+                    guild_id,
+                    actor_id,
+                    is_admin,
+                    OwnershipCommand::Transfer { target_id },
+                )
+                .await
+                .unwrap_or_else(|| {
+                    "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+                });
             reply(ephemeral_response(&text)).await;
             true
         }

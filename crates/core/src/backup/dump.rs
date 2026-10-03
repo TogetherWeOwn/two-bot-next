@@ -211,25 +211,39 @@ async fn sequence_state(
 /// reissues a value the source or the target already handed out, including
 /// one whose row was deleted (the cutover allocator gate).
 /// Catalog identifiers are quoted by Postgres; restart values are checked i64s.
+/// `sources` are every restored (table, column) allocated from `sequence`; the
+/// first names it in refusals and supplies the archive mark. It resumes past
+/// the edge across all of them.
 /// <https://www.postgresql.org/docs/16/sql-altersequence.html>
 async fn restart_sequence(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    table: &str,
-    column: &str,
+    sources: &[(&str, &str)],
     sequence: &str,
     mark: Option<&SequenceMark>,
 ) -> Result<(), DbDumpError> {
     let state = sequence_state(tx, sequence).await?;
+    // The first source names the allocator in refusals and supplies the
+    // archive mark; later sources only widen the restored edge (0113 draws
+    // retry tickets from the ban-ownership sequence without owning a column).
+    let (table, column) = sources[0];
     let exhausted =
         || DbDumpError::Refused(format!("{table}.{column}: restored sequence exhausted"));
-    let quoted_column = format!("\"{}\"", column.replace('"', "\"\""));
     let ascending = state.increment > 0;
     let aggregate = if ascending { "MAX" } else { "MIN" };
-    let (edge,): (Option<i64>,) = sqlx::query_as(audited(format!(
-        "SELECT {aggregate}({quoted_column})::bigint FROM {table}"
-    )))
-    .fetch_one(&mut **tx)
-    .await?;
+    let mut edge: Option<i64> = None;
+    for (source_table, source_column) in sources {
+        let quoted_column = format!("\"{}\"", source_column.replace('"', "\"\""));
+        let (value,): (Option<i64>,) = sqlx::query_as(audited(format!(
+            "SELECT {aggregate}({quoted_column})::bigint FROM {source_table}"
+        )))
+        .fetch_one(&mut **tx)
+        .await?;
+        edge = match (edge, value) {
+            (Some(a), Some(b)) if ascending => Some(a.max(b)),
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
     let own = if state.is_called {
         state.last_value.checked_add(state.increment)
     } else {
@@ -399,15 +413,20 @@ pub struct RestoreReport {
     pub dropped_columns: BTreeMap<String, Vec<String>>,
     /// Schema-required baseline rows initialized when absent from an old dump.
     pub initialized_tables: BTreeMap<String, u64>,
+    /// Old v3 has no acceptance/generation evidence. Never infer acceptance.
+    pub missing_member_ban_ownership: bool,
+    /// All executable expiry rows made non-executable for reconciliation.
+    pub quarantined_unbans: u64,
     pub ok: bool,
 }
 
 /// Replace the contents of the bot-owned tables with a dump.
 ///
-/// Destructive by design: the tables are truncated first, so a restore
-/// produces the database as it was, not a merge. It runs in one transaction,
-/// so a failure part way through leaves the target exactly as it was rather
-/// than half-wiped — the state you least want to discover during a recovery.
+/// Requires a target without moderation history: overwriting destination
+/// evidence could forget a post-backup PUT/DELETE or newer permanent ban.
+/// Other bot-owned tables are replaced, not merged. One transaction protects
+/// refusal/rollback, and every imported executable expiry is quarantined:
+/// snapshot acceptance is historical evidence, not current Discord ownership.
 pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbDumpError> {
     let contents: DumpContents = inspect(in_path)?;
     let manifest = contents.manifest;
@@ -446,6 +465,26 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     )))
     .execute(&mut *tx)
     .await?;
+    // Moderation history fence: overwriting destination evidence could forget
+    // a post-backup PUT/DELETE or a newer permanent ban. Refuse while the
+    // lock is held so no concurrent writer slips evidence in after the check.
+    // Tables absent from the target (fresh migrated targets, legacy schemas)
+    // are skipped via to_regclass; never CASCADE through unrelated history.
+    let has_history: bool = sqlx::query_scalar(
+        "SELECT (to_regclass('moderation_member_bans') IS NOT NULL AND EXISTS (SELECT 1 FROM moderation_member_bans))
+             OR (to_regclass('moderation_scheduled_unbans') IS NOT NULL AND EXISTS (SELECT 1 FROM moderation_scheduled_unbans))
+             OR (to_regclass('moderation_audit') IS NOT NULL AND EXISTS (SELECT 1 FROM moderation_audit))
+             OR (to_regclass('moderation_idempotency') IS NOT NULL AND EXISTS (SELECT 1 FROM moderation_idempotency))
+             OR (to_regclass('moderation_warnings') IS NOT NULL AND EXISTS (SELECT 1 FROM moderation_warnings))
+             OR (to_regclass('moderation_channel_executions') IS NOT NULL AND EXISTS (SELECT 1 FROM moderation_channel_executions))",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if has_history {
+        return Err(DbDumpError::Refused(
+            "destination moderation history exists; restore into a fresh migrated target, preserve the destination and reconcile both histories before enabling moderation".into(),
+        ));
+    }
     let mut suspended = Vec::new();
     for (table, trigger) in [
         ("guild_settings", "trg_guild_settings_revision"),
@@ -492,10 +531,10 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     for &table in &target_tables {
         for (column, sequence) in table_sequences(&mut tx, table).await? {
             if is_destination_owned(table, &column) {
+                let sources = [(table, column.as_str())];
                 restart_sequence(
                     &mut tx,
-                    table,
-                    &column,
+                    &sources,
                     &sequence,
                     manifest.sequence_mark(table, &column),
                 )
@@ -614,6 +653,25 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         }
     }
 
+    // Even a matching accepted snapshot intent cannot prove current remote
+    // ownership: a permanent ban may have superseded it after the backup.
+    // Quarantine ALL executable imports; preserve states in the original file,
+    // ownership evidence, and the independent fence of imported running DELETEs.
+    sqlx::query(
+        "UPDATE moderation_scheduled_unbans SET dispatch_uncertain = TRUE
+         WHERE state = 'running'
+            OR (state = 'quarantined' AND (claim_token IS NOT NULL OR claimed_at IS NOT NULL))",
+    )
+    .execute(&mut *tx)
+    .await?;
+    let quarantined_unbans = sqlx::query(
+        "UPDATE moderation_scheduled_unbans AS job SET state = 'quarantined'
+         WHERE job.state IN ('staged', 'pending', 'running')",
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
     // v3 predates the required singleton. Clearing stale target data is not
     // enough: settings writes would subsequently fail without this baseline.
     // Never synthesize application settings/history or replace an archived row.
@@ -649,21 +707,32 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         .await?;
     }
 
-    // Every other allocator (owned serial/identity and the standalone
-    // settings-version sequence) resumes past the restored rows, the
-    // archive's mark and the target's own position.
+    // Every other allocator (owned serial/identity, including columns not
+    // named `id`, and the standalone table_sequences allocators) resumes past
+    // the restored rows, the archive's mark and the target's own position.
+    // 0113 draws retry queue tickets from the ban-ownership generation
+    // sequence without owning a column: resume past restored tickets too, or
+    // the next PUT or retry reuses a restored queue position.
+    let has_retry_generation = columns_of(&mut tx, "moderation_scheduled_unbans")
+        .await?
+        .iter()
+        .any(|(name, _)| name == "retry_generation");
     for &table in &target_tables {
         for (column, sequence) in table_sequences(&mut tx, table).await? {
-            if !is_destination_owned(table, &column) {
-                restart_sequence(
-                    &mut tx,
-                    table,
-                    &column,
-                    &sequence,
-                    manifest.sequence_mark(table, &column),
-                )
-                .await?;
+            if is_destination_owned(table, &column) {
+                continue;
             }
+            let mut sources = vec![(table, column.as_str())];
+            if table == "moderation_member_bans" && column == "generation" && has_retry_generation {
+                sources.push(("moderation_scheduled_unbans", "retry_generation"));
+            }
+            restart_sequence(
+                &mut tx,
+                &sources,
+                &sequence,
+                manifest.sequence_mark(table, &column),
+            )
+            .await?;
         }
     }
     tx.commit().await?;
@@ -689,11 +758,17 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         restored.insert((*table).to_owned(), count);
     }
 
+    let missing_member_ban_ownership = !manifest
+        .tables
+        .iter()
+        .any(|table| table.name == "moderation_member_bans");
     Ok(RestoreReport {
         manifest,
         restored,
         dropped_columns,
         initialized_tables,
+        missing_member_ban_ownership,
+        quarantined_unbans,
         ok,
     })
 }

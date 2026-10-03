@@ -735,6 +735,14 @@ pub enum RoomAction {
     DeleteRoom {
         channel_id: Snowflake,
     },
+    /// V2 caretaker succession: persist an ownership handoff the worker
+    /// already applied to its tracked row. No Discord write; rename, privacy
+    /// and Join-channel follow-ups belong to later slices.
+    UpdateOwnership {
+        channel_id: Snowflake,
+        owner_id: Snowflake,
+        original_creator_id: Snowflake,
+    },
     RenameRoom {
         channel_id: Snowflake,
         name: String,
@@ -773,6 +781,7 @@ impl RoomAction {
             Self::CreateRoom { .. } | Self::CreateCompanion { .. } => None,
             Self::MoveMember { channel_id, .. }
             | Self::DeleteRoom { channel_id }
+            | Self::UpdateOwnership { channel_id, .. }
             | Self::RenameRoom { channel_id, .. }
             | Self::GrantCompanionView {
                 room_channel_id: channel_id,
@@ -1089,7 +1098,11 @@ impl ActionQueue {
 
 /// V1 slash-command shapes. `/create` makes a new creator channel (admin
 /// only); `/setup` is the viewable-by-anyone status panel whose actions
-/// need admin (enforced by the handler, V1 runtime slice).
+/// need admin (enforced by the handler, V1 runtime slice). V2 ownership:
+/// `/reclaim` takes back a room as the original creator (or claims one whose
+/// owner is gone); `/transfer` hands a room to a member in it and makes them
+/// the remembered creator. Both act on the caller's current room; typed
+/// refusals from the ownership core become ephemeral replies, never state.
 #[must_use]
 pub fn voice_commands() -> Vec<CommandDefinition> {
     vec![
@@ -1202,6 +1215,20 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
             .required()
             .max_length(32)]),
         ]),
+        CommandDefinition::new(
+            "reclaim",
+            "Take back ownership of your temporary voice room",
+        ),
+        CommandDefinition::new(
+            "transfer",
+            "Hand your temporary voice room to a member in it",
+        )
+        .options(vec![CommandOption::new(
+            "member",
+            "Member in the room to make the new owner",
+            CommandOptionType::User,
+        )
+        .required()]),
         CommandDefinition::new(
             "logging",
             "Set where room health notices go and how much they say",
@@ -1516,6 +1543,63 @@ mod tests {
             }),
             Some(RoomAction::DeleteRoom { channel_id: 502 })
         );
+        assert_eq!(q.pop_due(GUILD, 0), None);
+    }
+
+    #[test]
+    fn ownership_handoff_is_urgent_and_channel_scoped() {
+        let q = ActionQueue::new();
+        q.enqueue(
+            GUILD,
+            RoomAction::RenameRoom {
+                channel_id: 500,
+                name: "slow".to_owned(),
+            },
+        );
+        q.enqueue(
+            GUILD,
+            RoomAction::UpdateOwnership {
+                channel_id: 501,
+                owner_id: MEMBER,
+                original_creator_id: MEMBER,
+            },
+        );
+        // The urgent handoff jumps the earlier rename.
+        assert_eq!(
+            q.pop_due(GUILD, 0).map(|a| {
+                q.mark_succeeded(&a);
+                a.action
+            }),
+            Some(RoomAction::UpdateOwnership {
+                channel_id: 501,
+                owner_id: MEMBER,
+                original_creator_id: MEMBER,
+            })
+        );
+        // Suspension and forget-drops cover the handoff like any other
+        // channel-scoped write.
+        q.enqueue(
+            GUILD,
+            RoomAction::UpdateOwnership {
+                channel_id: 502,
+                owner_id: MEMBER,
+                original_creator_id: MEMBER,
+            },
+        );
+        q.suspend(GUILD, 502);
+        assert_eq!(
+            q.pop_due(GUILD, 0).map(|a| {
+                q.mark_succeeded(&a);
+                a.action
+            }),
+            Some(RoomAction::RenameRoom {
+                channel_id: 500,
+                name: "slow".to_owned(),
+            })
+        );
+        assert_eq!(q.pop_due(GUILD, 0), None);
+        q.resume(GUILD, 502);
+        assert_eq!(q.drop_for_channel(GUILD, 502), 1);
         assert_eq!(q.pop_due(GUILD, 0), None);
     }
 
@@ -1899,6 +1983,8 @@ mod tests {
                 "invite",
                 "textchannels",
                 "access",
+                "reclaim",
+                "transfer",
                 "logging"
             ]
         );
@@ -1951,7 +2037,7 @@ mod tests {
         // `/access` is admin-gated and is all sub-commands, each with its
         // required options listed before the optional ones.
         let access = &defs[5];
-        let logging = &defs[6];
+        let logging = &defs[8];
         assert_eq!(
             access.default_member_permissions,
             Some(PERM_MANAGE_CHANNELS.to_string())
@@ -1985,6 +2071,14 @@ mod tests {
                 .all(|o| o.required != Some(true));
             assert!(required_first, "{} lists a required option late", sub.name);
         }
+        // `/reclaim` takes no options; `/transfer` names its recipient.
+        assert_eq!(defs[6].default_member_permissions, None);
+        assert!(defs[6].options.is_empty());
+        assert_eq!(defs[7].default_member_permissions, None);
+        assert_eq!(defs[7].options.len(), 1);
+        assert_eq!(defs[7].options[0].name, "member");
+        assert_eq!(defs[7].options[0].kind, CommandOptionType::User as u8);
+        assert!(defs[7].options[0].required == Some(true));
         // Merges cleanly alongside the other slices, first-wins.
         let merged = merge_commands(
             &[feature_commands(), moderation_commands(), voice_commands()],
@@ -1997,6 +2091,9 @@ mod tests {
         assert!(merged.iter().any(|d| d.name == "invite"));
         assert!(merged.iter().any(|d| d.name == "textchannels"));
         assert!(merged.iter().any(|d| d.name == "access"));
+        assert!(merged.iter().any(|d| d.name == "reclaim"));
+        assert!(merged.iter().any(|d| d.name == "transfer"));
+        assert!(merged.iter().any(|d| d.name == "logging"));
 
         assert!(!VoiceGates::from_map(&Default::default()).enabled);
         let vars: HashMap<String, String> = [("TWO_VOICE".to_owned(), "1".to_owned())]

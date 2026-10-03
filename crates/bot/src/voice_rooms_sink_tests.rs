@@ -43,6 +43,9 @@ impl RoomPersistence for Arc<Store> {
     async fn persist(&self, room: &VoiceRoom) -> Result<(), StoreError> {
         self.as_ref().persist(room).await
     }
+    async fn update_ownership(&self, room: &VoiceRoom) -> Result<bool, StoreError> {
+        self.as_ref().update_ownership(room).await
+    }
     async fn forget(&self, guild: u64, channel: u64) -> Result<(), StoreError> {
         self.as_ref().forget(guild, channel).await
     }
