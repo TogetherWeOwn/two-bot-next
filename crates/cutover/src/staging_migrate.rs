@@ -75,6 +75,16 @@ fn is_ref(value: &str) -> bool {
 }
 
 /// Pure prerequisite checks; nothing here touches the network.
+///
+/// Pinned-identity model: the workflow pins the exact non-secret staging
+/// endpoint host and database name per dispatch, and [`verify_target`]
+/// refuses before any DDL unless the secret migrator binding points at
+/// exactly that pinned identity. A `staging` substring in the database name
+/// remains accepted but is no longer required, so the verified shared-Neon
+/// staging database (which cannot carry `staging` in its name) can be
+/// targeted. Production exclusion is fail-closed: any `prod`-like host or
+/// database pin is refused, and no production Neon endpoint is recorded in
+/// `docs/cutover.md` or `docs/production-deploy.md` as of this change.
 pub fn validate_request(req: &Request) -> Result<(), RunError> {
     let sha = &req.source_sha;
     if sha.len() != 40 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
@@ -92,13 +102,9 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
             ));
         }
     }
-    if !req
-        .expected_database
-        .to_ascii_lowercase()
-        .contains("staging")
-    {
-        return refuse("expected database name must identify staging");
-    }
+    // NOTE: no `staging`-substring requirement here. The pinned host plus the
+    // binding-match check in `verify_target` is the staging identity; the
+    // database name alone cannot prove it.
     if !is_ref(&req.recovery_evidence_ref) {
         return refuse("approved recovery evidence reference is missing or not a bare reference");
     }
@@ -400,6 +406,19 @@ mod tests {
             apply: false,
         };
         assert!(validate_request(&ok).is_ok());
+        // The verified shared-Neon staging identity needs no `staging` in the
+        // database name: a pinned non-prod host plus an explicit database pin
+        // validates, and the binding-match check owns the rest.
+        let neon_pin = Request {
+            url: Some(
+                "postgres://u@ep-staging-example.us-east-2.aws.neon.tech:5432/two_bot?sslmode=require"
+                    .to_owned(),
+            ),
+            expected_host: "ep-staging-example.us-east-2.aws.neon.tech".to_owned(),
+            expected_database: "two_bot".to_owned(),
+            ..ok.clone()
+        };
+        assert!(validate_request(&neon_pin).is_ok());
         let bad = [
             Request {
                 url: None,
@@ -414,7 +433,15 @@ mod tests {
                 ..ok.clone()
             },
             Request {
-                expected_database: "scratch".to_owned(),
+                expected_host: "ep-prod-example.us-east-2.aws.neon.tech".to_owned(),
+                ..ok.clone()
+            },
+            Request {
+                expected_host: String::new(),
+                ..ok.clone()
+            },
+            Request {
+                expected_database: String::new(),
                 ..ok.clone()
             },
             Request {
@@ -428,6 +455,33 @@ mod tests {
         ];
         for r in bad {
             assert!(matches!(validate_request(&r), Err(RunError::Refused(_))));
+        }
+    }
+
+    #[test]
+    fn binding_must_match_pinned_identity() {
+        let base = Request {
+            url: Some("postgres://u@agent-testdb:5432/two_bot?sslmode=disable".to_owned()),
+            source_sha: "a".repeat(40),
+            expected_host: "agent-testdb".to_owned(),
+            expected_database: "two_bot".to_owned(),
+            recovery_evidence_ref: "TOG-1#doc".to_owned(),
+            acl_plan_ref: "TOG-2#doc".to_owned(),
+            apply: false,
+        };
+        assert!(validate_request(&base).is_ok());
+        assert!(verify_target(&base).is_ok());
+        for pin in [
+            Request {
+                expected_host: "other-host".to_owned(),
+                ..base.clone()
+            },
+            Request {
+                expected_database: "two_bot_other".to_owned(),
+                ..base.clone()
+            },
+        ] {
+            assert!(matches!(verify_target(&pin), Err(RunError::Refused(_))));
         }
     }
 }

@@ -18,10 +18,10 @@ on:
         description: Full 40-char reviewed commit on main
         required: true
       staging_host:
-        description: Verified staging database host (non-secret)
+        description: Pinned staging endpoint host, non-secret (binding must match; prod-like refused)
         required: true
       staging_database:
-        description: Verified staging database name (must contain "staging")
+        description: Pinned staging database name, non-secret (binding must match; prod-like refused)
         required: true
       recovery_evidence_ref:
         description: Reference to approved recovery evidence (card/document, no URL secrets)

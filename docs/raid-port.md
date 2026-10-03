@@ -132,9 +132,22 @@ independent enable switch. Anti-nuke dry-run does **not** suppress risk evidence
 or staff messages. Preserve session-mode refusal of armed anti-nuke and the
 adapter's contained-restart skips. Do not infer activation from a pure proposal.
 
-Runtime integration remains on this parent's retained work: gateway calls after
-join recording, live raid tuning, startup fences, log/delivery through the
-shared REST executor, and staging soak. The executor seam is TOG-10076; no
+Runtime integration is split across this parent's retained work (TOG-10430).
+**Landed — raid watch:** `crates/bot/src/raid_runtime.rs`. The pipeline hands
+each non-bot join to a registered `JoinObserver` after the funnel rows are
+written (`Pipeline::set_join_observer`), so an alert problem can never cost the
+join record. A single worker owns the volatile `RaidWatch`, re-reads
+`TWO_RAID_JOIN_THRESHOLD` / `TWO_RAID_WINDOW_SECONDS` through the settings store
+at most every 15 s (hot-wired keys; a failed read keeps the last good values),
+logs `raid_alert` first, and posts the staff message through the shared
+`ActionExecutor` only to the boot-time `DISCORD_STAFF_ALERT_CHANNEL_ID` when the
+bot can View and Send there, with empty allowed mentions. Missing channel,
+denied permission and send failure are logged and never retried; the cooldown is
+consumed at proposal. It is always on (legacy parity) and independent of
+`TWO_ANTI_NUKE`. `DISCORD_STAFF_ALERT_CHANNEL_ID` is not hot-wired and is not yet
+forwarded into the Container by the Worker, so staging stays log-only until a
+separate change classifies it. **Remaining:** join-risk delivery, startup
+fences, and staging soak. The executor seam is TOG-10076; no
 private production HTTP client is added here. The transactional join-risk
 claim store (`join_risk_store`, migration `0360_join_risk_flags.sql`, legacy
 0015 shape) serializes per-guild event-ID claims, counts prior rows by
