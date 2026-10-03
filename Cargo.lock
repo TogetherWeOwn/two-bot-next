@@ -2390,16 +2390,6 @@ name = "two-bot-next"
 version = "0.2.0"
 
 [[package]]
-name = "two-bot-testsupport"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "sqlx",
- "tokio",
- "url",
-]
-
-[[package]]
 name = "two-bot-store"
 version = "0.2.0"
 dependencies = [
@@ -2412,6 +2402,16 @@ dependencies = [
  "twilight-model",
  "two-bot-core",
  "two-bot-discord",
+]
+
+[[package]]
+name = "two-bot-testsupport"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "sqlx",
+ "tokio",
+ "url",
 ]
 
 [[package]]

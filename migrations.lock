@@ -121,6 +121,14 @@
       "sha256": "71d8dd5e3b804e389b0c58235df92c46de50dccd6c143e569db825eb7b916756",
       "justification": "Add V10b guild room-command controls table for TOG-10111 (0227 follows 0226 voice text channels)."
     },
+    "crates/cutover/migrations/0228_voice_logging_settings.sql": {
+      "sha256": "bbe19556578154885a5e4e10035715b32d7e8f82bc9ca9f98d953ab8c858308b",
+      "justification": "Add V10a guild room logging settings table for TOG-10111 (0228 follows 0227 voice access controls)."
+    },
+    "crates/cutover/migrations/0229_voice_config.sql": {
+      "sha256": "709b1649e07179ae87c38ae2b37ff6d99f8c83fe9d0960719ff6d1de16f7c9d2",
+      "justification": "TOG-12875: V11b configuration persistence for channel templates, game aliases, random lists, logging and guild settings; adds status_template and group_by_category to voice_creators (renumbered 0228 to 0229: main took 0228 for voice logging settings)."
+    },
     "crates/cutover/migrations/0300_website_contract.sql": {
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
       "sha256": "7d67d32e021ca9e9162474e1acfd9411ef68f4d3ec4e1289901dd4825b8eea43"

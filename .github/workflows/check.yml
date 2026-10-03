@@ -11,6 +11,11 @@ on:
   # PRs opened with GITHUB_TOKEN trigger no workflows, so the required `check`
   # / `worker check` would never run on the release PR without this path.
   workflow_dispatch:
+    inputs:
+      single_core_tests:
+        description: Pin native Rust test binaries to one allowed CPU for flake validation
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -87,8 +92,14 @@ jobs:
           # Ephemeral CI service only; tests explicitly use an empty password.
           # Slice scratch databases are created in the prepare step below.
           POSTGRES_HOST_AUTH_METHOD: trust
+        # PG18 places data and WAL below this volume. Isolate disposable fixture
+        # checkpoint I/O from shared-host disk; keep PostgreSQL defaults intact.
+        # Tmpfs counts against the 2GiB service cap; do not spill it into swap.
         options: >-
-          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --tmpfs /var/lib/postgresql:rw,size=1073741824
+          --memory 2147483648
+          --memory-swap 2147483648
+          --health-cmd "test $(stat -f -c %T $PGDATA) = tmpfs && pg_isready -U agent_test -d agent_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
@@ -123,6 +134,13 @@ jobs:
         run: |
           printf 'job-inputs: rust=%s worker=%s parity=%s\n' \
             "$SEL_RUST" "$SEL_WORKER" "$SEL_PARITY"
+
+      # `worker check` and the database jobs are skipped when `job inputs
+      # changed` fails, and GitHub counts a skipped required check as passing.
+      # Failing here keeps a broken selector from turning those into false greens.
+      - name: require job inputs selection to pass
+        if: needs.job-inputs.result != 'success'
+        run: exit 1
 
       - name: require parity docs to pass
         if: needs.parity-docs.result != 'success' && needs.job-inputs.outputs.parity != 'false'
@@ -161,7 +179,10 @@ jobs:
         run: '"$RUNNER_TEMP/zizmor/bin/zizmor" --offline --strict-collection --no-progress .github/workflows'
 
       - name: offline build-cache safety regressions
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_ci_single_core.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_ci_postgres_storage.py' -v
 
       - name: Guard channel CI database routing and job isolation
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_channel_ci.py' -v
@@ -193,6 +214,48 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+
+      - name: Pin native tests to one CPU (loaded-runner validation)
+        if: github.event_name == 'workflow_dispatch' && inputs.single_core_tests
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+          import tempfile
+
+          taskset = shutil.which('taskset')
+          if taskset is None:
+              raise SystemExit('single-core validation requires taskset')
+          affinity = sorted(os.sched_getaffinity(0))
+          threads = os.environ.get('RUST_TEST_THREADS')
+          source = 'explicit RUST_TEST_THREADS'
+          if threads is None:
+              # Ask Rust before pinning: available_parallelism also honors CPU
+              # quotas, unlike simply counting the original affinity mask.
+              source = 'unpinned Rust available_parallelism'
+              with tempfile.TemporaryDirectory() as directory:
+                  probe = str(pathlib.Path(directory) / 'test-parallelism')
+                  subprocess.run(['rustc', '-', '--crate-name', 'test_parallelism', '-o', probe],
+                                 input='fn main() { println!("{}", std::thread::available_parallelism().unwrap().get()); }',
+                                 text=True, check=True)
+                  threads = subprocess.check_output([probe], text=True).strip()
+          if not threads.isascii() or not threads.isdecimal() or int(threads) < 1:
+              raise SystemExit('single-core validation requires a positive RUST_TEST_THREADS')
+          cpu = min(affinity)
+          subprocess.run([taskset, '-c', str(cpu), 'true'], check=True)
+          version = subprocess.check_output(['rustc', '-vV'], text=True)
+          host = next(line.removeprefix('host: ') for line in version.splitlines() if line.startswith('host: '))
+          key = 'CARGO_TARGET_' + host.upper().replace('-', '_') + '_RUNNER'
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'RUST_TEST_THREADS={threads}\n')
+              env.write(f'{key}={taskset} -c {cpu}\n')
+          print(f'libtest threads: {threads} ({source}); unpinned affinity: {affinity}; explicit --test-threads still wins')
+          print(f'Native Rust test binaries: {taskset} -c {cpu}; revision {os.environ["GITHUB_SHA"]}')
+          print('loadavg:', pathlib.Path('/proc/loadavg').read_text().strip())
+          print('cpu pressure:', pathlib.Path('/proc/pressure/cpu').read_text().strip())
+          PY
 
       # Fail-fast (TOG-12055): cheap lint/format/guard checks run before the
       # ~4 GiB cargo cache restore, so a failure skips the big download. The
@@ -248,6 +311,36 @@ jobs:
       - name: Prepare isolated test databases
         if: needs.job-inputs.outputs.rust != 'false'
         run: createdb -h agent-testdb -U agent_test two_bot_test_ci
+
+      - name: Verify disposable Postgres defaults
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          if any(name.startswith('PG') for name in os.environ):
+              raise SystemExit('unset ambient libpq PG* configuration before probing the test service')
+          expected = {
+              'data_directory': '/var/lib/postgresql/18/docker',
+              'fsync': 'on',
+              'full_page_writes': 'on',
+              'synchronous_commit': 'on',
+          }
+          fields = ', '.join(f"'{key}', current_setting('{key}')" for key in expected)
+          settings = json.loads(subprocess.check_output([
+              'psql', 'postgres://agent_test:@agent-testdb:5432/two_bot_test_ci',
+              '-X', '-w', '-At', '-v', 'ON_ERROR_STOP=1',
+              '-c', f'SELECT json_build_object({fields})',
+          ], text=True, env=os.environ | {
+              'PGPASSFILE': '/dev/null', 'PGSSLMODE': 'disable',
+              'PGOPTIONS': '-c statement_timeout=5000',
+          }))
+          if settings != expected:
+              raise SystemExit('disposable Postgres data path or durability defaults changed')
+          print('Disposable Postgres defaults:', json.dumps(settings, sort_keys=True))
+          PY
 
       # Preserve cargo test's default unit/binary, integration and doc targets.
       # Migrated suites create/drop unique databases; this bootstrap is not reset.
@@ -307,6 +400,11 @@ jobs:
         run: >-
           cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
 
+      - name: LFG actual-router and mock-Discord regressions
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: >-
+          cargo test -p two-bot-discord --features db --locked --test lfg_interactions -- --ignored --test-threads=1
+
       - name: leveling gateway and interaction integration (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
         env:
@@ -320,6 +418,10 @@ jobs:
       - name: onboarding shared runtime acceptance (mock Discord and CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot --locked onboarding_ -- --include-ignored
+
+      - name: raid runtime acceptance (mock Discord and CI service only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot --locked raid_runtime_ -- --include-ignored
 
       - name: automod durable dedupe (CI service container only)
         if: needs.job-inputs.outputs.rust != 'false'
@@ -352,6 +454,10 @@ jobs:
       - name: voice room store regressions (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-cutover --test voice_rooms_store --locked -- --ignored
+
+      - name: Voice configuration store (CI service container only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-cutover --test voice_config_store --locked -- --ignored
 
       - name: Docker dependency-layer manifests (offline)
         if: needs.job-inputs.outputs.rust != 'false'
@@ -807,7 +913,8 @@ jobs:
     permissions:
       contents: read
     needs: [job-inputs]
-    # Skip when the selector sees no worker inputs (not a required check).
+    # Required check. Skipped when the selector sees no worker inputs, which
+    # GitHub counts as passing; `check` fails if the selector itself fails.
     if: needs.job-inputs.outputs.worker != 'false'
     # Runner routing: see the note on the first job above.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'worker') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}

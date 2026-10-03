@@ -17,7 +17,9 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use super::commands::{CommandDefinition, CommandOption, CommandOptionType, PERM_MANAGE_CHANNELS};
+use super::commands::{
+    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, PERM_MANAGE_CHANNELS,
+};
 use super::voice_text_channel::{
     TextChannelPlan, TextChannelSettings, MAX_TEXT_CHANNEL_NAME_CHARS,
 };
@@ -713,6 +715,13 @@ pub enum RoomAction {
         channel_id: Snowflake,
         name: String,
     },
+    /// V4 enforcement for a passed vote: deny the member Connect on this room
+    /// channel only, then disconnect them. Both writes are idempotent, so a
+    /// retried action is safe.
+    KickMember {
+        channel_id: Snowflake,
+        member_id: Snowflake,
+    },
 }
 
 /// Queue lane.
@@ -737,7 +746,8 @@ impl RoomAction {
             Self::CreateRoom { .. } => None,
             Self::MoveMember { channel_id, .. }
             | Self::DeleteRoom { channel_id }
-            | Self::RenameRoom { channel_id, .. } => Some(*channel_id),
+            | Self::RenameRoom { channel_id, .. }
+            | Self::KickMember { channel_id, .. } => Some(*channel_id),
         }
     }
 }
@@ -1127,6 +1137,63 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
             )
             .required()
             .max_length(32)]),
+        ]),
+        CommandDefinition::new(
+            "logging",
+            "Set where room health notices go and how much they say",
+        )
+        .permissions(PERM_MANAGE_CHANNELS)
+        .options(vec![
+            CommandOption::new(
+                "show",
+                "Show the current logging settings",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "level",
+                "Set how much the bot logs, or turn logging off",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "level",
+                "How much to log",
+                CommandOptionType::String,
+            )
+            .required()
+            .choices(vec![
+                CommandChoice {
+                    name: "Off".to_owned(),
+                    value: "off".to_owned(),
+                },
+                CommandChoice {
+                    name: "Brief".to_owned(),
+                    value: "brief".to_owned(),
+                },
+                CommandChoice {
+                    name: "Full".to_owned(),
+                    value: "full".to_owned(),
+                },
+            ])]),
+            CommandOption::new(
+                "channel",
+                "Set or clear the channel notices are sent to",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "channel",
+                "Notice channel; leave empty to use the automatic fallback",
+                CommandOptionType::Channel,
+            )]),
+            CommandOption::new(
+                "mention",
+                "Set or clear the role mentioned on errors",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "role",
+                "Role to mention; leave empty to clear it",
+                CommandOptionType::Role,
+            )]),
         ]),
     ]
 }
@@ -1761,7 +1828,7 @@ mod tests {
         let defs = voice_commands();
         assert_eq!(
             defs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-            ["create", "setup", "ping", "invite", "access"]
+            ["create", "setup", "ping", "invite", "access", "logging"]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
         assert_eq!(
@@ -1782,6 +1849,7 @@ mod tests {
         // `/access` is admin-gated and is all sub-commands, each with its
         // required options listed before the optional ones.
         let access = &defs[4];
+        let logging = &defs[5];
         assert_eq!(
             access.default_member_permissions,
             Some(PERM_MANAGE_CHANNELS.to_string())
@@ -1794,7 +1862,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["show", "creation", "role", "restrict", "unrestrict"]
         );
-        for sub in &access.options {
+        assert_eq!(
+            logging.default_member_permissions,
+            Some(PERM_MANAGE_CHANNELS.to_string())
+        );
+        assert_eq!(
+            logging
+                .options
+                .iter()
+                .map(|o| o.name.as_str())
+                .collect::<Vec<_>>(),
+            ["show", "level", "channel", "mention"]
+        );
+        for sub in access.options.iter().chain(&logging.options) {
             assert_eq!(sub.kind, CommandOptionType::SubCommand.as_u8());
             let required_first = sub
                 .options

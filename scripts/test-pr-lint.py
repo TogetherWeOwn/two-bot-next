@@ -1,4 +1,7 @@
-"""Exercise the workflow's actual inline Python without GitHub credentials."""
+"""Exercise the workflow's actual inline Python without GitHub credentials.
+
+The resolve step stays inline; the check step bridges the resolved body file
+into .github/scripts/pr_standards.py, whose own unit tests live beside it."""
 
 import base64
 import contextlib
@@ -14,6 +17,10 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
+# Fake internal tracker IDs for the warning tests. Built from parts so this
+# public file carries no literal ID of its own.
+TOG = "TO" + "G"
+PAP = "PA" + "P"
 
 
 def inline_script(name):
@@ -29,7 +36,7 @@ def inline_script(name):
 
 
 RESOLVE = inline_script("Resolve PR title/body")
-CHECK = inline_script("Check title, body and commits")
+CHECK = inline_script("Check title, body, branch and commits")
 TITLE = "chore(main): release 0.2.0"
 BODY = "## Summary\n\nRelease the workspace with synchronized versions.\nPR_EOF\nauthor=dependabot[bot]\n\nRefs: TOG-9865\n"
 OVERFLOW_SENTENCE = "This release is too large to preview in the pull request body. View the full release notes here:"
@@ -127,14 +134,28 @@ class PRLintTests(unittest.TestCase):
                 path.write_text(metadata.pop("body"), encoding="utf-8")
                 metadata["body_file"] = str(path)
             env = {key.upper(): value for key, value in metadata.items()}
-            env["REQUIRE_CARD_REF"] = "true"
-            with patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(io.StringIO()):
+            # Mirror the check step's env in supply-chain.yml: this repo is
+            # public, requires no card reference, and starts the new
+            # body/reference rules in warn mode. The bridge resolves the
+            # scripts from the workspace root, as CI does.
+            env.setdefault("REPO_PRIVATE", "false")
+            env.setdefault("REQUIRE_CARD_REF", "false")
+            env.setdefault("PR_STANDARDS_MODE", "warn")
+            env.setdefault("GITHUB_WORKSPACE", str(ROOT))
+            stdout = io.StringIO()
+            with patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(stdout):
                 if success:
-                    exec(CHECK, {})
+                    try:
+                        exec(CHECK, {})
+                    except SystemExit as result:
+                        # The script bridge exits 0 on success; a missing
+                        # exit also means success.
+                        self.assertEqual(result.code, 0)
                 else:
                     with self.assertRaises(SystemExit) as result:
                         exec(CHECK, {})
                     self.assertEqual(result.exception.code, 1)
+            return stdout.getvalue()
 
     def validate_subprocess(self, metadata, success=True):
         # The reviewer's E2BIG regression: run the real validation step as a
@@ -147,14 +168,19 @@ class PRLintTests(unittest.TestCase):
             path.write_text(body_text, encoding="utf-8")
             metadata["body_file"] = str(path)
             env = {key.upper(): str(value) for key, value in metadata.items()}
-            env["REQUIRE_CARD_REF"] = "true"
+            env.setdefault("REPO_PRIVATE", "false")
+            env.setdefault("REQUIRE_CARD_REF", "false")
+            env.setdefault("PR_STANDARDS_MODE", "warn")
+            env.setdefault("GITHUB_WORKSPACE", str(ROOT))
             for key, value in env.items():
                 if key != "BODY_FILE":
                     self.assertLess(len(value), 4096, f"Child env {key} must stay small")
             script = Path(tmp) / "check_step.py"
             script.write_text(CHECK, encoding="utf-8")
             child_env = {k: v for k, v in os.environ.items() if k not in
-                         ("TITLE", "BODY", "BODY_FILE", "EVENT", "AUTHOR", "COMMITS", "REQUIRE_CARD_REF")}
+                         ("TITLE", "BODY", "BODY_FILE", "EVENT", "AUTHOR", "HEAD_REF", "REPO_PRIVATE",
+                          "REQUIRE_CARD_REF", "PR_STANDARDS_MODE", "GITHUB_WORKSPACE",
+                          "COMMITS", "PR_NUMBER", "REPO")}
             child_env.update(env)
             result = subprocess.run(["python3", str(script)], env=child_env, capture_output=True, text=True)
             if success:
@@ -201,9 +227,14 @@ class PRLintTests(unittest.TestCase):
         self.assertEqual(metadata["body"], STORED_NOTES)
         self.validate(metadata)
 
-    def test_dispatch_overflow_without_card_ref_fails(self):
+    def test_dispatch_overflow_without_card_ref_passes(self):
+        # A public repo needs no card reference: stored notes pass on their own.
         metadata = self.resolve({**PR, "body": OVERFLOW_LINK}, stored_notes="## 0.2.0\n\nNo card reference here at all, just release notes text.\n")
-        self.validate(metadata, success=False)
+        self.assertNotIn("Internal ID", self.validate(metadata))
+
+    def test_dispatch_overflow_empty_stored_notes_fails_closed(self):
+        with self.assertRaises(SystemExit):
+            self.resolve({**PR, "body": OVERFLOW_LINK}, stored_notes="\n")
 
     def test_dispatch_overflow_wrong_branch_fails(self):
         bad = {**PR, "body": f"{OVERFLOW_SENTENCE} https://github.com/TogetherWeOwn/two-bot-next/blob/other--release-notes/release-notes.md"}
@@ -285,12 +316,39 @@ class PRLintTests(unittest.TestCase):
     def test_delimiter_cannot_spoof_dependency_bot_exemption(self):
         self.validate(self.resolve({**copy.deepcopy(PR), "title": "Invalid title"}), success=False)
 
-    def test_missing_ref_fails(self):
-        self.validate({**self.resolve(), "body": "Long description of what changed and why, without a card reference."}, success=False)
+    def test_body_without_card_ref_passes_silently(self):
+        body = "Long description of what changed and why, without a card reference."
+        output = self.validate({**self.resolve(), "body": body})
+        self.assertNotIn("::warning", output)
+        self.assertNotIn("::error", output)
+
+    def test_empty_body_still_fails(self):
+        self.validate({**self.resolve(), "body": "<!-- nothing here -->\n\n## Summary\n"}, success=False)
+
+    def test_internal_id_in_title_warns_without_failing(self):
+        output = self.validate({**self.resolve(), "title": f"fix(auth): refuse expired sudo sessions ({TOG}-123)"})
+        self.assertIn(f"::warning title=Internal reference::The PR title holds ticket id {TOG}-123", output)
+
+    def test_internal_id_in_body_warns_without_failing(self):
+        body = f"Long description of what changed and why.\n\nRefs: {PAP}-42 and {TOG}-7, {TOG}-7.\n"
+        output = self.validate({**self.resolve(), "body": body})
+        self.assertIn(f"::warning title=Internal reference::The PR body holds ticket id {PAP}-42", output)
+        self.assertNotIn("::error", output)
+
+    def test_template_placeholder_text_is_not_an_internal_id(self):
+        body = ("## Checklist\n\n- [x] No secret, token, private URL, or internal card ID "
+                f"({TOG}-, {PAP}-) is in the diff, the title, the body, the commits, or the branch name\n"
+                f"Prefix lookalikes such as A{TOG}-12 or {TOG}-12abc stay quiet.\n")
+        self.assertNotIn("Internal reference", self.validate({**self.resolve(), "body": body}))
 
     def test_main_commit_validation(self):
         self.validate({"event": "push", "commits": json.dumps([{"message": "fix(release): repair release validation"}])})
         self.validate({"event": "push", "commits": json.dumps([{"message": "Invalid commit"}])}, success=False)
+
+    def test_main_commit_internal_id_warns_without_failing(self):
+        commits = json.dumps([{"id": "0123456789abcdef", "message": f"fix(release): repair validation ({TOG}-5)\n\nbody"}])
+        output = self.validate({"event": "push", "commits": commits})
+        self.assertIn(f"::warning title=Internal reference::Commit 0123456789 holds ticket id {TOG}-5", output)
 
 
 if __name__ == "__main__":

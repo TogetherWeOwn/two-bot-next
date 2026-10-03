@@ -316,6 +316,11 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         self.pipeline.cache()
     }
 
+    /// Register the post-funnel join observer (raid watch). First wins.
+    pub fn set_join_observer(&self, observer: std::sync::Arc<dyn crate::pipeline::JoinObserver>) {
+        self.pipeline.set_join_observer(observer);
+    }
+
     /// Drain deferred XP awards without holding the async dispatch lock.
     /// The caller owns ordering (the serial checkpoint writer); this only
     /// preserves the funnel-before-award sequence per dispatch.
