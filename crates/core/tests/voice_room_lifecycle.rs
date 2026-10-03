@@ -186,7 +186,7 @@ fn reconcile_forgets_hand_deleted_rooms_without_a_delete_write() {
     let store = MemRoomStore::new();
     let gone = tracked(501, OWNER);
     store.add_room(gone.clone());
-    let plan = reconcile(&[gone.clone()], &[]);
+    let plan = reconcile(std::slice::from_ref(&gone), &[]);
     assert_eq!(plan.forget, vec![gone.clone()]);
     assert!(plan.delete_empty.is_empty());
     assert!(plan.suspend.is_empty());
@@ -200,7 +200,7 @@ fn reconcile_forgets_hand_deleted_rooms_without_a_delete_write() {
 fn reconcile_deletes_empty_present_rooms() {
     let room = tracked(502, OWNER);
     let plan = reconcile(
-        &[room.clone()],
+        std::slice::from_ref(&room),
         &[SeenChannel {
             channel_id: 502,
             human_occupants: 0,
@@ -218,7 +218,7 @@ fn reconcile_suspends_inaccessible_rooms_and_keeps_them_tracked() {
     let locked = tracked(503, OWNER);
     store.add_room(locked.clone());
     let plan = reconcile(
-        &[locked.clone()],
+        std::slice::from_ref(&locked),
         &[SeenChannel {
             channel_id: 503,
             human_occupants: 2,
@@ -236,7 +236,7 @@ fn reconcile_suspends_inaccessible_rooms_and_keeps_them_tracked() {
 fn reconcile_leaves_occupied_rooms_and_untracked_channels_alone() {
     let lived_in = tracked(504, OWNER);
     let plan = reconcile(
-        &[lived_in.clone()],
+        std::slice::from_ref(&lived_in),
         &[
             SeenChannel {
                 channel_id: 504,
