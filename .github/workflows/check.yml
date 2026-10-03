@@ -391,6 +391,7 @@ jobs:
         run: cargo test -p two-bot-core --features db --locked channel_moderation -- --include-ignored
 
       - name: channel moderation shared-router REST acceptance (CI service only)
+        if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-

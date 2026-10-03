@@ -583,6 +583,21 @@ impl ChannelModerationStore {
     /// A timeout or ambiguous failure must retain the claim to prevent replay.
     /// Returns false for stale tickets or completed claims.
     pub async fn release(&self, ticket: &ChannelClaimTicket) -> Result<bool, sqlx::Error> {
+        // The shared execution fence references the idempotency ledger, so a
+        // proven-safe release must retire the lane before its ledger row.
+        // Deleting the ledger first violates
+        // moderation_channel_executions_guild_id_idempotency_key_fkey and
+        // would orphan the lane, blocking a same-channel retry.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM moderation_channel_executions
+              WHERE guild_id = $1 AND idempotency_key = $2 AND claim_token = $3",
+        )
+        .bind(&ticket.guild_id)
+        .bind(&ticket.idempotency_key)
+        .bind(ticket.claim_token.expose())
+        .execute(&mut *tx)
+        .await?;
         let result = sqlx::query(
             "DELETE FROM moderation_idempotency
               WHERE guild_id = $1 AND idempotency_key = $2
@@ -591,8 +606,9 @@ impl ChannelModerationStore {
         .bind(&ticket.guild_id)
         .bind(&ticket.idempotency_key)
         .bind(ticket.claim_token.expose())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 

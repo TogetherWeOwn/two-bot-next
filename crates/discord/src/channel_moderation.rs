@@ -308,7 +308,9 @@ impl ChannelModerationRuntime {
                 self.store.record_audit(&request.row).await?;
                 return Ok(Some(ChannelReply::uncertain()));
             }
-            Err(DiscordError::Rejected(_)) => unreachable!("safe rejection handled above"),
+            Err(DiscordError::Rejected(_) | DiscordError::Guard(_)) => {
+                unreachable!("safe rejection handled above")
+            }
         };
         if !self
             .finish(&ticket, &mut request, &reply, cleanup.as_ref())
