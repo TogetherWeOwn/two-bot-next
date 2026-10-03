@@ -54,3 +54,17 @@ Static half done (health endpoints probed, revision pinned, candidate command
 list inventoried). Live half outstanding: presence, gateway ping, published
 command runs, screenshots — needs (a) staging gateway `ready`, (b) a
 Discord-capable pass with the staging bot token.
+
+## Pass 2 re-probe (2026-10-03 ~23:00Z)
+
+- `/health` 200 (0.43 s) — still PASS.
+- `/readyz` still 503, still serving build `9b73b33a` (`37157866778-1`):
+  deploy run 410 (HEAD `92ab5293`) still `in_progress`/not yet taken over.
+- New detail: `/readyz` now reports
+  `gateway_failure: {phase: durable_gateway, class: checkpoint_load_failed}` —
+  the gateway is crashlooping on checkpoint load (DB-behind-binary shape), not
+  merely slow to start. Re-probing will not turn this green; it needs the
+  staging repair path.
+- Follow-up: child card "Live Discord pass: presence/ping/published-list when
+  staging gateway ready", blocked on TOG-12907 (staging on-call repair card).
+  This card closes with the NEEDS WORK report; the live pass resumes there.
