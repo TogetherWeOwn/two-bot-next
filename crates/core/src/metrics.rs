@@ -52,6 +52,8 @@ pub const REST_ROUTES: &[&str] = &[
     "POST /guilds/:guild/scheduled-events",
     "PATCH /guilds/:guild/scheduled-events/:event",
     "DELETE /guilds/:guild/scheduled-events/:event",
+    "POST /guilds/:guild/channels",
+    "DELETE /channels/:channel",
     "other",
 ];
 const RESULTS: &[&str] = &["2xx", "3xx", "4xx", "429", "5xx", "transport"];
@@ -69,6 +71,35 @@ pub const JOBS: &[&str] = &[
     "other",
 ];
 const JOB_OUTCOMES: &[&str] = &["success", "failure"];
+/// Room lifecycle operations (TOG-13543): creator-channel create/move/delete
+/// outcomes only. Retries (429/backoff) are not outcomes.
+pub const VOICE_OPERATIONS: &[&str] = &["create", "move", "delete"];
+const VOICE_OUTCOMES: &[&str] = &[
+    "success",
+    "category_full",
+    "discord",
+    "persistence",
+    "cancelled",
+];
+/// Reconcile plan actions (TOG-13543): what one `reconcile` pass enqueued.
+pub const VOICE_RECONCILE_ACTIONS: &[&str] = &[
+    "delete_enqueued",
+    "suspended",
+    "resumed",
+    "succession_enqueued",
+];
+/// Dead-lettered queue actions by bounded family (TOG-13543). Companion
+/// grants/revokes share `companion`; all unknown shapes share `other`.
+pub const VOICE_DEAD_ACTIONS: &[&str] = &[
+    "create",
+    "move",
+    "delete",
+    "companion",
+    "ownership",
+    "kick",
+    "rename",
+    "other",
+];
 const BUCKETS_MICROS: &[u64] = &[
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
@@ -131,6 +162,12 @@ struct Values {
     resumes: u64,
     latency_micros: Option<u64>,
     handler: Histogram,
+    voice_ops: [[u64; 5]; 3],
+    voice_reconcile: [u64; 4],
+    voice_dead: [u64; 8],
+    voice_tracked: u64,
+    voice_compensation: u64,
+    voice_orphans: u64,
 }
 
 /// All storage is fixed-size. Unknown labels collapse to `other`, including hostile input.
@@ -219,6 +256,69 @@ impl Metrics {
         let current = &mut values.jobs[bounded_index(job, JOBS)];
         current.runs[1] = current.runs[1].saturating_add(1);
         current.consecutive_failures = current.consecutive_failures.saturating_add(1);
+    }
+
+    /// One finished room lifecycle outcome (TOG-13543). Call once per
+    /// terminal create/move/delete: retries and rate-limit backoffs are not
+    /// outcomes. Unknown `op`/`outcome` collapse to the trailing `other`
+    /// slot only when the allowlists grow; today every caller passes a
+    /// member, so `other` stays zero. No IDs, tokens or bodies are retained.
+    pub fn voice_operation(&self, op: &str, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.voice_ops[bounded_index(op, VOICE_OPERATIONS)]
+            [bounded_index(outcome, VOICE_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// Add one reconcile plan size (TOG-13543). `count` is the number of
+    /// rooms in this pass for `action`; zero is a no-op.
+    pub fn voice_reconcile(&self, action: &str, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.voice_reconcile[bounded_index(action, VOICE_RECONCILE_ACTIONS)];
+        *counter = counter.saturating_add(count);
+    }
+
+    /// One queue write exhausted `QUEUE_MAX_ATTEMPTS` (TOG-13543). Unknown
+    /// families collapse to `other`.
+    pub fn voice_dead_letter(&self, action: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.voice_dead[bounded_index(action, VOICE_DEAD_ACTIONS)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// Current worker state for ghost verification (TOG-13543): tracked
+    /// rooms plus compensation-pending orphans awaiting delete. Last writer
+    /// wins; on staging (single guild) this is exact, on multi-guild it is
+    /// the freshest reporter until runtimes aggregate.
+    pub fn voice_state(&self, tracked: u64, compensation: u64) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_tracked = tracked;
+        values.voice_compensation = compensation;
+    }
+
+    /// One untracked creator-channel orphan needing manual deletion after
+    /// failed `/create` compensation (TOG-13543). No channel ID is retained.
+    pub fn voice_orphan(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_orphans = values.voice_orphans.saturating_add(1);
     }
 
     /// Pool samples are supplied at scrape time; this function never opens a DB connection.
@@ -329,6 +429,72 @@ impl Metrics {
             )
             .unwrap();
         }
+        header(
+            &mut out,
+            "two_bot_voice_operations_total",
+            "counter",
+            "Finished room lifecycle outcomes by bounded operation and outcome; retries are not outcomes.",
+        );
+        for (op, outcomes) in VOICE_OPERATIONS.iter().zip(values.voice_ops) {
+            for (outcome, count) in VOICE_OUTCOMES.iter().zip(outcomes) {
+                writeln!(
+                    out,
+                    "two_bot_voice_operations_total{{op=\"{op}\",outcome=\"{outcome}\"}} {count}"
+                )
+                .unwrap();
+            }
+        }
+        header(
+            &mut out,
+            "two_bot_voice_reconcile_actions_total",
+            "counter",
+            "Reconcile plan sizes by bounded action.",
+        );
+        for (action, count) in VOICE_RECONCILE_ACTIONS.iter().zip(values.voice_reconcile) {
+            writeln!(
+                out,
+                "two_bot_voice_reconcile_actions_total{{action=\"{action}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_voice_dead_letters_total",
+            "counter",
+            "Queue writes that exhausted QUEUE_MAX_ATTEMPTS by bounded family.",
+        );
+        for (action, count) in VOICE_DEAD_ACTIONS.iter().zip(values.voice_dead) {
+            writeln!(
+                out,
+                "two_bot_voice_dead_letters_total{{action=\"{action}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_voice_tracked_rooms",
+            "gauge",
+            "Rooms tracked in memory; compare with live Discord channels for ghosts.",
+        );
+        writeln!(out, "two_bot_voice_tracked_rooms {}", values.voice_tracked).unwrap();
+        header(
+            &mut out,
+            "two_bot_voice_compensation_pending",
+            "gauge",
+            "Tracked rooms awaiting compensating delete after a failed write.",
+        );
+        writeln!(
+            out,
+            "two_bot_voice_compensation_pending {}",
+            values.voice_compensation
+        )
+        .unwrap();
+        scalar(
+            &mut out,
+            "two_bot_voice_orphans_total",
+            "counter",
+            values.voice_orphans,
+        );
         let (size, idle, max) = pool.unwrap_or_default();
         scalar(
             &mut out,
@@ -450,6 +616,59 @@ mod tests {
         }
         assert!(text.contains("two_bot_job_last_success_timestamp_seconds{job=\"rank\"} 456\n"));
         assert!(text.contains("two_bot_job_consecutive_failures{job=\"rank\"} 0\n"));
+    }
+
+    #[test]
+    fn voice_signals_stay_bounded_and_saturate() {
+        let metrics = Metrics::default();
+        metrics.voice_operation("create", "success");
+        metrics.voice_operation("move", "discord");
+        metrics.voice_operation("delete", "persistence");
+        metrics.voice_operation("create", "category_full");
+        metrics.voice_operation("move", "cancelled");
+        metrics.voice_reconcile("delete_enqueued", 2);
+        metrics.voice_reconcile("suspended", 1);
+        metrics.voice_reconcile("resumed", 0);
+        metrics.voice_dead_letter("create");
+        metrics.voice_dead_letter("other");
+        metrics.voice_state(7, 2);
+        metrics.voice_orphan();
+        let text = metrics.render(None);
+        assert!(
+            text.contains("two_bot_voice_operations_total{op=\"create\",outcome=\"success\"} 1\n")
+        );
+        assert!(
+            text.contains("two_bot_voice_operations_total{op=\"move\",outcome=\"discord\"} 1\n")
+        );
+        assert!(
+            text.contains("two_bot_voice_reconcile_actions_total{action=\"delete_enqueued\"} 2\n")
+        );
+        assert!(text.contains("two_bot_voice_dead_letters_total{action=\"create\"} 1\n"));
+        assert!(text.contains("two_bot_voice_tracked_rooms 7\n"));
+        assert!(text.contains("two_bot_voice_compensation_pending 2\n"));
+        assert!(text.contains("two_bot_voice_orphans_total 1\n"));
+        // Fixed cardinality: 3x5 ops + 4 reconcile + 8 dead-letters.
+        let mut series = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(series.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn voice_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.voice_operation(&hostile, &hostile);
+            metrics.voice_reconcile(&hostile, 1);
+            metrics.voice_dead_letter(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
     }
 
     #[test]
