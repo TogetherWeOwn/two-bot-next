@@ -35,7 +35,13 @@ use twilight_model::{
         Channel, ChannelType, VideoQualityMode,
     },
     guild::{Permissions, Role},
-    http::interaction::InteractionResponse,
+    http::{
+        interaction::InteractionResponse,
+        permission_overwrite::{
+            PermissionOverwrite as HttpPermissionOverwrite,
+            PermissionOverwriteType as HttpPermissionOverwriteType,
+        },
+    },
     id::{
         marker::{ApplicationMarker, InteractionMarker, RoleMarker},
         Id,
@@ -574,9 +580,16 @@ impl RoomHttp {
         if text_channel_id == 0 {
             return Err(RoomHttpError::InvalidRequest);
         }
+        // The edit endpoint takes the outbound model, not the channel model.
+        let wire = HttpPermissionOverwrite {
+            allow: Some(overwrite.allow),
+            deny: Some(overwrite.deny),
+            id: overwrite.id,
+            kind: HttpPermissionOverwriteType::Member,
+        };
         let request = self
             .http
-            .update_channel_permission(Id::new(text_channel_id), &overwrite)
+            .update_channel_permission(Id::new(text_channel_id), &wire)
             .try_into_request()
             .map_err(classify_http_error)?;
         self.send(request, still_managing).await?;
