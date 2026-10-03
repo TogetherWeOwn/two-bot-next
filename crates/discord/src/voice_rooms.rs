@@ -370,6 +370,12 @@ impl RoomHttp {
                 request.body().unwrap_or_default(),
             )))
             .map_err(|_| RoomHttpError::InvalidRequest)?;
+        // One adapter-visible REST attempt per wire send, shared with the
+        // executor's accounting: template only, never IDs, tokens or bodies.
+        // `Attempt` finishes at headers so 429s stay visible even when the
+        // body is broken; transport failures and outer timeouts fall back to
+        // `transport` via `Drop`.
+        let mut attempt = crate::executor_metrics::Attempt::new(&request);
         let response = tokio::time::timeout(Duration::from_secs(10), async {
             let response = self
                 .transport
@@ -377,6 +383,7 @@ impl RoomHttp {
                 .await
                 .map_err(|_| RoomHttpError::UnknownOutcome)?;
             let status = response.status().as_u16();
+            attempt.finish(Some(status));
             if status == 401 {
                 if bot_authenticated {
                     self.unauthorized.store(true, Ordering::Relaxed);

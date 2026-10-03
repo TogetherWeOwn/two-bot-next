@@ -161,7 +161,10 @@ pub fn response_for_slash(outcome: &SlashOutcome) -> Option<InteractionResponse>
 #[cfg(feature = "db")]
 #[derive(Debug)]
 pub struct InteractionRuntime {
-    pub router: InteractionRouter,
+    /// Shared with integration seams that read the same registrations (for
+    /// example the custom-command execution seam): registrations are complete
+    /// once `with_router` returns, so every `Arc` clone reads the same set.
+    pub router: std::sync::Arc<InteractionRouter>,
     executor: crate::ActionExecutor,
     lfg: crate::lfg_interactions::LfgInteractions,
     bot_user_id: std::sync::atomic::AtomicU64,
@@ -196,7 +199,7 @@ impl InteractionRuntime {
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::Lfg)));
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgClose)));
         Self {
-            router,
+            router: std::sync::Arc::new(router),
             executor,
             lfg: crate::lfg_interactions::LfgInteractions::new(pool),
             bot_user_id: std::sync::atomic::AtomicU64::new(bot_user_id),

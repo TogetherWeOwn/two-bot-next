@@ -19,7 +19,7 @@ JOB_INVENTORY = {
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"release-please", "dispatch-checks", "sbom-target", "release-sbom",
                     "attach-sbom"},
-    "staging-migrate.yml": {"migrate"},
+    "staging-migrate.yml": {"plan", "apply"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
     # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
     # `image` builds/scans the untrusted ref with pinned actions only; `verify`
@@ -101,11 +101,13 @@ def staging_migrate_errors(workflow):
     Dispatch-only with exactly the seven reviewed inputs (plan/apply
     defaulting to plan, the six identity/evidence inputs required, and the
     plan-bound expected_pending list optional at dispatch but required by the
-    runner for apply), reading the pre-existing staging-migrate Environment
-    binding, main-branch dispatches only, and the routed runner for job
-    'migrate'. No push/pull_request/schedule trigger, no production path, no
-    wrangler/probe markers: anything else is an activation route and must fail
-    closed.
+    runner for apply). Two jobs: `plan` always runs through the no-reviewer
+    staging-migrate-plan environment; `apply` runs only for mode=apply after
+    a green plan through the reviewed staging-migrate-apply environment.
+    Each job pins main-branch dispatch, its own routed runner, and the
+    pipefail Run step. No push/pull_request/schedule trigger, no production
+    path, no wrangler/probe markers: anything else is an activation route
+    and must fail closed.
     """
     name = "staging-migrate.yml"
     errors = []
@@ -133,16 +135,44 @@ def staging_migrate_errors(workflow):
                 or "ascending" not in str(pending.get("description")).lower()):
             errors.append(f"{name}: expected_pending must stay optional, default empty, "
                           "and documented as the ascending reviewed plan list")
-    job = (workflow.get("jobs") or {}).get("migrate", {})
-    if job.get("environment") != "staging-migrate":
-        errors.append(f"{name}:migrate: must read the staging-migrate Environment binding")
-    if job.get("if") != "github.ref == 'refs/heads/main'":
-        errors.append(f"{name}:migrate: must run only from main")
-    if not runner_allowed("migrate", job.get("runs-on")):
-        errors.append(f"{name}:migrate: must use the routed runner expression for job 'migrate'")
-    text = str(job).lower()
-    if job.get("uses") is not None or any(marker in text for marker in DEPLOY_MARKERS):
-        errors.append(f"{name}:migrate: deployment/probe alternative outside approved deploy workflows")
+        acl = inputs.get("acl_plan_ref") or {}
+        if "bare" not in str(acl.get("description")).lower():
+            errors.append(f"{name}: acl_plan_ref must document the bare reference contract "
+                          "(refused before any DDL otherwise)")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"plan", "apply"}:
+        errors.append(f"{name}: jobs must be exactly plan and apply")
+        return errors
+    plan, apply = jobs.get("plan", {}), jobs.get("apply", {})
+    if plan.get("environment") != "staging-migrate-plan":
+        errors.append(f"{name}:plan: must read the staging-migrate-plan Environment binding")
+    if apply.get("environment") != "staging-migrate-apply":
+        errors.append(f"{name}:apply: must read the staging-migrate-apply Environment binding")
+    if plan.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:plan: must run only from main")
+    if apply.get("if") != "github.ref == 'refs/heads/main' && inputs.mode == 'apply'":
+        errors.append(f"{name}:apply: must run only from main for mode=apply")
+    if apply.get("needs") != "plan":
+        errors.append(f"{name}:apply: must wait for a green plan")
+    for job_id, job in (("plan", plan), ("apply", apply)):
+        if not runner_allowed(job_id, job.get("runs-on")):
+            errors.append(f"{name}:{job_id}: must use the routed runner expression for job '{job_id}'")
+        text = str(job).lower()
+        if job.get("uses") is not None or any(marker in text for marker in DEPLOY_MARKERS):
+            errors.append(f"{name}:{job_id}: deployment/probe alternative outside approved deploy workflows")
+        run_steps = [step for step in job.get("steps", []) if "tee" in str(step.get("run", ""))]
+        if not run_steps:
+            errors.append(f"{name}:{job_id}: no Run step piping through tee")
+        for step in run_steps:
+            if step.get("shell") != "bash" or "set -o pipefail" not in str(step.get("run", "")):
+                errors.append(f"{name}:{job_id}: Run step must use a pipefail shell so a "
+                              "migrator refusal/failure fails the job instead of reporting green")
+    plan_runs = " ".join(str(step.get("run", "")) for step in plan.get("steps", []))
+    apply_runs = " ".join(str(step.get("run", "")) for step in apply.get("steps", []))
+    if "--plan" not in plan_runs or "--apply" in plan_runs:
+        errors.append(f"{name}:plan: must run the migrator with --plan only")
+    if "--apply" not in apply_runs or "--plan" in apply_runs:
+        errors.append(f"{name}:apply: must run the migrator with --apply only")
     return errors
 
 
@@ -380,21 +410,42 @@ class WorkflowTests(unittest.TestCase):
                 mode = w["on"]["workflow_dispatch"]["inputs"]["mode"]
                 mode["default"] = "apply"
             self.assertTrue(mutated(widen))
-        for key, value in (("environment", None), ("environment", "production"),
-                           ("if", None), ("if", "${{ always() }}"),
-                           ("runs-on", "ubuntu-latest")):
-            with self.subTest(job_key=key, value=value):
-                def change(w, key=key, value=value):
-                    job = w["jobs"]["migrate"]
-                    if value is None:
-                        job.pop(key, None)
-                    else:
-                        job[key] = value
-                self.assertTrue(mutated(change))
-        for step in ({"run": "npx wrangler deploy"},
-                     {"run": 'curl "$STAGING_WORKER_URL/readyz"'}):
-            with self.subTest(deploy_step=step):
-                self.assertTrue(mutated(lambda w, s=step: w["jobs"]["migrate"]["steps"].append(s)))
+        with self.subTest(missing="apply-job"):
+            def drop(w):
+                del w["jobs"]["apply"]
+            self.assertTrue(mutated(drop))
+        for job_id in ("plan", "apply"):
+            for key, value in (("environment", None), ("environment", "production"),
+                               ("if", None), ("if", "${{ always() }}"),
+                               ("runs-on", "ubuntu-latest")):
+                with self.subTest(job=job_id, job_key=key, value=value):
+                    def change(w, key=key, value=value, job_id=job_id):
+                        job = w["jobs"][job_id]
+                        if value is None:
+                            job.pop(key, None)
+                        else:
+                            job[key] = value
+                    self.assertTrue(mutated(change))
+        for job_id in ("plan", "apply"):
+            for step in ({"run": "npx wrangler deploy"},
+                         {"run": 'curl "$STAGING_WORKER_URL/readyz"'}):
+                with self.subTest(job=job_id, deploy_step=step):
+                    def add(w, s=step, job_id=job_id):
+                        w["jobs"][job_id]["steps"].append(s)
+                    self.assertTrue(mutated(add))
+        with self.subTest(apply="no-needs"):
+            def drop(w):
+                del w["jobs"]["apply"]["needs"]
+            self.assertTrue(mutated(drop))
+        with self.subTest(apply="always-runs"):
+            def widen(w):
+                w["jobs"]["apply"]["if"] = "github.ref == 'refs/heads/main'"
+            self.assertTrue(mutated(widen))
+        with self.subTest(environments="swapped"):
+            def swap(w):
+                w["jobs"]["plan"]["environment"] = "staging-migrate-apply"
+                w["jobs"]["apply"]["environment"] = "staging-migrate-plan"
+            self.assertTrue(mutated(swap))
 
     def test_overflow_runner_must_name_its_own_job(self):
         self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))

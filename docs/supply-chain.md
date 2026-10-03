@@ -29,6 +29,10 @@ afterwards (CodeQL cache-poisoning gate). The `image` job runs the offline
 fixtures from the trusted root checkout *before* the `source` checkout, then
 builds, scans and hands the lockfile, provenance, BOMs, findings and the saved
 image to the `verify` job through the short-lived `sbom-partial` artifact.
+The handoff name carries the run ID and attempt (`sbom-partial-<run_id>-<run_attempt>`,
+same scheme as the scanned image tag): v4 artifacts are immutable and same-named
+uploads coexist, so a bare name lets a `rerun failed jobs` retry download the
+previous attempt's BOMs/image instead of the current attempt's.
 Validation, evidence and preflight run only in `verify`, which never checks
 out `inputs.ref`.
 

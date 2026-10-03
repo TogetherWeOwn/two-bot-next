@@ -252,6 +252,19 @@ class SupplyChainTests(unittest.TestCase):
         self.assertNotIn("inputs.ref", verify)
         self.assertIn("sbom-partial", image)
         self.assertIn("sbom-partial", verify)
+        # The internal handoff artifact is per-attempt (same
+        # run_id/run_attempt scheme as the scanned image tag): v4 artifacts
+        # are immutable and same-named uploads coexist, so a bare-name
+        # download on a `rerun failed jobs` retry can resolve to the previous
+        # attempt's BOMs/image and fail validation (or validate stale BOMs).
+        attempt_handoff = "name: sbom-partial-${{ github.run_id }}-${{ github.run_attempt }}"
+        self.assertIn(attempt_handoff, image)
+        self.assertIn(attempt_handoff, verify)
+        for line in supply.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            self.assertNotEqual(line.strip(), "name: sbom-partial",
+                                "bare sbom-partial artifact name reintroduces cross-attempt reuse on reruns")
         # The verify job reads the exact inputs.ref lockfile handed over in
         # the artifact, never its own checkout's lockfile; the handoff copy
         # is removed before checksums so release assets stay pinned.

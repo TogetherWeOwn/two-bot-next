@@ -112,6 +112,25 @@
   runs in CI and gates the required `check` job.
   Runtime router/REST wiring remains deferred; this does not enable Discord
   role mutations.
+- Framework-free custom-command validation, template rendering, feature-gate
+  decisions, accepted-message text trigger selection, command-list formatting,
+  registry merge outcomes and automation audit facts.
+- Postgres custom-command and shared audit persistence, migration `0130`,
+  transaction-compatible capacity locking, and a credential-free database
+  regression test against agent-testdb or a CI service container.
+- Shared-router custom-command execution adapter with transactional management,
+  deferred mention-safe replies, dynamic slash execution auditing, and serialized
+  full-registry publication. Add mock REST + isolated testdb runtime fixtures;
+  gateway execution is wired with bounded dispatch/checkpoint ordering.
+- Explicit moderation-acceptance contract and prefix execution through the shared
+  REST executor, with immutable pre-send audit reservations preventing replay of
+  unknown deliveries. Preserve uncertain transport/timeout/5xx/429 outcomes as
+  unresolved rather than auditing a definite failure. Add prefix failure/restart
+  fixtures, dual-gated Message Content intent, and unchanged Worker forwarding of
+  custom-command and automod flags. Add shared bootstrap metadata reads, cold-RESUME
+  context and gateway dispatch under the existing heartbeat-safe checkpoint budget.
+  Prefixes require explicit automod-disabled configuration until the ordinary
+  moderation-result producer is integrated; unknown acceptance stays fail-closed.
 - Wire `/feed-add`, `/feed-remove` and `/feed-list` through the same command runtime, router and REST executor as sticky commands. Defer ephemerally before guild-scoped CRUD and audit writes, preserve the invoking channel, and publish the complete gated command registry on Ready. Isolated Postgres and mock REST acceptance cover feed commands and sticky coexistence; announcements remain off by default, with no fetching, polling or relay posts.
 - Wire `/sticky` and `/sticky-remove` through the shared interaction router and drive accepted-message re-posts through the shared REST executor. The runtime claims one re-post window atomically per burst, validates and records the replacement id before retiring the previous sticky (best-effort), releases the claim and audits `post_failed` on REST failure, and deletes an orphaned replacement when the claim moved on. Commands defer ephemerally before I/O and edit the original reply; refusals are limited to owned sticky commands. `TWO_AUTOMATIONS` gates both surfaces; ManageGuild is required, and `/sticky` validates a 1–2000 UTF-16 body with a 1–300 s debounce (default 5 s). Covered by isolated Postgres and mock REST acceptance tests.
 - Add the audit mirror delivery service over the shared REST executor: record-before-deliver, private guild-fenced destinations, enforced nonce/mention suppression, kill-switch enforcement, crash-safe marker reconciliation and quarantine. Revalidate prepared ownership after shared transport pacing, preserve interrupted dedup adoption evidence, treat malformed history as uncertain, and run service fault-injection regressions in CI. Runtime wiring and activation remain deferred.

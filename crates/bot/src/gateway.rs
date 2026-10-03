@@ -97,13 +97,17 @@ pub fn session_snapshot(shard: &Shard) -> Option<Session> {
 }
 
 /// Resolve the gateway intents after boot activation: privileged
-/// `MESSAGE_CONTENT` only when permitted automod is enabled or tickets
-/// are independently configured (legacy `needsMessageContent`).
+/// `MESSAGE_CONTENT` only when permitted automod is enabled, tickets
+/// are independently configured (legacy `needsMessageContent`), or
+/// permitted automations enable custom text commands
+/// (`TWO_AUTOMATIONS=1` and `TWO_TEXT_COMMANDS=1`). A refused capability
+/// never contributes its condition: requesting a privileged intent without
+/// the grant closes the gateway with 4014 instead of isolated refusal.
 pub fn intents_from_env(activation: &crate::activation::BootActivation) -> Intents {
     fn var(name: &str) -> String {
         std::env::var(name).unwrap_or_default()
     }
-    intents_for_settings(
+    let base = intents_for_settings(
         activation,
         &var("TWO_AUTOMOD"),
         [
@@ -111,7 +115,17 @@ pub fn intents_from_env(activation: &crate::activation::BootActivation) -> Inten
             var("DISCORD_TICKET_STAFF_ROLE_ID").as_str(),
             var("DISCORD_TICKET_PANEL_CHANNEL_ID").as_str(),
         ],
-    )
+    );
+    // Custom text commands ride the automations surface: a refused Automations
+    // capability must not request privileged MESSAGE_CONTENT, which the live
+    // app may not hold (a 4014 close would take every cleared capability
+    // down with it).
+    let text_commands = activation.permitted(two_bot_core::activation::LiveCapability::Automations)
+        && two_bot_discord::intents::needs_text_command_message_content(
+            &var("TWO_AUTOMATIONS"),
+            &var("TWO_TEXT_COMMANDS"),
+        );
+    base | gateway_intents(text_commands)
 }
 
 fn intents_for_settings(

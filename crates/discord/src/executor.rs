@@ -2571,22 +2571,53 @@ impl ActionExecutor {
         Ok(id)
     }
 
-    /// Resolve the authenticated bot's application for a resumed startup
-    /// without READY. One bounded, paced read; no alternate client or guessed id.
+    /// Resolve the authenticated bot's application via `GET /applications/@me`,
+    /// at bootstrap and for a resumed startup without READY: one paced attempt
+    /// with the shared 5 s abort and only 200 accepted. Missing or invalid
+    /// metadata refuses with a fixed error, never response content; no
+    /// alternate client or guessed id.
+    /// https://docs.rs/twilight-http/0.17.1/twilight_http/request/struct.GetUserApplicationInfo.html
     pub async fn current_application_id(&self) -> Result<u64, DiscordError> {
         let req = Self::request_of(self.inner.factory.current_user_application())?;
-        let (res, _) = self.send_with_timeout(&req, Some(false)).await?;
-        match res.status {
-            200..=299 => {
-                let body: serde_json::Value = serde_json::from_slice(&res.body).map_err(|_| {
-                    DiscordError::Unavailable("invalid application response".to_owned())
-                })?;
-                let id: Id<ApplicationMarker> = serde_json::from_value(body["id"].clone())
-                    .map_err(|_| DiscordError::Unavailable("invalid application id".to_owned()))?;
-                Ok(id.get())
-            }
-            _ => Err(throw_for_status(&res)),
-        }
+        let doc = self.bootstrap_doc(req).await?;
+        doc.as_ref()
+            .and_then(|doc| doc.get("id"))
+            .and_then(|id| id.as_str())
+            .and_then(|id| id.parse::<u64>().ok())
+            .filter(|id| *id != 0)
+            .ok_or_else(|| DiscordError::Rejected("invalid application metadata".to_owned()))
+    }
+
+    /// Bootstrap guild context via `GET /guilds/{id}`: one attempt with the
+    /// shared 5 s abort and only 200 accepted. Requires the requested nonzero
+    /// identity and a nonblank name; malformed metadata never reaches errors.
+    /// https://docs.rs/twilight-http/0.17.1/twilight_http/request/guild/struct.GetGuild.html
+    pub async fn guild_name(&self, guild_id: u64) -> Result<String, DiscordError> {
+        let guild = Id::<GuildMarker>::new_checked(guild_id)
+            .ok_or_else(|| DiscordError::Rejected("bad guild id".to_owned()))?;
+        let req = Self::request_of(self.inner.factory.guild(guild))?;
+        let doc = self.bootstrap_doc(req).await?;
+        doc.as_ref()
+            .filter(|doc| {
+                doc.get("id")
+                    .and_then(|id| id.as_str())
+                    .and_then(|id| id.parse::<u64>().ok())
+                    == Some(guild.get())
+            })
+            .and_then(|doc| doc.get("name"))
+            .and_then(|name| name.as_str())
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| DiscordError::Rejected("invalid guild metadata".to_owned()))
+    }
+
+    /// One paced, bounded bootstrap read: only 200 accepted; an unreadable
+    /// body is `None` so callers can refuse with their own fixed error.
+    async fn bootstrap_doc(&self, req: Request) -> Result<Option<serde_json::Value>, DiscordError> {
+        let mut res = self.call_once_raw_paced(req, &[200]).await?;
+        let doc = serde_json::from_slice(&res.body).ok();
+        res.complete().await;
+        Ok(doc)
     }
 
     /// Publish the router's full guild command set in one send
@@ -2623,16 +2654,24 @@ impl ActionExecutor {
                     .map_err(|_| DiscordError::Timeout)??;
             match res.status {
                 200 => {
-                    let published: Vec<twilight_model::application::command::Command> =
-                        serde_json::from_slice(&res.body).map_err(|_| {
-                            DiscordError::Unavailable("invalid command registry receipt".to_owned())
-                        })?;
+                    let parsed: Result<
+                        Vec<twilight_model::application::command::Command>,
+                        DiscordError,
+                    > = serde_json::from_slice(&res.body).map_err(|_| {
+                        DiscordError::Unavailable("invalid command registry receipt".to_owned())
+                    });
+                    // A 200 is definite: Discord stored the full replacement.
+                    // Release durable admission before validating the receipt
+                    // so an unreadable or short body cannot poison the next
+                    // boot's bootstrap (alive restart held the lane and failed
+                    // with custom_commands_init_failed).
+                    res.complete().await;
+                    let published = parsed?;
                     if published.len() != commands.len() {
                         return Err(DiscordError::Unavailable(
                             "incomplete command registry receipt".to_owned(),
                         ));
                     }
-                    res.complete().await;
                     return Ok(());
                 }
                 429 => {
