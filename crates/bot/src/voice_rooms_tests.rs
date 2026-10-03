@@ -3107,6 +3107,16 @@ impl InteractionReplies for Replies {
         self.completed.lock().unwrap().push(response);
         self.complete_error.map_or(Ok(()), Err)
     }
+
+    async fn respond(
+        &self,
+        _: &Interaction,
+        response: InteractionResponse,
+    ) -> Result<(), RoomHttpError> {
+        self.trace.lock().unwrap().push("respond".to_owned());
+        self.completed.lock().unwrap().push(response);
+        self.complete_error.map_or(Ok(()), Err)
+    }
 }
 
 fn create_interaction() -> Interaction {
@@ -4901,4 +4911,106 @@ fn kick_and_ballot_share_the_kick_restriction_name() {
         .name(),
         "kick"
     );
+}
+
+fn kick_sink_interaction(target: u64, initiator: u64) -> Interaction {
+    with_user(
+        voice_interaction(
+            Some(command_data(
+                "kick",
+                vec![
+                    user_option("member", target),
+                    command_option("reason", "too loud"),
+                ],
+            )),
+            None,
+            true,
+        ),
+        initiator,
+    )
+}
+
+fn voice_member_in(member_id: u64, channel_id: u64) -> VoiceMember {
+    VoiceMember {
+        member_id,
+        channel_id,
+        bot: Some(false),
+    }
+}
+
+#[tokio::test]
+async fn sink_claimed_kick_answers_public_ballot_without_defer() {
+    const VOTER: u64 = 301;
+    const TARGET: u64 = 303;
+    const KICK_ROOM: u64 = 500;
+    let trace = Trace::default();
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            move || {
+                let store = Store::new(trace.clone());
+                store
+                    .rooms
+                    .lock()
+                    .unwrap()
+                    .insert(KICK_ROOM, room(KICK_ROOM));
+                (store, Http::new(trace.clone()))
+            }
+        },
+        Duration::from_millis(10),
+        true,
+    );
+    assert!(runtime.publish_snapshot(
+        GUILD,
+        snapshot(
+            &[KICK_ROOM],
+            vec![
+                voice_member_in(VOTER, KICK_ROOM),
+                voice_member_in(TARGET, KICK_ROOM),
+            ],
+        )
+    ));
+    let replies = Replies::new(trace.clone());
+    VoiceResponder::respond_with(
+        &runtime,
+        &replies,
+        &kick_sink_interaction(TARGET, VOTER),
+        None,
+        None,
+    )
+    .await;
+    // No defer: the ballot goes out as the initial public callback, so every
+    // occupant can see the buttons and reach quorum.
+    assert_eq!(*trace.lock().unwrap(), ["respond"]);
+    let completed = replies.completed.lock().unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(
+        completed[0].kind,
+        InteractionResponseType::ChannelMessageWithSource
+    );
+    let data = completed[0].data.as_ref().expect("ballot body");
+    assert_ne!(data.flags, Some(MessageFlags::EPHEMERAL));
+    let content = data.content.as_deref().unwrap_or_default();
+    assert!(content.contains("<@303>"), "{content}");
+    assert!(content.contains("too loud"), "{content}");
+    assert_eq!(data.components.as_ref().map_or(0, Vec::len), 1);
+}
+
+#[tokio::test]
+async fn sink_unclaimed_kick_stays_fully_silent_for_the_router() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let replies = Replies::new(trace.clone());
+    // No actor, no rooms: a moderation-shaped target must produce no ack at
+    // all here, otherwise the defer races (and loses to) the router answer.
+    VoiceResponder::respond_with(
+        &runtime,
+        &replies,
+        &kick_sink_interaction(303, 301),
+        None,
+        None,
+    )
+    .await;
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(replies.completed.lock().unwrap().is_empty());
 }

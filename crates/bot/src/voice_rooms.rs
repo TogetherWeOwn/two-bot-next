@@ -5033,14 +5033,16 @@ where
                 .await;
                 return true;
             };
-            // Resolve the room first: a non-room target is a moderation
-            // kick, so stay silent here and keep the router's path (the
-            // claim check made the same read concurrently). A target who
-            // left since a positive claim lands in the NotARoom refusal
-            // below — still exactly one response, since the router stayed
-            // silent for the claimed vote. `kick_start` revalidates
-            // atomically, so a join in between cannot corrupt the ledger.
+            // Resolve the room first. The sink only reaches this arm for
+            // claimed votes (it returns before deferring otherwise, leaving
+            // the router to answer), so a refusal here is exactly once.
+            // `kick_start` revalidates atomically, so a join in between
+            // cannot corrupt the ledger.
             let Some(room_id) = runtime.kick_room_of(guild_id, target).await else {
+                reply(ephemeral_response(kick_refusal_text(
+                    &KickRefusal::NotARoom,
+                )))
+                .await;
                 return true;
             };
             match runtime
@@ -5533,6 +5535,14 @@ pub trait InteractionReplies: Send + Sync {
         interaction: &Interaction,
         response: InteractionResponse,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// Send the response as the initial interaction callback (type 4 or 7).
+    /// Vote-kick uses this: the public ballot and its in-place updates must
+    /// not travel the ephemeral-defer + PATCH path.
+    fn respond(
+        &self,
+        interaction: &Interaction,
+        response: InteractionResponse,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
 }
 
 impl InteractionReplies for RoomHttp {
@@ -5578,6 +5588,20 @@ impl InteractionReplies for RoomHttp {
         )
         .await
     }
+
+    async fn respond(
+        &self,
+        interaction: &Interaction,
+        response: InteractionResponse,
+    ) -> Result<(), RoomHttpError> {
+        self.respond_interaction(
+            interaction.application_id,
+            interaction.id,
+            &interaction.token,
+            &response,
+        )
+        .await
+    }
 }
 
 /// Gateway wrapper: retain lifecycle publication, spawn command work off-loop.
@@ -5605,6 +5629,60 @@ where
         invite_code: Option<&str>,
         inventory: Option<GuildInventory>,
     ) {
+        // Vote-kick owns its transport. A non-room `/kick` belongs to the
+        // moderation path, so return before any acknowledgement and let the
+        // router answer: deferring here would race it and hang on "thinking".
+        if let Some(VoiceCommand::Kick { target, .. }) = parse_voice_command(interaction) {
+            let Some(guild) = interaction_guild(interaction) else {
+                return;
+            };
+            if runtime.kick_room_of(guild, target).await.is_none() {
+                return;
+            }
+            let answered: Arc<Mutex<Option<InteractionResponse>>> = Arc::new(Mutex::new(None));
+            let writer = Arc::clone(&answered);
+            handle_voice_interaction_with(
+                runtime,
+                interaction,
+                invite_code,
+                inventory.as_ref(),
+                move |response| async move {
+                    *writer.lock().unwrap() = Some(response);
+                },
+            )
+            .await;
+            if let Some(response) = answered.lock().unwrap().take() {
+                if let Err(error) = replies.respond(interaction, response).await {
+                    warn!(interaction_id = interaction.id.get(), %error,
+                        "voice vote response failed; not retried");
+                }
+            }
+            return;
+        }
+        if let Some(VoiceCommand::Ballot { .. }) = parse_voice_command(interaction) {
+            // Ballots update the public message in place (type 7). The
+            // defer + PATCH path would edit each voter's own ephemeral
+            // followup instead, so answer with the initial callback.
+            let answered: Arc<Mutex<Option<InteractionResponse>>> = Arc::new(Mutex::new(None));
+            let writer = Arc::clone(&answered);
+            handle_voice_interaction_with(
+                runtime,
+                interaction,
+                invite_code,
+                inventory.as_ref(),
+                move |response| async move {
+                    *writer.lock().unwrap() = Some(response);
+                },
+            )
+            .await;
+            if let Some(response) = answered.lock().unwrap().take() {
+                if let Err(error) = replies.respond(interaction, response).await {
+                    warn!(interaction_id = interaction.id.get(), %error,
+                        "voice ballot response failed; not retried");
+                }
+            }
+            return;
+        }
         if let Err(error) = replies.defer(interaction).await {
             warn!(interaction_id = interaction.id.get(), %error,
                 "voice acknowledgement failed; command not executed");
