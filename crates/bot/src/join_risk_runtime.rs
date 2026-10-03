@@ -1,4 +1,4 @@
-//! Join-risk delivery runtime (TOG-10430 R2; decisions in `docs/raid-port.md`
+//! Join-risk delivery runtime (decisions in `docs/raid-port.md`
 //! and `docs/containment.md`).
 //!
 //! The gateway pipeline hands every non-bot join to the [`JoinObserver`] seam

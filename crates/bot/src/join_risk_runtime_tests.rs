@@ -96,11 +96,11 @@ fn join_risk_settings_defaults_and_bad_values() {
         ("TWO_JOIN_RISK_THRESHOLD", "8"),
         ("TWO_JOIN_RISK_WINDOW_SECONDS", "30.5"),
         ("TWO_BULK_JOIN_WINDOW_UNTIL", "1790780400000"),
-        ("DISCORD_STAFF_ALERT_CHANNEL_ID", "12"),
+        ("DISCORD_STAFF_ALERT_CHANNEL_ID", "123456789012345678"),
     ]));
     assert_eq!(set.tuning, RaidTuning::new(30.5, 8.0).unwrap());
     assert_eq!(set.bulk_join_window_until_ms, Some(1_790_780_400_000));
-    assert_eq!(set.staff_channel.as_deref(), Some("12"));
+    assert_eq!(set.staff_channel.as_deref(), Some("123456789012345678"));
 
     // Unusable numbers never disable scoring or invent a bulk window.
     for bad in ["0", "-3", "abc", "NaN", "inf"] {
@@ -407,7 +407,7 @@ async fn join_risk_worker_posts_persisted_flags_once_and_ignores_the_rest() {
         Scripted(settings(5.0, Some(CHANNEL))),
         store,
         &mock,
-        (0..5).map(|n| join(2000 + n, NOW + 10_000 + n * 1000)),
+        (0..5).map(|n| join(2000 + n, NOW + 10_000 + n as i64 * 1000)),
     )
     .await;
     assert_eq!(
