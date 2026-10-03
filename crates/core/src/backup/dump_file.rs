@@ -114,7 +114,8 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_rooms",
     "voice_text_companions",
     "voice_access_controls",
-    // V11b configuration tables (0228). Guild-keyed, no foreign keys, so order
+    "voice_logging_settings",
+    // V11b configuration tables (0229). Guild-keyed, no foreign keys, so order
     // among them is free.
     "voice_channel_templates",
     "voice_game_aliases",

@@ -29,7 +29,8 @@ are outside this implementation's scope.
   plus the creation-time settings snapshot) store no member IDs and are
   untouched by member erasure. Guild room-command controls
   (`voice_access_controls`: creation switch, required role ID, per-command role
-  IDs) hold role IDs only and no member IDs.
+  IDs) and room logging settings (`voice_logging_settings`: detail level, notice
+  channel ID, mention role ID) hold channel and role IDs only and no member IDs.
 - Event RSVPs and attendance/community facts, including attribution and compound
   voice-session/event keys (`event_rsvps`, `community_facts`). Scorecards normally
   store aggregates; the erasure plan also checks their serialized payloads.

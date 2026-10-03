@@ -80,6 +80,9 @@ struct Store {
     access: Arc<Mutex<AccessControls>>,
     access_error: Option<StoreError>,
     save_access_error: Option<StoreError>,
+    logging: Arc<Mutex<LoggingSettings>>,
+    logging_error: Option<StoreError>,
+    save_logging_error: Option<StoreError>,
     forget_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
     after_persist: Option<Hook>,
@@ -95,6 +98,9 @@ impl Store {
             access: Arc::new(Mutex::new(AccessControls::default())),
             access_error: None,
             save_access_error: None,
+            logging: Arc::new(Mutex::new(LoggingSettings::default())),
+            logging_error: None,
+            save_logging_error: None,
             forget_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
             after_persist: None,
@@ -121,6 +127,23 @@ impl RoomPersistence for Store {
             return Err(error);
         }
         *self.access.lock().unwrap() = controls.clone();
+        Ok(())
+    }
+    async fn logging_settings(&self, _: u64) -> Result<LoggingSettings, StoreError> {
+        match self.logging_error {
+            Some(error) => Err(error),
+            None => Ok(*self.logging.lock().unwrap()),
+        }
+    }
+    async fn save_logging_settings(
+        &self,
+        _: u64,
+        settings: &LoggingSettings,
+    ) -> Result<(), StoreError> {
+        if let Some(error) = self.save_logging_error {
+            return Err(error);
+        }
+        *self.logging.lock().unwrap() = *settings;
         Ok(())
     }
     async fn rooms(&self, _: u64) -> Result<Vec<VoiceRoom>, StoreError> {
@@ -912,7 +935,10 @@ fn voice_command_set_is_gated_on_two_voice() {
         .iter()
         .map(|definition| definition.name.clone())
         .collect();
-    assert_eq!(names, ["create", "setup", "ping", "invite", "access"]);
+    assert_eq!(
+        names,
+        ["create", "setup", "ping", "invite", "access", "logging"]
+    );
     let off = VoiceGates::from_map(&Default::default());
     assert!(voice_command_set(&off).is_empty());
 }
@@ -1561,6 +1587,181 @@ async fn access_command_reports_store_failures_and_changes_nothing() {
     assert!(response_text(&response.expect("reply")).contains("Nothing was changed"));
 }
 
+fn channel_option(name: &str, id: u64) -> CommandDataOption {
+    CommandDataOption {
+        name: name.to_owned(),
+        value: CommandOptionValue::Channel(Id::new(id)),
+    }
+}
+
+fn logging_interaction(sub: CommandDataOption, admin: bool) -> Interaction {
+    voice_interaction(
+        Some(command_data("logging", vec![sub])),
+        admin.then_some(Permissions::MANAGE_CHANNELS),
+        true,
+    )
+}
+
+fn logging_action(sub: CommandDataOption) -> LoggingAction {
+    match parse_voice_command(&logging_interaction(sub, true)) {
+        Some(VoiceCommand::Logging(action)) => action,
+        other => panic!("not a /logging command: {other:?}"),
+    }
+}
+
+fn logging_runtime(
+    shared: Arc<Mutex<LoggingSettings>>,
+    read_error: Option<StoreError>,
+    save_error: Option<StoreError>,
+) -> VoiceRuntime<Store, Http> {
+    let trace = Trace::default();
+    VoiceRuntime::new(
+        move || {
+            let mut store = Store::new(trace.clone());
+            store.logging = shared.clone();
+            store.logging_error = read_error;
+            store.save_logging_error = save_error;
+            (store, Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+}
+
+#[test]
+fn parse_logging_subcommands() {
+    assert_eq!(
+        logging_action(sub_option("show", vec![])),
+        LoggingAction::Show
+    );
+    assert_eq!(
+        logging_action(sub_option("level", vec![command_option("level", "Full")])),
+        LoggingAction::Level("Full".to_owned())
+    );
+    assert_eq!(
+        logging_action(sub_option("channel", vec![channel_option("channel", 5)])),
+        LoggingAction::Channel(Some(5))
+    );
+    // No channel or role clears the setting.
+    assert_eq!(
+        logging_action(sub_option("channel", vec![])),
+        LoggingAction::Channel(None)
+    );
+    assert_eq!(
+        logging_action(sub_option("mention", vec![role_option("role", 9)])),
+        LoggingAction::Mention(Some(9))
+    );
+    assert_eq!(
+        logging_action(sub_option("mention", vec![])),
+        LoggingAction::Mention(None)
+    );
+    // Malformed shapes are answered, never ignored.
+    for sub in [sub_option("bogus", vec![]), sub_option("level", vec![])] {
+        assert_eq!(logging_action(sub), LoggingAction::Invalid);
+    }
+    let bare = voice_interaction(Some(command_data("logging", Vec::new())), None, true);
+    assert_eq!(
+        parse_voice_command(&bare),
+        Some(VoiceCommand::Logging(LoggingAction::Invalid))
+    );
+}
+
+#[tokio::test]
+async fn logging_command_needs_an_admin() {
+    let runtime = logging_runtime(Arc::default(), None, None);
+    let member = logging_interaction(sub_option("show", vec![]), false);
+    let (owned, response) = handle_capture(&runtime, &member).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(&response.expect("denial")),
+        "You need Manage Channels to use /logging."
+    );
+}
+
+#[tokio::test]
+async fn logging_command_changes_are_saved_and_shown() {
+    let shared = Arc::new(Mutex::new(LoggingSettings::default()));
+    let runtime = logging_runtime(shared.clone(), None, None);
+    let run = |sub| {
+        let interaction = logging_interaction(sub, true);
+        let runtime = &runtime;
+        async move {
+            let (_, response) = handle_capture(runtime, &interaction).await;
+            response_text(&response.expect("reply"))
+        }
+    };
+
+    let text = run(sub_option("show", vec![])).await;
+    assert!(text.contains("Log level: brief"), "{text}");
+    assert!(!text.starts_with("Saved."), "{text}");
+
+    let text = run(sub_option("level", vec![command_option("level", " FULL ")])).await;
+    assert!(text.starts_with("Saved."), "{text}");
+    assert_eq!(shared.lock().unwrap().level, DetailLevel::Full);
+
+    let text = run(sub_option("channel", vec![channel_option("channel", 5)])).await;
+    assert!(text.contains("Log channel: <#5>"), "{text}");
+    let text = run(sub_option("mention", vec![role_option("role", 9)])).await;
+    assert!(text.contains("Mentioned on errors: <@&9>"), "{text}");
+    assert_eq!(
+        *shared.lock().unwrap(),
+        LoggingSettings {
+            level: DetailLevel::Full,
+            channel_id: Some(5),
+            mention_role_id: Some(9),
+        }
+    );
+
+    // Clearing the channel and mention keeps the level.
+    run(sub_option("channel", vec![])).await;
+    run(sub_option("mention", vec![])).await;
+    let text = run(sub_option("level", vec![command_option("level", "off")])).await;
+    assert!(text.contains("Log level: off"), "{text}");
+    assert_eq!(
+        *shared.lock().unwrap(),
+        LoggingSettings {
+            level: DetailLevel::Off,
+            channel_id: None,
+            mention_role_id: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn logging_command_refuses_bad_input_without_changing_anything() {
+    let shared = Arc::new(Mutex::new(LoggingSettings::default()));
+    let runtime = logging_runtime(shared.clone(), None, None);
+    for sub in [
+        sub_option("level", vec![command_option("level", "loud")]),
+        sub_option("bogus", vec![]),
+    ] {
+        let (_, response) = handle_capture(&runtime, &logging_interaction(sub, true)).await;
+        let text = response_text(&response.expect("reply"));
+        assert!(!text.starts_with("Saved."), "{text}");
+        assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
+    }
+}
+
+#[tokio::test]
+async fn logging_command_reports_store_failures_and_changes_nothing() {
+    let level = || {
+        logging_interaction(
+            sub_option("level", vec![command_option("level", "off")]),
+            true,
+        )
+    };
+    let shared = Arc::new(Mutex::new(LoggingSettings::default()));
+    let unsavable = logging_runtime(shared.clone(), None, Some(StoreError::Unavailable));
+    let (_, response) = handle_capture(&unsavable, &level()).await;
+    assert!(response_text(&response.expect("reply")).contains("Nothing was changed"));
+    assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
+
+    let unreadable = logging_runtime(shared.clone(), Some(StoreError::Unavailable), None);
+    let (_, response) = handle_capture(&unreadable, &level()).await;
+    assert!(response_text(&response.expect("reply")).contains("Nothing was changed"));
+    assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
+}
+
 #[tokio::test]
 async fn worker_does_not_start_when_access_controls_cannot_load() {
     let (live, mut store, http, _) = fixture();
@@ -2061,4 +2262,145 @@ async fn disabled_gateway_responder_does_not_acknowledge() {
     );
     tokio::task::yield_now().await;
     assert!(trace.lock().unwrap().is_empty());
+}
+
+fn channel_with_overwrites(
+    id: u64,
+    kind: u8,
+    parent: Option<u64>,
+    overwrites: serde_json::Value,
+) -> Channel {
+    let mut channel = channel(id, kind, parent);
+    channel.permission_overwrites = Some(serde_json::from_value(overwrites).unwrap());
+    channel
+}
+
+fn health_guild(
+    base: Permissions,
+    category: Vec<serde_json::Value>,
+    creator: Vec<serde_json::Value>,
+) -> LiveGuild {
+    let live = LiveGuild::new(GUILD);
+    live.publish(GuildSnapshot {
+        channels: vec![
+            channel_with_overwrites(CREATOR, 2, Some(CATEGORY), json!(creator)),
+            channel_with_overwrites(CATEGORY, 4, None, json!(category)),
+        ],
+        members: vec![],
+        bot: BotAccess {
+            member_id: 999,
+            guild_owner_id: 998,
+            member_roles: vec![],
+            roles: vec![role(base)],
+        },
+    });
+    live
+}
+
+fn everyone_overwrite(deny: Permissions) -> serde_json::Value {
+    json!({ "id": GUILD.to_string(), "type": 0, "allow": "0", "deny": deny.bits().to_string() })
+}
+
+#[test]
+fn health_check_is_clean_when_every_level_grants_the_four_permissions() {
+    let live = health_guild(permissions(), vec![], vec![]);
+    assert!(live.permission_findings(&[CREATOR]).is_empty());
+}
+
+#[test]
+fn health_check_names_a_missing_guild_level_permission() {
+    let live = health_guild(permissions() - Permissions::MOVE_MEMBERS, vec![], vec![]);
+    assert_eq!(
+        live.permission_findings(&[CREATOR]),
+        vec![PermissionFinding {
+            permission: VoicePermission::MoveMembers,
+            scope: VoicePermissionScope::Guild,
+            category_id: None,
+            channel_id: None,
+        }]
+    );
+}
+
+#[test]
+fn health_check_names_the_category_override_that_causes_it() {
+    let live = health_guild(
+        permissions(),
+        vec![everyone_overwrite(Permissions::MANAGE_CHANNELS)],
+        vec![],
+    );
+    let findings = live.permission_findings(&[CREATOR]);
+    assert_eq!(
+        findings,
+        vec![PermissionFinding {
+            permission: VoicePermission::ManageChannels,
+            scope: VoicePermissionScope::Category,
+            category_id: Some(CATEGORY),
+            channel_id: None,
+        }]
+    );
+    assert_eq!(
+        health_line(&findings[0]),
+        "health: the permission override on category <#400> removes Manage Channels from the bot"
+    );
+}
+
+#[test]
+fn health_check_names_a_creator_channel_override() {
+    let live = health_guild(
+        permissions(),
+        vec![],
+        vec![everyone_overwrite(Permissions::VIEW_CHANNEL)],
+    );
+    let findings = live.permission_findings(&[CREATOR]);
+    assert_eq!(
+        findings,
+        vec![PermissionFinding {
+            permission: VoicePermission::ViewChannel,
+            scope: VoicePermissionScope::Channel,
+            category_id: None,
+            channel_id: Some(CREATOR),
+        }]
+    );
+    assert_eq!(
+        health_line(&findings[0]),
+        "health: the permission override on <#200> removes View Channel from the bot"
+    );
+}
+
+#[test]
+fn health_check_reports_nothing_for_incomplete_data_or_unknown_channels() {
+    let never_published = LiveGuild::new(GUILD);
+    assert!(never_published.permission_findings(&[CREATOR]).is_empty());
+    let live = health_guild(permissions() - Permissions::MANAGE_ROLES, vec![], vec![]);
+    assert!(live.permission_findings(&[12345]).is_empty());
+    assert!(live.permission_findings(&[]).is_empty());
+    assert_eq!(
+        health_line(&live.permission_findings(&[CREATOR])[0]),
+        "health: the bot lacks Manage Roles for the whole server"
+    );
+}
+
+#[test]
+fn health_check_dedups_a_shared_category_override() {
+    let live = LiveGuild::new(GUILD);
+    live.publish(GuildSnapshot {
+        channels: vec![
+            channel(CREATOR, 2, Some(CATEGORY)),
+            channel(201, 2, Some(CATEGORY)),
+            channel_with_overwrites(
+                CATEGORY,
+                4,
+                None,
+                json!([everyone_overwrite(Permissions::MOVE_MEMBERS)]),
+            ),
+        ],
+        members: vec![],
+        bot: BotAccess {
+            member_id: 999,
+            guild_owner_id: 998,
+            member_roles: vec![],
+            roles: vec![role(permissions())],
+        },
+    });
+    assert_eq!(live.permission_findings(&[CREATOR, 201]).len(), 1);
 }

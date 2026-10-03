@@ -388,8 +388,14 @@ INSERT INTO voice_access_controls (guild_id, room_creation_enabled, required_rol
 VALUES ('100000000000000001', FALSE, '100000000000000040',
         '{"kick": ["100000000000000041", "100000000000000042"], "template": []}'::jsonb),
        ('100000000000000002', TRUE, NULL, '{}'::jsonb);
+-- Guild room logging: one configured guild (full detail, channel, mention
+-- role), one at the stored defaults.
+INSERT INTO voice_logging_settings (guild_id, detail_level, log_channel_id,
+  mention_role_id)
+VALUES ('100000000000000001', 'full', '100000000000000050', '100000000000000051'),
+       ('100000000000000002', 'brief', NULL, NULL);
 
--- V11b configuration (0228): one row in every section, including a command
+-- V11b configuration (0229): one row in every section, including a command
 -- restriction with roles and one without, so every table round-trips.
 INSERT INTO voice_channel_templates (guild_id, channel_id, name_template, status_template)
 VALUES ('100000000000000001', '100000000000000040', 'Lounge {n}', NULL),

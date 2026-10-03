@@ -39,6 +39,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'voice_rooms', 'table'),
     ('public', 'voice_text_companions', 'table'),
     ('public', 'voice_access_controls', 'table'),
+    ('public', 'voice_logging_settings', 'table'),
     ('public', 'voice_channel_templates', 'table'),
     ('public', 'voice_game_aliases', 'table'),
     ('public', 'voice_random_lists', 'table'),

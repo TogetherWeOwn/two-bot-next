@@ -206,7 +206,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // Same insert-once shape as voice_rooms (PgRoomStore::add_companion never
     // overwrites the creation snapshot).
     TableSpec { table: "voice_text_companions", measure: TableMeasure::Columns(&["created_at"]) },
-    // V11b configuration tables (0228): replaced wholesale by
+    // V11b configuration tables (0229): replaced wholesale by
     // PgVoiceConfigStore::apply, so none carries a write timestamp.
     TableSpec {
         table: "voice_channel_templates",
@@ -247,6 +247,12 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec {
         table: "voice_command_role_members",
         measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+    },
+    TableSpec {
+        table: "voice_logging_settings",
+        measure: TableMeasure::Unmeasurable(
+            "mutable per-guild settings row with no timestamp column; no member IDs",
+        ),
     },
     TableSpec {
         table: "voice_access_controls",
