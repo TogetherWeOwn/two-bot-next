@@ -216,13 +216,17 @@ pub async fn import(
         imported += 1;
     }
     let mut conflicts = parsed.translation_conflicts.clone();
-    conflicts.extend(diff.rejected.iter().filter_map(|rejection| {
-        matches!(
-            rejection.code.as_str(),
-            "would_overwrite" | "trigger_in_use"
-        )
-        .then(|| rejection.name.clone())
-    }));
+    conflicts.extend(
+        diff.rejected
+            .iter()
+            .filter(|rejection| {
+                matches!(
+                    rejection.code.as_str(),
+                    "would_overwrite" | "trigger_in_use"
+                )
+            })
+            .map(|rejection| rejection.name.clone()),
+    );
     let skipped = parsed.invalid_entries + diff.rejected.len();
     let summary = AuditRecord {
         guild_id: guild.to_owned(),
