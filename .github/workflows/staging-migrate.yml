@@ -29,6 +29,10 @@ on:
       acl_plan_ref:
         description: Reference to the reviewed ACL sequence
         required: true
+      expected_pending:
+        description: Ascending comma-separated versions the reviewed plan listed (apply refuses unless it matches; empty when none pending)
+        required: false
+        default: ''
 
 permissions: {}
 
@@ -79,8 +83,10 @@ jobs:
           STAGING_DATABASE: ${{ inputs.staging_database }}
           RECOVERY_REF: ${{ inputs.recovery_evidence_ref }}
           ACL_REF: ${{ inputs.acl_plan_ref }}
+          EXPECTED_PENDING: ${{ inputs.expected_pending }}
         run: |
           ./target/debug/staging-migrate "--$MODE" --source-sha "$SOURCE_SHA" \
             --staging-host "$STAGING_HOST" --staging-database "$STAGING_DATABASE" \
             --recovery-evidence-ref "$RECOVERY_REF" --acl-plan-ref "$ACL_REF" \
+            --expected-pending "$EXPECTED_PENDING" \
             | tee staging-migrate-manifest.json

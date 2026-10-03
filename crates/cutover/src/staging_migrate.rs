@@ -56,6 +56,9 @@ pub struct Request {
     pub recovery_evidence_ref: String,
     pub acl_plan_ref: String,
     pub apply: bool,
+    /// Raw `expected_pending` workflow input (ascending, comma-separated
+    /// versions). Required for apply; ignored for plan.
+    pub expected_pending: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,10 +77,31 @@ fn is_ref(value: &str) -> bool {
         && !value.chars().any(char::is_whitespace)
 }
 
+/// Parse the `expected_pending` workflow input: ascending, comma-separated
+/// versions. Empty input means no pending work is expected.
+pub fn parse_expected_pending(raw: &str) -> Result<Vec<i64>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for part in trimmed.split(',') {
+        let part = part.trim();
+        let version: i64 = part
+            .parse()
+            .map_err(|_| format!("expected_pending entry {part:?} is not a version"))?;
+        if out.last().is_some_and(|&prev| prev >= version) {
+            return Err("expected_pending must be strictly ascending".to_owned());
+        }
+        out.push(version);
+    }
+    Ok(out)
+}
+
 /// Pure prerequisite checks; nothing here touches the network.
 ///
 /// Pinned-identity model: the workflow pins the exact non-secret staging
-/// endpoint host and database name per dispatch, and [`verify_target`]
+/// endpoint host and database name per dispatch, and `verify_target`
 /// refuses before any DDL unless the secret migrator binding points at
 /// exactly that pinned identity. A `staging` substring in the database name
 /// remains accepted but is no longer required, so the verified shared-Neon
@@ -101,6 +125,20 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
                 "{label} is empty, production-like or not a bare name"
             ));
         }
+    }
+    // Session SET ROLE and the SQLx advisory lock are unsound behind
+    // transaction pooling: only the direct endpoint may be targeted.
+    if req.expected_host.to_ascii_lowercase().contains("-pooler") {
+        return refuse("pooler endpoints are refused; use the direct endpoint");
+    }
+    match &req.expected_pending {
+        Some(raw) => {
+            parse_expected_pending(raw).map_err(RunError::Refused)?;
+        }
+        None if req.apply => {
+            return refuse("apply requires expected_pending from the reviewed plan");
+        }
+        None => {}
     }
     // NOTE: no `staging`-substring requirement here. The pinned host plus the
     // binding-match check in `verify_target` is the staging identity; the
@@ -128,52 +166,64 @@ fn verify_target(req: &Request) -> Result<sqlx::postgres::PgConnectOptions, RunE
     })?;
     let host = options.get_host().to_ascii_lowercase();
     let database = options.get_database().unwrap_or_default();
+    if host.contains("-pooler") {
+        return refuse("pooler endpoints are refused; use the direct endpoint");
+    }
     if host != req.expected_host.to_ascii_lowercase() || database != req.expected_database {
         return refuse("migrator binding target does not match the verified staging identity");
     }
     Ok(options)
 }
 
-/// Compare the full ledger with the embedded migrations. Returns the versions
-/// still to apply, or the first reason SQL must not run.
+/// Compare the full ledger with the embedded migrations. Returns the source
+/// versions absent from the ledger, in source order, or the first reason SQL
+/// must not run. Set-based: a ledger may lag the source by any subset, because
+/// SQLx itself applies every unapplied version regardless of the ledger max;
+/// only failed rows, versions unknown to the source, and checksum drift refuse.
 pub fn reconcile(ledger: &[LedgerRow], migrator: &Migrator) -> Result<Vec<i64>, String> {
-    let known: Vec<(i64, String)> = migrator
+    reconcile_against(ledger, &known_checksums(migrator))
+}
+
+fn known_checksums(migrator: &Migrator) -> Vec<(i64, String)> {
+    migrator
         .iter()
         .filter(|m| !m.migration_type.is_down_migration())
         .map(|m| (m.version, hex::encode(&m.checksum)))
+        .collect()
+}
+
+fn reconcile_against(ledger: &[LedgerRow], known: &[(i64, String)]) -> Result<Vec<i64>, String> {
+    use std::collections::{HashMap, HashSet};
+    let checksums: HashMap<i64, &String> = known
+        .iter()
+        .map(|(version, checksum)| (*version, checksum))
         .collect();
-    let mut rows = ledger.to_vec();
-    rows.sort_by_key(|r| r.version);
-    for (i, row) in rows.iter().enumerate() {
+    for row in ledger {
         if !row.success {
             return Err(format!(
                 "ledger version {} is failed/incomplete",
                 row.version
             ));
         }
-        let Some((version, checksum)) = known.get(i) else {
-            return Err(format!(
-                "ledger version {} is unknown to this source",
-                row.version
-            ));
-        };
-        if !known.iter().any(|(v, _)| *v == row.version) {
-            return Err(format!(
-                "ledger version {} is unknown to this source",
-                row.version
-            ));
-        }
-        if row.version != *version {
-            return Err(format!(
-                "ledger is not a prefix of the source order (found {}, expected {version})",
-                row.version
-            ));
-        }
-        if &row.checksum_hex != checksum {
-            return Err(format!("checksum drift at version {}", row.version));
+        match checksums.get(&row.version) {
+            None => {
+                return Err(format!(
+                    "ledger version {} is unknown to this source",
+                    row.version
+                ));
+            }
+            Some(checksum) if row.checksum_hex != checksum.as_str() => {
+                return Err(format!("checksum drift at version {}", row.version));
+            }
+            Some(_) => {}
         }
     }
-    Ok(known[rows.len()..].iter().map(|(v, _)| *v).collect())
+    let present: HashSet<i64> = ledger.iter().map(|row| row.version).collect();
+    Ok(known
+        .iter()
+        .filter(|(version, _)| !present.contains(version))
+        .map(|(version, _)| *version)
+        .collect())
 }
 
 async fn read_ledger(conn: &mut PgConnection) -> Result<Vec<LedgerRow>, sqlx::Error> {
@@ -285,6 +335,15 @@ async fn run_on_pool(
         .map_err(|_| failed("ledger read failed"))?;
     drop(conn);
     let pending = reconcile(&before, &MIGRATOR).map_err(RunError::Refused)?;
+    // Plan binding: apply runs only the exact pending list the reviewed plan
+    // showed. Validated in `validate_request`; compared here, before any DDL.
+    let expected = match &req.expected_pending {
+        Some(raw) => parse_expected_pending(raw).map_err(RunError::Refused)?,
+        None => Vec::new(),
+    };
+    if req.apply && expected != pending {
+        return refuse("expected_pending does not match the computed pending list");
+    }
 
     let mut applied = 0usize;
     let mut after = before.clone();
@@ -339,6 +398,7 @@ async fn run_on_pool(
         "ledger_before": ledger_json(&before),
         "ledger_after": ledger_json(&after),
         "pending_before": pending,
+        "expected_pending": expected,
         "applied_count": applied,
     }))
 }
@@ -374,12 +434,23 @@ mod tests {
             reconcile(&all[..2], &MIGRATOR).unwrap().len(),
             all.len() - 2
         );
+        // Set-based: a hole in the middle is filled, not refused.
+        let gap = vec![all[0].clone(), all[2].clone()];
+        let pending = reconcile(&gap, &MIGRATOR).unwrap();
+        assert!(pending.contains(&all[1].version));
+        assert_eq!(pending.len(), all.len() - 2);
+        // Refusals survive anywhere in the ledger, not just at the edges.
         let mut drift = all.clone();
         drift[1].checksum_hex = "00".repeat(48);
         assert!(reconcile(&drift, &MIGRATOR).unwrap_err().contains("drift"));
         let mut bad = all.clone();
         bad[0].success = false;
         assert!(reconcile(&bad, &MIGRATOR)
+            .unwrap_err()
+            .contains("incomplete"));
+        let mut mid_bad = vec![all[0].clone(), all[1].clone(), all[2].clone()];
+        mid_bad[1].success = false;
+        assert!(reconcile(&mid_bad, &MIGRATOR)
             .unwrap_err()
             .contains("incomplete"));
         let mut unknown = all.clone();
@@ -390,8 +461,105 @@ mod tests {
         assert!(reconcile(&unknown, &MIGRATOR)
             .unwrap_err()
             .contains("unknown"));
-        let gap = vec![all[0].clone(), all[2].clone()];
-        assert!(reconcile(&gap, &MIGRATOR).unwrap_err().contains("prefix"));
+        let mut mid_unknown = vec![all[0].clone(), all[1].clone()];
+        mid_unknown.insert(
+            1,
+            LedgerRow {
+                version: 99998,
+                ..all[0].clone()
+            },
+        );
+        assert!(reconcile(&mid_unknown, &MIGRATOR)
+            .unwrap_err()
+            .contains("unknown"));
+        let known = known_checksums(&MIGRATOR);
+        let mut mid_drift = vec![all[0].clone(), all[1].clone(), all[2].clone()];
+        mid_drift[2].checksum_hex = "ff".repeat(48);
+        assert!(reconcile_against(&mid_drift, &known)
+            .unwrap_err()
+            .contains("drift"));
+    }
+
+    /// Exact staging ledger at the base SHA: 29 ledger rows must yield the 24
+    /// pending versions below, in source order. Later source versions stay
+    /// pending too, so the live mapping is asserted as a subsequence.
+    const STAGING_LEDGER: [i64; 29] = [
+        1, 2, 120, 121, 122, 123, 140, 141, 150, 160, 170, 180, 190, 200, 210, 300, 310, 311, 320,
+        330, 331, 332, 333, 334, 340, 350, 351, 360, 390,
+    ];
+    const STAGING_PENDING_AT_BASE: [i64; 24] = [
+        201, 202, 203, 204, 205, 206, 220, 221, 222, 223, 224, 225, 226, 227, 228, 312, 321, 352,
+        353, 361, 362, 370, 410, 411,
+    ];
+
+    #[test]
+    fn staging_ledger_fixture_is_set_based() {
+        use std::collections::{HashMap, HashSet};
+        let checksums: HashMap<i64, String> = MIGRATOR
+            .iter()
+            .map(|m| (m.version, hex::encode(&m.checksum)))
+            .collect();
+        let ledger: Vec<LedgerRow> = STAGING_LEDGER
+            .iter()
+            .map(|version| LedgerRow {
+                version: *version,
+                description: format!("fixture {version}"),
+                success: true,
+                checksum_hex: checksums[version].clone(),
+            })
+            .collect();
+        // Base source set: the 29 ledger rows plus the 24 pending versions.
+        let base: HashSet<i64> = STAGING_LEDGER
+            .iter()
+            .chain(STAGING_PENDING_AT_BASE.iter())
+            .copied()
+            .collect();
+        assert_eq!(base.len(), 53);
+        let known_base: Vec<(i64, String)> = MIGRATOR
+            .iter()
+            .filter(|m| base.contains(&m.version))
+            .map(|m| (m.version, hex::encode(&m.checksum)))
+            .collect();
+        assert_eq!(
+            known_base.len(),
+            53,
+            "every base version must still exist at this head"
+        );
+        assert_eq!(
+            reconcile_against(&ledger, &known_base).unwrap(),
+            STAGING_PENDING_AT_BASE
+        );
+        // The live source may have grown past the base; the base mapping must
+        // survive unchanged inside it, in source order.
+        let live = reconcile(&ledger, &MIGRATOR).unwrap();
+        let live_base: Vec<i64> = live
+            .iter()
+            .copied()
+            .filter(|version| base.contains(version))
+            .collect();
+        assert_eq!(live_base, STAGING_PENDING_AT_BASE);
+        for version in STAGING_PENDING_AT_BASE {
+            assert!(live.contains(&version));
+        }
+    }
+
+    #[test]
+    fn expected_pending_parses_ascending() {
+        assert_eq!(parse_expected_pending("").unwrap(), Vec::<i64>::new());
+        assert_eq!(parse_expected_pending("  ").unwrap(), Vec::<i64>::new());
+        assert_eq!(
+            parse_expected_pending("201,202, 410").unwrap(),
+            vec![201, 202, 410]
+        );
+        assert!(parse_expected_pending("201,abc")
+            .unwrap_err()
+            .contains("not a version"));
+        assert!(parse_expected_pending("202,201")
+            .unwrap_err()
+            .contains("ascending"));
+        assert!(parse_expected_pending("201,201")
+            .unwrap_err()
+            .contains("ascending"));
     }
 
     #[test]
@@ -404,6 +572,7 @@ mod tests {
             recovery_evidence_ref: "TOG-1#doc".to_owned(),
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
+            expected_pending: None,
         };
         assert!(validate_request(&ok).is_ok());
         // The verified shared-Neon staging identity needs no `staging` in the
@@ -452,10 +621,36 @@ mod tests {
                 acl_plan_ref: "postgres://x:y@h/d".to_owned(),
                 ..ok.clone()
             },
+            Request {
+                expected_host: "ep-test-pooler.us-east-2.aws.neon.tech".to_owned(),
+                ..ok.clone()
+            },
+            Request {
+                apply: true,
+                expected_pending: None,
+                ..ok.clone()
+            },
+            Request {
+                apply: true,
+                expected_pending: Some("201,abc".to_owned()),
+                ..ok.clone()
+            },
+            Request {
+                apply: true,
+                expected_pending: Some("202,201".to_owned()),
+                ..ok.clone()
+            },
         ];
         for r in bad {
             assert!(matches!(validate_request(&r), Err(RunError::Refused(_))));
         }
+        // Apply accepts a well-formed binding when given one.
+        assert!(validate_request(&Request {
+            apply: true,
+            expected_pending: Some(String::new()),
+            ..ok.clone()
+        })
+        .is_ok());
     }
 
     #[test]
@@ -468,6 +663,7 @@ mod tests {
             recovery_evidence_ref: "TOG-1#doc".to_owned(),
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
+            expected_pending: None,
         };
         assert!(validate_request(&base).is_ok());
         assert!(verify_target(&base).is_ok());
@@ -483,5 +679,19 @@ mod tests {
         ] {
             assert!(matches!(verify_target(&pin), Err(RunError::Refused(_))));
         }
+        // A pooler binding is refused even when the pins match it.
+        let pooler = Request {
+            url: Some(
+                "postgres://u@ep-test-pooler.us-east-2.aws.neon.tech:5432/two_bot?sslmode=require"
+                    .to_owned(),
+            ),
+            expected_host: "ep-test-pooler.us-east-2.aws.neon.tech".to_owned(),
+            ..base.clone()
+        };
+        assert!(matches!(
+            validate_request(&pooler),
+            Err(RunError::Refused(_))
+        ));
+        assert!(matches!(verify_target(&pooler), Err(RunError::Refused(_))));
     }
 }

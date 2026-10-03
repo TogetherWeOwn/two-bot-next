@@ -22,6 +22,10 @@ and modals with the encoders and parses interactions back as untrusted input.
 - `/name` panel custom (`name_custom_custom_id`) and restore
   (`name_restore_custom_id`) buttons plus the custom-name modal submit
   (`name_modal_custom_id`), all bound to the room.
+- V11 `/import` preview Confirm (`import_confirm_custom_id`) and Cancel
+  (`import_cancel_custom_id`) buttons, bound to the uploading member and the
+  previewed diff's content hash. Confirm re-reads current state and re-diffs;
+  a concurrent change yields a fresh preview instead of applying.
 
 ## Wire shape
 
@@ -35,6 +39,8 @@ and modals with the encoders and parses interactions back as untrusted input.
 | Name custom | `two:voice:name-custom:<room_id>` |
 | Name restore | `two:voice:name-restore:<room_id>` |
 | Name modal | `two:voice:name-modal:<room_id>` |
+| Import confirm | `two:voice:import-confirm:<member_id>:<hash>` |
+| Import cancel | `two:voice:import-cancel:<member_id>:<hash>` |
 
 Ids are canonical nonzero decimal `u64` strings, never JSON numbers or padded
 forms. Every encoded id is at most `MAX_VOICE_CUSTOM_ID_CHARS` (100),
