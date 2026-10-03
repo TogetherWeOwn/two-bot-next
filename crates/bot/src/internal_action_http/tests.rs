@@ -10,6 +10,8 @@ use tower::ServiceExt;
 use two_bot_core::internal_actions::sign;
 use two_bot_testsupport::TestDatabase;
 
+mod adapter;
+
 fn secret(index: usize) -> String {
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../core/tests/fixtures/internal-action-signing.json"
@@ -122,13 +124,20 @@ fn payload() -> &'static str {
     r#"{"action":"announcement.post","channel_key":"ann","body":"fixture announcement"}"#
 }
 
-fn signed(raw: &str, key: &str, nonce: u32, intent: &str) -> Request {
+fn nonce() -> String {
+    hex::encode(rand::random::<[u8; 16]>())
+}
+
+fn signed(raw: &str, key: &str, intent: &str) -> Request {
+    signed_with_nonce(raw, key, &nonce(), intent)
+}
+
+fn signed_with_nonce(raw: &str, key: &str, nonce: &str, intent: &str) -> Request {
     let timestamp = (now_ms() / 1000).to_string();
-    let nonce = format!("{nonce:032x}");
     let signature = sign(
         secret(usize::from(key == "new")).as_bytes(),
         &timestamp,
-        &nonce,
+        nonce,
         raw.as_bytes(),
     );
     Request::builder()
@@ -208,14 +217,14 @@ async fn method_path_media_headers_and_body_are_bounded_before_authentication() 
         "idempotency-key",
         "content-type",
     ] {
-        let mut request = signed(payload(), "old", 1, "intent-fixture");
+        let mut request = signed(payload(), "old", "intent-fixture");
         let value = request.headers()[name].clone();
         request.headers_mut().append(name, value);
         let (status, _, _) = answer(router(state.clone()), request).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{name}");
     }
     for (media, encoding) in [("text/plain", None), ("application/json", Some("gzip"))] {
-        let mut request = signed(payload(), "old", 2, "intent-fixture");
+        let mut request = signed(payload(), "old", "intent-fixture");
         request
             .headers_mut()
             .insert(header::CONTENT_TYPE, HeaderValue::from_static(media));
@@ -229,7 +238,7 @@ async fn method_path_media_headers_and_body_are_bounded_before_authentication() 
             StatusCode::UNSUPPORTED_MEDIA_TYPE
         );
     }
-    let mut request = signed(payload(), "old", 3, "intent-fixture");
+    let mut request = signed(payload(), "old", "intent-fixture");
     request.headers_mut().insert(
         "x-padding",
         HeaderValue::from_str(&"p".repeat(MAX_HEADER_BYTES)).unwrap(),
@@ -238,7 +247,7 @@ async fn method_path_media_headers_and_body_are_bounded_before_authentication() 
         answer(router(state.clone()), request).await.0,
         StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
     );
-    let mut request = signed(payload(), "old", 4, "intent-fixture");
+    let mut request = signed(payload(), "old", "intent-fixture");
     request.headers_mut().insert(
         header::CONTENT_LENGTH,
         HeaderValue::from_str(&(MAX_BODY_BYTES + 1).to_string()).unwrap(),
@@ -247,7 +256,7 @@ async fn method_path_media_headers_and_body_are_bounded_before_authentication() 
         answer(router(state.clone()), request).await.0,
         StatusCode::PAYLOAD_TOO_LARGE
     );
-    let mut request = signed(payload(), "old", 5, "intent-fixture");
+    let mut request = signed(payload(), "old", "intent-fixture");
     *request.body_mut() = Body::from(vec![b'p'; MAX_BODY_BYTES + 1]);
     assert_eq!(
         answer(router(state.clone()), request).await.0,
@@ -268,7 +277,7 @@ async fn exhausted_request_capacity_refuses_without_authentication_or_effect() {
         .unwrap();
     let (status, _, body) = answer(
         router(state.clone()),
-        signed(payload(), "old", 7, "intent-fixture"),
+        signed(payload(), "old", "intent-fixture"),
     )
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -284,7 +293,7 @@ async fn exhausted_request_capacity_refuses_without_authentication_or_effect() {
 async fn stalled_body_collection_times_out_and_releases_capacity_before_authentication() {
     let effect = Arc::new(MockEffect::new(MockOutcome::Success));
     let state = state(lazy_pool(), effect.clone());
-    let mut request = signed(payload(), "old", 8, "intent-fixture");
+    let mut request = signed(payload(), "old", "intent-fixture");
     *request.body_mut() = Body::from_stream(futures_util::stream::pending::<
         Result<axum::body::Bytes, std::io::Error>,
     >());
@@ -301,7 +310,7 @@ async fn forged_and_unknown_authentication_share_redacted_wire_and_do_not_touch_
     let effect = Arc::new(MockEffect::new(MockOutcome::Success));
     let state = state(lazy_pool(), effect.clone());
     for key in ["old", "unknown", "secret-sentinel"] {
-        let mut request = signed(payload(), "old", 6, "intent-fixture");
+        let mut request = signed(payload(), "old", "intent-fixture");
         request
             .headers_mut()
             .insert("x-two-key-id", HeaderValue::from_str(key).unwrap());
@@ -326,23 +335,27 @@ async fn signed_malformed_json_burns_before_parse_and_nonce_replay_is_refused() 
     let Some(db) = database().await else { return };
     let effect = Arc::new(MockEffect::new(MockOutcome::Success));
     let app = router(state(db.pool().clone(), effect.clone()));
-    for (nonce, raw) in [
-        (10, "{"),
-        (
-            11,
-            r#"{"action":"announcement.post","action":"announcement.post"}"#,
-        ),
+    for raw in [
+        "{",
+        r#"{"action":"announcement.post","action":"announcement.post"}"#,
     ] {
+        let nonce = nonce();
         assert_eq!(
-            answer(app.clone(), signed(raw, "old", nonce, "intent-fixture"))
-                .await
-                .2["error"]["code"],
+            answer(
+                app.clone(),
+                signed_with_nonce(raw, "old", &nonce, "intent-fixture")
+            )
+            .await
+            .2["error"]["code"],
             "malformed"
         );
         assert_eq!(
-            answer(app.clone(), signed(raw, "old", nonce, "intent-fixture"))
-                .await
-                .2["error"]["code"],
+            answer(
+                app.clone(),
+                signed_with_nonce(raw, "old", &nonce, "intent-fixture")
+            )
+            .await
+            .2["error"]["code"],
             "replayed"
         );
     }
@@ -364,7 +377,7 @@ async fn success_replays_across_key_rotation_and_restart_but_changed_bytes_confl
     let effect = Arc::new(MockEffect::new(MockOutcome::Success));
     let app = router(state(db.pool().clone(), effect.clone()));
     let (status, headers, first) =
-        answer(app.clone(), signed(payload(), "old", 20, "intent-fixture")).await;
+        answer(app.clone(), signed(payload(), "old", "intent-fixture")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(!headers.contains_key("idempotent-replay"));
     assert_eq!(first["result"], json!({"message_id":"444444444444444444"}));
@@ -373,7 +386,7 @@ async fn success_replays_across_key_rotation_and_restart_but_changed_bytes_confl
     let restarted = router(state(restarted_pool.clone(), effect.clone()));
     let (status, headers, replay) = answer(
         restarted.clone(),
-        signed(payload(), "new", 21, "intent-fixture"),
+        signed(payload(), "new", "intent-fixture"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -381,8 +394,7 @@ async fn success_replays_across_key_rotation_and_restart_but_changed_bytes_confl
     assert_eq!(first["result"], replay["result"]);
     // Same JSON intent with changed exact signed representation is a mismatch.
     let changed = format!("{} ", payload());
-    let (status, _, refusal) =
-        answer(restarted, signed(&changed, "new", 22, "intent-fixture")).await;
+    let (status, _, refusal) = answer(restarted, signed(&changed, "new", "intent-fixture")).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(refusal["error"]["retryable"], false);
     assert_eq!(effect.calls(), 1);
@@ -397,7 +409,7 @@ async fn concurrent_duplicate_gets_in_progress_then_receipt_without_second_effec
     let app = router(state(db.pool().clone(), effect.clone()));
     let first = tokio::spawn(answer(
         app.clone(),
-        signed(payload(), "old", 30, "intent-fixture"),
+        signed(payload(), "old", "intent-fixture"),
     ));
     tokio::time::timeout(Duration::from_secs(5), effect.entered.acquire())
         .await
@@ -405,7 +417,7 @@ async fn concurrent_duplicate_gets_in_progress_then_receipt_without_second_effec
         .unwrap()
         .forget();
     let (status, _, duplicate) =
-        answer(app.clone(), signed(payload(), "old", 31, "intent-fixture")).await;
+        answer(app.clone(), signed(payload(), "old", "intent-fixture")).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(
         duplicate["error"],
@@ -415,7 +427,7 @@ async fn concurrent_duplicate_gets_in_progress_then_receipt_without_second_effec
     effect.release.add_permits(1);
     assert_eq!(first.await.unwrap().0, StatusCode::OK);
     assert_eq!(
-        answer(app, signed(payload(), "old", 32, "intent-fixture"))
+        answer(app, signed(payload(), "old", "intent-fixture"))
             .await
             .1["idempotent-replay"],
         "true"
@@ -427,16 +439,9 @@ async fn concurrent_duplicate_gets_in_progress_then_receipt_without_second_effec
 #[tokio::test]
 async fn no_effect_and_unknown_outcomes_never_resend_the_intent() {
     let Some(db) = database().await else { return };
-    for (nonce, intent, outcome, code, replayed) in [
+    for (intent, outcome, code, replayed) in [
+        ("intent-no-effect", MockOutcome::NoEffect, "no_effect", true),
         (
-            40,
-            "intent-no-effect",
-            MockOutcome::NoEffect,
-            "no_effect",
-            true,
-        ),
-        (
-            50,
             "intent-unknown",
             MockOutcome::Unknown,
             "needs_reconciliation",
@@ -445,10 +450,10 @@ async fn no_effect_and_unknown_outcomes_never_resend_the_intent() {
     ] {
         let effect = Arc::new(MockEffect::new(outcome));
         let app = router(state(db.pool().clone(), effect.clone()));
-        let (_, _, first) = answer(app.clone(), signed(payload(), "old", nonce, intent)).await;
+        let (_, _, first) = answer(app.clone(), signed(payload(), "old", intent)).await;
         assert_eq!(first["error"]["code"], code);
         assert_eq!(first["error"]["retryable"], false);
-        let (_, headers, second) = answer(app, signed(payload(), "old", nonce + 1, intent)).await;
+        let (_, headers, second) = answer(app, signed(payload(), "old", intent)).await;
         assert_eq!(second["error"]["code"], code);
         assert_eq!(headers.contains_key("idempotent-replay"), replayed);
         assert_eq!(effect.calls(), 1);
@@ -463,7 +468,7 @@ async fn cancellation_after_committed_claim_never_reclaims_even_when_stale() {
     let app = router(state(db.pool().clone(), effect.clone()));
     let first = tokio::spawn(answer(
         app.clone(),
-        signed(payload(), "old", 60, "intent-fixture"),
+        signed(payload(), "old", "intent-fixture"),
     ));
     tokio::time::timeout(Duration::from_secs(5), effect.entered.acquire())
         .await
@@ -478,7 +483,7 @@ async fn cancellation_after_committed_claim_never_reclaims_even_when_stale() {
     .execute(db.pool())
     .await
     .unwrap();
-    let (_, _, next) = answer(app, signed(payload(), "old", 61, "intent-fixture")).await;
+    let (_, _, next) = answer(app, signed(payload(), "old", "intent-fixture")).await;
     assert_eq!(next["error"]["code"], "needs_reconciliation");
     assert_eq!(next["error"]["retryable"], false);
     assert_eq!(effect.calls(), 1);
@@ -495,7 +500,7 @@ async fn missing_nonce_or_claim_storage_prevents_any_effect() {
         .await
         .unwrap();
     assert_eq!(
-        answer(app.clone(), signed(payload(), "old", 70, "intent-fixture"))
+        answer(app.clone(), signed(payload(), "old", "intent-fixture"))
             .await
             .2["error"]["code"],
         "internal"
@@ -509,7 +514,7 @@ async fn missing_nonce_or_claim_storage_prevents_any_effect() {
         .await
         .unwrap();
     assert_eq!(
-        answer(app, signed(payload(), "old", 71, "intent-fixture"))
+        answer(app, signed(payload(), "old", "intent-fixture"))
             .await
             .2["error"]["code"],
         "internal"
@@ -525,13 +530,13 @@ async fn finish_failure_after_effect_is_not_success_or_permission_to_resend() {
     mock.break_finish = Some(db.pool().clone());
     let effect = Arc::new(mock);
     let app = router(state(db.pool().clone(), effect.clone()));
-    let (_, _, first) = answer(app.clone(), signed(payload(), "old", 80, "intent-fixture")).await;
+    let (_, _, first) = answer(app.clone(), signed(payload(), "old", "intent-fixture")).await;
     assert_eq!(first["error"]["code"], "needs_reconciliation");
     sqlx::query("ALTER TABLE receiver_hidden_audit RENAME TO internal_action_log")
         .execute(db.pool())
         .await
         .unwrap();
-    let (_, _, second) = answer(app, signed(payload(), "old", 81, "intent-fixture")).await;
+    let (_, _, second) = answer(app, signed(payload(), "old", "intent-fixture")).await;
     assert_eq!(second["error"]["code"], "in_progress");
     assert_eq!(effect.calls(), 1);
     db.close().await.unwrap();
@@ -542,17 +547,11 @@ async fn authenticated_unsupported_actions_and_bad_channel_keys_stay_redacted() 
     let Some(db) = database().await else { return };
     let effect = Arc::new(MockEffect::new(MockOutcome::Success));
     let app = router(state(db.pool().clone(), effect.clone()));
-    for (nonce, raw) in [
-        (
-            90,
-            r#"{"action":"role.assign","discord_id":"111111111111111111","role_key":"fixture"}"#,
-        ),
-        (
-            91,
-            r#"{"action":"announcement.post","channel_key":"secret-sentinel","body":"secret-sentinel"}"#,
-        ),
+    for raw in [
+        r#"{"action":"role.assign","discord_id":"111111111111111111","role_key":"fixture"}"#,
+        r#"{"action":"announcement.post","channel_key":"secret-sentinel","body":"secret-sentinel"}"#,
     ] {
-        let (_, _, body) = answer(app.clone(), signed(raw, "old", nonce, "intent-fixture")).await;
+        let (_, _, body) = answer(app.clone(), signed(raw, "old", "intent-fixture")).await;
         assert_eq!(body["error"]["code"], "action_not_allowed");
         assert!(!body.to_string().contains("secret-sentinel"));
     }
@@ -569,7 +568,7 @@ async fn health_router_has_no_action_route() {
         database: None,
     };
     let response = crate::server::router(state)
-        .oneshot(signed(payload(), "old", 100, "intent-fixture"))
+        .oneshot(signed(payload(), "old", "intent-fixture"))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);

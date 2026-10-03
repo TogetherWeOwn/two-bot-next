@@ -133,11 +133,18 @@ Receiver tests use a module-private injected effect and guarded, migrated
 capacity, redacted authentication failures, nonce-before-parse ordering,
 concurrent/restarted/key-rotated replay, byte mismatch, unsupported actions,
 cancellation/stale ownership, unknown/no-effect outcomes, unavailable stores,
-failed receipt finalization and listener supervision. They do not send live
-Discord actions. Existing announcement-adapter tests independently exercise
-loopback transport and durable outbound admission. A combined real-adapter HTTP
-acceptance test remains to be added; injected-effect coverage is not evidence
-that the full network path passed.
+failed receipt finalization and listener supervision. Nonces are generated
+fresh for each attempt; the nonce-replay test intentionally reuses one generated
+value. They do not send live Discord actions.
+
+Combined receiver/real-adapter acceptance uses an ephemeral loopback HTTP double
+and independent migrated test pools. It covers successful durable receipts,
+rotation/restart replay, single-attempt 429 refusal, token-wide holds blocking
+new intents and other transports, and invalid receipts retaining both intent and
+send-lane ownership. The Discord crate's `test-support` origin seam is enabled
+only as a bot dev-dependency: it refuses non-loopback origins and executors without
+admission. Runtime construction has no origin override. Added test source is not
+evidence of execution; record exact-head compiler/test results separately.
 
 On the persistent controller, run compiling checks only through the approved
 bounded-cache wrapper, for example:
