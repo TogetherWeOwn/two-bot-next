@@ -17,6 +17,8 @@ use two_bot_core::voice_rooms::{
 };
 use two_bot_core::{format_iso_millis, parse_iso_millis, Snowflake};
 
+use super::voice_config_store::PgVoiceConfigStore;
+
 #[derive(Debug, Clone)]
 pub struct PgRoomStore {
     pool: PgPool,
@@ -26,6 +28,14 @@ impl PgRoomStore {
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// V11 configuration persistence (`/export` reads, `/import` writes)
+    /// over this store's pool. Snapshot and apply each run in one
+    /// transaction; apply never touches live rooms or companions.
+    #[must_use]
+    pub fn voice_configs(&self) -> PgVoiceConfigStore {
+        PgVoiceConfigStore::new(self.pool.clone())
     }
 
     pub async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), sqlx::Error> {

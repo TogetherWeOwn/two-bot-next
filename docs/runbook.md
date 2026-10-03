@@ -293,14 +293,24 @@ Invocation (secret-free; the URL comes only from the existing
 
 ```text
 staging-migrate --plan --source-sha <40hex> --staging-host <host> \
-  --staging-database <db> --recovery-evidence-ref <ref> --acl-plan-ref <ref>
+  --staging-database <db> --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
+  [--expected-pending <ascending,comma-separated versions>]
 ```
+
+Reconcile is set-based: pending is every source version absent from the
+ledger, in source order, so a ledger may lag the source by any subset. `--plan`
+prints that list in the manifest (`pending_before`) and changes nothing.
+`--apply` requires `--expected-pending` (the workflow input of the same name)
+and refuses before any DDL unless it equals the computed pending list exactly,
+so apply can only run the pending set a reviewed plan already showed.
 
 It refuses (exit 2, before any DDL) when the binding is absent, the target does
 not equal the pinned staging host/database inputs, either pin is empty or looks
-like production, the login cannot assume `two_bot_migrator`, a reference is
-missing, or the ledger has a failed/incomplete row, a SHA-384 mismatch, an
-unknown version or a non-prefix order. The database name needs no `staging`
+like production, either host pin or the binding host is a pooler endpoint
+(session `SET ROLE` and the migrator lock need the direct endpoint), the login
+cannot assume `two_bot_migrator`, a reference is missing, `--apply` has no
+`--expected-pending` or it mismatches, or the ledger has a failed/incomplete
+row, a SHA-384 mismatch or a version unknown to the source. The database name needs no `staging`
 substring (the verified shared-Neon staging database is `two_bot`); the pinned
 host plus the binding-match check is the staging identity. It never resets,
 reverts, restores, creates roles or grants. The sanitized JSON manifest (source

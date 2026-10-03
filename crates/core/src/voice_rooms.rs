@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::commands::{
     CommandChoice, CommandDefinition, CommandOption, CommandOptionType, PERM_MANAGE_CHANNELS,
+    PERM_MANAGE_GUILD,
 };
 use super::voice_text_channel::{
     TextChannelPlan, TextChannelSettings, MAX_TEXT_CHANNEL_NAME_CHARS,
@@ -1287,6 +1288,22 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
             )]),
         ]),
         CommandDefinition::new(
+            "export",
+            "Download this server's voice configuration as a versioned JSON file",
+        )
+        .permissions(PERM_MANAGE_GUILD),
+        CommandDefinition::new(
+            "import",
+            "Preview a voice configuration file before applying it",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![CommandOption::new(
+            "file",
+            "Voice configuration JSON file from /export",
+            CommandOptionType::Attachment,
+        )
+        .required()]),
+        CommandDefinition::new(
             "kick",
             "Start a vote to disconnect a member from your voice room",
         )
@@ -2004,6 +2021,8 @@ mod tests {
                 "reclaim",
                 "transfer",
                 "logging",
+                "export",
+                "import",
                 "kick"
             ]
         );
@@ -2092,7 +2111,7 @@ mod tests {
         }
         // `/kick` is open to every occupant; the worker refuses
         // non-occupant initiators and protected targets.
-        let kick = &defs[9];
+        let kick = &defs[11];
         assert_eq!(kick.default_member_permissions, None);
         assert_eq!(
             kick.options
@@ -2103,6 +2122,24 @@ mod tests {
         );
         assert_eq!(kick.options[0].required, Some(true));
         assert_eq!(kick.options[1].required, None);
+        // `/export` takes no options; `/import` takes one required file
+        // attachment. Both are Manage Server (Manage Guild) gated.
+        let export = &defs[9];
+        let import = &defs[10];
+        for def in [export, import] {
+            assert_eq!(
+                def.default_member_permissions,
+                Some(PERM_MANAGE_GUILD.to_string())
+            );
+        }
+        assert!(export.options.is_empty());
+        assert_eq!(import.options.len(), 1);
+        assert_eq!(import.options[0].name, "file");
+        assert_eq!(
+            import.options[0].kind,
+            CommandOptionType::Attachment.as_u8()
+        );
+        assert!(import.options[0].required == Some(true));
         // `/reclaim` takes no options; `/transfer` names its recipient.
         assert_eq!(defs[6].default_member_permissions, None);
         assert!(defs[6].options.is_empty());

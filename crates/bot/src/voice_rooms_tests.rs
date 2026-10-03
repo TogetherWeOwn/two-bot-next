@@ -95,6 +95,9 @@ struct Store {
     companion_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
     after_persist: Option<Hook>,
+    config: Arc<Mutex<VoiceConfiguration>>,
+    config_error: Option<StoreError>,
+    save_config_error: Option<StoreError>,
 }
 
 impl Store {
@@ -115,6 +118,9 @@ impl Store {
             companion_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
             after_persist: None,
+            config: Arc::new(Mutex::new(empty_config())),
+            config_error: None,
+            save_config_error: None,
         }
     }
 }
@@ -225,6 +231,21 @@ impl RoomPersistence for Store {
         self.rooms.lock().unwrap().remove(&channel);
         Ok(())
     }
+    async fn config_snapshot(&self, _: u64) -> Result<VoiceConfiguration, StoreError> {
+        match self.config_error {
+            Some(error) => Err(error),
+            None => Ok(self.config.lock().unwrap().clone()),
+        }
+    }
+    async fn config_apply(&self, _: u64, config: &VoiceConfiguration) -> Result<(), StoreError> {
+        if let Some(error) = self.save_config_error {
+            return Err(error);
+        }
+        self.trace.lock().unwrap().push("config_apply".to_owned());
+        *self.config.lock().unwrap() = config.clone();
+        Ok(())
+    }
+
     async fn companions(&self, _: u64) -> Result<Vec<TextCompanion>, StoreError> {
         Ok(self.companions.lock().unwrap().values().cloned().collect())
     }
@@ -259,6 +280,9 @@ impl RoomPersistence for Store {
     }
 }
 
+/// Scripted `/import` download queue shared with the harness.
+type DownloadResults = Arc<Mutex<VecDeque<Result<Vec<u8>, RoomHttpError>>>>;
+
 struct Http {
     trace: Trace,
     next_id: Mutex<u64>,
@@ -275,6 +299,8 @@ struct Http {
     after_create: Option<Hook>,
     before_move: Option<Hook>,
     before_delete: Option<Hook>,
+    downloaded_urls: Mutex<Vec<String>>,
+    download_results: DownloadResults,
 }
 
 impl Http {
@@ -295,6 +321,8 @@ impl Http {
             after_create: None,
             before_move: None,
             before_delete: None,
+            downloaded_urls: Mutex::new(Vec::new()),
+            download_results: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 }
@@ -406,6 +434,19 @@ impl RoomWrites for Http {
             None => Ok(()),
         }
     }
+    async fn download_attachment(
+        &self,
+        url: &str,
+        _max_bytes: usize,
+    ) -> Result<Vec<u8>, RoomHttpError> {
+        self.trace.lock().unwrap().push(format!("download:{url}"));
+        self.downloaded_urls.lock().unwrap().push(url.to_owned());
+        match self.download_results.lock().unwrap().pop_front() {
+            Some(result) => result,
+            None => Err(RoomHttpError::UnknownOutcome),
+        }
+    }
+
     async fn create_companion(
         &self,
         plan: &TextChannelPlan,
@@ -1389,6 +1430,8 @@ fn voice_command_set_is_gated_on_two_voice() {
             "reclaim",
             "transfer",
             "logging",
+            "export",
+            "import",
             "kick"
         ]
     );
@@ -1805,7 +1848,7 @@ async fn invite_renders_the_vanity_code_or_the_fixed_notice() {
     );
     let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
     let writer = seen.clone();
-    handle_voice_interaction_with(&runtime, &interaction, Some("abc-123"), |response| {
+    handle_voice_interaction_with(&runtime, &interaction, Some("abc-123"), None, |response| {
         *writer.lock().unwrap() = Some(response);
         async {}
     })
@@ -3082,7 +3125,7 @@ async fn responder_defers_before_any_create_and_completes_once() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());
     let replies = Replies::new(trace.clone());
-    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None).await;
+    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None, None).await;
     assert_eq!(
         *trace.lock().unwrap(),
         ["defer", "create", "add_creator:500", "complete"]
@@ -3110,7 +3153,7 @@ async fn responder_failed_or_ambiguous_ack_never_executes_or_retries() {
         let runtime = test_runtime(trace.clone());
         let mut replies = Replies::new(trace.clone());
         replies.defer_error = Some(error);
-        VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None).await;
+        VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None, None).await;
         assert_eq!(*trace.lock().unwrap(), ["defer"]);
         assert!(replies.completed.lock().unwrap().is_empty());
     }
@@ -3122,7 +3165,7 @@ async fn responder_completion_failure_does_not_repeat_channel_creation() {
     let runtime = test_runtime(trace.clone());
     let mut replies = Replies::new(trace.clone());
     replies.complete_error = Some(RoomHttpError::UnknownOutcome);
-    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None).await;
+    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None, None).await;
     assert_eq!(
         *trace.lock().unwrap(),
         ["defer", "create", "add_creator:500", "complete"]
@@ -3845,6 +3888,701 @@ fn health_check_dedups_a_shared_category_override() {
         },
     });
     assert_eq!(live.permission_findings(&[CREATOR, 201]).len(), 1);
+}
+
+// --- V11c `/export` + `/import` handler tests ---------------------------------
+
+use twilight_model::{
+    application::interaction::{
+        message_component::MessageComponentInteractionData, InteractionDataResolved,
+    },
+    channel::message::component::ComponentType,
+};
+use two_bot_core::voice_config as config_codec;
+
+const UPLOADER: u64 = 302;
+const OTHER_MEMBER: u64 = 303;
+const ATTACHMENT_ID: u64 = 900;
+const TEXT_CHANNEL: u64 = 500;
+const TEMPLATE_CHANNEL: u64 = 600;
+const MENTION_ROLE: u64 = 700;
+
+fn empty_config() -> VoiceConfiguration {
+    VoiceConfiguration {
+        version: config_codec::VOICE_CONFIG_VERSION,
+        guild_id: GUILD.to_string(),
+        creators: Vec::new(),
+        templates: Vec::new(),
+        aliases: Vec::new(),
+        lists: Vec::new(),
+        logging: None,
+        settings: config_codec::GuildSettings {
+            creation_enabled: true,
+            unique_names: false,
+            no_game_label: "No game".to_owned(),
+            force_single_game: false,
+            count_members_without_activity: false,
+            time_zone: "UTC".to_owned(),
+            text_channel_name: "voice-chat".to_owned(),
+            text_viewer_role_id: None,
+            command_role_id: None,
+            command_roles: Vec::new(),
+        },
+    }
+}
+
+fn full_config() -> VoiceConfiguration {
+    let mut config = empty_config();
+    config.creators = vec![config_codec::CreatorConfiguration {
+        channel_id: CREATOR.to_string(),
+        name_template: "{game}".to_owned(),
+        status_template: None,
+        default_limit: 0,
+        always_private: false,
+        text_channels: false,
+        position: config_codec::RoomPosition::Above,
+        first_number: 1,
+        group_by_category: false,
+        permission_source: config_codec::PermissionSource::Creator {},
+    }];
+    config.templates = vec![config_codec::ChannelTemplates {
+        channel_id: TEMPLATE_CHANNEL.to_string(),
+        name_template: "Lobby".to_owned(),
+        status_template: None,
+    }];
+    config.aliases = vec![config_codec::GameAlias {
+        game: "chess".to_owned(),
+        alias: "Chess".to_owned(),
+    }];
+    config.lists = vec![config_codec::RandomList {
+        name: "maps".to_owned(),
+        choices: vec!["a".to_owned(), "b".to_owned()],
+    }];
+    config.logging = Some(config_codec::LoggingConfiguration {
+        channel_id: TEXT_CHANNEL.to_string(),
+        detail: config_codec::LogDetail::Errors,
+        mention_member_ids: vec![MEMBER.to_string()],
+        mention_role_ids: vec![MENTION_ROLE.to_string()],
+    });
+    config
+}
+
+fn config_inventory() -> GuildInventory {
+    let guild = GUILD.to_string();
+    let channel = |kind: config_codec::ChannelKind| config_codec::ChannelReference {
+        guild_id: guild.clone(),
+        kind,
+    };
+    GuildInventory {
+        guild_id: guild.clone(),
+        channels: [
+            (
+                CREATOR.to_string(),
+                channel(config_codec::ChannelKind::Voice),
+            ),
+            (
+                CATEGORY.to_string(),
+                channel(config_codec::ChannelKind::Category),
+            ),
+            (
+                TEXT_CHANNEL.to_string(),
+                channel(config_codec::ChannelKind::Text),
+            ),
+            (
+                TEMPLATE_CHANNEL.to_string(),
+                channel(config_codec::ChannelKind::Voice),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        roles: [
+            (GUILD.to_string(), guild.clone()),
+            (MENTION_ROLE.to_string(), guild.clone()),
+        ]
+        .into_iter()
+        .collect(),
+        members: [
+            (MEMBER.to_string(), guild.clone()),
+            (UPLOADER.to_string(), guild.clone()),
+        ]
+        .into_iter()
+        .collect(),
+    }
+}
+
+fn user(id: u64) -> User {
+    serde_json::from_value(json!({
+        "id": id.to_string(), "username": "fixture",
+        "discriminator": "0001", "avatar": null,
+    }))
+    .unwrap()
+}
+
+fn with_user(mut interaction: Interaction, id: u64) -> Interaction {
+    interaction.member.as_mut().expect("member").user = Some(user(id));
+    interaction
+}
+
+fn manager() -> Option<Permissions> {
+    Some(Permissions::MANAGE_GUILD)
+}
+
+fn import_interaction(size: u64, permissions: Option<Permissions>, member_id: u64) -> Interaction {
+    let meta: twilight_model::channel::Attachment = serde_json::from_value(json!({
+        "id": ATTACHMENT_ID.to_string(),
+        "filename": "voice-config.json",
+        "url": "https://cdn.discordapp.com/attachments/1/2/voice-config.json",
+        "proxy_url": "https://media.discordapp.net/attachments/1/2/voice-config.json",
+        "size": size,
+    }))
+    .unwrap();
+    let mut data = command_data(
+        "import",
+        vec![CommandDataOption {
+            name: "file".to_owned(),
+            value: CommandOptionValue::Attachment(Id::new(ATTACHMENT_ID)),
+        }],
+    );
+    data.resolved = Some(InteractionDataResolved {
+        attachments: [(Id::new(ATTACHMENT_ID), meta)].into_iter().collect(),
+        channels: HashMap::new(),
+        members: HashMap::new(),
+        messages: HashMap::new(),
+        roles: HashMap::new(),
+        users: HashMap::new(),
+    });
+    with_user(voice_interaction(Some(data), permissions, true), member_id)
+}
+
+fn component_interaction(
+    custom_id: &str,
+    permissions: Option<Permissions>,
+    member_id: u64,
+) -> Interaction {
+    let mut interaction = with_user(voice_interaction(None, permissions, true), member_id);
+    interaction.kind = InteractionType::MessageComponent;
+    interaction.data = Some(InteractionData::MessageComponent(Box::new(
+        MessageComponentInteractionData {
+            custom_id: custom_id.to_owned(),
+            component_type: ComponentType::Button,
+            resolved: None,
+            values: Vec::new(),
+        },
+    )));
+    interaction
+}
+
+async fn handle_import_capture(
+    runtime: &VoiceRuntime<Store, Http>,
+    interaction: &Interaction,
+    inventory: Option<&GuildInventory>,
+) -> (bool, Option<InteractionResponse>) {
+    let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
+    let writer = seen.clone();
+    let owned = handle_voice_interaction_with(runtime, interaction, None, inventory, |response| {
+        *writer.lock().unwrap() = Some(response);
+        async {}
+    })
+    .await;
+    let response = seen.lock().unwrap().clone();
+    (owned, response)
+}
+
+/// Runtime sharing one configuration and one scripted download queue across
+/// every store/http pair, so an upload and its Confirm see the same state.
+fn import_harness(
+    trace: Trace,
+    config: VoiceConfiguration,
+    downloads: Vec<Result<Vec<u8>, RoomHttpError>>,
+) -> (VoiceRuntime<Store, Http>, Arc<Mutex<VoiceConfiguration>>) {
+    let shared_config = Arc::new(Mutex::new(config));
+    let shared_downloads = Arc::new(Mutex::new(downloads.into_iter().collect::<VecDeque<_>>()));
+    let closure_config = shared_config.clone();
+    let runtime = VoiceRuntime::new(
+        move || {
+            let mut store = Store::new(trace.clone());
+            store.config = closure_config.clone();
+            let mut http = Http::new(trace.clone());
+            http.download_results = shared_downloads.clone();
+            (store, http)
+        },
+        Duration::from_millis(10),
+        true,
+    );
+    (runtime, shared_config)
+}
+
+fn preview_buttons(response: &InteractionResponse) -> (String, String) {
+    let components = response
+        .data
+        .as_ref()
+        .and_then(|data| data.components.as_ref())
+        .expect("preview buttons");
+    let mut confirm = None;
+    let mut cancel = None;
+    for component in components {
+        let Component::ActionRow(row) = component else {
+            continue;
+        };
+        for inner in &row.components {
+            let Component::Button(button) = inner else {
+                continue;
+            };
+            match button.label.as_deref() {
+                Some("Confirm") => confirm = button.custom_id.clone(),
+                Some("Cancel") => cancel = button.custom_id.clone(),
+                _ => {}
+            }
+        }
+    }
+    (
+        confirm.expect("confirm button"),
+        cancel.expect("cancel button"),
+    )
+}
+
+fn applied(trace: &Trace) -> bool {
+    trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry == "config_apply")
+}
+
+#[test]
+fn parse_export_and_import_attachment_option() {
+    let export = with_user(
+        voice_interaction(Some(command_data("export", Vec::new())), manager(), true),
+        UPLOADER,
+    );
+    assert_eq!(parse_voice_command(&export), Some(VoiceCommand::Export));
+    let import = import_interaction(10, manager(), UPLOADER);
+    assert_eq!(
+        parse_voice_command(&import),
+        Some(VoiceCommand::Import {
+            file_id: Some(Id::new(ATTACHMENT_ID)),
+        })
+    );
+    // A missing or wrong-typed option is answered, never silently ignored.
+    let missing = with_user(
+        voice_interaction(Some(command_data("import", Vec::new())), manager(), true),
+        UPLOADER,
+    );
+    assert_eq!(
+        parse_voice_command(&missing),
+        Some(VoiceCommand::Import { file_id: None })
+    );
+    let wrong = with_user(
+        voice_interaction(
+            Some(command_data("import", vec![command_option("file", "x")])),
+            manager(),
+            true,
+        ),
+        UPLOADER,
+    );
+    assert_eq!(
+        parse_voice_command(&wrong),
+        Some(VoiceCommand::Import { file_id: None })
+    );
+    // Other components stay untouched by the import router.
+    let kick = component_interaction("two:voice:kick-yes:99", manager(), UPLOADER);
+    assert_eq!(voice_import_action(&kick), None);
+    let slash = import_interaction(10, manager(), UPLOADER);
+    assert_eq!(voice_import_action(&slash), None);
+}
+
+#[tokio::test]
+async fn export_denied_without_manage_server() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = with_user(
+        voice_interaction(Some(command_data("export", Vec::new())), None, true),
+        MEMBER,
+    );
+    let inventory = config_inventory();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    let response = response.expect("refusal");
+    assert!(response_text(&response).contains("Manage Server"));
+    assert!(response
+        .data
+        .as_ref()
+        .and_then(|data| data.attachments.as_ref())
+        .is_none());
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn export_attaches_versioned_file_ephemerally() {
+    let trace = Trace::default();
+    let (runtime, shared) = import_harness(trace.clone(), full_config(), Vec::new());
+    let interaction = with_user(
+        voice_interaction(Some(command_data("export", Vec::new())), manager(), true),
+        UPLOADER,
+    );
+    let inventory = config_inventory();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    let response = response.expect("export reply");
+    assert_eq!(
+        response.data.as_ref().and_then(|data| data.flags),
+        Some(MessageFlags::EPHEMERAL)
+    );
+    assert!(response_text(&response).contains("/import"));
+    let attachments = response
+        .data
+        .as_ref()
+        .and_then(|data| data.attachments.as_ref())
+        .expect("export file");
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(
+        attachments[0].filename,
+        format!("voice-config-guild-{GUILD}-v1.json")
+    );
+    let decoded: VoiceConfiguration =
+        serde_json::from_slice(&attachments[0].file).expect("exported JSON parses");
+    assert_eq!(decoded, full_config());
+    assert_eq!(decoded, *shared.lock().unwrap());
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn export_and_import_refuse_without_guild_inventory() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let export = with_user(
+        voice_interaction(Some(command_data("export", Vec::new())), manager(), true),
+        UPLOADER,
+    );
+    let (owned, response) = handle_import_capture(&runtime, &export, None).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("unavailable"));
+    let import = import_interaction(10, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &import, None).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("unavailable"));
+}
+
+#[tokio::test]
+async fn import_denied_without_manage_server() {
+    let trace = Trace::default();
+    let (runtime, _) = import_harness(trace.clone(), empty_config(), Vec::new());
+    let interaction = import_interaction(10, None, MEMBER);
+    let inventory = config_inventory();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("Manage Server"));
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn import_refuses_oversize_before_download() {
+    let trace = Trace::default();
+    let (runtime, _) = import_harness(trace.clone(), empty_config(), Vec::new());
+    let interaction = import_interaction(MAX_IMPORT_BYTES as u64 + 1, manager(), UPLOADER);
+    let inventory = config_inventory();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("too large"));
+    // The size check runs before any download.
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn import_refuses_malformed_upload() {
+    let trace = Trace::default();
+    let (runtime, shared) = import_harness(
+        trace.clone(),
+        empty_config(),
+        vec![Ok(b"not json{".to_vec())],
+    );
+    let interaction = import_interaction(9, manager(), UPLOADER);
+    let inventory = config_inventory();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("malformed"));
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_empty_diff_offers_no_confirm() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, _) = import_harness(trace.clone(), full_config(), vec![Ok(bytes.clone())]);
+    let interaction = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let inventory = config_inventory();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    let response = response.expect("empty notice");
+    assert_eq!(response_text(&response), "No changes");
+    assert!(response
+        .data
+        .as_ref()
+        .and_then(|data| data.components.as_ref())
+        .is_none());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_confirm_applies() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (owned, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    assert!(owned);
+    let preview = preview.expect("preview");
+    let (confirm_id, _) = preview_buttons(&preview);
+    assert!(!applied(&trace));
+
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    assert_eq!(*shared.lock().unwrap(), full_config());
+    assert!(applied(&trace));
+}
+
+#[tokio::test]
+async fn import_skips_unknown_channels_and_confirms_remainder() {
+    let trace = Trace::default();
+    let mut incoming = full_config();
+    incoming.aliases[0].alias = "Chess Club".to_owned();
+    incoming.creators.push(config_codec::CreatorConfiguration {
+        channel_id: "999".to_owned(),
+        name_template: "{game}".to_owned(),
+        status_template: None,
+        default_limit: 0,
+        always_private: false,
+        text_channels: false,
+        position: config_codec::RoomPosition::Above,
+        first_number: 1,
+        group_by_category: false,
+        permission_source: config_codec::PermissionSource::Creator {},
+    });
+    let bytes = serde_json::to_vec(&incoming).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), full_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let preview = preview.expect("preview");
+    let text = response_text(&preview);
+    assert!(text.contains("unknown channel"), "{text}");
+    assert!(text.contains("999"), "{text}");
+    let (confirm_id, _) = preview_buttons(&preview);
+
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    // The known change applied; the unknown channel never entered storage.
+    let stored = shared.lock().unwrap().clone();
+    assert_eq!(stored.aliases[0].alias, "Chess Club");
+    assert!(stored
+        .creators
+        .iter()
+        .all(|creator| creator.channel_id != "999"));
+    assert!(applied(&trace));
+}
+
+#[tokio::test]
+async fn import_unknown_channels_only_reports_without_confirm() {
+    let trace = Trace::default();
+    let mut incoming = full_config();
+    incoming.creators.push(config_codec::CreatorConfiguration {
+        channel_id: "999".to_owned(),
+        name_template: "{game}".to_owned(),
+        status_template: None,
+        default_limit: 0,
+        always_private: false,
+        text_channels: false,
+        position: config_codec::RoomPosition::Above,
+        first_number: 1,
+        group_by_category: false,
+        permission_source: config_codec::PermissionSource::Creator {},
+    });
+    let bytes = serde_json::to_vec(&incoming).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), full_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let response = response.expect("notice");
+    let text = response_text(&response);
+    assert!(text.contains("unknown channel"), "{text}");
+    assert!(text.contains("999"), "{text}");
+    assert!(response
+        .data
+        .as_ref()
+        .and_then(|data| data.components.as_ref())
+        .is_none());
+    assert_eq!(*shared.lock().unwrap(), full_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_cancel_needs_no_inventory() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let preview = preview.expect("preview");
+    let (_, cancel_id) = preview_buttons(&preview);
+
+    let cancel = component_interaction(&cancel_id, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &cancel, None).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("cancelled")).contains("cancelled"));
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_cancel_writes_nothing_and_consumes_the_preview() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let preview = preview.expect("preview");
+    let (confirm_id, cancel_id) = preview_buttons(&preview);
+
+    let cancel = component_interaction(&cancel_id, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &cancel, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("cancelled")).contains("cancelled"));
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+
+    // The consumed preview cannot be confirmed afterwards.
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(response_text(&response.expect("expired")).contains("expired"));
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_stale_confirm_repreviews_instead_of_applying() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (stale_confirm_id, _) = preview_buttons(&preview.expect("preview"));
+
+    // A concurrent change lands before Confirm.
+    let mut concurrent = full_config();
+    concurrent.aliases.push(config_codec::GameAlias {
+        game: "go".to_owned(),
+        alias: "Go".to_owned(),
+    });
+    *shared.lock().unwrap() = concurrent.clone();
+
+    let confirm = component_interaction(&stale_confirm_id, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned);
+    let response = response.expect("fresh preview");
+    assert!(
+        response_text(&response).contains("Import preview:"),
+        "{}",
+        response_text(&response)
+    );
+    // The candidate was not applied over the concurrent change.
+    assert_eq!(*shared.lock().unwrap(), concurrent);
+    assert!(!applied(&trace));
+
+    // The fresh preview confirms cleanly.
+    let (fresh_confirm_id, _) = preview_buttons(&response);
+    assert_ne!(fresh_confirm_id, stale_confirm_id);
+    let confirm = component_interaction(&fresh_confirm_id, manager(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    assert_eq!(*shared.lock().unwrap(), full_config());
+    assert!(applied(&trace));
+}
+
+#[tokio::test]
+async fn import_confirm_rejects_foreign_member() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+
+    let foreign = component_interaction(&confirm_id, manager(), OTHER_MEMBER);
+    let (owned, response) = handle_import_capture(&runtime, &foreign, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("Only the member"));
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_confirm_requires_manage_server() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+
+    // Same uploader, but the Manage Server grant is gone at confirm time.
+    let confirm = component_interaction(&confirm_id, None, UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("Manage Server"));
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_confirm_expired_writes_nothing() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+
+    runtime
+        .pending_imports
+        .lock()
+        .expect("voice runtime lock")
+        .iter_mut()
+        .for_each(|(_, entry)| {
+            entry.expires_at = Instant::now() - Duration::from_secs(1);
+        });
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("expired")).contains("expired"));
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_without_file_asks_for_attachment() {
+    let trace = Trace::default();
+    let (runtime, _) = import_harness(trace.clone(), empty_config(), Vec::new());
+    let interaction = with_user(
+        voice_interaction(Some(command_data("import", Vec::new())), manager(), true),
+        UPLOADER,
+    );
+    let inventory = config_inventory();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("Attach"));
+    assert!(trace.lock().unwrap().is_empty());
 }
 
 // --- V10 error notices ----------------------------------------------------
