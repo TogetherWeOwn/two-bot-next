@@ -155,6 +155,243 @@ pub fn response_for_slash(outcome: &SlashOutcome) -> Option<InteractionResponse>
     }
 }
 
+/// Shared execution runtime: route once, acknowledge promptly, then run the
+/// registered feature through the shared REST executor. Unsupported features
+/// remain owned by their integration slices, not by a second dispatcher.
+#[cfg(feature = "db")]
+#[derive(Debug)]
+pub struct InteractionRuntime {
+    pub router: InteractionRouter,
+    executor: crate::ActionExecutor,
+    lfg: crate::lfg_interactions::LfgInteractions,
+    bot_user_id: std::sync::atomic::AtomicU64,
+    application_id: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "db")]
+impl InteractionRuntime {
+    pub fn new(
+        gates: two_bot_core::RouterGates,
+        pool: sqlx::PgPool,
+        executor: crate::ActionExecutor,
+        bot_user_id: u64,
+    ) -> Self {
+        Self::with_router(InteractionRouter::new(gates), pool, executor, bot_user_id)
+    }
+
+    /// Compose LFG with the bot's existing feature registrations in ONE router.
+    pub fn with_router(
+        mut router: InteractionRouter,
+        pool: sqlx::PgPool,
+        executor: crate::ActionExecutor,
+        bot_user_id: u64,
+    ) -> Self {
+        #[derive(Debug)]
+        struct LfgRegistration(two_bot_core::HandlerId);
+        impl two_bot_core::InteractionHandler for LfgRegistration {
+            fn id(&self) -> two_bot_core::HandlerId {
+                self.0
+            }
+        }
+        router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::Lfg)));
+        router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgClose)));
+        Self {
+            router,
+            executor,
+            lfg: crate::lfg_interactions::LfgInteractions::new(pool),
+            bot_user_id: std::sync::atomic::AtomicU64::new(bot_user_id),
+            application_id: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub fn set_bot_user_id(&self, id: u64) {
+        self.bot_user_id
+            .store(id, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// RESUMED boots without tickets never learn the bot user: resolve it once
+    /// through the shared executor. Unknown stays 0, which nonce recovery refuses.
+    async fn bot_user_id(&self) -> u64 {
+        let id = self.bot_user_id.load(std::sync::atomic::Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+        match self.executor.current_bot_user_id().await {
+            Ok(id) => {
+                self.set_bot_user_id(id);
+                id
+            }
+            Err(_) => 0,
+        }
+    }
+
+    pub fn set_application_id(&self, id: u64) {
+        self.application_id
+            .store(id, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns false for interactions owned by another feature or guild.
+    pub async fn handle(&self, interaction: &Interaction) -> Result<bool, crate::DiscordError> {
+        let application_id = self
+            .application_id
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if application_id != 0 && interaction.application_id.get() != application_id {
+            return Ok(false);
+        }
+        let routed = route_interaction(&self.router, interaction, None);
+        self.handle_routed(interaction, routed).await
+    }
+
+    /// Execute an outcome from this runtime's shared router without routing twice.
+    pub async fn handle_routed(
+        &self,
+        interaction: &Interaction,
+        routed: RoutedInteraction,
+    ) -> Result<bool, crate::DiscordError> {
+        let application_id = self
+            .application_id
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if application_id != 0 && interaction.application_id.get() != application_id {
+            return Ok(false);
+        }
+        use crate::lfg_interactions::{LfgError, LfgRequest};
+        use twilight_model::application::interaction::application_command::CommandOptionValue;
+        use twilight_model::channel::message::{component::ComponentType, AllowedMentions};
+        use two_bot_core::{ComponentHandler, HandlerId};
+        let request = match routed {
+            RoutedInteraction::Slash {
+                outcome: SlashOutcome::Refuse { refusal },
+                ..
+            } => {
+                self.executor
+                    .answer_interaction(
+                        interaction.id.get(),
+                        &interaction.token,
+                        &refusal_response(refusal),
+                    )
+                    .await?;
+                return Ok(true);
+            }
+            RoutedInteraction::Slash {
+                outcome:
+                    SlashOutcome::Handled {
+                        handler: HandlerId::Lfg | HandlerId::LfgClose,
+                    },
+                ..
+            } => {
+                let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_ref()
+                else {
+                    return Ok(false);
+                };
+                let option = |name: &str| -> Result<String, LfgError> {
+                    data.options
+                        .iter()
+                        .find(|o| o.name == name)
+                        .and_then(|o| match &o.value {
+                            CommandOptionValue::String(value) => Some(value.clone()),
+                            _ => None,
+                        })
+                        .ok_or_else(|| LfgError::Invalid(format!("Missing {name} option.")))
+                };
+                if data.name == "lfg" {
+                    option("title").and_then(|title| {
+                        Ok(LfgRequest::Create {
+                            title,
+                            starts_at: option("starts-at")?,
+                            roles: option("roles")?,
+                            channel_id: interaction
+                                .channel
+                                .as_ref()
+                                .map(|c| c.id.to_string())
+                                .ok_or_else(|| LfgError::Invalid("Missing channel.".into()))?,
+                        })
+                    })
+                } else {
+                    option("id").map(|post_id| LfgRequest::Close { post_id })
+                }
+            }
+            RoutedInteraction::Component {
+                custom_id,
+                values,
+                outcome:
+                    ComponentOutcome::Handled {
+                        handler: ComponentHandler::LfgSignup,
+                    },
+            } => {
+                let Some(InteractionData::MessageComponent(data)) = interaction.data.as_ref()
+                else {
+                    return Ok(false);
+                };
+                if data.component_type != ComponentType::TextSelectMenu || values.len() != 1 {
+                    Err(LfgError::Invalid("Choose one LFG role.".into()))
+                } else {
+                    two_bot_core::lfg::parse_lfg_select(&custom_id, &values[0])
+                        .map(LfgRequest::Select)
+                        .ok_or_else(|| LfgError::Invalid("Invalid LFG select.".into()))
+                }
+            }
+            _ => return Ok(false),
+        };
+        let Some(guild) = interaction.guild_id else {
+            return Ok(false);
+        };
+        let Some(actor) = interaction.author_id() else {
+            return Ok(false);
+        };
+        let deferred = InteractionResponse {
+            kind: InteractionResponseType::DeferredChannelMessageWithSource,
+            data: Some(InteractionResponseData {
+                flags: Some(MessageFlags::EPHEMERAL),
+                allowed_mentions: Some(AllowedMentions {
+                    parse: vec![],
+                    replied_user: false,
+                    roles: vec![],
+                    users: vec![],
+                }),
+                ..Default::default()
+            }),
+        };
+        // Acknowledge before locks, SQL or paced REST can exceed Discord's 3 s window.
+        // https://docs.discord.com/developers/interactions/receiving-and-responding#interaction-response
+        self.executor
+            .answer_interaction(interaction.id.get(), &interaction.token, &deferred)
+            .await?;
+        let result = match request {
+            Ok(request) => {
+                self.lfg
+                    .execute(
+                        &self.executor,
+                        request,
+                        &guild.to_string(),
+                        &actor.to_string(),
+                        interaction.id.get(),
+                        self.bot_user_id().await,
+                    )
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        let reply = match result {
+            Ok(reply) => reply,
+            Err(LfgError::Invalid(reply)) => reply,
+            Err(LfgError::Uncertain) => {
+                "LFG post acceptance is uncertain; saved state retained for nonce recovery.".into()
+            }
+            Err(_) => {
+                tracing::warn!(
+                    interaction_id = interaction.id.get(),
+                    "LFG operation failed; details withheld"
+                );
+                "LFG operation failed; check the saved state before retrying.".into()
+            }
+        };
+        self.executor
+            .finish_interaction(interaction.application_id.get(), &interaction.token, &reply)
+            .await?;
+        Ok(true)
+    }
+}
+
 /// Token-bearing transport, deliberately not Debug. Uses the existing executor
 /// and its injectable REST transport rather than a second HTTP client.
 pub struct InteractionReplyTransport<'a> {

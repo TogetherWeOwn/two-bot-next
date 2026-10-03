@@ -739,6 +739,13 @@ pub enum RoomAction {
         channel_id: Snowflake,
         name: String,
     },
+    /// V4 enforcement for a passed vote: deny the member Connect on this room
+    /// channel only, then disconnect them. Both writes are idempotent, so a
+    /// retried action is safe.
+    KickMember {
+        channel_id: Snowflake,
+        member_id: Snowflake,
+    },
 }
 
 /// Queue lane.
@@ -774,7 +781,8 @@ impl RoomAction {
             | Self::RevokeCompanionView {
                 room_channel_id: channel_id,
                 ..
-            } => Some(*channel_id),
+            }
+            | Self::KickMember { channel_id, .. } => Some(*channel_id),
         }
     }
 }
