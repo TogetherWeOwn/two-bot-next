@@ -4,9 +4,18 @@ name: release
 # synchronized workspace versions, Common Changelog and flat vX.Y.Z tags.
 # Stay 0.x until production cutover. No App keys or PATs in Actions.
 # GITHUB_TOKEN-created PRs need explicit required-check workflow dispatch.
+# TOG-12931: only `schedule` and `workflow_dispatch` (re)generate the release
+# PR. A `push` to main runs release-please with skip-github-pull-request, so it
+# still publishes the tag/release when the release PR merges but never rewrites
+# the PR head or starts a ~20 min `check` on it. See docs/releases.md for the
+# freeze -> dispatch -> merge -> unfreeze procedure.
 on:
   push:
     branches: [main]
+  schedule:
+    # Off the hour to avoid the busiest scheduled-run window (UTC); weekly,
+    # because the normal cut is an operator dispatch (docs/releases.md).
+    - cron: '23 4 * * 1'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -48,6 +57,8 @@ jobs:
           persist-credentials: false
       - name: Inspect existing release PR
         id: plan
+        # A push never regenerates the PR, so it has no reuse decision to make.
+        if: github.event_name != 'push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -58,9 +69,10 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-          # Keep publication enabled. Only skip PR regeneration when its branch
-          # already includes this main snapshot, including our migrated notes.
-          skip-github-pull-request: ${{ steps.plan.outputs.reuse_pr == 'true' }}
+          # Keep publication enabled on every event. A push never regenerates
+          # the PR; schedule/dispatch skip it only when its branch already
+          # includes this main snapshot, including our migrated notes.
+          skip-github-pull-request: ${{ github.event_name == 'push' || steps.plan.outputs.reuse_pr == 'true' }}
 
       # Query independently of prs_created: a failed migration can leave an
       # unchanged native PR, so action outputs alone cannot drive recovery.
@@ -71,15 +83,16 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: node scripts/release-pr-state.cjs select
 
+      # Reconciliation and its checkout only follow a regeneration, never a push.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: steps.select.outputs.pr_available == 'true'
+        if: github.event_name != 'push' && steps.select.outputs.pr_available == 'true'
         with:
           persist-credentials: false
           ref: ${{ fromJSON(steps.select.outputs.pr).headBranchName }}
       # Env expressions are evaluated even on a skipped step. Selection emits
       # valid {} JSON when publication leaves no open PR; the guard stays false.
       - name: Preserve bootstrap release notes
-        if: steps.select.outputs.pr_available == 'true'
+        if: github.event_name != 'push' && steps.select.outputs.pr_available == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -176,7 +189,8 @@ jobs:
     permissions:
       actions: write # Dispatch required checks for GITHUB_TOKEN-created release PRs.
     needs: release-please
-    if: needs.release-please.outputs.pr_available == 'true'
+    # Never on a push: it did not regenerate the PR, so there is no new head.
+    if: github.event_name != 'push' && needs.release-please.outputs.pr_available == 'true'
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'dispatch-checks') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
