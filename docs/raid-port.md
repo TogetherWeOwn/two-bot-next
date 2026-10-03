@@ -132,10 +132,14 @@ independent enable switch. Anti-nuke dry-run does **not** suppress risk evidence
 or staff messages. Preserve session-mode refusal of armed anti-nuke and the
 adapter's contained-restart skips. Do not infer activation from a pure proposal.
 
-Runtime integration remains on this parent's retained work: transactional store
-and migrations, gateway calls after join recording, live raid tuning, startup
-fences, log/delivery through the shared REST executor, and staging soak. The
-executor seam is TOG-10076; no private production HTTP client is added here.
+Runtime integration remains on this parent's retained work: gateway calls after
+join recording, live raid tuning, startup fences, log/delivery through the
+shared REST executor, and staging soak. The executor seam is TOG-10076; no
+private production HTTP client is added here. The transactional join-risk
+claim store (`join_risk_store`, migration `0360_join_risk_flags.sql`, legacy
+0015 shape) serializes per-guild event-ID claims, counts prior rows by
+processing-time `created_at`, scores with the current join, and persists the
+evidence in one transaction — but is not wired to the gateway or executor.
 
 `raid.rs` unit tests cover strict clocks/age/window/cooldown boundaries, reverse
 arrival, dedupe-before-prune, fractional/live tuning, guild isolation, payload

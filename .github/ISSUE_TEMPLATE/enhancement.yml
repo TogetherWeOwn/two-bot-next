@@ -1,0 +1,56 @@
+name: Enhancement
+description: Improve behavior that already exists
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form to improve something that already works, such as a clearer error, a faster path, or a tighter default. For a new capability, use the **Feature request** form instead. For something that is broken, use the **Bug report** form.
+
+        Never paste a token, ID, or private URL. Redact it first.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area affected
+      description: Which part of the repo would change? Pick the closest match.
+      options:
+        - Gateway and event handling (crates/discord, crates/bot)
+        - Commands and moderation (crates/core)
+        - Storage and migrations (crates/store, sql/)
+        - Cutover and backup tooling (crates/cutover)
+        - Cloudflare Worker wrapper (wrangler/)
+        - Container image and deploy
+        - CI and release automation (.github/, scripts/)
+        - Documentation
+        - Unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: current
+    attributes:
+      label: Current behavior
+      description: What happens today? Name the command, event, endpoint, or script.
+    validations:
+      required: true
+
+  - type: textarea
+    id: improvement
+    attributes:
+      label: Proposed improvement
+      description: What should it do instead, and why is that better?
+    validations:
+      required: true
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and risk
+      description: Could this change an existing command shape, stored data, a setting default, or a documented runbook step? Say how you would keep it safe.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links, measurements, or related issues.

@@ -29,12 +29,20 @@ IMAGE = rf"registry\.cloudflare\.com/[^/@\s]+/{APPLICATION}@sha256:[0-9a-f]{{64}
 
 
 class GateError(Exception):
-    """Fixed diagnostic class only; never constructed from upstream text."""
+    """Fixed diagnostic class only; never constructed from upstream text.
+
+    `detail` is optional and may only come from `receipt_shape` (allowlisted
+    record-type counts and version fields).
+    """
+
+    def __init__(self, code, detail=None):
+        super().__init__(code)
+        self.detail = detail
 
 
-def require(condition, code):
+def require(condition, code, detail=None):
     if not condition:
-        raise GateError(code)
+        raise GateError(code, detail)
 
 
 def identifier(value):
@@ -158,14 +166,65 @@ def wrangler_sessions(records):
             "wrong_wrangler_receipt")
 
 
+SAFE_TYPE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+SAFE_FIELD = re.compile(r"[0-9]{1,4}(?:\.[0-9]{1,4}){0,3}(?:-[A-Za-z0-9.]{1,16})?")
+
+
+def session_kind(row):
+    """Classify a `wrangler-session` without echoing its arguments.
+
+    Returns one of "deploy", "probe" or "other"; only the counts are printed.
+    """
+    args = command_line(row)
+    if args is not None and args[:1] == ["deploy"]:
+        return "deploy"
+    if args in VERSION_PROBES:
+        return "probe"
+    return "other"
+
+
+def receipt_shape(records):
+    """Allowlisted failure diagnostic: record-type counts and session version fields.
+
+    Never includes `command_line_args`, log paths, timestamps, IDs or any other value.
+    """
+    def field(value):
+        # bool is an int subclass; only plain small integers and version-like strings print.
+        if type(value) is int and 0 <= value <= 9999 or isinstance(value, str) and SAFE_FIELD.fullmatch(value):
+            return str(value)
+        return "invalid"
+
+    counts = {}
+    for row in records:
+        kind = row.get("type")
+        kind = kind if isinstance(kind, str) and SAFE_TYPE.fullmatch(kind) else "other"
+        counts[kind] = counts.get(kind, 0) + 1
+    sessions = [row for row in records if row.get("type") == "wrangler-session"]
+    kinds = [session_kind(row) for row in sessions]
+    shape = ("records " + (",".join(f"{kind}={counts[kind]}" for kind in sorted(counts)) or "none")
+             + "; sessions " + (",".join(f"{kind}={kinds.count(kind)}"
+                                         for kind in ("deploy", "probe", "other")) or "none")
+             + "; " + (" ".join(f"v{field(row.get('version'))}/wrangler-{field(row.get('wrangler_version'))}"
+                                for row in sessions) or "none"))
+    return shape
+
+
 def deploy_version(records, started):
-    wrangler_sessions(records)
+    # The session rule itself lives in `wrangler_sessions()` (kept verbatim);
+    # failures are re-raised with the allowlisted receipt shape attached.
+    detail = receipt_shape(records)
+    try:
+        wrangler_sessions(records)
+    except GateError as error:
+        raise GateError(str(error), detail) from None
     rows = [row for row in records if row.get("type") == "deploy"]
-    require(len(rows) == 1, "deploy_receipt_missing_or_ambiguous")
+    require(len(rows) == 1, "deploy_receipt_missing_or_ambiguous", detail)
     row = rows[0]
-    require(row.get("version") == 1 and row.get("worker_name") == WORKER
-            and row.get("wrangler_environment") == "staging"
-            and row.get("worker_name_overridden") is False, "wrong_deploy_receipt")
+    checks = {"version": row.get("version") == 1, "worker": row.get("worker_name") == WORKER,
+              "environment": row.get("wrangler_environment") == "staging",
+              "not_overridden": row.get("worker_name_overridden") is False}
+    require(all(checks.values()), "wrong_deploy_receipt",
+            detail + "; deploy " + " ".join(f"{name}={'ok' if ok else 'bad'}" for name, ok in checks.items()))
     require(timestamp(row.get("timestamp")) >= started, "stale_deploy_receipt")
     version = identifier(row.get("version_id"))
     require(re.fullmatch(UUID, version), "invalid_worker_version")
@@ -362,10 +421,21 @@ def prepare(args, client):
     print("staging rollout baseline recorded")
 
 
+def read_records(path):
+    return [mapping(decode(line)) for line in Path(path).read_bytes().splitlines() if line.strip()]
+
+
+def receipt(args, client=None):
+    """Network-free: accept the Wrangler deploy receipt before ownership moves."""
+    baseline = mapping(decode(Path(args.receipt).read_bytes()))
+    version = deploy_version(read_records(args.output), baseline["started"])
+    save(args.evidence, {"worker_version": version})
+    print("wrangler deploy receipt accepted")
+
+
 def verify(args, client):
     baseline = mapping(decode(Path(args.receipt).read_bytes()))
-    records = [mapping(decode(line)) for line in Path(args.output).read_bytes().splitlines() if line.strip()]
-    version = deploy_version(records, baseline["started"])
+    version = deploy_version(read_records(args.output), baseline["started"])
     image = docker_image(version, baseline["revision"], baseline["build_id"])
     require(worker_namespace(client, version) == baseline["namespace_id"], "worker_namespace_changed")
     url = staging_url()
@@ -417,7 +487,7 @@ def verify(args, client):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["prepare", "verify"])
+    parser.add_argument("mode", choices=["prepare", "receipt", "verify"])
     parser.add_argument("--receipt", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--config", default="wrangler.toml")
@@ -427,10 +497,14 @@ def main():
     client = None
     try:
         deadline = time.monotonic() + 300 if args.mode == "verify" else None
-        client = Client(os.environ.get("CLOUDFLARE_ACCOUNT_ID"), os.environ.get("CLOUDFLARE_API_TOKEN"), deadline)
-        (prepare if args.mode == "prepare" else verify)(args, client)
+        # `receipt` only reads the local Wrangler NDJSON; it needs no Cloudflare credentials.
+        client = None if args.mode == "receipt" else Client(
+            os.environ.get("CLOUDFLARE_ACCOUNT_ID"), os.environ.get("CLOUDFLARE_API_TOKEN"), deadline)
+        {"prepare": prepare, "receipt": receipt, "verify": verify}[args.mode](args, client)
     except GateError as error:
         print(f"staging rollout gate failed: {error}")
+        if error.detail:
+            print(f"staging rollout diagnostic: {error.detail}")
         if str(error) == "rollout_timeout" and client is not None and client.observation:
             print(f"last observation before timeout: {client.observation}")
         return 1
