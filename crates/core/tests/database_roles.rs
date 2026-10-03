@@ -48,12 +48,15 @@ fn names() -> (String, Vec<String>) {
         .as_nanos();
     let sequence = NEXT_DB.fetch_add(1, Ordering::Relaxed);
     let name = format!("dbroles10892_{}_{stamp}_{sequence}", std::process::id());
-    let roles = ["m", "b", "w"].map(|suffix| format!("{name}_{suffix}"));
+    let roles = ["m", "b", "w", "r"].map(|suffix| format!("{name}_{suffix}"));
     (name, roles.to_vec())
 }
 
 fn isolated(sql: &str, roles: &[String]) -> String {
-    sql.replace("two_bot_migrator", &roles[0])
+    // The read-only group name starts with the migrator group name: replace
+    // the longer name first or it becomes "<migrator>_ro".
+    sql.replace("two_bot_migrator_ro", &roles[3])
+        .replace("two_bot_migrator", &roles[0])
         .replace("two_bot_runtime", &roles[1])
         .replace("two_web_reader", &roles[2])
 }
@@ -254,7 +257,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
             .iter()
             .filter(|finding| finding.starts_with("missing role:"))
             .count()
-            == 3,
+            == 4,
         "missing groups were not reported",
     )?;
     execute(pool, isolated(&database_roles::plan(), roles)).await?;
@@ -430,9 +433,11 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         denied(pool, &roles[2], sql).await?;
     }
 
+    migrator_ro_probes(pool, roles).await?;
+
     // Each drift starts clean, is detected, and is then restored. Effective
     // PUBLIC/column access, attributes, inheritance and future grants all count.
-    let (migrator, runtime, reader) = (&roles[0], &roles[1], &roles[2]);
+    let (migrator, runtime, reader, ro) = (&roles[0], &roles[1], &roles[2], &roles[3]);
     for (change, restore) in [
         (format!("REVOKE SELECT ON public.discord_send_admission FROM {runtime}"),
          format!("GRANT SELECT ON public.discord_send_admission TO {runtime}")),
@@ -482,6 +487,17 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
          format!("REVOKE SELECT ON public.invite_campaigns FROM {reader}")),
         (format!("REVOKE SELECT ON public.member_erasure_audit FROM {migrator}"),
          format!("GRANT SELECT ON public.member_erasure_audit TO {migrator}")),
+        (format!("GRANT INSERT ON public.members TO {ro}"),
+         format!("REVOKE INSERT ON public.members FROM {ro}")),
+        (format!("GRANT SELECT ON public.invite_campaigns TO {ro}"),
+         format!("REVOKE SELECT ON public.invite_campaigns FROM {ro}")),
+        (format!("GRANT USAGE, SELECT ON SEQUENCE public.guild_settings_cas_seq TO {ro}"),
+         format!("REVOKE ALL ON SEQUENCE public.guild_settings_cas_seq FROM {ro}")),
+        (format!("REVOKE SELECT ON public._sqlx_migrations FROM {ro}"),
+         format!("GRANT SELECT ON public._sqlx_migrations TO {ro}")),
+        (format!("REVOKE SELECT ON public.members FROM {ro}"),
+         format!("GRANT SELECT ON public.members TO {ro}")),
+        (format!("GRANT {migrator} TO {ro}"), format!("REVOKE {migrator} FROM {ro}")),
     ] {
         execute(pool, change.clone()).await?;
         require(!findings(pool, roles).await?.is_empty(), &format!("missed drift: {change}"))?;
@@ -937,6 +953,91 @@ async fn role_matrix_b2_regression(pool: &PgPool, roles: &[String]) -> Result<()
             denied(pool, &roles[2], &sql).await?;
         }
     }
+    Ok(())
+}
+
+/// Read-only migration-plan identity: SELECT on bot tables, the admission
+/// lane and the ledger; no DML, DDL, sequence, function or web-view access.
+/// Denied operations must stay denied; granted reads must keep working.
+async fn migrator_ro_probes(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
+    let ro = &roles[3];
+    // Plan-run reads: ledger pending versions plus ordinary bot tables.
+    as_role(
+        pool,
+        ro,
+        "SELECT version FROM public._sqlx_migrations; SELECT * FROM public.members; \
+         SELECT * FROM public.discord_send_admission; SELECT * FROM public.events",
+    )
+    .await?;
+    require(
+        sqlx::query_scalar::<_, bool>(
+            r#"SELECT has_table_privilege($1::text, 'public.members', 'SELECT')
+                AND has_table_privilege($1::text, 'public._sqlx_migrations', 'SELECT')
+                AND has_table_privilege($1::text, 'public.discord_send_admission', 'SELECT')
+                AND NOT has_table_privilege($1::text, 'public.members', 'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
+                AND NOT has_table_privilege($1::text, 'public.member_erasure_audit', 'SELECT')
+                AND NOT has_table_privilege($1::text, 'public.invite_campaigns', 'SELECT')
+                AND NOT has_schema_privilege($1::text, 'public', 'CREATE')
+                AND NOT has_schema_privilege($1::text, 'web_v1', 'CREATE')
+                AND NOT has_database_privilege($1::text, current_database(), 'CREATE')
+                AND NOT has_database_privilege($1::text, current_database(), 'TEMP')
+                AND NOT has_sequence_privilege($1::text, 'public.guild_settings_cas_seq', 'USAGE, SELECT, UPDATE')
+                AND NOT has_function_privilege($1::text, 'public.guild_settings_assign_version()', 'EXECUTE')"#,
+        )
+        .bind(ro)
+        .fetch_one(pool)
+        .await?,
+        "read-only migrator least-privilege ACL differs",
+    )?;
+    for sql in [
+        // DML is never allowed, not even on tables it can read.
+        "INSERT INTO public.members (member_id) VALUES ('ro-probe')",
+        "UPDATE public.members SET member_id = 'ro-probe'",
+        "DELETE FROM public.members",
+        "TRUNCATE public.members",
+        "INSERT INTO public.discord_send_admission (token_key) VALUES ('ro-probe')",
+        "INSERT INTO public._sqlx_migrations (version) VALUES (-1)",
+        // DDL is never allowed.
+        "CREATE TABLE public.ro_probe (id int)",
+        "CREATE TEMP TABLE ro_probe (id int)",
+        "CREATE SCHEMA ro_probe",
+        "ALTER TABLE public.members ADD COLUMN forbidden int",
+        // No sequence, function or web-view access.
+        "SELECT nextval('public.guild_settings_cas_seq')",
+        "SELECT last_value FROM public.guild_settings_cas_seq",
+        "SELECT public.guild_settings_assign_version()",
+        "SELECT * FROM web_v1.members",
+        "SELECT * FROM public.member_erasure_audit",
+        "SELECT * FROM public.invite_campaigns",
+    ] {
+        denied(pool, ro, sql).await?;
+    }
+    // Non-superuser escalation fence: a login holding only the read-only
+    // group cannot SET ROLE into the migrator group. (The pooled acceptance
+    // connection is the bootstrap superuser, for whom any nested SET ROLE
+    // trivially succeeds, so this needs its own least-privilege login.)
+    let login = format!("{ro}_login");
+    execute(pool, format!("CREATE ROLE {login} LOGIN")).await?;
+    execute(pool, format!("GRANT {ro} TO {login}")).await?;
+    let probe = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(pool.connect_options().as_ref().clone().username(&login))
+        .await?;
+    let escalated = sqlx::query_scalar::<_, bool>("SELECT pg_has_role(current_user, $1, 'MEMBER')")
+        .bind(&roles[0])
+        .fetch_one(&probe)
+        .await?;
+    require(!escalated, "read-only login is a migrator member")?;
+    let denied_set = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET ROLE {}", roles[0])))
+        .execute(&probe)
+        .await;
+    probe.close().await;
+    execute(pool, format!("REVOKE {ro} FROM {login}")).await?;
+    execute(pool, format!("DROP ROLE {login}")).await?;
+    require(
+        matches!(denied_set, Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42501")),
+        "read-only login SET ROLE into migrator was not denied",
+    )?;
     Ok(())
 }
 

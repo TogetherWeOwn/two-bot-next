@@ -88,6 +88,7 @@ mod tests {
             assert!(rendered.contains(MATRIX));
             rendered_without_login(&rendered);
             assert!(rendered.contains("CREATE ROLE two_bot_runtime NOLOGIN"));
+            assert!(rendered.contains("CREATE ROLE two_bot_migrator_ro NOLOGIN"));
             assert!(rendered.starts_with("-- Print-only operator plan."));
             assert!(rendered.ends_with("COMMIT;\n"));
             // The ephemeral self-grant is present in both phases and revoked

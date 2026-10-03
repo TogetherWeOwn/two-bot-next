@@ -317,17 +317,21 @@ reverts, restores, creates roles or grants. The sanitized JSON manifest (source
 SHA, per-migration SHA-384, ledger before/after, applied count) is the evidence;
 on failure the ledger-after is preserved, not repaired.
 
-The workflow runs only when dispatched from `main` and reads the binding from
-the `staging-migrate` GitHub environment. That environment must have a required
-reviewer and a main-only deployment-branch rule, and the binding must be an
-environment secret, not a repository secret; otherwise a workflow edited on
-another branch could read it. This change does not create the environment or
-the secret.
+The workflow runs only when dispatched from `main` and splits into two jobs.
+The `plan` job always runs and reads the binding from the `staging-migrate-plan`
+GitHub environment, which carries no reviewer because planning changes nothing;
+the `apply` job runs only for `mode: apply`, after a green plan, and reads the
+binding from the `staging-migrate-apply` environment, which must have a
+required reviewer and a main-only deployment-branch rule. Both bindings must be
+environment secrets, not repository secrets; otherwise a workflow edited on
+another branch could read them. This change does not create the environments or
+the secrets: create both before dispatch, or the jobs fail instead of running.
 
 Prerequisites the legitimate principal must verify **before dispatch** (the
 runner cannot, and this change does not claim them): the real staging Neon
 identity; that the dedicated migrator binding already exists; the
-`staging-migrate` environment protections above; and a complete
+`staging-migrate-plan` / `staging-migrate-apply` environment protections
+above; and a complete
 recovery set covering the Next schema, `_sqlx_migrations` ledger, object
 ownership, ACLs and logins. The generic legacy backup omits Next tables and the
 SQLx history, and unverified Neon PITR is not a working recovery. Apply the
