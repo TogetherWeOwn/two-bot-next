@@ -26,7 +26,8 @@ use twilight_cache_inmemory::DefaultInMemoryCache;
 use twilight_gateway::Event;
 use twilight_model::{
     application::interaction::{
-        application_command::CommandOptionValue, Interaction, InteractionData, InteractionType,
+        application_command::{CommandDataOption, CommandOptionValue},
+        Interaction, InteractionData, InteractionType,
     },
     channel::{message::MessageFlags, Channel},
     guild::{Permissions, Role},
@@ -36,8 +37,8 @@ use twilight_model::{
 use two_bot_core::{
     now_iso,
     voice_access::{
-        may_create_room, may_use_command, AccessControls, AccessDecision, AccessDenyReason,
-        AccessMember,
+        is_voice_command, may_create_room, may_use_command, validate_access_controls,
+        AccessControls, AccessDecision, AccessDenyReason, AccessMember,
     },
     voice_rooms::{
         category_full_message, voice_commands, ActionQueue, CreatorChannel, NewRoomSpec,
@@ -81,6 +82,12 @@ pub trait RoomPersistence: Send + Sync {
         &self,
         guild: Snowflake,
     ) -> impl Future<Output = Result<AccessControls, StoreError>> + Send;
+    /// Replace the guild's controls (validated before the write).
+    fn save_access_controls(
+        &self,
+        guild: Snowflake,
+        controls: &AccessControls,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
     fn forget(
         &self,
         guild: Snowflake,
@@ -118,6 +125,16 @@ impl RoomPersistence for PgRoomStore {
 
     async fn access_controls(&self, guild: Snowflake) -> Result<AccessControls, StoreError> {
         self.access_controls(guild).await.map_err(store_error)
+    }
+
+    async fn save_access_controls(
+        &self,
+        guild: Snowflake,
+        controls: &AccessControls,
+    ) -> Result<(), StoreError> {
+        self.save_access_controls(guild, controls)
+            .await
+            .map_err(store_error)
     }
 
     async fn forget(&self, guild: Snowflake, channel: Snowflake) -> Result<(), StoreError> {
@@ -1096,6 +1113,8 @@ enum ActorCommand {
         created_at: String,
     },
     CreatorAdded(CreatorChannel),
+    /// The guild's saved access controls changed (`/access`).
+    AccessChanged(AccessControls),
     /// One-shot worker snapshot for `/setup` (room count, failures, halt).
     Status(oneshot::Sender<WorkerStatus>),
 }
@@ -1109,6 +1128,9 @@ pub struct VoiceRuntime<S, H> {
     enabled: bool,
     seeds: AtomicU64,
     actors: Mutex<HashMap<Snowflake, GuildActor>>,
+    /// Serializes `/access` read-modify-write cycles so two admins cannot
+    /// overwrite each other's change (rare, admin-only, so one lock is enough).
+    access_lock: tokio::sync::Mutex<()>,
 }
 
 impl<S, H> VoiceRuntime<S, H>
@@ -1130,6 +1152,7 @@ where
             enabled,
             seeds: AtomicU64::new(initial_seed()),
             actors: Mutex::new(HashMap::new()),
+            access_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1248,6 +1271,14 @@ where
         if let Some(actor) = self.live_actor(guild) {
             update(&actor.live);
             let _ = actor.tx.send(ActorCommand::Reconcile);
+        }
+    }
+
+    /// Push freshly saved access controls to the live actor, so a creation
+    /// switch takes effect without a restart.
+    fn access_changed(&self, guild: Snowflake, controls: AccessControls) {
+        if let Some(actor) = self.live_actor(guild) {
+            let _ = actor.tx.send(ActorCommand::AccessChanged(controls));
         }
     }
 
@@ -1419,6 +1450,7 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             worker.creators.insert(creator.channel_id, creator);
             worker.reconcile();
         }
+        ActorCommand::AccessChanged(controls) => worker.access = controls,
         ActorCommand::Status(reply) => {
             let _ = reply.send(WorkerStatus {
                 tracked_rooms: worker.tracked().len(),
@@ -1670,6 +1702,22 @@ pub enum VoiceCommand {
     Setup,
     Ping,
     Invite,
+    Access(AccessAction),
+}
+
+/// One `/access` sub-command. `Invalid` is a malformed or unknown shape; it
+/// is answered, never silently ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessAction {
+    Show,
+    Creation(bool),
+    RequiredRole(Option<Snowflake>),
+    Restrict {
+        command: String,
+        roles: Vec<Snowflake>,
+    },
+    Unrestrict(String),
+    Invalid,
 }
 
 /// Guild the interaction was invoked in. `PartialMember` carries no guild, so
@@ -1706,7 +1754,55 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
         "setup" => Some(VoiceCommand::Setup),
         "ping" => Some(VoiceCommand::Ping),
         "invite" => Some(VoiceCommand::Invite),
+        "access" => Some(VoiceCommand::Access(parse_access_action(&command.options))),
         _ => None,
+    }
+}
+
+fn parse_access_action(options: &[CommandDataOption]) -> AccessAction {
+    let Some(sub) = options.first() else {
+        return AccessAction::Invalid;
+    };
+    let CommandOptionValue::SubCommand(args) = &sub.value else {
+        return AccessAction::Invalid;
+    };
+    let roles: Vec<Snowflake> = ["role", "role2", "role3"]
+        .iter()
+        .filter_map(|name| args.iter().find(|option| option.name == *name))
+        .filter_map(|option| match option.value {
+            CommandOptionValue::Role(role) => Some(role.get()),
+            _ => None,
+        })
+        .fold(Vec::new(), |mut roles, role| {
+            if !roles.contains(&role) {
+                roles.push(role);
+            }
+            roles
+        });
+    let command = args
+        .iter()
+        .find(|option| option.name == "command")
+        .and_then(|option| match &option.value {
+            CommandOptionValue::String(value) => Some(value.trim().to_ascii_lowercase()),
+            _ => None,
+        });
+    match sub.name.as_str() {
+        "show" => AccessAction::Show,
+        "creation" => args
+            .iter()
+            .find(|option| option.name == "enabled")
+            .and_then(|option| match option.value {
+                CommandOptionValue::Boolean(enabled) => Some(AccessAction::Creation(enabled)),
+                _ => None,
+            })
+            .unwrap_or(AccessAction::Invalid),
+        "role" => AccessAction::RequiredRole(roles.first().copied()),
+        "restrict" => command.map_or(AccessAction::Invalid, |command| AccessAction::Restrict {
+            command,
+            roles,
+        }),
+        "unrestrict" => command.map_or(AccessAction::Invalid, AccessAction::Unrestrict),
+        _ => AccessAction::Invalid,
     }
 }
 
@@ -1733,6 +1829,7 @@ impl VoiceCommand {
             Self::Setup => "setup",
             Self::Ping => "ping",
             Self::Invite => "invite",
+            Self::Access(_) => "access",
         }
     }
 }
@@ -1866,6 +1963,90 @@ async fn execute_create<S: RoomPersistence, H: RoomWrites>(
     }
 }
 
+/// Render the controls for `/access show` and as the confirmation after a change.
+fn access_summary(controls: &AccessControls) -> String {
+    let mut lines = vec![
+        format!(
+            "Room creation: {}",
+            if controls.room_creation_enabled {
+                "on"
+            } else {
+                "off (existing rooms and commands keep working)"
+            }
+        ),
+        match controls.required_role {
+            Some(role) => format!("Required role: <@&{role}>"),
+            None => "Required role: none".to_owned(),
+        },
+    ];
+    if controls.command_roles.is_empty() {
+        lines.push("Restricted commands: none".to_owned());
+    } else {
+        lines.push("Restricted commands:".to_owned());
+        for (command, roles) in &controls.command_roles {
+            let who = if roles.is_empty() {
+                "admins only".to_owned()
+            } else {
+                roles
+                    .iter()
+                    .map(|role| format!("<@&{role}>"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            lines.push(format!("- /{command}: {who}"));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Apply one `/access` action: read, change, validate, save, then hand the
+/// saved controls to `on_saved` (the live actor). A failed read or write
+/// changes nothing and says so.
+async fn execute_access<S: RoomPersistence>(
+    store: &S,
+    guild_id: Snowflake,
+    action: AccessAction,
+    on_saved: impl FnOnce(AccessControls),
+) -> String {
+    let Ok(mut controls) = store.access_controls(guild_id).await else {
+        return "Could not read the voice-room settings. Nothing was changed; try again."
+            .to_owned();
+    };
+    match action {
+        AccessAction::Show => return access_summary(&controls),
+        AccessAction::Invalid => {
+            return "Unknown /access option. Use show, creation, role, restrict or unrestrict."
+                .to_owned()
+        }
+        AccessAction::Creation(enabled) => controls.room_creation_enabled = enabled,
+        AccessAction::RequiredRole(role) => controls.required_role = role,
+        AccessAction::Restrict { command, roles } => {
+            if !is_voice_command(&command) {
+                return format!("/{command} is not a voice-room command, so nothing was changed.");
+            }
+            controls.command_roles.insert(command, roles);
+        }
+        AccessAction::Unrestrict(command) => {
+            if controls.command_roles.remove(&command).is_none() {
+                return format!("/{command} has no role restriction, so nothing was changed.");
+            }
+        }
+    }
+    if validate_access_controls(&controls).is_err() {
+        return "Those settings are not valid, so nothing was changed.".to_owned();
+    }
+    match store.save_access_controls(guild_id, &controls).await {
+        Ok(()) => {
+            let summary = access_summary(&controls);
+            on_saved(controls);
+            format!("Saved.\n{summary}")
+        }
+        Err(_) => {
+            "Could not save the voice-room settings. Nothing was changed; try again.".to_owned()
+        }
+    }
+}
+
 fn create_error_text(error: RoomHttpError) -> String {
     match error {
         RoomHttpError::Unauthorized => "Voice rooms are paused: Discord refused the bot credential. Tell an admin to fix the token, then restart the bot.".to_owned(),
@@ -1944,6 +2125,23 @@ where
         }
         VoiceCommand::Invite => {
             reply(ephemeral_response(&invite_render(invite_code))).await;
+            true
+        }
+        VoiceCommand::Access(action) => {
+            if !member.is_admin {
+                reply(ephemeral_response(
+                    "You need Manage Channels to use /access.",
+                ))
+                .await;
+                return true;
+            }
+            let _serialized = runtime.access_lock.lock().await;
+            let (store, _) = runtime.make_pair();
+            let text = execute_access(&store, guild_id, action, |controls| {
+                runtime.access_changed(guild_id, controls);
+            })
+            .await;
+            reply(ephemeral_response(&text)).await;
             true
         }
         VoiceCommand::Setup => {
