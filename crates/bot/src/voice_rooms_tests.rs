@@ -1967,6 +1967,11 @@ async fn join_with_companion(
     // Simulate Discord's voice-state echo: the member is now in the room.
     worker.live.voice_update(member, Some(500), Some(false));
     worker.reconcile();
+    // The companion plan was built before the move, so the creation
+    // overwrites carry no occupant: the echo's reconcile queues the first
+    // occupant's View grant. Drain it so callers start from an idle queue.
+    dispatch(worker, *now).await;
+    *now += 1;
     500
 }
 
@@ -2238,7 +2243,7 @@ async fn later_promoted_admin_role_is_resolved_live_without_touching_open_rooms(
     // A role is promoted to Manage Channels after the companion exists: the
     // next published snapshot carries it and the occupant is still inside.
     let mut promoted = snapshot(
-        &[500],
+        &[500, worker.companions[&500].text_channel_id],
         vec![VoiceMember {
             member_id: MEMBER,
             channel_id: 500,
