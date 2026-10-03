@@ -5160,7 +5160,7 @@ fn dead_letter_families_cover_every_queue_action_shape() {
 #[tokio::test]
 async fn terminal_queue_failure_dead_letters_exactly_once_per_family() {
     let (live, store, http, _) = fixture();
-    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     // Non-terminal attempt: requeues with backoff, emits no dead letter.
     worker.queue.enqueue(
         GUILD,
@@ -5231,7 +5231,7 @@ async fn failed_create_compensation_orphan_is_counted_without_a_channel_id() {
     let text = execute_create(&store, &http, GUILD, "lobby", |_, _| {}).await;
     assert!(text.contains("manually"), "{text}");
     assert!(
-        global_series("two_bot_voice_orphans_total") >= before + 1,
+        global_series("two_bot_voice_orphans_total") > before,
         "untracked orphan must advance the counter"
     );
 }
