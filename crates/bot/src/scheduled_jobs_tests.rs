@@ -118,10 +118,13 @@ async fn due_one_shot_posts_once_with_legacy_mentions_and_leaves_the_due_set() {
 
     let sent = posts(&mock);
     assert_eq!(sent.len(), 1, "only the due row posts");
-    // The shared send path defuses @everyone in the text as well as sending
-    // `allowed_mentions.parse = []`.
+    // The shared send path defuses @everyone in the text and sends the
+    // legacy-closed allowed_mentions (nothing parsed, no roles/users/reply ping).
     assert_eq!(sent[0]["content"], "standup @\u{200b}everyone");
-    assert_eq!(sent[0]["allowed_mentions"], json!({"parse": []}));
+    assert_eq!(
+        sent[0]["allowed_mentions"],
+        json!({"parse": [], "roles": [], "users": [], "replied_user": false})
+    );
     assert_eq!(sent[0]["enforce_nonce"], true);
     assert_eq!(sent[0]["nonce"].as_str().map(str::len), Some(24));
     let done = row(pool, "once").await;
