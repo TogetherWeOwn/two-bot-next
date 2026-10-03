@@ -5651,7 +5651,8 @@ where
                 },
             )
             .await;
-            if let Some(response) = answered.lock().unwrap().take() {
+            let response = answered.lock().unwrap().take();
+            if let Some(response) = response {
                 if let Err(error) = replies.respond(interaction, response).await {
                     warn!(interaction_id = interaction.id.get(), %error,
                         "voice vote response failed; not retried");
@@ -5675,7 +5676,8 @@ where
                 },
             )
             .await;
-            if let Some(response) = answered.lock().unwrap().take() {
+            let response = answered.lock().unwrap().take();
+            if let Some(response) = response {
                 if let Err(error) = replies.respond(interaction, response).await {
                     warn!(interaction_id = interaction.id.get(), %error,
                         "voice ballot response failed; not retried");
