@@ -57,9 +57,11 @@ async fn original_response_edit_suppresses_mentions_bounds_content_and_validates
     );
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body["allowed_mentions"]["parse"], serde_json::json!([]));
-    // Twilight omits the empty explicit allowlists; parse=[] disables all pings.
-    assert!(body["allowed_mentions"].get("users").is_none());
-    assert!(body["allowed_mentions"].get("roles").is_none());
+    // The executor rewrites mentions explicitly rather than relying on
+    // Twilight's omitted-empty serialization: empty allowlists are present
+    // but ping nobody, and parse=[] disables all pings.
+    assert_eq!(body["allowed_mentions"]["users"], serde_json::json!([]));
+    assert_eq!(body["allowed_mentions"]["roles"], serde_json::json!([]));
     assert!(matches!(
         executor
             .edit_interaction_response(0, "synthetic-webhook-token", "result")
