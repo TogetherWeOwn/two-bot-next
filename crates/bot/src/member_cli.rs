@@ -409,7 +409,8 @@ where
         println!("DRY RUN: would {intent}; pass --execute to write");
         return 0;
     }
-    match write(store, &now_iso()).await {
+    let now = now_iso();
+    match write(store, &now).await {
         Ok(()) => {
             println!("RECONCILED: {intent}");
             0
