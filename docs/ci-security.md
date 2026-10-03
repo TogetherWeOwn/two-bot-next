@@ -76,8 +76,10 @@ SHA; the guard accepts only a run that concluded `success` on that SHA, so a
 closed. This change does not authorize a production bypass.
 
 `supply-chain.yml` holds the required `pr-lint` and `gitleaks` jobs (main #187).
-The `pipeline-benchmark` reusable call in `nightly.yml` is the only permitted
-`uses:` job, and its caller grants `contents: read`. Under a default-deny top
+The permitted same-repo reusable calls are the `pipeline-benchmark` call in
+`nightly.yml` and the read-only SBOM inventory calls (`supply-chain` in
+`check.yml`, `release-sbom` in `release.yml`, both to `sbom.yml`, TOG-10893);
+each caller grants `contents: read`. Under a default-deny top
 level, a called workflow can only narrow the caller's grant.
 
 Environment settings, secrets, branch protection, and deployments are not
