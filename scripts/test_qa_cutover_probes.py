@@ -56,6 +56,35 @@ class BaseUrlTest(unittest.TestCase):
         base = probe.normalize_base("http://127.0.0.1:8080/")
         self.assertEqual(base, "http://127.0.0.1:8080")
 
+    def test_ipv6_brackets_survive(self):
+        base = probe.normalize_base("http://[::1]:8080/")
+        self.assertEqual(base, "http://[::1]:8080")
+
+    def test_truthful_503_with_gateway_ready_stays_green(self):
+        body = (503, json.dumps({
+            "components": [["process", "ready"], ["gateway", "ready"],
+                           ["database", "down"]],
+            "jobs": {"counter": {"parked": True, "running": False}},
+            "build_revision": "r", "build_id": "b",
+        }).encode())
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS gateway-state:", out)
+
+    def test_truthful_503_with_gateway_ready_fails_expect_ready(self):
+        body = (503, json.dumps({
+            "components": [["process", "ready"], ["gateway", "ready"],
+                           ["database", "down"]],
+            "jobs": {"counter": {"parked": True, "running": False}},
+            "build_revision": "r", "build_id": "b",
+        }).encode())
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/", "--expect-ready")
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL gateway-state:", out)
+        self.assertIn("service not ready", out)
+
 
 class ParkedPreviewTest(unittest.TestCase):
     def test_parked_preview_stays_green(self):

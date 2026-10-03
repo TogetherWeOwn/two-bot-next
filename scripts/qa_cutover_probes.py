@@ -18,10 +18,12 @@ Probes and the code path each one checks:
                    vocabulary, plus build_revision and build_id.
                    Source: crates/bot/src/server.rs ReadinessReport,
                    crates/core/src/health.rs HealthReport.
-  gateway-state    the gateway component agrees with the HTTP status
-                   (200 means ready; 503 means down/starting, i.e. parked,
-                   which is not E2E approval). A 200 with a parked gateway,
-                   or a 503 naming a ready gateway, fails as a lying gate.
+  gateway-state    the gateway component is truthful (ready means READY
+                   dispatch committed; down/starting means parked, which is
+                   not E2E approval). readiness-shape already proves the HTTP
+                   status matches the breakdown, so gateway-ready + 503 (e.g.
+                   database down) passes: only the service is not ready.
+                   Pass --expect-ready when the gate needs readiness itself.
                    Source: crates/bot/src/gateway.rs GatewayState::status,
                    crates/bot/src/server.rs readiness_after_ping.
   jobs-map         /readyz carries the informational jobs map (each entry
@@ -91,10 +93,9 @@ def normalize_base(url):
     except ValueError:
         raise ProbeError(f"refusing: {url!r:.80} is not a usable base URL")
     try:
-        port = parts.port
+        parts.port
     except ValueError:
         raise ProbeError(f"refusing: {url!r:.80} has an unusable port")
-    _ = port
     if parts.scheme not in ("http", "https"):
         raise ProbeError(f"refusing: {url!r:.80} is not http(s)")
     if parts.username or parts.password:
@@ -102,6 +103,8 @@ def normalize_base(url):
     if parts.path not in ("", "/") or parts.query or parts.fragment:
         raise ProbeError(f"refusing: {url!r:.80} must be a bare origin, no path")
     host = parts.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
     port_suffix = f":{parts.port}" if parts.port else ""
     return f"{parts.scheme}://{host}{port_suffix}"
 
@@ -170,8 +173,17 @@ def check_readyz_shape(status, body):
 
 def check_gateway(state, status, expect_ready):
     gateway = state["gateway"]
-    if status == 200 and gateway == "ready":
-        return "gateway ready: READY dispatch committed"
+    if gateway == "ready":
+        # readiness-shape already proved the status matches the breakdown,
+        # so gateway-ready + 503 (e.g. database down) is truthful, not a lie:
+        # only the service itself is not ready. Gateway truthfulness and
+        # service readiness are separate verdicts.
+        note = "gateway ready: READY dispatch committed"
+        if status == 200:
+            return note
+        if expect_ready:
+            raise ProbeError(f"{note}, but HTTP {status}: service not ready")
+        return f"{note}, but HTTP {status} (truthful, probe stays green)"
     if status == 503 and gateway in ("down", "starting"):
         note = f"gateway {gateway}: parked, not E2E approval"
         if expect_ready:

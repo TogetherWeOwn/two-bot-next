@@ -57,22 +57,14 @@ They are HTTP observations, **not database probes or test authorization**.
 | Neither route answers / 500 / HTTP 1101 | Inspect Worker bindings and container startup. Named environments must repeat all Container/DO/exports wiring; do not bypass readiness. |
 
 The same two routes are graded by the read-only cutover acceptance probes
-(`scripts/qa_cutover_probes.py`, stdlib only, no credentials, no writes):
-
-```bash
-# Local preview now (truthful parked 503 stays green):
-python3 scripts/qa_cutover_probes.py --base-url http://127.0.0.1:8080
-# Staging later (same invocation, https origin):
-python3 scripts/qa_cutover_probes.py --base-url "${STAGING_WORKER_URL}"
-# Cutover gate mode: fail unless the service itself is ready:
-python3 scripts/qa_cutover_probes.py --base-url "${STAGING_WORKER_URL}" --expect-ready
-```
-
-The five probes check liveness, the readyz breakdown shape, gateway truthfulness
-(200 only with gateway ready), the informational jobs map, and that the body is
-the container's breakdown rather than an ownership-fence refusal. A parked
-preview (503, gateway down) passes; pass `--expect-ready` only when the gate
-needs readiness itself. Each probe line cites the code path it checks.
+(`scripts/qa_cutover_probes.py`, stdlib only, no credentials, no writes).
+Run from the repo root against a local preview or staging by passing its bare
+origin as `--base-url` (or `QA_PROBE_BASE_URL`); add `--expect-ready` only when
+the gate needs the service itself ready. A parked preview (truthful 503) stays
+green without the flag. Each probe line cites the code path it checks. The five
+probes cover liveness, the readyz breakdown shape, gateway truthfulness, the
+informational jobs map, and that the body is the container's breakdown rather
+than an ownership-fence refusal.
 
 The container listens on `LISTEN_ADDR` (default `0.0.0.0:8080`). The Worker
 sets it from `BOT_PORT` (default 8080). Both routes use this listener; there is
