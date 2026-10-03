@@ -230,7 +230,7 @@ fn reconciled_target_preserves_window_changes_without_broadening() {
             },
         ],
     );
-    let mock = MockDiscord::from_baseline(&[baseline.clone()]);
+    let mock = MockDiscord::from_baseline(std::slice::from_ref(&baseline));
     let live_ids: BTreeMap<String, String> = mock.live_ids_for_scope(&baseline.scope);
     let report = reconcile_watch_window(&baseline, &staged, &live, &lineage, &live_ids);
     assert!(report.is_go(), "frozen: {:?}", report.frozen_reasons);
@@ -273,7 +273,7 @@ fn restoring_the_baseline_must_not_undo_window_changes() {
             },
         ],
     );
-    let mock = MockDiscord::from_baseline(&[baseline.clone()]);
+    let mock = MockDiscord::from_baseline(std::slice::from_ref(&baseline));
     let live_ids = mock.live_ids_for_scope(&baseline.scope);
     let report = reconcile_watch_window(&baseline, &staged, &live, &lineage, &live_ids);
     assert!(!report.is_go());
@@ -287,7 +287,7 @@ fn restoring_the_baseline_must_not_undo_window_changes() {
 fn full_rehearsal_is_go_on_both_scopes_with_provisioned_access() {
     for baseline in [global_baseline(), guild_baseline()] {
         let staged = baseline.clone();
-        let mut mock = MockDiscord::from_baseline(&[baseline.clone()]);
+        let mut mock = MockDiscord::from_baseline(std::slice::from_ref(&baseline));
         let input = RehearsalInput {
             baseline: baseline.clone(),
             staged: staged.clone(),
@@ -325,7 +325,7 @@ fn full_rehearsal_is_go_on_both_scopes_with_provisioned_access() {
 #[test]
 fn full_rehearsal_stops_before_reconciled_puts_without_access() {
     let baseline = guild_baseline();
-    let mut mock = MockDiscord::from_baseline(&[baseline.clone()]);
+    let mut mock = MockDiscord::from_baseline(std::slice::from_ref(&baseline));
     let input = RehearsalInput {
         baseline: baseline.clone(),
         staged: baseline.clone(),
