@@ -188,53 +188,35 @@ async fn scheduled_runtime_probe(pool: &PgPool, role: &str) -> Result<(), sqlx::
     Ok(())
 }
 
+/// Every cutover migration in source order, read from the directory so a new
+/// migration is exercised without updating a hardcoded list.
+fn migration_files() -> Vec<(i64, String)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cutover/migrations");
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .expect("cutover migrations directory")
+        .map(|entry| entry.expect("migration entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+        .collect();
+    entries.sort();
+    entries
+        .iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .expect("migration file name")
+                .to_string_lossy();
+            let digits: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let version: i64 = digits.parse().expect("migration version prefix");
+            let sql = std::fs::read_to_string(path).expect("read migration");
+            (version, sql)
+        })
+        .collect()
+}
+
 async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     // Real migration files, not a reduced fixture that omits trigger/sequence paths.
-    for migration in [
-        include_str!("../../cutover/migrations/0001_funnel.sql"),
-        include_str!("../../cutover/migrations/0002_leveling.sql"),
-        include_str!("../../cutover/migrations/0120_channel_moderation.sql"),
-        include_str!("../../cutover/migrations/0121_channel_claim_generation.sql"),
-        include_str!("../../cutover/migrations/0122_channel_lockdown_generation.sql"),
-        include_str!("../../cutover/migrations/0140_scheduled_messages.sql"),
-        include_str!("../../cutover/migrations/0141_scheduled_messages_legacy_upgrade.sql"),
-        include_str!("../../cutover/migrations/0150_sticky_messages.sql"),
-        include_str!("../../cutover/migrations/0160_rsvp.sql"),
-        include_str!("../../cutover/migrations/0170_lfg.sql"),
-        include_str!("../../cutover/migrations/0190_onboarding.sql"),
-        include_str!("../../cutover/migrations/0200_self_roles.sql"),
-        include_str!("../../cutover/migrations/0203_self_role_pending_exchange.sql"),
-        include_str!("../../cutover/migrations/0205_self_role_exchange_receipts.sql"),
-        include_str!("../../cutover/migrations/0206_self_role_exchange_baselines.sql"),
-        include_str!("../../cutover/migrations/0210_tickets.sql"),
-        include_str!("../../cutover/migrations/0220_automod.sql"),
-        include_str!("../../cutover/migrations/0221_automod_delivery_claims.sql"),
-        include_str!("../../cutover/migrations/0222_automod_counted_claim.sql"),
-        include_str!("../../cutover/migrations/0223_automod_preserved_match.sql"),
-        include_str!("../../cutover/migrations/0224_voice_rooms.sql"),
-        include_str!("../../cutover/migrations/0225_voice_inherit_limit.sql"),
-        include_str!("../../cutover/migrations/0226_voice_text_channels.sql"),
-        include_str!("../../cutover/migrations/0227_voice_access_controls.sql"),
-        include_str!("../../cutover/migrations/0228_voice_logging_settings.sql"),
-        include_str!("../../cutover/migrations/0229_voice_config.sql"),
-        include_str!("../../cutover/migrations/0300_website_contract.sql"),
-        include_str!("../../cutover/migrations/0310_presence_probe.sql"),
-        include_str!("../../cutover/migrations/0311_community_scorecard.sql"),
-        include_str!("../../cutover/migrations/0312_community_scorecard_attempts.sql"),
-        include_str!("../../cutover/migrations/0320_gateway_sessions.sql"),
-        include_str!("../../cutover/migrations/0321_gateway_boot_directives.sql"),
-        include_str!("../../cutover/migrations/0330_guild_settings.sql"),
-        include_str!("../../cutover/migrations/0331_guild_settings_versions.sql"),
-        include_str!("../../cutover/migrations/0332_guild_settings_allocator.sql"),
-        include_str!("../../cutover/migrations/0333_guild_settings_revision.sql"),
-        include_str!("../../cutover/migrations/0334_guild_settings_cas.sql"),
-        include_str!("../../cutover/migrations/0340_operational_audit.sql"),
-        include_str!("../../cutover/migrations/0350_internal_actions.sql"),
-        include_str!("../../cutover/migrations/0353_internal_clock_high_water.sql"),
-        include_str!("../../cutover/migrations/0361_discord_send_admission.sql"),
-        include_str!("../../cutover/migrations/0362_gateway_onboarding_jobs.sql"),
-    ] {
-        sqlx::raw_sql(migration).execute(pool).await?;
+    for (_, migration) in migration_files() {
+        sqlx::raw_sql(migration.as_str()).execute(pool).await?;
     }
     sqlx::raw_sql("CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);")
         .execute(pool)
@@ -351,6 +333,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     // Migration 0210 relations require runtime CRUD, including the transcript's
     // ticket foreign key. Delete the transcript before its parent ticket.
     as_role(pool, &roles[1], "INSERT INTO public.tickets (id, guild_id, channel_id, opener_id, status, created_at) VALUES ('ticket-probe', 'g', 'c', 'm', 'open', '2026-01-01T00:00:00Z'); SELECT * FROM public.tickets; UPDATE public.tickets SET claimed_by = 'staff' WHERE id = 'ticket-probe'; INSERT INTO public.ticket_transcripts (ticket_id, guild_id, channel_id, opener_id, claimed_by, content, message_count, created_at, purge_after) VALUES ('ticket-probe', 'g', 'c', 'm', 'staff', 'probe', 1, '2026-01-01T00:00:00Z', '2026-04-01T00:00:00Z'); SELECT * FROM public.ticket_transcripts; UPDATE public.ticket_transcripts SET content = 'updated probe' WHERE ticket_id = 'ticket-probe'; DELETE FROM public.ticket_transcripts WHERE ticket_id = 'ticket-probe'; DELETE FROM public.tickets WHERE id = 'ticket-probe'").await?;
+    matrix_backfill_runtime_regression(pool, roles).await?;
     automod_runtime_role_regression(pool, roles).await?;
     for view in [
         "contract_meta",
@@ -472,6 +455,76 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         findings(pool, roles).await?.is_empty(),
         "restored matrix drifted",
     )?;
+    Ok(())
+}
+
+async fn matrix_backfill_runtime_regression(
+    pool: &PgPool,
+    roles: &[String],
+) -> Result<(), sqlx::Error> {
+    // Tables backfilled into the matrix after the staging rehearsal: the six
+    // runtime DML tables accept least-privilege CRUD under the runtime login,
+    // while the two migrator-only tables stay closed to runtime and reader.
+    as_role(
+        pool,
+        &roles[1],
+        r#"INSERT INTO public.feed_relays (id, guild_id, channel_id, kind, source, created_by, created_at, updated_at)
+            VALUES ('roles-probe', 'g', 'c', 'rss', 'https://example.test/feed', 'actor', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        INSERT INTO public.feed_deliveries (feed_id, item_key, nonce, state, first_seen_at)
+            VALUES ('roles-probe', 'item', 'nonce', 'pending', '2026-01-01T00:00:00Z');
+        SELECT * FROM public.feed_deliveries;
+        UPDATE public.feed_deliveries SET state = 'delivered' WHERE feed_id = 'roles-probe';
+        DELETE FROM public.feed_deliveries WHERE feed_id = 'roles-probe';
+        DELETE FROM public.feed_relays WHERE id = 'roles-probe';
+        INSERT INTO public.join_risk_flags (event_id, guild_id, member_id, account_created_at, joined_at, source, score, reasons_json, bulk_join_window, flagged, created_at)
+            VALUES ('roles-probe', 'g', 'm', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'join', 0, '[]', false, false, '2026-01-01T00:00:00Z');
+        SELECT * FROM public.join_risk_flags;
+        UPDATE public.join_risk_flags SET flagged = true WHERE event_id = 'roles-probe';
+        DELETE FROM public.join_risk_flags WHERE event_id = 'roles-probe';
+        INSERT INTO public.moderation_idempotency (guild_id, idempotency_key, action, request_hash, state, claimed_at)
+            VALUES ('g', 'roles-probe', 'lock', 'hash', 'claimed', '2026-01-01T00:00:00Z');
+        INSERT INTO public.moderation_channel_executions (channel_id, guild_id, idempotency_key, claim_token)
+            VALUES ('c', 'g', 'roles-probe', 'tok');
+        SELECT * FROM public.moderation_channel_executions;
+        UPDATE public.moderation_channel_executions SET claim_token = 'tok2' WHERE channel_id = 'c';
+        DELETE FROM public.moderation_channel_executions WHERE channel_id = 'c';
+        DELETE FROM public.moderation_idempotency WHERE guild_id = 'g' AND idempotency_key = 'roles-probe';
+        INSERT INTO public.containment_events (audit_entry_id, guild_id, action, weight, occurred_at, state, reason, created_at)
+            VALUES ('roles-probe', 'g', 'observe', 1, '2026-01-01T00:00:00Z', 'observe', 'probe', '2026-01-01T00:00:00Z');
+        INSERT INTO public.containment_incidents (id, guild_id, executor_id, trigger_audit_entry_id, heat, state, started_at)
+            VALUES ('roles-probe', 'g', 'e', 'roles-probe', 1, 'dry_run', '2026-01-01T00:00:00Z');
+        SELECT * FROM public.containment_incidents;
+        UPDATE public.containment_incidents SET state = 'contained' WHERE id = 'roles-probe';
+        DELETE FROM public.containment_incidents WHERE id = 'roles-probe';
+        DELETE FROM public.containment_events WHERE audit_entry_id = 'roles-probe';"#,
+    )
+    .await?;
+    for table in [
+        "feed_relays",
+        "feed_deliveries",
+        "join_risk_flags",
+        "moderation_channel_executions",
+        "containment_events",
+        "containment_incidents",
+    ] {
+        denied(pool, &roles[2], &format!("SELECT * FROM public.{table}")).await?;
+    }
+    // Migrator-only: operator tooling tables with no runtime or reader path.
+    // UPDATE targets real columns: parse errors are not permission denials.
+    for (table, column) in [
+        ("member_erasure_audit", "actor"),
+        ("invite_campaigns", "label"),
+    ] {
+        for sql in [
+            format!("SELECT * FROM public.{table}"),
+            format!("INSERT INTO public.{table} DEFAULT VALUES"),
+            format!("UPDATE public.{table} SET {column} = 'forbidden'"),
+            format!("DELETE FROM public.{table}"),
+        ] {
+            denied(pool, &roles[1], &sql).await?;
+            denied(pool, &roles[2], &sql).await?;
+        }
+    }
     Ok(())
 }
 
@@ -677,6 +730,220 @@ async fn transactional_drift(
     .await;
     tx.rollback().await?;
     result
+}
+
+/// Staging ledger before the first bootstrap: the 29 migration versions the
+/// pending set is computed against. Pending versions are derived as every
+/// other source version, so later migrations join the pending set unlisted.
+const STAGING_LEDGER29: [i64; 29] = [
+    1, 2, 120, 121, 122, 123, 140, 141, 150, 160, 170, 180, 190, 200, 210, 300, 310, 311, 320, 330,
+    331, 332, 333, 334, 340, 350, 351, 360, 390,
+];
+
+/// The ephemeral self-grant must be gone after the plan commits: the
+/// executing identity cannot SET the migrator group anymore. Runs inside a
+/// rolled-back transaction so the pooled connection keeps no role state.
+async fn cannot_set_role(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let result = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET LOCAL ROLE {role}")))
+        .execute(&mut *tx)
+        .await;
+    tx.rollback().await?;
+    match result {
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42501") => Ok(()),
+        _ => Err(sqlx::Error::InvalidArgument(format!(
+            "{role} membership was not revoked"
+        ))),
+    }
+}
+
+#[tokio::test]
+async fn scratch_bootstrap_flow_from_staging_ledger() {
+    let url = match std::env::var("TWO_ROLES_TEST_DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") => TEST_URL.to_owned(),
+        Err(_) => return, // Offline suite: explicitly requested and CI tests never skip.
+    };
+    let options = test_database::test_options(&url).expect("refusing non-test-container target");
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    let (name, roles) = names();
+    let provisioner = format!("{name}_p");
+    let migrator_login = format!("{name}_l");
+    // Non-superuser CREATEROLE provisioning identity owning the scratch
+    // database, plus a plain login that becomes the dedicated migrator login.
+    // Trust auth on the disposable cluster takes the empty password, exactly
+    // like the existing acceptance test.
+    execute(
+        &admin,
+        format!("CREATE ROLE {provisioner} LOGIN CREATEROLE"),
+    )
+    .await
+    .unwrap();
+    execute(&admin, format!("CREATE ROLE {migrator_login} LOGIN"))
+        .await
+        .unwrap();
+    execute(
+        &admin,
+        format!("CREATE DATABASE {name} OWNER {provisioner}"),
+    )
+    .await
+    .unwrap();
+    let provision_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone().username(&provisioner).database(&name))
+        .await
+        .unwrap();
+    // Build the 29-version state as the provisioning identity.
+    let all = migration_files();
+    let mut ledger = 0usize;
+    for (version, migration) in &all {
+        if STAGING_LEDGER29.contains(version) {
+            sqlx::raw_sql(migration.as_str())
+                .execute(&provision_pool)
+                .await
+                .unwrap();
+            ledger += 1;
+        }
+    }
+    require(ledger == STAGING_LEDGER29.len(), "29-state incomplete").unwrap();
+    sqlx::raw_sql(include_str!("../../../sql/web_v1.sql"))
+        .execute(&provision_pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);")
+        .execute(&provision_pool)
+        .await
+        .unwrap();
+    let ledger_rows = STAGING_LEDGER29
+        .iter()
+        .map(|version| format!("({version})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO public._sqlx_migrations (version) VALUES {ledger_rows}"
+    )))
+    .execute(&provision_pool)
+    .await
+    .unwrap();
+    // The default phase still fails closed on the absent relations.
+    let error = execute(
+        &provision_pool,
+        isolated(
+            &database_roles::plan_for_phase(database_roles::Phase::Full),
+            &roles,
+        ),
+    )
+    .await
+    .expect_err("full plan must raise on absent relations");
+    match error {
+        sqlx::Error::Database(error) => {
+            require(
+                error.message().contains("missing relation"),
+                "full plan failed without the strict raise",
+            )
+            .unwrap();
+        }
+        other => panic!("unexpected full-plan error: {other:?}"),
+    }
+    // The bootstrap phase transfers the existing objects as the non-superuser
+    // identity, using the ephemeral SET membership for this transaction only.
+    execute(
+        &provision_pool,
+        isolated(
+            &database_roles::plan_for_phase(database_roles::Phase::Bootstrap),
+            &roles,
+        ),
+    )
+    .await
+    .unwrap();
+    cannot_set_role(&provision_pool, &roles[0]).await.unwrap();
+    // Part A equivalent (operator action): the dedicated migrator login joins
+    // the migrator group. It keeps SET membership; the provisioning identity
+    // does not.
+    execute(&admin, format!("GRANT {} TO {migrator_login}", roles[0]))
+        .await
+        .unwrap();
+    let migrator_role = roles[0].clone();
+    let migrator_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |connection, _| {
+            let role = migrator_role.clone();
+            Box::pin(async move {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET ROLE {role}")))
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(options.clone().username(&migrator_login).database(&name))
+        .await
+        .unwrap();
+    // Apply every pending migration as a SET ROLE member, then record them.
+    let mut pending = Vec::new();
+    for (version, migration) in &all {
+        if !STAGING_LEDGER29.contains(version) {
+            sqlx::raw_sql(migration.as_str())
+                .execute(&migrator_pool)
+                .await
+                .unwrap();
+            pending.push(*version);
+        }
+    }
+    require(!pending.is_empty(), "no pending migrations applied").unwrap();
+    let pending_rows = pending
+        .iter()
+        .map(|version| format!("({version})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO public._sqlx_migrations (version) VALUES {pending_rows}"
+    )))
+    .execute(&migrator_pool)
+    .await
+    .unwrap();
+    // The full phase is idempotent once every object exists; the ephemeral
+    // grant is re-acquired and revoked on each run.
+    for _ in 0..2 {
+        execute(
+            &provision_pool,
+            isolated(
+                &database_roles::plan_for_phase(database_roles::Phase::Full),
+                &roles,
+            ),
+        )
+        .await
+        .unwrap();
+        cannot_set_role(&provision_pool, &roles[0]).await.unwrap();
+    }
+    // Verify as the superuser: the provisioning identity intentionally keeps
+    // no schema access after the transfer, and catalog inspection needs none.
+    let scratch_admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.database(&name))
+        .await
+        .unwrap();
+    require(
+        findings(&scratch_admin, &roles).await.unwrap().is_empty(),
+        "bootstrap flow drifted",
+    )
+    .unwrap();
+    provision_pool.close().await;
+    migrator_pool.close().await;
+    scratch_admin.close().await;
+    // Clean up even if a privilege probe failed. Only generated owned names.
+    execute(&admin, format!("DROP DATABASE {name}"))
+        .await
+        .unwrap();
+    for role in roles.iter().chain([&provisioner, &migrator_login]) {
+        execute(&admin, format!("DROP ROLE IF EXISTS {role}"))
+            .await
+            .unwrap();
+    }
+    admin.close().await;
 }
 
 #[tokio::test]

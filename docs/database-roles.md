@@ -35,9 +35,21 @@ functions do not need runtime EXECUTE once their triggers have been created.
 
 ```sh
 two-bot db roles plan > database-roles.sql
+two-bot db roles plan --phase bootstrap > database-roles-bootstrap.sql
 # Review the rendered SQL; operator applies it separately.
 two-bot db roles verify
 ```
+
+Both phases start, after the group-creation guard, with an ephemeral
+membership block: when the executing identity cannot SET or USE
+`two_bot_migrator`, the plan grants the membership to `current_user` for this
+transaction only (`WITH INHERIT TRUE, SET TRUE` on PostgreSQL 16+, plain
+`GRANT` on 15) and revokes it before `COMMIT`, refusing the plan when the
+membership is still absent. A non-superuser provisioning identity otherwise
+fails at `ALTER SCHEMA public OWNER TO two_bot_migrator` and loses `public`
+access once ownership flips. The bootstrap render differs from the default
+(`full`) render only by the skip lines; neither render contains a password or
+a login grant.
 
 `plan` prints SQL without opening a connection, reading a database URL or executing
 anything. There is deliberately **no apply subcommand or --apply flag**. This is
@@ -58,13 +70,23 @@ never returns PASS. Verification checks missing groups/objects, group attributes
 and memberships, database/schema privileges, ownership/object kinds, effective
 table/column/sequence/function privileges (including PUBLIC), grant options, parsed
 boolean view invoker settings and unsafe future grants. Explicit grants cover the
-current migrations' 46 ordinary bot tables plus the restricted admission lane,
-SQLx ledger, nine named SERIAL sequences and
-`guild_settings_version_seq`, nine web views and five functions. This includes
+current migrations' 76 ordinary bot tables plus the restricted admission lane,
+two migrator-only tables (see below), the
+SQLx ledger, eleven named sequences, nine web views and six functions
+(three guild-settings triggers, three `web_v1` helpers). This includes
 `gateway_onboarding_jobs` and its sequence: the DML-only gateway must recover and
 write this queue, while the web reader must not access it. A detached SERIAL
 sequence remains required even after `OWNED BY NONE`. New relations/sequences need
-a reviewed matrix update; there are **no wildcard future-table grants**.
+a reviewed matrix update; there are **no wildcard future-table grants**. The
+offline matrix test enumerates the migrations directory, so a new
+`CREATE TABLE`/`SEQUENCE`/`FUNCTION` without a matrix row fails CI.
+
+`member_erasure_audit` and `invite_campaigns` are `migrator-only`: owner and
+migrator hold ALL, and neither runtime nor reader receives any grant. They are
+operator-tooling tables (erasure runs, redirect-store copy targets) with no
+runtime or reader code path. A new runtime path needs a reviewed kind change,
+never a silent grant. Migrator-only tables must not gain owned sequences
+without an explicit reviewed matrix row and matching plan/verifier support.
 Migrator-created functions default to no PUBLIC EXECUTE. Ownership alone does not
 prove ordinary ACL privileges: verification checks the migrator's required table,
 sequence and helper-function rights, and reapplication restores those rights.
@@ -103,14 +125,22 @@ and revoking grants; do not copy a credential from another service if it fails.
 The plan is transactional and refuses unsafe existing groups instead of changing
 their login status or silently removing memberships. It contains no passwords.
 
-1. For the first bootstrap, the authorized provisioning identity applies
-   `crates/cutover/migrations` through the established SQLx migration process
-   (ledger in `public`) and applies `sql/web_v1.sql` with `public` as the bot-table
-   search path. The full role plan requires those objects to exist. For later
-   migrations, the dedicated migrator login must `SET ROLE two_bot_migrator`
-   before creating objects: creator-specific default ACLs belong to the group,
-   not automatically to a member login. Reapply the reviewed plan after migrations
-   and view updates, then verify.
+1. For the first bootstrap, the order is fixed: (a) the authorized
+   provisioning identity applies the rendered bootstrap phase
+   (`two-bot db roles plan --phase bootstrap`), which transfers the existing
+   allowlisted objects and skips relations/sequences the pending migrations
+   have not created yet; (b) the operator provisions the dedicated migrator
+   login as a member of `two_bot_migrator`; (c) the migration runner plans the
+   pending set read-only for review; (d) the runner applies the pending
+   migrations with `SET ROLE two_bot_migrator`, so new objects are
+   migrator-owned from creation; (e) the provisioning identity applies the
+   full phase (`two-bot db roles plan`, the default), idempotently; (f) verify
+   reads 0 findings. For later migrations, the dedicated migrator login must
+   `SET ROLE two_bot_migrator` before creating objects: creator-specific
+   default ACLs belong to the group, not automatically to a member login.
+   Reapply the reviewed full plan after migrations and view updates, then
+   verify. `sql/web_v1.sql` is applied with `public` as the bot-table search
+   path before the bootstrap phase; functions stay strict in both phases.
 2. Review and apply the rendered role plan with the authorized provisioning
    identity. It transfers only allowlisted objects to `two_bot_migrator`; unrelated
    tables are not transferred or granted to the runtime.
