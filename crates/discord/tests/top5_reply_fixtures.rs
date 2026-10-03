@@ -39,7 +39,7 @@ use twilight_model::{
 };
 use two_bot_core::{
     commands::{PERM_BAN_MEMBERS, PERM_MANAGE_EVENTS},
-    router::replies::UNKNOWN_INTERACTION_REPLY,
+    router::replies::UNKNOWN_COMMAND_REPLY,
     HandlerId, InteractionRouter, ModerationAction, RouterGates, RouterRefusal, SlashOutcome,
 };
 use two_bot_discord::{refusal_response, response_for_slash, route_interaction, RoutedInteraction};
@@ -174,17 +174,17 @@ const PRIMARY_REFUSALS: &[(&str, RouterRefusal, &str)] = &[
     (
         "rsvp",
         RouterRefusal::AnnouncementsDisabled,
-        "Announcements are disabled on this server.",
+        "Announcements are disabled on this server. Ask a server admin to enable them in the bot configuration — this is a host setting, not a Discord role.",
     ),
     (
         "lfg",
         RouterRefusal::ManageEventsRequired,
-        "Manage Events permission is required.",
+        "You need the Manage Events permission to use this command. Ask a server admin to grant it.",
     ),
     (
         "ban",
         RouterRefusal::ModerationPermission(ModerationAction::Ban),
-        "Missing required permission for moderation.ban",
+        "You need the Ban Members permission to use /ban. Ask a server moderator or admin to grant it.",
     ),
 ];
 
@@ -247,17 +247,17 @@ fn disabled_features_refuse_with_documented_copy() {
         (
             "rsvp",
             RouterRefusal::AnnouncementsDisabled,
-            "Announcements are disabled on this server.",
+            "Announcements are disabled on this server. Ask a server admin to enable them in the bot configuration — this is a host setting, not a Discord role.",
         ),
         (
             "lfg",
             RouterRefusal::AnnouncementsDisabled,
-            "Announcements are disabled on this server.",
+            "Announcements are disabled on this server. Ask a server admin to enable them in the bot configuration — this is a host setting, not a Discord role.",
         ),
         (
             "ban",
             RouterRefusal::ModerationDisabled,
-            "Moderation is not enabled on this server.",
+            "Moderation is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.",
         ),
     ] {
         let outcome = slash_outcome(&off, name);
@@ -351,7 +351,7 @@ fn every_primary_refusal_is_ephemeral_without_mentions() {
 }
 
 #[test]
-fn unknown_names_get_the_uniform_stale_reply() {
+fn unknown_names_get_the_unknown_command_reply() {
     let router = InteractionRouter::new(all_on());
     for name in ["definitely-not-a-command", "help", "ping"] {
         // Neither legacy name exists as a slash command on this tree.
@@ -359,7 +359,7 @@ fn unknown_names_get_the_uniform_stale_reply() {
         assert_eq!(outcome, SlashOutcome::Unknown, "{name} is unknown");
         let response = response_for_slash(&outcome).expect("unknown answers");
         let json = serde_json::to_value(&response).expect("serializes");
-        assert_eq!(json["data"]["content"], UNKNOWN_INTERACTION_REPLY);
+        assert_eq!(json["data"]["content"], UNKNOWN_COMMAND_REPLY);
         assert_eq!(json["data"]["flags"], 64, "ephemeral");
     }
 }
