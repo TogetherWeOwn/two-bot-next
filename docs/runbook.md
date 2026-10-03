@@ -112,7 +112,10 @@ Look for these literal messages:
   loaded its durable state; not yet proof of a successful RESUMED event.
 - `gateway shard loop started` / `gateway reconnect failed; Twilight will retry`.
 - `durable gateway failed; checkpoint unchanged, readiness unavailable` — fatal
-  initialization failure; underlying SQL error deliberately not logged.
+  initialization failure; underlying SQL error deliberately not logged. Its
+  `error_class` is also on `/readyz` as `gateway_failure` for 15 s before exit
+  and in Workers Logs as `container_gateway_failure` (see
+  [startup-diagnostics.md](startup-diagnostics.md)).
 - `container service failed` / `SIGTERM received; draining`.
 - Worker: `two-bot container started|stopped`, `two-bot /readyz unhealthy`,
   `two-bot keepalive probe failed`, `two-bot container error`.
@@ -451,8 +454,9 @@ next boot after READY has no directive and RESUMEs normally.
 
 **Do not confuse a ported core contract with an active control.** The current
 binary runs the gateway/cache/funnel pipeline. It does not start audit delivery,
-automod sanction workers, moderation/slash-command handlers, internal-action
-HTTP, or the settings poller. The Worker does not forward the feature vars.
+automod sanction workers, moderation/slash-command handlers, or the settings
+poller. Internal-action HTTP is the dark-by-default private receiver (see the
+Internal actions row). The Worker forwards only the reviewed `TWO_*` flags.
 There is no binary audit-halt command or hot-reload/admin endpoint to recommend.
 
 For unexpected writes: first identify the actual writer (legacy bot, next image,
@@ -469,7 +473,7 @@ tokens, or redeploy with an unreviewed wiring change during this docs procedure.
 | Automations/announcements/text | `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`; text needs automations **and** `TWO_TEXT_COMMANDS=1`. | Library gates; no command publishing/job service wired. |
 | Onboarding | `TWO_ONBOARDING_MODE=legacy|session|anchor`, default legacy; `TWO_ONBOARDING_DRY_RUN=1`. | Core only; session/anchor roles and dry-run are not active runtime switches. |
 | Community scorecard | `TWO_COMMUNITY_SCORECARD=1`; recommendations on unless `TWO_COMMUNITY_RECOMMENDATIONS=0`. | Core/store present; no scorecard scheduler wired. |
-| Internal actions | Moderation requires `TWO_INTERNAL_ALLOW_MODERATION=1` **and** `TWO_MODERATION=1`; other verbs have allow flags. | Durable replay store/executor ports do not create an HTTP listener or authorize writes. |
+| Internal actions | Moderation requires `TWO_INTERNAL_ALLOW_MODERATION=1` **and** `TWO_MODERATION=1`; other verbs have allow flags. | Only the private `announcement.post` receiver exists, and only in staging: dark until the Operator sets the Worker secret `TWO_INTERNAL_ACTIONS` to `1` last; unset it to go dark again. Reachable solely through the staging Worker ingress for `POST /internal/actions`; production has none. The other allow flags still authorize nothing. See [staging ingress](internal-actions-receiver.md#staging-ingress-default-dark). |
 | Settings hot reload | Typed catalogue/store with env-only secret/moderation keys. | Poller/runtime rebuilding remains follow-up; no promise of changes applying without restart. |
 
 Source: [`automod.rs`](../crates/core/src/automod.rs),
@@ -556,6 +560,8 @@ or existing operator handoff; see [backup.md](backup.md) for unit contracts.
 | HTTP 200 health but persistent 503 ready | Listener works, gateway does not. Read `gateway` state and startup logs. Never soften readiness or count the scaffold-era deploy gate as recovery. |
 | Reconnect / RESUME refused | Follow [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery); 4007/4009 force fresh IDENTIFY. Preserve the durable checkpoint, don't hand-edit sequence or start another shard. |
 | Discord REST 429 / suspected breaker | The legacy shared global/route 429 breaker is absent; current gateway binary also has no wired REST action executor to reset. The ported executor honors retry-after (body then header, fallback 1 s, +250 ms, cap 60 s). Moderation uses one timed attempt; paced kick/publishing have bounded attempts, but paced GET 429 retries are not count-bounded. Do not claim every REST request has five retries, hammer Discord, replay uncertain moderation writes, or invent a breaker-reset command. Identify the real writer and use its verified containment. See [`executor.rs`](../crates/discord/src/executor.rs). |
+| `POST /internal/actions` 404 on staging | The route is dark unless the Worker var `INTERNAL_ACTIONS_INGRESS` (staging env) **and** the secret `TWO_INTERNAL_ACTIONS` are both exactly `1`. Wrong method, a trailing slash or any query string is also 404 by design. Production is always 404. |
+| `POST /internal/actions` 503 `unavailable` | The container is not running (public ingress never starts it; wait for the probe or keepalive), the ownership fence refused this deployment, or the receiver answered something other than its JSON envelope. Check `/readyz` and ownership status; do not retry-loop a signed request with a new nonce. |
 | Ready but feature inactive | Gateway readiness says nothing about library-only commands/jobs/kill switches. Check [runtime boundaries](#containment-kill-switches-and-feature-flags), not extra environment guesses. |
 | Worker restored but Rust regression remains | Worker-version rollback did not prove image rollback. Inspect the active image and use a schema-compatible full redeploy of the known-good pair. |
 | Backup/drill red | Preserve valid archives; inspect exit status, verifier line, table counts and off-box receipt. Rehearse only on a prepared test database. No automatic promotion to a production restore. |
@@ -569,6 +575,7 @@ operation; this inventory is not a request to create, rotate or delete one.
 | Surface | Names | Boundary |
 |---|---|---|
 | Gateway Worker secrets forwarded to container | `DISCORD_TOKEN`, `DATABASE_URL` | Current runtime spellings. `GUILD_ID` is also stored as a Worker secret in staging, but is an identifier, not a credential. |
+| Staging private receiver (default dark) | `TWO_INTERNAL_KEYS` (signing key), `TWO_INTERNAL_CALLERS`, `TWO_INTERNAL_CHANNEL_KEYS`, `TWO_INTERNAL_ACTIONS` | Staging Worker secrets set by the Operator only, never `wrangler.toml` vars and never in production. `TWO_INTERNAL_ACTIONS=1` is set last. The key is generated on the Operator host and never printed; see the [enable order](internal-actions-receiver.md#enable-order-and-rollback). |
 | Staging deployment CI secrets | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` | Existing deploy workflow; no personal credential substitution. `STAGING_WORKER_URL` is a repository **variable**. |
 | Backup database connections | `TWO_DATABASE_URL`, `TWO_RESTORE_URL` | Different source/target names; scratch-only in examples. |
 | Off-box upload | `TWO_BACKUP_S3_ACCESS_KEY_ID`, `TWO_BACKUP_S3_SECRET_ACCESS_KEY` | Provisioned S3/R2 destination only; see backup.md for non-secret endpoint/bucket settings. |

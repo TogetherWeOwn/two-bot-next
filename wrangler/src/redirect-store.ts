@@ -51,6 +51,10 @@ const END_TIMEOUT_MS = 1_000;
 export class DbTimeoutError extends Error {
   constructor() {
     super("redirect store timed out");
+    // Explicit: a subclass instance otherwise reports name "Error", and the
+    // classifier in redirect.ts matches on this name (an import would cycle
+    // back into redirect.ts and break the standalone Miniflare embed).
+    this.name = "DbTimeoutError";
   }
 }
 

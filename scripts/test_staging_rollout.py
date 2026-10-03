@@ -97,6 +97,26 @@ def receipts():
     ]
 
 
+def real_shape_receipts():
+    """Record shapes written by Wrangler 4.143.1 when `wrangler-action` drives a deploy.
+
+    Field names follow workers-sdk `packages/wrangler/src/index.ts` (the `wrangler-session`
+    entry, written for EVERY invocation) and its deploy output entry; values are
+    synthetic. The first session is the action's `wrangler --version` probe.
+    """
+    log = "/home/runner/.config/.wrangler/logs/wrangler-2026-10-03_01-22-59_123.log"
+    return [
+        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.143.1",
+         "command_line_args": ["--version"], "log_file_path": log, "timestamp": date()},
+        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.143.1",
+         "command_line_args": ["deploy", "--config", "/tmp/staging-deploy.json", "--env", "staging"],
+         "log_file_path": log, "timestamp": date()},
+        {"version": 1, "type": "deploy", "worker_name": "two-bot-next-staging",
+         "worker_tag": "tag123", "version_id": VERSION, "targets": [URL],
+         "worker_name_overridden": False, "wrangler_environment": "staging", "timestamp": date()},
+    ]
+
+
 def baseline():
     return {
         "started": STARTED, "application_id": APPLICATION_ID,
@@ -179,6 +199,7 @@ class FakeClient:
         self.api_routes = copy.deepcopy(api_routes or {})
         self.request_routes = copy.deepcopy(request_routes or {})
         self.deadline = deadline
+        self.observation = None
         self.calls = []
 
     def respond(self, routes, key):
@@ -291,6 +312,51 @@ class DeployReceiptTests(OfflineTestCase):
                         [other_command] + receipts(), [no_args_probe] + receipts()]:
             with self.subTest(records=records):
                 self.assert_gate("wrong_wrangler_receipt", rollout.deploy_version, records, STARTED)
+
+    def test_failure_diagnostic_is_allowlisted_counts_and_versions_only(self):
+        records = real_shape_receipts()
+        records[0]["wrangler_version"] = "4.142.0"
+        records[1]["wrangler_version"] = SENTINEL
+        records.append({"type": SENTINEL, "command_line_args": [SENTINEL]})
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.deploy_version(records, STARTED)
+        self.assertEqual(str(caught.exception), "wrong_wrangler_receipt")
+        self.assertEqual(caught.exception.detail,
+                         "records deploy=1,other=1,wrangler-session=2; "
+                         "sessions deploy=1,probe=1,other=0; "
+                         "v1/wrangler-4.142.0 v1/wrangler-invalid")
+        for private in [SENTINEL, "command_line_args", "log_file_path", "/home/runner", "timestamp"]:
+            self.assertNotIn(private, caught.exception.detail)
+
+    def test_diagnostic_names_session_class_counts(self):
+        # An unrecognized session (e.g. another Wrangler command at the pinned
+        # version) must show up as `other` so the failing sub-check is named.
+        records = real_shape_receipts()
+        records[1]["command_line_args"] = ["secret", "put", "X"]
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.deploy_version(records, STARTED)
+        self.assertEqual(str(caught.exception), "wrong_wrangler_receipt")
+        self.assertIn("sessions deploy=0,probe=1,other=1", caught.exception.detail)
+        self.assertNotIn("secret", caught.exception.detail)
+
+    def test_diagnostic_does_not_print_non_integer_or_bool_versions(self):
+        records = [{"type": "wrangler-session", "version": True, "wrangler_version": 4.1},
+                   {"type": "wrangler-session", "version": 10 ** 6, "wrangler_version": None}]
+        self.assertEqual(rollout.receipt_shape(records),
+                         "records wrangler-session=2; sessions deploy=0,probe=0,other=2; "
+                         "vinvalid/wrangler-invalid vinvalid/wrangler-invalid")
+        self.assertEqual(rollout.receipt_shape([]),
+                         "records none; sessions deploy=0,probe=0,other=0; none")
+
+    def test_deploy_field_diagnostic_names_failed_checks_only(self):
+        records = receipts()
+        records[1]["wrangler_environment"] = SENTINEL
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.deploy_version(records, STARTED)
+        self.assertEqual(str(caught.exception), "wrong_deploy_receipt")
+        self.assertTrue(caught.exception.detail.endswith(
+            "deploy version=ok worker=ok environment=bad not_overridden=ok"))
+        self.assertNotIn(SENTINEL, caught.exception.detail)
 
     def test_missing_deploy_fields_fail_closed(self):
         for key in ["worker_name", "wrangler_environment", "worker_name_overridden", "version"]:
@@ -658,6 +724,35 @@ class ClientSanitizationTests(OfflineTestCase):
         )
         self.assertEqual(client.request(URL + "/readyz"), (503, {}, b""))
 
+    def test_unauthenticated_503_keeps_the_body_only_when_it_is_json(self):
+        body = b'{"gateway_failure":{"phase":"durable_gateway","class":"checkpoint_load_failed"}}'
+        for headers in [{"content-type": "application/json"},
+                        {"content-type": "Application/JSON; charset=utf-8"}]:
+            with self.subTest(headers=headers):
+                client = rollout.Client(ACCOUNT, SENTINEL)
+                client.opener.open.side_effect = HTTPError(URL, 503, "x", headers, io.BytesIO(body))
+                self.assertEqual(client.request(URL + "/readyz"), (503, headers, body))
+        for code, headers in [(503, {"content-type": "text/plain"}), (503, {}),
+                              (500, {"content-type": "application/json"}),
+                              (429, {"content-type": "application/json"})]:
+            with self.subTest(code=code, headers=headers):
+                client = rollout.Client(ACCOUNT, SENTINEL)
+                client.opener.open.side_effect = HTTPError(
+                    URL, code, SENTINEL, headers, io.BytesIO(SENTINEL.encode()))
+                self.assertEqual(client.request(URL + "/readyz"), (code, {}, b""))
+
+    def test_unauthenticated_json_503_body_is_size_bounded_and_read_errors_discard_it(self):
+        client = rollout.Client(ACCOUNT, SENTINEL)
+        big = io.BytesIO(b" " * (rollout.MAX_BODY + 1))
+        client.opener.open.side_effect = HTTPError(
+            URL, 503, "x", {"content-type": "application/json"}, big)
+        self.assertEqual(client.request(URL + "/readyz"), (503, {}, b""))
+        broken = Mock()
+        broken.read.side_effect = OSError(SENTINEL)
+        client.opener.open.side_effect = HTTPError(
+            URL, 503, "x", {"content-type": "application/json"}, broken)
+        self.assertEqual(client.request(URL + "/readyz"), (503, {}, b""))
+
     def test_api_error_envelope_does_not_expose_upstream_errors(self):
         client = rollout.Client(ACCOUNT, SENTINEL)
         body = json.dumps({"success": False, "errors": [{"message": SENTINEL}],
@@ -708,8 +803,23 @@ class DeploymentWiringTests(unittest.TestCase):
         steps = re.split(r"(?m)^      - ", source)[1:]
         prepare = [step for step in steps if "python3 ../scripts/staging_rollout.py prepare" in step]
         deploy = [step for step in steps if "command: deploy --config" in step]
+        receipt = [step for step in steps if "python3 ../scripts/staging_rollout.py receipt" in step]
+        takeover = [step for step in steps if "ownership-control.mjs deployment-takeover" in step]
         verify = [step for step in steps if "python3 ../scripts/staging_rollout.py verify" in step]
-        self.assertEqual((len(prepare), len(deploy), len(verify)), (1, 1, 1))
+        self.assertEqual((len(prepare), len(deploy), len(receipt), len(takeover), len(verify)),
+                         (1, 1, 1, 1, 1))
+        # The local Wrangler receipt is accepted after the deploy and before ownership moves.
+        self.assertLess(steps.index(deploy[0]), steps.index(receipt[0]))
+        self.assertLess(steps.index(receipt[0]), steps.index(takeover[0]))
+        self.assertLess(steps.index(takeover[0]), steps.index(verify[0]))
+        self.assertNotRegex(receipt[0], r"(?m)^\s*(?:if|continue-on-error):")
+        self.assertIn("set -euo pipefail", receipt[0])
+        self.assertIn('--receipt "$ROLLOUT_DIR/baseline.json"', receipt[0])
+        self.assertIn('--output "$WRANGLER_OUTPUT_FILE_PATH"', receipt[0])
+        # Network-free: no Cloudflare credentials or staging URL in this step.
+        self.assertNotIn("secrets.", receipt[0])
+        self.assertNotIn("STAGING_URL", receipt[0])
+        self.assertNotIn("|| true", receipt[0])
         # GitHub rejects the whole workflow if job-level env uses the runner context.
         job_header = source.split("    steps:\n", 1)[0]
         self.assertNotIn("runner.", job_header)
@@ -960,6 +1070,206 @@ class OrchestrationTests(OfflineTestCase):
                 self.assert_no_evidence()
         self.assert_no_secret_saved_or_printed()
 
+    def test_timeout_records_which_stage_was_stuck_without_echoing_service_output(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        _, headers, _ = ready_response()
+        stuck = {"build_revision": REVISION, "build_id": BUILD_ID,
+                 "components": [["process", "ready"], ["gateway", "starting"],
+                                ["token_invalid", "ready"], ["Bad\nname", "ready"],
+                                ["gateway", SENTINEL], ["x"], "junk"]}
+        for status, body, expected in [
+            (503, json.dumps(stuck).encode(),
+             "rollout=converged readyz=503 components=process:ready,gateway:starting,token_invalid:ready "
+             "identity=match"),
+            (503, json.dumps({**stuck, "build_id": "other"}).encode(),
+             "rollout=converged readyz=503 components=process:ready,gateway:starting,token_invalid:ready "
+             "identity=mismatch"),
+            (503, SENTINEL.encode(), "rollout=converged readyz=503 body=unreadable"),
+            (0, b"", "rollout=converged readyz=0 body=unreadable"),
+        ]:
+            with self.subTest(status=status, expected=expected):
+                self.clock.now = 100
+                client = verify_client()
+                client.request_routes[URL + "/readyz"] = [(status, headers, body)]
+                self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+                self.assertEqual(client.observation, expected)
+                self.assertNotIn(SENTINEL, client.observation)
+        self.assert_no_secret_saved_or_printed()
+
+    def test_timeout_observation_for_missing_and_unconverged_rollouts(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.api_routes[ROWS_PATH] = [[old_row()]]
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertEqual(client.observation, "no_new_rollout")
+        self.clock.now = 100
+        pending = completed_row()
+        pending["status"] = "progressing"
+        pending["health"] = {"instances": {"active": 1, "healthy": 0, "failed": 0, "starting": 1,
+                                           "scheduling": SENTINEL}}
+        client = verify_client()
+        client.api_routes[DETAIL_PATH] = [pending]
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertEqual(client.observation,
+                         "rollout=progressing instances=active:1,healthy:0,failed:0,starting:1")
+        self.assert_no_secret_saved_or_printed()
+
+    def readyz_body(self, failure, **extra):
+        body = {"build_revision": REVISION, "build_id": BUILD_ID,
+                "components": [["process", "ready"], ["gateway", "down"]], **extra}
+        if failure is not None:
+            body["gateway_failure"] = failure
+        return json.dumps(body).encode()
+
+    def test_timeout_names_the_gateway_failure_class_from_a_converged_rollout(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        _, headers, _ = ready_response()
+        failure = {"phase": "durable_gateway", "class": "checkpoint_load_failed"}
+        self.clock.now = 100
+        client = verify_client()
+        client.request_routes[URL + "/readyz"] = [(503, headers, self.readyz_body(failure))]
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertEqual(
+            client.observation,
+            "rollout=converged readyz=503 components=process:ready,gateway:down identity=match "
+            "gateway_failure=durable_gateway:checkpoint_load_failed")
+
+    def test_hostile_gateway_failure_values_are_dropped_from_the_observation(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        _, headers, _ = ready_response()
+        hostile = [
+            {"phase": "durable_gateway", "class": "postgres://user:" + SENTINEL + "@db/app"},
+            {"phase": "durable_gateway", "class": SENTINEL},
+            {"phase": "durable_gateway", "class": "Checkpoint_Load_Failed"},
+            {"phase": "durable_gateway", "class": "a" * 33},
+            {"phase": "", "class": "checkpoint_load_failed"},
+            {"phase": "durable gateway", "class": "checkpoint_load_failed"},
+            {"phase": "durable_gateway", "class": "checkpoint_load_failed\n"},
+            {"phase": "durable_gateway", "class": 7},
+            {"phase": "durable_gateway"},
+            "durable_gateway:checkpoint_load_failed", None, ["durable_gateway", "x"],
+        ]
+        for value in hostile:
+            with self.subTest(value=value):
+                self.clock.now = 100
+                client = verify_client()
+                body = self.readyz_body(None, gateway_failure=value)
+                client.request_routes[URL + "/readyz"] = [(503, headers, body)]
+                self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+                self.assertEqual(
+                    client.observation,
+                    "rollout=converged readyz=503 components=process:ready,gateway:down identity=match")
+                self.assertNotIn(SENTINEL, client.observation)
+        self.assert_no_secret_saved_or_printed()
+
+    def test_failure_with_extra_keys_prints_only_the_two_tokens(self):
+        self.assertEqual(
+            rollout.runtime_observation(
+                503, {"x-two-worker-version": VERSION},
+                self.readyz_body({"phase": "durable_gateway", "class": "gateway_runtime_failed",
+                                  "error": SENTINEL}),
+                VERSION, REVISION, BUILD_ID),
+            "readyz=503 components=process:ready,gateway:down identity=match "
+            "gateway_failure=durable_gateway:gateway_runtime_failed")
+
+    def unconverged_client(self, readyz):
+        pending = completed_row()
+        pending["status"] = "progressing"
+        pending["health"] = {"instances": {"active": 0, "healthy": 0, "failed": 0, "starting": 1,
+                                           "scheduling": 0}}
+        client = verify_client()
+        client.api_routes[DETAIL_PATH] = [pending]
+        client.request_routes[URL + "/readyz"] = [readyz]
+        return client
+
+    def test_unconverged_rollout_still_surfaces_the_gateway_failure_of_this_build(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        failure = {"phase": "durable_gateway", "class": "automod_config_invalid"}
+        self.clock.now = 100
+        client = self.unconverged_client(
+            (503, {"x-two-worker-version": VERSION}, self.readyz_body(failure)))
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertEqual(
+            client.observation,
+            "rollout=progressing instances=active:0,healthy:0,failed:0,starting:1,scheduling:0 "
+            "gateway_failure=durable_gateway:automod_config_invalid")
+        self.assert_no_evidence()
+
+    def test_unconverged_rollout_ignores_a_failure_from_another_worker_or_image(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        failure = {"phase": "durable_gateway", "class": "automod_config_invalid"}
+        stale = json.loads(self.readyz_body(failure))
+        stale["build_id"] = "999999-1"
+        for headers, body in [({"x-two-worker-version": OLD_VERSION}, self.readyz_body(failure)),
+                              ({}, self.readyz_body(failure)),
+                              ({"x-two-worker-version": VERSION}, json.dumps(stale).encode()),
+                              ({"x-two-worker-version": VERSION}, SENTINEL.encode()),
+                              ({"x-two-worker-version": VERSION}, b"[]"),
+                              ({}, b"")]:
+            with self.subTest(headers=headers):
+                self.clock.now = 100
+                client = self.unconverged_client((503, headers, body))
+                self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+                self.assertEqual(client.observation,
+                                 "rollout=progressing instances=active:0,healthy:0,failed:0,starting:1,scheduling:0")
+        self.assert_no_secret_saved_or_printed()
+
+    def test_main_prints_the_gateway_failure_in_the_last_observation(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        argv = ["staging_rollout.py", "verify", "--receipt", self.args.receipt,
+                "--output", self.args.output, "--evidence", self.args.evidence]
+        _, headers, _ = ready_response()
+        body = self.readyz_body({"phase": "durable_gateway", "class": "milestones_load_failed"})
+        client = verify_client()
+        client.request_routes[URL + "/readyz"] = [(503, headers, body)]
+        self.stdout.seek(0)
+        self.stdout.truncate()
+        with patch.object(sys, "argv", argv), patch.object(rollout, "Client", return_value=client):
+            self.assertEqual(rollout.main(), 1)
+        self.assertEqual(self.stdout.getvalue().splitlines(), [
+            "staging rollout gate failed: rollout_timeout",
+            "last observation before timeout: rollout=converged readyz=503 "
+            "components=process:ready,gateway:down identity=match "
+            "gateway_failure=durable_gateway:milestones_load_failed"])
+
+    def test_main_prints_last_observation_only_for_rollout_timeout(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        argv = ["staging_rollout.py", "verify", "--receipt", self.args.receipt,
+                "--output", self.args.output, "--evidence", self.args.evidence]
+        _, headers, _ = ready_response()
+        body = json.dumps({"build_revision": REVISION, "build_id": BUILD_ID,
+                           "components": [["process", "ready"], ["gateway", "down"]]}).encode()
+        client = verify_client()
+        client.request_routes[URL + "/readyz"] = [(503, headers, body)]
+        self.stdout.seek(0)
+        self.stdout.truncate()
+        with patch.object(sys, "argv", argv), patch.object(rollout, "Client", return_value=client):
+            self.assertEqual(rollout.main(), 1)
+        self.assertEqual(self.stdout.getvalue().splitlines(), [
+            "staging rollout gate failed: rollout_timeout",
+            "last observation before timeout: rollout=converged readyz=503 "
+            "components=process:ready,gateway:down identity=match"])
+        self.stdout.seek(0)
+        self.stdout.truncate()
+        self.clock.now = 100
+        client = verify_client()
+        changed = app()
+        changed["id"] = "different_application"
+        client.api_routes[APP_PATH] = [[changed]]
+        with patch.object(sys, "argv", argv), patch.object(rollout, "Client", return_value=client):
+            self.assertEqual(rollout.main(), 1)
+        self.assertEqual(self.stdout.getvalue().splitlines(),
+                         ["staging rollout gate failed: application_identity_drift"])
+        self.assert_no_secret_saved_or_printed()
+
     def test_health_status_or_serving_worker_mismatch_never_succeeds(self):
         self.prepare_baseline()
         self.write_deploy_output()
@@ -1093,6 +1403,55 @@ class OrchestrationTests(OfflineTestCase):
         self.assert_gate("api_http_failure", rollout.verify, self.args, client)
         self.assert_no_evidence()
         self.assert_no_secret_saved_or_printed()
+
+    def test_receipt_mode_accepts_real_shape_without_cloudflare_credentials_or_network(self):
+        self.prepare_baseline()
+        self.write_deploy_output(real_shape_receipts())
+        argv = ["staging_rollout.py", "receipt", "--receipt", self.args.receipt,
+                "--output", self.args.output, "--evidence", self.args.evidence]
+        with patch.dict(os.environ, {}, clear=True), patch.object(sys, "argv", argv), \
+                patch.object(rollout, "Client", side_effect=AssertionError("receipt must be network-free")):
+            self.assertEqual(rollout.main(), 0)
+        self.assertEqual(json.loads(Path(self.args.evidence).read_text()), {"worker_version": VERSION})
+        self.assertIn("wrangler deploy receipt accepted", self.stdout.getvalue())
+        self.docker.assert_not_called()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_receipt_mode_rejections_stop_before_ownership_moves(self):
+        self.prepare_baseline()
+        stale = real_shape_receipts()
+        stale[2]["timestamp"] = date(-1)
+        wrong = real_shape_receipts()
+        wrong[0]["wrangler_version"] = "4.142.0"
+        for records, code in [(stale, "stale_deploy_receipt"),
+                              (wrong, "wrong_wrangler_receipt"),
+                              (real_shape_receipts()[:2], "deploy_receipt_missing_or_ambiguous")]:
+            with self.subTest(code=code):
+                self.write_deploy_output(records)
+                self.assert_gate(code, rollout.receipt, self.args)
+                self.assert_no_evidence()
+
+    def test_main_prints_allowlisted_diagnostic_after_gate_code(self):
+        self.prepare_baseline()
+        records = real_shape_receipts()
+        records[0]["wrangler_version"] = "4.142.0"
+        records[0]["command_line_args"] = [SENTINEL]
+        self.write_deploy_output(records)
+        argv = ["staging_rollout.py", "verify", "--receipt", self.args.receipt,
+                "--output", self.args.output, "--evidence", self.args.evidence]
+        with patch.object(sys, "argv", argv), patch.object(rollout, "Client", return_value=verify_client()):
+            self.assertEqual(rollout.main(), 1)
+        self.assertEqual(self.stdout.getvalue().splitlines()[1:], [
+            "staging rollout gate failed: wrong_wrangler_receipt",
+            "staging rollout diagnostic: records deploy=1,wrangler-session=2; "
+            "sessions deploy=1,probe=0,other=1; v1/wrangler-4.142.0 v1/wrangler-4.143.1",
+        ])
+        self.assert_no_evidence()
+        # The caller-owned NDJSON input legitimately holds the sentinel; only
+        # printed output and generated files are checked.
+        self.assertNotIn(SENTINEL, self.stdout.getvalue() + self.stderr.getvalue())
+        for path in [self.args.receipt, self.args.deploy_config]:
+            self.assertNotIn(SENTINEL, Path(path).read_text())
 
     def test_main_hides_raw_unexpected_exception_and_returns_failure(self):
         self.prepare_baseline()

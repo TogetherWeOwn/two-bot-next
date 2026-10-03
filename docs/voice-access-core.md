@@ -47,6 +47,16 @@ read and replace the whole per-guild row in one upsert. No row reads as
 with an unknown command or zero role fails closed instead of becoming a
 silent no-op. The runtime still owns per-guild serialization and enforcement.
 
+## `/access` (admin)
+
+`/access` (Manage Channels, the spec's "admin") sets the controls at runtime:
+`show`, `creation enabled:<bool>`, `role [role]` (no role clears it),
+`restrict command:<name> [role] [role2] [role3]` (no role = admins only) and
+`unrestrict command:<name>`. Each change is a read-modify-write under one
+runtime lock, validated by `validate_access_controls`, saved with
+`save_access_controls`, then pushed to the guild's live actor so a creation
+switch applies immediately. A failed read or write changes nothing and says so.
+
 ## Residual parent work
 
 Room lifecycle (V1), owner controls (V2/V3), logging/health/error routing

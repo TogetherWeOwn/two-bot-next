@@ -132,3 +132,14 @@ fn repeats_stop_after_the_bound() {
     assert!(ledger.should_send());
     assert!(ledger.record_send());
 }
+
+#[test]
+fn detail_level_text_round_trips_and_defaults_to_brief() {
+    for level in [DetailLevel::Off, DetailLevel::Brief, DetailLevel::Full] {
+        assert_eq!(parse_detail_level(level.as_str()), Ok(level));
+    }
+    let defaults = two_bot_core::voice_logging::LoggingSettings::default();
+    assert_eq!(defaults.level, DetailLevel::Brief);
+    assert_eq!(defaults.channel_id, None);
+    assert_eq!(defaults.mention_role_id, None);
+}

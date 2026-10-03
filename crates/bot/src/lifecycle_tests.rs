@@ -66,10 +66,7 @@ async fn stops_http(termination: Termination) {
         }
     });
     let state = Arc::new(RwLock::new(GatewayState::Armed));
-    let http_state = server::SharedState {
-        gateway: Arc::clone(&state),
-        database: None,
-    };
+    let http_state = server::SharedState::new(Arc::clone(&state), None);
     let (shutdown, stop) = watch::channel(false);
     let (cleanup_started, cleanup_observed) = oneshot::channel();
     let (finish_cleanup, cleanup_gate) = oneshot::channel();
@@ -413,10 +410,7 @@ async fn http_server_observes_stop_before_first_poll() {
         Duration::from_secs(2),
         server::serve(
             server::bind("127.0.0.1:0").await.unwrap(),
-            server::SharedState {
-                gateway: Arc::new(RwLock::new(GatewayState::Armed)),
-                database: None,
-            },
+            server::SharedState::new(Arc::new(RwLock::new(GatewayState::Armed)), None),
             crate::jobs::statuses(&[], true),
             shutdown,
         ),
@@ -633,4 +627,160 @@ async fn gateway_failure_joins_pending_website_job_before_returning() {
     tokio::time::advance(Duration::from_secs(60)).await;
     tokio::task::yield_now().await;
     assert_eq!(starts.load(Ordering::SeqCst), 1, "no later website ticks");
+}
+
+// TOG-13044: the failing class stays readable on /readyz for a bounded linger.
+
+async fn readyz_body(state: &server::SharedState) -> serde_json::Value {
+    use tower::ServiceExt as _;
+    let response = server::router(state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/readyz")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), 8192)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn failure_class_is_served_on_readyz_for_the_whole_linger_then_the_task_ends() {
+    use crate::gateway_failure::{FailureClass, GatewayFailure};
+    let state = server::SharedState::new(Arc::new(RwLock::new(GatewayState::Armed)), None);
+    assert!(readyz_body(&state).await.get("gateway_failure").is_none());
+    let (_shutdown, stopping) = watch::channel(false);
+    let linger = Duration::from_secs(15);
+    let mut publish = tokio::spawn({
+        let state = state.clone();
+        async move {
+            crate::publish_gateway_failure(
+                &state.gateway,
+                &state.failure,
+                FailureClass::CheckpointLoadFailed,
+                stopping,
+                linger,
+            )
+            .await;
+        }
+    });
+    tokio::time::sleep(Duration::from_secs(14)).await;
+    assert!(!publish.is_finished(), "linger must last the full bound");
+    let body = readyz_body(&state).await;
+    assert_eq!(
+        body["gateway_failure"],
+        serde_json::json!({"phase": "durable_gateway", "class": "checkpoint_load_failed"})
+    );
+    assert_eq!(
+        body["components"][1],
+        serde_json::json!(["gateway", "starting"])
+    );
+    assert_eq!(
+        state.failure.get(),
+        Some(GatewayFailure::durable_gateway(
+            FailureClass::CheckpointLoadFailed
+        ))
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    (&mut publish).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_cuts_the_failure_linger_short() {
+    use crate::gateway_failure::FailureClass;
+    let state = server::SharedState::new(Arc::new(RwLock::new(GatewayState::Armed)), None);
+    let (shutdown, stopping) = watch::channel(false);
+    let publish = tokio::spawn({
+        let state = state.clone();
+        async move {
+            crate::publish_gateway_failure(
+                &state.gateway,
+                &state.failure,
+                FailureClass::GatewayRuntimeFailed,
+                stopping,
+                Duration::from_secs(3600),
+            )
+            .await;
+        }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!publish.is_finished());
+    shutdown.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(1), publish)
+        .await
+        .expect("a stop request must not wait out the linger")
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_draining_gateway_is_not_reverted_to_starting() {
+    use crate::gateway_failure::FailureClass;
+    let state = server::SharedState::new(Arc::new(RwLock::new(GatewayState::Draining)), None);
+    let (_shutdown, stopping) = watch::channel(false);
+    crate::publish_gateway_failure(
+        &state.gateway,
+        &state.failure,
+        FailureClass::GatewayRuntimeFailed,
+        stopping,
+        Duration::ZERO,
+    )
+    .await;
+    assert_eq!(*state.gateway.read().await, GatewayState::Draining);
+    assert!(readyz_body(&state).await.get("gateway_failure").is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn supervisor_still_exits_with_an_error_after_a_lingering_failure() {
+    use crate::gateway_failure::FailureClass;
+    let state = server::SharedState::new(Arc::new(RwLock::new(GatewayState::Armed)), None);
+    let (shutdown, stopping) = watch::channel(false);
+    let task = tokio::spawn({
+        let state = state.clone();
+        async move {
+            crate::publish_gateway_failure(
+                &state.gateway,
+                &state.failure,
+                FailureClass::AutomodConfigInvalid,
+                stopping,
+                Duration::from_secs(15),
+            )
+            .await;
+            Err(sqlx::Error::InvalidArgument("not for logs".into()))
+        }
+    });
+    // HTTP stays up until the supervisor signals the drain, like the real server.
+    let http_stop = shutdown.subscribe();
+    let service = tokio::spawn(supervise_gateway_bounded(
+        task,
+        async move {
+            server::shutdown_requested(http_stop).await;
+            Ok(())
+        },
+        Arc::clone(&state.gateway),
+        shutdown,
+        Duration::from_secs(35),
+    ));
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(
+        !service.is_finished(),
+        "HTTP must outlive the failure for the linger"
+    );
+    assert_eq!(
+        readyz_body(&state).await["gateway_failure"]["class"],
+        "automod_config_invalid"
+    );
+    let result = tokio::time::timeout(Duration::from_secs(10), service)
+        .await
+        .expect("supervisor exits once the linger ends")
+        .unwrap();
+    assert!(result.is_err(), "the process must still exit nonzero");
+    assert_eq!(*state.gateway.read().await, GatewayState::Draining);
 }
