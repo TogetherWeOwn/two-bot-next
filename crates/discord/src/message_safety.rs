@@ -1,6 +1,9 @@
 //! Explicit outbound policy, applied before Twilight validates message payloads.
-//! No current sending action opts into notifications. Never trust caller-supplied
-//! `allowed_mentions`, including for interaction message updates.
+//! Suppress notifications by default. Never trust caller-supplied
+//! `allowed_mentions`, including for interaction message updates. The shared
+//! component post accepts only onboarding's typed one-member welcome exception;
+//! the fixed ticket-controls template alone opts into a validated opener-id
+//! notification AFTER this sanitizer.
 
 use serde_json::{json, Value};
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
@@ -61,6 +64,30 @@ pub(crate) fn sanitize_message(body: &mut Value) {
             }
         }
         embeds.retain(has_embed_payload);
+    }
+    // Poll question/answer text is message text too: an obfuscated `@everyone`
+    // here must not ride a poll past the content guard. Length is left to
+    // Discord's own poll ceilings (an overlong question/answer surfaces as a
+    // wire rejection, never a mutation), so only mentions are neutralized.
+    if let Some(poll) = body.get_mut("poll") {
+        if let Some(question) = poll.get_mut("question") {
+            sanitize_poll_media_text(question);
+        }
+        if let Some(answers) = poll.get_mut("answers").and_then(Value::as_array_mut) {
+            for answer in answers.iter_mut() {
+                if let Some(media) = answer.get_mut("poll_media") {
+                    sanitize_poll_media_text(media);
+                }
+            }
+        }
+    }
+}
+
+fn sanitize_poll_media_text(media: &mut Value) {
+    if let Some(text) = media.get_mut("text") {
+        if let Some(raw) = text.as_str() {
+            *text = Value::String(text::neutralize_mentions(raw));
+        }
     }
 }
 
@@ -235,6 +262,32 @@ mod tests {
             data: None,
         })
         .is_err());
+    }
+
+    #[test]
+    fn poll_question_and_answer_text_cannot_carry_mass_mentions() {
+        let mut body = json!({"poll": {
+            "question": {"text": "@eve\u{2060}ryone"},
+            "answers": [
+                {"poll_media": {"text": "@he\u{200b}re"}},
+                {"poll_media": {}},
+                {"answer_id": 3},
+            ],
+        }});
+        sanitize_message(&mut body);
+        assert_eq!(body["poll"]["question"]["text"], "@\u{200b}everyone");
+        assert_eq!(
+            body["poll"]["answers"][0]["poll_media"]["text"],
+            "@\u{200b}here"
+        );
+        assert!(body["poll"]["answers"][1]["poll_media"]
+            .get("text")
+            .is_none());
+        assert!(body["poll"]["answers"][2].get("poll_media").is_none());
+        let safe = body.clone();
+        sanitize_message(&mut body);
+        assert_eq!(body, safe);
+        assert!(validate_create(&body).is_ok());
     }
 
     #[test]

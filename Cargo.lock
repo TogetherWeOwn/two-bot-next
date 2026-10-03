@@ -2288,6 +2288,7 @@ dependencies = [
  "two-bot-core",
  "two-bot-cutover",
  "two-bot-discord",
+ "two-bot-store",
  "two-bot-testsupport",
 ]
 
@@ -2321,6 +2322,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
+ "tracing-subscriber",
  "two-bot-testsupport",
  "unicode-normalization",
  "url",
@@ -2331,6 +2333,8 @@ name = "two-bot-cutover"
 version = "0.2.0"
 dependencies = [
  "hex",
+ "libc",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2342,6 +2346,8 @@ dependencies = [
  "twilight-http",
  "twilight-model",
  "two-bot-core",
+ "two-bot-discord",
+ "two-bot-testsupport",
  "url",
 ]
 
@@ -2349,8 +2355,11 @@ dependencies = [
 name = "two-bot-discord"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
+ "axum",
  "bytes",
  "futures-util",
+ "hex",
  "http",
  "http-body-util",
  "hyper",
@@ -2359,8 +2368,10 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "thiserror",
+ "time",
  "tokio",
  "tokio-websockets",
  "tracing",
@@ -2370,12 +2381,28 @@ dependencies = [
  "twilight-http",
  "twilight-model",
  "two-bot-core",
+ "two-bot-cutover",
  "two-bot-testsupport",
 ]
 
 [[package]]
 name = "two-bot-next"
 version = "0.2.0"
+
+[[package]]
+name = "two-bot-store"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "twilight-model",
+ "two-bot-core",
+ "two-bot-discord",
+]
 
 [[package]]
 name = "two-bot-testsupport"

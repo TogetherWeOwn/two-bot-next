@@ -10,31 +10,45 @@
 //! [`CommandRuntime::dispatch`] and are handled entirely through those interfaces.
 //!
 //! Served slices:
+//! - LFG (`/lfg`, `/lfg-close`, `two:lfg:` selects; TOG-10260), composed
+//!   through `InteractionRuntime` over this same router and executor.
 //! - sticky (`/sticky`, `/sticky-remove` + the accepted-message re-post hook;
 //!   legacy order pinned below: claim → post → record → delete previous →
 //!   audit, with `post_failed`/orphan cleanup on the failure edges).
 //! - feed relays (`/feed-add`, `/feed-remove`, `/feed-list`; TOG-10085 domain
 //!   and store): plan → guild-scoped CRUD → `announcements_audit_log` row → ephemeral
 //!   completion. The generated relay/audit ids replace legacy `randomUUID()`.
+//! - channel moderation (`/purge`, `/slowmode`, `/lockdown`, `/unlock`): shared
+//!   router authorization → ephemeral defer → durable claim/lane → REST effect →
+//!   atomic result/audit → original-response edit. Ambiguity retains the lane.
+//! - schedules (`/schedule`, `/schedule-remove`, `/schedule-list`; TOG-12237
+//!   over the TOG-10081 domain and store): validate → guild-scoped CRUD →
+//!   `automation_audit_log` row → ephemeral completion. The handlers live in
+//!   [`crate::schedule_runtime`]; the runtime only registers and dispatches.
+//! - leveling (`/rank [member]`, `/leaderboard`): one immediate callback,
+//!   ephemeral rank and public mention-suppressed top ten. The ordered gateway
+//!   award path shares this runtime's pool, executor and onboarding gates.
 //!
 //! Registry publication runs here too: every `Event::Ready` publishes the
 //! router's ONE merged publish set (`set_guild_commands` is idempotent, so a
 //! duplicate READY is a harmless repeat). A resumed process also synchronizes
 //! once: a persisted gateway session does not preserve this process's gates
-//! or command definitions. No custom-command store exists on `main` yet —
-//! `publish_set` gets an empty custom slice until that slice lands its own reader.
+//! or command definitions. Until the custom-command store supplies authoritative
+//! rows, publication is deferred when automations enable dynamic commands.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
+use crate::self_role_handlers::SelfRoleService;
 use sqlx::{Pool, Postgres};
 use tracing::warn;
 use twilight_gateway::Event;
 use twilight_model::{
     application::interaction::{application_command::CommandOptionValue, Interaction},
     channel::message::{Message, MessageFlags},
+    gateway::GatewayReaction,
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
@@ -50,11 +64,14 @@ use two_bot_core::{
         sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
         RemoveOutcome, StickyAudit, StickyAuditAction, StickyAuditOutcome,
     },
-    FeatureGates, HandlerId, InteractionHandler, InteractionRouter, ModerationGates, RouterGates,
-    SlashOutcome, SurfaceFlags,
+    tickets::TicketAction,
+    ChannelModerationStore, ComponentHandler, ComponentOutcome, FeatureGates, HandlerId,
+    InteractionHandler, InteractionRouter, ModerationGates, RouterGates, SlashOutcome,
+    SurfaceFlags,
 };
 use two_bot_discord::{
-    publish_commands, response_for_slash, route_interaction, ActionExecutor, RoutedInteraction,
+    publish_commands, register_channel_handlers, response_for_slash, route_interaction,
+    ActionExecutor, ChannelModerationRuntime, LevelingRuntime, RoutedInteraction,
 };
 
 /// Audit-log reason for retiring the previous sticky (legacy audits carry a
@@ -86,26 +103,60 @@ impl InteractionHandler for StickyHandler {
     }
 }
 
-/// Router handler marker for the feed-relay commands; one instance per id.
+/// Router handler marker for the feed and leveling slices; one per id.
 #[derive(Debug)]
-struct FeedHandler(HandlerId);
+struct SliceHandler(HandlerId);
 
-impl InteractionHandler for FeedHandler {
+impl InteractionHandler for SliceHandler {
     fn id(&self) -> HandlerId {
         self.0
     }
 }
 
+/// Separate admission budgets prevent message bursts or registry pacing from
+/// consuming interaction acknowledgement capacity. No queued/spawned waiters.
+const DISPATCH_LIMITS: [usize; 3] = [16, 16, 1];
+
+#[derive(Default)]
+struct DispatchTasks {
+    stopped: bool,
+    lanes: [Vec<tokio::task::AbortHandle>; 3],
+}
+
+/// Cancels admitted work on gateway exit, including supervisor cancellation.
+/// Interrupted channel effects retain their durable claims for reconciliation.
+pub(crate) struct CommandDispatchGuard(Arc<CommandRuntime>);
+
+impl Drop for CommandDispatchGuard {
+    fn drop(&mut self) {
+        let mut tasks = self.0.tasks.lock().expect("command task scope");
+        tasks.stopped = true;
+        for lane in &mut tasks.lanes {
+            for handle in lane.drain(..) {
+                handle.abort();
+            }
+        }
+    }
+}
+
 /// The shared command runtime: one router + one REST executor + the sqlx
-/// stores, driven by gateway dispatches. Cheap to clone behind `Arc`; every
-/// `dispatch` spawns detached work because twilight only drives heartbeats
-/// while the shard is polled.
+/// stores, driven by gateway dispatches. Bounded asynchronous work leaves
+/// twilight free to poll heartbeats, and is cancelled when its shard exits.
+/// LFG caps its own pool use (`LFG_MAX_IN_FLIGHT`).
 pub struct CommandRuntime {
     pool: Pool<Postgres>,
     executor: ActionExecutor,
-    router: InteractionRouter,
+    interactions: two_bot_discord::interactions::InteractionRuntime,
+    custom_commands: Option<Vec<two_bot_core::CustomCommand>>,
+    application_id: AtomicU64,
+    channel: ChannelModerationRuntime,
+    tasks: Mutex<DispatchTasks>,
+    /// Shared self-role surface; production boot stays parked pending acceptance.
+    self_roles: Option<Arc<SelfRoleService>>,
+    leveling: LevelingRuntime,
     /// Configured guild (`GUILD_ID`); also the router's guild fence.
     guild_id: u64,
+    tickets: Option<Arc<crate::ticket_runtime::TicketRuntime>>,
     /// `TWO_AUTOMATIONS=1`: fast-path gate for the message hook (the router
     /// still answers `/sticky*` refusals when it is off).
     automations: bool,
@@ -117,13 +168,85 @@ pub struct CommandRuntime {
     attempts: AtomicU64,
 }
 
+// Each in-flight LFG execution holds up to two connections of the shared pool;
+// the gateway checkpoint writer must still find one free.
+const _: () = assert!(
+    two_bot_discord::lfg_interactions::LFG_MAX_IN_FLIGHT * 2 < two_bot_store::DB_POOL_MAX as usize
+);
+
+/// Why an attempted registry sync did not publish. Kept detail-free: the
+/// underlying REST errors are not logged.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RegistrySyncError {
+    /// The merged command set failed to assemble.
+    Invalid,
+    /// RESUMED needed the application id and the lookup failed.
+    ApplicationLookup,
+    /// Discord refused or did not answer the bulk overwrite.
+    Publish,
+}
+
 impl CommandRuntime {
+    /// Compose all feature slices over the same router, executor and pool.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build(
+        pool: Pool<Postgres>,
+        executor: ActionExecutor,
+        router: InteractionRouter,
+        self_roles: Option<Arc<SelfRoleService>>,
+        leveling: LevelingRuntime,
+        guild_id: u64,
+        custom_commands: Option<Vec<two_bot_core::CustomCommand>>,
+        tickets: Option<Arc<crate::ticket_runtime::TicketRuntime>>,
+    ) -> Arc<Self> {
+        let automations = router.gates().automations;
+        let interactions = two_bot_discord::interactions::InteractionRuntime::with_router(
+            router,
+            pool.clone(),
+            executor.clone(),
+            0,
+        );
+        let channel = ChannelModerationRuntime::new(
+            ChannelModerationStore::from_pool(pool.clone()),
+            executor.clone(),
+        );
+        Arc::new(Self {
+            pool,
+            executor,
+            interactions,
+            custom_commands,
+            application_id: AtomicU64::new(0),
+            channel,
+            tasks: Mutex::new(DispatchTasks::default()),
+            self_roles,
+            leveling,
+            guild_id,
+            tickets,
+            automations,
+            registry_synced: tokio::sync::Mutex::new(false),
+            attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
+        })
+    }
+
+    pub(crate) fn set_identity(&self, bot_user_id: u64, application_id: u64) {
+        self.interactions.set_bot_user_id(bot_user_id);
+        self.interactions.set_application_id(application_id);
+        self.application_id.store(application_id, Ordering::Relaxed);
+    }
+
     /// Build the runtime from process env gates + the optional
-    /// `DISCORD_API_BASE` proxy override. Returns `None` — gateway still
-    /// boots — when gate parsing or executor construction fails, so bad
-    /// env cannot take the shard down.
+    /// `DISCORD_API_BASE` proxy override. Returns `None` (gateway still boots)
+    /// when gate parsing or executor construction fails. `self_roles` is the
+    /// boot-composed service shared with the recovery job; only its presence
+    /// opens the self-role router surface.
     #[must_use]
-    pub fn from_env(pool: Pool<Postgres>, token: &str, guild_id: u64) -> Option<Arc<Self>> {
+    pub fn from_env(
+        pool: Pool<Postgres>,
+        token: &str,
+        guild_id: u64,
+        self_roles: Option<Arc<SelfRoleService>>,
+        onboarding: two_bot_core::OnboardingGates,
+    ) -> Option<Arc<Self>> {
         let features = match FeatureGates::from_env() {
             Ok(features) => features,
             Err(err) => {
@@ -138,40 +261,65 @@ impl CommandRuntime {
                 return None;
             }
         };
+        let ticket_config = crate::ticket_runtime::TicketConfig::from_env(guild_id);
         let gates = RouterGates::from_slices(
             Some(guild_id),
             &features,
             &moderation,
-            SurfaceFlags::default(),
+            SurfaceFlags {
+                session_picker: onboarding.mode == two_bot_core::OnboardingMode::Session,
+                tickets: ticket_config.is_some(),
+                self_roles: self_roles.is_some(),
+                ..SurfaceFlags::default()
+            },
         );
-        let mut router = InteractionRouter::new(gates);
-        router.register(Box::new(StickyHandler));
-        for id in [
-            HandlerId::FeedAdd,
-            HandlerId::FeedRemove,
-            HandlerId::FeedList,
-        ] {
-            router.register(Box::new(FeedHandler(id)));
-        }
         let proxy = std::env::var("DISCORD_API_BASE")
             .ok()
             .filter(|value| !value.is_empty());
-        let executor = match ActionExecutor::with_proxy(token.to_owned(), proxy) {
+        let admission =
+            match two_bot_core::send_admission::PgSendAdmission::new(pool.clone(), token) {
+                Ok(admission) => Arc::new(admission),
+                Err(err) => {
+                    warn!(error = %err, "send admission invalid; command runtime disabled");
+                    return None;
+                }
+            };
+        let executor = match ActionExecutor::with_admission(token.to_owned(), proxy, admission) {
             Ok(executor) => executor,
             Err(err) => {
                 warn!(error = %err, "REST executor failed to build; command runtime disabled");
                 return None;
             }
         };
-        Some(Arc::new(Self {
+        let leveling = LevelingRuntime::new(
+            pool.clone(),
+            Arc::new(executor.clone()),
+            guild_id,
+            onboarding,
+        );
+        let tickets = match ticket_config {
+            Some(config) => match crate::ticket_runtime::TicketRuntime::new(
+                pool.clone(),
+                executor.clone(),
+                config,
+            ) {
+                Ok(runtime) => Some(Arc::new(runtime)),
+                Err(_) => return None,
+            },
+            None => None,
+        };
+        // No custom-command store exists on main yet: an empty slice is the
+        // authoritative baseline (same as before LFG).
+        Some(Self::build(
             pool,
             executor,
-            router,
+            router_with_commands(gates),
+            self_roles,
+            leveling,
             guild_id,
-            automations: features.automations,
-            registry_synced: tokio::sync::Mutex::new(false),
-            attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
-        }))
+            Some(Vec::new()),
+            tickets,
+        ))
     }
 
     /// Test constructor: skips env gate reads so tests inject their own
@@ -184,107 +332,365 @@ impl CommandRuntime {
         guild_id: u64,
         automations: bool,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        assert_eq!(automations, router.gates().automations);
+        let leveling = LevelingRuntime::new(
+            pool.clone(),
+            Arc::new(executor.clone()),
+            guild_id,
+            two_bot_core::OnboardingGates {
+                mode: two_bot_core::OnboardingMode::Legacy,
+                dry_run: false,
+            },
+        );
+        // Tests provide an authoritative empty custom-command fixture.
+        Self::build(
             pool,
             executor,
             router,
+            None,
+            leveling,
             guild_id,
-            automations,
-            registry_synced: tokio::sync::Mutex::new(false),
-            attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
-        })
+            Some(Vec::new()),
+            None,
+        )
     }
 
-    /// Detached dispatch for one gateway event. Clones the payload and spawns
-    /// so the shard loop never awaits runtime work; the DB claims tolerate
-    /// the reorder/crash windows spawning opens.
-    ///
-    /// READY replaces the full merged set; a first RESUMED also synchronizes
-    /// this process's definitions/gates, even without a preceding READY.
-    pub fn dispatch(self: &Arc<Self>, event: &Event) {
+    pub(crate) fn dispatch_guard(self: &Arc<Self>) -> CommandDispatchGuard {
+        CommandDispatchGuard(Arc::clone(self))
+    }
+
+    /// The one process executor (admission lane and pacing included); other
+    /// runtimes (onboarding, automod) render through a clone, never a private
+    /// client.
+    pub fn executor(&self) -> ActionExecutor {
+        self.executor.clone()
+    }
+
+    fn spawn(
+        &self,
+        lane: usize,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        let mut tasks = self.tasks.lock().expect("command task scope");
+        if tasks.stopped {
+            return false;
+        }
+        let handles = &mut tasks.lanes[lane];
+        handles.retain(|handle| !handle.is_finished());
+        if handles.len() >= DISPATCH_LIMITS[lane] {
+            warn!(lane, "command dispatch saturated; event not admitted");
+            return false;
+        }
+        let task = tokio::spawn(work);
+        handles.push(task.abort_handle());
+        true
+    }
+
+    /// Shares this runtime's pool, executor/pacing and onboarding gates with
+    /// the ordered award path; only this runtime dispatches interactions.
+    pub fn leveling(&self) -> LevelingRuntime {
+        self.leveling.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_self_roles(
+        pool: Pool<Postgres>,
+        executor: ActionExecutor,
+        router: InteractionRouter,
+        guild_id: u64,
+        automations: bool,
+        service: Arc<SelfRoleService>,
+    ) -> Arc<Self> {
+        let mut runtime = Self::new(pool, executor, router, guild_id, automations);
+        Arc::get_mut(&mut runtime)
+            .expect("new runtime is unshared")
+            .self_roles = Some(service);
+        runtime
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_tickets(
+        pool: Pool<Postgres>,
+        executor: ActionExecutor,
+        tickets: Arc<crate::ticket_runtime::TicketRuntime>,
+    ) -> Arc<Self> {
+        let router = InteractionRouter::new(RouterGates {
+            configured_guild: Some(100),
+            tickets: true,
+            scorecard: false,
+            automations: false,
+            announcements: false,
+            moderation: false,
+            self_roles: false,
+            onboarding_picker: false,
+            session_picker: false,
+        });
+        let mut runtime = Self::new(pool, executor, router, 100, false);
+        Arc::get_mut(&mut runtime)
+            .expect("unshared test runtime")
+            .tickets = Some(tickets);
+        runtime
+    }
+
+    /// Isolate ticket gateway acceptance from unrelated command publication.
+    #[cfg(test)]
+    pub(crate) async fn suppress_registry_for_test(&self) {
+        *self.registry_synced.lock().await = true;
+    }
+
+    pub(crate) fn start_tickets(&self) -> Option<crate::ticket_runtime::TicketSupervisor> {
+        self.tickets.as_ref().and_then(|tickets| tickets.start())
+    }
+
+    /// Admit before spawning, without waiting on SQL/REST in the shard loop.
+    /// Saturated lanes drop events without effects, queued waiters or tokens in
+    /// logs. READY/RESUMED publication has independent capacity; overlapping
+    /// connection events coalesce while the full registry is being synchronized.
+    pub fn dispatch(self: &Arc<Self>, event: &Event) -> bool {
         match event {
             Event::MessageCreate(message) => {
+                if !self.automations {
+                    return false;
+                }
                 let runtime = Arc::clone(self);
                 let message = message.0.clone();
-                // Dropping the JoinHandle detaches the task — exactly what the
-                // shard loop needs (never await runtime work while polling).
-                drop(tokio::spawn(async move {
+                self.spawn(0, async move {
                     runtime.on_message(&message).await;
-                }));
+                })
             }
             Event::InteractionCreate(interaction) => {
                 let runtime = Arc::clone(self);
                 let interaction = interaction.0.clone();
-                drop(tokio::spawn(async move {
-                    runtime.on_interaction(&interaction).await;
-                }));
+                let is_ticket = matches!(
+                    interaction.data.as_ref(),
+                    Some(twilight_model::application::interaction::InteractionData::MessageComponent(component))
+                        if TicketAction::from_custom_id(&component.custom_id).is_some()
+                );
+                if let Some(tickets) = self.tickets.as_ref().filter(|_| is_ticket) {
+                    tickets.spawn(async move {
+                        runtime.on_interaction(&interaction).await;
+                    });
+                    true
+                } else {
+                    self.spawn(1, async move {
+                        runtime.on_interaction(&interaction).await;
+                    })
+                }
+            }
+            Event::ReactionAdd(reaction) => {
+                self.dispatch_self_role_reaction(&reaction.0, false);
+                true
+            }
+            Event::ReactionRemove(reaction) => {
+                self.dispatch_self_role_reaction(&reaction.0, true);
+                true
             }
             Event::Ready(ready) => {
+                self.set_identity(ready.user.id.get(), ready.application.id.get());
+                if let Some(tickets) = &self.tickets {
+                    tickets.on_ready(ready.user.id.get());
+                }
                 let runtime = Arc::clone(self);
                 let application_id = ready.application.id.get();
-                drop(tokio::spawn(async move {
+                self.spawn(2, async move {
                     runtime.publish_registry(Some(application_id)).await;
-                }));
+                })
             }
             Event::Resumed => {
+                if let Some(tickets) = &self.tickets {
+                    let runtime = Arc::clone(self);
+                    // Saved sessions emit RESUMED without READY. Resolve the
+                    // authenticated USER through the shared executor before
+                    // waking maintenance; application ids are not author ids.
+                    // Keep the lookup in the ticket shutdown scope, independent
+                    // of registry publication and its success/dedup gate.
+                    tickets.spawn(async move {
+                        runtime.ready_tickets_after_resume().await;
+                    });
+                }
                 let runtime = Arc::clone(self);
-                drop(tokio::spawn(async move {
+                self.spawn(2, async move {
                     runtime.publish_registry(None).await;
-                }));
+                })
             }
-            _ => {}
+            _ => false,
+        }
+    }
+
+    fn dispatch_self_role_reaction(&self, reaction: &GatewayReaction, remove: bool) {
+        if !self.interactions.router.gates().self_roles {
+            return;
+        }
+        let Some(service) = self.self_roles.as_ref().cloned() else {
+            return;
+        };
+        let Some(input) = service.reaction_input(reaction, remove) else {
+            return;
+        };
+        drop(tokio::spawn(async move {
+            let _ = service.handle(&input).await;
+        }));
+    }
+
+    async fn self_role_component(&self, interaction: &Interaction) {
+        let Some(service) = &self.self_roles else {
+            return;
+        };
+        let Some(input) = service.component_input(interaction) else {
+            return;
+        };
+        if !self.defer(interaction, "self-role").await {
+            return;
+        }
+        let result = service.handle(&input).await;
+        self.finish(interaction, result.reply(input.panel.color))
+            .await;
+    }
+
+    async fn ready_tickets_after_resume(&self) {
+        let Some(tickets) = &self.tickets else {
+            return;
+        };
+        match self.executor.current_bot_user_id().await {
+            Ok(bot_id) => {
+                // Reuse this lookup for LFG nonce recovery; no extra REST read.
+                self.interactions.set_bot_user_id(bot_id);
+                tickets.on_ready(bot_id);
+            }
+            Err(_) => {
+                warn!("bot user lookup failed; ticket readiness skipped");
+            }
         }
     }
 
     /// Publish the ONE complete merged registry (legacy `CommandRegistry::sync`
     /// on `ready`). `publish_set` assembles every gated builtin plus DB custom
-    /// rows — none on `main` yet, so `&[]` — and `set_guild_commands` is a
-    /// full replace, making a duplicate READY idempotent rather than stale.
+    /// rows. Unknown custom rows defer publication rather than deleting commands.
+    /// `set_guild_commands` is a full replace, making duplicate READY idempotent.
     /// RESUMED supplies no application id: resolve it through the same executor
     /// and synchronize once per process. Failed syncs remain eligible to retry
     /// on a later gateway connection event, never a polling timer.
     pub(crate) async fn publish_registry(&self, application_id: Option<u64>) {
-        let mut synced = self.registry_synced.lock().await;
-        if application_id.is_none() && *synced {
-            return;
-        }
-        let application_id = match application_id {
-            Some(id) => id,
-            None => match self.executor.current_application_id().await {
-                Ok(id) => id,
-                Err(err) => {
-                    warn!(error = %err, "application lookup failed; publish skipped");
-                    return;
-                }
-            },
-        };
-        let defs = match self.router.publish_set(&[]) {
-            Ok(defs) => defs,
-            Err(err) => {
-                warn!(error = %err, "command registry failed to assemble; publish skipped");
-                return;
-            }
-        };
-        let commands = publish_commands(&defs);
-        if let Err(err) = self
-            .executor
-            .publish_guild_commands(application_id, self.guild_id, &commands)
-            .await
-        {
-            warn!(error = %err, "command registry publish failed");
-        } else {
-            *synced = true;
+        if self.publish_registry_checked(application_id).await.is_err() {
+            warn!("command registry sync failed; details withheld");
         }
     }
 
-    /// Route all slash commands through the shared router. Refusals get the
-    /// existing ephemeral text; accepted builtins without a wired slice get
-    /// an unavailable reply. Only the five implemented names defer and run
-    /// their slice. Router Ignore (unknown names/guild fence) stays silent.
-    pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
-        let RoutedInteraction::Slash { name, outcome } =
-            route_interaction(&self.router, interaction, None)
+    /// [`Self::publish_registry`] with the outcome returned. `Ok(())` covers a
+    /// completed sync and a deferred one (custom-command rows unknown, nothing
+    /// sent); `Err` means an attempted sync failed and a later READY/RESUMED retries it.
+    pub(crate) async fn publish_registry_checked(
+        &self,
+        application_id: Option<u64>,
+    ) -> Result<(), RegistrySyncError> {
+        let mut synced = self.registry_synced.lock().await;
+        if application_id.is_none() && *synced {
+            return Ok(());
+        }
+        let Some(defs) = publication_definitions(
+            &self.interactions.router,
+            self.interactions.router.gates(),
+            self.custom_commands.as_deref(),
+        )?
         else {
+            return Ok(());
+        };
+        let application_id = match application_id {
+            Some(id) => id,
+            None => {
+                let id = self
+                    .executor
+                    .current_application_id()
+                    .await
+                    .map_err(|_| RegistrySyncError::ApplicationLookup)?;
+                // RESUMED carries no application: arm the interaction fence from
+                // this registry lookup instead of a separate identity read.
+                self.interactions.set_application_id(id);
+                self.application_id.store(id, Ordering::Relaxed);
+                id
+            }
+        };
+        let commands = publish_commands(&defs);
+        self.executor
+            .publish_guild_commands(application_id, self.guild_id, &commands)
+            .await
+            .map_err(|_| RegistrySyncError::Publish)?;
+        *synced = true;
+        Ok(())
+    }
+
+    /// Route slash commands and LFG selects once through the shared router. An
+    /// injected self-role service handles only its owned component surface.
+    /// Refusals get the existing ephemeral text; LFG/sticky/feed/schedule defer
+    /// before I/O; leveling sends its own immediate callback. Channel commands
+    /// own their defer/audit lifecycle. Unwired builtins
+    /// get an unavailable reply; router Ignore (unknown/guild) stays silent.
+    pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
+        let application_id = self.application_id.load(Ordering::Relaxed);
+        if application_id != 0 && interaction.application_id.get() != application_id {
+            return;
+        }
+        if ChannelModerationRuntime::accepts(interaction) {
+            if let Err(error) = self
+                .channel
+                .respond(&self.interactions.router, interaction)
+                .await
+            {
+                warn!(interaction_id = %interaction.id.get(), error = %error, "channel response failed; no effect retry");
+            }
+            return;
+        }
+        let routed = route_interaction(&self.interactions.router, interaction, None);
+        if matches!(
+            &routed,
+            RoutedInteraction::Slash {
+                outcome: SlashOutcome::Handled {
+                    handler: HandlerId::Lfg | HandlerId::LfgClose,
+                },
+                ..
+            } | RoutedInteraction::Component {
+                outcome: two_bot_core::ComponentOutcome::Handled {
+                    handler: two_bot_core::ComponentHandler::LfgSignup,
+                },
+                ..
+            }
+        ) {
+            if self
+                .interactions
+                .handle_routed(interaction, routed)
+                .await
+                .is_err()
+            {
+                warn!(
+                    interaction_id = interaction.id.get(),
+                    "LFG execution failed; details withheld"
+                );
+            }
+            return;
+        }
+        if let RoutedInteraction::Component {
+            custom_id,
+            outcome: ComponentOutcome::Handled { handler },
+            ..
+        } = &routed
+        {
+            match handler {
+                ComponentHandler::SelfRole => {
+                    self.self_role_component(interaction).await;
+                }
+                ComponentHandler::Tickets => {
+                    if let (Some(tickets), Some(action)) =
+                        (&self.tickets, TicketAction::from_custom_id(custom_id))
+                    {
+                        self.on_ticket_interaction(tickets, interaction, action)
+                            .await;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        let RoutedInteraction::Slash { name, outcome } = routed else {
             return;
         };
         if let Some(response) = response_for_slash(&outcome) {
@@ -294,8 +700,18 @@ impl CommandRuntime {
         let SlashOutcome::Handled { handler } = outcome else {
             return;
         };
+        if matches!(handler, HandlerId::Rank | HandlerId::Leaderboard) {
+            // Leveling owns its immediate rank-ephemeral/leaderboard-public
+            // callback. Never send the generic ephemeral defer as well.
+            if let Err(error) = self.leveling.handle_interaction(interaction, handler).await {
+                warn!(interaction_id = %interaction.id.get(), command = %name, error = %error, "leveling interaction failed");
+            }
+            return;
+        }
         let owner = match name.as_str() {
-            "sticky" | "sticky-remove" => Some(HandlerId::AutomationAdmin),
+            "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
+                Some(HandlerId::AutomationAdmin)
+            }
             "feed-add" => Some(HandlerId::FeedAdd),
             "feed-remove" => Some(HandlerId::FeedRemove),
             "feed-list" => Some(HandlerId::FeedList),
@@ -307,7 +723,57 @@ impl CommandRuntime {
         }
         // Acknowledge before any database wait or Discord cleanup. If the
         // acknowledgement fails, do not mutate state without a reply path.
-        if let Err(err) = self
+        if !self.defer(interaction, &name).await {
+            return;
+        }
+        match name.as_str() {
+            "sticky" => self.sticky_set(interaction).await,
+            "sticky-remove" => self.sticky_remove(interaction).await,
+            "feed-add" => self.feed_add(interaction).await,
+            "feed-remove" => self.feed_remove(interaction).await,
+            "feed-list" => self.feed_list(interaction).await,
+            "schedule" => {
+                crate::schedule_runtime::schedule_create(
+                    &self.pool,
+                    &self.executor,
+                    &self.guild_id.to_string(),
+                    interaction,
+                )
+                .await;
+            }
+            "schedule-remove" => {
+                crate::schedule_runtime::schedule_remove(
+                    &self.pool,
+                    &self.executor,
+                    &self.guild_id.to_string(),
+                    interaction,
+                )
+                .await;
+            }
+            "schedule-list" => {
+                crate::schedule_runtime::schedule_list(
+                    &self.pool,
+                    &self.executor,
+                    &self.guild_id.to_string(),
+                    interaction,
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn on_ticket_interaction(
+        &self,
+        tickets: &crate::ticket_runtime::TicketRuntime,
+        interaction: &Interaction,
+        action: TicketAction,
+    ) {
+        if let Err(error) = tickets.authorize(interaction, action) {
+            self.answer(interaction, ephemeral(error.to_string())).await;
+            return;
+        }
+        if self
             .executor
             .answer_interaction(
                 interaction.id.get(),
@@ -321,17 +787,25 @@ impl CommandRuntime {
                 },
             )
             .await
+            .is_err()
         {
-            warn!(interaction_id = %interaction.id.get(), command = %name, error = %err, "command defer failed");
+            warn!("ticket defer failed; no state mutated");
             return;
         }
-        match name.as_str() {
-            "sticky" => self.sticky_set(interaction).await,
-            "sticky-remove" => self.sticky_remove(interaction).await,
-            "feed-add" => self.feed_add(interaction).await,
-            "feed-remove" => self.feed_remove(interaction).await,
-            "feed-list" => self.feed_list(interaction).await,
-            _ => {}
+        let reply = match tickets.execute(interaction, action).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                warn!(error_class = ?error.class(), "ticket action incomplete");
+                error.reply()
+            }
+        };
+        if self
+            .executor
+            .edit_interaction_response(interaction.application_id.get(), &interaction.token, &reply)
+            .await
+            .is_err()
+        {
+            warn!("ticket response edit failed; durable state retained");
         }
     }
 
@@ -718,7 +1192,7 @@ impl CommandRuntime {
     /// invoker's member permission bits decide `can_manage_guild`.
     fn feed_inputs(&self, interaction: &Interaction) -> FeedInputs {
         FeedInputs {
-            enabled: self.router.gates().announcements,
+            enabled: self.interactions.router.gates().announcements,
             configured_guild_id: self.guild_id.to_string(),
             guild_id: interaction
                 .guild_id
@@ -751,6 +1225,30 @@ impl CommandRuntime {
 
     /// Answer an interaction through the shared executor. The token never
     /// appears in logs — only the interaction id and error.
+    async fn defer(&self, interaction: &Interaction, command: &str) -> bool {
+        match self
+            .executor
+            .answer_interaction(
+                interaction.id.get(),
+                &interaction.token,
+                &InteractionResponse {
+                    kind: InteractionResponseType::DeferredChannelMessageWithSource,
+                    data: Some(InteractionResponseData {
+                        flags: Some(MessageFlags::EPHEMERAL),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await
+        {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(interaction_id = %interaction.id.get(), command, error = %err, "command defer failed");
+                false
+            }
+        }
+    }
+
     async fn answer(&self, interaction: &Interaction, response: InteractionResponse) {
         if let Err(err) = self
             .executor
@@ -916,18 +1414,21 @@ pub(crate) fn feed_remove_option(interaction: &Interaction) -> Option<String> {
         })
 }
 
-/// The runtime's router for tests that bypass `from_env`'s env reads:
-/// sticky + feed handler markers, matching `from_env`'s registrations.
-#[cfg(test)]
+/// Shared sticky/feed/channel/leveling registrations; LFG is composed by
+/// `InteractionRuntime`. Tests that bypass `from_env`'s env reads use this
+/// same router, matching `from_env`'s registrations.
 pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     let mut router = InteractionRouter::new(gates);
+    register_channel_handlers(&mut router);
     router.register(Box::new(StickyHandler));
     for id in [
         HandlerId::FeedAdd,
         HandlerId::FeedRemove,
         HandlerId::FeedList,
+        HandlerId::Rank,
+        HandlerId::Leaderboard,
     ] {
-        router.register(Box::new(FeedHandler(id)));
+        router.register(Box::new(SliceHandler(id)));
     }
     router
 }
@@ -978,4 +1479,25 @@ pub(crate) fn sticky_options(interaction: &Interaction) -> (Option<String>, Opti
         }
     }
     (body, debounce)
+}
+
+#[cfg(test)]
+#[path = "command_runtime_resumed_tests.rs"]
+mod resumed_tests;
+
+/// Full-set publication: a bulk replace needs an authoritative custom-command
+/// row load, so an unknown store defers instead of deleting Discord commands.
+pub(crate) fn publication_definitions(
+    router: &InteractionRouter,
+    gates: RouterGates,
+    custom: Option<&[two_bot_core::CustomCommand]>,
+) -> Result<Option<Vec<two_bot_core::CommandDefinition>>, RegistrySyncError> {
+    if gates.automations && custom.is_none() {
+        warn!("registry publication deferred: custom-command store unavailable");
+        return Ok(None);
+    }
+    router
+        .publish_set(custom.unwrap_or_default())
+        .map(Some)
+        .map_err(|_| RegistrySyncError::Invalid)
 }

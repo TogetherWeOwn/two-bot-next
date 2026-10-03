@@ -108,6 +108,28 @@ pub async fn put_lfg(
     tx.commit().await
 }
 
+/// Save an accepted message without replacing roles, signups or a concurrent close.
+pub async fn save_lfg_message_id(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    id: &str,
+    message_id: &str,
+) -> Result<(), sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE lfg_posts SET message_id = $3 WHERE guild_id = $1 AND id = $2
+         AND (message_id IS NULL OR message_id = $3)",
+    )
+    .bind(guild_id)
+    .bind(id)
+    .bind(message_id)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(())
+}
+
 /// Fetch one post by guild + id (legacy `getLfg`); `None` when missing or
 /// fenced to another guild.
 pub async fn get_lfg(
@@ -660,6 +682,53 @@ mod tests {
             .await
             .expect("signup"),
             SignupOutcome::Closed
+        );
+        reset(&pool, id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs agent-testdb or the CI service container"]
+    async fn accepted_id_save_preserves_roles_signups_and_closure() {
+        let pool = test_pool().await;
+        let id = "lfg-store-save-message";
+        reset(&pool, id).await;
+        let post = test_post(id);
+        let roles = test_roles(id);
+        put_lfg(&pool, &post, &roles, true).await.expect("insert");
+        signup_lfg(
+            &pool,
+            &post.guild_id,
+            id,
+            "tank",
+            "u1",
+            "2026-09-10T11:00:00Z",
+        )
+        .await
+        .expect("signup");
+        close_lfg(&pool, &post.guild_id, id, "2026-09-10T12:00:00Z")
+            .await
+            .expect("close");
+        assert!(
+            save_lfg_message_id(&pool, "other-guild", id, "333333333333333333")
+                .await
+                .is_err()
+        );
+        save_lfg_message_id(&pool, &post.guild_id, id, "333333333333333333")
+            .await
+            .expect("accept");
+        let stored = get_lfg(&pool, &post.guild_id, id)
+            .await
+            .expect("get")
+            .expect("post");
+        assert_eq!(stored.message_id.as_deref(), Some("333333333333333333"));
+        assert_eq!(stored.status, LfgStatus::Closed);
+        assert!(stored.closed_at.is_some());
+        assert_eq!(list_lfg_roles(&pool, id).await.expect("roles"), roles);
+        assert_eq!(list_lfg_signups(&pool, id).await.expect("signups").len(), 1);
+        assert!(
+            save_lfg_message_id(&pool, &post.guild_id, id, "444444444444444444")
+                .await
+                .is_err()
         );
         reset(&pool, id).await;
     }

@@ -55,9 +55,12 @@ mod tests {
 
     #[tokio::test]
     async fn existing_server_exposes_metrics_without_gateway_or_database() {
-        let state = Arc::new(tokio::sync::RwLock::new(
-            crate::gateway::GatewayState::Unconfigured,
-        ));
+        let state = crate::server::SharedState::new(
+            Arc::new(tokio::sync::RwLock::new(
+                crate::gateway::GatewayState::Unconfigured,
+            )),
+            None,
+        );
         let response = crate::server::router(state)
             .oneshot(
                 Request::builder()
@@ -92,6 +95,60 @@ mod tests {
         ] {
             assert!(text.contains(&format!("# TYPE {name} ")), "missing {name}");
         }
+    }
+
+    #[tokio::test]
+    async fn scrape_contract_pins_wire_content_type_and_stable_labels() {
+        // Pin the literal wire value, not just self-equality with the
+        // constant: Prometheus scrapers match this exact exposition version.
+        assert_eq!(
+            metrics::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let state = crate::server::SharedState::new(
+            Arc::new(tokio::sync::RwLock::new(
+                crate::gateway::GatewayState::Unconfigured,
+            )),
+            None,
+        );
+        let response = crate::server::router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let text = String::from_utf8(
+            to_bytes(response.into_body(), 65_536)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        // Stable label names already emitted by crates/core/src/metrics.rs.
+        // Unknown values collapse to `other`; renaming a label breaks scrapers.
+        for sample in [
+            "two_bot_gateway_events_total{event=\"RESUMED\"} ",
+            "two_bot_gateway_events_total{event=\"other\"} ",
+            "two_bot_rest_requests_total{route=\"other\",result=\"429\"} ",
+            "two_bot_job_last_success_timestamp_seconds{job=\"session_checkpoint\"} ",
+            "two_bot_job_last_success_timestamp_seconds{job=\"invite_snapshot\"} ",
+            "two_bot_job_last_success_timestamp_seconds{job=\"other\"} ",
+            "two_bot_db_pool_configured ",
+            "two_bot_db_pool_idle_connections ",
+            "two_bot_db_pool_max_connections ",
+        ] {
+            assert!(text.contains(sample), "missing sample {sample}");
+        }
+        assert!(text.ends_with('\n'));
     }
 
     #[tokio::test]

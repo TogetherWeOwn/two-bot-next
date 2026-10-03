@@ -5,10 +5,16 @@
 
 use sqlx::{PgPool, Row};
 
+use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
 use crate::internal_actions::{
     body_hash, is_implemented, valid_idempotency_key, valid_nonce_format, within_skew,
     CLAIM_STALE_SECONDS, MAX_BODY_BYTES, NONCE_TTL_SECONDS, SKEW_SECONDS,
 };
+
+/// Clock domain for the durable nonce high-water mark. One guard per clock
+/// domain: DB `clock_timestamp()` readings are not comparable with any
+/// process-local wall clock, so the durable mark lives in its own domain row.
+pub const NONCE_DB_CLOCK_DOMAIN: &str = "internal_nonce_db";
 
 /// Public errors deliberately omit SQLx sources and all request/provider details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -252,6 +258,15 @@ impl InternalActionStore {
     /// burn, even if the row it waited on expired mid-wait. Callers must treat
     /// every error (including this one) as refusal: only `Ok(true)` with a
     /// fresh timestamp is a successful burn.
+    ///
+    /// F8 fail-closed clock policy: the commit instant also advances the
+    /// persisted [`NONCE_DB_CLOCK_DOMAIN`] high-water mark, and a DB-time
+    /// regression past [`CLOCK_SKEW_TOLERANCE_MS`] rolls the whole burn back
+    /// with `InvalidInput` — even for a fresh nonce. Within tolerance the mark
+    /// (not the regressed reading) decides freshness, so a sweep can never
+    /// reopen a signed window the mark has already passed. Restart/failover
+    /// re-derives the mark from the table (see [`Self::nonce_high_water_ms`]),
+    /// so persisted time cannot move backwards past burned nonces.
     pub async fn burn_nonce(
         &self,
         nonce: &str,
@@ -295,25 +310,83 @@ impl InternalActionStore {
             .execute(&mut *tx)
             .await?;
         }
-        // Commit-time freshness: the wait above may have crossed the skew
-        // window (or expiry) after the receiver's pre-burn check passed. Decide
+        // Commit-time freshness AND clock policy: the wait above may have
+        // crossed the skew window (or expiry) after the receiver's pre-burn
+        // check passed, and the DB clock itself may have regressed. Decide
         // against database time — never the caller's clock — with the same
         // whole-second `within_skew` semantics as the domain check, and roll
         // the whole burn back when the attempt is no longer fresh. An invalid
         // (non-numeric) timestamp fails `within_skew` and is refused the same
         // way; format-validated nonces are unaffected.
-        let commit_secs: i64 =
-            sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()))::bigint")
-                .fetch_one(&mut *tx)
-                .await?;
-        let commit_secs =
-            u64::try_from(commit_secs).map_err(|_| InternalStoreError::InvalidInput)?;
-        if !within_skew(timestamp, SKEW_SECONDS, commit_secs) {
+        //
+        // The guard compares the commit instant against the persisted
+        // high-water mark in the SAME transaction (locked via FOR UPDATE), so
+        // a regression check cannot race a concurrent advancing burn. The
+        // tolerance covers a commit that sampled its instant before an
+        // earlier-committed burn advanced the mark: within tolerance the mark
+        // decides freshness. Past tolerance the burn refuses fail-closed.
+        let commit_ms: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let commit_ms = u64::try_from(commit_ms).map_err(|_| InternalStoreError::InvalidInput)?;
+        let mark_ms: Option<i64> = sqlx::query_scalar(
+            "SELECT high_water_ms FROM internal_clock_high_water WHERE domain = $1 FOR UPDATE",
+        )
+        .bind(NONCE_DB_CLOCK_DOMAIN)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let guarded_ms = match mark_ms {
+            Some(mark) => {
+                let mark = u64::try_from(mark).map_err(|_| InternalStoreError::InvalidInput)?;
+                if commit_ms >= mark {
+                    commit_ms
+                } else if mark - commit_ms <= CLOCK_SKEW_TOLERANCE_MS {
+                    mark
+                } else {
+                    tx.rollback().await?;
+                    return Err(InternalStoreError::InvalidInput);
+                }
+            }
+            None => commit_ms,
+        };
+        let guarded_secs = guarded_ms / 1000;
+        if !within_skew(timestamp, SKEW_SECONDS, guarded_secs) {
             tx.rollback().await?;
             return Err(InternalStoreError::InvalidInput);
         }
+        let guarded_ms = i64::try_from(guarded_ms).map_err(|_| InternalStoreError::InvalidInput)?;
+        sqlx::query(
+            "INSERT INTO internal_clock_high_water (domain, high_water_ms, observed_at) \
+             VALUES ($1, $2, clock_timestamp()) \
+             ON CONFLICT (domain) DO UPDATE \
+             SET high_water_ms = EXCLUDED.high_water_ms, observed_at = clock_timestamp() \
+             WHERE internal_clock_high_water.high_water_ms < EXCLUDED.high_water_ms",
+        )
+        .bind(NONCE_DB_CLOCK_DOMAIN)
+        .bind(guarded_ms)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(burned)
+    }
+
+    /// Highest DB freshness instant observed by [`Self::burn_nonce`],
+    /// milliseconds since epoch. A new process restores its guard from this
+    /// (or equivalently from the newest `burned_at`) before evaluating
+    /// freshness, so an earlier clock refuses old captures instead of
+    /// treating its first read as new.
+    pub async fn nonce_high_water_ms(&self) -> Result<Option<u64>, InternalStoreError> {
+        let mark: Option<i64> = sqlx::query_scalar(
+            "SELECT high_water_ms FROM internal_clock_high_water WHERE domain = $1",
+        )
+        .bind(NONCE_DB_CLOCK_DOMAIN)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        mark.map(|ms| u64::try_from(ms).map_err(|_| InternalStoreError::InvalidInput))
+            .transpose()
     }
 
     /// Insert and audit share a transaction. Only committed new claims may run.
@@ -363,6 +436,21 @@ impl InternalActionStore {
                 match row.try_get::<&str, _>("state")? {
                     "completed" => InternalClaim::Replay(TerminalResponse::from_row(&row)?),
                     "unknown" => InternalClaim::NeedsReconciliation,
+                    "not_sent" if !Self::matches_subject(&row, subject)? => InternalClaim::Mismatch,
+                    "not_sent" => {
+                        sqlx::query(
+                            "WITH fresh AS MATERIALIZED (SELECT clock_timestamp() AS now) \
+                             UPDATE internal_idempotency SET state = 'in_flight', \
+                             created_at = now, updated_at = now FROM fresh WHERE intent_id = $1",
+                        )
+                        .bind(row.try_get::<i64, _>("intent_id")?)
+                        .execute(&mut *tx)
+                        .await?;
+                        InternalClaim::Claimed(ExecutionClaim {
+                            intent_id: row.try_get("intent_id")?,
+                            identity: identity.clone(),
+                        })
+                    }
                     "in_flight" if row.try_get::<bool, _>("stale")? => {
                         InternalClaim::NeedsReconciliation
                     }
@@ -373,6 +461,49 @@ impl InternalActionStore {
         };
         tx.commit().await?;
         Ok(result)
+    }
+
+    /// Release only when the caller proves the mutation was never dispatched.
+    /// Consumes the opaque, non-Clone claim even on failure: no old owner can
+    /// finish or mark unknown after a new claimant acquires this same intent.
+    /// Nonces, payload/subject binding and per-intent audit evidence are retained.
+    ///
+    /// ```compile_fail
+    /// use two_bot_core::internal_action_store::{ExecutionClaim, InternalActionStore};
+    /// async fn old_owner(store: &InternalActionStore, claim: ExecutionClaim) {
+    ///     store.release_proven_not_sent(claim).await.unwrap();
+    ///     store.mark_unknown(&claim).await.unwrap(); // claim was consumed
+    /// }
+    /// ```
+    pub async fn release_proven_not_sent(
+        &self,
+        claim: ExecutionClaim,
+    ) -> Result<(), InternalStoreError> {
+        let mut tx = self.pool.begin().await?;
+        let row = Self::lock_identity(&mut tx, &claim.identity).await?;
+        if !Self::matches(&row, &claim.identity)?
+            || row.try_get::<i64, _>("intent_id")? != claim.intent_id
+            || row.try_get::<&str, _>("state")? != "in_flight"
+            || row.try_get::<bool, _>("stale")?
+        {
+            return Err(InternalStoreError::TransitionRefused);
+        }
+        sqlx::query(
+            "UPDATE internal_idempotency SET state = 'not_sent', updated_at = clock_timestamp() \
+             WHERE intent_id = $1",
+        )
+        .bind(claim.intent_id)
+        .execute(&mut *tx)
+        .await?;
+        Self::audit(
+            &mut tx,
+            claim.intent_id,
+            "released",
+            Some("proven_not_sent"),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Record a definitive outcome. Late completion cannot overwrite reconciliation.
@@ -391,7 +522,7 @@ impl InternalActionStore {
         let row = Self::lock_identity(&mut tx, &claim.identity).await?;
         if !Self::matches(&row, &claim.identity)?
             || row.try_get::<i64, _>("intent_id")? != claim.intent_id
-            || row.try_get::<&str, _>("state")? == "completed"
+            || !matches!(row.try_get::<&str, _>("state")?, "in_flight" | "unknown")
         {
             return Err(InternalStoreError::TransitionRefused);
         }
@@ -434,7 +565,7 @@ impl InternalActionStore {
         let intent_id: i64 = row.try_get("intent_id")?;
         let state: &str = row.try_get("state")?;
         if !Self::matches(&row, identity)?
-            || state == "completed"
+            || !matches!(state, "in_flight" | "unknown")
             || owner_id.is_some_and(|id| id != intent_id)
             || (owner_id.is_none() && state != "unknown" && !row.try_get::<bool, _>("stale")?)
         {
@@ -484,6 +615,20 @@ impl InternalActionStore {
     ) -> Result<bool, InternalStoreError> {
         Ok(row.try_get::<&str, _>("action")? == identity.action
             && row.try_get::<&str, _>("payload_hash")? == identity.payload_hash)
+    }
+
+    fn matches_subject(
+        row: &sqlx::postgres::PgRow,
+        subject: &AuditSubject,
+    ) -> Result<bool, InternalStoreError> {
+        Ok(row.try_get::<Option<&str>, _>("guild_id")?
+            == subject.guild_id.as_ref().map(DiscordId::as_str)
+            && row.try_get::<Option<&str>, _>("actor_id")?
+                == subject.actor_id.as_ref().map(DiscordId::as_str)
+            && row.try_get::<Option<&str>, _>("target_id")?
+                == subject.target_id.as_ref().map(DiscordId::as_str)
+            && row.try_get::<Option<&str>, _>("resolved_role_id")?
+                == subject.resolved_role_id.as_ref().map(DiscordId::as_str))
     }
 
     async fn audit(

@@ -46,19 +46,49 @@ fn script(
     managed: bool,
     channel: Value,
 ) -> Vec<ScriptedResponse> {
-    [
+    script_channels(base, flags, target_position, managed, vec![channel])
+}
+
+fn script_channels(
+    base: Permissions,
+    flags: u64,
+    target_position: u64,
+    managed: bool,
+    channels: Vec<Value>,
+) -> Vec<ScriptedResponse> {
+    let mut bodies = vec![
         user(),
         json!({"id": BOT.to_string(), "name": TOKEN, "description": "", "bot_public": true,
             "bot_require_code_grant": false, "verify_key": "fixture", "flags": flags}),
         json!({"user": user(), "roles": [BOT_ROLE.to_string()], "deaf": false, "mute": false, "flags": 0}),
-        json!([role(GUILD, Permissions::empty(), 0, false), role(BOT_ROLE, base, 10, true), role(TARGET_ROLE, Permissions::empty(), target_position, managed)]),
+        json!([
+            role(GUILD, Permissions::empty(), 0, false),
+            role(BOT_ROLE, base, 10, true),
+            role(TARGET_ROLE, Permissions::empty(), target_position, managed)
+        ]),
         json!([]),
-        channel,
-    ].into_iter().map(|body| ScriptedResponse::json(200, body)).collect()
+    ];
+    bodies.extend(channels);
+    bodies
+        .into_iter()
+        .map(|body| ScriptedResponse::json(200, body))
+        .collect()
 }
 
 fn channel() -> Value {
     json!({"id": CHANNEL.to_string(), "guild_id": GUILD.to_string(), "name": TOKEN, "type": 0, "permission_overwrites": []})
+}
+
+const CATEGORY: u64 = 7777;
+
+/// Ticket category destination: a GuildCategory (type 4) in the target guild.
+fn category_channel() -> Value {
+    json!({"id": CATEGORY.to_string(), "guild_id": GUILD.to_string(), "name": TOKEN, "type": 4, "permission_overwrites": []})
+}
+
+/// The same category slot served as a text channel: must fail as a mismatch.
+fn category_channel_as_text() -> Value {
+    json!({"id": CATEGORY.to_string(), "guild_id": GUILD.to_string(), "name": TOKEN, "type": 0, "permission_overwrites": []})
 }
 
 async fn cli(mock: &MockRest, args: &[&str], vars: &[(&str, &str)]) -> std::process::Output {
@@ -163,32 +193,39 @@ async fn human_table_and_unused_privileged_intent_warn_without_failing() {
     mock.shutdown().await;
 }
 
+fn ticket_triple(staff: &str) -> Vec<(&str, &str)> {
+    vec![
+        ("DISCORD_TICKET_CATEGORY_ID", "7777"),
+        ("DISCORD_TICKET_STAFF_ROLE_ID", staff),
+        ("DISCORD_TICKET_PANEL_CHANNEL_ID", "6666"),
+    ]
+}
+
 #[tokio::test]
 async fn intents_follow_automod_and_the_ticket_triple() {
-    for (flags, vars, code) in [
-        (0, vec![], 1),
-        (1 << 15, vec![("TWO_AUTOMOD", "1")], 1),
-        ((1 << 15) | (1 << 19), vec![("TWO_AUTOMOD", "1")], 0),
+    for (flags, vars, bodies, code) in [
+        (0, vec![], vec![channel()], 1),
+        (1 << 15, vec![("TWO_AUTOMOD", "1")], vec![channel()], 1),
+        (
+            (1 << 15) | (1 << 19),
+            vec![("TWO_AUTOMOD", "1")],
+            vec![channel()],
+            0,
+        ),
         (
             1 << 15,
-            vec![
-                ("DISCORD_TICKET_CATEGORY_ID", "6666"),
-                ("DISCORD_TICKET_STAFF_ROLE_ID", "5555"),
-                ("DISCORD_TICKET_PANEL_CHANNEL_ID", "6666"),
-            ],
+            ticket_triple("5555"),
+            vec![channel(), category_channel()],
             1,
         ),
         (
             (1 << 15) | (1 << 18),
-            vec![
-                ("DISCORD_TICKET_CATEGORY_ID", "6666"),
-                ("DISCORD_TICKET_STAFF_ROLE_ID", "5555"),
-                ("DISCORD_TICKET_PANEL_CHANNEL_ID", "6666"),
-            ],
+            ticket_triple("5555"),
+            vec![channel(), category_channel()],
             0,
         ),
     ] {
-        let mock = mock(script(permissions(), flags, 1, false, channel())).await;
+        let mock = mock(script_channels(permissions(), flags, 1, false, bodies)).await;
         let output = cli(&mock, &["--json"], &vars).await;
         assert_eq!(
             output.status.code(),
@@ -232,6 +269,126 @@ async fn roles_fail_for_missing_managed_or_high_targets_even_with_administrator(
         );
         mock.shutdown().await;
     }
+}
+
+/// TOG-11802: the ticket staff role reuses the hierarchy gate (missing,
+/// managed, @everyone, or not strictly below the bot fails closed), and the
+/// ticket category slot requires GuildCategory. Static guidance only; the
+/// report must never echo the fake token.
+#[tokio::test]
+async fn ticket_staff_role_and_category_fail_closed() {
+    // PASS path: staff role below the bot + GuildCategory destination.
+    // (Named pass_mock so later mock(...) calls in this fn still resolve
+    // to the helper instead of the local binding.)
+    let pass_mock = mock(script_channels(
+        permissions(),
+        (1 << 15) | (1 << 18),
+        1,
+        false,
+        vec![channel(), category_channel()],
+    ))
+    .await;
+    let output = cli(&pass_mock, &["--json"], &ticket_triple("5555")).await;
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    pass_mock.shutdown().await;
+
+    // Staff-role failures: missing (deleted), managed, @everyone, and above
+    // the bot. Equal position still passes here: Twilight orders equal
+    // positions by ascending snowflake, and 5555 sorts below the bot's 4444
+    // (covered by the PASS path at position 1 and the existing equal-position
+    // level-reward case). Each case needs a role snapshot carrying the
+    // referenced role except the missing one.
+    for (staff, position, managed) in [
+        ("7777", 1, false),  // missing from the role snapshot
+        ("5555", 1, true),   // managed (integration/bot role)
+        ("2222", 0, false),  // @everyone must never be staff
+        ("5555", 11, false), // above the bot
+    ] {
+        let mock = mock(script_channels(
+            permissions(),
+            (1 << 15) | (1 << 18),
+            position,
+            managed,
+            vec![channel(), category_channel()],
+        ))
+        .await;
+        let output = cli(&mock, &["--json"], &ticket_triple(staff)).await;
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{staff}/{position}/{managed}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            report["checks"].as_array().unwrap().iter().any(|check| check["check"]
+                == format!("role {staff}")
+                && check["status"] == "FAIL"),
+            "{staff}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        mock.shutdown().await;
+    }
+
+    // Category mismatch: the category slot served a text channel.
+    // (Distinct binding names: each `let mock = mock(...)` initializer
+    // must resolve to the helper, not an earlier MockRest binding.)
+    let mismatch_mock = mock(script_channels(
+        permissions(),
+        (1 << 15) | (1 << 18),
+        1,
+        false,
+        vec![channel(), category_channel_as_text()],
+    ))
+    .await;
+    let output = cli(&mismatch_mock, &["--json"], &ticket_triple("5555")).await;
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["check"] == format!("channel {CATEGORY}") && check["status"] == "FAIL"));
+    mismatch_mock.shutdown().await;
+
+    // Partial triple: only one of the three ticket keys set.
+    let partial_mock = mock(script(
+        permissions(),
+        (1 << 15) | (1 << 18),
+        1,
+        false,
+        channel(),
+    ))
+    .await;
+    let output = cli(
+        &partial_mock,
+        &["--json"],
+        &[("DISCORD_TICKET_STAFF_ROLE_ID", "5555")],
+    )
+    .await;
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["check"] == "ticket configuration" && check["status"] == "FAIL"));
+    partial_mock.shutdown().await;
 }
 
 #[tokio::test]
@@ -373,6 +530,30 @@ async fn invalid_configuration_and_nonloopback_seams_fail_before_rest() {
         assert!(mock.requests().is_empty());
         mock.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn live_checks_without_admission_authority_refuse_before_rest() {
+    let mock = mock(vec![]).await;
+    let output = cli(&mock, &["--json"], &[("DISCORD_PREFLIGHT_API_BASE", "")]).await;
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("TWO_DATABASE_URL"));
+    assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn preflight_429_is_one_attempt_and_stops_the_check_sequence() {
+    let mock = mock(vec![ScriptedResponse::json(
+        429,
+        json!({"retry_after":0.001,"global":true}),
+    )])
+    .await;
+    let output = cli(&mock, &["--json"], &[]).await;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("HTTP 429"));
+    assert_eq!(mock.requests().len(), 1);
+    mock.shutdown().await;
 }
 
 #[tokio::test]

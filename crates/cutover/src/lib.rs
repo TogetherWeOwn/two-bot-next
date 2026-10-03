@@ -5,7 +5,7 @@
 //! `src/backfill/` + `src/core/inviteTracker.ts`). The library holds the pure
 //! logic — parsing, planning, reconciliation — so it unit-tests without a
 //! database or Discord; `db` and `rest` hold the sqlx/twilight seams and the
-//! seven `src/bin/` CLIs are thin arg-parsing shells around them.
+//! `src/bin/` CLIs are thin arg-parsing shells around them.
 //!
 //! Conventions inherited from legacy: dry run is the default everywhere that
 //! writes (`--apply` is the only thing that writes); every CLI refuses the
@@ -21,22 +21,33 @@ pub mod dedupe;
 pub mod gateway_session;
 pub mod internal_settings;
 pub mod invite;
+pub mod invite_store;
+pub mod leave_gap;
 pub mod legacy_copy;
 pub mod legacy_mapping;
 pub mod legacy_verify;
 pub mod mee6_names;
 pub mod mee6_rewards;
 pub mod mee6_xp;
+pub mod member_erasure;
 pub mod message_scan;
 pub mod parse;
+pub mod raid_tools;
+pub mod reengagement;
 pub mod rest;
+pub mod rollback_delta;
 pub mod self_role_store;
 pub mod settings;
+pub mod staging_migrate;
+pub mod tickets;
+pub mod voice_config_store;
+pub mod voice_reconcile;
+pub mod voice_rooms;
 
 pub use backfill_plan::{plan_backfill_merge, BackfillMerge, ListedMember, PlannedEvent};
 pub use db::{
-    connect, mark_bot, record_earliest, record_event, replace_role_rewards, role_rewards,
-    touch_activity, CutoverDb, FunnelWrite, ReplaceRewardsError, DB_POOL_MAX_DEFAULT,
+    connect, connect_with_tls, mark_bot, record_earliest, record_event, replace_role_rewards,
+    role_rewards, touch_activity, CutoverDb, FunnelWrite, ReplaceRewardsError, DB_POOL_MAX_DEFAULT,
     STATEMENT_TIMEOUT_MS,
 };
 pub use dedupe::{
@@ -65,7 +76,10 @@ pub use parse::{
     parse_voice_message, snowflake_to_date_ms, EmbedView, LeaveAttributionRecord, MemberLogKind,
     MemberLogRecord, MessageView, VoiceKind, VoiceRecord,
 };
-pub use rest::{iso_to_millis, timestamp_ms, RestClient, RestError, ScanPage};
+pub use rest::{
+    iso_to_millis, timestamp_ms, ArchiveIncompleteReason, ArchivedThreadsOutcome, RestClient,
+    RestError, ScanCompletion, ScanPage, DEFAULT_ARCHIVED_THREAD_PAGES,
+};
 pub use settings::{log_refresh_report, SettingsStore, SettingsWriteError};
 
 /// Live TWO guild: every CLI refuses it without `--allow-live-guild`
@@ -75,9 +89,12 @@ pub const LIVE_GUILD_ID: &str = "326474832151838730";
 /// Staging guild for soak runs (legacy `TWO_STAGING_GUILD_ID`).
 pub const STAGING_GUILD_ID: &str = "1545644954272137297";
 
-/// True when `s` is a Discord snowflake (legacy `/^\d{17,20}$/`).
+/// True when `s` is a canonical Discord snowflake, safe for identity comparisons.
 #[must_use]
 pub fn is_snowflake(s: &str) -> bool {
     let len = s.len();
-    (17..=20).contains(&len) && s.bytes().all(|b| b.is_ascii_digit())
+    (17..=20).contains(&len)
+        && !s.starts_with('0')
+        && s.bytes().all(|b| b.is_ascii_digit())
+        && s.parse::<u64>().is_ok()
 }

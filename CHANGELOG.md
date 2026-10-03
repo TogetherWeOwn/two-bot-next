@@ -5,6 +5,102 @@
 ### Added
 
 - Register an immediate-first, non-overlapping feed poll job with the existing owned job supervisor, pinned HTTPS connector, shared REST executor and fenced SQLx ledger. Preserve exact string nonces (including decimal-looking values), recover pending deliveries even after items leave the feed, rotate the bounded recovery queue without starving XML-present items, and surface bounded-history misses or uncertain send/completion receipts as recovery-required rather than reposting. Announcements remain off by default; no deployment or activation is included.
+- Add self-role reads and singular role operations to the shared REST executor:
+  authoritative member/bot/role/channel policy snapshots, fetched reaction-message
+  identity, paced single-attempt operations with pre/post ownership checks and
+  retained ambiguous or accepted-but-stale exchanges. Add event-first/lane-first
+  runtime admission, concurrent cancellation-safe renewal of both leases, and
+  one-time fenced intent initialization (migration 0201). Recovery preserves
+  intentionally empty snapshots and computes remaining work from freshly fetched
+  member state. Add durable paced send journaling, fresh-policy singular execution,
+  effect checkpoints, and a monotonic compensation phase (migration 0202) that
+  survives restart without retrying rejected intent. Add newly leased stale-worker
+  repair to the committed target, live atomic runtime settlement, and durable
+  pending-exchange recovery (migration 0203) that refuses false success after an
+  interrupted remote send. Add isolated Postgres/mock REST regressions for
+  partial/ambiguous failures, compensation recovery, stale in-flight repair,
+  selected/empty targets, expiry rollback and unresolved settlement refusal.
+  Add injectable shared component/reaction dispatch with source and input-type
+  validation, ephemeral defer-before-admission and final-settlement-only success
+  replies. Add fenced dry-run audits without role mutations or simulated target
+  publication, plus input and orchestration regressions. Add bounded configured-
+  source discovery and generation-fenced recovery of expired processing audits
+  without gateway redelivery, preserving initialized empty targets and unresolved
+  evidence. Gate reaction dispatch through the shared router and add actual
+  partial/duplicate add/remove fixtures. Add optional shared-supervisor recovery
+  registration with bounded cadence/timeout and discovery I/O, per-name parked
+  status, and cancellation/evidence-preservation fixtures. Add separate terminal
+  supersession discovery, fresh typed evidence leases, dual-fenced repair
+  journaling/completion receipts and inherited-unknown preservation (migration
+  0204), with isolated source regressions. Add cancellation-owned terminal restart
+  repair through the shared journaled executor to a freshly leased committed
+  selected/empty target, atomic paired ownership checks and bounded fair mixed
+  discovery. Preserve inherited uncertainty and terminal rejection; dry-run skips
+  terminal claims. Add source fixtures for restart convergence, missing/unknown
+  targets, pending evidence, cancelled renewals and mixed sweeps. Extend terminal
+  fault-injection source coverage for partial repair rejection/rate-limit/received
+  ambiguity/timeout, independent evidence/lane transfer during REST, and expiry
+  after pacing or journal waits without false sends or uncertainty retirement.
+  Route older processing audits inserted after the winning lane's bulk
+  supersession into terminal discovery before prepared ownership, using a fresh
+  post-lock event fence and stored scope/chronology checks. Preserve all intent,
+  pending and compensation evidence without REST or winner publication; add
+  early-supersession runtime/store and lock-wait source fixtures. Preserve singular
+  role-response status before unused provider-body reads can fail or stall, while
+  requiring complete snapshot bodies. Resolve definite new role/direction evidence
+  without erasing older unknown sends or mislabeling unrelated acknowledged work;
+  add partial-body, ownership-loss and inherited-evidence source regressions.
+  Add distinct per-send journal tickets and idempotent response/no-send receipts
+  (migration 0205) that survive generation transfer without former-worker audit
+  or target authority. Pending tickets gate settlement and cannot be erased by
+  aggregate checkpoint clearing. Read ticket evidence only after audit lock waits
+  and preserve unresolved role/direction IDs from pending tickets. Add processing/
+  terminal provenance, lock-wait and role-matrix source fixtures. Wire tickets
+  into normal processing and typed terminal paced runtime steps, persisting raw
+  response/no-send receipts before stale aggregate writes; retain timeout and
+  cancellation uncertainty without retry. Extend runtime/executor source fixtures
+  for status provenance, generation transfer, post-journal no-send and pending
+  tickets. Add live-fenced current-owner receipt evidence incorporation to processing
+  recovery and typed terminal repair, restoring cumulative attempts and acknowledged
+  204 compensation while preserving pending/legacy uncertainty, snapshot effects,
+  terminal outcome and committed target. Distinguish received ambiguous effects
+  from unknown in-flight sends. Add replay, stale-fence, lock-wait and recovery
+  source coverage. Add explicit legacy uncertainty baselines and current-owner
+  receipt-specific retirement (migration 0206), preserving overlapping pending
+  tickets and legacy work. Require live fences after receipt lock waits; received
+  ambiguous effects are not no-effect verdicts or unknown sends. Protect unretired
+  completed tickets and legacy floors from aggregate clearing/settlement. Wire
+  processing/typed terminal retirement and post-commit claim refresh; atomically
+  pin untracked stale-path journals instead of borrowing a ticket's provenance.
+  Add classifier, overlap/replay, stale-fence, lock-wait and recovery source
+  fixtures plus baseline role-matrix coverage. Replace lane-only stale-maintenance
+  journaling with immutable-metadata handoff to the shared fresh typed terminal
+  owner and newly leased committed target. Remove the maintenance alternative from
+  normal processing steps; every new repair send has a distinct ticket. Preserve
+  inherited pending/legacy work and former-worker refusal, without publishing a
+  target or claiming success for obsolete input. Add active-owner/mismatched-hint,
+  stale-cache, overlap/no-send and selected/empty convergence source fixtures.
+  Document bounded unknown-work continuation and add a shared-service restart
+  regression for repeated pending sweeps, durable lease backoff, other-row progress,
+  one acknowledged repair, genuine sender completion and preserved legacy floors.
+  Compose one boot-time self-role service, shared by gateway dispatch and the
+  supervised recovery job, only for a nonempty catalogue in the pinned TWO Staging
+  guild with a verified bot identity; any other guild, an empty or invalid
+  catalogue or a failed identity read parks the surface and the job.
+- Pure `scan_joins_for_bursts` raid replay over recorded joins (fresh watch per
+  call, instant-ordered, strict RFC 3339) with the legacy historical-raid
+  scenarios as integration tests. No runtime or database wiring. (TOG-12378)
+- Wire leveling through the shared command runtime, interaction router and REST executor with ordered, awaited gateway awards. Preserve message eligibility, measured voice duration, session/dry-run reward suppression, ephemeral rank and mention-suppressed public top 10. Ordinary level-ups only grant roles; explicit revokes require a pinned staging fence and whole-set permission/hierarchy preflight. Mock REST and migrated disposable database proofs run in CI, including a shared-runtime single-callback regression.
+- Wire LFG commands and role selects through the shared interaction runtime and REST executor, with ephemeral replies, mention-free message refresh, serialized capacity/closure, nonce recovery, failed-post cleanup and shared announcement audit outcomes.
+- Add bounded component-bearing posts, member-role deltas and deferred-response edits to the shared Discord executor, with explicit onboarding mention/menu rendering and fail-closed per-guild configuration. Wire pre-update gateway capture and shared-router orchestration with live settings/permissions, guarded welcomes and post-role routing; verify through mock Discord and isolated testdb acceptance. Persist pre-pipeline welcome/goodbye jobs atomically with gateway checkpoints and bound restart attempts; retain token-free interrupted-component receipts instead of replaying uncertain role writes. Commit anchor marker/routing together and finish deferred processing errors with bounded honest replies. Recovery validation remains in progress; no live activation is claimed.
+- Automod gateway decision/enrichment seams and capture-only funnel handoff,
+  staging/live-approval and dry-run fences, protected-target enforcement plans,
+  repeat-history expiration, and replay-safe delivery claims with the
+  legacy-compatible once-per-message violation ledger. Shared executor/shard
+  activation is not enabled by this slice. (TOG-10089)
+- Scheduled-message domain logic, PostgreSQL store and migration, with validation, prefix-resolved removal, recurring timing and retry outcomes. Discord router/executor wiring follows separately.
+- Scheduled-store integration tests run against the isolated PostgreSQL service container in CI.
+- Add ticket lifecycle domain logic and guild-scoped Postgres persistence, with atomic transcript capture, 300-second cooldowns, restart-recovery plans and 90-day transcript purge. Shared-router/REST runtime wiring remains pending.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
   legacy-compatible audit/panel tables (migration 0200). Shared event and
@@ -21,15 +117,98 @@
 - Add the audit mirror delivery service over the shared REST executor: record-before-deliver, private guild-fenced destinations, enforced nonce/mention suppression, kill-switch enforcement, crash-safe marker reconciliation and quarantine. Revalidate prepared ownership after shared transport pacing, preserve interrupted dedup adoption evidence, treat malformed history as uncertain, and run service fault-injection regressions in CI. Runtime wiring and activation remain deferred.
 - Add the pinned-address HTTPS feed connector (`feeds_connector`). `fetch_feed` validates the source through `feeds_http`, resolves all A/AAAA answers once, pins them into a `PublicRequest`, and dials only those addresses through a per-request hyper/rustls client whose resolver answers only the pinned host. TLS SNI, certificate verification and the Host header keep the URL hostname; every redirect hop re-validates and re-pins under a three-hop, same-host, HTTPS-only budget, one 15 s total deadline, `Owen/1.0 (+https://two.gg)` identity, and compressed-then-decompressed `MAX_FEED_BYTES` bounds before XML parsing. Injected resolver/connector seams keep every test hermetic; the private-fixture constructor exists only under `#[cfg(test)]`.
 
+- Add a durable channel-mutation lane that blocks different request keys after
+  ambiguous outcomes, plus atomic claim completion, audit insertion and confirmed
+  unlock recovery cleanup (migration 0123).
+- Register channel moderation adapters on the shared interaction router and execute
+  purge, slowmode, lockdown and recorded-state unlock through the shared REST executor.
+  Verify gates, exact overwrite recovery, durable retry exclusion and finalization-only
+  retries with mock REST and isolated PostgreSQL tests. Defer ephemerally before SQL/REST
+  work, then edit the original response without mentions or effect retries.
+  Compose these handlers alongside sticky and feed commands at startup and publish
+  the complete gated set on READY/RESUMED. Bound asynchronous work in separate message,
+  interaction and registry lanes; cancel it on shard exit without releasing uncertain
+  effects. Moderation remains default-off; no live guild activation is included.
+### Security
+
+- Require authenticated TLS for `two_bot_cutover::connect` (threat-model F6). `TWO_DATABASE_TLS` defaults to `required`, which refuses local hosts and missing, `disable`, `allow` or `prefer` sslmode, and always connects as `verify-full`. `local-only` (tests and CI only) allows loopback, CI service and socket hosts and refuses remote ones. Refusals are fixed strings that never echo the URL. See `docs/database-tls.md`.
+- Fence the remaining Postgres connect paths with the same TLS policy (threat-model F6): the gateway store pool, both `two-bot backup` URL parses, and `channel_moderation_store::connect`. Each refuses a `sslmode=disable` remote URL with the same fixed string and connects `Required` URLs as `verify-full`. (TOG-12208)
+
 ### Fixed
 
 - Support the exact authenticated-user REST read used by feed history reconciliation, and preserve the uncompressed runtime-image budget when Docker's containerd store also accounts for compressed blobs.
+- Retain unsent onboarding welcome/goodbye payloads when successful REST responses contain inconsistent role snapshots or unusable channel evidence, while preserving proven-denial skips. Resolve only submitted session destinations so an unavailable unselected room cannot block valid routing. Add mock restart and selected/unselected regressions; current-head execution and independent review remain pending.
+- Synchronize the interrupted onboarding callback restart fixture on its first durable claim, not early HTTP arrival. Keep token-free receipts, exact attempt counts, replay fencing and fresh-reselection assertions unchanged.
+- Reconcile onboarding with the shared sticky/feed command runtime and outbound message safety. Component posts accept only typed no-mention/one-member welcome policies, neutralize mass mentions and validate effective payloads; original-response edits retain shared scalar-safe truncation and clearing semantics. Preserve independent gateway/feature pools, bounded ingress and worker admission. Add focused mock-wire regressions; preceding ingress repair passed required CI, while the complete reconciliation and independent review remain pending.
+- Reserve a distinct gateway-only database pool within the existing five-connection gateway budget and admit at most two onboarding workers independently of the 32-row durable queue. Keep shard ingress polling through ordered SQL with a bounded packet buffer and cancellation-owned, receive-relative component acknowledgement; gate selection effects on committed jobs and confirmed ACK, fence stale readiness and finish post-defer settings/configuration failures honestly. Preserve feature transaction/member-lock semantics across REST; exact-head validation and independent review remain pending.
+- Preserve unavailable onboarding permission evidence for bounded durable recovery instead of consuming unsent welcome/goodbye jobs; distinguish visible forum routing from plain-message posting and keep existing game pickers usable without landing channels, including anchor-only configuration. Add shaped forum, hot-removal and mock-shard transient-read restart regressions; validation and the independent review gate remain pending.
+- Include the onboarding recovery table and sequence in the reviewed runtime privilege matrix so DML-only gateway startup can recover pending jobs; preserve web-reader denial and verify queue grants through isolated role regressions.
+- Fold the self-role runtime CI command so its Rust module selector is literal
+  text, not an invalid YAML mapping; retain the isolated mocked acceptance opt-in.
+- Accept and strip Neon's `channel_binding` URL option before SQLx without changing TLS mode; retain fatal startup exits with fixed, credential-safe diagnostics and sanitized Worker HTTP 500 responses. Gate staging deployments on the intended new container rollout, immutable image/build identity and serving Worker version; parked readiness 503 no longer passes deployment acceptance.
+- Keep parallel settings DB fixture schemas distinct when wall-clock readings
+  repeat, without sharing schemas or serializing the CAS regressions. (TOG-10089)
+- Grant runtime-only CRUD on the automod relations and cover migrations 0220–0223
+  in least-privilege role tests. Keep edit retry identity stable across member
+  role changes, and inspect updates without replacing or evicting CREATE repeat
+  history needed by queued deliveries. (TOG-10089)
+- Give owned disposable-database teardown a separate finite 30-second statement
+  timeout for checkpoint waits, retaining five-second fixture query deadlines and
+  verified cleanup after failures or caller cancellation.
+- Bound automod repeat inspection to each revision's time window without letting
+  unstamped updates prune delayed creates; retain immutable CREATE facts during
+  role enrichment and clarify enforce-only preserved-match recovery. Run the
+  preserved-replay database regression alongside durable dedupe in CI. (TOG-10089)
+- Redact automod delivery-claim capabilities from derived debug output, including
+  acquired and preserved results; expose tokens only at SQL fencing binds.
+- Grant the least-privilege runtime role scheduled-message CRUD and claim access, with web-reader denial coverage.
+- Isolate scheduled-store fixtures in per-test schema-only pools with awaited teardown on success or panic, so concurrent suites cannot replace each other's claims. Use literal legacy CHECK probes compatible with SQLx 0.9.
+- Upgrade legacy scheduled-message queues to BIGINT intervals and add missing claim/nonce columns without losing definitions or run facts (additive migration 0141).
+- Validate scheduled bodies in UTF-16 units and refuse whitespace/invisible-only effective messages before saving.
+- Scheduled claims lease one occurrence per call, preventing distinct messages from sharing a batch nonce while preserving the nonce across retries and restarts.
+- Scheduled-message ID prefixes treat `%`, `_` and backslashes literally, matching the domain resolver.
+- Configured scheduled-store tests fail on connection, migration or cleanup errors instead of silently skipping; test URLs are restricted to test databases.
+- Keep mock announcement response-classification tests on the production executor
+  deadline; reserve the 100 ms fixture deadline for deliberate header/body timeout
+  coverage. Preserve malformed-response, no-retry and uncertain-outcome assertions
+  without changing production timing or weakening checks.
+- Execute the standalone backup round trip in CI with the current retry-ticket
+  schema while preserving frozen legacy-v3 input coverage. Release only a newly
+  claimed warning key when connection acquisition fails before INSERT; uncertain
+  execution and lost acknowledgments remain fenced. Recurring scratch restore
+  drills allocate fresh migrated test-only targets and retain prior databases,
+  private archive copies and stage receipts instead of overwriting moderation
+  history. Scratch-only pinned legacy DDL prepares seven archive tables not yet
+  shipped by S6; receipts retain dropped-column diagnostics and sync the retained
+  directory entry before allocation. Archive hashing uses a bounded read buffer
+  instead of allocating the entire compressed file. Restore explicitly locks/checks the newer
+  channel FK child and truncates it only when empty, without CASCADE. Destination
+  history protection and moderation default-off remain enforced. CI uses separate
+  guarded databases for backup round-trip and actual-CLI publication faults;
+  runbook command-drift checks follow the drill's real confirmation parser.
+  Nightly routes every guarded channel fixture, including shared timestamp
+  coverage, to the mandatory dedicated suite; offline regressions pin routing
+  and cutover reference autolinks without weakening strict rustdoc warnings.
+- Resolve historical member-ban acceptance only with exact-attempt acceptance
+  and ordering evidence, atomically audited without taking newer ownership or
+  clearing dispatched DELETE uncertainty. Moderation activation remains deferred.
+- Fence member-ban PUT confirmation and rejection to the attempt generation
+  returned by staging, including safely rejected request-ID retries. Legacy
+  identity-only reconciliation fails closed; accepted-PUT audits retain the
+  exact attempt generation. Moderation activation remains deferred.
+- Refuse restores over destination moderation history and quarantine every
+  executable imported expiry, even accepted snapshots, while preserving remote
+  dispatch evidence. Fresh-target restore requires reconciliation before
+  moderation activation; transient pre-write failures have scoped retry tests.
 - Answer published but unwired commands ephemerally instead of timing out, preserving the existing router refusals and complete registry. Synchronize the registry on resumed process startup as well as Ready, without blocking gateway polling.
 - Capture the REST pacing timestamp after the lane wait completes, preserving adjacent-request spacing across three or more reads and kicks.
 - Grant the least-privilege runtime role CRUD on the self-role audit and panel-claim relations (migration 0200), cover 0200 in the role-matrix tests, and prove runtime claim access with continued web-reader denial.
 - Record late result/compensation evidence for superseded self-role events under their still-current token/generation without reopening settlement or panel publication, with regression coverage.
 - Reject the guild @everyone role as a self-role mutation target during catalogue validation and unconditionally at dispatch.
 - Hold self-role claim fencing tokens in `Secret` so derived `Debug` redacts them; the raw value is exposed only at the SQL fencing comparisons.
+- Align channel/member shared audit and idempotency timestamps with an additive,
+  row-preserving migration and explicit SQL timestamp casts (migration 0124).
+- Grant the existing runtime group narrow member-moderation ledger and generation-sequence access, with explicit role-matrix and restricted-store coverage. Definite unban refusals yield a durable queue ticket so later due members progress without retrying the same operation in a tick or reclaiming unknown outcomes.
 
 ## [0.2.0](https://github.com/TogetherWeOwn/two-bot-next/releases/tag/v0.2.0) (2026-09-30)
 
@@ -93,6 +272,9 @@
   unlock (or a retried cleanup whose earlier result was lost) reports stale instead of
   deleting a later lockdown cycle's seed. Repeated lockdowns preserve the original
   generation alongside the original seed (migration 0122).
+- Member moderation domain for ban, tempban, kick, timeout and warn, with
+  idempotent claims, durable scheduled-unban recovery and audit/warning ledgers.
+- Feature-gated Postgres moderation store and isolated test-container CI coverage.
 
 ### Fixed
 
@@ -116,7 +298,32 @@
 - Reject malformed scheduled-event timestamps without panicking or replacing the last good mirror.
 - Recover gateway sessions rejected with close codes 4007/4009, preserve the committed READY URL after endpoint fallback, and exit for Container restart when the essential gateway task stops instead of serving a healthy zombie.
 - Bound total checkpoint SQL waits to a heartbeat-safe deadline and report readiness unavailable while persistence is pending; fail closed and restore from committed state after a slow-database restart.
+- Scope unban recovery to its guild, fence older expiries with durable ban
+  generations, and recover only explicitly accepted bans rather than guessed
+  staging. Permanent bans supersede older tempbans; failed refusal cleanup keeps
+  a reconciliation fence instead of scheduling an unsafe unban.
+- Claim sweep jobs individually so cancellation cannot strand an undispatched
+  batch, and bound the final generated expiry reason with UTF-16-compatible,
+  Unicode-safe truncation.
+- Refuse new bans while a dispatched unban remains uncertain; confirmation cannot
+  erase running claims, which require exact-token authoritative reconciliation.
+- Upgrade legacy moderation TEXT timestamps in place without reactivating
+  quarantined imports, audit accepted effects before completion writes, and
+  release idempotency keys after definite pre-dispatch transaction rollback.
+- Audit accepted ban PUTs before confirmation/activation and scheduled DELETEs
+  while their dispatch claims remain held; preserve the required expiry after
+  an authoritatively voided DELETE, and retry never-dispatched fence refusals
+  without releasing the older uncertain operation.
+- Preserve ban ownership, generations and expiry eligibility in consistent
+  backups; replace stale destination ownership and reset generation sequences
+  on restore. Old v3 restores quarantine unknown expiries without inventing
+  acceptance or discarding running DELETE fences.
+- Redact unban claim tokens from diagnostics, lock member migrations to their
+  unchanged checksums, and isolate moderation database CI on self-hosted runners.
 
 ### Notes
 
 - Command/component wiring and the Discord REST reads stay on the S4 interaction router and REST executor slices; the outcome enums are the integration surface until they land. Scorecard and probe collection are not enabled by this change.
+- Runtime registration, the shared REST executor's 5-second abort and the
+  30-second scheduler remain gated on the S4 integration slices; moderation
+  is not enabled by this change.

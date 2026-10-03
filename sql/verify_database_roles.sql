@@ -35,13 +35,13 @@ sequences AS (
 table_grants(role_name, oid, privilege) AS (
     SELECT 'two_bot_runtime', o.oid, p.name FROM objects o
     CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE')) p(name)
-    WHERE o.kind = 'table'
+    WHERE o.kind = 'table' OR (o.kind = 'admission' AND p.name <> 'DELETE')
     UNION ALL
     SELECT 'two_web_reader', oid, 'SELECT' FROM objects WHERE kind = 'view'
     UNION ALL
     SELECT 'two_bot_migrator', o.oid, p.name FROM objects o
     CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), ('REFERENCES'), ('TRIGGER')) p(name)
-    WHERE o.kind IN ('table', 'ledger', 'view')
+    WHERE o.kind IN ('table', 'admission', 'ledger', 'view', 'migrator')
 ),
 -- System objects have ordinary PUBLIC catalog access. Compare additional grants
 -- with initdb's immutable PUBLIC baseline, not the possibly drifted current ACL.
@@ -87,7 +87,7 @@ system_owners AS (
     SELECT c.oid::regclass::text AS target, c.relowner AS owner,
         EXISTS (
             SELECT FROM objects o JOIN pg_class base ON base.oid = o.oid
-            WHERE o.kind IN ('table', 'ledger') AND base.reltoastrelid <> 0
+            WHERE o.kind IN ('table', 'admission', 'ledger', 'migrator') AND base.reltoastrelid <> 0
               AND (c.oid = base.reltoastrelid OR EXISTS (
                   SELECT FROM pg_index i WHERE i.indexrelid = c.oid AND i.indrelid = base.reltoastrelid
               ))
@@ -169,7 +169,7 @@ findings AS (
     SELECT 'object kind/owner differs: ' || o.schema_name || '.' || o.name
     FROM objects o JOIN relations c ON c.oid = o.oid WHERE o.kind <> 'function'
       AND (c.relowner IS DISTINCT FROM (SELECT oid FROM roles WHERE rolname = 'two_bot_migrator')
-        OR NOT ((o.kind IN ('table', 'ledger') AND c.relkind IN ('r', 'p'))
+        OR NOT ((o.kind IN ('table', 'admission', 'ledger', 'migrator') AND c.relkind IN ('r', 'p'))
           OR (o.kind = 'view' AND c.relkind = 'v') OR (o.kind = 'sequence' AND c.relkind = 'S')))
     UNION ALL
     SELECT 'sequence owner differs: ' || c.oid::regclass::text FROM relations c JOIN sequences s ON s.oid = c.oid
