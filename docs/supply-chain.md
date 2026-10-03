@@ -11,16 +11,26 @@ not a claim that every locked package is linked into the runtime executable.
 The image BOM inventories OS/image packages; Rust binaries are not reliably
 recoverable by image analysis, so the separate lockfile scan is intentional.
 
-Both gates use SHA-pinned Trivy Action 0.35.0 with Trivy v0.69.3. They fail on
-HIGH/CRITICAL in OS and library dependencies, **including unfixed findings**.
-A fresh vulnerability DB is downloaded by Trivy on every run. No shared cache
-is written or read: the BuildKit GitHub-Actions cache is disabled and every
-Trivy step sets `cache: false`, so a poisoned cross-run DB or layer cache
-cannot make the gate pass. Scanner errors also fail; no `continue-on-error` or blanket
-`ignore-unfixed` is allowed. SBOMs and JSON findings remain in the `supply-chain`
-Actions artifact for 14 days, including on a vulnerability failure. The existing
-required `check` depends on this scan job and explicitly rejects failed, skipped
-or cancelled results, so scan failure cannot leave that merge check green.
+Both gates run in the `image` job and use SHA-pinned Trivy Action 0.35.0 with
+Trivy v0.69.3. They fail on HIGH/CRITICAL in OS and library dependencies,
+**including unfixed findings**. A fresh vulnerability DB is downloaded by Trivy
+on every run. No shared cache is written or read: the BuildKit GitHub-Actions
+cache is disabled and every Trivy step sets `cache: false`, so a poisoned
+cross-run DB or layer cache cannot make the gate pass. Scanner errors also
+fail; no `continue-on-error` or blanket `ignore-unfixed` is allowed. The
+`verify` job validates the handed-off BOMs and retains SBOMs and JSON findings
+in the `supply-chain` Actions artifact for 14 days, including on a
+vulnerability failure. The existing required `check` depends on this scan job
+and explicitly rejects failed, skipped or cancelled results, so scan failure
+cannot leave that merge check green.
+
+No job both checks out the untrusted `inputs.ref` and executes a local script
+afterwards (CodeQL cache-poisoning gate). The `image` job runs the offline
+fixtures from the trusted root checkout *before* the `source` checkout, then
+builds, scans and hands the lockfile, provenance, BOMs, findings and the saved
+image to the `verify` job through the short-lived `sbom-partial` artifact.
+Validation, evidence and preflight run only in `verify`, which never checks
+out `inputs.ref`.
 
 ## Exceptions
 

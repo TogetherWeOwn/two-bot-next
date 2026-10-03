@@ -231,6 +231,38 @@ class SupplyChainTests(unittest.TestCase):
             self.assertNotIn(shared, supply)
         self.assertEqual(supply.count("cache: false"), 4)
 
+    def test_no_local_script_runs_after_untrusted_checkout(self):
+        # CodeQL cache-poisoning gate: a job reachable from workflow_dispatch
+        # (release.yml -> sbom.yml) that checks out inputs.ref must not execute
+        # a local script afterwards. The fixtures step runs from the trusted
+        # root checkout BEFORE the `source` checkout; validation, evidence and
+        # preflight run in `verify`, which never checks out inputs.ref and
+        # receives the lockfile, provenance, BOMs and image through the
+        # sbom-partial artifact.
+        supply = (ROOT / ".github/workflows/sbom.yml").read_text()
+        self.assertIn("ref: ${{ inputs.ref }}", supply)
+        self.assertIn("python3 scripts/test-supply-chain.py", supply)
+        self.assertLess(supply.index("python3 scripts/test-supply-chain.py"),
+                        supply.index("ref: ${{ inputs.ref }}"))
+        image = supply.split("  verify:", 1)[0]
+        self.assertNotIn("python3 scripts/validate-sbom.py", image)
+        self.assertNotIn("python3 scripts/runtime-image-evidence.py", image)
+        self.assertNotIn("python3 scripts/vulnerability-preflight.py", image)
+        verify = supply.split("  verify:", 1)[1]
+        self.assertNotIn("inputs.ref", verify)
+        self.assertIn("sbom-partial", image)
+        self.assertIn("sbom-partial", verify)
+        # The verify job reads the exact inputs.ref lockfile handed over in
+        # the artifact, never its own checkout's lockfile; the handoff copy
+        # is removed before checksums so release assets stay pinned.
+        self.assertIn("python3 scripts/validate-sbom.py sbom/Cargo.lock sbom", verify)
+        self.assertIn("cp source/Cargo.lock sbom/Cargo.lock", image)
+        self.assertIn("rm sbom/Cargo.lock", verify)
+        # Verify still runs after a failed gate (needs without a
+        # needs-referencing if would skip on failure) but not on cancellation.
+        self.assertIn("needs.image.result == 'success' || needs.image.result == 'failure'", verify)
+        self.assertIn("!cancelled()", verify)
+
     def test_candidate_preflight_cannot_replace_existing_gates(self):
         supply = (ROOT / ".github/workflows/sbom.yml").read_text()
         self.assertIn("python3 scripts/test-vulnerability-preflight.py", supply)

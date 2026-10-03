@@ -20,7 +20,10 @@ JOB_INVENTORY = {
     "staging-migrate.yml": {"migrate"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
     # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
-    "sbom.yml": {"image"},
+    # `image` builds/scans the untrusted ref with pinned actions only; `verify`
+    # runs the local validation/evidence/preflight scripts without ever
+    # checking out inputs.ref (CodeQL cache-poisoning gate).
+    "sbom.yml": {"image", "verify"},
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
