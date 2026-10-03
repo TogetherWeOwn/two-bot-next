@@ -2066,7 +2066,12 @@ async fn companion_deleted_with_its_room_and_delete_is_idempotent() {
         calls.contains(&"remove_companion:500".to_owned()),
         "companion row removed: {calls:?}"
     );
+    assert!(
+        calls.contains(&"forget:500".to_owned()),
+        "room row forgotten once the companion is gone: {calls:?}"
+    );
     assert!(worker.companions.is_empty());
+    assert!(worker.rooms.is_empty());
     // Re-dispatching the room delete (or a duplicate) is a no-op.
     worker.reconcile();
     assert!(!worker.dispatch_one(now + 1).await);
@@ -2289,4 +2294,143 @@ async fn creator_edit_applies_to_new_rooms_only() {
         worker.creators[&CREATOR].text_channel_name.as_deref(),
         Some("lounge")
     );
+}
+
+#[tokio::test]
+async fn companion_row_write_failure_is_retried_without_a_second_post() {
+    let (live, store, http, trace) = companion_fixture();
+    store
+        .companion_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::Unavailable);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    // Room create, then the companion POST succeeds but its row write fails.
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert!(worker.unpersisted_companions.contains(&500));
+    assert!(worker.companions.contains_key(&500));
+    assert!(worker.store.companions.lock().unwrap().is_empty());
+    // After the backoff the same action writes only the row.
+    dispatch(&mut worker, 60_000).await;
+    let calls = trace.lock().unwrap().clone();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("create_companion"))
+            .count(),
+        1,
+        "the retry never POSTs again: {calls:?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| *call == "add_companion:500:501")
+            .count(),
+        2,
+        "row written on the first try and on the retry: {calls:?}"
+    );
+    assert!(worker
+        .store
+        .companions
+        .lock()
+        .unwrap()
+        .contains_key(&(GUILD, 500)));
+    assert!(worker.unpersisted_companions.is_empty());
+}
+
+#[tokio::test]
+async fn unknown_companion_outcome_never_adopts_another_rooms_companion() {
+    let (live, store, http, trace) = companion_fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    // Room A (500) and its companion (501), tracked.
+    join_with_companion(&mut worker, MEMBER, &mut now).await;
+    assert_eq!(worker.companions[&500].text_channel_id, 501);
+    // The fake names every channel "room"; give A's companion the constant
+    // default name every room's plan carries.
+    worker
+        .live
+        .inner
+        .write()
+        .unwrap()
+        .channels
+        .get_mut(&501)
+        .unwrap()
+        .name = Some("voice-chat".to_owned());
+    worker
+        .http
+        .companion_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::UnknownOutcome);
+    // Room B (502) in the same category: its companion POST outcome is
+    // unknown, and the only name-matching channel is A's.
+    join(&mut worker, MEMBER + 1);
+    while worker.dispatch_one(now).await {
+        now += 1;
+    }
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("create_companion:502")),
+        "room B attempted its own companion: {calls:?}"
+    );
+    assert!(
+        !worker.companions.contains_key(&502),
+        "room B must not adopt room A's companion"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.starts_with("add_companion:502")),
+        "{calls:?}"
+    );
+    assert_eq!(worker.companions[&500].text_channel_id, 501);
+    assert_eq!(worker.companion_channels[&500], 501);
+}
+
+#[tokio::test]
+async fn adopt_skips_tracked_and_older_channels_and_takes_the_oldest_remaining() {
+    let (live, store, http, _) = companion_fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    for id in [450, 700, 800, 900] {
+        worker.live.upsert_channel(channel(id, 0, Some(CATEGORY)));
+    }
+    {
+        let mut live = worker.live.inner.write().unwrap();
+        for id in [450, 700, 800] {
+            live.channels.get_mut(&id).unwrap().name = Some("voice-chat".to_owned());
+        }
+    }
+    let plan = TextChannelPlan {
+        room_id: 500,
+        guild_id: GUILD,
+        name: "voice-chat".to_owned(),
+        category_id: CATEGORY,
+        overwrites: Vec::new(),
+        settings: two_bot_core::voice_text_channel::TextChannelSettings {
+            enabled: true,
+            configured_name: None,
+            viewer_role_id: None,
+        },
+    };
+    // 450 predates the room, 700 is another room's companion, 900 has the
+    // wrong name: 800 is the only candidate.
+    worker.companion_channels.insert(600, 700);
+    assert_eq!(worker.adopt_companion(&plan), Some(800));
+    // A companion row loaded from the store counts as tracked too.
+    worker.companions.insert(
+        601,
+        TextCompanion {
+            guild_id: GUILD,
+            room_channel_id: 601,
+            text_channel_id: 800,
+            settings: plan.settings.clone(),
+            created_at: NOW.to_owned(),
+        },
+    );
+    assert_eq!(worker.adopt_companion(&plan), None);
 }

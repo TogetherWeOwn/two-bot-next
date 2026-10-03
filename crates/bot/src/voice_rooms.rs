@@ -573,6 +573,10 @@ pub struct GuildRoomWorker<S, H> {
     companions: HashMap<Snowflake, TextCompanion>,
     /// Per-companion Discord text channel ids, for overwrite guards.
     companion_channels: HashMap<Snowflake, Snowflake>,
+    /// Rooms whose companion channel exists on Discord but whose row write
+    /// failed: the create retry persists the row instead of treating the
+    /// in-memory record as already durable.
+    unpersisted_companions: HashSet<Snowflake>,
     /// Last occupancy each companion's overwrites were synced to (V9c).
     /// Compared against live occupancy via [`occupancy_diff`] on reconcile.
     companion_seen: HashMap<Snowflake, Vec<Snowflake>>,
@@ -618,6 +622,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             rooms,
             companions,
             companion_channels: HashMap::new(),
+            unpersisted_companions: HashSet::new(),
             companion_seen: HashMap::new(),
             queue: ActionQueue::new(),
             renames: RenameCoalescer::new(),
@@ -1220,6 +1225,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 self.rooms.remove(&channel_id);
                                 self.companions.remove(&channel_id);
                                 self.companion_channels.remove(&channel_id);
+                                self.unpersisted_companions.remove(&channel_id);
                                 self.companion_seen.remove(&channel_id);
                                 self.deletes.remove(&channel_id);
                                 self.compensation.remove(&channel_id);
@@ -1297,14 +1303,28 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 room_channel_id,
                 plan,
             } => {
-                // Idempotent: a companion already tracked (or persisted by a
-                // racing dispatch) is success without another POST.
-                if self.companions.contains_key(&room_channel_id) {
+                if !self.rooms.contains_key(&room_channel_id) {
                     self.queue.mark_succeeded(&action);
                     return true;
                 }
-                if !self.rooms.contains_key(&room_channel_id) {
-                    self.queue.mark_succeeded(&action);
+                // Idempotent: a companion already tracked (or persisted by a
+                // racing dispatch) is success without another POST. One whose
+                // row write failed earlier retries only the row, never the
+                // POST.
+                if let Some(companion) = self.companions.get(&room_channel_id).cloned() {
+                    if self.unpersisted_companions.contains(&room_channel_id) {
+                        self.persist_companion(
+                            &action,
+                            room_channel_id,
+                            companion,
+                            &plan,
+                            now_ms,
+                            started,
+                        )
+                        .await;
+                    } else {
+                        self.queue.mark_succeeded(&action);
+                    }
                     return true;
                 }
                 let live = self.live.clone();
@@ -1320,59 +1340,22 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     let state = live.inner.read().expect("live voice lock");
                     state.ready
                         && state.channels.contains_key(&room_channel_id)
-                        && state
-                            .permissions(live.guild_id, room_channel_id)
-                            .is_some_and(can_manage_room)
+                        && can_manage_room(state.permissions(live.guild_id, room_channel_id))
                 });
                 match self.http.create_companion(&plan, bot_id, guard).await {
                     Ok(channel) => {
                         let text_channel_id = channel.id.get();
                         self.live.upsert_channel(channel);
                         let companion = TextCompanion::from_plan(&plan, text_channel_id, now_iso());
-                        match self.store.add_companion(&companion).await {
-                            Ok(inserted) => {
-                                self.queue.mark_succeeded(&action);
-                                if inserted || !self.companions.contains_key(&room_channel_id) {
-                                    self.companions.insert(room_channel_id, companion);
-                                }
-                                self.companion_channels
-                                    .insert(room_channel_id, text_channel_id);
-                                self.companion_seen.insert(
-                                    room_channel_id,
-                                    plan.overwrites
-                                        .iter()
-                                        .filter_map(|overwrite| match overwrite.target {
-                                            OverwriteTarget::Member(id) => Some(id),
-                                            _ => None,
-                                        })
-                                        .collect(),
-                                );
-                            }
-                            Err(error) => {
-                                self.record(LifecycleFailure::Persistence {
-                                    channel_id: Some(room_channel_id),
-                                    error,
-                                });
-                                if error == StoreError::CredentialRefused {
-                                    self.halted = true;
-                                    self.queue.mark_succeeded(&action);
-                                } else {
-                                    // The Discord channel exists; only the row
-                                    // write failed. Keep the in-memory record
-                                    // so grants/revokes and the room delete
-                                    // still find the channel, and retry the
-                                    // row write on the next dispatch.
-                                    self.companions.insert(room_channel_id, companion);
-                                    self.companion_channels
-                                        .insert(room_channel_id, text_channel_id);
-                                    self.queue.mark_failed(
-                                        action,
-                                        "companion persistence unavailable".to_owned(),
-                                        elapsed_ms(now_ms, started),
-                                    );
-                                }
-                            }
-                        }
+                        self.persist_companion(
+                            &action,
+                            room_channel_id,
+                            companion,
+                            &plan,
+                            now_ms,
+                            started,
+                        )
+                        .await;
                     }
                     Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
                         self.queue.mark_rate_limited(
@@ -1389,24 +1372,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         // next dispatch recheck.
                         if let Some(adopted) = self.adopt_companion(&plan) {
                             let companion = TextCompanion::from_plan(&plan, adopted, now_iso());
-                            match self.store.add_companion(&companion).await {
-                                Ok(_) => {
-                                    self.queue.mark_succeeded(&action);
-                                    self.companions.insert(room_channel_id, companion);
-                                    self.companion_channels.insert(room_channel_id, adopted);
-                                }
-                                Err(error) => {
-                                    self.record(LifecycleFailure::Persistence {
-                                        channel_id: Some(room_channel_id),
-                                        error,
-                                    });
-                                    self.queue.mark_failed(
-                                        action,
-                                        "companion persistence unavailable".to_owned(),
-                                        elapsed_ms(now_ms, started),
-                                    );
-                                }
-                            }
+                            self.persist_companion(
+                                &action,
+                                room_channel_id,
+                                companion,
+                                &plan,
+                                now_ms,
+                                started,
+                            )
+                            .await;
                         } else {
                             self.queue.mark_failed(
                                 action,
@@ -1505,9 +1479,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     }
 
     /// Adopt a companion text channel the live snapshot already shows after
-    /// an unknown create outcome: the text channel in the room's category
-    /// carrying the planned name. The check reads only the worker's own live
-    /// map, never the network. `None` means no such channel is visible yet.
+    /// an unknown create outcome: a text channel in the room's category
+    /// carrying the planned name. The default name is the same constant for
+    /// every room, so a candidate must also be untracked (not another room's
+    /// companion) and newer than the room (snowflakes grow with time, and the
+    /// companion is created after its room). The check reads only the
+    /// worker's own live map, never the network. `None` means no such
+    /// channel is visible yet.
     fn adopt_companion(&self, plan: &TextChannelPlan) -> Option<Snowflake> {
         let live = self.live.inner.read().expect("live voice lock");
         live.channels
@@ -1516,9 +1494,79 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 channel.kind == twilight_model::channel::ChannelType::GuildText
                     && channel.parent_id.map(twilight_model::id::Id::get) == Some(plan.category_id)
                     && channel.name.as_deref() == Some(plan.name.as_str())
+                    && channel.id.get() > plan.room_id
+                    && !self.companion_text_channel_tracked(channel.id.get())
             })
             .map(|channel| channel.id.get())
             .min()
+    }
+
+    /// True when some room already owns this text channel as its companion,
+    /// in memory or in a loaded row.
+    fn companion_text_channel_tracked(&self, text_channel_id: Snowflake) -> bool {
+        self.companion_channels
+            .values()
+            .any(|tracked| *tracked == text_channel_id)
+            || self
+                .companions
+                .values()
+                .any(|companion| companion.text_channel_id == text_channel_id)
+    }
+
+    /// Persist the companion row after its Discord channel exists, and track
+    /// it. A non-credential write failure keeps the in-memory record (so
+    /// grants/revokes and the room delete still find the channel), flags it
+    /// unpersisted, and backs off: the retry writes only the row, never
+    /// another POST. A refused credential halts the worker.
+    async fn persist_companion(
+        &mut self,
+        action: &QueuedAction,
+        room_channel_id: Snowflake,
+        companion: TextCompanion,
+        plan: &TextChannelPlan,
+        now_ms: u64,
+        started: Instant,
+    ) {
+        let text_channel_id = companion.text_channel_id;
+        match self.store.add_companion(&companion).await {
+            Ok(_) => {
+                self.queue.mark_succeeded(action);
+                self.unpersisted_companions.remove(&room_channel_id);
+                self.companions.insert(room_channel_id, companion);
+                self.companion_channels
+                    .insert(room_channel_id, text_channel_id);
+                self.companion_seen.insert(
+                    room_channel_id,
+                    plan.overwrites
+                        .iter()
+                        .filter_map(|overwrite| match overwrite.target {
+                            OverwriteTarget::Member(id) => Some(id),
+                            _ => None,
+                        })
+                        .collect(),
+                );
+            }
+            Err(error) => {
+                self.record(LifecycleFailure::Persistence {
+                    channel_id: Some(room_channel_id),
+                    error,
+                });
+                if error == StoreError::CredentialRefused {
+                    self.halted = true;
+                    self.queue.mark_succeeded(action);
+                } else {
+                    self.companions.insert(room_channel_id, companion);
+                    self.companion_channels
+                        .insert(room_channel_id, text_channel_id);
+                    self.unpersisted_companions.insert(room_channel_id);
+                    self.queue.mark_failed(
+                        action.clone(),
+                        "companion persistence unavailable".to_owned(),
+                        elapsed_ms(now_ms, started),
+                    );
+                }
+            }
+        }
     }
 
     /// Delete the companion tracked for a room: Discord delete first, then
@@ -1542,14 +1590,20 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .channels
             .contains_key(&text_channel_id);
         if present {
+            // The room is already gone from the live map when its companion
+            // is deleted, so the guard reads the text channel's own
+            // permissions (View + Manage Channels) rather than the room's.
             let live = self.live.clone();
             let guild_id = self.live.guild_id;
             let guard: WriteGuard = Arc::new(move || {
-                live.inner
-                    .read()
-                    .expect("live voice lock")
-                    .permissions(guild_id, room_channel_id)
-                    .is_some_and(can_manage_room)
+                let state = live.inner.read().expect("live voice lock");
+                state.ready
+                    && state
+                        .permissions(guild_id, text_channel_id)
+                        .is_some_and(|permissions| {
+                            permissions
+                                .contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_CHANNELS)
+                        })
             });
             if let Err(error) = self.http.delete(text_channel_id, guard).await {
                 self.record(LifecycleFailure::Discord {
@@ -1568,6 +1622,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             Ok(_) => {
                 self.companions.remove(&room_channel_id);
                 self.companion_channels.remove(&room_channel_id);
+                self.unpersisted_companions.remove(&room_channel_id);
                 self.companion_seen.remove(&room_channel_id);
                 true
             }
@@ -1629,9 +1684,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             let state = live.inner.read().expect("live voice lock");
             state.ready
                 && state.channels.contains_key(&text_channel_id)
-                && state
-                    .permissions(guild_id, room_channel_id)
-                    .is_some_and(can_manage_room)
+                && can_manage_room(state.permissions(guild_id, room_channel_id))
         });
         let result = if grant {
             self.http

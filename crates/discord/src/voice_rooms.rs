@@ -933,4 +933,57 @@ mod tests {
             }
         );
     }
+
+    fn companion_plan(overwrites: Vec<ChannelOverwrite>) -> TextChannelPlan {
+        TextChannelPlan {
+            room_id: 500,
+            guild_id: 100,
+            name: "voice-chat".to_owned(),
+            category_id: 400,
+            overwrites,
+            settings: two_bot_core::voice_text_channel::TextChannelSettings {
+                enabled: true,
+                configured_name: None,
+                viewer_role_id: None,
+            },
+        }
+    }
+
+    #[test]
+    fn companion_view_grant_is_a_member_allow_never_a_deny() {
+        let grant = companion_view_grant(300).unwrap();
+        assert_eq!(grant.id.get(), 300);
+        assert_eq!(grant.kind, PermissionOverwriteType::Member);
+        assert_eq!(grant.allow, Permissions::VIEW_CHANNEL);
+        assert_eq!(grant.deny, Permissions::empty());
+        assert!(companion_view_grant(0).is_none());
+    }
+
+    #[test]
+    fn companion_overwrites_add_the_bot_view_allow_exactly_once() {
+        let plan = companion_plan(vec![ChannelOverwrite {
+            target: OverwriteTarget::Everyone,
+            allow_view: false,
+            deny_view: true,
+        }]);
+        let overwrites = companion_overwrites(&plan, 999);
+        assert_eq!(overwrites.len(), 2);
+        assert_eq!(overwrites[0].id.get(), 100);
+        assert_eq!(overwrites[0].kind, PermissionOverwriteType::Role);
+        assert_eq!(overwrites[0].deny, Permissions::VIEW_CHANNEL);
+        assert_eq!(overwrites[1].id.get(), 999);
+        assert_eq!(overwrites[1].kind, PermissionOverwriteType::Member);
+        assert_eq!(overwrites[1].allow, Permissions::VIEW_CHANNEL);
+        assert_eq!(overwrites[1].deny, Permissions::empty());
+
+        // A plan that already grants the bot is not duplicated; a zero bot
+        // id adds nothing.
+        let planned_bot = companion_plan(vec![ChannelOverwrite {
+            target: OverwriteTarget::Member(999),
+            allow_view: true,
+            deny_view: false,
+        }]);
+        assert_eq!(companion_overwrites(&planned_bot, 999).len(), 1);
+        assert_eq!(companion_overwrites(&plan, 0).len(), 1);
+    }
 }
