@@ -4,6 +4,7 @@ use sqlx::{postgres::PgConnectOptions, postgres::PgPoolOptions, PgPool, Postgres
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use two_bot_core::voice_access::AccessControls;
+use two_bot_core::voice_logging::{DetailLevel, LoggingSettings};
 use two_bot_core::voice_rooms::{
     CreatorChannel, PermissionSource, RoomPosition, TextCompanion, VoiceRoom,
 };
@@ -186,7 +187,8 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
             .await
             .is_err()
     );
-    verify_access_controls(&store, pool).await
+    verify_access_controls(&store, pool).await?;
+    verify_logging_settings(&store, pool).await
 }
 
 async fn verify_access_controls(store: &PgRoomStore, pool: &PgPool) -> TestResult {
@@ -245,5 +247,67 @@ async fn verify_access_controls(store: &PgRoomStore, pool: &PgPool) -> TestResul
     .execute(pool)
     .await
     .is_err());
+    Ok(())
+}
+
+async fn verify_logging_settings(store: &PgRoomStore, pool: &PgPool) -> TestResult {
+    // A never-configured guild reads as the defaults.
+    assert_eq!(
+        store.logging_settings(100).await?,
+        LoggingSettings::default()
+    );
+
+    let settings = LoggingSettings {
+        level: DetailLevel::Full,
+        channel_id: Some(u64::MAX),
+        mention_role_id: Some(7),
+    };
+    store.save_logging_settings(100, &settings).await?;
+    assert_eq!(store.logging_settings(100).await?, settings);
+    assert_eq!(
+        PgRoomStore::new(pool.clone()).logging_settings(100).await?,
+        settings
+    );
+    assert_eq!(
+        store.logging_settings(101).await?,
+        LoggingSettings::default(),
+        "settings are per guild"
+    );
+
+    // Saving replaces the whole row: clearing the channel and mention sticks.
+    let off = LoggingSettings {
+        level: DetailLevel::Off,
+        channel_id: None,
+        mention_role_id: None,
+    };
+    store.save_logging_settings(100, &off).await?;
+    assert_eq!(store.logging_settings(100).await?, off);
+
+    // Refused before the database: zero ids.
+    for bad in [
+        LoggingSettings {
+            channel_id: Some(0),
+            ..off
+        },
+        LoggingSettings {
+            mention_role_id: Some(0),
+            ..off
+        },
+    ] {
+        assert!(store.save_logging_settings(100, &bad).await.is_err());
+    }
+    assert_eq!(store.logging_settings(100).await?, off);
+
+    // The table's own checks hold when SQL bypasses the adapter.
+    for statement in [
+        "UPDATE voice_logging_settings SET detail_level = 'loud' WHERE guild_id = '100'",
+        "UPDATE voice_logging_settings SET log_channel_id = '0' WHERE guild_id = '100'",
+        "UPDATE voice_logging_settings SET mention_role_id = '0' WHERE guild_id = '100'",
+    ] {
+        assert!(
+            sqlx::query(statement).execute(pool).await.is_err(),
+            "{statement}"
+        );
+    }
     Ok(())
 }

@@ -67,6 +67,7 @@ pub enum CommandOptionType {
     Integer = 4,
     Boolean = 5,
     User = 6,
+    Channel = 7,
     Role = 8,
 }
 

@@ -180,8 +180,8 @@ push or dispatch, and a stale notes branch alongside a normal body is ignored.
 The stored-notes Contents PUT carries the branch inside the JSON payload
 (`gh api --input` moves `-f` flags to the URL query, which the Contents API
 ignores). PR lint resolves the same validated notes-branch file before its
-card-reference check, so required lint passes on overflow PRs without
-weakening the `Refs: TOG-*` gate. Migration can also grow a large normal body
+body checks, so required lint passes on overflow PRs without weakening the
+empty-body gate. Migration can also grow a large normal body
 past the native 65,536-char limit; the workflow routes that reconciled output
 through the same overflow representation (stored notes plus link) instead of an
 oversized PATCH that GitHub would reject on every retry. The next run resolves
