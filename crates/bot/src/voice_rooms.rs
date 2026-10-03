@@ -39,7 +39,7 @@ use two_bot_core::{
         category_full_message, is_usable_channel_name, voice_commands, ActionQueue, CreatorChannel,
         NewRoomSpec, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, RoomPosition,
         TextCompanion, VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN,
-        QUEUE_MAX_ATTEMPTS, RENAME_MIN_INTERVAL_MS,
+        RENAME_MIN_INTERVAL_MS,
     },
     voice_text_channel::{
         admin_view_roles, occupancy_diff, text_channel_plan, OverwriteTarget, TextChannelPlan,
@@ -1644,7 +1644,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// target left again before dispatch. Revokes always run: the leave path
     /// deletes the overwrite even if the member rejoined elsewhere. A 429
     /// honours retry-after; other failures back off with the queue budget
-    /// (dead-lettered after [`QUEUE_MAX_ATTEMPTS`], surfaced via `/setup`).
+    /// (dead-lettered after [`two_bot_core::voice_rooms::QUEUE_MAX_ATTEMPTS`],
+    /// surfaced via `/setup`).
     async fn dispatch_companion_view(
         &mut self,
         action: &QueuedAction,
