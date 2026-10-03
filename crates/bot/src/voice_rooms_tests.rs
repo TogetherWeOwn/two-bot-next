@@ -2221,26 +2221,39 @@ async fn companion_plan_carries_admin_roles() {
 }
 
 #[tokio::test]
-async fn later_promoted_admin_role_covers_new_companions_without_room_updates() {
-    let (live, store, http, trace) = companion_fixture();
+async fn later_promoted_admin_role_is_resolved_live_without_touching_open_rooms() {
+    let (live, store, http, _) = companion_fixture();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     let mut now = 0;
     join_with_companion(&mut worker, MEMBER, &mut now).await;
-    // The role is promoted after the first companion exists.
-    worker.live.publish(snapshot_with_roles(vec![role_with(
-        LATE_ADMIN_ROLE,
-        Permissions::MANAGE_CHANNELS,
-    )]));
-    worker.reconcile();
-    let calls_after_promotion = trace.lock().unwrap().clone();
-    assert!(
-        !calls_after_promotion
-            .iter()
-            .any(|call| call.contains(&LATE_ADMIN_ROLE.to_string())),
-        "existing companions are not rewritten: {calls_after_promotion:?}"
+    {
+        let state = worker.live.inner.read().unwrap();
+        assert!(state.admin_role_ids(GUILD).is_empty());
+    }
+    // A role is promoted to Manage Channels after the companion exists: the
+    // next published snapshot carries it and the occupant is still inside.
+    let mut promoted = snapshot(
+        &[500],
+        vec![VoiceMember {
+            member_id: MEMBER,
+            channel_id: 500,
+            bot: Some(false),
+        }],
     );
-    let state = worker.live.inner.read().unwrap();
-    assert_eq!(state.admin_role_ids(GUILD), vec![LATE_ADMIN_ROLE]);
+    promoted
+        .bot
+        .roles
+        .push(role_with(LATE_ADMIN_ROLE, Permissions::MANAGE_CHANNELS));
+    worker.live.publish(promoted);
+    worker.reconcile();
+    {
+        let state = worker.live.inner.read().unwrap();
+        assert_eq!(state.admin_role_ids(GUILD), vec![LATE_ADMIN_ROLE]);
+    }
+    assert!(
+        !worker.dispatch_one(now).await,
+        "no per-room overwrite update is queued for the promotion"
+    );
 }
 
 #[tokio::test]

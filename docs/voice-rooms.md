@@ -239,7 +239,13 @@ library code with no Discord dependency and can start immediately.
   a companion text channel in the same category, deleted along with the room.
 - Visible to current occupants (granted on join, removed on leave), admins, and
   one configurable role (can be @everyone).
+- Admins who hold Manage Channels through a role see companions via a role
+  overwrite, so promoting a role later needs no per-room update. Administrator
+  roles and the guild owner bypass overwrites and need no entry. The bot keeps
+  its own View access so it can edit and delete the channel.
 - The name is configurable (default `voice-chat`).
+- `/textchannels channel [enabled] [name] [viewer-role]` needs Manage Channels
+  and an existing creator channel; leaving `enabled` out turns companions on.
 - Changing the setting only affects text channels created afterwards.
 
 ## V10: Logging, health, errors, utilities

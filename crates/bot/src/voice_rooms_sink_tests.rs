@@ -13,6 +13,13 @@ impl RoomPersistence for Arc<Store> {
     async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), StoreError> {
         self.as_ref().add_creator(creator).await
     }
+    async fn creator_for(
+        &self,
+        guild: u64,
+        channel: u64,
+    ) -> Result<Option<CreatorChannel>, StoreError> {
+        self.as_ref().creator_for(guild, channel).await
+    }
     async fn persist(&self, room: &VoiceRoom) -> Result<(), StoreError> {
         self.as_ref().persist(room).await
     }
