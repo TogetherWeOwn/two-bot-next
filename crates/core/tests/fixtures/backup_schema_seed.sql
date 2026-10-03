@@ -398,3 +398,10 @@ VALUES ('100000000000000001', '100000000000000033', '100000000000000036',
         TRUE, NULL, NULL, '2026-08-01T10:00:00.123456Z'),
        ('100000000000000001', '100000000000000034', '100000000000000037',
         TRUE, 'Squad chat', '100000000000000001', '2026-08-02T10:00:00Z');
+-- Guild room-command controls: one configured guild (creation off, required
+-- role, a restricted command and a fail-closed empty list), one defaulted.
+INSERT INTO voice_access_controls (guild_id, room_creation_enabled, required_role_id,
+  command_roles)
+VALUES ('100000000000000001', FALSE, '100000000000000040',
+        '{"kick": ["100000000000000041", "100000000000000042"], "template": []}'::jsonb),
+       ('100000000000000002', TRUE, NULL, '{}'::jsonb);

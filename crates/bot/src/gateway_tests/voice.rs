@@ -29,6 +29,12 @@ impl RoomWrites for DeleteOnly {
     ) -> Result<(), RoomHttpError> {
         panic!("reconciliation must not move a member");
     }
+    async fn disconnect(&self, _: u64, _: u64, _: WriteGuard) -> Result<(), RoomHttpError> {
+        panic!("reconciliation must not disconnect a member");
+    }
+    async fn deny_connect(&self, _: u64, _: u64, _: WriteGuard) -> Result<(), RoomHttpError> {
+        panic!("reconciliation must not deny connect");
+    }
     async fn delete(&self, channel: u64, guard: WriteGuard) -> Result<(), RoomHttpError> {
         assert_eq!(channel, 700);
         if !guard() {
@@ -198,6 +204,7 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
         pipeline.clone(),
         state.clone(),
         db.store.clone(),
+        None,
         None,
         None,
         Some(voice.clone()),

@@ -231,6 +231,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0224_voice_rooms.sql"),
         include_str!("../../cutover/migrations/0225_voice_inherit_limit.sql"),
         include_str!("../../cutover/migrations/0226_voice_text_channels.sql"),
+        include_str!("../../cutover/migrations/0227_voice_access_controls.sql"),
         include_str!("../../cutover/migrations/0300_website_contract.sql"),
         include_str!("../../cutover/migrations/0310_presence_probe.sql"),
         include_str!("../../cutover/migrations/0311_community_scorecard.sql"),
@@ -246,6 +247,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0350_internal_actions.sql"),
         include_str!("../../cutover/migrations/0353_internal_clock_high_water.sql"),
         include_str!("../../cutover/migrations/0361_discord_send_admission.sql"),
+        include_str!("../../cutover/migrations/0362_gateway_onboarding_jobs.sql"),
     ] {
         // Never grant a shared cluster role: isolate names even in migrations.
         execute(pool, isolated(migration, roles)).await?;
@@ -309,13 +311,19 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "CREATE TABLE public.migrator_probe (id int)",
     )
     .await?;
-    as_role(pool, &roles[1], "INSERT INTO public.voice_creators (guild_id, channel_id) VALUES ('100', '200'); SELECT * FROM public.voice_creators; UPDATE public.voice_creators SET default_limit = 5 WHERE guild_id = '100'; INSERT INTO public.voice_rooms (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at) VALUES ('100', '500', '200', '300', '300', '7', now()); SELECT * FROM public.voice_rooms; UPDATE public.voice_rooms SET owner_id = '301' WHERE guild_id = '100'; INSERT INTO public.voice_text_companions (guild_id, room_channel_id, text_channel_id, text_channels, created_at) VALUES ('100', '500', '600', TRUE, now()); SELECT * FROM public.voice_text_companions; DELETE FROM public.voice_text_companions WHERE guild_id = '100'; DELETE FROM public.voice_rooms WHERE guild_id = '100'; DELETE FROM public.voice_creators WHERE guild_id = '100'").await?;
+    as_role(pool, &roles[1], "INSERT INTO public.voice_creators (guild_id, channel_id) VALUES ('100', '200'); SELECT * FROM public.voice_creators; UPDATE public.voice_creators SET default_limit = 5 WHERE guild_id = '100'; INSERT INTO public.voice_rooms (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at) VALUES ('100', '500', '200', '300', '300', '7', now()); SELECT * FROM public.voice_rooms; UPDATE public.voice_rooms SET owner_id = '301' WHERE guild_id = '100'; INSERT INTO public.voice_text_companions (guild_id, room_channel_id, text_channel_id, text_channels, created_at) VALUES ('100', '500', '600', TRUE, now()); SELECT * FROM public.voice_text_companions; INSERT INTO public.voice_access_controls (guild_id) VALUES ('100'); SELECT * FROM public.voice_access_controls; UPDATE public.voice_access_controls SET room_creation_enabled = FALSE WHERE guild_id = '100'; DELETE FROM public.voice_access_controls WHERE guild_id = '100'; DELETE FROM public.voice_text_companions WHERE guild_id = '100'; DELETE FROM public.voice_rooms WHERE guild_id = '100'; DELETE FROM public.voice_creators WHERE guild_id = '100'").await?;
     denied(pool, &roles[2], "SELECT * FROM public.voice_creators").await?;
     denied(pool, &roles[2], "SELECT * FROM public.voice_rooms").await?;
     denied(
         pool,
         &roles[2],
         "SELECT * FROM public.voice_text_companions",
+    )
+    .await?;
+    denied(
+        pool,
+        &roles[2],
+        "SELECT * FROM public.voice_access_controls",
     )
     .await?;
     // Invoker trigger DML must work without runtime direct function EXECUTE.
@@ -345,6 +353,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         $cas$;"#,
     )
     .await?;
+    as_role(pool, &roles[1], "SELECT * FROM public.gateway_onboarding_jobs; INSERT INTO public.gateway_onboarding_jobs (guild_id, shard_id, session_id, seq, occurred_at_ms) VALUES ('roles', 0, 'roles', 1, 0); UPDATE public.gateway_onboarding_jobs SET state = 'running', attempts = attempts + 1 WHERE guild_id = 'roles'; DELETE FROM public.gateway_onboarding_jobs WHERE guild_id = 'roles'").await?;
     // Migration 0200 relations are runtime-operated: event claims and panel
     // lane leases must work under the least-privilege login.
     as_role(pool, &roles[1], "SELECT * FROM public.self_role_audit; INSERT INTO public.self_role_audit (event_id, guild_id, panel_id, member_id, source_id, source, operation, outcome, added_role_ids, removed_role_ids, created_at) VALUES ('roles-probe', 'g', 'p', 'm', 's', 'button', 'add', 'processing', '[]', '[]', '2026-01-01T00:00:00Z'); UPDATE public.self_role_audit SET reason = 'probe' WHERE event_id = 'roles-probe'; DELETE FROM public.self_role_audit WHERE event_id = 'roles-probe'").await?;
@@ -394,6 +403,9 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "UPDATE public.discord_send_admission SET in_flight = FALSE",
         "DELETE FROM public.discord_send_admission",
         "SELECT * FROM public.members",
+        "SELECT * FROM public.gateway_onboarding_jobs",
+        "INSERT INTO public.gateway_onboarding_jobs (guild_id, shard_id, session_id, seq, occurred_at_ms) VALUES ('reader', 0, 'reader', 1, 0)",
+        "SELECT nextval('public.gateway_onboarding_jobs_id_seq')",
         "INSERT INTO public.members (member_id) VALUES ('test')",
         "SELECT * FROM public.self_role_audit",
         "SELECT * FROM public.self_role_panel_claims",
@@ -439,6 +451,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         (format!("GRANT CREATE ON SCHEMA public TO {runtime}"),
          format!("REVOKE CREATE ON SCHEMA public FROM {runtime}")),
         (format!("GRANT {migrator} TO {reader}"), format!("REVOKE {migrator} FROM {reader}")),
+        (format!("REVOKE SELECT ON public.gateway_onboarding_jobs FROM {runtime}"),
+         format!("GRANT SELECT ON public.gateway_onboarding_jobs TO {runtime}")),
         (format!("REVOKE SELECT ON web_v1.members FROM {reader}"),
          format!("GRANT SELECT ON web_v1.members TO {reader}")),
         (format!("REVOKE UPDATE ON public.tickets FROM {runtime}"),

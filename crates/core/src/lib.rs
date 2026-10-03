@@ -24,6 +24,7 @@ pub mod channel_moderation_store;
 pub mod classify;
 pub mod clock_guard;
 pub mod command_permissions;
+pub mod command_restoration;
 pub mod commands;
 pub mod community;
 pub mod community_snapshots;
@@ -60,6 +61,8 @@ pub mod internal_action_store;
 pub mod internal_actions;
 pub mod internal_settings;
 pub mod invites;
+#[cfg(feature = "db")]
+pub mod join_risk_store;
 pub mod leveling;
 #[cfg(feature = "db")]
 pub mod leveling_store;
