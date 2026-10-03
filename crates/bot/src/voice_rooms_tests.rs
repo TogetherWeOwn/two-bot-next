@@ -5014,3 +5014,224 @@ async fn sink_unclaimed_kick_stays_fully_silent_for_the_router() {
     assert!(trace.lock().unwrap().is_empty());
     assert!(replies.completed.lock().unwrap().is_empty());
 }
+
+// ---- lifecycle-outcome signals (offline cutover verification) ----
+//
+// The worker emits fixed-cardinality outcome signals for every terminal
+// create/move/delete, reconcile plan size, queue dead-letter and
+// creator-orphan. These tests pin the emission wiring end to end through
+// the fake store/HTTP fixtures: pure mapper coverage plus worker-driven
+// metric deltas. Global counters are monotonic, so the worker tests assert
+// `after >= before + expected`: safe under parallel test threads.
+
+/// Read one counter series from the process-global metrics exposition.
+fn global_series(prefix: &str) -> u64 {
+    metrics::global()
+        .render(None)
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .map(|line| {
+            line.rsplit_once(' ')
+                .unwrap_or_else(|| panic!("bad sample: {line}"))
+                .1
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("bad sample: {line}"))
+        })
+        .sum()
+}
+
+#[test]
+fn http_error_outcomes_stay_bounded_for_cutover_queries() {
+    use RoomHttpError::*;
+    // Rate limits are retries, never outcomes; callers skip them before
+    // reaching the mapper. Everything terminal is `discord` except a
+    // stale guard, which is `cancelled`. Status/code values never leak.
+    for error in [
+        AccessDenied,
+        NotFound,
+        Unauthorized,
+        UnknownOutcome,
+        InvalidRequest,
+        RenameDeferred,
+        Rejected {
+            status: 400,
+            code: 50035,
+        },
+        Rejected {
+            status: 403,
+            code: 50013,
+        },
+    ] {
+        assert_eq!(voice_outcome_from_http(&error), "discord", "{error:?}");
+    }
+    assert_eq!(voice_outcome_from_http(&Cancelled), "cancelled");
+}
+
+#[test]
+fn store_errors_share_one_persistence_outcome() {
+    for error in [
+        StoreError::Unavailable,
+        StoreError::CredentialRefused,
+        StoreError::Conflict,
+    ] {
+        assert_eq!(voice_outcome_from_store(&error), "persistence");
+    }
+}
+
+#[test]
+fn dead_letter_families_cover_every_queue_action_shape() {
+    let companion_plan = || TextChannelPlan {
+        room_id: 500,
+        guild_id: GUILD,
+        name: "voice-chat".to_owned(),
+        category_id: CATEGORY,
+        overwrites: Vec::new(),
+        settings: two_bot_core::voice_text_channel::TextChannelSettings::default(),
+    };
+    let cases: Vec<(RoomAction, &str)> = vec![
+        (
+            RoomAction::CreateRoom {
+                creator_channel_id: CREATOR,
+                owner_id: MEMBER,
+                name: "room".to_owned(),
+                seed: 7,
+            },
+            "create",
+        ),
+        (
+            RoomAction::MoveMember {
+                member_id: MEMBER,
+                channel_id: 500,
+            },
+            "move",
+        ),
+        (RoomAction::DeleteRoom { channel_id: 500 }, "delete"),
+        (
+            RoomAction::CreateCompanion {
+                room_channel_id: 500,
+                plan: companion_plan(),
+            },
+            "companion",
+        ),
+        (
+            RoomAction::GrantCompanionView {
+                room_channel_id: 500,
+                text_channel_id: 501,
+                member_id: MEMBER,
+            },
+            "companion",
+        ),
+        (
+            RoomAction::RevokeCompanionView {
+                room_channel_id: 500,
+                text_channel_id: 501,
+                member_id: MEMBER,
+            },
+            "companion",
+        ),
+        (
+            RoomAction::UpdateOwnership {
+                channel_id: 500,
+                owner_id: MEMBER,
+                original_creator_id: MEMBER,
+            },
+            "ownership",
+        ),
+        (
+            RoomAction::KickMember {
+                channel_id: 500,
+                member_id: MEMBER,
+            },
+            "kick",
+        ),
+        (
+            RoomAction::RenameRoom {
+                channel_id: 500,
+                name: "den".to_owned(),
+            },
+            "rename",
+        ),
+    ];
+    for (action, family) in &cases {
+        assert_eq!(voice_dead_action(action), *family, "{action:?}");
+    }
+}
+
+#[tokio::test]
+async fn terminal_queue_failure_dead_letters_exactly_once_per_family() {
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Non-terminal attempt: requeues with backoff, emits no dead letter.
+    worker.queue.enqueue(
+        GUILD,
+        RoomAction::RenameRoom {
+            channel_id: 500,
+            name: "den".to_owned(),
+        },
+    );
+    let action = worker.queue.pop_due(GUILD, 0).expect("rename due");
+    let before = global_series("two_bot_voice_dead_letters_total{action=\"rename\"}");
+    assert!(worker.mark_failed_observed(action, "flaky".to_owned(), 0));
+    assert_eq!(
+        global_series("two_bot_voice_dead_letters_total{action=\"rename\"}"),
+        before,
+        "non-terminal failure must not dead-letter"
+    );
+    // Terminal attempt (attempts saturating at QUEUE_MAX_ATTEMPTS): one
+    // dead letter under the action family, surfaced in failed().
+    let mut terminal = worker.queue.pop_due(GUILD, 60_000).expect("retry due");
+    terminal.attempts = QUEUE_MAX_ATTEMPTS - 1;
+    // Re-mark in-flight: pop_due registered this dispatch id.
+    let before = global_series("two_bot_voice_dead_letters_total{action=\"rename\"}");
+    assert!(worker.mark_failed_observed(terminal, "still down".to_owned(), 61_000));
+    assert_eq!(
+        global_series("two_bot_voice_dead_letters_total{action=\"rename\"}"),
+        before + 1,
+        "terminal failure must dead-letter exactly once"
+    );
+    assert_eq!(worker.queue.failed().len(), 1);
+    assert_eq!(worker.queue.failed()[0].action.attempts, QUEUE_MAX_ATTEMPTS);
+}
+
+#[tokio::test]
+async fn reconcile_pass_reports_its_plan_sizes() {
+    let (live, store, http, _) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    store.rooms.lock().unwrap().insert(501, room(501));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.upsert_channel(channel(501, 2, Some(CATEGORY)));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let resumed_before = global_series("two_bot_voice_reconcile_actions_total{action=\"resumed\"}");
+    let enqueued_before =
+        global_series("two_bot_voice_reconcile_actions_total{action=\"delete_enqueued\"}");
+    worker.reconcile();
+    // Both tracked rooms are present, accessible and empty: each pass
+    // resumes its lane and enqueues its delete.
+    assert!(
+        global_series("two_bot_voice_reconcile_actions_total{action=\"resumed\"}")
+            >= resumed_before + 2
+    );
+    assert!(
+        global_series("two_bot_voice_reconcile_actions_total{action=\"delete_enqueued\"}")
+            >= enqueued_before + 2
+    );
+}
+
+#[tokio::test]
+async fn failed_create_compensation_orphan_is_counted_without_a_channel_id() {
+    let trace = Trace::default();
+    let store = Store::new(trace.clone());
+    *store.add_creator_error.lock().unwrap() = Some(StoreError::Unavailable);
+    let http = Http::new(trace.clone());
+    http.delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let before = global_series("two_bot_voice_orphans_total");
+    let text = execute_create(&store, &http, GUILD, "lobby", |_, _| {}).await;
+    assert!(text.contains("manually"), "{text}");
+    assert!(
+        global_series("two_bot_voice_orphans_total") >= before + 1,
+        "untracked orphan must advance the counter"
+    );
+}
