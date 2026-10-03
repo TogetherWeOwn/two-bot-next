@@ -63,8 +63,8 @@ not production authorization or a migration tool.
    it. Raw session arguments/log paths are never published. A failure prints,
    after the fixed gate code, only an allowlisted diagnostic: record-type counts,
    session class counts (deploy / probe / other), each session's record/Wrangler
-   version, which deploy-record checks failed, and, on a verify timeout, the last
-   rollout status word and `/readyz` HTTP status.
+   version, and which deploy-record checks failed. A verify timeout separately
+   prints the last rollout/readiness observation (fixed vocabulary only).
 4. Resolve that exact Worker version's `TWO_BOT`/`TwoBotContainer` namespace through
    the versions API and match it to the application. Find the unique local
    Cloudflare registry tag for the expected application and Worker UUID prefix;

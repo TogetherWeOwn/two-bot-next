@@ -134,6 +134,11 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     // replay a pre-restore lane hold into a recovered process; a restored
     // database re-admits from generation zero and re-learns cooldowns.
     "discord_send_admission",
+    // Onboarding restart-recovery queue: captured member state and delivery
+    // receipts bound to a gateway session. Never replay a pre-restore job
+    // into a recovered process; welcome/goodbye state of record lives in the
+    // onboarding stores, which are archived.
+    "gateway_onboarding_jobs",
     // Migration ledgers describe target DDL; replacing them would falsely mark
     // unapplied migrations as applied. Legacy schema_migrations is diagnostic
     // manifest metadata only, never restored application data.

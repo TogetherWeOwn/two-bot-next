@@ -22,8 +22,8 @@ CLASS = "TwoBotContainer"
 WRANGLER = "4.143.1"
 VERSION_PROBES = (["--version"], ["-v"])
 LIMIT = 100
-ROLLOUT_STATUSES = ("pending", "progressing", "completed", "replaced", "reverted")
 MAX_BODY = 2 * 1024 * 1024
+TOKEN = re.compile(r"[a-z0-9_]{1,32}")
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 IMAGE = rf"registry\.cloudflare\.com/[^/@\s]+/{APPLICATION}@sha256:[0-9a-f]{{64}}"
 
@@ -88,6 +88,8 @@ class Client:
         self.base = f"https://api.cloudflare.com/client/v4/accounts/{account}"
         self.token = token
         self.deadline = deadline
+        # Last allowlisted state seen by verify; printed only on rollout_timeout.
+        self.observation = None
         self.opener = build_opener(NoRedirect())
 
     def request(self, url, authenticated=False):
@@ -339,6 +341,37 @@ def runtime_ready(status, headers, body, version, revision, build_id):
                                    for part in components)
 
 
+def rollout_observation(row):
+    # Fixed vocabulary and integers only; configurations never reach the log.
+    status = row.get("status")
+    parts = [f"rollout={status if status in ('pending', 'progressing', 'completed') else 'unknown'}"]
+    health = row.get("health")
+    instances = health.get("instances") if isinstance(health, dict) else None
+    if isinstance(instances, dict):
+        counts = [f"{key}:{instances[key]}" for key in ("active", "healthy", "failed", "starting", "scheduling")
+                  if type(instances.get(key)) is int]
+        parts.append("instances=" + ",".join(counts))
+    return " ".join(parts)
+
+
+def runtime_observation(status, headers, body, version, revision, build_id):
+    # Only component names/states that fit a strict token are echoed; the probe
+    # body and headers are service output and are otherwise discarded.
+    parts = [f"readyz={status}"]
+    try:
+        report = mapping(decode(body))
+        components = [f"{part[0]}:{part[1]}" for part in sequence(report.get("components"))
+                      if isinstance(part, list) and len(part) == 2
+                      and all(isinstance(item, str) and TOKEN.fullmatch(item) for item in part)]
+        parts.append("components=" + ",".join(components))
+        parts.append("identity=" + ("match" if headers.get("x-two-worker-version") == version
+                                    and report.get("build_revision") == revision
+                                    and report.get("build_id") == build_id else "mismatch"))
+    except GateError:
+        parts.append("body=unreadable")
+    return " ".join(parts)
+
+
 def staging_url():
     url = os.environ.get("STAGING_URL", "").rstrip("/")
     # Staging deploy job only; no production fallback or credentialed URLs.
@@ -407,27 +440,27 @@ def verify(args, client):
     require(worker_namespace(client, version) == baseline["namespace_id"], "worker_namespace_changed")
     url = staging_url()
     pinned = None
-    # Last observation, for the timeout diagnostic only: a fixed rollout status
-    # word and an HTTP status code. Response bodies are never kept.
-    last = {"rollout": "none", "readyz": "none"}
     while time.monotonic() < client.deadline:
         app = application(client)
         require(app["id"] == baseline["application_id"]
                 and app["durable_objects"]["namespace_id"] == baseline["namespace_id"], "application_identity_drift")
         if pinned is None:
             pinned = select_rollout(rollouts(client, app["id"]), baseline, image)
+            client.observation = "no_new_rollout"
         if pinned is not None:
             row = mapping(client.api(f"/containers/applications/{app['id']}/rollouts/{identifier(pinned['id'])}"))
             require(row.get("id") == pinned["id"], "rollout_identity_drift")
-            last["rollout"] = row["status"] if row.get("status") in ROLLOUT_STATUSES else "unknown"
             complete = converged(row, image, number(pinned.get("target_version")))
+            client.observation = rollout_observation(row)
             if complete:
                 require(mapping(app.get("configuration")).get("image") == image, "application_image_drift")
                 active_worker(client, version)
                 status, headers, body = client.request(url + "/readyz")
-                last["readyz"] = status if type(status) is int and 0 <= status <= 599 else "invalid"
+                client.observation = "rollout=converged " + runtime_observation(
+                    status, headers, body, version, baseline["revision"], baseline["build_id"])
                 if runtime_ready(status, headers, body, version, baseline["revision"], baseline["build_id"]):
                     health, health_headers, _ = client.request(url + "/health")
+                    client.observation = f"rollout=converged readyz=200 health={health}"
                     if health == 200 and health_headers.get("x-two-worker-version") == version:
                         # Re-read control plane after the runtime probes; neither
                         # Worker activation nor container rollout is transactional.
@@ -449,7 +482,7 @@ def verify(args, client):
         # Warming is allowed, but never acceptance evidence; discard the body.
         client.request(url + "/health")
         time.sleep(max(0, min(5, client.deadline - time.monotonic())))
-    raise GateError("rollout_timeout", f"last rollout={last['rollout']} readyz={last['readyz']}")
+    raise GateError("rollout_timeout")
 
 
 def main():
@@ -461,6 +494,7 @@ def main():
     parser.add_argument("--deploy-config", default="staging-deploy.json")
     parser.add_argument("--evidence", default="staging-rollout-evidence.json")
     args = parser.parse_args()
+    client = None
     try:
         deadline = time.monotonic() + 300 if args.mode == "verify" else None
         # `receipt` only reads the local Wrangler NDJSON; it needs no Cloudflare credentials.
@@ -471,6 +505,8 @@ def main():
         print(f"staging rollout gate failed: {error}")
         if error.detail:
             print(f"staging rollout diagnostic: {error.detail}")
+        if str(error) == "rollout_timeout" and client is not None and client.observation:
+            print(f"last observation before timeout: {client.observation}")
         return 1
     except Exception:
         # No traceback: filesystem, SDK receipt and JSON errors may carry data.
