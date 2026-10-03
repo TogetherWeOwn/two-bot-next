@@ -222,6 +222,11 @@ async fn checkpoint_io<T>(
 async fn transport_disconnected(state: &RwLock<GatewayState>, generation: &AtomicU64) {
     // Share the lock with checkpoint restoration and READY publication so a
     // disconnect cannot land between their generation check and state write.
+    // The counter below is the 48h-watch disconnect series: every transport
+    // loss funnels through here (reconnect failures, close frames, invalid
+    // sessions, cold-resume IDENTIFY), so each one must later pair with a
+    // RESUME or fresh READY in the same window.
+    two_bot_core::metrics::global().gateway_disconnect();
     let mut state = state.write().await;
     generation.fetch_add(1, Ordering::AcqRel);
     if *state != GatewayState::Draining {
@@ -399,6 +404,18 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing resume URL".into()))?;
                         let checkpoint = GatewaySession { session_id: session.id().to_owned(), sequence, resume_url: resume_url.to_owned(), updated_at_ms: two_bot_core::funnel::now_millis_for_test() };
                         if dispatch_action(received.as_ref(), &checkpoint.session_id, sequence) == DispatchAction::Duplicate { continue; }
+                        // Sequence jumps inside one session are dispatches
+                        // Discord assigned but this process never received
+                        // (transport loss across a RESUME). Count them toward
+                        // the 48h-watch zero-missed-events acceptance.
+                        let missed = two_bot_core::gateway_session::missed_gap(
+                            received.as_ref(),
+                            &checkpoint.session_id,
+                            sequence,
+                        );
+                        if missed > 0 {
+                            two_bot_core::metrics::global().gateway_missed_events(missed);
+                        }
                         // A partial MESSAGE_UPDATE omits fields a full Twilight
                         // Message needs: decode its raw IDs before parsing.
                         let edit = if automod_enabled {
