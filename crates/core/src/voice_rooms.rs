@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::commands::{
     CommandChoice, CommandDefinition, CommandOption, CommandOptionType, PERM_MANAGE_CHANNELS,
+    PERM_MANAGE_GUILD,
 };
 use super::voice_text_channel::{
     TextChannelPlan, TextChannelSettings, MAX_TEXT_CHANNEL_NAME_CHARS,
@@ -704,6 +705,30 @@ pub enum RoomAction {
         name: String,
         seed: u64,
     },
+    /// Create the V9 companion text channel for an already-created room.
+    /// The full [`TextChannelPlan`] (name, category, creation-time overwrites
+    /// plus settings snapshot) rides the action so a later `/textchannels`
+    /// change cannot alter this channel; overwrites are never patched after
+    /// the POST. `channel_id()` is `None` (like `CreateRoom`): the companion
+    /// is keyed by its room, and room-scoped suspend/drop must not cancel a
+    /// creation whose outcome is unknown — the dispatch rechecks the store.
+    CreateCompanion {
+        room_channel_id: Snowflake,
+        plan: TextChannelPlan,
+    },
+    /// Grant one occupant View on the companion (V9 join). Never a deny.
+    GrantCompanionView {
+        room_channel_id: Snowflake,
+        text_channel_id: Snowflake,
+        member_id: Snowflake,
+    },
+    /// Delete one occupant's overwrite on the companion (V9 leave). The
+    /// overwrite is deleted, never replaced with a deny.
+    RevokeCompanionView {
+        room_channel_id: Snowflake,
+        text_channel_id: Snowflake,
+        member_id: Snowflake,
+    },
     MoveMember {
         member_id: Snowflake,
         channel_id: Snowflake,
@@ -748,14 +773,25 @@ impl RoomAction {
     }
 
     /// The room channel this action touches, if any (suspend/drop scope).
+    /// Companion view edits scope to their room: once the room is gone its
+    /// companion is deleted, so pending grants/revokes for it are dropped
+    /// with it. `CreateCompanion` scopes to no channel (like `CreateRoom`).
     #[must_use]
     pub fn channel_id(&self) -> Option<Snowflake> {
         match self {
-            Self::CreateRoom { .. } => None,
+            Self::CreateRoom { .. } | Self::CreateCompanion { .. } => None,
             Self::MoveMember { channel_id, .. }
             | Self::DeleteRoom { channel_id }
             | Self::UpdateOwnership { channel_id, .. }
             | Self::RenameRoom { channel_id, .. }
+            | Self::GrantCompanionView {
+                room_channel_id: channel_id,
+                ..
+            }
+            | Self::RevokeCompanionView {
+                room_channel_id: channel_id,
+                ..
+            }
             | Self::KickMember { channel_id, .. } => Some(*channel_id),
         }
     }
@@ -1090,6 +1126,35 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         CommandDefinition::new("ping", "Show the bot's response latency"),
         CommandDefinition::new("invite", "Show this server's invite link"),
         CommandDefinition::new(
+            "textchannels",
+            "Toggle companion text channels for one creator channel",
+        )
+        .permissions(PERM_MANAGE_CHANNELS)
+        .options(vec![
+            CommandOption::new(
+                "channel",
+                "Creator voice channel to configure",
+                CommandOptionType::Channel,
+            )
+            .required(),
+            CommandOption::new(
+                "enabled",
+                "Turn companion text channels on or off (default on)",
+                CommandOptionType::Boolean,
+            ),
+            CommandOption::new(
+                "name",
+                "Companion channel name (default voice-chat)",
+                CommandOptionType::String,
+            )
+            .max_length(MAX_TEXT_CHANNEL_NAME_CHARS as u32),
+            CommandOption::new(
+                "viewer-role",
+                "Extra role that may view companions (@everyone for all)",
+                CommandOptionType::Role,
+            ),
+        ]),
+        CommandDefinition::new(
             "access",
             "Set who can create voice rooms and use room commands",
         )
@@ -1222,6 +1287,22 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::Role,
             )]),
         ]),
+        CommandDefinition::new(
+            "export",
+            "Download this server's voice configuration as a versioned JSON file",
+        )
+        .permissions(PERM_MANAGE_GUILD),
+        CommandDefinition::new(
+            "import",
+            "Preview a voice configuration file before applying it",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![CommandOption::new(
+            "file",
+            "Voice configuration JSON file from /export",
+            CommandOptionType::Attachment,
+        )
+        .required()]),
     ]
 }
 
@@ -1912,7 +1993,19 @@ mod tests {
         let defs = voice_commands();
         assert_eq!(
             defs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-            ["create", "setup", "ping", "invite", "access", "reclaim", "transfer", "logging"]
+            [
+                "create",
+                "setup",
+                "ping",
+                "invite",
+                "textchannels",
+                "access",
+                "reclaim",
+                "transfer",
+                "logging",
+                "export",
+                "import"
+            ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
         assert_eq!(
@@ -1930,10 +2023,40 @@ mod tests {
             assert_eq!(def.default_member_permissions, None);
             assert!(def.options.is_empty());
         }
+        // `/textchannels` is admin-gated like `/create`: a required creator
+        // channel plus optional toggle, name and viewer role.
+        assert_eq!(
+            defs[4].default_member_permissions,
+            Some(PERM_MANAGE_CHANNELS.to_string())
+        );
+        let options: Vec<(&str, u8, bool)> = defs[4]
+            .options
+            .iter()
+            .map(|option| {
+                (
+                    option.name.as_str(),
+                    option.kind,
+                    option.required == Some(true),
+                )
+            })
+            .collect();
+        assert_eq!(
+            options,
+            vec![
+                ("channel", CommandOptionType::Channel.as_u8(), true),
+                ("enabled", CommandOptionType::Boolean.as_u8(), false),
+                ("name", CommandOptionType::String.as_u8(), false),
+                ("viewer-role", CommandOptionType::Role.as_u8(), false),
+            ]
+        );
+        assert_eq!(
+            defs[4].options[2].max_length,
+            Some(MAX_TEXT_CHANNEL_NAME_CHARS as u32)
+        );
         // `/access` is admin-gated and is all sub-commands, each with its
         // required options listed before the optional ones.
-        let access = &defs[4];
-        let logging = &defs[7];
+        let access = &defs[5];
+        let logging = &defs[8];
         assert_eq!(
             access.default_member_permissions,
             Some(PERM_MANAGE_CHANNELS.to_string())
@@ -1967,14 +2090,32 @@ mod tests {
                 .all(|o| o.required != Some(true));
             assert!(required_first, "{} lists a required option late", sub.name);
         }
+        // `/export` takes no options; `/import` takes one required file
+        // attachment. Both are Manage Server (Manage Guild) gated.
+        let export = &defs[9];
+        let import = &defs[10];
+        for def in [export, import] {
+            assert_eq!(
+                def.default_member_permissions,
+                Some(PERM_MANAGE_GUILD.to_string())
+            );
+        }
+        assert!(export.options.is_empty());
+        assert_eq!(import.options.len(), 1);
+        assert_eq!(import.options[0].name, "file");
+        assert_eq!(
+            import.options[0].kind,
+            CommandOptionType::Attachment.as_u8()
+        );
+        assert!(import.options[0].required == Some(true));
         // `/reclaim` takes no options; `/transfer` names its recipient.
-        assert_eq!(defs[5].default_member_permissions, None);
-        assert!(defs[5].options.is_empty());
         assert_eq!(defs[6].default_member_permissions, None);
-        assert_eq!(defs[6].options.len(), 1);
-        assert_eq!(defs[6].options[0].name, "member");
-        assert_eq!(defs[6].options[0].kind, CommandOptionType::User as u8);
-        assert!(defs[6].options[0].required == Some(true));
+        assert!(defs[6].options.is_empty());
+        assert_eq!(defs[7].default_member_permissions, None);
+        assert_eq!(defs[7].options.len(), 1);
+        assert_eq!(defs[7].options[0].name, "member");
+        assert_eq!(defs[7].options[0].kind, CommandOptionType::User as u8);
+        assert!(defs[7].options[0].required == Some(true));
         // Merges cleanly alongside the other slices, first-wins.
         let merged = merge_commands(
             &[feature_commands(), moderation_commands(), voice_commands()],
@@ -1985,6 +2126,8 @@ mod tests {
         assert!(merged.iter().any(|d| d.name == "setup"));
         assert!(merged.iter().any(|d| d.name == "ping"));
         assert!(merged.iter().any(|d| d.name == "invite"));
+        assert!(merged.iter().any(|d| d.name == "textchannels"));
+        assert!(merged.iter().any(|d| d.name == "access"));
         assert!(merged.iter().any(|d| d.name == "reclaim"));
         assert!(merged.iter().any(|d| d.name == "transfer"));
         assert!(merged.iter().any(|d| d.name == "logging"));

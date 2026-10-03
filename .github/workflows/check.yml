@@ -184,6 +184,9 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_ci_single_core.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_ci_postgres_storage.py' -v
 
+      - name: Guard channel CI database routing and job isolation
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_channel_ci.py' -v
+
       - name: Scratch drill schema provenance (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_restore_drill_schema.py' -v
 
@@ -446,6 +449,10 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot --locked raid_runtime_ -- --include-ignored
 
+      - name: join-risk runtime acceptance (mock Discord and CI service only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot --locked join_risk_runtime_ -- --include-ignored
+
       - name: automod durable dedupe (CI service container only)
         if: needs.job-inputs.outputs.rust != 'false'
         env:
@@ -518,6 +525,14 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-core --features db --locked channel_moderation -- --include-ignored
+
+      - name: channel moderation shared-router REST acceptance (CI service only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: >-
+          env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS cargo test -p two-bot-discord
+          --features db --locked --test channel_moderation_runtime -- --include-ignored
 
       - name: Internal channel moderation executor (mock REST and CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
@@ -1019,6 +1034,8 @@ jobs:
         run: python3 ../scripts/test-release-retry.py
       - name: Verify staging rollout provenance (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollout.py -v
+      - name: Verify staging redirect smoke (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_redirect_smoke.py -v
       - name: Verify runner routing for every workflow job
         run: python3 ../scripts/test-runner-routing.py
       - name: Verify offline release lifecycle

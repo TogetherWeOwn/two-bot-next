@@ -69,6 +69,7 @@ pub enum CommandOptionType {
     User = 6,
     Channel = 7,
     Role = 8,
+    Attachment = 11,
 }
 
 impl CommandOptionType {

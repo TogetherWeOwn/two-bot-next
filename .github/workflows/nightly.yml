@@ -62,6 +62,10 @@ jobs:
       TWO_LFG_TESTDB_CI: '1'
       TWO_LEVELING_TEST_CI: '1'
       TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
+      # CI service hosts only; deployed processes default to `required`
+      # (docs/database-tls.md). Without it the in-process `connect` refuses
+      # the loopback test database and voice startup degrades to voice-off.
+      TWO_DATABASE_TLS: local-only
     services:
       agent-testdb:
         image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
@@ -114,11 +118,14 @@ jobs:
       # Serial execution prevents the ignored stores' shared tables/locks from
       # racing. Sticky/onboarding tests are disposable-DB tests, not Discord calls.
       # Channel moderation, the discord channel-moderation executor, feeds_store,
-      # legacy_verify_db and raid_list_db require agent_test, not the
-      # two_bot_test_* bootstrap used by TestDatabase suites. Skip only those
-      # tests here, then run ALL five suites below with their accepted URL.
+      # legacy_verify_db, raid_list_db, reengagement_list_db, staging_migrate_db
+      # and internal_events require agent_test, not the two_bot_test_* bootstrap
+      # used by TestDatabase suites. Skip only those tests here, then run ALL of
+      # those suites below with their accepted URL.
       # The store suite reads its own TEST_DATABASE_URL and isolates per schema.
       # No ignored suite is permanently excluded.
+      # --no-fail-fast: cargo otherwise stops at the first failing test binary and
+      # hides every later failure, so one red target masked the rest of the sweep.
       - name: Full workspace sweep including ignored tests
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_nightly
@@ -126,7 +133,8 @@ jobs:
           TEST_DATABASE_URL: postgresql://agent_test@agent-testdb:5432/postgres
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/nightly-workspace
         run: >-
-          cargo test --workspace --all-features --locked -- --include-ignored --test-threads=1
+          cargo test --workspace --all-features --locked --no-fail-fast -- --include-ignored --test-threads=1
+          --skip channel_moderation_store::
           --skip channel_moderation_store::tests::lockdown_round_trip_stores_and_restores_exact_masks
           --skip channel_moderation_store::tests::repeated_lockdown_preserves_first_masks
           --skip channel_moderation_store::tests::delayed_unlock_cleanup_cannot_delete_a_later_lockdown
@@ -137,6 +145,27 @@ jobs:
           --skip channel_moderation_store::tests::action_only_reuse_is_mismatch_in_flight_and_done
           --skip channel_moderation_store::tests::audit_rows_are_written_once
           --skip channel_moderation_store::tests::shared_timestamp_schema_preserves_channel_claim_and_audit_instants
+          --skip channel_moderation_store::tests::channel_lane_blocks_distinct_keys_until_safe_release_or_finish
+          --skip channel_moderation_store::tests::finish_rolls_back_completion_and_lane_release_when_audit_fails
+          --skip channel_moderation_store::tests::finish_restoration_cleanup_is_atomic_and_generation_fenced
+          --skip channel_moderation_store::tests::stale_finish_cannot_audit_or_release_a_new_claim_generation
+          --skip channel_moderation_store::tests::shared_ledger_accepts_channel_and_member_timestamp_bindings
+          --skip channel_moderation_store::tests::timestamp_upgrade_preserves_legacy_rows_and_claim_generations
+          --skip defer_precedes_sql_and_effect_then_edits_original_with_no_mentions
+          --skip rejected_or_ambiguous_defer_never_claims_or_mutates
+          --skip failed_result_edit_never_repeats_a_completed_effect
+          --skip persistence_failure_edits_safe_reconciliation_reply_and_keeps_lane
+          --skip disabled_command_uses_ephemeral_lifecycle_and_other_slices_are_untouched
+          --skip shared_router_gates_bounds_and_required_reason_refuse_without_http
+          --skip purge_and_slowmode_success_audit_and_replay_without_repeating_effects
+          --skip repeated_lockdown_keeps_first_seed_and_unlock_restores_exact_masks
+          --skip initially_absent_overwrite_is_deleted_only_after_recorded_lockdown
+          --skip ambiguous_unlock_retains_recovery_and_both_claims_across_all_keys
+          --skip rejected_first_lock_retires_only_its_seed_and_finishes_refusal
+          --skip audit_failure_retries_only_finalization_not_a_successful_discord_effect
+          --skip first_seed_and_durable_lane_exist_before_lock_put_is_accepted
+          --skip exhausted_audit_failure_retains_lane_and_cannot_redo_successful_effect
+          --skip stale_tickets_and_action_only_mismatch_never_admit_runtime_effects
           --skip delayed_unlock_cannot_overwrite_a_later_lockdown_cycle
           --skip post_mutation_audit_failure_rolls_back_completion_and_retains_recovery
           --skip rejected_repeated_lockdown_preserves_original_seed_and_unlock_failure_keeps_it
@@ -162,12 +191,23 @@ jobs:
           --skip parity_mismatch_cursor_and_read_only_acceptance
           --skip dump_inspect_restore_round_trip
           --skip flags_are_guild_scoped_half_open_deduplicated_and_activity_protected
+          --skip list_is_guild_scoped_selector_shaped_and_read_only
+          --skip real_sqlx_runner_cases
+          --skip database::actions_persist_rows_and_preserve_other_events_and_guilds
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
           cargo test -p two-bot-core --all-features --lib --locked channel_moderation_store::
+          -- --include-ignored --test-threads=1
+      - name: Channel moderation runtime acceptance with its guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: >-
+          env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS cargo test -p two-bot-discord
+          --all-features --test channel_moderation_runtime --locked
           -- --include-ignored --test-threads=1
       - name: Discord channel-moderation executor ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
@@ -189,6 +229,27 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
           cargo test -p two-bot-cutover --all-features --test legacy_verify_db --locked
+          -- --include-ignored --test-threads=1
+      - name: Reengagement list ignored tests with their guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: >-
+          cargo test -p two-bot-cutover --all-features --test reengagement_list_db --locked
+          -- --include-ignored --test-threads=1
+      - name: Staging migration runner ignored tests with their guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: >-
+          cargo test -p two-bot-cutover --all-features --test staging_migrate_db --locked
+          -- --include-ignored --test-threads=1
+      - name: Internal events ignored tests with their guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: >-
+          cargo test -p two-bot-discord --all-features --test internal_events --locked
           -- --include-ignored --test-threads=1
       - name: Raid list ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}

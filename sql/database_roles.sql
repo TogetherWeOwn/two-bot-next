@@ -1,5 +1,8 @@
 -- Print-only operator plan. Apply after bot migrations and sql/web_v1.sql.
 -- NOLOGIN groups only: passwords and login membership are provisioned separately.
+-- Rendered by `two-bot db roles plan [--phase full|bootstrap]`. The bootstrap
+-- phase skips relations and sequences absent from the database; functions stay
+-- strict in both phases. The full (default) phase raises on any absent object.
 BEGIN;
 SET LOCAL search_path = pg_catalog, pg_temp;
 
@@ -25,6 +28,42 @@ BEGIN
     END IF;
 END
 $roles$;
+
+-- Ephemeral membership for the executing identity. A non-superuser CREATEROLE
+-- identity holds only ADMIN OPTION on the group it just created, so
+-- `ALTER SCHEMA public OWNER TO two_bot_migrator` fails with
+-- "must be able to SET ROLE", and the identity loses USAGE on `public` once
+-- ownership flips. Grant SET/USAGE to `current_user` for this transaction
+-- only; the matching REVOKE before COMMIT restores the pre-plan state.
+DO $membership$
+DECLARE
+    modern boolean := current_setting('server_version_num')::integer >= 160000;
+    usable boolean;
+BEGIN
+    IF modern THEN
+        usable := pg_has_role(current_user, 'two_bot_migrator', 'SET')
+              AND pg_has_role(current_user, 'two_bot_migrator', 'USAGE');
+    ELSE
+        usable := pg_has_role(current_user, 'two_bot_migrator', 'MEMBER');
+    END IF;
+    IF NOT usable THEN
+        IF modern THEN
+            EXECUTE format('GRANT %I TO %I WITH INHERIT TRUE, SET TRUE', 'two_bot_migrator', current_user);
+        ELSE
+            EXECUTE format('GRANT %I TO %I', 'two_bot_migrator', current_user);
+        END IF;
+    END IF;
+    IF modern THEN
+        usable := pg_has_role(current_user, 'two_bot_migrator', 'SET')
+              AND pg_has_role(current_user, 'two_bot_migrator', 'USAGE');
+    ELSE
+        usable := pg_has_role(current_user, 'two_bot_migrator', 'MEMBER');
+    END IF;
+    IF NOT usable THEN
+        RAISE EXCEPTION 'executing identity cannot SET ROLE two_bot_migrator; refusing role plan';
+    END IF;
+END
+$membership$;
 
 DO $database$
 BEGIN
@@ -53,6 +92,7 @@ BEGIN
     FOR obj IN (
 -- @matrix
     ) LOOP
+-- @absent_relation
         IF obj.kind = 'function' THEN
             target := to_regprocedure(obj.schema_name || '.' || obj.name)::text;
             IF target IS NULL THEN
@@ -84,8 +124,13 @@ BEGIN
                     EXECUTE format('GRANT SELECT, INSERT, UPDATE ON TABLE %s TO two_bot_runtime', target);
                 ELSIF obj.kind = 'view' THEN
                     EXECUTE format('GRANT SELECT ON TABLE %s TO two_web_reader', target);
+                ELSIF obj.kind = 'migrator' THEN
+                    -- Migrator-only: owner/migrator ALL, no runtime/reader grant.
+                    -- Covers operator audit and redirect-store tables that the
+                    -- gateway and website must never read or write directly.
+                    NULL;
                 END IF;
-                -- SERIAL/IDENTITY sequences follow only allowlisted bot tables.
+                -- SERIAL/IDENTITY sequences follow only allowlisted runtime tables.
                 FOR seq IN (
                     SELECT c.oid::regclass AS name FROM pg_class c
                     JOIN pg_depend d ON d.objid = c.oid AND d.classid = 'pg_class'::regclass
@@ -106,5 +151,9 @@ $objects$;
 ALTER DEFAULT PRIVILEGES FOR ROLE two_bot_migrator REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 ALTER DEFAULT PRIVILEGES FOR ROLE two_bot_migrator REVOKE ALL ON TABLES FROM PUBLIC, two_bot_runtime, two_web_reader;
 ALTER DEFAULT PRIVILEGES FOR ROLE two_bot_migrator REVOKE ALL ON SEQUENCES FROM PUBLIC, two_bot_runtime, two_web_reader;
+
+-- Drop the ephemeral self-grant before COMMIT so the executing identity keeps
+-- only its pre-plan memberships (e.g. the creator ADMIN OPTION row).
+REVOKE two_bot_migrator FROM CURRENT_USER;
 
 COMMIT;

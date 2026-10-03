@@ -4,7 +4,7 @@
 //! errors to the caller. Callers must persist a created channel before moving
 //! its owner and compensate a failed write by deleting that new channel.
 //!
-//! Parameter binding: https://docs.rs/sqlx/0.9.0/sqlx/fn.query.html
+//! Parameter binding: <https://docs.rs/sqlx/0.9.0/sqlx/fn.query.html>
 
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
@@ -17,6 +17,8 @@ use two_bot_core::voice_rooms::{
 };
 use two_bot_core::{format_iso_millis, parse_iso_millis, Snowflake};
 
+use super::voice_config_store::PgVoiceConfigStore;
+
 #[derive(Debug, Clone)]
 pub struct PgRoomStore {
     pool: PgPool,
@@ -26,6 +28,14 @@ impl PgRoomStore {
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// V11 configuration persistence (`/export` reads, `/import` writes)
+    /// over this store's pool. Snapshot and apply each run in one
+    /// transaction; apply never touches live rooms or companions.
+    #[must_use]
+    pub fn voice_configs(&self) -> PgVoiceConfigStore {
+        PgVoiceConfigStore::new(self.pool.clone())
     }
 
     pub async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), sqlx::Error> {
@@ -252,6 +262,24 @@ impl PgRoomStore {
         .await?
         .rows_affected()
             != 0)
+    }
+
+    /// Every companion tracked in a guild, for worker load and startup
+    /// reconciliation (V9c): each row carries its creation-time settings
+    /// snapshot, so later `/textchannels` changes never alter it.
+    pub async fn companions_in_guild(
+        &self,
+        guild_id: Snowflake,
+    ) -> Result<Vec<TextCompanion>, sqlx::Error> {
+        sqlx::query(
+            "SELECT * FROM voice_text_companions WHERE guild_id = $1 ORDER BY room_channel_id",
+        )
+        .bind(guild_id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(decode_companion)
+        .collect()
     }
 
     pub async fn companion_for(
