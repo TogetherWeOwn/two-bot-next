@@ -87,6 +87,10 @@ pub struct E2eMatrixRow {
     pub denials: &'static [&'static str],
 }
 
+// Eight fields because one row is one contract line; splitting the struct
+// would split the coverage test's field-by-field pins. Same precedent as the
+// other multi-field row builders in this repo.
+#[allow(clippy::too_many_arguments)]
 const fn row(
     command: &'static str,
     parity_row: u8,
