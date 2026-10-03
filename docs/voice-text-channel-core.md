@@ -17,6 +17,16 @@ It requires no `db` feature, Discord wire types, clock, or external I/O.
   overwrites: @everyone denied View (allowed instead when the viewer role is
   @everyone), the viewer role allowed, and every current occupant and admin
   allowed. The plan also carries `settings`, the snapshot taken at creation.
+- `VoiceRoomFacts::admin_role_ids` and `admin_view_roles` (V9d): guild roles that
+  hold Manage Channels become `Role` View allows in the plan, so an admin
+  promoted later is covered without per-room edits. Administrator roles (they
+  bypass overwrites), @everyone (already covered) and zero IDs never get an
+  entry; a role that is also the viewer role is emitted once. The runtime
+  resolves the roles live from its role snapshot at plan time, and passes them
+  as `protected` alongside the viewer role and the bot. The `/textchannels`
+  command (Manage Channels, a required creator channel plus optional `enabled`,
+  `name` and `viewer-role`; `enabled` defaults to on) edits the creator row
+  only, so open companions keep their creation-time snapshot.
 - `sanitise_channel_name`: lowercase, whitespace runs collapse to one `-` with
   edges trimmed, at most 100 characters; codepoints with no lowercase mapping
   (e.g. U+1D400) are dropped; blank or empty results fall back to
