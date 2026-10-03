@@ -780,7 +780,7 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
     let mut ledger = 0usize;
     for (version, migration) in &all {
         if STAGING_LEDGER29.contains(version) {
-            sqlx::raw_sql(migration.as_str())
+            sqlx::raw_sql(sqlx::AssertSqlSafe(migration.clone()))
                 .execute(&provision_pool)
                 .await
                 .unwrap();
@@ -827,6 +827,12 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         }
         other => panic!("unexpected full-plan error: {other:?}"),
     }
+    // The refused plan leaves this pooled connection inside an aborted BEGIN;
+    // roll back before reuse or the next statement fails with 25P02.
+    sqlx::raw_sql("ROLLBACK")
+        .execute(&provision_pool)
+        .await
+        .unwrap();
     // The bootstrap phase transfers the existing objects as the non-superuser
     // identity, using the ephemeral SET membership for this transaction only.
     execute(
@@ -867,7 +873,7 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         if !STAGING_LEDGER29.contains(version)
             && !PENDING_EXCLUDED_WITHOUT_MATRIX_ROW.contains(version)
         {
-            sqlx::raw_sql(migration.as_str())
+            sqlx::raw_sql(sqlx::AssertSqlSafe(migration.clone()))
                 .execute(&migrator_pool)
                 .await
                 .unwrap();
