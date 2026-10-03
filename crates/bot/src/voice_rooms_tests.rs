@@ -2851,6 +2851,617 @@ async fn handle_textchannels_surfaces_store_failures() {
     );
 }
 
+// --- V8 per-creator settings commands ------------------------------------------
+
+fn v8_interaction(name: &str, options: Vec<CommandDataOption>) -> Interaction {
+    voice_interaction(
+        Some(command_data(name, options)),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    )
+}
+
+#[test]
+fn parse_position_extracts_side_and_first_number() {
+    let interaction = v8_interaction(
+        "position",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("position", CommandOptionValue::String("below".to_owned())),
+            typed_option("first-number", CommandOptionValue::Integer(5)),
+        ],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Position {
+            channel_id: CREATOR,
+            request: PositionRequest {
+                position: Some(RoomPosition::Below),
+                first_number: Some(5),
+            },
+        })
+    );
+}
+
+#[test]
+fn parse_position_leaves_unset_options_unset() {
+    let interaction = v8_interaction(
+        "position",
+        vec![typed_option(
+            "channel",
+            CommandOptionValue::Channel(Id::new(CREATOR)),
+        )],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Position {
+            channel_id: CREATOR,
+            request: PositionRequest {
+                position: None,
+                first_number: None,
+            },
+        })
+    );
+}
+
+#[test]
+fn parse_group_inherit_defaultlimit_and_alwaysprivate() {
+    let interaction = v8_interaction(
+        "group",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("enabled", CommandOptionValue::Boolean(false)),
+        ],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Group {
+            channel_id: CREATOR,
+            request: GroupRequest {
+                enabled: Some(false),
+            },
+        })
+    );
+    let interaction = v8_interaction(
+        "inheritpermissions",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("source", CommandOptionValue::String("channel".to_owned())),
+            typed_option("source-channel", CommandOptionValue::Channel(Id::new(400))),
+        ],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::InheritPermissions {
+            channel_id: CREATOR,
+            request: InheritPermissionsRequest {
+                source: Some("channel".to_owned()),
+                source_channel: Some(400),
+            },
+        })
+    );
+    let interaction = v8_interaction(
+        "defaultlimit",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("limit", CommandOptionValue::Integer(4)),
+        ],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::DefaultLimit {
+            channel_id: CREATOR,
+            request: DefaultLimitRequest { limit: Some(4) },
+        })
+    );
+    let interaction = v8_interaction(
+        "alwaysprivate",
+        vec![typed_option(
+            "channel",
+            CommandOptionValue::Channel(Id::new(CREATOR)),
+        )],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::AlwaysPrivate {
+            channel_id: CREATOR,
+            request: AlwaysPrivateRequest { enabled: None },
+        })
+    );
+}
+
+#[test]
+fn decide_position_updates_side_and_number() {
+    let base = CreatorChannel::new(GUILD, CREATOR);
+    let updated = match decide_position(
+        Some(base),
+        &PositionRequest {
+            position: Some(RoomPosition::Below),
+            first_number: Some(5),
+        },
+    ) {
+        PositionPlan::Update(creator) => creator,
+        PositionPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(updated.position, RoomPosition::Below);
+    assert_eq!(updated.first_room_number, 5);
+    // A side-only edit keeps the stored number.
+    let side_only = match decide_position(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &PositionRequest {
+            position: Some(RoomPosition::Below),
+            first_number: None,
+        },
+    ) {
+        PositionPlan::Update(creator) => creator,
+        PositionPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(side_only.first_room_number, 1);
+}
+
+#[test]
+fn decide_position_refuses_empty_and_bad_numbers() {
+    let base = || Some(CreatorChannel::new(GUILD, CREATOR));
+    assert!(matches!(
+        decide_position(
+            None,
+            &PositionRequest {
+                position: Some(RoomPosition::Above),
+                first_number: None,
+            }
+        ),
+        PositionPlan::Refuse { .. }
+    ));
+    assert!(matches!(
+        decide_position(
+            base(),
+            &PositionRequest {
+                position: None,
+                first_number: None,
+            }
+        ),
+        PositionPlan::Refuse { .. }
+    ));
+    for bad in [0, -3] {
+        assert!(
+            matches!(
+                decide_position(
+                    base(),
+                    &PositionRequest {
+                        position: None,
+                        first_number: Some(bad),
+                    }
+                ),
+                PositionPlan::Refuse { .. }
+            ),
+            "first number {bad} must refuse"
+        );
+    }
+}
+
+#[test]
+fn decide_group_defaults_to_on() {
+    let on = match decide_group(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &GroupRequest { enabled: None },
+    ) {
+        GroupPlan::Update(creator) => creator,
+        GroupPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert!(on.group_by_category);
+    let off = match decide_group(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &GroupRequest {
+            enabled: Some(false),
+        },
+    ) {
+        GroupPlan::Update(creator) => creator,
+        GroupPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert!(!off.group_by_category);
+    assert!(matches!(
+        decide_group(None, &GroupRequest { enabled: None }),
+        GroupPlan::Refuse { .. }
+    ));
+}
+
+#[test]
+fn decide_inherit_permissions_stores_each_source() {
+    let creator = match decide_inherit_permissions(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &InheritPermissionsRequest {
+            source: Some("category".to_owned()),
+            source_channel: None,
+        },
+    ) {
+        InheritPermissionsPlan::Update(creator) => creator,
+        InheritPermissionsPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(creator.permission_source, PermissionSource::Category);
+    assert_eq!(creator.permission_channel_id, None);
+    let channel = match decide_inherit_permissions(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &InheritPermissionsRequest {
+            source: Some("channel".to_owned()),
+            source_channel: Some(400),
+        },
+    ) {
+        InheritPermissionsPlan::Update(creator) => creator,
+        InheritPermissionsPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(channel.permission_source, PermissionSource::Channel(400));
+    assert_eq!(channel.permission_channel_id, Some(400));
+}
+
+#[test]
+fn decide_inherit_permissions_refuses_bad_input() {
+    let base = || Some(CreatorChannel::new(GUILD, CREATOR));
+    // No creator row, no source, unknown source.
+    assert!(matches!(
+        decide_inherit_permissions(
+            None,
+            &InheritPermissionsRequest {
+                source: Some("creator".to_owned()),
+                source_channel: None,
+            }
+        ),
+        InheritPermissionsPlan::Refuse { .. }
+    ));
+    for bad in [
+        InheritPermissionsRequest {
+            source: None,
+            source_channel: None,
+        },
+        InheritPermissionsRequest {
+            source: Some("everywhere".to_owned()),
+            source_channel: None,
+        },
+        // Channel source without a channel, or with a zero channel.
+        InheritPermissionsRequest {
+            source: Some("channel".to_owned()),
+            source_channel: None,
+        },
+        InheritPermissionsRequest {
+            source: Some("channel".to_owned()),
+            source_channel: Some(0),
+        },
+        // A source channel without the channel source.
+        InheritPermissionsRequest {
+            source: Some("creator".to_owned()),
+            source_channel: Some(400),
+        },
+        InheritPermissionsRequest {
+            source: Some("category".to_owned()),
+            source_channel: Some(400),
+        },
+    ] {
+        assert!(
+            matches!(
+                decide_inherit_permissions(base(), &bad),
+                InheritPermissionsPlan::Refuse { .. }
+            ),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn decide_default_limit_sets_and_clears() {
+    let set = match decide_default_limit(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &DefaultLimitRequest { limit: Some(4) },
+    ) {
+        DefaultLimitPlan::Update(creator) => creator,
+        DefaultLimitPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(set.default_limit, Some(4));
+    let unlimited = match decide_default_limit(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &DefaultLimitRequest { limit: Some(0) },
+    ) {
+        DefaultLimitPlan::Update(creator) => creator,
+        DefaultLimitPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(unlimited.default_limit, Some(0));
+    // An omitted limit clears back to inherit.
+    let inherit = match decide_default_limit(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &DefaultLimitRequest { limit: None },
+    ) {
+        DefaultLimitPlan::Update(creator) => creator,
+        DefaultLimitPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(inherit.default_limit, None);
+    for bad in [100, -1] {
+        assert!(
+            matches!(
+                decide_default_limit(
+                    Some(CreatorChannel::new(GUILD, CREATOR)),
+                    &DefaultLimitRequest { limit: Some(bad) }
+                ),
+                DefaultLimitPlan::Refuse { .. }
+            ),
+            "limit {bad} must refuse"
+        );
+    }
+    assert!(matches!(
+        decide_default_limit(None, &DefaultLimitRequest { limit: Some(4) }),
+        DefaultLimitPlan::Refuse { .. }
+    ));
+}
+
+#[test]
+fn decide_always_private_defaults_to_on() {
+    let on = match decide_always_private(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &AlwaysPrivateRequest { enabled: None },
+    ) {
+        AlwaysPrivatePlan::Update(creator) => creator,
+        AlwaysPrivatePlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert!(on.private_default);
+    let off = match decide_always_private(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &AlwaysPrivateRequest {
+            enabled: Some(false),
+        },
+    ) {
+        AlwaysPrivatePlan::Update(creator) => creator,
+        AlwaysPrivatePlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert!(!off.private_default);
+}
+
+#[test]
+fn v8_summaries_report_the_stored_settings() {
+    let mut creator = CreatorChannel::new(GUILD, CREATOR);
+    creator.position = RoomPosition::Below;
+    creator.first_room_number = 5;
+    let text = position_summary(&creator);
+    assert!(text.contains("below"), "{text}");
+    assert!(text.contains('5'), "{text}");
+    creator.group_by_category = true;
+    let grouped = group_summary(&creator);
+    assert!(grouped.contains("on"), "{grouped}");
+    creator.group_by_category = false;
+    let ungrouped = group_summary(&creator);
+    assert!(ungrouped.contains("off"), "{ungrouped}");
+    creator.permission_source = PermissionSource::Category;
+    let inherit = inherit_permissions_summary(&creator);
+    assert!(inherit.contains("category"), "{inherit}");
+    creator.default_limit = Some(4);
+    let limited = default_limit_summary(&creator);
+    assert!(limited.contains('4'), "{limited}");
+    creator.default_limit = None;
+    let inherited = default_limit_summary(&creator);
+    assert!(inherited.contains("inherit"), "{inherited}");
+    creator.private_default = true;
+    let private = always_private_summary(&creator);
+    assert!(private.contains("private"), "{private}");
+}
+
+#[test]
+fn v8_command_names_key_the_role_restrictions() {
+    let commands = [
+        VoiceCommand::Position {
+            channel_id: CREATOR,
+            request: PositionRequest {
+                position: None,
+                first_number: Some(2),
+            },
+        },
+        VoiceCommand::Group {
+            channel_id: CREATOR,
+            request: GroupRequest { enabled: None },
+        },
+        VoiceCommand::InheritPermissions {
+            channel_id: CREATOR,
+            request: InheritPermissionsRequest {
+                source: Some("creator".to_owned()),
+                source_channel: None,
+            },
+        },
+        VoiceCommand::DefaultLimit {
+            channel_id: CREATOR,
+            request: DefaultLimitRequest { limit: Some(4) },
+        },
+        VoiceCommand::AlwaysPrivate {
+            channel_id: CREATOR,
+            request: AlwaysPrivateRequest { enabled: None },
+        },
+    ];
+    for command in &commands {
+        assert!(
+            two_bot_core::voice_access::VOICE_COMMANDS.contains(&command.name()),
+            "{} is not a restrictable voice command",
+            command.name()
+        );
+    }
+    assert_eq!(commands[0].name(), "position");
+    assert_eq!(commands[1].name(), "group");
+    assert_eq!(commands[2].name(), "inheritpermissions");
+    assert_eq!(commands[3].name(), "defaultlimit");
+    assert_eq!(commands[4].name(), "alwaysprivate");
+}
+
+#[tokio::test]
+async fn handle_v8_commands_refuse_without_manage_channels() {
+    for (name, options) in [
+        (
+            "position",
+            vec![
+                typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+                typed_option("first-number", CommandOptionValue::Integer(2)),
+            ],
+        ),
+        (
+            "group",
+            vec![typed_option(
+                "channel",
+                CommandOptionValue::Channel(Id::new(CREATOR)),
+            )],
+        ),
+        (
+            "inheritpermissions",
+            vec![
+                typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+                typed_option("source", CommandOptionValue::String("category".to_owned())),
+            ],
+        ),
+        (
+            "defaultlimit",
+            vec![
+                typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+                typed_option("limit", CommandOptionValue::Integer(4)),
+            ],
+        ),
+        (
+            "alwaysprivate",
+            vec![typed_option(
+                "channel",
+                CommandOptionValue::Channel(Id::new(CREATOR)),
+            )],
+        ),
+    ] {
+        let trace = Trace::default();
+        let runtime = test_runtime(trace.clone());
+        let interaction = voice_interaction(
+            Some(command_data(name, options)),
+            Some(Permissions::VIEW_CHANNEL),
+            true,
+        );
+        let (owned, response) = handle_capture(&runtime, &interaction).await;
+        assert!(owned, "/{name} owns its interaction");
+        assert!(
+            response_text(response.as_ref().expect("reply")).contains("Manage Channels"),
+            "/{name} refuses without Manage Channels"
+        );
+        assert!(
+            !trace
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.starts_with("add_creator")),
+            "/{name} writes nothing without Manage Channels"
+        );
+    }
+}
+
+#[tokio::test]
+async fn handle_position_saves_side_and_number() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = v8_interaction(
+        "position",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("position", CommandOptionValue::String("below".to_owned())),
+            typed_option("first-number", CommandOptionValue::Integer(5)),
+        ],
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(text.contains("below"), "{text}");
+    assert!(text.contains('5'), "{text}");
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("add_creator:{CREATOR}")));
+}
+
+#[tokio::test]
+async fn handle_group_saves_the_toggle() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = v8_interaction(
+        "group",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("enabled", CommandOptionValue::Boolean(true)),
+        ],
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(
+        response_text(response.as_ref().expect("reply")).contains("on"),
+        "group reports the stored toggle"
+    );
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("add_creator:{CREATOR}")));
+}
+
+#[tokio::test]
+async fn handle_inheritpermissions_saves_the_source() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = v8_interaction(
+        "inheritpermissions",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("source", CommandOptionValue::String("category".to_owned())),
+        ],
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(
+        response_text(response.as_ref().expect("reply")).contains("category"),
+        "inheritpermissions reports the stored source"
+    );
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("add_creator:{CREATOR}")));
+}
+
+#[tokio::test]
+async fn handle_defaultlimit_saves_the_limit() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = v8_interaction(
+        "defaultlimit",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("limit", CommandOptionValue::Integer(4)),
+        ],
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(
+        response_text(response.as_ref().expect("reply")).contains('4'),
+        "defaultlimit reports the stored limit"
+    );
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("add_creator:{CREATOR}")));
+}
+
+#[tokio::test]
+async fn handle_alwaysprivate_saves_the_default() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = v8_interaction(
+        "alwaysprivate",
+        vec![typed_option(
+            "channel",
+            CommandOptionValue::Channel(Id::new(CREATOR)),
+        )],
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(
+        response_text(response.as_ref().expect("reply")).contains("private"),
+        "alwaysprivate defaults on and reports it"
+    );
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("add_creator:{CREATOR}")));
+}
+
 #[test]
 fn ephemeral_response_is_ephemeral_channel_message() {
     let response = ephemeral_response("hello");
