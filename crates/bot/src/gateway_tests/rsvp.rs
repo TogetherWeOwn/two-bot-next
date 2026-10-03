@@ -444,7 +444,15 @@ async fn queued_commands(
             "dispatch backlog full"
         };
         assert!(error.to_string().contains(expected), "{error}");
-        assert_eq!(db.count().await, 0);
+        if slow_database {
+            assert_eq!(db.count().await, 0);
+        } else {
+            // Fatal backlog drain commits queued funnel work before returning:
+            // leaves received before overflow are processed, so the events
+            // table holds their collapsed same-member rows instead of zero.
+            // The I/O-deadline sibling above still expects zero (no drain).
+            assert!(db.count().await > 0);
+        }
         None
     } else {
         wait_sequence(&db.store, 6).await;
