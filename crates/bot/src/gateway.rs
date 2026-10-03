@@ -825,13 +825,11 @@ pub async fn run_shard<I: InviteSource + 'static>(
     // same stuck checkpoint under drain, not a second cause. A cooperative
     // supervisor return still surfaces the worker's retained error, so
     // checkpoint-failure reporting after accepted-work drain is unchanged.
-    if result.is_err() {
-        return result;
-    }
+    result?;
     if let Some(error) = error.lock().expect("gateway error lock").take() {
         return Err(error);
     }
-    result
+    Ok(())
 }
 
 /// Durable onboarding job worker: claims committed jobs, runs them through the
