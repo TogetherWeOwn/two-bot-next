@@ -818,6 +818,16 @@ pub async fn run_shard<I: InviteSource + 'static>(
         tickets.shutdown().await;
     }
     drained?;
+    // The dispatch supervisor is the authority on admission: when it fails
+    // closed (backlog full, I/O or drain deadlines), its reason stands even
+    // if the stuck worker later records its own checkpoint timeout. The
+    // supervisor breaks first; the worker timeout is the consequence of the
+    // same stuck checkpoint under drain, not a second cause. A cooperative
+    // supervisor return still surfaces the worker's retained error, so
+    // checkpoint-failure reporting after accepted-work drain is unchanged.
+    if result.is_err() {
+        return result;
+    }
     if let Some(error) = error.lock().expect("gateway error lock").take() {
         return Err(error);
     }
