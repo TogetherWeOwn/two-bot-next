@@ -2959,7 +2959,7 @@ async fn companion_plan_carries_admin_roles() {
         .overwrites
         .iter()
         .filter_map(|overwrite| match overwrite.target {
-            OverwriteTarget::Role(id) => Some(id),
+            TextOverwriteTarget::Role(id) => Some(id),
             _ => None,
         })
         .collect();

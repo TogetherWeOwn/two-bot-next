@@ -48,8 +48,9 @@ use two_bot_core::{
         RENAME_MIN_INTERVAL_MS,
     },
     voice_text_channel::{
-        admin_view_roles, occupancy_diff, text_channel_plan, OverwriteTarget, TextChannelPlan,
-        VoiceRoomFacts, DEFAULT_TEXT_CHANNEL_NAME, MAX_TEXT_CHANNEL_NAME_CHARS,
+        admin_view_roles, occupancy_diff, text_channel_plan,
+        OverwriteTarget as TextOverwriteTarget, TextChannelPlan, VoiceRoomFacts,
+        DEFAULT_TEXT_CHANNEL_NAME, MAX_TEXT_CHANNEL_NAME_CHARS,
     },
     voice_utilities::{invite_render, ping_render},
     CommandDefinition, OverwriteTarget, PermissionFinding, PermissionOverwrite as HealthOverwrite,
@@ -1745,7 +1746,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     plan.overwrites
                         .iter()
                         .filter_map(|overwrite| match overwrite.target {
-                            OverwriteTarget::Member(id) => Some(id),
+                            TextOverwriteTarget::Member(id) => Some(id),
                             _ => None,
                         })
                         .collect(),
