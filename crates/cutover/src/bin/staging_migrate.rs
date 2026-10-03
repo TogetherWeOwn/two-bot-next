@@ -2,7 +2,10 @@
 //!
 //! staging-migrate --plan|--apply --source-sha <40hex> --staging-host <host>
 //!   --staging-database <db> --recovery-evidence-ref <ref> --acl-plan-ref <ref>
+//!   [--expected-pending <ascending,comma-separated versions>]
 //! The database URL comes only from TWO_BOT_STAGING_MIGRATOR_DATABASE_URL.
+//! --apply refuses before any DDL unless --expected-pending equals the computed
+//! pending list exactly; --plan prints that list in the manifest and ignores it.
 //! Exit: 0 ok, 2 refused before any DDL, 1 failed (evidence on stdout).
 
 // Operator CLI reports intentionally use stdout; runtime/library modules do not.
@@ -27,7 +30,8 @@ fn real_main() -> i32 {
             | "--staging-host"
             | "--staging-database"
             | "--recovery-evidence-ref"
-            | "--acl-plan-ref" => match it.next() {
+            | "--acl-plan-ref"
+            | "--expected-pending" => match it.next() {
                 Some(v) => {
                     values.insert(arg.clone(), v.clone());
                 }
@@ -48,6 +52,7 @@ fn real_main() -> i32 {
         recovery_evidence_ref: get("--recovery-evidence-ref"),
         acl_plan_ref: get("--acl-plan-ref"),
         apply,
+        expected_pending: values.get("--expected-pending").cloned(),
     };
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
