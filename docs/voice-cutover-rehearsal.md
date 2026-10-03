@@ -30,11 +30,12 @@ Rules the rehearsal verified in source:
   above, numbering from 1). If the database write fails after the channel is
   created, the handler deletes the channel again (compensation); if that
   delete also fails it names the channel so an admin can remove it by hand.
-- Per-creator tuning after creation runs through the V11 import (the whole
-  configuration document), because the individual settings commands
-  (`/position`, `/group`, `/inheritpermissions`, `/defaultlimit`,
-  `/alwaysprivate`) are not wired as slash commands. There is no partial
-  per-creator edit path: change the value in the exported JSON and re-import.
+- Per-creator tuning after creation runs through the single-setting
+  commands (`/position`, `/group`, `/inheritpermissions`, `/defaultlimit`,
+  `/alwaysprivate`), each an admin-gated write of one field with the same
+  bounds the import validates. The V11 import remains for bulk edits
+  (templates, aliases, lists, logging): change the value in the exported
+  JSON and re-import.
 - `group_by_category` (shared numbering and contiguous block per category)
   is stored by the V11 import, shown in the diff, and honored by the room
   planner (new rooms land at the edge of the category's room block). Shared
@@ -151,8 +152,10 @@ staging returning to healthy; it is not listed here as a code gap.
    tracking diffs live only in the runtime reconcile pass, surfaced via
    `/setup` health and logs; there is no read-only count an operator can
    poll across the swap.
-3. The per-creator settings commands (`/position`,
-   `/inheritpermissions`, `/defaultlimit`, `/alwaysprivate`) are not wired,
-   so mid-cutover tuning requires a full-document export/edit/import
-   cycle. Usable, but slower and easier to mistype under time pressure
-   than single-setting commands.
+3. ~~The per-creator settings commands are not wired, so mid-cutover
+   tuning requires a full-document export/edit/import cycle~~ Wired: the
+   per-creator settings commands (`/position`, `/group`,
+   `/inheritpermissions`, `/defaultlimit`, `/alwaysprivate`) are
+   admin-gated slash commands with single-field writes, covered by unit
+   tests. Still open: live staging practice of each command on the
+   staging guild once staging is healthy (§4 live run).

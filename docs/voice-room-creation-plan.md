@@ -44,7 +44,7 @@ room lands next to its creator; if not, only that function changes.
 
 ## Not in this slice
 
-The settings commands (`/position`, `/inheritpermissions`,
-`/defaultlimit`, `/alwaysprivate`) and the required-role setting are not wired.
-Until then the stored defaults come from `/create` (spec defaults) or the V11
-import.
+The per-creator settings commands (`/position`, `/group`,
+`/inheritpermissions`, `/defaultlimit`, `/alwaysprivate`) are wired as
+admin-gated slash commands with single-field writes; the required-role
+setting is not. Until that lands, role gating stays on the V11 import.
