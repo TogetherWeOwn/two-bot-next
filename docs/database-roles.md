@@ -22,6 +22,13 @@ lane is a restricted exception: runtime has SELECT, INSERT and UPDATE only,
 never DELETE/TRUNCATE; reader and PUBLIC receive no lane access. The verifier
 requires these three privileges and rejects extra erase privileges.
 
+Two tables are migrator-only (`migrator` kind): `member_erasure_audit`
+(operator accountability written by the operator-only erasure path, never the
+gateway) and `invite_campaigns` (redirect store with no gateway reader/writer).
+The plan transfers them to the migrator and grants the migrator ALL with no
+runtime or reader grant; the verifier requires migrator ownership/privileges
+and rejects any runtime/reader access, including TOAST-storage ownership drift.
+
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
 base-table privileges: only the reviewed `web_v1` projection is exposed. Do not
@@ -58,9 +65,10 @@ never returns PASS. Verification checks missing groups/objects, group attributes
 and memberships, database/schema privileges, ownership/object kinds, effective
 table/column/sequence/function privileges (including PUBLIC), grant options, parsed
 boolean view invoker settings and unsafe future grants. Explicit grants cover the
-current migrations' 46 ordinary bot tables plus the restricted admission lane,
-SQLx ledger, nine named SERIAL sequences and
-`guild_settings_version_seq`, nine web views and five functions. This includes
+current migrations' 76 ordinary bot tables plus the restricted admission lane,
+SQLx ledger, two migrator-only tables, eleven sequences,
+nine web views and six functions (three trigger helpers plus three `web_v1`
+helpers). This includes
 `gateway_onboarding_jobs` and its sequence: the DML-only gateway must recover and
 write this queue, while the web reader must not access it. A detached SERIAL
 sequence remains required even after `OWNED BY NONE`. New relations/sequences need
@@ -152,10 +160,13 @@ Hosted CI automatically runs the acceptance test on its ephemeral service during
 the existing integration-test step (`GITHUB_ACTIONS=true` selects the fixed test
 URL). Without CI or `TWO_ROLES_TEST_DATABASE_URL`, the offline suite makes no
 connection; configured failures are never skipped. Tests apply every real migration
-and the actual view contract, apply the plan twice, exercise allowed DML/DDL/view
-reads and denied runtime CREATE/ALTER/TRUNCATE/temporary-table and reader base-table
+in version order (directory enumeration, not a hardcoded subset) and the actual
+view contract, apply the plan twice, exercise allowed DML/DDL/view reads and
+denied runtime CREATE/ALTER/TRUNCATE/temporary-table and reader base-table
 operations, then inject and restore privilege drift. Ticket and transcript tests
 exercise valid runtime CRUD, deny reader SELECT/INSERT and runtime ALTER/TRUNCATE,
 and detect missing runtime and excess reader privileges on both tables, restoring
-a clean matrix after each drift. Offline tests also cover CLI execution-flag
-rejection and matrix coverage, including migration 0210.
+a clean matrix after each drift. The B2 regression exercises runtime CRUD on the
+six runtime tables and migrator-only denial on the two `migrator` tables, with
+drift cases for both classes. Offline tests also cover CLI execution-flag
+rejection and directory-enumerating matrix coverage over every migration file.
