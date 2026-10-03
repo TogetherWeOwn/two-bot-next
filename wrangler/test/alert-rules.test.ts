@@ -57,20 +57,48 @@ test("transitions notify once on fire and once on resolve", () => {
   assert.match(transitionMessages(["job_stale:rank"], [])[0]!, /RESOLVED/);
 });
 
+test("db errors fire on a burst, ignore trickles and restarts", () => {
+  const base = ev([`two_bot_db_errors_total{op="admission"} 0`, `two_bot_db_errors_total{op="other"} 0`]);
+  assert.deepEqual(base.firing, []);
+  const trickle = ev([`two_bot_db_errors_total{op="admission"} 2`, `two_bot_db_errors_total{op="other"} 0`], base.state);
+  assert.deepEqual(trickle.firing, []);
+  const burst = ev([`two_bot_db_errors_total{op="admission"} 5`, `two_bot_db_errors_total{op="other"} 0`], base.state);
+  assert.deepEqual(burst.firing, ["db_errors"]);
+  const restart = ev([`two_bot_db_errors_total{op="admission"} 1`], burst.state);
+  assert.deepEqual(restart.firing, []);
+});
+
+test("send admission blocked needs three consecutive windows with new refusals", () => {
+  const lines = (n: number) => [`two_bot_send_admissions_total{outcome="blocked"} ${n}`];
+  let state = EMPTY_STATE;
+  for (const expected of [[], [], ["send_admission_blocked"]]) {
+    const r = ev(lines(state.sendBlocked + 1), state);
+    assert.deepEqual(r.firing, expected);
+    state = r.state;
+  }
+  // A quiet window clears the streak; a counter reset (restart) resets it.
+  assert.equal(ev(lines(state.sendBlocked), state).state.sendBlockedStreak, 0);
+  assert.equal(ev([`two_bot_send_admissions_total{outcome="blocked"} 0`], state).state.sendBlockedStreak, 0);
+});
+
 test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   const window = "2026-10-09T20-11-06Z";
   // Single shared spelling with the Rust canonical list (ALERT_RULE_IDS in
-  // crates/core/src/evidence.rs); both sides pin all four here and there.
+  // crates/core/src/evidence.rs); both sides pin all six here and there.
   assert.deepEqual(RULES.map((r) => r.id), [
     "job_stale",
     "job_consecutive_failures",
     "rest_429_rate",
     "db_pool_saturated",
+    "db_errors",
+    "send_admission_blocked",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
   assert.equal(packetFilename("rest_429_rate", window), `evidence-rest_429_rate-${window}.json`);
   assert.equal(packetFilename("db_pool_saturated", window), `evidence-db_pool_saturated-${window}.json`);
+  assert.equal(packetFilename("db_errors", window), `evidence-db_errors-${window}.json`);
+  assert.equal(packetFilename("send_admission_blocked", window), `evidence-send_admission_blocked-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
@@ -100,6 +128,17 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   let pool = EMPTY_STATE;
   for (let i = 0; i < 3; i++) pool = ev(poolLines, pool).state;
   firing.push(...pool.firing);
+  firing.push(
+    ...ev(
+      [`two_bot_db_errors_total{op="admission"} 5`, `two_bot_db_errors_total{op="other"} 0`],
+      ev([`two_bot_db_errors_total{op="admission"} 0`, `two_bot_db_errors_total{op="other"} 0`]).state,
+    ).firing,
+  );
+  let blocked = EMPTY_STATE;
+  for (let i = 1; i <= 3; i++) {
+    blocked = ev([`two_bot_send_admissions_total{outcome="blocked"} ${i}`], blocked).state;
+  }
+  firing.push(...blocked.firing);
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);
   assert.equal(packets.length, RULES.length);

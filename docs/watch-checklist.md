@@ -30,6 +30,8 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `job_consecutive_failures:<job>` | 3 failed completions in a row | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-failures) |
 | `rest_429_rate` | 429s above 10% of REST requests between samples (min 10 requests; restarts skip the window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-429) |
 | `db_pool_saturated` | pool at max with zero idle for 3 consecutive samples | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-db-pool) |
+| `db_errors` | 3+ storage failures between samples (restarts skip the window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-db-errors) |
+| `send_admission_blocked` | new admission refusals in 3 consecutive samples | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-send-admission-blocked) |
 
 Out of scope for paging (log-only findings, still recorded on the watch log):
 gateway session starts, handler-latency quantiles, unban-queue depth via
@@ -134,9 +136,10 @@ cutover execution thread, not blockers on this sheet.
   the live page needs the governed operator path.
 - No external uptime check covers a missing Worker/alarm or a total
   monitoring outage; the keepalive only watches a running loop.
-- No database error counter exists (the pool rule is a proxy) and no
-  send-admission series is alerted; both need the metric series first,
-  then a rule.
+- The DB error counter records send-admission SQL only; other stores still
+  surface through the pool proxy and the job-failure rules until they adopt
+  `Metrics::db_error`. A slow error trickle below the burst threshold likewise
+  surfaces only through `job_consecutive_failures`.
 - Webhook delivery is at most once per transition with no retry; a
   crash between persistence and notification loses that page.
 - Voice room-operation budgets consume lifecycle outcome signals that
