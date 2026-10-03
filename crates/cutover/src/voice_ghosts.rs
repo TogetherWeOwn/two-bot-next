@@ -176,4 +176,46 @@ mod tests {
         assert_eq!(counts.tracked_gone, vec![103]);
         assert_eq!(counts.untracked_present, vec![201]);
     }
+
+    #[test]
+    fn tracked_gone_matches_runtime_reconcile_forget_ids() {
+        use two_bot_core::voice_rooms::{reconcile, SeenChannel};
+
+        // One fixture drives both halves: tracked rooms 101-103 against live
+        // voice 101, 102 plus untracked interim-bot leftover 201.
+        let tracked = vec![room(101), room(102), room(103)];
+        let live = vec![101, 102, 201];
+        let counts = count_ghosts(&tracked, &live);
+        // Occupied and manageable, so the runtime plan isolates the forget
+        // class: nothing to delete, nothing to suspend.
+        let seen: Vec<SeenChannel> = live
+            .iter()
+            .map(|id| SeenChannel {
+                channel_id: *id,
+                human_occupants: 2,
+                manageable: true,
+            })
+            .collect();
+        let plan = reconcile(&tracked, &seen);
+        let mut forget_ids: Vec<Snowflake> =
+            plan.forget.iter().map(|room| room.channel_id).collect();
+        forget_ids.sort_unstable();
+        assert_eq!(counts.tracked_gone, forget_ids);
+        assert_eq!(counts.tracked_gone, vec![103]);
+        assert!(plan.delete_empty.is_empty());
+        assert!(plan.suspend.is_empty());
+        // The untracked leftover is triage-only: the runtime plan never
+        // mentions it or the still-present rooms.
+        assert_eq!(counts.untracked_present, vec![201]);
+        let mentioned: Vec<Snowflake> = plan
+            .forget
+            .iter()
+            .chain(plan.delete_empty.iter())
+            .chain(plan.suspend.iter())
+            .map(|room| room.channel_id)
+            .collect();
+        assert!(!mentioned.contains(&201));
+        assert!(!mentioned.contains(&101));
+        assert!(!mentioned.contains(&102));
+    }
 }

@@ -748,6 +748,38 @@ async fn reconnect_only_prunes_tracked_empty_channels_and_counts_unknown_members
 }
 
 #[tokio::test]
+async fn untracked_live_channels_enqueue_zero_deletes() {
+    // Interim-bot leftovers are live but never tracked: even an empty
+    // stranger must not enqueue a delete. The tracked room stays occupied
+    // so the pass enqueues nothing at all.
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.publish(snapshot(
+        &[500, 900],
+        vec![VoiceMember {
+            member_id: MEMBER,
+            channel_id: 500,
+            bot: Some(false),
+        }],
+    ));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reconcile();
+    for time in 0..2 {
+        dispatch(&mut worker, time).await;
+    }
+    let calls = trace.lock().unwrap();
+    assert!(
+        !calls.iter().any(|call| call.starts_with("delete:")),
+        "untracked 900 must enqueue zero deletes, got {calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|call| call.contains("900")),
+        "untracked 900 must stay untouched, got {calls:?}"
+    );
+    assert_eq!(worker.tracked().len(), 1);
+}
+
+#[tokio::test]
 async fn owner_leave_hands_room_to_earliest_joiner_and_persists() {
     let (live, store, http, trace) = fixture();
     store.rooms.lock().unwrap().insert(500, room(500));
