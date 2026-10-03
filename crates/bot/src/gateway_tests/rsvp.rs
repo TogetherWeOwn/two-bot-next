@@ -1034,8 +1034,8 @@ async fn rsvp_lookup_and_completion_edit_wait_out_lane_hold() {
     assert!(waited >= Duration::from_millis(1000), "{waited:?}");
     assert!(waited < Duration::from_secs(3), "{waited:?}");
     assert!(occupied.await.unwrap().unwrap().is_some());
-    let patches: Vec<_> = rest
-        .requests()
+    let snapshot = rest.requests();
+    let patches: Vec<_> = snapshot
         .iter()
         .filter(|request| request.method == "PATCH")
         .collect();
@@ -1055,9 +1055,10 @@ async fn receipt_callback_total_stays_inside_absolute_budget() {
     };
     let db = TestDb::new().await;
     let seen = Arc::new(AtomicBool::new(false));
+    let seen_probe = Arc::clone(&seen);
     let rest = MockRest::with_responder(move |request| {
         if request.method == "GET" && request.path.contains("scheduled-events") {
-            seen.store(true, Ordering::Release);
+            seen_probe.store(true, Ordering::Release);
             // Occupancy ends 100 ms before the receipt budget does, but the
             // admitted callback still needs 600 ms of transport.
             return ScriptedResponse::json(200, json!({"id":EVENT,"guild_id":GUILD,"status":1}))
