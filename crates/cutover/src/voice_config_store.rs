@@ -10,7 +10,7 @@
 //!
 //! The caller validates against a trusted guild inventory with
 //! `two_bot_core::voice_config::validate_configuration` before applying; the
-//! SQL CHECKs in `0227_voice_config.sql` are the last line of defense and the
+//! SQL CHECKs in `0228_voice_config.sql` are the last line of defense and the
 //! reason a mid-apply failure is a meaningful rollback case.
 //!
 //! Canonical order: snapshots list every keyed section sorted (snowflakes

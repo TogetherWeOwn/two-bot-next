@@ -37,6 +37,8 @@ default = []
 db = ["two-bot-core/db", "dep:sqlx"]
 # Explicit service-DB acceptance lane; no credentialed Discord traffic.
 db-tests = ["db"]
+# Loopback-only origin seam for downstream acceptance tests; never enabled by runtime.
+test-support = []
 
 # Local Discord doubles and measurement drivers only; none ship in release.
 [dev-dependencies]

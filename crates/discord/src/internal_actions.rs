@@ -169,6 +169,18 @@ impl AnnouncementExecutor {
         Ok(executor)
     }
 
+    /// Downstream tests exercise the real transport without live Discord or a
+    /// runtime origin override. Preserve the admitted lane and refuse anything
+    /// except a loopback HTTP origin. This feature is a dev-dependency only.
+    #[cfg(feature = "test-support")]
+    pub fn with_loopback_test_origin(mut self, origin: &str) -> Result<Self, AdmissionError> {
+        if self.admission.is_none() || !is_loopback_http(origin) {
+            return Err(AdmissionError::Configuration);
+        }
+        self.api_origin = origin.trim_end_matches('/').to_owned();
+        Ok(self)
+    }
+
     #[must_use]
     pub fn supports(action: &str) -> bool {
         SUPPORTED_ACTIONS.contains(&action)

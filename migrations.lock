@@ -113,9 +113,13 @@
       "sha256": "eb73644e24d46df87e828728e1b0572ac35f7dc1fdbf4d40dce8181f52dbf867",
       "justification": "Add V9b text-channel settings columns and companion table for TOG-12802 (0226 follows 0225 voice inherit)."
     },
-    "crates/cutover/migrations/0227_voice_config.sql": {
+    "crates/cutover/migrations/0227_voice_access_controls.sql": {
+      "sha256": "71d8dd5e3b804e389b0c58235df92c46de50dccd6c143e569db825eb7b916756",
+      "justification": "Add V10b guild room-command controls table for TOG-10111 (0227 follows 0226 voice text channels)."
+    },
+    "crates/cutover/migrations/0228_voice_config.sql": {
       "sha256": "709b1649e07179ae87c38ae2b37ff6d99f8c83fe9d0960719ff6d1de16f7c9d2",
-      "justification": "TOG-12875: V11b configuration persistence for channel templates, game aliases, random lists, logging and guild settings; adds status_template and group_by_category to voice_creators."
+      "justification": "TOG-12875: V11b configuration persistence for channel templates, game aliases, random lists, logging and guild settings; adds status_template and group_by_category to voice_creators (renumbered 0227 to 0228: main took 0227 for voice access controls)."
     },
     "crates/cutover/migrations/0300_website_contract.sql": {
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
@@ -188,6 +192,14 @@
     "crates/cutover/migrations/0361_discord_send_admission.sql": {
       "sha256": "5f5986ae81173571aaea237bff45f09d6e23256f5023ed7a3570697796da791d",
       "justification": "TOG-11045: add durable token-wide Discord send admission; no existing migration SQL changed."
+    },
+    "crates/cutover/migrations/0362_gateway_onboarding_jobs.sql": {
+      "sha256": "c6490615662e718d2bfe4535dc1851f9d0c9aeb2ccb9f7a3db1d5a68a533a668",
+      "justification": "Add durable onboarding delivery jobs and token-free callback receipts alongside gateway checkpoints for TOG-10278."
+    },
+    "crates/cutover/migrations/0370_containment_claims.sql": {
+      "sha256": "e4af118aa85ad503a90528157f3ece4c7043df4b0180eaf245a64de3fd0e3edf",
+      "justification": "Add legacy-shaped containment event and incident claim tables for the durable claim store (TOG-12239); no audit listener or containment arming."
     },
     "crates/cutover/migrations/0390_legacy_copy_presence.sql": {
       "justification": "Baseline legacy-copy migration merged in PR #113 before this guard; no SQL changes.",

@@ -69,7 +69,8 @@ mod tests {
             include_str!("../../cutover/migrations/0224_voice_rooms.sql"),
             include_str!("../../cutover/migrations/0225_voice_inherit_limit.sql"),
             include_str!("../../cutover/migrations/0226_voice_text_channels.sql"),
-            include_str!("../../cutover/migrations/0227_voice_config.sql"),
+            include_str!("../../cutover/migrations/0227_voice_access_controls.sql"),
+            include_str!("../../cutover/migrations/0228_voice_config.sql"),
             include_str!("../../cutover/migrations/0300_website_contract.sql"),
             include_str!("../../cutover/migrations/0310_presence_probe.sql"),
             include_str!("../../cutover/migrations/0311_community_scorecard.sql"),
@@ -85,6 +86,7 @@ mod tests {
             include_str!("../../cutover/migrations/0350_internal_actions.sql"),
             include_str!("../../cutover/migrations/0353_internal_clock_high_water.sql"),
             include_str!("../../cutover/migrations/0361_discord_send_admission.sql"),
+            include_str!("../../cutover/migrations/0362_gateway_onboarding_jobs.sql"),
         ] {
             let mut table = None;
             for line in migration.lines() {
@@ -108,9 +110,14 @@ mod tests {
                     assert!(MATRIX.contains(&format!("'public', '{name}', 'function'")));
                 } else {
                     let mut words = line.split_whitespace();
-                    if let (Some(column), Some("BIGSERIAL" | "SERIAL" | "SMALLSERIAL")) =
-                        (words.next(), words.next())
-                    {
+                    if let (Some(column), Some(_)) = (
+                        words.next(),
+                        words.next().filter(|kind| {
+                            ["BIGSERIAL", "SERIAL", "SMALLSERIAL"]
+                                .iter()
+                                .any(|serial| kind.eq_ignore_ascii_case(serial))
+                        }),
+                    ) {
                         let table = table.expect("serial column outside table");
                         assert!(MATRIX
                             .contains(&format!("'public', '{table}_{column}_seq', 'sequence'")));

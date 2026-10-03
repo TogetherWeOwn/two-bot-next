@@ -418,10 +418,12 @@ impl HyperTransport {
         let url = self.url(request.path());
         let mut builder = hyper::Request::builder().method(method).uri(url);
         if let Some(headers) = builder.headers_mut() {
-            let mut authorization = hyper::header::HeaderValue::from_str(self.token.expose())
-                .map_err(|_| "bad token header".to_owned())?;
-            authorization.set_sensitive(true);
-            headers.insert(hyper::header::AUTHORIZATION, authorization);
+            if request.use_authorization_token() {
+                let mut authorization = hyper::header::HeaderValue::from_str(self.token.expose())
+                    .map_err(|_| "bad token header".to_owned())?;
+                authorization.set_sensitive(true);
+                headers.insert(hyper::header::AUTHORIZATION, authorization);
+            }
             if let Some(bytes) = request.body() {
                 headers.insert(
                     hyper::header::CONTENT_LENGTH,
@@ -1453,6 +1455,13 @@ impl ActionExecutor {
         Ok(self.get_json_observed(path).await?.map(|(data, _)| data))
     }
 
+    /// Permission evidence must distinguish denied/absent (403/404) from an
+    /// unavailable or unreadable response. Keep the shared paced read policy,
+    /// but never let a transient failure look like a proven delivery skip.
+    pub async fn get_json_checked(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
+        self.read_json(path, true).await
+    }
+
     /// Membership evidence is bounded by the successful attempt's request
     /// start, after pacing, never by headers/body completion or an earlier
     /// failed attempt. Ordinary `get_json` keeps its data-only contract.
@@ -1500,6 +1509,69 @@ impl ActionExecutor {
                     attempt += 1;
                 }
                 _ => return Ok(None),
+            }
+        }
+    }
+
+    async fn read_json(
+        &self,
+        path: &str,
+        checked: bool,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let route = raw_get_route(path)?;
+        let mut attempt: u32 = 0;
+        loop {
+            let request = Request::from_route(&route);
+            // Guard refusals are terminal; pacing completes before the send.
+            self.admit(&request, Some(false))
+                .await
+                .map_err(|error| error.to_string())?;
+            let (res, global) = match self.send_admitted(&request).await {
+                Ok(r) => r,
+                Err(detail) => {
+                    if attempt >= MAX_HTTP_TRIES - 1 {
+                        return Err(detail.to_string());
+                    }
+                    tokio::time::sleep(Duration::from_millis(backoff_ms(attempt))).await;
+                    attempt += 1;
+                    continue;
+                }
+            };
+            match res.status {
+                200..=299 => {
+                    let value = serde_json::from_slice(&res.body);
+                    return if checked {
+                        value
+                            .map(Some)
+                            .map_err(|_| "unreadable Discord evidence".to_owned())
+                    } else {
+                        Ok(value.ok())
+                    };
+                }
+                429 => {
+                    if !global {
+                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                    }
+                }
+                403 | 404 => return Ok(None),
+                500..=599 => {
+                    if attempt >= MAX_HTTP_TRIES - 1 {
+                        return if checked {
+                            Err("Discord evidence unavailable".to_owned())
+                        } else {
+                            Ok(None)
+                        };
+                    }
+                    tokio::time::sleep(Duration::from_millis(backoff_ms(attempt))).await;
+                    attempt += 1;
+                }
+                _ => {
+                    return if checked {
+                        Err("Discord evidence unavailable".to_owned())
+                    } else {
+                        Ok(None)
+                    }
+                }
             }
         }
     }
@@ -2033,6 +2105,120 @@ impl ActionExecutor {
         Ok(message_id)
     }
 
+    // Twilight omits empty roles/users lists when serializing AllowedMentions.
+    // Onboarding's wire contract requires all three lists explicitly present.
+    // Keep the validated builder's method/path/auth (notably webhook auth=false).
+    fn explicit_mentions(
+        req: Request,
+        mentions: &AllowedMentions,
+    ) -> Result<Request, DiscordError> {
+        let mut body: serde_json::Value = serde_json::from_slice(req.body().unwrap_or_default())
+            .map_err(|_| DiscordError::Rejected("invalid message body".into()))?;
+        body["allowed_mentions"] = serde_json::json!({
+            "parse": mentions.parse,
+            "users": mentions.users,
+            "roles": mentions.roles,
+            "replied_user": mentions.replied_user,
+        });
+        let bytes = serde_json::to_vec(&body)
+            .map_err(|_| DiscordError::Rejected("invalid mention policy".into()))?;
+        let mut builder =
+            twilight_http::request::RequestBuilder::raw(req.method(), req.path().to_owned())
+                .body(bytes)
+                .use_authorization_token(req.use_authorization_token());
+        if let Some(headers) = req.headers() {
+            builder = builder.headers(
+                headers
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
+        builder
+            .build()
+            .map_err(|_| DiscordError::Rejected("invalid message request".into()))
+    }
+
+    /// Post a component-bearing message through the shared bounded transport.
+    /// Empty components are omitted (anchor welcomes must attach nothing).
+    /// No automatic retry: send-then-record callers must not hide ambiguity.
+    /// Only the domain-authorized welcome recipient may notify; arbitrary parse,
+    /// role, multi-user and reply policies cannot enter this boundary.
+    /// Source: https://docs.rs/twilight-http/0.17.1/twilight_http/request/channel/message/struct.CreateMessage.html
+    pub async fn post_channel_message(
+        &self,
+        channel_id: &str,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+        policy: two_bot_core::onboarding::MentionPolicy,
+    ) -> Result<String, DiscordError> {
+        if utf16_len(content) > MAX_MESSAGE_CHARS {
+            return Err(DiscordError::Rejected(
+                "message exceeds UTF-16 ceiling".into(),
+            ));
+        }
+        if matches!(policy, two_bot_core::onboarding::MentionPolicy::Member(0)) {
+            return Err(DiscordError::Rejected("bad welcome recipient".into()));
+        }
+        let content = two_bot_core::message_safety::content(content);
+        crate::message_safety::validate_create(&serde_json::json!({
+            "content": content,
+            "components": components,
+        }))?;
+        let mentions = crate::onboarding_messages::allowed_mentions(policy);
+        let mut builder = self
+            .inner
+            .factory
+            .create_message(snowflake(channel_id)?)
+            .allowed_mentions(Some(&mentions));
+        if !content.is_empty() {
+            builder = builder.content(&content);
+        }
+        if !components.is_empty() {
+            builder = builder.components(components);
+        }
+        let req = Self::explicit_mentions(Self::request_of(builder)?, &mentions)?;
+        // An accepted mutation still needs its validated id receipt before the
+        // durable lane reopens; an unreadable receipt is uncertain, never an
+        // empty successful id that a caller would record as delivered.
+        let mut res = self.call_once_raw(req, &[200, 201]).await?;
+        let id = mutation_receipt_id(&res.body)?;
+        res.complete().await;
+        Ok(id)
+    }
+
+    /// Add or remove one member role, preserving all unrelated roles. The
+    /// shared lane owns pacing; mutations are bounded and never auto-retried.
+    pub async fn set_member_role(
+        &self,
+        guild_id: &str,
+        member_id: &str,
+        role_id: &str,
+        present: bool,
+        reason: &str,
+    ) -> Result<(), DiscordError> {
+        let guild = snowflake(guild_id)?;
+        let member = snowflake(member_id)?;
+        let role = snowflake(role_id)?;
+        let req = if present {
+            Self::request_of(
+                self.inner
+                    .factory
+                    .add_guild_member_role(guild, member, role)
+                    .reason(reason),
+            )?
+        } else {
+            Self::request_of(
+                self.inner
+                    .factory
+                    .remove_guild_member_role(guild, member, role)
+                    .reason(reason),
+            )?
+        };
+        let mut res = self.call_once_raw_paced(req, &[200, 204]).await?;
+        res.complete().await;
+        Ok(())
+    }
+
     /// Carry out one [`ChannelCall`].
     pub async fn execute_channel(
         &self,
@@ -2396,6 +2582,7 @@ impl ActionExecutor {
 
     /// Complete an acknowledged interaction by editing its original response.
     /// Like the initial callback, this bypasses the paced moderation lane.
+    /// The original callback decides ephemerality; edits retain it.
     pub async fn edit_interaction_response(
         &self,
         application_id: u64,
@@ -2416,6 +2603,7 @@ impl ActionExecutor {
                 .content(Some(&content))
                 .allowed_mentions(Some(&mentions)),
         )?;
+        let req = Self::explicit_mentions(req, &mentions)?;
         let mut res = self.call_once_raw(req, &[200]).await?;
         mutation_receipt_id(&res.body)?;
         res.complete().await;

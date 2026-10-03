@@ -86,6 +86,12 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
     TableSpec { table: "feed_relays", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "gateway_boot_directives", measure: TableMeasure::Columns(&["armed_at", "consumed_at"]) },
+    TableSpec {
+        table: "gateway_onboarding_jobs",
+        measure: TableMeasure::Unmeasurable(
+            "transient restart-recovery queue with no timestamp column (occurred_at_ms is a gateway event time); rows hold no durable member state",
+        ),
+    },
     TableSpec { table: "gateway_sessions", measure: TableMeasure::Columns(&["updated_at"]) },
     // Collector read-times ride the same row write, so their maximum is the
     // row's last write.
@@ -200,7 +206,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // Same insert-once shape as voice_rooms (PgRoomStore::add_companion never
     // overwrites the creation snapshot).
     TableSpec { table: "voice_text_companions", measure: TableMeasure::Columns(&["created_at"]) },
-    // V11b configuration tables (0227): replaced wholesale by
+    // V11b configuration tables (0228): replaced wholesale by
     // PgVoiceConfigStore::apply, so none carries a write timestamp.
     TableSpec {
         table: "voice_channel_templates",
@@ -241,6 +247,12 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec {
         table: "voice_command_role_members",
         measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+    },
+    TableSpec {
+        table: "voice_access_controls",
+        measure: TableMeasure::Unmeasurable(
+            "mutable per-guild settings row with no timestamp column; no member IDs",
+        ),
     },
     TableSpec {
         table: "web_contract_meta",

@@ -22,6 +22,7 @@ pub mod gateway_session;
 pub mod internal_settings;
 pub mod invite;
 pub mod invite_store;
+pub mod leave_gap;
 pub mod legacy_copy;
 pub mod legacy_mapping;
 pub mod legacy_verify;
@@ -40,6 +41,7 @@ pub mod settings;
 pub mod staging_migrate;
 pub mod tickets;
 pub mod voice_config_store;
+pub mod voice_reconcile;
 pub mod voice_rooms;
 
 pub use backfill_plan::{plan_backfill_merge, BackfillMerge, ListedMember, PlannedEvent};
