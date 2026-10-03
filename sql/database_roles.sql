@@ -124,8 +124,13 @@ BEGIN
                     EXECUTE format('GRANT SELECT, INSERT, UPDATE ON TABLE %s TO two_bot_runtime', target);
                 ELSIF obj.kind = 'view' THEN
                     EXECUTE format('GRANT SELECT ON TABLE %s TO two_web_reader', target);
+                ELSIF obj.kind = 'migrator' THEN
+                    -- Migrator-only: owner/migrator ALL, no runtime/reader grant.
+                    -- Covers operator audit and redirect-store tables that the
+                    -- gateway and website must never read or write directly.
+                    NULL;
                 END IF;
-                -- SERIAL/IDENTITY sequences follow only allowlisted bot tables.
+                -- SERIAL/IDENTITY sequences follow only allowlisted runtime tables.
                 FOR seq IN (
                     SELECT c.oid::regclass AS name FROM pg_class c
                     JOIN pg_depend d ON d.objid = c.oid AND d.classid = 'pg_class'::regclass
