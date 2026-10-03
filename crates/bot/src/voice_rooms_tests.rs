@@ -714,8 +714,10 @@ async fn successive_creates_reserve_category_slots_before_gateway_echoes() {
 }
 
 #[tokio::test]
-async fn lacking_manage_roles_uses_category_overwrites_not_creator_overwrites() {
-    use twilight_model::channel::permission_overwrite::PermissionOverwriteType;
+async fn lacking_manage_roles_creates_without_overrides_so_the_room_syncs_to_its_category() {
+    use twilight_model::channel::permission_overwrite::{
+        PermissionOverwrite, PermissionOverwriteType,
+    };
     let (live, store, http, _) = fixture();
     let overwrite = PermissionOverwrite {
         id: Id::new(GUILD),
@@ -731,10 +733,25 @@ async fn lacking_manage_roles_uses_category_overwrites_not_creator_overwrites() 
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
-    assert_eq!(
-        worker.http.created_attributes.lock().unwrap()[0].overwrites,
-        [overwrite]
-    );
+    // The bot cannot set overrides without Manage Roles: none are sent, so
+    // Discord syncs the new room to the category it is created in.
+    let created = worker.http.created_attributes.lock().unwrap();
+    assert_eq!(created[0].parent_id, Some(CATEGORY));
+    assert!(created[0].overwrites.is_empty());
+}
+
+#[tokio::test]
+async fn created_rooms_carry_the_owner_override_and_a_placement_from_the_start() {
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    let created = worker.http.created_attributes.lock().unwrap();
+    assert!(created[0]
+        .overwrites
+        .iter()
+        .any(|overwrite| overwrite.id.get() == MEMBER));
+    assert!(created[0].position.is_some());
 }
 
 #[test]
