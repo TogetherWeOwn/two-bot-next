@@ -1666,6 +1666,11 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     }
     if gates.automations {
         router.register(Box::new(StickyHandler));
+        // Custom commands are an automations capability: a refused identity
+        // must not even resolve their handlers (4014 isolation depends on the
+        // narrowed intent too). Dispatch refuses and publish withholds when
+        // off, but registration alone would advertise the surface.
+        two_bot_discord::custom_commands::CustomCommandRuntime::register(&mut router);
     }
     if gates.announcements {
         for id in [
@@ -1681,7 +1686,6 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     for id in [HandlerId::Rank, HandlerId::Leaderboard] {
         router.register(Box::new(SliceHandler(id)));
     }
-    two_bot_discord::custom_commands::CustomCommandRuntime::register(&mut router);
     router
 }
 
