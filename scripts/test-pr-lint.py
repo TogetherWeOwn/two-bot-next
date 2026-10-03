@@ -14,6 +14,10 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
+# Fake internal tracker IDs for the warning tests. Built from parts so this
+# public file carries no literal ID of its own.
+TOG = "TO" + "G"
+PAP = "PA" + "P"
 
 
 def inline_script(name):
@@ -300,19 +304,19 @@ class PRLintTests(unittest.TestCase):
         self.validate({**self.resolve(), "body": "<!-- nothing here -->\n\n## Summary\n"}, success=False)
 
     def test_internal_id_in_title_warns_without_failing(self):
-        output = self.validate({**self.resolve(), "title": "fix(auth): refuse expired sudo sessions (TOG-123)"})
-        self.assertIn("::warning title=Internal ID::The PR title mentions TOG-123", output)
+        output = self.validate({**self.resolve(), "title": f"fix(auth): refuse expired sudo sessions ({TOG}-123)"})
+        self.assertIn(f"::warning title=Internal ID::The PR title mentions {TOG}-123", output)
 
     def test_internal_id_in_body_warns_without_failing(self):
-        body = "Long description of what changed and why.\n\nRefs: PAP-42 and TOG-7, TOG-7.\n"
+        body = f"Long description of what changed and why.\n\nRefs: {PAP}-42 and {TOG}-7, {TOG}-7.\n"
         output = self.validate({**self.resolve(), "body": body})
-        self.assertIn("::warning title=Internal ID::The PR body mentions PAP-42, TOG-7.", output)
+        self.assertIn(f"::warning title=Internal ID::The PR body mentions {PAP}-42, {TOG}-7.", output)
         self.assertNotIn("::error", output)
 
     def test_template_placeholder_text_is_not_an_internal_id(self):
         body = ("## Checklist\n\n- [x] No secret, token, private URL, or internal card ID "
-                "(TOG-, PAP-) is in the diff, the title, the body, the commits, or the branch name\n"
-                "Prefix lookalikes such as ATOG-12 or TOG-12abc stay quiet.\n")
+                f"({TOG}-, {PAP}-) is in the diff, the title, the body, the commits, or the branch name\n"
+                f"Prefix lookalikes such as A{TOG}-12 or {TOG}-12abc stay quiet.\n")
         self.assertNotIn("Internal ID", self.validate({**self.resolve(), "body": body}))
 
     def pr_commit_output(self, lines, error=None):
@@ -327,8 +331,8 @@ class PRLintTests(unittest.TestCase):
         return output
 
     def test_internal_id_in_pr_commit_subject_warns_without_failing(self):
-        output = self.pr_commit_output(["0123456789 fix(auth): refuse expired sudo sessions", "abcdef0123 fix(auth): follow-up (TOG-9)"])
-        self.assertIn("::warning title=Internal ID::Commit abcdef0123 subject mentions TOG-9", output)
+        output = self.pr_commit_output(["0123456789 fix(auth): refuse expired sudo sessions", f"abcdef0123 fix(auth): follow-up ({TOG}-9)"])
+        self.assertIn(f"::warning title=Internal ID::Commit abcdef0123 subject mentions {TOG}-9", output)
         self.assertNotIn("0123456789 subject", output)
 
     def test_commit_lookup_failure_never_fails_the_check(self):
@@ -341,9 +345,9 @@ class PRLintTests(unittest.TestCase):
         self.validate({"event": "push", "commits": json.dumps([{"message": "Invalid commit"}])}, success=False)
 
     def test_main_commit_internal_id_warns_without_failing(self):
-        commits = json.dumps([{"id": "0123456789abcdef", "message": "fix(release): repair validation (TOG-5)\n\nbody"}])
+        commits = json.dumps([{"id": "0123456789abcdef", "message": f"fix(release): repair validation ({TOG}-5)\n\nbody"}])
         output = self.validate({"event": "push", "commits": commits})
-        self.assertIn("::warning title=Internal ID::Commit 0123456789 subject mentions TOG-5", output)
+        self.assertIn(f"::warning title=Internal ID::Commit 0123456789 subject mentions {TOG}-5", output)
 
 
 if __name__ == "__main__":
