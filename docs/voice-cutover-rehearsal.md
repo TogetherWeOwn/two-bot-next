@@ -100,14 +100,20 @@ UTC timestamp; timings below are the targets to beat.
 3. Move/rename probes: owner `/limit`, `/name`, `/private`, `/public`
    round-trip with ephemeral replies; companion Join channel follows the
    owner and dies with the room.
-4. Ghost-channel check: compare tracked rooms against the channels that
-   actually exist. Tracked-but-gone rooms are forgotten; channels the bot
-   never tracked are never touched. The runtime `reconcile` pass does this
-   at startup and after reconnects; the read-only
-   `report voice-reconcile --guild <id>` CLI covers funnel event halves
-   (session start/end), not room tracking, so the ghost check itself is a
-   tracked-vs-live comparison, currently via `/setup` health plus worker
-   logs. A dedicated count query is an open gap (see §6).
+4. Ghost-channel check: poll the read-only
+   `report voice-ghosts --guild <staging-guild-id>` count across the swap.
+   It diffs tracked `voice_rooms` rows against the guild's live voice
+   channels (one SELECT plus one channel-listing GET, no writes) and prints
+   `tracked_present`, `tracked_gone` (the runtime `reconcile` forget class)
+   and `untracked_present` plus a `clean` flag: poll until `tracked_gone`
+   and `untracked_present` are both empty. Tracked-but-gone rooms are
+   forgotten; channels the bot never tracked are never touched — the report
+   lists them for manual triage. Existence only: occupant and manageability
+   classes need a gateway-derived snapshot (pair the id lists with live
+   occupancy when building a cleanup snapshot), and the sibling
+   `report voice-reconcile` CLI covers funnel event halves (session
+   start/end), not room tracking. `--seed` prints a fixture demo with no
+   database and no Discord.
 5. Rename-rate-limit behavior: at most ~2 renames per 10 minutes per
    channel; the bot coalesces to one pending name and never delays
    create/delete behind a rename backlog.
@@ -146,10 +152,11 @@ staging returning to healthy; it is not listed here as a code gap.
 1. Shared/category numbering (`/group`) is stored but not honored: the
    room planner hardcodes ungrouped placement, so an import carrying
    `group_by_category` changes nothing at runtime.
-2. No dedicated ghost-channel count for cutover verification: room
-   tracking diffs live only in the runtime reconcile pass, surfaced via
-   `/setup` health and logs; there is no read-only count an operator can
-   poll across the swap.
+2. ~~No dedicated ghost-channel count for cutover verification~~ Shipped:
+   `report voice-ghosts --guild <id>` is the pollable read-only count
+   (tracked-present, tracked-gone, untracked-present plus a `clean` flag),
+   covered by unit and CLI integration tests. Still open: live staging
+   polling of the count across a rehearsal swap (§4 live run).
 3. ~~The per-creator settings commands are not wired, so mid-cutover
    tuning requires a full-document export/edit/import cycle~~ Wired: the
    per-creator settings commands (`/position`, `/group`,

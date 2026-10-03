@@ -292,13 +292,19 @@ fn error_content(ops: &[ReplyOperation]) -> &str {
 }
 
 fn reference(content: &str) -> &str {
-    let id = content
+    let after_prefix = content
         .strip_prefix("Something went wrong (ref ")
-        .unwrap()
-        .strip_suffix(')')
-        .unwrap();
+        .expect("generic failure prefix");
+    // Format: `(ref XXXXXXXX). Please try again …` — the id ends at `)`.
+    let end = after_prefix.find(')').expect("reference closing paren");
+    let id = &after_prefix[..end];
     assert_eq!(id.len(), 8);
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    // Retry hint is part of the contract: the user gets a next step.
+    assert!(
+        after_prefix[end..].contains("Please try again"),
+        "generic failure names the retry: {content}"
+    );
     id
 }
 
