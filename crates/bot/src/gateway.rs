@@ -594,6 +594,10 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let writer_live = Arc::clone(&live_interactions);
     let writer_signal = Arc::clone(&queue_signal);
     let writer_onboarding = onboarding.clone();
+    // Set once reception and the blocking writer have drained: no further
+    // checkpoint commit can arrive, so the queue worker may exit once idle.
+    let writer_drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drain_signal = Arc::clone(&queue_signal);
     let queue_worker = onboarding.clone().map(|runtime| {
         onboarding_queue(
             runtime,
@@ -602,6 +606,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             Arc::clone(&generation),
             Arc::clone(&live_interactions),
             Arc::clone(&queue_signal),
+            Arc::clone(&writer_drained),
         )
     });
     let dispatch = crate::dispatch::dispatch_bounded(
@@ -832,17 +837,46 @@ pub async fn run_shard<I: InviteSource + 'static>(
         crate::dispatch::DISPATCH_DRAIN_MAX,
     );
     let result: Result<(), sqlx::Error> = match queue_worker {
-        // The durable queue worker only returns on a fatal error; fail the
-        // runner (Draining) and drop reception/writer with it.
-        Some(queue_worker) => tokio::select! {
-            result = dispatch => {
-                result.map_err(|reason| sqlx::Error::InvalidArgument(reason.into()))
+        // The durable queue worker returns on a fatal error, or once the
+        // writer drain below observes it quiescent. Fail the runner
+        // (Draining) and drop reception/writer with it on a fatal return.
+        Some(queue_worker) => {
+            futures_util::pin_mut!(queue_worker);
+            tokio::select! {
+                result = dispatch => {
+                    let result = result.map_err(|reason| sqlx::Error::InvalidArgument(reason.into()));
+                    if result.is_ok() && error.lock().expect("gateway error lock").is_none() {
+                        // Cooperative end with a healthy writer: the last
+                        // commit may have raced the drain return before the
+                        // queue worker claimed it, stranding the job until
+                        // the next boot. Drive the queue to quiescence,
+                        // bounded, while still polling it for fatal errors.
+                        // Anything still pending then keeps the bounded
+                        // restart-recovery path, as a dropped worker would.
+                        writer_drained.store(true, Ordering::Release);
+                        drain_signal.notify_one();
+                        match tokio::time::timeout(
+                            crate::dispatch::DISPATCH_DRAIN_MAX,
+                            &mut queue_worker,
+                        )
+                        .await
+                        {
+                            Ok(Err(worker_error)) => {
+                                *state.write().await = GatewayState::Draining;
+                                Err(worker_error)
+                            }
+                            _ => result,
+                        }
+                    } else {
+                        result
+                    }
+                }
+                result = &mut queue_worker => {
+                    *state.write().await = GatewayState::Draining;
+                    result
+                }
             }
-            result = queue_worker => {
-                *state.write().await = GatewayState::Draining;
-                result
-            }
-        },
+        }
         None => dispatch
             .await
             .map_err(|reason| sqlx::Error::InvalidArgument(reason.into())),
@@ -879,7 +913,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
 
 /// Durable onboarding job worker: claims committed jobs, runs them through the
 /// shared executor with bounded concurrency and records completion. Returns
-/// only on a fatal error (the runner then fails closed).
+/// on a fatal error (the runner then fails closed), or once the writer drain
+/// flag is set and the durable queue is empty with no effect in flight
+/// (cooperative shutdown drain).
 async fn onboarding_queue(
     runtime: Arc<crate::onboarding::OnboardingRuntime>,
     store: GatewaySessionStore,
@@ -887,6 +923,7 @@ async fn onboarding_queue(
     generation: Arc<AtomicU64>,
     live_interactions: LiveInteractions,
     signal: Arc<tokio::sync::Notify>,
+    writer_drained: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), sqlx::Error> {
     let deadline = CHECKPOINT_IO_MAX;
     let mut feature_jobs = tokio::task::JoinSet::new();
@@ -901,6 +938,13 @@ async fn onboarding_queue(
     )
     .await?;
     loop {
+        // Once the writer has drained, no new job can be committed: force a
+        // final claim probe (a commit may have raced the drain return) and
+        // exit once no claimed effect is in flight either.
+        let draining = writer_drained.load(Ordering::Acquire);
+        if draining {
+            queue_dirty = true;
+        }
         // Claim only available worker slots; reception keeps polling Twilight.
         if queue_dirty && feature_jobs.len() < ONBOARDING_WORKER_LIMIT {
             if let Some(saved) =
@@ -963,6 +1007,9 @@ async fn onboarding_queue(
                 }
             } else {
                 queue_dirty = false;
+                if draining && feature_jobs.is_empty() {
+                    return Ok(());
+                }
             }
         }
         tokio::select! {
