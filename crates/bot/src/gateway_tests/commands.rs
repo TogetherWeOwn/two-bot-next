@@ -301,7 +301,7 @@ async fn ready_routes_custom_slash_and_accepted_prefix_before_checkpoint() {
         // rejects id-less mutation receipts as uncertain delivery.
         ScriptedResponse::json(200, json!({"id": "9001"})), // slash completion
         ScriptedResponse::json(200, json!({"id": "9000"})), // prefix
-        ScriptedResponse::status(403),          // terminal runtime error
+        ScriptedResponse::status(403),                      // terminal runtime error
     ]);
     let rest = MockRest::start(script, ScriptedResponse::status(500)).await;
     let commands = bootstrap(&db, &rest, &vars(Some("0"))).await;
