@@ -113,6 +113,10 @@
       "sha256": "eb73644e24d46df87e828728e1b0572ac35f7dc1fdbf4d40dce8181f52dbf867",
       "justification": "Add V9b text-channel settings columns and companion table for TOG-12802 (0226 follows 0225 voice inherit)."
     },
+    "crates/cutover/migrations/0227_voice_config.sql": {
+      "sha256": "709b1649e07179ae87c38ae2b37ff6d99f8c83fe9d0960719ff6d1de16f7c9d2",
+      "justification": "TOG-12875: V11b configuration persistence for channel templates, game aliases, random lists, logging and guild settings; adds status_template and group_by_category to voice_creators."
+    },
     "crates/cutover/migrations/0300_website_contract.sql": {
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
       "sha256": "7d67d32e021ca9e9162474e1acfd9411ef68f4d3ec4e1289901dd4825b8eea43"
