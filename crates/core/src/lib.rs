@@ -52,6 +52,7 @@ pub mod health;
 pub mod inactivity;
 #[cfg(feature = "db")]
 pub mod inactivity_store;
+pub mod internal_action_config;
 #[cfg(feature = "db")]
 pub mod internal_action_store;
 pub mod internal_actions;
@@ -96,6 +97,7 @@ pub mod tickets;
 pub mod voice;
 pub mod voice_access;
 pub mod voice_alias;
+pub mod voice_alias_core;
 pub mod voice_assistant_cap;
 pub mod voice_assistant_request;
 pub mod voice_assistant_validate;

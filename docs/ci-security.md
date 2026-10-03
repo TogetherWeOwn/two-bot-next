@@ -13,35 +13,46 @@ an ephemeral Git credential helper for that one command, not a persisted token.
 Untrusted PR metadata remains in environment variables, never interpolated into
 shell source. The deploy job does not restore caches from PR checks.
 
-## Staging suspension and activation prerequisite
+## Staging deployment (active)
 
-AUTOMATED staging deployment is suspended by the unconditional job-level
-`jobs.deploy.if: ${{ false }}` in `deploy-staging.yml`, for both push/main and
-workflow_dispatch. This blocks the whole runner/checkout/install/deploy/probe
-path; no input, variable, actor or secret can enable it. A skipped green job is
-**not** deployment, readiness, protected-environment or E2E success. Existing
-running staging resources are unchanged; no alternate manual route is authorized.
+AUTOMATED staging deployment is ACTIVE (TOG-12856, unblocking the TOG-12852
+rehearsal): the `deploy` job in `deploy-staging.yml` runs unconditionally on
+every push to `main` and on manual `workflow_dispatch`, in the GitHub
+`staging` environment, with the single fenced `release_fence` dispatch input
+(opt-in boolean, defaults to false). There is no job-level `if:` — a condition
+there (including the old `if: ${{ false }}` suspension, removed here) would
+silently skip deploys on some SHAs and leave the production guard refusing
+those SHAs with no deploy ever running. A skipped job is **not** deployment,
+readiness, protected-environment or E2E success; only a `success` conclusion
+with the intended-rollout evidence counts. Existing running staging resources
+are unchanged; no alternate manual deploy route is authorized.
 
-CISO accepted this disabled CI-only scope in TOG-10958 and TOG-11179 plan revision
-2. The frozen 31-occurrence baseline and independent exact-head green-CI review
-and non-author squash-merge gates remain. Actual staging provisioning and later
-activation are separate on TOG-11271; this change does not satisfy that receipt.
+CISO accepted the prior disabled CI-only scope in TOG-10958 and TOG-11179 plan
+revision 2. This re-activation ships as a reviewed workflow PR with exact-head
+green `check`, `pr-lint`, `gitleaks` and an independent Code Reviewer pass
+(the reviewer decides whether CISO review is also needed). The frozen
+31-occurrence baseline and independent exact-head green-CI review and
+non-author squash-merge gates remain. The staging control secret is already
+provisioned (TOG-12030); no credential creation or rotation is included here.
 
 The offline workflow regression uses pinned PyYAML 6.0.3, rejects duplicate
-keys, inventories every workflow/job, requires all staging jobs to have the exact
-static-false guard, and rejects new jobs/workflows or known CI jobs repurposed as
-deploy/probe alternatives. Negative fixtures cover guard deletion/mutation,
-step-only guards, mutable activation flags and alternate deployment jobs. It
-also preserves private self-hosted routing, job-container service isolation,
-per-job grants and nonpersistent checkouts.
+keys, inventories every workflow/job, requires the staging `deploy` job to
+carry no job condition while keeping the `staging` environment scope, the
+routed runner expression for job `deploy`, and the fenced `release_fence`
+dispatch shape, rejects statically-disabled steps that would report success
+without deploying, and rejects new jobs/workflows or known CI jobs repurposed
+as unapproved deploy/probe alternatives. Negative fixtures cover job-condition
+insertion/mutation, step-level disables, dispatch-shape widening and alternate
+deployment jobs. It also preserves visibility-aware runner routing,
+job-container service isolation, per-job grants and nonpersistent checkouts.
 
-The suspended job retains GitHub environment `staging`. **A YAML environment
+The active job retains GitHub environment `staging`. **A YAML environment
 name alone does not create protection rules or scope repository-level secrets.**
-Before separately approved activation, an authorized provisioning principal must
-verify and retain evidence for:
+The environment scoping stays in place, and secret placement must remain
+environment-scoped with no unintended fallback:
 
-- An existing protected `staging` environment with approved deployment approval
-  and branch restrictions (only approved staging code, normally `main`).
+- The `staging` environment keeps its approved deployment approval and branch
+  restrictions (only approved staging code, normally `main`).
 - `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are environment-scoped, with no
   unintended repository/organization fallback exposing them to other jobs.
 - The existing deployment/approval principal can still deploy and the
@@ -59,10 +70,10 @@ Environment. Negative fixtures cover extra triggers, removed `needs` or
 environment, a bypass condition, deploy steps in the guard, and dropping those
 checks.
 
-While staging is statically disabled, every deploy-staging run on a new SHA
-concludes `skipped`, so the guard refuses production for that SHA. This fails
-closed. Production for a newer SHA therefore waits on approved staging
-activation (TOG-11271); this change does not authorize a bypass.
+With staging active (TOG-12856), every `main` push runs deploy-staging on its
+SHA; the guard accepts only a run that concluded `success` on that SHA, so a
+`skipped` or failed run still refuses production for that SHA. This fails
+closed. This change does not authorize a production bypass.
 
 `supply-chain.yml` holds the required `pr-lint` and `gitleaks` jobs (main #187).
 The `pipeline-benchmark` reusable call in `nightly.yml` is the only permitted
@@ -133,9 +144,10 @@ no write grant. Transitive dependencies remain unlocked. A future fixture
 lockfile can remove this exception; it is not an exception for deployment
 package installation.
 
-The static-false staging condition has a narrow `obfuscation` suppression:
-its explicit expression is the reviewed suspension invariant, not untrusted
-input or a mutable activation flag. The offline regression requires it exactly.
+The former `if: ${{ false }}` staging suspension (and its narrow
+`obfuscation` suppression) is removed by this re-activation; the workflow
+carries no such suppression. The offline regression now requires the deploy
+job to carry no job condition at all.
 
 Pedantic zizmor may report informational `superfluous-actions` advisories for
 existing pinned Rust toolchain Actions. They are intentionally retained; all
