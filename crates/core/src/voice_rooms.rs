@@ -1130,6 +1130,68 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::Role,
             ),
         ]),
+        CommandDefinition::new(
+            "access",
+            "Set who can create voice rooms and use room commands",
+        )
+        .permissions(PERM_MANAGE_CHANNELS)
+        .options(vec![
+            CommandOption::new(
+                "show",
+                "Show the current voice-room access settings",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "creation",
+                "Turn temporary room creation on or off",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "enabled",
+                "On allows new rooms, off stops them (existing rooms keep working)",
+                CommandOptionType::Boolean,
+            )
+            .required()]),
+            CommandOption::new(
+                "role",
+                "Set or clear the role required to use room commands",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "role",
+                "Required role; leave empty to clear it",
+                CommandOptionType::Role,
+            )]),
+            CommandOption::new(
+                "restrict",
+                "Limit a room command to specific roles (no role = admins only)",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![
+                CommandOption::new(
+                    "command",
+                    "The command name without the slash, e.g. kick",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(32),
+                CommandOption::new("role", "Allowed role", CommandOptionType::Role),
+                CommandOption::new("role2", "Another allowed role", CommandOptionType::Role),
+                CommandOption::new("role3", "Another allowed role", CommandOptionType::Role),
+            ]),
+            CommandOption::new(
+                "unrestrict",
+                "Lift a room command's role restriction",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "command",
+                "The command name without the slash, e.g. kick",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(32)]),
+        ]),
     ]
 }
 
@@ -1763,7 +1825,14 @@ mod tests {
         let defs = voice_commands();
         assert_eq!(
             defs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-            ["create", "setup", "ping", "invite", "textchannels"]
+            [
+                "create",
+                "setup",
+                "ping",
+                "invite",
+                "textchannels",
+                "access"
+            ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
         assert_eq!(
@@ -1811,6 +1880,30 @@ mod tests {
             defs[4].options[2].max_length,
             Some(MAX_TEXT_CHANNEL_NAME_CHARS as u32)
         );
+        // `/access` is admin-gated and is all sub-commands, each with its
+        // required options listed before the optional ones.
+        let access = &defs[5];
+        assert_eq!(
+            access.default_member_permissions,
+            Some(PERM_MANAGE_CHANNELS.to_string())
+        );
+        assert_eq!(
+            access
+                .options
+                .iter()
+                .map(|o| o.name.as_str())
+                .collect::<Vec<_>>(),
+            ["show", "creation", "role", "restrict", "unrestrict"]
+        );
+        for sub in &access.options {
+            assert_eq!(sub.kind, CommandOptionType::SubCommand.as_u8());
+            let required_first = sub
+                .options
+                .iter()
+                .skip_while(|o| o.required == Some(true))
+                .all(|o| o.required != Some(true));
+            assert!(required_first, "{} lists a required option late", sub.name);
+        }
         // Merges cleanly alongside the other slices, first-wins.
         let merged = merge_commands(
             &[feature_commands(), moderation_commands(), voice_commands()],
@@ -1822,6 +1915,7 @@ mod tests {
         assert!(merged.iter().any(|d| d.name == "ping"));
         assert!(merged.iter().any(|d| d.name == "invite"));
         assert!(merged.iter().any(|d| d.name == "textchannels"));
+        assert!(merged.iter().any(|d| d.name == "access"));
 
         assert!(!VoiceGates::from_map(&Default::default()).enabled);
         let vars: HashMap<String, String> = [("TWO_VOICE".to_owned(), "1".to_owned())]

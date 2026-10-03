@@ -82,8 +82,9 @@ struct Store {
     rooms: Mutex<HashMap<u64, VoiceRoom>>,
     companions: Mutex<HashMap<(u64, u64), TextCompanion>>,
     persist_error: Option<StoreError>,
-    access: Mutex<AccessControls>,
+    access: Arc<Mutex<AccessControls>>,
     access_error: Option<StoreError>,
+    save_access_error: Option<StoreError>,
     forget_errors: Mutex<VecDeque<StoreError>>,
     companion_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
@@ -98,8 +99,9 @@ impl Store {
             rooms: Mutex::new(HashMap::new()),
             companions: Mutex::new(HashMap::new()),
             persist_error: None,
-            access: Mutex::new(AccessControls::default()),
+            access: Arc::new(Mutex::new(AccessControls::default())),
             access_error: None,
+            save_access_error: None,
             forget_errors: Mutex::new(VecDeque::new()),
             companion_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
@@ -117,6 +119,17 @@ impl RoomPersistence for Store {
             Some(error) => Err(error),
             None => Ok(self.access.lock().unwrap().clone()),
         }
+    }
+    async fn save_access_controls(
+        &self,
+        _: u64,
+        controls: &AccessControls,
+    ) -> Result<(), StoreError> {
+        if let Some(error) = self.save_access_error {
+            return Err(error);
+        }
+        *self.access.lock().unwrap() = controls.clone();
+        Ok(())
     }
     async fn rooms(&self, _: u64) -> Result<Vec<VoiceRoom>, StoreError> {
         Ok(self.rooms.lock().unwrap().values().cloned().collect())
@@ -1022,7 +1035,17 @@ fn voice_command_set_is_gated_on_two_voice() {
         .iter()
         .map(|definition| definition.name.clone())
         .collect();
-    assert_eq!(names, ["create", "setup", "ping", "invite", "textchannels"]);
+    assert_eq!(
+        names,
+        [
+            "create",
+            "setup",
+            "ping",
+            "invite",
+            "textchannels",
+            "access"
+        ]
+    );
     let off = VoiceGates::from_map(&Default::default());
     assert!(voice_command_set(&off).is_empty());
 }
@@ -1427,6 +1450,343 @@ async fn unreadable_settings_fail_closed_for_members_only() {
     );
     let (_, response) = handle_capture(&runtime, &admin).await;
     assert!(response_text(&response.expect("ping")).starts_with("Pong! "));
+}
+
+fn sub_option(name: &str, args: Vec<CommandDataOption>) -> CommandDataOption {
+    CommandDataOption {
+        name: name.to_owned(),
+        value: CommandOptionValue::SubCommand(args),
+    }
+}
+
+fn role_option(name: &str, id: u64) -> CommandDataOption {
+    CommandDataOption {
+        name: name.to_owned(),
+        value: CommandOptionValue::Role(Id::new(id)),
+    }
+}
+
+fn access_interaction(sub: CommandDataOption, admin: bool) -> Interaction {
+    voice_interaction(
+        Some(command_data("access", vec![sub])),
+        admin.then_some(Permissions::MANAGE_CHANNELS),
+        true,
+    )
+}
+
+fn access_action(sub: CommandDataOption) -> AccessAction {
+    match parse_voice_command(&access_interaction(sub, true)) {
+        Some(VoiceCommand::Access(action)) => action,
+        other => panic!("not an /access command: {other:?}"),
+    }
+}
+
+#[test]
+fn parse_access_subcommands() {
+    assert_eq!(
+        access_action(sub_option("show", vec![])),
+        AccessAction::Show
+    );
+    assert_eq!(
+        access_action(sub_option(
+            "creation",
+            vec![CommandDataOption {
+                name: "enabled".to_owned(),
+                value: CommandOptionValue::Boolean(false),
+            }]
+        )),
+        AccessAction::Creation(false)
+    );
+    assert_eq!(
+        access_action(sub_option("role", vec![role_option("role", 9)])),
+        AccessAction::RequiredRole(Some(9))
+    );
+    // No role clears the requirement.
+    assert_eq!(
+        access_action(sub_option("role", vec![])),
+        AccessAction::RequiredRole(None)
+    );
+    // Command names are lowercased; roles keep order and drop duplicates.
+    assert_eq!(
+        access_action(sub_option(
+            "restrict",
+            vec![
+                command_option("command", " Kick "),
+                role_option("role", 7),
+                role_option("role2", 8),
+                role_option("role3", 7),
+            ]
+        )),
+        AccessAction::Restrict {
+            command: "kick".to_owned(),
+            roles: vec![7, 8]
+        }
+    );
+    assert_eq!(
+        access_action(sub_option(
+            "restrict",
+            vec![command_option("command", "kick")]
+        )),
+        AccessAction::Restrict {
+            command: "kick".to_owned(),
+            roles: vec![]
+        }
+    );
+    assert_eq!(
+        access_action(sub_option(
+            "unrestrict",
+            vec![command_option("command", "Kick")]
+        )),
+        AccessAction::Unrestrict("kick".to_owned())
+    );
+}
+
+#[test]
+fn parse_access_malformed_shapes_are_invalid() {
+    assert_eq!(
+        access_action(sub_option("bogus", vec![])),
+        AccessAction::Invalid
+    );
+    assert_eq!(
+        access_action(sub_option("creation", vec![])),
+        AccessAction::Invalid
+    );
+    assert_eq!(
+        access_action(sub_option("restrict", vec![])),
+        AccessAction::Invalid
+    );
+    assert_eq!(
+        access_action(sub_option("unrestrict", vec![])),
+        AccessAction::Invalid
+    );
+    let bare = voice_interaction(Some(command_data("access", Vec::new())), None, true);
+    assert_eq!(
+        parse_voice_command(&bare),
+        Some(VoiceCommand::Access(AccessAction::Invalid))
+    );
+}
+
+fn shared_runtime(
+    trace: Trace,
+    shared: Arc<Mutex<AccessControls>>,
+    save_error: Option<StoreError>,
+) -> VoiceRuntime<Store, Http> {
+    VoiceRuntime::new(
+        move || {
+            let mut store = Store::new(trace.clone());
+            store.access = shared.clone();
+            store.save_access_error = save_error;
+            (store, Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+}
+
+#[tokio::test]
+async fn access_command_needs_an_admin() {
+    let shared = Arc::new(Mutex::new(AccessControls::default()));
+    let runtime = shared_runtime(Trace::default(), shared.clone(), None);
+    let member = access_interaction(sub_option("show", vec![]), false);
+    let (owned, response) = handle_capture(&runtime, &member).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(&response.expect("denial")),
+        "You need Manage Channels to use /access."
+    );
+}
+
+#[tokio::test]
+async fn access_command_changes_are_saved_and_shown() {
+    let shared = Arc::new(Mutex::new(AccessControls::default()));
+    let runtime = shared_runtime(Trace::default(), shared.clone(), None);
+    let run = |sub| {
+        let interaction = access_interaction(sub, true);
+        let runtime = &runtime;
+        async move {
+            let (_, response) = handle_capture(runtime, &interaction).await;
+            response_text(&response.expect("reply"))
+        }
+    };
+
+    let text = run(sub_option("role", vec![role_option("role", 9)])).await;
+    assert!(text.starts_with("Saved."), "{text}");
+    assert!(text.contains("Required role: <@&9>"), "{text}");
+    assert_eq!(shared.lock().unwrap().required_role, Some(9));
+
+    let text = run(sub_option(
+        "restrict",
+        vec![command_option("command", "kick"), role_option("role", 7)],
+    ))
+    .await;
+    assert!(text.contains("- /kick: <@&7>"), "{text}");
+    // No roles at all fails closed: admins only.
+    let text = run(sub_option(
+        "restrict",
+        vec![command_option("command", "template")],
+    ))
+    .await;
+    assert!(text.contains("- /template: admins only"), "{text}");
+    assert_eq!(shared.lock().unwrap().command_roles.len(), 2);
+
+    let text = run(sub_option(
+        "unrestrict",
+        vec![command_option("command", "kick")],
+    ))
+    .await;
+    assert!(!text.contains("/kick"), "{text}");
+    let text = run(sub_option("show", vec![])).await;
+    assert!(text.contains("- /template: admins only"), "{text}");
+    assert!(!text.starts_with("Saved."), "{text}");
+
+    let text = run(sub_option("role", vec![])).await;
+    assert!(text.contains("Required role: none"), "{text}");
+    assert_eq!(shared.lock().unwrap().required_role, None);
+}
+
+#[tokio::test]
+async fn access_command_refuses_bad_input_without_changing_anything() {
+    let shared = Arc::new(Mutex::new(AccessControls::default()));
+    let runtime = shared_runtime(Trace::default(), shared.clone(), None);
+    for sub in [
+        sub_option("restrict", vec![command_option("command", "kik")]),
+        sub_option("unrestrict", vec![command_option("command", "kick")]),
+        sub_option("bogus", vec![]),
+    ] {
+        let (_, response) = handle_capture(&runtime, &access_interaction(sub, true)).await;
+        let text = response_text(&response.expect("reply"));
+        assert!(!text.starts_with("Saved."), "{text}");
+        assert_eq!(*shared.lock().unwrap(), AccessControls::default());
+    }
+}
+
+#[tokio::test]
+async fn access_command_reports_store_failures_and_changes_nothing() {
+    let shared = Arc::new(Mutex::new(AccessControls::default()));
+    let runtime = shared_runtime(
+        Trace::default(),
+        shared.clone(),
+        Some(StoreError::Unavailable),
+    );
+    let disable = || {
+        access_interaction(
+            sub_option(
+                "creation",
+                vec![CommandDataOption {
+                    name: "enabled".to_owned(),
+                    value: CommandOptionValue::Boolean(false),
+                }],
+            ),
+            true,
+        )
+    };
+    let (_, response) = handle_capture(&runtime, &disable()).await;
+    let text = response_text(&response.expect("reply"));
+    assert!(text.contains("Nothing was changed"), "{text}");
+    assert!(shared.lock().unwrap().room_creation_enabled);
+
+    let unreadable = gated_runtime(
+        Trace::default(),
+        AccessControls::default(),
+        Some(StoreError::Unavailable),
+    );
+    let (_, response) = handle_capture(&unreadable, &disable()).await;
+    assert!(response_text(&response.expect("reply")).contains("Nothing was changed"));
+}
+
+#[tokio::test]
+async fn worker_does_not_start_when_access_controls_cannot_load() {
+    let (live, mut store, http, _) = fixture();
+    store.access_error = Some(StoreError::Unavailable);
+    assert!(GuildRoomWorker::load(live, store, http).await.is_err());
+}
+
+#[tokio::test]
+async fn access_changed_refreshes_a_loaded_worker() {
+    for (before, after) in [(false, true), (true, false)] {
+        let (live, store, http, _) = fixture();
+        *store.access.lock().unwrap() = AccessControls {
+            room_creation_enabled: before,
+            ..AccessControls::default()
+        };
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        apply_command(
+            &mut worker,
+            ActorCommand::AccessChanged(AccessControls {
+                room_creation_enabled: after,
+                ..AccessControls::default()
+            }),
+        );
+        let ticket = worker
+            .live
+            .voice_update(MEMBER, Some(CREATOR), Some(false))
+            .unwrap();
+        assert_eq!(
+            worker.accept_join(ticket, "new room".to_owned(), 7, NOW.to_owned()),
+            after
+        );
+    }
+}
+
+async fn wait_for_trace(trace: &Trace, entry: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if trace.lock().unwrap().iter().any(|line| line == entry) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn access_command_reaches_the_live_actor_without_a_restart() {
+    let trace = Trace::default();
+    let shared = Arc::new(Mutex::new(AccessControls::default()));
+    let runtime = shared_runtime(trace.clone(), shared, None);
+    assert!(runtime.publish_snapshot(GUILD, snapshot(&[], vec![])));
+    // The actor is loaded once it can answer a status request.
+    for _ in 0..500 {
+        if runtime.worker_status(GUILD).await.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let creation = |enabled: bool| {
+        access_interaction(
+            sub_option(
+                "creation",
+                vec![CommandDataOption {
+                    name: "enabled".to_owned(),
+                    value: CommandOptionValue::Boolean(enabled),
+                }],
+            ),
+            true,
+        )
+    };
+
+    handle_capture(&runtime, &creation(false)).await;
+    assert!(runtime.voice_frame(GUILD, MEMBER, Some(CREATOR), Some(false), "off".to_owned()));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !trace.lock().unwrap().iter().any(|line| line == "create"),
+        "creation is off: {:?}",
+        trace.lock().unwrap()
+    );
+
+    handle_capture(&runtime, &creation(true)).await;
+    assert!(runtime.voice_frame(
+        GUILD,
+        MEMBER + 1,
+        Some(CREATOR),
+        Some(false),
+        "on".to_owned()
+    ));
+    assert!(
+        wait_for_trace(&trace, "create").await,
+        "creation back on: {:?}",
+        trace.lock().unwrap()
+    );
 }
 
 #[test]

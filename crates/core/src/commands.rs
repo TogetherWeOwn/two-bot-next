@@ -62,6 +62,7 @@ pub const OCCURRENCE_ID_MAX_CHARS: usize = 128;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum CommandOptionType {
+    SubCommand = 1,
     String = 3,
     Integer = 4,
     Boolean = 5,
@@ -94,6 +95,9 @@ pub struct CommandOption {
     pub max_length: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub choices: Vec<CommandChoice>,
+    /// Nested options of a sub-command; empty for every other option.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub options: Vec<CommandOption>,
 }
 
 impl CommandOption {
@@ -109,7 +113,16 @@ impl CommandOption {
             max_value: None,
             max_length: None,
             choices: Vec::new(),
+            options: Vec::new(),
         }
+    }
+
+    /// Nested options for a [`CommandOptionType::SubCommand`]; required ones
+    /// must come first (Discord rejects the definition otherwise).
+    #[must_use]
+    pub fn sub_options(mut self, options: Vec<CommandOption>) -> Self {
+        self.options = options;
+        self
     }
 
     #[must_use]

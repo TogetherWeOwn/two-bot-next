@@ -77,6 +77,59 @@ const github = new Proxy({
   assert.equal(release.tag.toString(), 'v0.2.0');
   assert.equal(release.notes, expectedNotes, 'Native publication must retain the entire real notes region');
   for (const note of historicalNotes) assert.equal(release.notes.split(note).length - 1, 1);
+  // TOG-12931: a push to main runs the action with skip-github-pull-request, so
+  // the merge of the release PR must still publish while no PR write exists.
+  // Mirrors release-please-action v5.0.0 src/index.ts main(): releases unless
+  // skip-github-release, pull requests unless skip-github-pull-request.
+  const workflow = read('.github/workflows/release.yml');
+  assert(workflow.includes("skip-github-pull-request: ${{ github.event_name == 'push' || steps.plan.outputs.reuse_pr == 'true' }}"), 'push must skip PR generation');
+  assert(!workflow.includes('skip-github-release:'), 'publication must stay enabled on every event');
+  const pushInputs = {skipGitHubRelease: undefined, skipGitHubPullRequest: true};
+  const pushState = {labels: ['autorelease: pending'], created: [], comments: [], removed: [], added: []};
+  const pushTarget = {
+    ...github,
+    async *pullRequestIterator() {
+      yield {
+        number: 60, title: 'chore(main): release 0.2.0', body,
+        headBranchName: 'release-please--branches--main--components--two-bot-next',
+        baseBranchName: 'main', labels: pushState.labels, sha: 'merged-fixture',
+        files: ['.release-please-manifest.json', 'Cargo.toml', 'Cargo.lock', 'CHANGELOG.md'],
+      };
+    },
+    async createRelease(candidate, options) {
+      pushState.created.push({tag: candidate.tag.toString(), notes: candidate.notes, options});
+      return {id: 1, name: candidate.name, tagName: candidate.tag.toString(), sha: candidate.sha, notes: candidate.notes, url: 'https://example.invalid/release', draft: false, uploadUrl: ''};
+    },
+    async commentOnIssue(comment, number) { pushState.comments.push([comment, number]); },
+    async removeIssueLabels(labels, number) { pushState.removed.push([labels, number]); pushState.labels = pushState.labels.filter(label => !labels.includes(label)); },
+    async addIssueLabels(labels, number) { pushState.added.push([labels, number]); pushState.labels = [...pushState.labels, ...labels]; },
+  };
+  // Only release publication is mocked: any PR/branch write is an unmocked operation and throws.
+  const pushGithub = new Proxy(pushTarget, {
+    get(target, key) { assert(key in target, `Unmocked GitHub operation: ${String(key)}`); return target[key]; },
+  });
+  const runAction = async inputs => {
+    const loaded = await Manifest.fromManifest(pushGithub, 'main', undefined, undefined, {logger});
+    const created = inputs.skipGitHubRelease ? [] : await loaded.createReleases();
+    const prs = inputs.skipGitHubPullRequest ? [] : await loaded.createPullRequests();
+    return {created, prs};
+  };
+  const pushRun = await runAction(pushInputs);
+  assert.deepEqual(pushRun.prs, [], 'A push run must not regenerate the release PR');
+  assert.equal(pushRun.created.length, 1, 'The release PR merge publishes exactly one release');
+  assert.equal(pushRun.created[0].tagName, 'v0.2.0');
+  assert.equal(pushState.created.length, 1);
+  assert.equal(pushState.created[0].notes, expectedNotes, 'Push publication carries the full notes region');
+  assert.deepEqual(pushState.removed, [[['autorelease: pending'], 60]]);
+  assert.deepEqual(pushState.added, [[['autorelease: tagged'], 60]]);
+  assert.equal(pushState.comments.length, 1);
+  assert.deepEqual((await runAction(pushInputs)).created, [], 'A rerun after tagging publishes nothing');
+  assert.equal(pushState.created.length, 1);
+  // Negative control: without the skip the same run reaches for GitHub operations
+  // beyond publication, which this fail-closed mock rejects, so the guard above
+  // is what keeps a push from regenerating.
+  await assert.rejects(() => runAction({skipGitHubRelease: true, skipGitHubPullRequest: false}), /Unmocked GitHub operation/);
+
   // Reproduce the adverse-review input: template ahead of version INSIDE notes.
   const robot = header.split('\n\n')[0];
   const template = header.slice(robot.length).trim();
@@ -84,5 +137,5 @@ const github = new Proxy({
   assert.equal(PullRequestBody.parse(mergedBody, logger).releaseData.length, 0);
   const [broken] = await manifest.buildReleases();
   assert.equal(broken.notes, '', 'Negative control reproduces the original empty-publication bug');
-  console.log(`PASS real template-bearing publication: 1 v0.2.0 payload, ${Buffer.byteLength(release.notes)} notes bytes, historical notes once; misplaced-template negative control empty; retry and seed-link repair idempotent`);
+  console.log(`PASS real template-bearing publication: 1 v0.2.0 payload, ${Buffer.byteLength(release.notes)} notes bytes, historical notes once; misplaced-template negative control empty; retry and seed-link repair idempotent; push run publishes v0.2.0 once and cannot regenerate`);
 })().catch(error => { console.error(error.stack); process.exitCode = 1; });
