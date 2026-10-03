@@ -29,6 +29,8 @@ pub mod pipeline;
 pub mod ratelimit_guard;
 #[cfg(feature = "db")]
 pub mod rsvp;
+#[cfg(test)]
+mod test_clock;
 pub mod voice_rooms;
 
 #[cfg(feature = "db")]
