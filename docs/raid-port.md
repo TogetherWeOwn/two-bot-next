@@ -159,12 +159,18 @@ evidence first, and posts `staff_message(persisted)` through the shared
 Duplicates, undeliverable channels and failed sends are never retried.
 Dry-run and session mode do not suppress evidence or messages; arming stays
 refused without explicit dry-run `0` outside session mode, and R2 has no armed
-path. **Remaining:** staging soak. The executor seam is TOG-10076; no
+path. **Landed — containment:** `crates/bot/src/containment_runtime.rs`
+(audit-entry observer seam, fenced construction, verified application identity,
+dry-run-default plans, armed-only removals, shared-executor staff posts).
+**Remaining:** staging soak — 7 consecutive days with zero missed gateway events
+on TWO Staging behind `TWO_ANTI_NUKE=1` (dry-run default), recorded on the soak
+card; moderation stays staging-gated until it passes. The executor seam is TOG-10076; no
 private production HTTP client is added here. The transactional join-risk
 claim store (`join_risk_store`, migration `0360_join_risk_flags.sql`, legacy
 0015 shape) serializes per-guild event-ID claims, counts prior rows by
 processing-time `created_at`, scores with the current join, and persists the
-evidence in one transaction — but is not wired to the gateway or executor.
+evidence in one transaction — now wired to the gateway and executor
+(`crates/bot/src/join_risk_runtime.rs`).
 
 `raid.rs` unit tests cover strict clocks/age/window/cooldown boundaries, reverse
 arrival, dedupe-before-prune, fractional/live tuning, guild isolation, payload
