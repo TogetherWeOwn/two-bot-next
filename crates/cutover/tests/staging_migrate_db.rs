@@ -523,12 +523,21 @@ async fn real_sqlx_runner_cases() -> TestResult {
     assert_eq!(code, 0, "{err}");
     assert_eq!(manifest(&out)["applied_count"], 0);
 
-    // SHA-384 drift refuses.
+    // SHA-384 drift refuses. The binding inputs must be valid-format so the
+    // run reaches reconcile (which fails on drift) instead of refusing on the
+    // missing binding first.
     sqlx::query("UPDATE public._sqlx_migrations SET checksum = decode(repeat('00', 48), 'hex') WHERE version = (SELECT min(version) FROM public._sqlx_migrations)")
         .execute(&mut c)
         .await?;
     let (code, _, err) = fx
-        .run("--apply", Some(member.clone()), &host, &db, Some(""), None)
+        .run(
+            "--apply",
+            Some(member.clone()),
+            &host,
+            &db,
+            Some(""),
+            Some((&empty_hash, "424244")),
+        )
         .await;
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("drift"));
@@ -552,8 +561,17 @@ async fn real_sqlx_runner_cases() -> TestResult {
             .execute(&mut c)
             .await?;
     }
+    // Same valid-format binding here: the run must reach reconcile (which
+    // fails on the incomplete row) instead of refusing on the binding first.
     let (code, _, err) = fx
-        .run("--apply", Some(member), &host, &db, Some(""), None)
+        .run(
+            "--apply",
+            Some(member),
+            &host,
+            &db,
+            Some(""),
+            Some((&empty_hash, "424245")),
+        )
         .await;
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("incomplete"));
