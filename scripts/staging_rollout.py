@@ -20,6 +20,7 @@ WORKER = "two-bot-next-staging"
 APPLICATION = "two-bot-next-twobotcontainer-staging"
 CLASS = "TwoBotContainer"
 WRANGLER = "4.143.1"
+VERSION_PROBES = (["--version"], ["-v"])
 LIMIT = 100
 MAX_BODY = 2 * 1024 * 1024
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -136,10 +137,26 @@ def rollouts(client, app_id):
     return rows
 
 
-def deploy_version(records, started):
+def command_line(row):
+    args = row.get("command_line_args")
+    return args if isinstance(args, list) and all(isinstance(arg, str) for arg in args) else None
+
+
+def wrangler_sessions(records):
+    # Wrangler appends one session record per invocation, and wrangler-action
+    # probes `wrangler --version` before it deploys. Accept those probes, but
+    # only from the pinned version, and demand exactly one deploy invocation.
     sessions = [row for row in records if row.get("type") == "wrangler-session"]
-    require(len(sessions) == 1 and sessions[0].get("version") == 1
-            and sessions[0].get("wrangler_version") == WRANGLER, "wrong_wrangler_receipt")
+    require(all(row.get("version") == 1 and row.get("wrangler_version") == WRANGLER
+                for row in sessions), "wrong_wrangler_receipt")
+    deploys = [row for row in sessions if (command_line(row) or [None])[0] == "deploy"]
+    require(len(deploys) == 1, "wrong_wrangler_receipt")
+    require(all(row is deploys[0] or command_line(row) in VERSION_PROBES for row in sessions),
+            "wrong_wrangler_receipt")
+
+
+def deploy_version(records, started):
+    wrangler_sessions(records)
     rows = [row for row in records if row.get("type") == "deploy"]
     require(len(rows) == 1, "deploy_receipt_missing_or_ambiguous")
     row = rows[0]
