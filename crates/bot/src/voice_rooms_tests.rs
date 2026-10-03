@@ -77,6 +77,9 @@ struct Store {
     creators: Mutex<Vec<CreatorChannel>>,
     rooms: Mutex<HashMap<u64, VoiceRoom>>,
     persist_error: Option<StoreError>,
+    access: Arc<Mutex<AccessControls>>,
+    access_error: Option<StoreError>,
+    save_access_error: Option<StoreError>,
     forget_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
     after_persist: Option<Hook>,
@@ -89,6 +92,9 @@ impl Store {
             creators: Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)]),
             rooms: Mutex::new(HashMap::new()),
             persist_error: None,
+            access: Arc::new(Mutex::new(AccessControls::default())),
+            access_error: None,
+            save_access_error: None,
             forget_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
             after_persist: None,
@@ -99,6 +105,23 @@ impl Store {
 impl RoomPersistence for Store {
     async fn creators(&self, _: u64) -> Result<Vec<CreatorChannel>, StoreError> {
         Ok(self.creators.lock().unwrap().clone())
+    }
+    async fn access_controls(&self, _: u64) -> Result<AccessControls, StoreError> {
+        match self.access_error {
+            Some(error) => Err(error),
+            None => Ok(self.access.lock().unwrap().clone()),
+        }
+    }
+    async fn save_access_controls(
+        &self,
+        _: u64,
+        controls: &AccessControls,
+    ) -> Result<(), StoreError> {
+        if let Some(error) = self.save_access_error {
+            return Err(error);
+        }
+        *self.access.lock().unwrap() = controls.clone();
+        Ok(())
     }
     async fn rooms(&self, _: u64) -> Result<Vec<VoiceRoom>, StoreError> {
         Ok(self.rooms.lock().unwrap().values().cloned().collect())
@@ -224,6 +247,36 @@ impl RoomWrites for Http {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+    async fn disconnect(
+        &self,
+        guild: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("disconnect:{guild}:{member}"));
+        Ok(())
+    }
+    async fn deny_connect(
+        &self,
+        channel: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("deny:{channel}:{member}"));
+        Ok(())
     }
     async fn delete(&self, channel: u64, guard: WriteGuard) -> Result<(), RoomHttpError> {
         if let Some(hook) = &self.before_delete {
@@ -714,8 +767,10 @@ async fn successive_creates_reserve_category_slots_before_gateway_echoes() {
 }
 
 #[tokio::test]
-async fn lacking_manage_roles_uses_category_overwrites_not_creator_overwrites() {
-    use twilight_model::channel::permission_overwrite::PermissionOverwriteType;
+async fn lacking_manage_roles_creates_without_overrides_so_the_room_syncs_to_its_category() {
+    use twilight_model::channel::permission_overwrite::{
+        PermissionOverwrite, PermissionOverwriteType,
+    };
     let (live, store, http, _) = fixture();
     let overwrite = PermissionOverwrite {
         id: Id::new(GUILD),
@@ -731,10 +786,25 @@ async fn lacking_manage_roles_uses_category_overwrites_not_creator_overwrites() 
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
-    assert_eq!(
-        worker.http.created_attributes.lock().unwrap()[0].overwrites,
-        [overwrite]
-    );
+    // The bot cannot set overrides without Manage Roles: none are sent, so
+    // Discord syncs the new room to the category it is created in.
+    let created = worker.http.created_attributes.lock().unwrap();
+    assert_eq!(created[0].parent_id, Some(CATEGORY));
+    assert!(created[0].overwrites.is_empty());
+}
+
+#[tokio::test]
+async fn created_rooms_carry_the_owner_override_and_a_placement_from_the_start() {
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    let created = worker.http.created_attributes.lock().unwrap();
+    assert!(created[0]
+        .overwrites
+        .iter()
+        .any(|overwrite| overwrite.id.get() == MEMBER));
+    assert!(created[0].position.is_some());
 }
 
 #[test]
@@ -842,7 +912,7 @@ fn voice_command_set_is_gated_on_two_voice() {
         .iter()
         .map(|definition| definition.name.clone())
         .collect();
-    assert_eq!(names, ["create", "setup"]);
+    assert_eq!(names, ["create", "setup", "ping", "invite", "access"]);
     let off = VoiceGates::from_map(&Default::default());
     assert!(voice_command_set(&off).is_empty());
 }
@@ -1067,6 +1137,523 @@ fn parse_create_without_name_defaults_blank_for_refusal() {
 fn parse_setup_command() {
     let interaction = voice_interaction(Some(command_data("setup", Vec::new())), None, true);
     assert_eq!(parse_voice_command(&interaction), Some(VoiceCommand::Setup));
+}
+
+#[test]
+fn parse_ping_and_invite_commands() {
+    for (name, expected) in [
+        ("ping", VoiceCommand::Ping),
+        ("invite", VoiceCommand::Invite),
+    ] {
+        let interaction = voice_interaction(Some(command_data(name, Vec::new())), None, true);
+        assert_eq!(parse_voice_command(&interaction), Some(expected));
+        let guildless = voice_interaction(Some(command_data(name, Vec::new())), None, false);
+        assert_eq!(parse_voice_command(&guildless), None);
+    }
+}
+
+#[test]
+fn interaction_latency_counts_from_the_snowflake_timestamp() {
+    let created_ms = DISCORD_EPOCH_MS + 1_000_000;
+    let id = (created_ms - DISCORD_EPOCH_MS) << 22;
+    assert_eq!(interaction_latency_ms(id, created_ms + 42), 42);
+    // The worker and sequence bits below the timestamp never count as time.
+    assert_eq!(interaction_latency_ms(id | 0x3F_FFFF, created_ms + 42), 42);
+    // A host clock behind Discord's saturates instead of underflowing.
+    assert_eq!(interaction_latency_ms(id, created_ms - 5), 0);
+    assert_eq!(interaction_latency_ms(u64::MAX, 0), 0);
+}
+
+#[tokio::test]
+async fn ping_replies_ephemerally_without_touching_store_or_http() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = voice_interaction(Some(command_data("ping", Vec::new())), None, true);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let response = response.expect("ping reply");
+    assert!(response_text(&response).starts_with("Pong! "));
+    assert_eq!(
+        response.data.as_ref().and_then(|data| data.flags),
+        Some(MessageFlags::EPHEMERAL)
+    );
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn invite_renders_the_vanity_code_or_the_fixed_notice() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = voice_interaction(Some(command_data("invite", Vec::new())), None, true);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(&response.expect("invite reply")),
+        two_bot_core::voice_utilities::NO_INVITE_CONFIGURED
+    );
+    let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
+    let writer = seen.clone();
+    handle_voice_interaction_with(&runtime, &interaction, Some("abc-123"), |response| {
+        *writer.lock().unwrap() = Some(response);
+        async {}
+    })
+    .await;
+    let response = seen.lock().unwrap().clone().expect("invite reply");
+    assert_eq!(
+        response_text(&response),
+        "Join the server: https://discord.gg/abc-123"
+    );
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+fn gated_runtime(
+    trace: Trace,
+    controls: AccessControls,
+    access_error: Option<StoreError>,
+) -> VoiceRuntime<Store, Http> {
+    VoiceRuntime::new(
+        move || {
+            let mut store = Store::new(trace.clone());
+            *store.access.lock().unwrap() = controls.clone();
+            store.access_error = access_error;
+            (store, Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+}
+
+fn with_roles(mut interaction: Interaction, roles: &[u64]) -> Interaction {
+    interaction.member.as_mut().expect("member").roles =
+        roles.iter().map(|role| Id::new(*role)).collect();
+    interaction
+}
+
+#[tokio::test]
+async fn creation_switch_off_refuses_new_rooms() {
+    let (live, store, http, _) = fixture();
+    *store.access.lock().unwrap() = AccessControls {
+        room_creation_enabled: false,
+        ..AccessControls::default()
+    };
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .unwrap();
+    assert!(!worker.accept_join(ticket, "new room".to_owned(), 7, NOW.to_owned()));
+    assert!(!worker.dispatch_one(0).await);
+    assert!(worker.tracked().is_empty());
+}
+
+#[tokio::test]
+async fn required_role_gates_members_but_never_admins() {
+    let controls = AccessControls {
+        required_role: Some(9),
+        ..AccessControls::default()
+    };
+    let runtime = gated_runtime(Trace::default(), controls, None);
+    let ping = || voice_interaction(Some(command_data("ping", Vec::new())), None, true);
+
+    let (owned, response) = handle_capture(&runtime, &ping()).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(&response.expect("denial")),
+        access_denied_text(AccessDenyReason::RequiredRole)
+    );
+
+    let (_, response) = handle_capture(&runtime, &with_roles(ping(), &[9])).await;
+    assert!(response_text(&response.expect("ping")).starts_with("Pong! "));
+
+    let admin = voice_interaction(
+        Some(command_data("ping", Vec::new())),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
+    let (_, response) = handle_capture(&runtime, &admin).await;
+    assert!(response_text(&response.expect("ping")).starts_with("Pong! "));
+}
+
+#[tokio::test]
+async fn per_command_restriction_applies_only_to_that_command() {
+    let controls = AccessControls {
+        command_roles: [("invite".to_owned(), vec![7])].into(),
+        ..AccessControls::default()
+    };
+    let runtime = gated_runtime(Trace::default(), controls, None);
+    let invite = || voice_interaction(Some(command_data("invite", Vec::new())), None, true);
+    let ping = voice_interaction(Some(command_data("ping", Vec::new())), None, true);
+
+    let (_, response) = handle_capture(&runtime, &ping).await;
+    assert!(response_text(&response.expect("ping")).starts_with("Pong! "));
+    let (_, response) = handle_capture(&runtime, &invite()).await;
+    assert_eq!(
+        response_text(&response.expect("denial")),
+        access_denied_text(AccessDenyReason::CommandRestricted)
+    );
+    let (_, response) = handle_capture(&runtime, &with_roles(invite(), &[7])).await;
+    assert_eq!(
+        response_text(&response.expect("invite")),
+        two_bot_core::voice_utilities::NO_INVITE_CONFIGURED
+    );
+}
+
+#[tokio::test]
+async fn unreadable_settings_fail_closed_for_members_only() {
+    let runtime = gated_runtime(
+        Trace::default(),
+        AccessControls::default(),
+        Some(StoreError::Unavailable),
+    );
+    let member = voice_interaction(Some(command_data("ping", Vec::new())), None, true);
+    let (owned, response) = handle_capture(&runtime, &member).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("notice")).contains("unavailable"));
+
+    let admin = voice_interaction(
+        Some(command_data("ping", Vec::new())),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
+    let (_, response) = handle_capture(&runtime, &admin).await;
+    assert!(response_text(&response.expect("ping")).starts_with("Pong! "));
+}
+
+fn sub_option(name: &str, args: Vec<CommandDataOption>) -> CommandDataOption {
+    CommandDataOption {
+        name: name.to_owned(),
+        value: CommandOptionValue::SubCommand(args),
+    }
+}
+
+fn role_option(name: &str, id: u64) -> CommandDataOption {
+    CommandDataOption {
+        name: name.to_owned(),
+        value: CommandOptionValue::Role(Id::new(id)),
+    }
+}
+
+fn access_interaction(sub: CommandDataOption, admin: bool) -> Interaction {
+    voice_interaction(
+        Some(command_data("access", vec![sub])),
+        admin.then_some(Permissions::MANAGE_CHANNELS),
+        true,
+    )
+}
+
+fn access_action(sub: CommandDataOption) -> AccessAction {
+    match parse_voice_command(&access_interaction(sub, true)) {
+        Some(VoiceCommand::Access(action)) => action,
+        other => panic!("not an /access command: {other:?}"),
+    }
+}
+
+#[test]
+fn parse_access_subcommands() {
+    assert_eq!(
+        access_action(sub_option("show", vec![])),
+        AccessAction::Show
+    );
+    assert_eq!(
+        access_action(sub_option(
+            "creation",
+            vec![CommandDataOption {
+                name: "enabled".to_owned(),
+                value: CommandOptionValue::Boolean(false),
+            }]
+        )),
+        AccessAction::Creation(false)
+    );
+    assert_eq!(
+        access_action(sub_option("role", vec![role_option("role", 9)])),
+        AccessAction::RequiredRole(Some(9))
+    );
+    // No role clears the requirement.
+    assert_eq!(
+        access_action(sub_option("role", vec![])),
+        AccessAction::RequiredRole(None)
+    );
+    // Command names are lowercased; roles keep order and drop duplicates.
+    assert_eq!(
+        access_action(sub_option(
+            "restrict",
+            vec![
+                command_option("command", " Kick "),
+                role_option("role", 7),
+                role_option("role2", 8),
+                role_option("role3", 7),
+            ]
+        )),
+        AccessAction::Restrict {
+            command: "kick".to_owned(),
+            roles: vec![7, 8]
+        }
+    );
+    assert_eq!(
+        access_action(sub_option(
+            "restrict",
+            vec![command_option("command", "kick")]
+        )),
+        AccessAction::Restrict {
+            command: "kick".to_owned(),
+            roles: vec![]
+        }
+    );
+    assert_eq!(
+        access_action(sub_option(
+            "unrestrict",
+            vec![command_option("command", "Kick")]
+        )),
+        AccessAction::Unrestrict("kick".to_owned())
+    );
+}
+
+#[test]
+fn parse_access_malformed_shapes_are_invalid() {
+    assert_eq!(
+        access_action(sub_option("bogus", vec![])),
+        AccessAction::Invalid
+    );
+    assert_eq!(
+        access_action(sub_option("creation", vec![])),
+        AccessAction::Invalid
+    );
+    assert_eq!(
+        access_action(sub_option("restrict", vec![])),
+        AccessAction::Invalid
+    );
+    assert_eq!(
+        access_action(sub_option("unrestrict", vec![])),
+        AccessAction::Invalid
+    );
+    let bare = voice_interaction(Some(command_data("access", Vec::new())), None, true);
+    assert_eq!(
+        parse_voice_command(&bare),
+        Some(VoiceCommand::Access(AccessAction::Invalid))
+    );
+}
+
+fn shared_runtime(
+    trace: Trace,
+    shared: Arc<Mutex<AccessControls>>,
+    save_error: Option<StoreError>,
+) -> VoiceRuntime<Store, Http> {
+    VoiceRuntime::new(
+        move || {
+            let mut store = Store::new(trace.clone());
+            store.access = shared.clone();
+            store.save_access_error = save_error;
+            (store, Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+}
+
+#[tokio::test]
+async fn access_command_needs_an_admin() {
+    let shared = Arc::new(Mutex::new(AccessControls::default()));
+    let runtime = shared_runtime(Trace::default(), shared.clone(), None);
+    let member = access_interaction(sub_option("show", vec![]), false);
+    let (owned, response) = handle_capture(&runtime, &member).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(&response.expect("denial")),
+        "You need Manage Channels to use /access."
+    );
+}
+
+#[tokio::test]
+async fn access_command_changes_are_saved_and_shown() {
+    let shared = Arc::new(Mutex::new(AccessControls::default()));
+    let runtime = shared_runtime(Trace::default(), shared.clone(), None);
+    let run = |sub| {
+        let interaction = access_interaction(sub, true);
+        let runtime = &runtime;
+        async move {
+            let (_, response) = handle_capture(runtime, &interaction).await;
+            response_text(&response.expect("reply"))
+        }
+    };
+
+    let text = run(sub_option("role", vec![role_option("role", 9)])).await;
+    assert!(text.starts_with("Saved."), "{text}");
+    assert!(text.contains("Required role: <@&9>"), "{text}");
+    assert_eq!(shared.lock().unwrap().required_role, Some(9));
+
+    let text = run(sub_option(
+        "restrict",
+        vec![command_option("command", "kick"), role_option("role", 7)],
+    ))
+    .await;
+    assert!(text.contains("- /kick: <@&7>"), "{text}");
+    // No roles at all fails closed: admins only.
+    let text = run(sub_option(
+        "restrict",
+        vec![command_option("command", "template")],
+    ))
+    .await;
+    assert!(text.contains("- /template: admins only"), "{text}");
+    assert_eq!(shared.lock().unwrap().command_roles.len(), 2);
+
+    let text = run(sub_option(
+        "unrestrict",
+        vec![command_option("command", "kick")],
+    ))
+    .await;
+    assert!(!text.contains("/kick"), "{text}");
+    let text = run(sub_option("show", vec![])).await;
+    assert!(text.contains("- /template: admins only"), "{text}");
+    assert!(!text.starts_with("Saved."), "{text}");
+
+    let text = run(sub_option("role", vec![])).await;
+    assert!(text.contains("Required role: none"), "{text}");
+    assert_eq!(shared.lock().unwrap().required_role, None);
+}
+
+#[tokio::test]
+async fn access_command_refuses_bad_input_without_changing_anything() {
+    let shared = Arc::new(Mutex::new(AccessControls::default()));
+    let runtime = shared_runtime(Trace::default(), shared.clone(), None);
+    for sub in [
+        sub_option("restrict", vec![command_option("command", "kik")]),
+        sub_option("unrestrict", vec![command_option("command", "kick")]),
+        sub_option("bogus", vec![]),
+    ] {
+        let (_, response) = handle_capture(&runtime, &access_interaction(sub, true)).await;
+        let text = response_text(&response.expect("reply"));
+        assert!(!text.starts_with("Saved."), "{text}");
+        assert_eq!(*shared.lock().unwrap(), AccessControls::default());
+    }
+}
+
+#[tokio::test]
+async fn access_command_reports_store_failures_and_changes_nothing() {
+    let shared = Arc::new(Mutex::new(AccessControls::default()));
+    let runtime = shared_runtime(
+        Trace::default(),
+        shared.clone(),
+        Some(StoreError::Unavailable),
+    );
+    let disable = || {
+        access_interaction(
+            sub_option(
+                "creation",
+                vec![CommandDataOption {
+                    name: "enabled".to_owned(),
+                    value: CommandOptionValue::Boolean(false),
+                }],
+            ),
+            true,
+        )
+    };
+    let (_, response) = handle_capture(&runtime, &disable()).await;
+    let text = response_text(&response.expect("reply"));
+    assert!(text.contains("Nothing was changed"), "{text}");
+    assert!(shared.lock().unwrap().room_creation_enabled);
+
+    let unreadable = gated_runtime(
+        Trace::default(),
+        AccessControls::default(),
+        Some(StoreError::Unavailable),
+    );
+    let (_, response) = handle_capture(&unreadable, &disable()).await;
+    assert!(response_text(&response.expect("reply")).contains("Nothing was changed"));
+}
+
+#[tokio::test]
+async fn worker_does_not_start_when_access_controls_cannot_load() {
+    let (live, mut store, http, _) = fixture();
+    store.access_error = Some(StoreError::Unavailable);
+    assert!(GuildRoomWorker::load(live, store, http).await.is_err());
+}
+
+#[tokio::test]
+async fn access_changed_refreshes_a_loaded_worker() {
+    for (before, after) in [(false, true), (true, false)] {
+        let (live, store, http, _) = fixture();
+        *store.access.lock().unwrap() = AccessControls {
+            room_creation_enabled: before,
+            ..AccessControls::default()
+        };
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        apply_command(
+            &mut worker,
+            ActorCommand::AccessChanged(AccessControls {
+                room_creation_enabled: after,
+                ..AccessControls::default()
+            }),
+        );
+        let ticket = worker
+            .live
+            .voice_update(MEMBER, Some(CREATOR), Some(false))
+            .unwrap();
+        assert_eq!(
+            worker.accept_join(ticket, "new room".to_owned(), 7, NOW.to_owned()),
+            after
+        );
+    }
+}
+
+async fn wait_for_trace(trace: &Trace, entry: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if trace.lock().unwrap().iter().any(|line| line == entry) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn access_command_reaches_the_live_actor_without_a_restart() {
+    let trace = Trace::default();
+    let shared = Arc::new(Mutex::new(AccessControls::default()));
+    let runtime = shared_runtime(trace.clone(), shared, None);
+    assert!(runtime.publish_snapshot(GUILD, snapshot(&[], vec![])));
+    // The actor is loaded once it can answer a status request.
+    for _ in 0..500 {
+        if runtime.worker_status(GUILD).await.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let creation = |enabled: bool| {
+        access_interaction(
+            sub_option(
+                "creation",
+                vec![CommandDataOption {
+                    name: "enabled".to_owned(),
+                    value: CommandOptionValue::Boolean(enabled),
+                }],
+            ),
+            true,
+        )
+    };
+
+    handle_capture(&runtime, &creation(false)).await;
+    assert!(runtime.voice_frame(GUILD, MEMBER, Some(CREATOR), Some(false), "off".to_owned()));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !trace.lock().unwrap().iter().any(|line| line == "create"),
+        "creation is off: {:?}",
+        trace.lock().unwrap()
+    );
+
+    handle_capture(&runtime, &creation(true)).await;
+    assert!(runtime.voice_frame(
+        GUILD,
+        MEMBER + 1,
+        Some(CREATOR),
+        Some(false),
+        "on".to_owned()
+    ));
+    assert!(
+        wait_for_trace(&trace, "create").await,
+        "creation back on: {:?}",
+        trace.lock().unwrap()
+    );
 }
 
 #[test]
@@ -1363,7 +1950,7 @@ async fn responder_defers_before_any_create_and_completes_once() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());
     let replies = Replies::new(trace.clone());
-    VoiceResponder::respond(&runtime, &replies, &create_interaction()).await;
+    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None).await;
     assert_eq!(
         *trace.lock().unwrap(),
         ["defer", "create", "add_creator:500", "complete"]
@@ -1391,7 +1978,7 @@ async fn responder_failed_or_ambiguous_ack_never_executes_or_retries() {
         let runtime = test_runtime(trace.clone());
         let mut replies = Replies::new(trace.clone());
         replies.defer_error = Some(error);
-        VoiceResponder::respond(&runtime, &replies, &create_interaction()).await;
+        VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None).await;
         assert_eq!(*trace.lock().unwrap(), ["defer"]);
         assert!(replies.completed.lock().unwrap().is_empty());
     }
@@ -1403,7 +1990,7 @@ async fn responder_completion_failure_does_not_repeat_channel_creation() {
     let runtime = test_runtime(trace.clone());
     let mut replies = Replies::new(trace.clone());
     replies.complete_error = Some(RoomHttpError::UnknownOutcome);
-    VoiceResponder::respond(&runtime, &replies, &create_interaction()).await;
+    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None).await;
     assert_eq!(
         *trace.lock().unwrap(),
         ["defer", "create", "add_creator:500", "complete"]
@@ -1474,4 +2061,145 @@ async fn disabled_gateway_responder_does_not_acknowledge() {
     );
     tokio::task::yield_now().await;
     assert!(trace.lock().unwrap().is_empty());
+}
+
+fn channel_with_overwrites(
+    id: u64,
+    kind: u8,
+    parent: Option<u64>,
+    overwrites: serde_json::Value,
+) -> Channel {
+    let mut channel = channel(id, kind, parent);
+    channel.permission_overwrites = Some(serde_json::from_value(overwrites).unwrap());
+    channel
+}
+
+fn health_guild(
+    base: Permissions,
+    category: Vec<serde_json::Value>,
+    creator: Vec<serde_json::Value>,
+) -> LiveGuild {
+    let live = LiveGuild::new(GUILD);
+    live.publish(GuildSnapshot {
+        channels: vec![
+            channel_with_overwrites(CREATOR, 2, Some(CATEGORY), json!(creator)),
+            channel_with_overwrites(CATEGORY, 4, None, json!(category)),
+        ],
+        members: vec![],
+        bot: BotAccess {
+            member_id: 999,
+            guild_owner_id: 998,
+            member_roles: vec![],
+            roles: vec![role(base)],
+        },
+    });
+    live
+}
+
+fn everyone_overwrite(deny: Permissions) -> serde_json::Value {
+    json!({ "id": GUILD.to_string(), "type": 0, "allow": "0", "deny": deny.bits().to_string() })
+}
+
+#[test]
+fn health_check_is_clean_when_every_level_grants_the_four_permissions() {
+    let live = health_guild(permissions(), vec![], vec![]);
+    assert!(live.permission_findings(&[CREATOR]).is_empty());
+}
+
+#[test]
+fn health_check_names_a_missing_guild_level_permission() {
+    let live = health_guild(permissions() - Permissions::MOVE_MEMBERS, vec![], vec![]);
+    assert_eq!(
+        live.permission_findings(&[CREATOR]),
+        vec![PermissionFinding {
+            permission: VoicePermission::MoveMembers,
+            scope: VoicePermissionScope::Guild,
+            category_id: None,
+            channel_id: None,
+        }]
+    );
+}
+
+#[test]
+fn health_check_names_the_category_override_that_causes_it() {
+    let live = health_guild(
+        permissions(),
+        vec![everyone_overwrite(Permissions::MANAGE_CHANNELS)],
+        vec![],
+    );
+    let findings = live.permission_findings(&[CREATOR]);
+    assert_eq!(
+        findings,
+        vec![PermissionFinding {
+            permission: VoicePermission::ManageChannels,
+            scope: VoicePermissionScope::Category,
+            category_id: Some(CATEGORY),
+            channel_id: None,
+        }]
+    );
+    assert_eq!(
+        health_line(&findings[0]),
+        "health: the permission override on category <#400> removes Manage Channels from the bot"
+    );
+}
+
+#[test]
+fn health_check_names_a_creator_channel_override() {
+    let live = health_guild(
+        permissions(),
+        vec![],
+        vec![everyone_overwrite(Permissions::VIEW_CHANNEL)],
+    );
+    let findings = live.permission_findings(&[CREATOR]);
+    assert_eq!(
+        findings,
+        vec![PermissionFinding {
+            permission: VoicePermission::ViewChannel,
+            scope: VoicePermissionScope::Channel,
+            category_id: None,
+            channel_id: Some(CREATOR),
+        }]
+    );
+    assert_eq!(
+        health_line(&findings[0]),
+        "health: the permission override on <#200> removes View Channel from the bot"
+    );
+}
+
+#[test]
+fn health_check_reports_nothing_for_incomplete_data_or_unknown_channels() {
+    let never_published = LiveGuild::new(GUILD);
+    assert!(never_published.permission_findings(&[CREATOR]).is_empty());
+    let live = health_guild(permissions() - Permissions::MANAGE_ROLES, vec![], vec![]);
+    assert!(live.permission_findings(&[12345]).is_empty());
+    assert!(live.permission_findings(&[]).is_empty());
+    assert_eq!(
+        health_line(&live.permission_findings(&[CREATOR])[0]),
+        "health: the bot lacks Manage Roles for the whole server"
+    );
+}
+
+#[test]
+fn health_check_dedups_a_shared_category_override() {
+    let live = LiveGuild::new(GUILD);
+    live.publish(GuildSnapshot {
+        channels: vec![
+            channel(CREATOR, 2, Some(CATEGORY)),
+            channel(201, 2, Some(CATEGORY)),
+            channel_with_overwrites(
+                CATEGORY,
+                4,
+                None,
+                json!([everyone_overwrite(Permissions::MOVE_MEMBERS)]),
+            ),
+        ],
+        members: vec![],
+        bot: BotAccess {
+            member_id: 999,
+            guild_owner_id: 998,
+            member_roles: vec![],
+            roles: vec![role(permissions())],
+        },
+    });
+    assert_eq!(live.permission_findings(&[CREATOR, 201]).len(), 1);
 }

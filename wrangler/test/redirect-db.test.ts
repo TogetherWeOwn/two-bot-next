@@ -164,9 +164,9 @@ describe("click insert through a bound REDIRECT_DB", () => {
 
 describe("store failures fall back without leaking the connection string", () => {
   for (const [name, opts, errorClass] of [
-    ["connect failure", { connect: async () => { throw new Error(SECRET_URL); } }, "Error"],
-    ["connect TypeError", { connect: async () => { throw new TypeError(`Invalid URL ${SECRET_URL}`); } }, "TypeError"],
-    ["query failure", { query: async () => { throw Object.assign(new Error(SECRET_URL), { name: SECRET_URL }); } }, "Error"],
+    ["connect failure", { connect: async () => { throw new Error(SECRET_URL); } }, "internal"],
+    ["connect TypeError", { connect: async () => { throw new TypeError(`Invalid URL ${SECRET_URL}`); } }, "internal"],
+    ["query failure", { query: async () => { throw Object.assign(new Error(SECRET_URL), { name: SECRET_URL }); } }, "internal"],
   ] as const) {
     test(`${name} redirects to REDIRECT_FALLBACK_CODE with a bounded errorClass`, async () => {
       const fake = fakeDb(opts);
@@ -190,7 +190,7 @@ describe("store failures fall back without leaking the connection string", () =>
     const { res, errors } = await redirectThrough(store(fake, 20));
     assert.ok(Date.now() - started < 1_000);
     assert.equal(res.headers["location"], `https://discord.gg/${FALLBACK}`);
-    assert.deepEqual(errors, [`invite_redirect_lookup_failed ${JSON.stringify({ slug: "reddit", errorClass: "Error" })}`]);
+    assert.deepEqual(errors, [`invite_redirect_lookup_failed ${JSON.stringify({ slug: "reddit", errorClass: "db_unavailable" })}`]);
     assert.equal(fake.ends, 0);
     arrive();
     await new Promise((resolve) => setImmediate(resolve));
@@ -353,7 +353,7 @@ describe("binding presence decides the source", () => {
     const res = await worker.fetch(new Request("https://fixture.invalid/reddit"), env, ctx);
     assert.equal(res.status, 302);
     assert.equal(res.headers.get("location"), `https://discord.gg/${FALLBACK}`);
-    assert.deepEqual(logs, [`invite_redirect_lookup_failed ${JSON.stringify({ slug: "reddit", errorClass: "TypeError" })}`]);
+    assert.deepEqual(logs, [`invite_redirect_lookup_failed ${JSON.stringify({ slug: "reddit", errorClass: "internal" })}`]);
     assertNoSecrets(logs.join("\n"));
   });
 });

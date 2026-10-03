@@ -2,6 +2,10 @@ name: deploy-staging
 
 # Staging only. Accept the intended new rollout + serving image, never an old
 # healthy singleton. Production deploys remain manual and cutover-owned.
+# Active (TOG-12856): runs on every push to main and on manual dispatch to
+# unblock the TOG-12852 rehearsal. The deploy job runs unconditionally in the
+# `staging` environment; `release_fence` only releases an uninitialized/parked
+# singleton after handoff authorization and defaults to false.
 on:
   push:
     branches: [main]
@@ -21,12 +25,12 @@ concurrency:
 jobs:
   deploy:
     name: wrangler deploy + intended rollout gate
-    if: ${{ false }} # zizmor: ignore[obfuscation] explicit unconditional suspension, tested offline
+    permissions:
+      contents: read # checkout only; the deploy authenticates with `staging` environment secrets
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'deploy') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     # TOG-11143: STAGING_OWNERSHIP_CONTROL_TOKEN is a `staging` environment
     # secret (TOG-12030); the job must declare the environment to read it.
-    # (Kept while the job is suspended so re-activation cannot drop the scope.)
     environment: staging
     timeout-minutes: 30
     defaults:
@@ -79,6 +83,22 @@ jobs:
           environment: staging
           wranglerVersion: "4.143.1"
           command: deploy --config ${{ env.ROLLOUT_DIR }}/staging-deploy.json --env staging
+      # Ordering (TOG-12939): ownership must not move to a deploy whose Wrangler
+      # receipt is not valid, fresh and pinned, so that part of the gate runs
+      # here, before the transfer. It reads only the local NDJSON (no network,
+      # no Cloudflare credentials). Readiness cannot be proven earlier: a fenced
+      # or non-owner singleton refuses /readyz, so the rollout/readiness half
+      # stays in `verify` after the transfer. A red `verify` therefore leaves
+      # staging owned by a Worker whose identity was already checked but whose
+      # rollout was not confirmed; the owner stays `active`, so the next push
+      # can hand off again, and the red run is the alert.
+      - name: Validate Wrangler deploy receipt before ownership transfer
+        run: |
+          set -euo pipefail
+          python3 ../scripts/staging_rollout.py receipt \
+            --receipt "$ROLLOUT_DIR/baseline.json" \
+            --output "$WRANGLER_OUTPUT_FILE_PATH" \
+            --evidence "$ROLLOUT_DIR/receipt.json"
       - name: Transfer staging ownership to the deployed version
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}

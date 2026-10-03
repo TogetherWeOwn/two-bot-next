@@ -212,14 +212,15 @@ struct MockDiscord {
 
 impl MockDiscord {
     async fn new() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let url = format!("ws://{addr}");
+        let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        let url = format!("ws://{ws_addr}");
         // Registry publication is HTTP before gateway connect on BOTH boots.
-        // Website jobs share DISCORD_API_BASE, so use a route-aware REST socket
-        // separate from the gateway: job reads must neither consume scripted
-        // registry replies nor be mistaken for websocket upgrades. No `/api/v10`
-        // suffix — the executor appends `/api/v{version}/` to the origin itself.
+        // Onboarding identity and website jobs share DISCORD_API_BASE, so use
+        // a route-aware REST socket separate from the gateway: job reads must
+        // neither consume scripted registry replies nor be mistaken for
+        // websocket upgrades. No `/api/v10` suffix — the executor appends
+        // the version to this origin itself.
         let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = format!("http://{}", rest_listener.local_addr().unwrap());
         let (auth_tx, auth) = mpsc::channel(2);
@@ -227,7 +228,7 @@ impl MockDiscord {
         let resume_url = url.clone();
         let task = tokio::spawn(async move {
             for boot in 0..2 {
-                let (stream, _) = listener.accept().await.unwrap();
+                let (stream, _) = ws_listener.accept().await.unwrap();
                 let (_, mut ws) = ServerBuilder::new()
                     .accept(stream)
                     .await
@@ -373,8 +374,12 @@ async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<RestRequest>>
             // Registry and job requests can interleave, so never script replies
             // by arrival order. The fixture grounds no raid windows; only the
             // events mirror reads. Unknown routes fail closed on this socket.
+            // Also serves onboarding's boot identity probe on this REST socket.
             let (status, body): (&str, Vec<u8>) = match (method.as_str(), path.as_str()) {
                 ("GET", "/api/v10/applications/@me") => ("200 OK", b"{\"id\":\"1111\"}".to_vec()),
+                ("GET", "/api/v10/users/@me") => {
+                    ("200 OK", b"{\"id\":\"999\",\"bot\":true}".to_vec())
+                }
                 ("PUT", "/api/v10/applications/1111/guilds/2222/commands") => {
                     ("200 OK", registry_echo)
                 }

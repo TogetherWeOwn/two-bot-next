@@ -65,6 +65,7 @@ async fn spawn_with_shutdown(
         Arc::new(RwLock::new(GatewayState::Armed)),
         db.store.clone(),
         Some(runtime(db, rest)),
+        None,
         Some(crate::command_runtime::CommandRuntime::new(
             db.pool.clone(),
             ActionExecutor::with_proxy(TOKEN.into(), Some(rest.origin())).unwrap(),
@@ -72,6 +73,7 @@ async fn spawn_with_shutdown(
             GUILD.parse().unwrap(),
             true,
         )),
+        None,
         None,
         async move {
             match shutdown {

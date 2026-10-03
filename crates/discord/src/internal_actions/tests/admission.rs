@@ -180,6 +180,53 @@ async fn admission_action_429_without_timing_installs_indefinite_global_hold() {
 
 #[tokio::test]
 #[ignore = "requires isolated agent-testdb or CI service"]
+async fn admission_slow_get_occupancy_rejects_concurrent_receipt_defer() {
+    let db = database().await;
+    let mut reply = Reply::success();
+    reply.delay = Duration::from_secs(1);
+    let mock = MockDiscord::start(reply).await;
+    let gate = Arc::new(PgSendAdmission::new(db.pool().clone(), &token()).unwrap());
+    let action =
+        ActionExecutor::with_admission(token(), Some(mock.origin.clone()), gate.clone()).unwrap();
+    // A governed GET holds the token lane while the provider is slow. The
+    // full executor path (guard + pacing + durable admission) stays engaged.
+    let reading = {
+        let action = action.clone();
+        let path = format!("/channels/{CHANNEL}");
+        tokio::spawn(async move { action.get_json_once(&path).await })
+    };
+    reached_wire(&mock).await;
+    // A concurrent receipt-bearing deferred PATCH is rejected before any
+    // second wire attempt — never queued behind or smuggled past the lane.
+    assert!(matches!(
+        action
+            .edit_interaction_response(111111111111111111, "fixture-token", "fixture")
+            .await,
+        Err(DiscordError::Unavailable(_))
+    ));
+    assert_eq!(mock.count(), 1, "blocked defer must not reach the wire");
+    assert_eq!(reading.await.unwrap().unwrap().unwrap()["id"], MESSAGE);
+    // The slow GET completed and released the lane; the deferred edit proceeds.
+    action
+        .edit_interaction_response(111111111111111111, "fixture-token", "fixture")
+        .await
+        .unwrap();
+    assert_eq!(mock.count(), 2);
+    {
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, format!("/api/v10/channels/{CHANNEL}"));
+        assert_eq!(requests[1].method, "PATCH");
+        assert_eq!(
+            requests[1].path,
+            "/api/v10/webhooks/111111111111111111/fixture-token/messages/@original"
+        );
+    }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb or CI service"]
 async fn admission_cancellation_after_wire_keeps_restart_and_other_transport_blocked() {
     let db = database().await;
     let mut reply = Reply::success();

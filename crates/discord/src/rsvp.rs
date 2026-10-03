@@ -24,10 +24,25 @@ use crate::{
 /// Acknowledgement is separate from ordered effects: the gateway prepares
 /// queued commands immediately, then completes them in dispatch order. The
 /// private deferred fields can only be constructed after a successful callback.
-#[derive(Debug)]
+///
+/// The held [`Interaction`] embeds its callback token, so [`PreparedRsvp`]
+/// never derives [`std::fmt::Debug`]: diagnostics name the owning handler and
+/// whether a deferred completion is pending, never the credential.
 pub struct PreparedRsvp {
     handled: bool,
     deferred: Option<(HandlerId, Interaction)>,
+}
+
+impl std::fmt::Debug for PreparedRsvp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedRsvp")
+            .field("handled", &self.handled)
+            .field(
+                "deferred",
+                &self.deferred.as_ref().map(|(handler, _)| handler),
+            )
+            .finish()
+    }
 }
 
 pub async fn prepare_rsvp_interaction(

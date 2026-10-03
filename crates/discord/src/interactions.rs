@@ -362,8 +362,11 @@ pub fn command_to_twilight(def: &CommandDefinition) -> Command {
 
 fn option_to_twilight(opt: &two_bot_core::commands::CommandOption) -> CommandOption {
     let kind = match opt.kind {
+        1 => CommandOptionType::SubCommand,
         4 => CommandOptionType::Integer,
+        5 => CommandOptionType::Boolean,
         6 => CommandOptionType::User,
+        8 => CommandOptionType::Role,
         _ => CommandOptionType::String,
     };
     CommandOption {
@@ -392,7 +395,11 @@ fn option_to_twilight(opt: &two_bot_core::commands::CommandOption) -> CommandOpt
         min_value: opt.min_value.map(CommandOptionValue::Integer),
         name: opt.name.clone(),
         name_localizations: None,
-        options: None,
+        options: if opt.options.is_empty() {
+            None
+        } else {
+            Some(opt.options.iter().map(option_to_twilight).collect())
+        },
         required: opt.required,
     }
 }

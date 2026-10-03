@@ -292,17 +292,18 @@ impl CommandRuntime {
         self.dispatch(event);
     }
 
+    /// The one process executor (admission lane and pacing included); other
+    /// runtimes (onboarding, automod) and the ordered interaction surface
+    /// render through a clone, never a private client. One token key, one
+    /// pacing lane, one governed admission for both surfaces.
+    pub fn executor(&self) -> ActionExecutor {
+        self.executor.clone()
+    }
+
     /// Shares this runtime's pool, executor/pacing and onboarding gates with
     /// the ordered award path; only this runtime dispatches interactions.
     pub fn leveling(&self) -> LevelingRuntime {
         self.leveling.clone()
-    }
-
-    /// Shares this runtime's governed REST executor (one token key, one
-    /// pacing lane) with the ordered interaction surface, so both surfaces
-    /// send through the same governed admission.
-    pub fn executor(&self) -> ActionExecutor {
-        self.executor.clone()
     }
 
     #[cfg(test)]
