@@ -2076,6 +2076,136 @@ impl ActionExecutor {
             .await
     }
 
+    /// Post a rendered feature message through the shared request factory.
+    pub async fn post_message_with_components(
+        &self,
+        channel_id: &str,
+        content: &str,
+        components: &[serde_json::Value],
+        nonce: &str,
+    ) -> Result<String, DiscordError> {
+        self.send_message_components(
+            channel_id,
+            content,
+            Some(nonce.into()),
+            Some(components),
+            false,
+        )
+        .await
+    }
+
+    /// Refresh content and selects. Edits must suppress mentions independently of POST.
+    pub async fn edit_message_with_components(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        content: &str,
+        components: &[serde_json::Value],
+    ) -> Result<(), DiscordError> {
+        if utf16_len(content) > MAX_MESSAGE_CHARS {
+            return Err(DiscordError::Rejected(
+                "message exceeds Discord's ceiling".into(),
+            ));
+        }
+        let channel: Id<ChannelMarker> = snowflake(channel_id)?;
+        let message: Id<MessageMarker> = snowflake(message_id)?;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "content": content, "components": components, "allowed_mentions": {"parse": []}
+        }))
+        .map_err(|e| DiscordError::Rejected(format!("build message body: {e}")))?;
+        let req = Request::builder(&Route::UpdateMessage {
+            channel_id: channel.get(),
+            message_id: message.get(),
+        })
+        .body(body)
+        .build()
+        .map_err(|e| DiscordError::Rejected(format!("build: {e}")))?;
+        self.call_once_raw_paced(req, &[200]).await?;
+        Ok(())
+    }
+
+    /// Bounded nonce reconciliation. An unreadable/denied history is NOT an empty history.
+    /// Only messages from this bot in the target channel can establish acceptance.
+    pub async fn recover_message_by_nonce(
+        &self,
+        channel_id: &str,
+        nonce: &str,
+        bot_user_id: u64,
+    ) -> Result<Option<String>, DiscordError> {
+        // Without the bot's identity no author check can prove acceptance.
+        if bot_user_id == 0 {
+            return Err(DiscordError::Unavailable("bot identity unknown".into()));
+        }
+        let mut before = None;
+        for _ in 0..3 {
+            let path = match &before {
+                Some(id) => format!("/channels/{channel_id}/messages?limit=100&before={id}"),
+                None => format!("/channels/{channel_id}/messages?limit=100"),
+            };
+            let route = raw_get_route(&path).map_err(DiscordError::Rejected)?;
+            let res = self
+                .call_once_raw_paced(Request::from_route(&route), &[200])
+                .await?;
+            let rows: Vec<serde_json::Value> = serde_json::from_slice(&res.body)
+                .map_err(|_| DiscordError::Unavailable("unreadable message history".into()))?;
+            for row in &rows {
+                if row["nonce"].as_str() == Some(nonce)
+                    && row["author"]["id"].as_str() == Some(&bot_user_id.to_string())
+                    && row["channel_id"].as_str() == Some(channel_id)
+                {
+                    let id = row["id"].as_str().ok_or_else(|| {
+                        DiscordError::Unavailable("accepted message missing id".into())
+                    })?;
+                    let _: Id<MessageMarker> = snowflake(id)?;
+                    return Ok(Some(id.to_owned()));
+                }
+            }
+            if rows.len() < 100 {
+                return Ok(None);
+            }
+            let last = rows
+                .last()
+                .and_then(|r| r["id"].as_str())
+                .ok_or_else(|| DiscordError::Unavailable("unreadable history cursor".into()))?;
+            let _: Id<MessageMarker> = snowflake(last)?;
+            if before.as_deref() == Some(last) {
+                return Err(DiscordError::Unavailable(
+                    "non-progressing history cursor".into(),
+                ));
+            }
+            before = Some(last.to_owned());
+        }
+        Err(DiscordError::Unavailable(
+            "nonce recovery history bound reached".into(),
+        ))
+    }
+
+    /// Complete an already-deferred ephemeral reply through the same executor.
+    pub async fn finish_interaction(
+        &self,
+        application_id: u64,
+        token: &str,
+        content: &str,
+    ) -> Result<(), DiscordError> {
+        let application = Id::<ApplicationMarker>::new_checked(application_id)
+            .ok_or_else(|| DiscordError::Rejected("bad application id".into()))?;
+        let interaction = self.inner.factory.interaction(application);
+        let mentions = AllowedMentions {
+            parse: vec![],
+            replied_user: false,
+            roles: vec![],
+            users: vec![],
+        };
+        let req = Self::request_of(
+            interaction
+                .update_response(token)
+                .content(Some(content))
+                .allowed_mentions(Some(&mentions)),
+        )?;
+        self.call_once_raw(req, &[200]).await?;
+        Ok(())
+    }
+
     /// Raw message send shared by [`Self::post_message`] and the audit
     /// string-nonce path: the pinned Twilight `CreateMessage` builder only
     /// models a `u64` nonce and never serializes `enforce_nonce`, so the body
@@ -2088,6 +2218,18 @@ impl ActionExecutor {
         channel_id: &str,
         content: &str,
         nonce: Option<serde_json::Value>,
+        after_authorization: bool,
+    ) -> Result<String, DiscordError> {
+        self.send_message_components(channel_id, content, nonce, None, after_authorization)
+            .await
+    }
+
+    async fn send_message_components(
+        &self,
+        channel_id: &str,
+        content: &str,
+        nonce: Option<serde_json::Value>,
+        components: Option<&[serde_json::Value]>,
         after_authorization: bool,
     ) -> Result<String, DiscordError> {
         // Legacy ceiling is UTF-16 units (two-bot counts JS string length),
@@ -2112,6 +2254,9 @@ impl ActionExecutor {
             "content": content,
             "allowed_mentions": {"parse": []},
         });
+        if let Some(components) = components {
+            body["components"] = serde_json::json!(components);
+        }
         if let Some(n) = nonce {
             body["nonce"] = n;
             body["enforce_nonce"] = serde_json::Value::Bool(true);
@@ -2126,6 +2271,7 @@ impl ActionExecutor {
         .body(body_bytes)
         .build()
         .map_err(|e| DiscordError::Rejected(format!("build: {e}")))?;
+        let paced = components.is_some();
         let message_id = if after_authorization {
             self.inner.transport.guard.check_now(false)?;
             let (mut res, _) =
@@ -2142,7 +2288,13 @@ impl ActionExecutor {
             res.complete().await;
             id
         } else {
-            let mut res = self.call_once_raw(req, &[200, 201]).await?;
+            // Feature posts with selects take the paced lane; the plain
+            // `post_message` path keeps main's unpaced single attempt.
+            let mut res = if paced {
+                self.call_once_raw_paced(req, &[200, 201]).await?
+            } else {
+                self.call_once_raw(req, &[200, 201]).await?
+            };
             let id = mutation_receipt_id(&res.body)?;
             res.complete().await;
             id
@@ -2188,7 +2340,7 @@ impl ActionExecutor {
     /// No automatic retry: send-then-record callers must not hide ambiguity.
     /// Only the domain-authorized welcome recipient may notify; arbitrary parse,
     /// role, multi-user and reply policies cannot enter this boundary.
-    /// Source: https://docs.rs/twilight-http/0.17.1/twilight_http/request/channel/message/struct.CreateMessage.html
+    /// Source: <https://docs.rs/twilight-http/0.17.1/twilight_http/request/channel/message/struct.CreateMessage.html>
     pub async fn post_channel_message(
         &self,
         channel_id: &str,

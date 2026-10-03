@@ -104,4 +104,4 @@ F6 stays open until the deployment card records a non-secret TLS receipt.
 - DB suites and CLIs pass `LocalOnly` explicitly (`connect_with_tls` /
   `connect_pool_with_tls` / `open_pool_with_tls`, or
   `TWO_DATABASE_TLS=local-only` on `env_clear()` subprocesses). The CI `check`
-  job sets it for in-process callers.
+  job and the nightly `sweep` job set it for in-process callers.

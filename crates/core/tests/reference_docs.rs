@@ -184,7 +184,10 @@ fn render_commands() -> String {
             let kind = match option.kind {
                 n if n == CommandOptionType::String.as_u8() => "string",
                 n if n == CommandOptionType::Integer.as_u8() => "integer",
+                n if n == CommandOptionType::Boolean.as_u8() => "boolean",
                 n if n == CommandOptionType::User.as_u8() => "user",
+                n if n == CommandOptionType::Channel.as_u8() => "channel",
+                n if n == CommandOptionType::Role.as_u8() => "role",
                 n => panic!("document new command option type {n}"),
             };
             let choices = if option.choices.is_empty() {

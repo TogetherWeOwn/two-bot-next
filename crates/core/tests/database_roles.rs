@@ -8,6 +8,18 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use two_bot_core::database_roles;
+use two_bot_core::member_moderation::{AuditRow, ClaimState, MemberModerationStore, StoreError};
+use two_bot_core::member_moderation_store::PgMemberModerationStore;
+
+const MEMBER_GRANTS: &str =
+    include_str!("../../cutover/migrations/0114_moderation_member_runtime_grants.sql");
+const MEMBER_TABLES: [&str; 5] = [
+    "moderation_warnings",
+    "moderation_scheduled_unbans",
+    "moderation_member_bans",
+    "moderation_audit",
+    "moderation_idempotency",
+];
 
 // Parallel tests share one pid and can read the same clock tick.
 static NEXT_DB: AtomicU64 = AtomicU64::new(0);
@@ -188,11 +200,41 @@ async fn scheduled_runtime_probe(pool: &PgPool, role: &str) -> Result<(), sqlx::
     Ok(())
 }
 
+/// Every cutover migration in source order, read from the directory so a new
+/// migration is exercised without updating a hardcoded list.
+fn migration_files() -> Vec<(i64, String)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cutover/migrations");
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .expect("cutover migrations directory")
+        .map(|entry| entry.expect("migration entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+        .collect();
+    entries.sort();
+    entries
+        .iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .expect("migration file name")
+                .to_string_lossy();
+            let digits: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let version: i64 = digits.parse().expect("migration version prefix");
+            let sql = std::fs::read_to_string(path).expect("read migration");
+            (version, sql)
+        })
+        .collect()
+}
+
 async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     // Real migration files, not a reduced fixture that omits trigger/sequence paths.
     for migration in [
         include_str!("../../cutover/migrations/0001_funnel.sql"),
         include_str!("../../cutover/migrations/0002_leveling.sql"),
+        include_str!("../../cutover/migrations/0110_moderation_member.sql"),
+        include_str!("../../cutover/migrations/0111_moderation_ban_ownership.sql"),
+        include_str!("../../cutover/migrations/0112_moderation_legacy_timestamps.sql"),
+        include_str!("../../cutover/migrations/0113_moderation_unban_retry_order.sql"),
+        include_str!("../../cutover/migrations/0114_moderation_member_runtime_grants.sql"),
         include_str!("../../cutover/migrations/0120_channel_moderation.sql"),
         include_str!("../../cutover/migrations/0121_channel_claim_generation.sql"),
         include_str!("../../cutover/migrations/0122_channel_lockdown_generation.sql"),
@@ -234,7 +276,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0361_discord_send_admission.sql"),
         include_str!("../../cutover/migrations/0362_gateway_onboarding_jobs.sql"),
     ] {
-        sqlx::raw_sql(migration).execute(pool).await?;
+        // Never grant a shared cluster role: isolate names even in migrations.
+        execute(pool, isolated(migration, roles)).await?;
     }
     sqlx::raw_sql("CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);")
         .execute(pool)
@@ -257,6 +300,9 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         findings(pool, roles).await?.is_empty(),
         "clean plan drifted",
     )?;
+
+    exercise_member_grants(pool, roles).await?;
+    exercise_member_store(pool, &roles[1]).await?;
 
     // Effective ACLs include PUBLIC/inherited access. Schema denial alone is
     // not proof of no reader sequence or function grant. The CAS sequence is
@@ -475,6 +521,174 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+async fn exercise_member_grants(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
+    let (migrator, runtime, reader) = (&roles[0], &roles[1], &roles[2]);
+    // Bootstrap above ran 0114 without groups. Also prove an existing deployment
+    // is repaired by the additive migration alone, executed by the object owner.
+    for table in MEMBER_TABLES {
+        execute(pool, format!("REVOKE ALL ON public.{table} FROM {runtime}")).await?;
+    }
+    execute(
+        pool,
+        format!(
+            "REVOKE ALL ON SEQUENCE public.moderation_member_bans_generation_seq FROM {runtime}"
+        ),
+    )
+    .await?;
+    require(
+        !findings(pool, roles).await?.is_empty(),
+        "missing member grants were not reported",
+    )?;
+    for _ in 0..2 {
+        let mut tx = pool.begin().await?;
+        let sql = format!(
+            "SET LOCAL ROLE {migrator}; {}",
+            isolated(MEMBER_GRANTS, roles)
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        require(
+            findings(pool, roles).await?.is_empty(),
+            "member grant migration drifted",
+        )?;
+    }
+    as_role(pool, runtime, "SELECT nextval('public.moderation_member_bans_generation_seq'); SELECT last_value FROM public.moderation_member_bans_generation_seq").await?;
+    for table in MEMBER_TABLES {
+        denied(
+            pool,
+            runtime,
+            &format!("ALTER TABLE public.{table} ADD COLUMN forbidden int"),
+        )
+        .await?;
+        denied(pool, runtime, &format!("TRUNCATE public.{table}")).await?;
+        denied(pool, runtime, &format!("DROP TABLE public.{table}")).await?;
+        denied(pool, reader, &format!("SELECT * FROM public.{table}")).await?;
+    }
+    // Backup/restore sequence resets and owner-level DDL remain administrative;
+    // runtime SELECT is intentionally allowed, not a blanket ban on data export.
+    for sql in [
+        "SELECT setval('public.moderation_member_bans_generation_seq', 1)",
+        "ALTER SEQUENCE public.moderation_member_bans_generation_seq RESTART WITH 1",
+        "SELECT * FROM public._sqlx_migrations",
+    ] {
+        denied(pool, runtime, sql).await?;
+    }
+    for sql in [
+        "SELECT nextval('public.moderation_member_bans_generation_seq')",
+        "SELECT last_value FROM public.moderation_member_bans_generation_seq",
+        "SELECT setval('public.moderation_member_bans_generation_seq', 1)",
+    ] {
+        denied(pool, reader, sql).await?;
+    }
+    denied(pool, runtime, &format!("GRANT {migrator} TO {reader}")).await?;
+    denied(
+        pool,
+        runtime,
+        &format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE {migrator} GRANT SELECT ON TABLES TO {runtime}"
+        ),
+    )
+    .await?;
+    // PostgreSQL may warn and no-op, rather than error, when GRANT lacks a
+    // grant option. Check the effective result inside the same transaction.
+    let mut tx = pool.begin().await?;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL ROLE {runtime}; GRANT SELECT ON public.moderation_warnings TO {reader}; GRANT USAGE ON SEQUENCE public.moderation_member_bans_generation_seq TO {reader}"
+    ))).execute(&mut *tx).await?;
+    let cannot_delegate: bool = sqlx::query_scalar(
+        "SELECT NOT has_table_privilege($1::text, 'public.moderation_warnings', 'SELECT')
+         AND NOT has_sequence_privilege($1::text, 'public.moderation_member_bans_generation_seq', 'USAGE')",
+    ).bind(reader).fetch_one(&mut *tx).await?;
+    tx.rollback().await?;
+    require(cannot_delegate, "runtime delegated member privileges")?;
+    // Named sequence coverage survives detachment, and effective PUBLIC/reader
+    // privileges or grant options cannot hide behind schema denial.
+    for (change, expected) in [
+        (format!("REVOKE SELECT ON public.moderation_warnings FROM {runtime}"), "missing table privilege:"),
+        (format!("GRANT SELECT ON public.moderation_member_bans TO {runtime} WITH GRANT OPTION"), "unexpected grant option:"),
+        (format!("ALTER SEQUENCE public.moderation_member_bans_generation_seq OWNED BY NONE; REVOKE USAGE ON SEQUENCE public.moderation_member_bans_generation_seq FROM {runtime}"), "sequence privilege differs:"),
+        (format!("GRANT UPDATE ON SEQUENCE public.moderation_member_bans_generation_seq TO {runtime}"), "sequence privilege differs:"),
+        (format!("GRANT USAGE, SELECT ON SEQUENCE public.moderation_member_bans_generation_seq TO {reader}"), "sequence privilege differs:"),
+        ("GRANT USAGE ON SEQUENCE public.moderation_member_bans_generation_seq TO PUBLIC".to_owned(), "sequence privilege differs:"),
+    ] {
+        require(transactional_drift(pool, roles, &change).await?.iter().any(|f| f.starts_with(expected)), &format!("missed member drift: {change}"))?;
+    }
+    require(
+        findings(pool, roles).await?.is_empty(),
+        "member probes left drift",
+    )
+}
+
+fn store_error(_: StoreError) -> sqlx::Error {
+    sqlx::Error::InvalidArgument("runtime member store operation failed".to_owned())
+}
+
+async fn exercise_member_store(pool: &PgPool, runtime: &str) -> Result<(), sqlx::Error> {
+    // Every connection uses the restricted group; store-owned transactions must
+    // not accidentally execute through the scratch database's admin pool.
+    let setup = format!("SET ROLE {runtime}; SET search_path = public");
+    let runtime_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |connection, _| {
+            let sql = setup.clone();
+            Box::pin(async move {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await?;
+    let result = async {
+        let store = PgMemberModerationStore::new(runtime_pool.clone(), "roles-member");
+        let now = "2026-01-01T00:00:00Z";
+        let due = "2026-01-01T00:01:00Z";
+        require(matches!(store.claim("roles-member", "warn", "warn", "hash", now).await.map_err(store_error)?, ClaimState::Claimed), "runtime did not claim")?;
+        store.add_warning("roles-warning", "roles-member", "member", "actor", "probe", "roles-warning", now).await.map_err(store_error)?;
+        store.record_audit(&AuditRow {
+            request_id: "roles-warning".to_owned(),
+            guild_id: "roles-member".to_owned(),
+            actor_id: "actor".to_owned(),
+            action: "warn",
+            target_id: Some("member".to_owned()),
+            reason: "probe".to_owned(),
+            outcome: "accepted",
+            idempotency_key: "warn".to_owned(),
+            metadata_json: "{}".to_owned(),
+        }).await.map_err(store_error)?;
+        store.complete("roles-member", "warn", "accepted", "{}", now).await.map_err(store_error)?;
+        require(matches!(store.claim("roles-member", "warn", "warn", "hash", now).await.map_err(store_error)?, ClaimState::Replayed { .. }), "runtime did not replay")?;
+        store.claim("roles-member", "release", "warn", "hash", now).await.map_err(store_error)?;
+        store.release("roles-member", "release").await.map_err(store_error)?;
+        let attempt = store.stage_unban("roles-member", "member", due, "probe", "roles-expiry", now).await.map_err(store_error)?;
+        require(attempt.generation > 0, "runtime did not allocate ban generation")?;
+        store.confirm_ban_attempt("roles-member", "member", "roles-expiry", attempt, now).await.map_err(store_error)?;
+        store.activate_staged_unban("roles-member", "member", "roles-expiry", now).await.map_err(store_error)?;
+        let jobs = store.claim_due_unbans("roles-member", due, 1).await.map_err(store_error)?;
+        require(jobs.len() == 1, "runtime did not claim expiry")?;
+        let job = &jobs[0];
+        require(store.owns_unban_claim(&job.request_id, &job.claim_token).await.map_err(store_error)?, "runtime lost expiry claim")?;
+        store.requeue_unban(&job.request_id, &job.claim_token).await.map_err(store_error)?;
+        let jobs = store.claim_due_unbans("roles-member", due, 1).await.map_err(store_error)?;
+        require(jobs.len() == 1, "runtime did not reclaim expiry")?;
+        store.complete_unban(&jobs[0].request_id, &jobs[0].claim_token).await.map_err(store_error)?;
+        // The store exercised INSERT/SELECT/UPDATE and claim release DELETE.
+        // Verify remaining CRUD on every ledger, without weakening its schema.
+        sqlx::raw_sql("UPDATE public.moderation_warnings SET reason = 'updated' WHERE guild_id = 'roles-member'; UPDATE public.moderation_audit SET reason = 'updated' WHERE guild_id = 'roles-member'").execute(&runtime_pool).await?;
+        for table in MEMBER_TABLES {
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM public.{table} WHERE guild_id = 'roles-member'"))).fetch_one(&runtime_pool).await?;
+            require(count == 1, "runtime member ledger CRUD differed")?;
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DELETE FROM public.{table} WHERE guild_id = 'roles-member'"))).execute(&runtime_pool).await?;
+        }
+        Ok(())
+    }.await;
+    runtime_pool.close().await;
+    result
+}
+
 async fn automod_runtime_role_regression(
     pool: &PgPool,
     roles: &[String],
@@ -677,6 +891,235 @@ async fn transactional_drift(
     .await;
     tx.rollback().await?;
     result
+}
+
+/// Staging ledger before the first bootstrap: the 29 migration versions the
+/// pending set is computed against. Pending versions are derived as every
+/// other source version, so later migrations join the pending set unlisted.
+/// Three pending versions create tables with no object-matrix row yet (0370
+/// containment claims, 0410 member erasure audit, 0411 invite campaigns);
+/// they stay out of this rehearsal until the matrix backfill lands, and the
+/// backfill removes this exclusion. A new migration that creates an
+/// unmatrixed table fails this test at the final verify, by design.
+const STAGING_LEDGER29: [i64; 29] = [
+    1, 2, 120, 121, 122, 123, 140, 141, 150, 160, 170, 180, 190, 200, 210, 300, 310, 311, 320, 330,
+    331, 332, 333, 334, 340, 350, 351, 360, 390,
+];
+const PENDING_EXCLUDED_WITHOUT_MATRIX_ROW: [i64; 3] = [370, 410, 411];
+
+/// The ephemeral self-grant must be gone after the plan commits: the
+/// executing identity cannot SET the migrator group anymore. Runs inside a
+/// rolled-back transaction so the pooled connection keeps no role state.
+async fn cannot_set_role(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let result = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET LOCAL ROLE {role}")))
+        .execute(&mut *tx)
+        .await;
+    tx.rollback().await?;
+    match result {
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42501") => Ok(()),
+        _ => Err(sqlx::Error::InvalidArgument(format!(
+            "{role} membership was not revoked"
+        ))),
+    }
+}
+
+#[tokio::test]
+async fn scratch_bootstrap_flow_from_staging_ledger() {
+    let url = match std::env::var("TWO_ROLES_TEST_DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") => TEST_URL.to_owned(),
+        Err(_) => return, // Offline suite: explicitly requested and CI tests never skip.
+    };
+    let options = test_database::test_options(&url).expect("refusing non-test-container target");
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    let (name, roles) = names();
+    let provisioner = format!("{name}_p");
+    let migrator_login = format!("{name}_l");
+    // Non-superuser CREATEROLE provisioning identity owning the scratch
+    // database, plus a plain login that becomes the dedicated migrator login.
+    // Trust auth on the disposable cluster takes the empty password, exactly
+    // like the existing acceptance test.
+    execute(
+        &admin,
+        format!("CREATE ROLE {provisioner} LOGIN CREATEROLE"),
+    )
+    .await
+    .unwrap();
+    execute(&admin, format!("CREATE ROLE {migrator_login} LOGIN"))
+        .await
+        .unwrap();
+    execute(
+        &admin,
+        format!("CREATE DATABASE {name} OWNER {provisioner}"),
+    )
+    .await
+    .unwrap();
+    let provision_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone().username(&provisioner).database(&name))
+        .await
+        .unwrap();
+    // Build the 29-version state as the provisioning identity.
+    let all = migration_files();
+    let mut ledger = 0usize;
+    for (version, migration) in &all {
+        if STAGING_LEDGER29.contains(version) {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(migration.clone()))
+                .execute(&provision_pool)
+                .await
+                .unwrap();
+            ledger += 1;
+        }
+    }
+    require(ledger == STAGING_LEDGER29.len(), "29-state incomplete").unwrap();
+    sqlx::raw_sql(include_str!("../../../sql/web_v1.sql"))
+        .execute(&provision_pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);")
+        .execute(&provision_pool)
+        .await
+        .unwrap();
+    let ledger_rows = STAGING_LEDGER29
+        .iter()
+        .map(|version| format!("({version})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO public._sqlx_migrations (version) VALUES {ledger_rows}"
+    )))
+    .execute(&provision_pool)
+    .await
+    .unwrap();
+    // The default phase still fails closed on the absent relations.
+    let error = execute(
+        &provision_pool,
+        isolated(
+            &database_roles::plan_for_phase(database_roles::Phase::Full),
+            &roles,
+        ),
+    )
+    .await
+    .expect_err("full plan must raise on absent relations");
+    match error {
+        sqlx::Error::Database(error) => {
+            require(
+                error.message().contains("missing relation"),
+                "full plan failed without the strict raise",
+            )
+            .unwrap();
+        }
+        other => panic!("unexpected full-plan error: {other:?}"),
+    }
+    // The refused plan leaves this pooled connection inside an aborted BEGIN;
+    // roll back before reuse or the next statement fails with 25P02.
+    sqlx::raw_sql("ROLLBACK")
+        .execute(&provision_pool)
+        .await
+        .unwrap();
+    // The bootstrap phase transfers the existing objects as the non-superuser
+    // identity, using the ephemeral SET membership for this transaction only.
+    execute(
+        &provision_pool,
+        isolated(
+            &database_roles::plan_for_phase(database_roles::Phase::Bootstrap),
+            &roles,
+        ),
+    )
+    .await
+    .unwrap();
+    cannot_set_role(&provision_pool, &roles[0]).await.unwrap();
+    // Part A equivalent (operator action): the dedicated migrator login joins
+    // the migrator group. It keeps SET membership; the provisioning identity
+    // does not.
+    execute(&admin, format!("GRANT {} TO {migrator_login}", roles[0]))
+        .await
+        .unwrap();
+    let migrator_role = roles[0].clone();
+    let migrator_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |connection, _| {
+            let role = migrator_role.clone();
+            Box::pin(async move {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET ROLE {role}")))
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(options.clone().username(&migrator_login).database(&name))
+        .await
+        .unwrap();
+    // Apply every pending migration as a SET ROLE member, then record them.
+    // Versions without a matrix row are excluded until the backfill lands.
+    let mut pending = Vec::new();
+    for (version, migration) in &all {
+        if !STAGING_LEDGER29.contains(version)
+            && !PENDING_EXCLUDED_WITHOUT_MATRIX_ROW.contains(version)
+        {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(migration.clone()))
+                .execute(&migrator_pool)
+                .await
+                .unwrap();
+            pending.push(*version);
+        }
+    }
+    require(!pending.is_empty(), "no pending migrations applied").unwrap();
+    let pending_rows = pending
+        .iter()
+        .map(|version| format!("({version})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO public._sqlx_migrations (version) VALUES {pending_rows}"
+    )))
+    .execute(&migrator_pool)
+    .await
+    .unwrap();
+    // The full phase is idempotent once every object exists; the ephemeral
+    // grant is re-acquired and revoked on each run.
+    for _ in 0..2 {
+        execute(
+            &provision_pool,
+            isolated(
+                &database_roles::plan_for_phase(database_roles::Phase::Full),
+                &roles,
+            ),
+        )
+        .await
+        .unwrap();
+        cannot_set_role(&provision_pool, &roles[0]).await.unwrap();
+    }
+    // Verify as the superuser: the provisioning identity intentionally keeps
+    // no schema access after the transfer, and catalog inspection needs none.
+    let scratch_admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.database(&name))
+        .await
+        .unwrap();
+    require(
+        findings(&scratch_admin, &roles).await.unwrap().is_empty(),
+        "bootstrap flow drifted",
+    )
+    .unwrap();
+    provision_pool.close().await;
+    migrator_pool.close().await;
+    scratch_admin.close().await;
+    // Clean up even if a privilege probe failed. Only generated owned names.
+    execute(&admin, format!("DROP DATABASE {name}"))
+        .await
+        .unwrap();
+    for role in roles.iter().chain([&provisioner, &migrator_login]) {
+        execute(&admin, format!("DROP ROLE IF EXISTS {role}"))
+            .await
+            .unwrap();
+    }
+    admin.close().await;
 }
 
 #[tokio::test]

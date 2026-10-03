@@ -4,9 +4,10 @@ use std::collections::BTreeSet;
 
 use proptest::prelude::*;
 use two_bot_core::voice_text_channel::{
-    occupancy_diff, plan_companion_deletion, sanitise_channel_name, text_channel_plan,
-    ChannelOverwrite, OverwriteTarget, TextChannelSettings, VoiceRoomFacts,
-    DEFAULT_TEXT_CHANNEL_NAME, MAX_TEXT_CHANNEL_NAME_CHARS,
+    admin_view_roles, occupancy_diff, plan_companion_deletion, sanitise_channel_name,
+    text_channel_plan, ChannelOverwrite, OverwriteTarget, TextChannelSettings, VoiceRoomFacts,
+    DEFAULT_TEXT_CHANNEL_NAME, MAX_TEXT_CHANNEL_NAME_CHARS, PERMISSION_BIT_ADMINISTRATOR,
+    PERMISSION_BIT_MANAGE_CHANNELS,
 };
 
 fn settings(enabled: bool) -> TextChannelSettings {
@@ -23,6 +24,7 @@ fn room<'a>(occupants: &'a [u64], admin_ids: &'a [u64]) -> VoiceRoomFacts<'a> {
         category_id: 13,
         occupants,
         admin_ids,
+        admin_role_ids: &[],
     }
 }
 
@@ -185,6 +187,93 @@ fn plan_carries_the_settings_snapshot() {
 fn deleted_room_maps_to_companion_deletion() {
     let deletion = plan_companion_deletion(11);
     assert_eq!(deletion.room_id, 11);
+}
+
+#[test]
+fn admin_view_roles_keep_manage_channels_without_admin_or_everyone() {
+    // Manage Channels role qualifies; Administrator bypasses overwrites and
+    // @everyone is covered by the @everyone entry, so neither gets an entry.
+    // Zero IDs are dropped; output is sorted and deduplicated.
+    assert_eq!(
+        admin_view_roles(
+            7,
+            &[
+                (51, PERMISSION_BIT_MANAGE_CHANNELS),
+                (
+                    52,
+                    PERMISSION_BIT_ADMINISTRATOR | PERMISSION_BIT_MANAGE_CHANNELS
+                ),
+                (7, PERMISSION_BIT_MANAGE_CHANNELS),
+                (53, 0),
+                (0, PERMISSION_BIT_MANAGE_CHANNELS),
+                (51, PERMISSION_BIT_MANAGE_CHANNELS),
+                (50, PERMISSION_BIT_MANAGE_CHANNELS),
+            ]
+        ),
+        vec![50, 51]
+    );
+    assert_eq!(admin_view_roles(7, &[]), Vec::<u64>::new());
+}
+
+fn room_with_roles<'a>(
+    occupants: &'a [u64],
+    admin_ids: &'a [u64],
+    admin_role_ids: &'a [u64],
+) -> VoiceRoomFacts<'a> {
+    VoiceRoomFacts {
+        guild_id: 7,
+        room_id: 11,
+        category_id: 13,
+        occupants,
+        admin_ids,
+        admin_role_ids,
+    }
+}
+
+#[test]
+fn admin_roles_become_role_allows() {
+    // A newly promoted admin role covers the room without any per-member
+    // update: the Role allow is in the initial overwrite set.
+    let plan = text_channel_plan(&settings(true), &room_with_roles(&[21], &[], &[51, 52])).unwrap();
+    assert_eq!(
+        plan.overwrites,
+        vec![
+            deny(OverwriteTarget::Everyone),
+            allow(OverwriteTarget::Role(51)),
+            allow(OverwriteTarget::Role(52)),
+            allow(OverwriteTarget::Member(21)),
+        ]
+    );
+}
+
+#[test]
+fn admin_role_matching_viewer_role_is_emitted_once() {
+    let settings = TextChannelSettings {
+        enabled: true,
+        viewer_role_id: Some(42),
+        ..TextChannelSettings::default()
+    };
+    let plan = text_channel_plan(&settings, &room_with_roles(&[21], &[], &[42])).unwrap();
+    assert_eq!(
+        plan.overwrites
+            .iter()
+            .filter(|o| o.target == OverwriteTarget::Role(42))
+            .count(),
+        1,
+        "viewer role and admin role collapse to one Role allow"
+    );
+}
+
+#[test]
+fn admin_role_matching_everyone_and_zero_are_dropped() {
+    let plan = text_channel_plan(&settings(true), &room_with_roles(&[21], &[], &[7, 0])).unwrap();
+    assert!(
+        !plan
+            .overwrites
+            .iter()
+            .any(|o| matches!(o.target, OverwriteTarget::Role(_))),
+        "@everyone is covered by the @everyone entry; zero is never emitted"
+    );
 }
 
 fn apply(before: &[u64], grants: &[u64], revokes: &[u64]) -> BTreeSet<u64> {

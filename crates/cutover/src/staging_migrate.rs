@@ -101,7 +101,7 @@ pub fn parse_expected_pending(raw: &str) -> Result<Vec<i64>, String> {
 /// Pure prerequisite checks; nothing here touches the network.
 ///
 /// Pinned-identity model: the workflow pins the exact non-secret staging
-/// endpoint host and database name per dispatch, and [`verify_target`]
+/// endpoint host and database name per dispatch, and `verify_target`
 /// refuses before any DDL unless the secret migrator binding points at
 /// exactly that pinned identity. A `staging` substring in the database name
 /// remains accepted but is no longer required, so the verified shared-Neon

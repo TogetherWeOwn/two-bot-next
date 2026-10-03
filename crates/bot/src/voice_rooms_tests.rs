@@ -24,8 +24,12 @@ fn permissions() -> Permissions {
 }
 
 fn role(permissions: Permissions) -> Role {
+    role_with(GUILD, permissions)
+}
+
+fn role_with(id: u64, permissions: Permissions) -> Role {
     serde_json::from_value(json!({
-        "id": "100", "name": "everyone", "color": 0, "hoist": false,
+        "id": id.to_string(), "name": "everyone", "color": 0, "hoist": false,
         "managed": false, "mentionable": false, "position": 0,
         "colors": { "primary_color": 0, "secondary_color": null, "tertiary_color": null },
         "permissions": permissions.bits().to_string(), "flags": 0
@@ -79,6 +83,7 @@ struct Store {
     trace: Trace,
     creators: Mutex<Vec<CreatorChannel>>,
     rooms: Mutex<HashMap<u64, VoiceRoom>>,
+    companions: Mutex<HashMap<(u64, u64), TextCompanion>>,
     persist_error: Option<StoreError>,
     access: Arc<Mutex<AccessControls>>,
     access_error: Option<StoreError>,
@@ -87,6 +92,7 @@ struct Store {
     logging_error: Option<StoreError>,
     save_logging_error: Option<StoreError>,
     forget_errors: Mutex<VecDeque<StoreError>>,
+    companion_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
     after_persist: Option<Hook>,
 }
@@ -97,6 +103,7 @@ impl Store {
             trace,
             creators: Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)]),
             rooms: Mutex::new(HashMap::new()),
+            companions: Mutex::new(HashMap::new()),
             persist_error: None,
             access: Arc::new(Mutex::new(AccessControls::default())),
             access_error: None,
@@ -105,6 +112,7 @@ impl Store {
             logging_error: None,
             save_logging_error: None,
             forget_errors: Mutex::new(VecDeque::new()),
+            companion_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
             after_persist: None,
         }
@@ -160,8 +168,23 @@ impl RoomPersistence for Store {
             .lock()
             .unwrap()
             .push(format!("add_creator:{}", creator.channel_id));
-        self.creators.lock().unwrap().push(creator.clone());
+        let mut creators = self.creators.lock().unwrap();
+        creators.retain(|row| row.channel_id != creator.channel_id);
+        creators.push(creator.clone());
         Ok(())
+    }
+    async fn creator_for(
+        &self,
+        _: u64,
+        channel: u64,
+    ) -> Result<Option<CreatorChannel>, StoreError> {
+        Ok(self
+            .creators
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|row| row.channel_id == channel)
+            .cloned())
     }
     async fn persist(&self, room: &VoiceRoom) -> Result<(), StoreError> {
         self.trace
@@ -180,6 +203,20 @@ impl RoomPersistence for Store {
             .insert(room.channel_id, room.clone());
         Ok(())
     }
+    async fn update_ownership(&self, room: &VoiceRoom) -> Result<bool, StoreError> {
+        self.trace.lock().unwrap().push(format!(
+            "update_ownership:{}:{}",
+            room.channel_id, room.owner_id
+        ));
+        let mut rooms = self.rooms.lock().unwrap();
+        if let Some(stored) = rooms.get_mut(&room.channel_id) {
+            stored.owner_id = room.owner_id;
+            stored.original_creator_id = room.original_creator_id;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
     async fn forget(&self, _: u64, channel: u64) -> Result<(), StoreError> {
         self.trace.lock().unwrap().push(format!("forget:{channel}"));
         if let Some(error) = self.forget_errors.lock().unwrap().pop_front() {
@@ -187,6 +224,38 @@ impl RoomPersistence for Store {
         }
         self.rooms.lock().unwrap().remove(&channel);
         Ok(())
+    }
+    async fn companions(&self, _: u64) -> Result<Vec<TextCompanion>, StoreError> {
+        Ok(self.companions.lock().unwrap().values().cloned().collect())
+    }
+    async fn add_companion(&self, companion: &TextCompanion) -> Result<bool, StoreError> {
+        self.trace.lock().unwrap().push(format!(
+            "add_companion:{}:{}",
+            companion.room_channel_id, companion.text_channel_id
+        ));
+        if let Some(error) = self.companion_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        Ok(self
+            .companions
+            .lock()
+            .unwrap()
+            .insert(
+                (companion.guild_id, companion.room_channel_id),
+                companion.clone(),
+            )
+            .is_none())
+    }
+    async fn remove_companion(
+        &self,
+        guild: u64,
+        room: u64,
+    ) -> Result<Option<TextCompanion>, StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("remove_companion:{room}"));
+        Ok(self.companions.lock().unwrap().remove(&(guild, room)))
     }
 }
 
@@ -197,9 +266,12 @@ struct Http {
     move_errors: Mutex<VecDeque<RoomHttpError>>,
     delete_errors: Mutex<VecDeque<RoomHttpError>>,
     rename_errors: Mutex<VecDeque<RoomHttpError>>,
+    companion_errors: Mutex<VecDeque<RoomHttpError>>,
+    view_errors: Mutex<VecDeque<RoomHttpError>>,
     notices: Mutex<Vec<(NoticeTarget, String, Option<u64>)>>,
     refused_notices: Mutex<Vec<NoticeTarget>>,
     created_attributes: Mutex<Vec<RoomChannelAttributes>>,
+    companion_plans: Mutex<Vec<TextChannelPlan>>,
     after_create: Option<Hook>,
     before_move: Option<Hook>,
     before_delete: Option<Hook>,
@@ -214,9 +286,12 @@ impl Http {
             move_errors: Mutex::new(VecDeque::new()),
             delete_errors: Mutex::new(VecDeque::new()),
             rename_errors: Mutex::new(VecDeque::new()),
+            companion_errors: Mutex::new(VecDeque::new()),
+            view_errors: Mutex::new(VecDeque::new()),
             notices: Mutex::new(Vec::new()),
             refused_notices: Mutex::new(Vec::new()),
             created_attributes: Mutex::new(Vec::new()),
+            companion_plans: Mutex::new(Vec::new()),
             after_create: None,
             before_move: None,
             before_delete: None,
@@ -327,6 +402,68 @@ impl RoomWrites for Http {
             .unwrap()
             .push(format!("rename:{channel}:{name}"));
         match self.rename_errors.lock().unwrap().pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    async fn create_companion(
+        &self,
+        plan: &TextChannelPlan,
+        bot_id: Snowflake,
+        guard: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace.lock().unwrap().push(format!(
+            "create_companion:{}:{}:{bot_id}",
+            plan.room_id, plan.name
+        ));
+        self.companion_plans.lock().unwrap().push(plan.clone());
+        if let Some(error) = self.companion_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        let id = {
+            let mut id = self.next_id.lock().unwrap();
+            let next = *id;
+            *id += 1;
+            next
+        };
+        // Text channel: kind 0, parented to the room's category.
+        Ok(channel(id, 0, Some(plan.category_id)))
+    }
+    async fn grant_companion_view(
+        &self,
+        text_channel: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("grant:{text_channel}:{member}"));
+        match self.view_errors.lock().unwrap().pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    async fn revoke_companion_view(
+        &self,
+        text_channel: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("revoke:{text_channel}:{member}"));
+        match self.view_errors.lock().unwrap().pop_front() {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -567,6 +704,289 @@ async fn reconnect_only_prunes_tracked_empty_channels_and_counts_unknown_members
     assert!(!calls.contains(&"delete:501".to_owned()));
     assert!(!calls.iter().any(|call| call.contains("900")));
     assert_eq!(worker.tracked().len(), 2);
+}
+
+#[tokio::test]
+async fn owner_leave_hands_room_to_earliest_joiner_and_persists() {
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    // Owner 300 alone first; 302 arrives, then 301. Caretaker is 302 by
+    // earliest join time even though 301 sorts first by id.
+    live.publish(snapshot(
+        &[500],
+        vec![VoiceMember {
+            member_id: MEMBER,
+            channel_id: 500,
+            bot: Some(false),
+        }],
+    ));
+    live.voice_update_at(302, Some(500), Some(false), 1_000);
+    live.voice_update_at(301, Some(500), Some(false), 2_000);
+    live.voice_update_at(MEMBER, None, Some(false), 3_000);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reconcile();
+    let tracked = worker.tracked().get(&500).expect("tracked room");
+    assert_eq!(tracked.owner_id, 302);
+    assert_eq!(tracked.original_creator_id, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&"update_ownership:500:302".to_owned()));
+    // Idempotent: the next tick sees the owner present and enqueues nothing.
+    let queued = worker.queue.pending_counts(GUILD);
+    worker.reconcile();
+    assert_eq!(worker.queue.pending_counts(GUILD), queued);
+}
+
+#[tokio::test]
+async fn succession_skips_present_owners_and_pending_moves() {
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.publish(snapshot(
+        &[500],
+        vec![
+            VoiceMember {
+                member_id: MEMBER,
+                channel_id: 500,
+                bot: Some(false),
+            },
+            VoiceMember {
+                member_id: 301,
+                channel_id: 500,
+                bot: Some(false),
+            },
+        ],
+    ));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Owner present: no handoff.
+    worker.reconcile();
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, MEMBER);
+    // Owner leaves while their move is still in flight: succession waits
+    // for the inbound owner instead of handing the room off.
+    worker.moves.insert(
+        500,
+        JoinTicket {
+            member_id: MEMBER,
+            creator_id: CREATOR,
+            generation: 0,
+            transition: 0,
+        },
+    );
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 4_000);
+    worker.reconcile();
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, MEMBER);
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call.starts_with("update_ownership")));
+}
+
+/// One room with two occupants: owner `MEMBER` (creator), plus 301.
+fn owned_room() -> (LiveGuild, Store, Http, Trace) {
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.publish(snapshot(
+        &[500],
+        vec![
+            VoiceMember {
+                member_id: MEMBER,
+                channel_id: 500,
+                bot: Some(false),
+            },
+            VoiceMember {
+                member_id: 301,
+                channel_id: 500,
+                bot: Some(false),
+            },
+        ],
+    ));
+    (live, store, http, trace)
+}
+
+#[tokio::test]
+async fn reclaim_hands_room_back_to_returned_creator_and_persists() {
+    let (live, store, http, trace) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Owner leaves first, so 301 is the caretaker; the creator returns.
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 1_000);
+    worker.reconcile();
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, 301);
+    worker
+        .live
+        .voice_update_at(MEMBER, Some(500), Some(false), 2_000);
+    let text = worker.apply_ownership(MEMBER, false, OwnershipCommand::Reclaim);
+    assert!(text.contains("owner of this room again"), "{text}");
+    let tracked = worker.tracked().get(&500).expect("tracked room");
+    assert_eq!(tracked.owner_id, MEMBER);
+    assert_eq!(tracked.original_creator_id, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert!(
+        trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.starts_with("update_ownership"))
+            .count()
+            >= 1
+    );
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("update_ownership:500:{MEMBER}")));
+}
+
+#[tokio::test]
+async fn reclaim_claims_room_whose_owner_is_gone() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Owner leaves; the claim runs before any succession pass while the
+    // owner-absent snapshot is current.
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 1_000);
+    let text = worker.apply_ownership(301, false, OwnershipCommand::Reclaim);
+    assert!(text.contains("yours now"), "{text}");
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, 301);
+}
+
+#[tokio::test]
+async fn reclaim_refuses_non_creator_while_owner_present() {
+    let (live, store, http, trace) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let text = worker.apply_ownership(301, false, OwnershipCommand::Reclaim);
+    assert!(text.contains("original creator"), "{text}");
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, MEMBER);
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn reclaim_repeated_is_idempotent() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 1_000);
+    worker.reconcile();
+    worker
+        .live
+        .voice_update_at(MEMBER, Some(500), Some(false), 2_000);
+    let first = worker.apply_ownership(MEMBER, false, OwnershipCommand::Reclaim);
+    assert!(first.contains("again"), "{first}");
+    let second = worker.apply_ownership(MEMBER, false, OwnershipCommand::Reclaim);
+    assert!(second.contains("already the owner"), "{second}");
+}
+
+#[tokio::test]
+async fn reclaim_outside_voice_asks_to_join() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let text = worker.apply_ownership(302, false, OwnershipCommand::Reclaim);
+    assert!(text.contains("need to be in a voice room"), "{text}");
+}
+
+#[tokio::test]
+async fn transfer_hands_room_to_occupant_and_remembers_creator() {
+    let (live, store, http, trace) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let text = worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
+    assert!(
+        text.contains("Transferred") && text.contains("<@301>"),
+        "{text}"
+    );
+    let tracked = worker.tracked().get(&500).expect("tracked room");
+    assert_eq!(tracked.owner_id, 301);
+    assert_eq!(tracked.original_creator_id, 301);
+    dispatch(&mut worker, 0).await;
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&"update_ownership:500:301".to_owned()));
+}
+
+#[tokio::test]
+async fn transfer_rejects_recipient_outside_room() {
+    let (live, store, http, trace) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let text = worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 302 });
+    assert!(text.contains("must be in the room"), "{text}");
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, MEMBER);
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn transfer_refuses_non_owner() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let text = worker.apply_ownership(301, false, OwnershipCommand::Transfer { target_id: MEMBER });
+    assert!(text.contains("Only the room owner"), "{text}");
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, MEMBER);
+}
+
+#[tokio::test]
+async fn transfer_replay_by_former_owner_fails_authorization() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let first =
+        worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
+    assert!(first.contains("Transferred"), "{first}");
+    // The former owner cannot replay the same handoff to take the room back.
+    let replay = worker.apply_ownership(
+        MEMBER,
+        false,
+        OwnershipCommand::Transfer { target_id: MEMBER },
+    );
+    assert!(replay.contains("Only the room owner"), "{replay}");
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, 301);
+}
+
+#[tokio::test]
+async fn admin_transfer_from_outside_voice_names_occupied_room() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Admin 999 is nowhere in voice but may act on any room.
+    let text = worker.apply_ownership(999, true, OwnershipCommand::Transfer { target_id: 301 });
+    assert!(
+        text.contains("Transferred") && text.contains("<@301>"),
+        "{text}"
+    );
+    let tracked = worker.tracked().get(&500).expect("tracked room");
+    assert_eq!(tracked.owner_id, 301);
+    assert_eq!(tracked.original_creator_id, 301);
+}
+
+#[tokio::test]
+async fn ownership_commands_on_untracked_channel_refuse() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .voice_update_at(302, Some(999), Some(false), 1_000);
+    let text = worker.apply_ownership(302, false, OwnershipCommand::Reclaim);
+    assert!(text.contains("isn't a temporary room"), "{text}");
+}
+
+#[tokio::test]
+async fn ownership_commands_while_halted_refuse_paused() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.halted = true;
+    let text = worker.apply_ownership(MEMBER, false, OwnershipCommand::Reclaim);
+    assert!(text.contains("paused"), "{text}");
 }
 
 #[tokio::test]
@@ -959,7 +1379,17 @@ fn voice_command_set_is_gated_on_two_voice() {
         .collect();
     assert_eq!(
         names,
-        ["create", "setup", "ping", "invite", "access", "logging"]
+        [
+            "create",
+            "setup",
+            "ping",
+            "invite",
+            "textchannels",
+            "access",
+            "reclaim",
+            "transfer",
+            "logging"
+        ]
     );
     let off = VoiceGates::from_map(&Default::default());
     assert!(voice_command_set(&off).is_empty());
@@ -1046,7 +1476,84 @@ use twilight_model::{
     },
     guild::{MemberFlags, PartialMember},
     oauth::ApplicationIntegrationMap,
+    user::User,
 };
+
+fn test_user(id: u64) -> User {
+    User {
+        accent_color: None,
+        avatar: None,
+        avatar_decoration: None,
+        avatar_decoration_data: None,
+        banner: None,
+        bot: false,
+        discriminator: 0,
+        email: None,
+        flags: None,
+        global_name: None,
+        id: Id::new(id),
+        locale: None,
+        mfa_enabled: None,
+        name: "member".to_owned(),
+        premium_type: None,
+        primary_guild: None,
+        public_flags: None,
+        system: None,
+        verified: None,
+    }
+}
+
+/// Interaction invoked by `user_id` (guild member by default). The ownership
+/// handlers authenticate the actor from `member.user`, else the top-level user.
+fn voice_interaction_as(
+    command: Option<CommandData>,
+    permissions: Option<Permissions>,
+    user_id: u64,
+) -> Interaction {
+    let mut interaction = voice_interaction(command, permissions, true);
+    if let Some(member) = interaction.member.as_mut() {
+        member.user = Some(test_user(user_id));
+    } else {
+        interaction.user = Some(test_user(user_id));
+    }
+    interaction
+}
+
+async fn wait_trace(trace: &Trace, entry: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if trace.lock().unwrap().iter().any(|value| value == entry) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "lifecycle trace deadline waiting for {entry}: {:?}",
+            trace.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Runtime with one tracked room (channel 500, owner/creator `MEMBER`) and a
+/// second occupant 301. Drives the real actor so ownership commands run
+/// against live worker state. The trailing voice frames are Discord reporting
+/// both members inside the new room — live occupancy only moves on frames,
+/// never on the create/move dispatch itself.
+async fn ownership_room_runtime(trace: Trace) -> VoiceRuntime<Store, Http> {
+    let runtime = test_runtime(trace.clone());
+    assert!(runtime.publish_snapshot(GUILD, snapshot(&[], vec![])));
+    assert!(runtime.voice_frame(
+        GUILD,
+        MEMBER,
+        Some(CREATOR),
+        Some(false),
+        "ava's room".to_owned(),
+    ));
+    wait_trace(&trace, "persist:500").await;
+    assert!(runtime.voice_frame(GUILD, MEMBER, Some(500), Some(false), "x".to_owned()));
+    assert!(runtime.voice_frame(GUILD, 301, Some(500), Some(false), "x".to_owned()));
+    runtime
+}
 
 fn member_with(permissions: Option<Permissions>) -> PartialMember {
     PartialMember {
@@ -1132,10 +1639,14 @@ fn response_text(response: &InteractionResponse) -> String {
         .unwrap_or_default()
 }
 
-async fn handle_capture(
-    runtime: &VoiceRuntime<Store, Http>,
+async fn handle_capture<S, H>(
+    runtime: &VoiceRuntime<S, H>,
     interaction: &Interaction,
-) -> (bool, Option<InteractionResponse>) {
+) -> (bool, Option<InteractionResponse>)
+where
+    S: RoomPersistence + Send + 'static,
+    H: RoomWrites + Send + 'static,
+{
     let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
     let writer = seen.clone();
     let owned = handle_voice_interaction(runtime, interaction, |response| {
@@ -1200,6 +1711,58 @@ fn parse_ping_and_invite_commands() {
     }
 }
 
+fn user_option(name: &str, id: u64) -> CommandDataOption {
+    CommandDataOption {
+        name: name.to_owned(),
+        value: CommandOptionValue::User(Id::new(id)),
+    }
+}
+
+#[test]
+fn parse_reclaim_command() {
+    let interaction = voice_interaction(Some(command_data("reclaim", Vec::new())), None, true);
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Reclaim)
+    );
+    let guildless = voice_interaction(Some(command_data("reclaim", Vec::new())), None, false);
+    assert_eq!(parse_voice_command(&guildless), None);
+}
+
+#[test]
+fn parse_transfer_extracts_member_target() {
+    let interaction = voice_interaction(
+        Some(command_data("transfer", vec![user_option("member", 301)])),
+        None,
+        true,
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Transfer { target_id: 301 })
+    );
+}
+
+#[test]
+fn parse_transfer_without_member_defaults_zero_for_refusal() {
+    let interaction = voice_interaction(Some(command_data("transfer", Vec::new())), None, true);
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Transfer { target_id: 0 })
+    );
+    let wrong_type = voice_interaction(
+        Some(command_data(
+            "transfer",
+            vec![command_option("member", "301")],
+        )),
+        None,
+        true,
+    );
+    assert_eq!(
+        parse_voice_command(&wrong_type),
+        Some(VoiceCommand::Transfer { target_id: 0 })
+    );
+}
+
 #[test]
 fn interaction_latency_counts_from_the_snowflake_timestamp() {
     let created_ms = DISCORD_EPOCH_MS + 1_000_000;
@@ -1252,6 +1815,78 @@ async fn invite_renders_the_vanity_code_or_the_fixed_notice() {
         "Join the server: https://discord.gg/abc-123"
     );
     assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn handle_transfer_by_owner_hands_room_to_occupant() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let interaction = voice_interaction_as(
+        Some(command_data("transfer", vec![user_option("member", 301)])),
+        None,
+        MEMBER,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(
+        text.contains("Transferred") && text.contains("<@301>"),
+        "{text}"
+    );
+    let status = tokio::time::timeout(Duration::from_secs(5), runtime.worker_status(GUILD))
+        .await
+        .expect("status reply")
+        .expect("live actor");
+    assert_eq!(status.tracked_rooms, 1);
+    // Persistence lands on the actor's timer tick, not in the reply path.
+    wait_trace(&trace, "update_ownership:500:301").await;
+}
+
+#[tokio::test]
+async fn handle_transfer_rejects_recipient_outside_room() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let interaction = voice_interaction_as(
+        Some(command_data("transfer", vec![user_option("member", 302)])),
+        None,
+        MEMBER,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(text.contains("must be in the room"), "{text}");
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn handle_reclaim_by_non_creator_refuses_while_owner_present() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let interaction = voice_interaction_as(Some(command_data("reclaim", Vec::new())), None, 301);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(text.contains("original creator"), "{text}");
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn handle_reclaim_outside_voice_asks_to_join() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let interaction = voice_interaction_as(Some(command_data("reclaim", Vec::new())), None, 302);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(text.contains("need to be in a voice room"), "{text}");
 }
 
 fn gated_runtime(
@@ -1900,6 +2535,278 @@ fn parse_ignores_unowned_commands() {
     assert_eq!(parse_voice_command(&ping), None);
 }
 
+fn typed_option(name: &str, value: CommandOptionValue) -> CommandDataOption {
+    CommandDataOption {
+        name: name.to_owned(),
+        value,
+    }
+}
+
+fn textchannels_interaction(
+    options: Vec<CommandDataOption>,
+    permissions: Option<Permissions>,
+) -> Interaction {
+    voice_interaction(
+        Some(command_data("textchannels", options)),
+        permissions,
+        true,
+    )
+}
+
+#[test]
+fn parse_textchannels_extracts_every_option() {
+    let interaction = textchannels_interaction(
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("enabled", CommandOptionValue::Boolean(false)),
+            typed_option("name", CommandOptionValue::String("lounge".to_owned())),
+            typed_option("viewer-role", CommandOptionValue::Role(Id::new(42))),
+        ],
+        Some(Permissions::MANAGE_CHANNELS),
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::TextChannels {
+            channel_id: CREATOR,
+            request: TextChannelsRequest {
+                enabled: Some(false),
+                name: Some("lounge".to_owned()),
+                viewer_role: Some(42),
+            },
+        })
+    );
+}
+
+#[test]
+fn parse_textchannels_leaves_unset_options_unset() {
+    let interaction = textchannels_interaction(
+        vec![typed_option(
+            "channel",
+            CommandOptionValue::Channel(Id::new(CREATOR)),
+        )],
+        Some(Permissions::MANAGE_CHANNELS),
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::TextChannels {
+            channel_id: CREATOR,
+            request: TextChannelsRequest {
+                enabled: None,
+                name: None,
+                viewer_role: None,
+            },
+        })
+    );
+}
+
+fn request(enabled: Option<bool>, name: Option<&str>, role: Option<u64>) -> TextChannelsRequest {
+    TextChannelsRequest {
+        enabled,
+        name: name.map(str::to_owned),
+        viewer_role: role,
+    }
+}
+
+fn plan_creator(plan: TextChannelsPlan) -> CreatorChannel {
+    match plan {
+        TextChannelsPlan::Update(creator) => creator,
+        TextChannelsPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    }
+}
+
+#[test]
+fn decide_text_channels_defaults_to_on_and_keeps_unset_fields() {
+    let base = CreatorChannel::new(GUILD, CREATOR);
+    let creator = plan_creator(decide_text_channels(
+        Some(base.clone()),
+        &request(None, None, None),
+    ));
+    assert!(creator.text_channels, "omitted toggle turns companions on");
+    assert_eq!(creator.text_channel_name, None);
+    assert_eq!(creator.text_viewer_role_id, None);
+    assert_eq!(creator.name_template, base.name_template);
+}
+
+#[test]
+fn decide_text_channels_stores_trimmed_name_and_viewer_role() {
+    let creator = plan_creator(decide_text_channels(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &request(Some(true), Some("  lounge  "), Some(42)),
+    ));
+    assert_eq!(creator.text_channel_name.as_deref(), Some("lounge"));
+    assert_eq!(creator.text_viewer_role_id, Some(42));
+    // @everyone is a valid viewer role (companion visible to all).
+    let everyone = plan_creator(decide_text_channels(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &request(None, None, Some(GUILD)),
+    ));
+    assert_eq!(everyone.text_viewer_role_id, Some(GUILD));
+}
+
+#[test]
+fn decide_text_channels_off_keeps_stored_name_and_role() {
+    let mut on = CreatorChannel::new(GUILD, CREATOR);
+    on.text_channels = true;
+    on.text_channel_name = Some("lounge".to_owned());
+    on.text_viewer_role_id = Some(42);
+    let off = plan_creator(decide_text_channels(
+        Some(on),
+        &request(Some(false), None, None),
+    ));
+    assert!(!off.text_channels);
+    assert_eq!(off.text_channel_name.as_deref(), Some("lounge"));
+    assert_eq!(off.text_viewer_role_id, Some(42));
+}
+
+#[test]
+fn decide_text_channels_refuses_bad_input() {
+    let base = || Some(CreatorChannel::new(GUILD, CREATOR));
+    for bad in [
+        decide_text_channels(None, &request(None, None, None)),
+        decide_text_channels(base(), &request(None, Some("   "), None)),
+        decide_text_channels(base(), &request(None, Some(""), None)),
+        decide_text_channels(
+            base(),
+            &request(
+                None,
+                Some(&"x".repeat(MAX_TEXT_CHANNEL_NAME_CHARS + 1)),
+                None,
+            ),
+        ),
+    ] {
+        assert!(matches!(bad, TextChannelsPlan::Refuse { .. }), "{bad:?}");
+    }
+    // A name at the ceiling is accepted.
+    assert!(matches!(
+        decide_text_channels(
+            base(),
+            &request(None, Some(&"x".repeat(MAX_TEXT_CHANNEL_NAME_CHARS)), None)
+        ),
+        TextChannelsPlan::Update(_)
+    ));
+}
+
+#[test]
+fn command_names_key_the_role_restrictions() {
+    let commands = [
+        VoiceCommand::Create {
+            name: String::new(),
+        },
+        VoiceCommand::Setup,
+        VoiceCommand::Ping,
+        VoiceCommand::Invite,
+        VoiceCommand::TextChannels {
+            channel_id: CREATOR,
+            request: request(None, None, None),
+        },
+    ];
+    for command in &commands {
+        assert!(
+            two_bot_core::voice_access::VOICE_COMMANDS.contains(&command.name()),
+            "{} is not a restrictable voice command",
+            command.name()
+        );
+    }
+    assert_eq!(commands[4].name(), "textchannels");
+}
+
+#[test]
+fn text_channels_summary_reports_the_stored_settings() {
+    let mut creator = CreatorChannel::new(GUILD, CREATOR);
+    assert!(text_channels_summary(&creator).contains("off"));
+    creator.text_channels = true;
+    let text = text_channels_summary(&creator);
+    assert!(text.contains("on for <#200>"), "{text}");
+    assert!(text.contains(DEFAULT_TEXT_CHANNEL_NAME), "{text}");
+    assert!(text.contains("occupants and admins"), "{text}");
+    creator.text_viewer_role_id = Some(42);
+    assert!(text_channels_summary(&creator).contains("<@&42>"));
+    creator.text_viewer_role_id = Some(GUILD);
+    assert!(text_channels_summary(&creator).contains("everyone"));
+}
+
+#[tokio::test]
+async fn handle_textchannels_refuses_without_manage_channels() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = textchannels_interaction(
+        vec![typed_option(
+            "channel",
+            CommandOptionValue::Channel(Id::new(CREATOR)),
+        )],
+        Some(Permissions::VIEW_CHANNEL),
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(response_text(response.as_ref().expect("reply")).contains("Manage Channels"));
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("add_creator")));
+}
+
+#[tokio::test]
+async fn handle_textchannels_saves_settings_for_a_creator_channel() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = textchannels_interaction(
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("name", CommandOptionValue::String("lounge".to_owned())),
+            typed_option("viewer-role", CommandOptionValue::Role(Id::new(42))),
+        ],
+        Some(Permissions::MANAGE_CHANNELS),
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(text.contains("on for <#200>"), "{text}");
+    assert!(text.contains("lounge"), "{text}");
+    assert!(text.contains("<@&42>"), "{text}");
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("add_creator:{CREATOR}")));
+}
+
+#[tokio::test]
+async fn handle_textchannels_refuses_a_channel_that_is_not_a_creator() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = textchannels_interaction(
+        vec![typed_option(
+            "channel",
+            CommandOptionValue::Channel(Id::new(CREATOR + 1)),
+        )],
+        Some(Permissions::ADMINISTRATOR),
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(response_text(response.as_ref().expect("reply")).contains("/create"));
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("add_creator")));
+}
+
+#[tokio::test]
+async fn handle_textchannels_surfaces_store_failures() {
+    // The runtime factory builds a fresh store per command, so a failing
+    // write is exercised through the pure decision + a store directly.
+    let store = Store::new(Trace::default());
+    *store.add_creator_error.lock().unwrap() = Some(StoreError::Unavailable);
+    let creator = plan_creator(decide_text_channels(
+        store.creator_for(GUILD, CREATOR).await.unwrap(),
+        &request(Some(true), None, None),
+    ));
+    assert_eq!(
+        store.add_creator(&creator).await,
+        Err(StoreError::Unavailable)
+    );
+}
+
 #[test]
 fn ephemeral_response_is_ephemeral_channel_message() {
     let response = ephemeral_response("hello");
@@ -2285,6 +3192,515 @@ async fn disabled_gateway_responder_does_not_acknowledge() {
     );
     tokio::task::yield_now().await;
     assert!(trace.lock().unwrap().is_empty());
+}
+
+// --- V9c companion lifecycle --------------------------------------------------
+
+fn text_creator() -> CreatorChannel {
+    let mut creator = CreatorChannel::new(GUILD, CREATOR);
+    creator.text_channels = true;
+    creator
+}
+
+fn companion_fixture() -> (LiveGuild, Store, Http, Trace) {
+    let trace = Trace::default();
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(&[], vec![]));
+    let store = Store::new(trace.clone());
+    store.creators.lock().unwrap()[0] = text_creator();
+    (live, store, Http::new(trace.clone()), trace)
+}
+
+/// Drive one full join through room create, companion create and move.
+async fn join_with_companion(
+    worker: &mut GuildRoomWorker<Store, Http>,
+    member: u64,
+    now: &mut u64,
+) -> u64 {
+    join(worker, member);
+    // Room create.
+    dispatch(worker, *now).await;
+    *now += 1;
+    // Companion create.
+    dispatch(worker, *now).await;
+    *now += 1;
+    // Move.
+    dispatch(worker, *now).await;
+    *now += 1;
+    // Simulate Discord's voice-state echo: the member is now in the room.
+    worker.live.voice_update(member, Some(500), Some(false));
+    worker.reconcile();
+    // The companion plan was built before the move, so the creation
+    // overwrites carry no occupant: the echo's reconcile queues the first
+    // occupant's View grant. Drain it so callers start from an idle queue.
+    dispatch(worker, *now).await;
+    *now += 1;
+    500
+}
+
+#[tokio::test]
+async fn companion_created_with_room_when_toggle_on() {
+    let (live, store, http, trace) = companion_fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    join_with_companion(&mut worker, MEMBER, &mut now).await;
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        calls.contains(&"create".to_owned()),
+        "room created: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("create_companion:500:voice-chat:999")),
+        "companion POST carries room id, default name and bot id: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("add_companion:500:")),
+        "companion record persisted: {calls:?}"
+    );
+    assert_eq!(worker.companions.len(), 1);
+    let companion = &worker.companions[&500];
+    assert_eq!(companion.guild_id, GUILD);
+    assert!(companion.settings.enabled);
+}
+
+#[tokio::test]
+async fn no_companion_when_toggle_off() {
+    let (live, store, http, trace) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    worker.reconcile();
+    assert!(!worker.dispatch_one(2).await);
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        !calls.iter().any(|call| call.contains("companion")),
+        "{calls:?}"
+    );
+    assert!(worker.companions.is_empty());
+}
+
+#[tokio::test]
+async fn join_grants_view_and_leave_revokes_without_deny() {
+    let (live, store, http, trace) = companion_fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    join_with_companion(&mut worker, MEMBER, &mut now).await;
+    let text_id = worker.companions[&500].text_channel_id;
+    // Second occupant joins the room: reconcile enqueues exactly one grant.
+    worker.live.voice_update(MEMBER + 1, Some(500), Some(false));
+    worker.reconcile();
+    dispatch(&mut worker, now).await;
+    now += 1;
+    // Occupant leaves: reconcile enqueues exactly one revoke (delete of the
+    // overwrite, never a deny).
+    worker.live.voice_update(MEMBER + 1, None, Some(false));
+    worker.reconcile();
+    dispatch(&mut worker, now).await;
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        calls.contains(&format!("grant:{text_id}:{}", MEMBER + 1)),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&format!("revoke:{text_id}:{}", MEMBER + 1)),
+        "{calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn companion_deleted_with_its_room_and_delete_is_idempotent() {
+    let (live, store, http, trace) = companion_fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    join_with_companion(&mut worker, MEMBER, &mut now).await;
+    let text_id = worker.companions[&500].text_channel_id;
+    // Everyone leaves: reconcile queues the room delete, which deletes the
+    // companion first.
+    worker.live.voice_update(MEMBER, None, Some(false));
+    worker.reconcile();
+    dispatch(&mut worker, now).await;
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        calls.contains(&format!("delete:{text_id}")),
+        "companion deleted: {calls:?}"
+    );
+    assert!(calls.contains(&"delete:500".to_owned()), "{calls:?}");
+    assert!(
+        calls.contains(&"remove_companion:500".to_owned()),
+        "companion row removed: {calls:?}"
+    );
+    assert!(
+        calls.contains(&"forget:500".to_owned()),
+        "room row forgotten once the companion is gone: {calls:?}"
+    );
+    assert!(worker.companions.is_empty());
+    assert!(worker.rooms.is_empty());
+    // Re-dispatching the room delete (or a duplicate) is a no-op.
+    worker.reconcile();
+    assert!(!worker.dispatch_one(now + 1).await);
+    let after = trace.lock().unwrap().clone();
+    assert_eq!(
+        after
+            .iter()
+            .filter(|call| *call == &format!("delete:{text_id}"))
+            .count(),
+        1,
+        "no duplicate companion delete: {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn companion_create_is_idempotent_when_record_already_exists() {
+    let (live, store, http, trace) = companion_fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, now).await;
+    now += 1;
+    // A racing dispatch persisted the companion first: the queued create is
+    // success without another POST.
+    worker.companions.insert(
+        500,
+        TextCompanion {
+            guild_id: GUILD,
+            room_channel_id: 500,
+            text_channel_id: 700,
+            settings: two_bot_core::voice_text_channel::TextChannelSettings {
+                enabled: true,
+                configured_name: None,
+                viewer_role_id: None,
+            },
+            created_at: NOW.to_owned(),
+        },
+    );
+    dispatch(&mut worker, now).await;
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.starts_with("create_companion")),
+        "no duplicate POST: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn unknown_companion_outcome_adopts_visible_channel_without_repost() {
+    let (live, store, http, trace) = companion_fixture();
+    http.companion_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::UnknownOutcome);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, now).await;
+    now += 1;
+    // The POST outcome is unknown, but the live snapshot already shows the
+    // channel the POST created (name + category match): adopt it.
+    worker.live.upsert_channel(channel(600, 0, Some(CATEGORY)));
+    {
+        let mut live = worker.live.inner.write().unwrap();
+        if let Some(created) = live.channels.get_mut(&600) {
+            created.name = Some("voice-chat".to_owned());
+        }
+    }
+    dispatch(&mut worker, now).await;
+    let calls = trace.lock().unwrap().clone();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("create_companion"))
+            .count(),
+        1,
+        "exactly one POST: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("add_companion:500:600")),
+        "adopted channel persisted: {calls:?}"
+    );
+    assert_eq!(worker.companions[&500].text_channel_id, 600);
+}
+
+// --- V9d admin roles and the settings snapshot ------------------------------
+
+const ADMIN_ROLE: u64 = 777;
+const ADMINISTRATOR_ROLE: u64 = 778;
+const LATE_ADMIN_ROLE: u64 = 779;
+
+fn snapshot_with_roles(extra_roles: Vec<Role>) -> GuildSnapshot {
+    let mut snapshot = snapshot(&[], vec![]);
+    snapshot.bot.roles.extend(extra_roles);
+    snapshot
+}
+
+fn admin_roles() -> Vec<Role> {
+    vec![
+        role_with(ADMIN_ROLE, Permissions::MANAGE_CHANNELS),
+        role_with(ADMINISTRATOR_ROLE, Permissions::ADMINISTRATOR),
+        role_with(780, Permissions::VIEW_CHANNEL),
+    ]
+}
+
+fn snapshot_companion(viewer_role_id: Option<u64>) -> TextCompanion {
+    TextCompanion {
+        guild_id: GUILD,
+        room_channel_id: 500,
+        text_channel_id: 700,
+        settings: two_bot_core::voice_text_channel::TextChannelSettings {
+            enabled: true,
+            configured_name: None,
+            viewer_role_id,
+        },
+        created_at: NOW.to_owned(),
+    }
+}
+
+#[test]
+fn admin_role_ids_keep_manage_channels_roles_only() {
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot_with_roles(admin_roles()));
+    let state = live.inner.read().unwrap();
+    // Manage Channels role qualifies. @everyone (this snapshot gives it
+    // Manage Channels), the Administrator role (bypasses overwrites) and a
+    // role without the bit do not.
+    assert_eq!(state.admin_role_ids(GUILD), vec![ADMIN_ROLE]);
+}
+
+#[tokio::test]
+async fn companion_plan_carries_admin_roles() {
+    let (live, store, http, trace) = companion_fixture();
+    live.publish(snapshot_with_roles(admin_roles()));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    join_with_companion(&mut worker, MEMBER, &mut now).await;
+    let plans = worker.http.companion_plans.lock().unwrap().clone();
+    assert_eq!(plans.len(), 1, "{:?}", trace.lock().unwrap());
+    let roles: Vec<u64> = plans[0]
+        .overwrites
+        .iter()
+        .filter_map(|overwrite| match overwrite.target {
+            TextOverwriteTarget::Role(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(roles, vec![ADMIN_ROLE], "{:?}", plans[0].overwrites);
+}
+
+#[tokio::test]
+async fn later_promoted_admin_role_is_resolved_live_without_touching_open_rooms() {
+    let (live, store, http, _) = companion_fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    join_with_companion(&mut worker, MEMBER, &mut now).await;
+    {
+        let state = worker.live.inner.read().unwrap();
+        assert!(state.admin_role_ids(GUILD).is_empty());
+    }
+    // A role is promoted to Manage Channels after the companion exists: the
+    // next published snapshot carries it and the occupant is still inside.
+    let mut promoted = snapshot(
+        &[500, worker.companions[&500].text_channel_id],
+        vec![VoiceMember {
+            member_id: MEMBER,
+            channel_id: 500,
+            bot: Some(false),
+        }],
+    );
+    promoted
+        .bot
+        .roles
+        .push(role_with(LATE_ADMIN_ROLE, Permissions::MANAGE_CHANNELS));
+    worker.live.publish(promoted);
+    worker.reconcile();
+    {
+        let state = worker.live.inner.read().unwrap();
+        assert_eq!(state.admin_role_ids(GUILD), vec![LATE_ADMIN_ROLE]);
+    }
+    assert!(
+        !worker.dispatch_one(now).await,
+        "no per-room overwrite update is queued for the promotion"
+    );
+}
+
+#[tokio::test]
+async fn protected_ids_hold_viewer_admin_roles_and_the_bot() {
+    let (live, store, http, _) = companion_fixture();
+    live.publish(snapshot_with_roles(admin_roles()));
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let state = worker.live.inner.read().unwrap();
+    let protected = worker.protected_ids(&state, &snapshot_companion(Some(42)));
+    assert_eq!(protected, vec![42, ADMIN_ROLE, 999]);
+    // No viewer role: admin roles and the bot stay protected.
+    let protected = worker.protected_ids(&state, &snapshot_companion(None));
+    assert_eq!(protected, vec![ADMIN_ROLE, 999]);
+}
+
+#[tokio::test]
+async fn creator_edit_applies_to_new_rooms_only() {
+    let (live, store, http, _) = companion_fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    join_with_companion(&mut worker, MEMBER, &mut now).await;
+    let before = worker.companions[&500].settings.clone();
+    // `/textchannels` swaps in an edited creator row.
+    let mut edited = text_creator();
+    edited.text_channel_name = Some("lounge".to_owned());
+    edited.text_viewer_role_id = Some(42);
+    apply_command(&mut worker, ActorCommand::CreatorAdded(edited), now);
+    assert_eq!(
+        worker.companions[&500].settings, before,
+        "the existing companion keeps its creation-time snapshot"
+    );
+    assert_eq!(
+        worker.creators[&CREATOR].text_channel_name.as_deref(),
+        Some("lounge")
+    );
+}
+
+#[tokio::test]
+async fn companion_row_write_failure_is_retried_without_a_second_post() {
+    let (live, store, http, trace) = companion_fixture();
+    store
+        .companion_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::Unavailable);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    // Room create, then the companion POST succeeds but its row write fails.
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert!(worker.unpersisted_companions.contains(&500));
+    assert!(worker.companions.contains_key(&500));
+    assert!(worker.store.companions.lock().unwrap().is_empty());
+    // After the backoff the same action writes only the row.
+    dispatch(&mut worker, 60_000).await;
+    let calls = trace.lock().unwrap().clone();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("create_companion"))
+            .count(),
+        1,
+        "the retry never POSTs again: {calls:?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| *call == "add_companion:500:501")
+            .count(),
+        2,
+        "row written on the first try and on the retry: {calls:?}"
+    );
+    assert!(worker
+        .store
+        .companions
+        .lock()
+        .unwrap()
+        .contains_key(&(GUILD, 500)));
+    assert!(worker.unpersisted_companions.is_empty());
+}
+
+#[tokio::test]
+async fn unknown_companion_outcome_never_adopts_another_rooms_companion() {
+    let (live, store, http, trace) = companion_fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    // Room A (500) and its companion (501), tracked.
+    join_with_companion(&mut worker, MEMBER, &mut now).await;
+    assert_eq!(worker.companions[&500].text_channel_id, 501);
+    // The fake names every channel "room"; give A's companion the constant
+    // default name every room's plan carries.
+    worker
+        .live
+        .inner
+        .write()
+        .unwrap()
+        .channels
+        .get_mut(&501)
+        .unwrap()
+        .name = Some("voice-chat".to_owned());
+    worker
+        .http
+        .companion_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::UnknownOutcome);
+    // Room B (502) in the same category: its companion POST outcome is
+    // unknown, and the only name-matching channel is A's.
+    join(&mut worker, MEMBER + 1);
+    while worker.dispatch_one(now).await {
+        now += 1;
+    }
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("create_companion:502")),
+        "room B attempted its own companion: {calls:?}"
+    );
+    assert!(
+        !worker.companions.contains_key(&502),
+        "room B must not adopt room A's companion"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.starts_with("add_companion:502")),
+        "{calls:?}"
+    );
+    assert_eq!(worker.companions[&500].text_channel_id, 501);
+    assert_eq!(worker.companion_channels[&500], 501);
+}
+
+#[tokio::test]
+async fn adopt_skips_tracked_and_older_channels_and_takes_the_oldest_remaining() {
+    let (live, store, http, _) = companion_fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    for id in [450, 700, 800, 900] {
+        worker.live.upsert_channel(channel(id, 0, Some(CATEGORY)));
+    }
+    {
+        let mut live = worker.live.inner.write().unwrap();
+        for id in [450, 700, 800] {
+            live.channels.get_mut(&id).unwrap().name = Some("voice-chat".to_owned());
+        }
+    }
+    let plan = TextChannelPlan {
+        room_id: 500,
+        guild_id: GUILD,
+        name: "voice-chat".to_owned(),
+        category_id: CATEGORY,
+        overwrites: Vec::new(),
+        settings: two_bot_core::voice_text_channel::TextChannelSettings {
+            enabled: true,
+            configured_name: None,
+            viewer_role_id: None,
+        },
+    };
+    // 450 predates the room, 700 is another room's companion, 900 has the
+    // wrong name: 800 is the only candidate.
+    worker.companion_channels.insert(600, 700);
+    assert_eq!(worker.adopt_companion(&plan), Some(800));
+    // A companion row loaded from the store counts as tracked too.
+    worker.companions.insert(
+        601,
+        TextCompanion {
+            guild_id: GUILD,
+            room_channel_id: 601,
+            text_channel_id: 800,
+            settings: plan.settings.clone(),
+            created_at: NOW.to_owned(),
+        },
+    );
+    assert_eq!(worker.adopt_companion(&plan), None);
 }
 
 fn channel_with_overwrites(

@@ -202,7 +202,7 @@ impl SettingsSource for StoreSettings {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Delivery {
+pub(crate) enum Delivery {
     Posted,
     /// The channel is missing, not a guild text channel, or the bot lacks
     /// View/Send there: a proven refusal, nothing was sent.
@@ -211,14 +211,14 @@ enum Delivery {
     Failed,
 }
 
-struct RaidDelivery {
+pub(crate) struct RaidDelivery {
     executor: ActionExecutor,
     guild_id: u64,
     bot_id: OnceCell<u64>,
 }
 
 impl RaidDelivery {
-    fn new(executor: ActionExecutor, guild_id: u64) -> Self {
+    pub(crate) fn new(executor: ActionExecutor, guild_id: u64) -> Self {
         Self {
             executor,
             guild_id,
@@ -250,13 +250,23 @@ impl RaidDelivery {
             error!(channel, "raid_alert_refused: mention policy is not empty");
             return;
         }
-        match tokio::time::timeout(DELIVERY_MAX, self.post(channel, &message.content)).await {
-            Ok(Delivery::Posted) => info!(channel, count = alert.count, "raid_alert_posted"),
-            Ok(Delivery::Undeliverable) => error!(
+        match self.post_staff_message(channel, &message.content).await {
+            Delivery::Posted => info!(channel, count = alert.count, "raid_alert_posted"),
+            Delivery::Undeliverable => error!(
                 channel,
                 "raid_alert_undeliverable: channel missing, not text, or bot lacks View/Send"
             ),
-            Ok(Delivery::Failed) | Err(_) => error!(channel, "raid_alert_post_failed"),
+            Delivery::Failed => error!(channel, "raid_alert_post_failed"),
+        }
+    }
+
+    /// Log-first post shared with the join-risk runtime: the caller logs the
+    /// evidence and enforces the empty-mentions boundary; this only bounds,
+    /// sends and classifies. Never retried by either caller.
+    pub(crate) async fn post_staff_message(&self, channel: &str, content: &str) -> Delivery {
+        match tokio::time::timeout(DELIVERY_MAX, self.post(channel, content)).await {
+            Ok(outcome) => outcome,
+            Err(_) => Delivery::Failed,
         }
     }
 

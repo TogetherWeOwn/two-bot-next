@@ -1,71 +1,74 @@
 <!--
-Fill in every section. Use short, active sentences. Delete these comments before you submit.
-Title: a Conventional Commits header, e.g. `fix(gateway): resume after a dropped session`.
+Title: Conventional Commits header, e.g. `fix(auth): refuse expired sudo sessions`.
 Types: feat fix perf refactor test docs build ci chore revert style security. Max 100 chars, no trailing period.
-Never put a secret, token, private URL, or internal card ID (TOG-, PAP-) in the title, body, commits, or branch name.
+This repo is public. Do not put internal ticket ids, instance links, localhost or private-network
+addresses in the title, the body, a commit message or the branch name. Name the branch after the change,
+for example `fix/sudo-window`. Link only public GitHub issues (`Fixes #123`).
+Write short, plain sentences. Fill in every section: the `pr-lint` check reads them.
+Full rules: CONTRIBUTING.md, "Pull request standards".
 -->
 
 ## Thinking Path
 
 <!--
-Walk from the system down to this change, one short bullet per step, like this:
-- This repo runs the Discord bot as one always-on container.
-- The gateway keeps one session and resumes it after a drop.
-- A resume after a long gap replays events the bot already handled.
-- This PR drops replayed events older than the stored cursor.
-- The benefit is one action per event, not two.
+  Required. Trace your reasoning from the project down to this change, as a blockquote.
+  Start with what this repo is, narrow through the subsystem and the problem, and end with
+  why this PR exists. Aim for 5-8 steps; the check needs at least 3 real ones.
 -->
 
--
+> - two-bot-next is the Together We Own Discord bot, written in Rust, running as one always-on container
+> - [Which subsystem or capability is involved]
+> - [What problem or gap exists]
+> - [Why it needs to be addressed]
+> - This pull request ...
+> - The benefit is ...
 
 ## Linked Issues or Issue Description
 
 <!--
-Link the issue this PR closes or advances. If there is none, describe the problem here.
-Closes #123  (a public GitHub issue), or write the problem here in two or three sentences.
+  Required for feat, fix, perf, refactor and security. Pick ONE:
+  (A) A public GitHub issue exists: `Fixes #123`, `Closes #123` or `Refs #123`.
+  (B) No issue exists: describe the problem here in your own words (what happened, what you expected,
+      how to reproduce it, or the motivation and proposed solution for a feature).
 -->
 
-Closes #
+-
 
 ## What Changed
 
-<!-- List the changes. Name each file or script that matters, and say what it does now. -->
+<!-- One bullet per logical unit. -->
 
 -
 
 ## Verification
 
-<!--
-Give the exact commands you ran and their results. Say what you did not run, and why.
-Never claim a green run you did not see. For a bug fix, show the test that fails without the fix.
--->
+<!-- Commands you ran and their results, so a reviewer can repeat them. -->
 
 -
 
 ## Risks
 
-<!--
-What can this break? Name credentials, permissions, hosts, or services it touches.
-Name the rollback. Write "None" only if you checked.
--->
+<!-- Migration safety, breaking changes, behaviour shifts. "Low risk" if genuinely minor. -->
 
 -
 
 ## Model Used
 
 <!--
-Name the provider and the exact model ID, plus the mode (reasoning effort, tool use) if it matters.
-If a human wrote every line, write: None — human-authored.
+  Required. Provider, exact model ID or version, context window, reasoning mode and tool use if known.
+  If no AI model was used, write "None - human-authored".
 -->
 
 -
 
 ## Checklist
 
-- [ ] The PR title is a Conventional Commits header
-- [ ] I filled in every section above
-- [ ] I ran the tests that cover this change and reported the results above
-- [ ] I addressed every review finding, or replied with why it does not apply
-- [ ] No secret, token, private URL, or internal card ID (TOG-, PAP-) is in the diff, the title, the body, the commits, or the branch name
-- [ ] I credited the contributors whose work this builds on
-- [ ] I updated the docs this change makes stale
+- [ ] I wrote a thinking path that runs from the project to this change
+- [ ] I named the model used, with its version
+- [ ] I searched for duplicate or related PRs and linked them above
+- [ ] I ran the tests locally and they pass
+- [ ] I added or updated tests where applicable
+- [ ] I updated the documentation this change touches
+- [ ] No secret, token or credential is in the diff, the title, the body or the branch name
+- [ ] No internal ticket id, instance link or private host is in the title, body, commits or branch name
+- [ ] CI is green on the exact head before I ask for review

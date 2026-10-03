@@ -25,7 +25,7 @@
 //! 0 over an existing NULL keeps the NULL, so a plain export/import round trip
 //! never turns "inherit" into "unlimited".
 //!
-//! Parameter binding: https://docs.rs/sqlx/0.9.0/sqlx/fn.query.html
+//! Parameter binding: <https://docs.rs/sqlx/0.9.0/sqlx/fn.query.html>
 
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};

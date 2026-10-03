@@ -41,7 +41,7 @@ use crate::voice_rooms::VoiceGates;
 /// the assistant stays disabled rather than truncating to another address.
 pub const MAX_ENDPOINT_CHARS: usize = 2048;
 
-/// Configured assistant endpoint and model. `None` (from [`from_map`]) means
+/// Configured assistant endpoint and model. `None` (from [`AssistantConfig::from_map`]) means
 /// disabled: no command is published and no endpoint call may happen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssistantConfig {
