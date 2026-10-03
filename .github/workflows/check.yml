@@ -19,12 +19,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  supply-chain:
+    name: PR SBOM dry-run
+    # Same inventory and gates as releases, but no publishing job or secrets.
+    # The reusable SBOM workflow lives in sbom.yml: supply-chain.yml is
+    # main's folded pr-lint + gitleaks gate (TOG-11810) and has no
+    # workflow_call trigger, so it cannot be called with `uses:`.
+    # A called workflow can only narrow the caller grant; with the default-deny
+    # top level it would otherwise check out this private repo with no token.
+    permissions:
+      contents: read
+    uses: ./.github/workflows/sbom.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
+    with:
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
   check:
     name: check
     permissions:
       contents: read
-    needs: [self-role-store, parity-docs, job-inputs]
-    # A skipped dependency must not make the required check appear green.
+    needs: [self-role-store, supply-chain, parity-docs, job-inputs]
+    # Failed, skipped or cancelled dependencies must not make check appear green.
     if: ${{ always() }}
     # Runner routing (TOG-12339). Every job in every workflow uses this
     # expression with its own job id; scripts/test-runner-routing.py pins it.
@@ -116,6 +130,10 @@ jobs:
 
       - name: require self-role store tests to pass
         if: needs.self-role-store.result != 'success' && needs.job-inputs.outputs.rust != 'false'
+        run: exit 1
+
+      - name: require supply-chain gate to pass
+        if: needs.supply-chain.result != 'success'
         run: exit 1
 
       - name: Check migration numbering and immutability
@@ -279,7 +297,7 @@ jobs:
 
       - name: audit database regressions (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo test -p two-bot-core --features db --test audit_store --test audit_service --locked -- --ignored
+        run: cargo test -p two-bot-core --features db --test audit_store --test audit_service --test containment_store --locked -- --ignored
 
       - name: LFG store regressions (CI service container only)
         if: needs.job-inputs.outputs.rust != 'false'
@@ -573,10 +591,7 @@ jobs:
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'container') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 30
     env:
-      # Unique per run: runners share one Docker host, so the historical
-      # shared two-bot:ci tag let a concurrent PR's image replace the one
-      # just built before the smoke below ran against it.
-      SMOKE_TAG: two-bot:ci-${{ github.run_id }}-${{ github.run_attempt }}
+      IMAGE: two-bot-next:smoke-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -598,6 +613,7 @@ jobs:
         if: needs.container-inputs.outputs.build == 'true'
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Build runtime image (local only)
+        id: build
         if: needs.container-inputs.outputs.build == 'true'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -606,30 +622,35 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
-          tags: ${{ env.SMOKE_TAG }}
+          tags: ${{ env.IMAGE }}
           cache-from: type=gha,scope=two-bot-runtime-amd64
           cache-to: type=gha,mode=max,scope=two-bot-runtime-amd64
       - name: Runtime contract and size budgets
         if: needs.container-inputs.outputs.build == 'true'
-        run: python3 scripts/container-smoke.py "$SMOKE_TAG"
+        env:
+          IMAGE_ID: ${{ steps.build.outputs.imageid }}
+        run: python3 scripts/container-smoke.py "$IMAGE_ID"
       - name: Prove deliberate budget breakage fails
         if: needs.container-inputs.outputs.build == 'true'
+        env:
+          IMAGE_ID: ${{ steps.build.outputs.imageid }}
         run: |
           set -euo pipefail
           for budget in image binary; do
             log="$RUNNER_TEMP/container-negative-$budget.log"
-            if python3 scripts/container-smoke.py "$SMOKE_TAG" "--$budget-max-bytes" 1 >"$log" 2>&1; then
+            if python3 scripts/container-smoke.py "$IMAGE_ID" "--$budget-max-bytes" 1 >"$log" 2>&1; then
               printf 'FAIL: deliberate %s budget violation was accepted\n' "$budget"
               exit 1
             fi
             grep -F "exceeds size budget" "$log"
             printf 'PASS: deliberate %s budget violation rejected\n' "$budget"
           done
-      # Per-run tags (SMOKE_TAG) would otherwise accumulate ~100 MiB images
-      # on the shared Docker host; always remove our own tag when done.
-      - name: Remove per-run smoke image
-        if: always() && needs.container-inputs.outputs.build == 'true'
-        run: docker rmi --force "$SMOKE_TAG" || true
+      - name: Remove only this run's smoke image
+        if: ${{ always() }}
+        run: |
+          if docker image inspect "$IMAGE" > /dev/null 2>&1; then
+            docker image rm "$IMAGE"
+          fi
 
   community-db:
     name: community db

@@ -340,6 +340,7 @@ async fn spawn_onboarding_with_store(
         Some(runtime),
         None,
         None,
+        None,
         std::future::pending(),
     ));
     Runner {

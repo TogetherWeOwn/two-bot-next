@@ -120,8 +120,6 @@ pub const DUMP_TABLES: &[&str] = &[
 pub const OPTIONAL_LEGACY_TABLES: &[&str] = &[
     "moderation_warnings",
     "moderation_scheduled_unbans",
-    "containment_events",
-    "containment_incidents",
     "automation_commands",
 ];
 
