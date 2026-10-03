@@ -1,14 +1,13 @@
 # two-bot-next: single always-on Cloudflare Container (ADR 0001).
 # Multi-stage: the builder needs the full Rust toolchain; the runtime image
-# carries only the static-ish release binary + CA certs (rustls uses
-# platform/webpki roots, no OpenSSL) and tini-style signal handling via
-# the exec form below (PID 1 receives the Container SIGTERM).
+# carries only the release binary on distroless/cc (glibc, libgcc, CA trust
+# data; no shell, package manager or OpenSSL CLI). rustls uses platform/webpki
+# roots, not OpenSSL. PID 1 receives the Container SIGTERM via the exec form.
 #
-# Build args (set via wrangler [[containers]] image_vars or docker build):
-#   RUST_VERSION  pinned toolchain (default: stable matching rust-toolchain.toml)
-
-ARG RUST_VERSION=1.94-bookworm
-FROM rust:${RUST_VERSION} AS builder
+# Multi-platform manifest digests keep tag names readable for Dependabot while
+# making both stages immutable. The builder and distroless runtime are both
+# Debian 13 (trixie), so the binary links against the same glibc it runs on.
+FROM rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c AS builder
 
 WORKDIR /app
 
@@ -33,31 +32,32 @@ RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutove
 # Real sources; the release profile (opt-level=z, lto, strip) targets the
 # `lite` 256 MiB ceiling from ADR 0001.
 COPY . .
+# Non-secret build provenance, compiled into readiness (not a runtime override).
+ARG BOT_BUILD_REVISION=unknown
+ARG BOT_BUILD_ID=unknown
 RUN cargo build --release --locked
 
-FROM debian:bookworm-slim AS certificates
+# The runtime base already ships Debian trust data (ca-certificates) and the
+# nonroot account (uid/gid 65532, home /home/nonroot); nothing is installed.
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2 AS runtime
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-FROM debian:bookworm-slim AS runtime
-
-# rustls needs the trust bundle, not the package's OpenSSL dependencies.
-COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+# Non-secret build provenance (main #137/#156), recorded as image labels.
+ARG BOT_BUILD_REVISION=unknown
+ARG BOT_BUILD_ID=unknown
+LABEL org.opencontainers.image.revision=$BOT_BUILD_REVISION \
+      com.togetherweown.build-id=$BOT_BUILD_ID
 
 # Non-root user: the bot never needs container root.
-RUN useradd --create-home --shell /usr/sbin/nologin two-bot
-USER two-bot
-WORKDIR /home/two-bot
+USER 65532:65532
+WORKDIR /home/nonroot
 
-COPY --from=builder --chown=two-bot:two-bot /app/target/release/two-bot ./two-bot
+COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot
 
 # Liveness + readiness (also the DO keepalive targets, see wrangler/).
 EXPOSE 8080
 ENV LISTEN_ADDR=0.0.0.0:8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["/home/two-bot/two-bot", "--healthcheck"]
+    CMD ["/home/nonroot/two-bot", "--healthcheck"]
 
-ENTRYPOINT ["/home/two-bot/two-bot"]
+ENTRYPOINT ["/home/nonroot/two-bot"]

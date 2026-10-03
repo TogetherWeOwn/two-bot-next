@@ -4,10 +4,28 @@ name: release
 # synchronized workspace versions, Common Changelog and flat vX.Y.Z tags.
 # Stay 0.x until production cutover. No App keys or PATs in Actions.
 # GITHUB_TOKEN-created PRs need explicit required-check workflow dispatch.
+# TOG-12931: only `schedule` and `workflow_dispatch` (re)generate the release
+# PR. A `push` to main runs release-please with skip-github-pull-request, so it
+# still publishes the tag/release when the release PR merges but never rewrites
+# the PR head or starts a ~20 min `check` on it. See docs/releases.md for the
+# freeze -> dispatch -> merge -> unfreeze procedure.
 on:
   push:
     branches: [main]
+  schedule:
+    # Off the hour to avoid the busiest scheduled-run window (UTC); weekly,
+    # because the normal cut is an operator dispatch (docs/releases.md).
+    - cron: '23 4 * * 1'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Generate and scan SBOMs without release-please or asset publication
+        type: boolean
+        default: false
+      release_tag:
+        description: Existing vX.Y.Z release to repair SBOM assets (skip release-please)
+        type: string
+        default: ''
 
 permissions: {}
 
@@ -21,19 +39,26 @@ jobs:
     permissions:
       contents: write # Publish releases and reconcile the release/notes branches.
       pull-requests: write # Create and reconcile the release PR.
-    if: github.ref == 'refs/heads/main'
+    # The dry_run/release_tag inputs keep the SBOM repair path live: those
+    # downstream jobs consume inputs.dry_run, inputs.release_tag and this
+    # job's release_created/tag_name outputs.
+    if: github.ref == 'refs/heads/main' && inputs.dry_run != true && (inputs.release_tag == '' || github.event_name != 'workflow_dispatch')
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'release-please') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 10
     outputs:
       pr_available: ${{ steps.select.outputs.pr_available }}
       pr: ${{ steps.select.outputs.pr }}
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Inspect existing release PR
         id: plan
+        # A push never regenerates the PR, so it has no reuse decision to make.
+        if: github.event_name != 'push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -44,9 +69,10 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-          # Keep publication enabled. Only skip PR regeneration when its branch
-          # already includes this main snapshot, including our migrated notes.
-          skip-github-pull-request: ${{ steps.plan.outputs.reuse_pr == 'true' }}
+          # Keep publication enabled on every event. A push never regenerates
+          # the PR; schedule/dispatch skip it only when its branch already
+          # includes this main snapshot, including our migrated notes.
+          skip-github-pull-request: ${{ github.event_name == 'push' || steps.plan.outputs.reuse_pr == 'true' }}
 
       # Query independently of prs_created: a failed migration can leave an
       # unchanged native PR, so action outputs alone cannot drive recovery.
@@ -57,15 +83,16 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: node scripts/release-pr-state.cjs select
 
+      # Reconciliation and its checkout only follow a regeneration, never a push.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: steps.select.outputs.pr_available == 'true'
+        if: github.event_name != 'push' && steps.select.outputs.pr_available == 'true'
         with:
           persist-credentials: false
           ref: ${{ fromJSON(steps.select.outputs.pr).headBranchName }}
       # Env expressions are evaluated even on a skipped step. Selection emits
       # valid {} JSON when publication leaves no open PR; the guard stays false.
       - name: Preserve bootstrap release notes
-        if: steps.select.outputs.pr_available == 'true'
+        if: github.event_name != 'push' && steps.select.outputs.pr_available == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -162,7 +189,8 @@ jobs:
     permissions:
       actions: write # Dispatch required checks for GITHUB_TOKEN-created release PRs.
     needs: release-please
-    if: needs.release-please.outputs.pr_available == 'true'
+    # Never on a push: it did not regenerate the PR, so there is no new head.
+    if: github.event_name != 'push' && needs.release-please.outputs.pr_available == 'true'
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'dispatch-checks') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
@@ -184,3 +212,63 @@ jobs:
           # TOG-11810: pr-lint and gitleaks are folded into supply-chain.yml,
           # whose dispatch form keeps the pr_number input for the lint job.
           gh workflow run supply-chain.yml --ref "$HEAD_BRANCH" -f pr_number="$PR_NUMBER"
+
+  sbom-target:
+    needs: release-please
+    if: ${{ !cancelled() && (inputs.dry_run == true || inputs.release_tag != '' || needs.release-please.outputs.release_created == 'true') }}
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'sbom-target') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    permissions:
+      contents: read
+    outputs:
+      ref: ${{ steps.target.outputs.ref }}
+      tag: ${{ steps.target.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select immutable SBOM source (dry-run never publishes)
+        id: target
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          RELEASE_TAG: ${{ inputs.release_tag || needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 scripts/release-sbom-target.py
+
+  release-sbom:
+    needs: sbom-target
+    if: ${{ !cancelled() && needs.sbom-target.result == 'success' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/sbom.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
+    with:
+      ref: ${{ needs.sbom-target.outputs.ref }}
+
+  attach-sbom:
+    needs: [sbom-target, release-sbom]
+    if: ${{ !cancelled() && needs.release-sbom.result == 'success' && needs.sbom-target.outputs.tag != '' }}
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'attach-sbom') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: supply-chain
+          path: sbom
+      - name: Attach verified inventories to the published tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.sbom-target.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.sbom-target.outputs.ref }}
+        run: |
+          set -euo pipefail
+          (cd sbom && sha256sum --check SHA256SUMS)
+          python3 scripts/release-sbom-target.py --verify-source sbom/source-sha.txt
+          gh release upload "$RELEASE_TAG" sbom/*.cdx.json sbom/SHA256SUMS sbom/source-sha.txt sbom/image-id.txt --clobber

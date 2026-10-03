@@ -33,7 +33,8 @@
  * - Bare `/` → fallback code redirect (uncounted), else 404.
  * - Lookup outage (throw) → fallback redirect when configured, else 503 +
  *   `retry-after: 30`. Unknown slug (null) → 404 with no Location (no open
- *   redirect). Confirmed misses are cached per isolate for 5s (1,024 slots);
+ *   redirect). Confirmed misses are cached per isolate for 2s (1,024 slots), the
+ *   legacy negative-TTL bound (TOG-11153);
  *   cache hits still consume caller budget. Outages and live rows are uncached.
  *   Invalid stored code → 500, nothing recorded.
  * - Slugs: lowercase alnum + internal hyphens, 2–40 chars; lookup is
@@ -115,13 +116,28 @@ export function isValidFallback(code: unknown): boolean {
   return code == null || (typeof code === "string" && (code === "" || isValidInviteCode(code)));
 }
 
-/** Fixed vocabulary only: never log error messages, arbitrary names or stacks. */
-export function redirectErrorClass(err: unknown): string {
-  if (err instanceof TypeError) return "TypeError";
-  if (err instanceof RangeError) return "RangeError";
-  if (err instanceof SyntaxError) return "SyntaxError";
-  if (err instanceof Error) return "Error";
-  return "Unknown";
+/**
+ * Fixed vocabulary for redirect failure logs (parity TOG-11183: lookup
+ * failures log `slug` plus a bounded `errorClass` — no credentials or raw
+ * sensitive errors). Never log error messages, stacks, connection strings or
+ * raw error names; log one of these buckets instead:
+ * - `db_unavailable`: the store's own connect/query deadline fired
+ *   (`DbTimeoutError` from redirect-store.ts) — the database did not answer
+ *   in time, so the outage path served fallback/503.
+ * - `internal`: everything else, including non-Error throws and errors with
+ *   attacker-influenced `name`s. One bucket by design: unknown inputs must
+ *   not mint new log values, and a spoofed `name` can at most move a line
+ *   between two safe buckets, never leak text.
+ */
+export type RedirectErrorClass = "db_unavailable" | "internal";
+
+export function redirectErrorClass(err: unknown): RedirectErrorClass {
+  // Name comparison, not an import: redirect-store.ts already imports from
+  // this module, and the Miniflare acceptance embeds this file standalone —
+  // either direction of import would break one of them. The name is only ever
+  // compared, never logged.
+  if (err instanceof Error && err.name === "DbTimeoutError") return "db_unavailable";
+  return "internal";
 }
 
 /** The URL a click is sent on to. Fixed host — never built from the path. */
@@ -371,7 +387,18 @@ export class TokenBuckets {
   }
 }
 
-/** Short, bounded negative cache: a new campaign becomes visible within 5s. */
+/**
+ * Short, bounded negative cache: the default keeps a new campaign visible
+ * within 2s (legacy campaigns.ts negative-TTL bound, TOG-11153), so neither
+ * this layer nor the store's short negative cache below can hold a miss
+ * long-lived on the production path (which always uses the default).
+ *
+ * Kept module-private: the Miniflare acceptance embeds this file as a Worker
+ * script, and a named const export becomes a workerd map entry and fails the
+ * runtime (`Incorrect type for map entry`). Callers use the default TTL.
+ */
+const MAX_MISS_TTL_MS = 2_000;
+
 export class RedirectMissCache {
   private misses = new Map<string, number>();
   private ttlMs: number;
@@ -380,7 +407,7 @@ export class RedirectMissCache {
 
   constructor(
     spec: { ttlMs: number; maxEntries: number } = {
-      ttlMs: 5_000,
+      ttlMs: MAX_MISS_TTL_MS,
       maxEntries: 1_024,
     },
     now: () => number = Date.now,
