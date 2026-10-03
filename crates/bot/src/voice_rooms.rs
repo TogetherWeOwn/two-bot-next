@@ -29,17 +29,18 @@ use twilight_model::{
         application_command::{CommandDataOption, CommandOptionValue},
         Interaction, InteractionData, InteractionType,
     },
-    channel::{message::MessageFlags, Channel},
+    channel::{message::MessageFlags, permission_overwrite::PermissionOverwriteType, Channel},
     guild::{Permissions, Role},
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
     id::{marker::RoleMarker, Id},
 };
 use two_bot_core::{
-    now_iso,
+    evaluate_permissions as evaluate_health, now_iso,
     voice_access::{
         is_voice_command, may_create_room, may_use_command, validate_access_controls,
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
     },
+    voice_logging::{parse_detail_level, DetailLevel, LoggingSettings},
     voice_ownership::{
         decide_ownership, OwnershipDecision, OwnershipError, OwnershipRequest, RoomActor,
         RoomMember, RoomOwnership,
@@ -50,7 +51,8 @@ use two_bot_core::{
         VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN, RENAME_MIN_INTERVAL_MS,
     },
     voice_utilities::{invite_render, ping_render},
-    CommandDefinition, Snowflake,
+    CommandDefinition, OverwriteTarget, PermissionFinding, PermissionOverwrite as HealthOverwrite,
+    Snowflake, VoicePermission, VoicePermissionScope,
 };
 use two_bot_cutover::voice_rooms::PgRoomStore;
 use two_bot_discord::voice_rooms::{
@@ -98,6 +100,17 @@ pub trait RoomPersistence: Send + Sync {
         &self,
         guild: Snowflake,
         controls: &AccessControls,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// The guild's V10a logging settings; an unconfigured guild reads as the defaults.
+    fn logging_settings(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<LoggingSettings, StoreError>> + Send;
+    /// Replace the guild's logging settings.
+    fn save_logging_settings(
+        &self,
+        guild: Snowflake,
+        settings: &LoggingSettings,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
     fn forget(
         &self,
@@ -155,6 +168,20 @@ impl RoomPersistence for PgRoomStore {
         controls: &AccessControls,
     ) -> Result<(), StoreError> {
         self.save_access_controls(guild, controls)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn logging_settings(&self, guild: Snowflake) -> Result<LoggingSettings, StoreError> {
+        self.logging_settings(guild).await.map_err(store_error)
+    }
+
+    async fn save_logging_settings(
+        &self,
+        guild: Snowflake,
+        settings: &LoggingSettings,
+    ) -> Result<(), StoreError> {
+        self.save_logging_settings(guild, settings)
             .await
             .map_err(store_error)
     }
@@ -450,6 +477,68 @@ impl LiveGuild {
         live.generation += 1;
     }
 
+    /// V10 health check: the bot's missing Manage Channels, Move Members,
+    /// Manage Roles and View Channel permissions across the given creator
+    /// channels and their categories, attributed to the outermost level that
+    /// removes each one. Incomplete cache data (no bot snapshot, a missing
+    /// @everyone or bot role) reports nothing rather than a false failure, and
+    /// the guild owner and Administrator roles never have findings.
+    #[must_use]
+    pub fn permission_findings(&self, creators: &[Snowflake]) -> Vec<PermissionFinding> {
+        let live = self.inner.read().expect("live voice lock");
+        let Some(bot) = live.bot.as_ref() else {
+            return Vec::new();
+        };
+        if bot.member_id == bot.guild_owner_id {
+            return Vec::new();
+        }
+        let Some(everyone) = bot.roles.iter().find(|role| role.id.get() == self.guild_id) else {
+            return Vec::new();
+        };
+        let mut base = everyone.permissions.bits();
+        for role_id in &bot.member_roles {
+            let Some(role) = bot.roles.iter().find(|role| role.id == *role_id) else {
+                return Vec::new();
+            };
+            base |= role.permissions.bits();
+        }
+        let bot_roles: Vec<Snowflake> = bot.member_roles.iter().map(|id| id.get()).collect();
+        let mut findings = Vec::new();
+        for creator_id in creators {
+            let Some(channel) = live.channels.get(creator_id) else {
+                continue;
+            };
+            let category = channel
+                .parent_id
+                .and_then(|parent| live.channels.get(&parent.get()));
+            // A creator outside a category, or whose category is not cached,
+            // has no category-level evidence: only guild and channel scopes.
+            let (category_id, category_overwrites) = category.map_or_else(
+                || (0, Vec::new()),
+                |category| {
+                    (
+                        category.id.get(),
+                        health_overwrites(self.guild_id, category),
+                    )
+                },
+            );
+            for finding in evaluate_health(
+                base,
+                category_id,
+                &category_overwrites,
+                *creator_id,
+                &health_overwrites(self.guild_id, channel),
+                bot.member_id,
+                &bot_roles,
+            ) {
+                if !findings.contains(&finding) {
+                    findings.push(finding);
+                }
+            }
+        }
+        findings
+    }
+
     /// Refresh the bot access snapshot after role changes. Generation is
     /// unchanged: role edits do not invalidate in-flight tickets, they only
     /// affect the next guard evaluation.
@@ -544,6 +633,53 @@ impl LiveGuild {
                         .permissions(live.guild_id, channel),
                 )
         })
+    }
+}
+
+/// Role and member overwrites of one cached channel, in the health core's
+/// shape. @everyone is the role whose id is the guild id.
+fn health_overwrites(guild_id: Snowflake, channel: &Channel) -> Vec<HealthOverwrite> {
+    channel
+        .permission_overwrites
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|overwrite| {
+            let target = match overwrite.kind {
+                PermissionOverwriteType::Role if overwrite.id.get() == guild_id => {
+                    OverwriteTarget::Everyone
+                }
+                PermissionOverwriteType::Role => OverwriteTarget::Role(overwrite.id.get()),
+                PermissionOverwriteType::Member => OverwriteTarget::Member(overwrite.id.get()),
+                _ => return None,
+            };
+            Some(HealthOverwrite {
+                target,
+                allow: overwrite.allow.bits(),
+                deny: overwrite.deny.bits(),
+            })
+        })
+        .collect()
+}
+
+/// One `/setup` line for a missing permission. Ids only: the category or
+/// channel is mentioned, never named.
+#[must_use]
+pub fn health_line(finding: &PermissionFinding) -> String {
+    let permission = match finding.permission {
+        VoicePermission::ManageChannels => "Manage Channels",
+        VoicePermission::MoveMembers => "Move Members",
+        VoicePermission::ManageRoles => "Manage Roles",
+        VoicePermission::ViewChannel => "View Channel",
+    };
+    match (finding.scope, finding.category_id, finding.channel_id) {
+        (VoicePermissionScope::Category, Some(category), _) => format!(
+            "health: the permission override on category <#{category}> removes {permission} from the bot"
+        ),
+        (VoicePermissionScope::Channel, _, Some(channel)) => format!(
+            "health: the permission override on <#{channel}> removes {permission} from the bot"
+        ),
+        _ => format!("health: the bot lacks {permission} for the whole server"),
     }
 }
 
@@ -1842,7 +1978,15 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         }
         ActorCommand::AccessChanged(controls) => worker.access = controls,
         ActorCommand::Status(reply) => {
+            let mut creator_ids: Vec<Snowflake> = worker.creators.keys().copied().collect();
+            creator_ids.sort_unstable();
             let _ = reply.send(WorkerStatus {
+                health: worker
+                    .live
+                    .permission_findings(&creator_ids)
+                    .iter()
+                    .map(health_line)
+                    .collect(),
                 tracked_rooms: worker.tracked().len(),
                 failures: worker.failures().iter().map(failure_line).collect(),
                 halted: worker.halted(),
@@ -2110,6 +2254,18 @@ pub enum VoiceCommand {
         target_id: Snowflake,
     },
     Access(AccessAction),
+    Logging(LoggingAction),
+}
+
+/// One `/logging` sub-command. `Invalid` is a malformed or unknown shape; it
+/// is answered, never silently ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoggingAction {
+    Show,
+    Level(String),
+    Channel(Option<Snowflake>),
+    Mention(Option<Snowflake>),
+    Invalid,
 }
 
 /// One `/access` sub-command. `Invalid` is a malformed or unknown shape; it
@@ -2178,6 +2334,9 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
             Some(VoiceCommand::Transfer { target_id })
         }
         "access" => Some(VoiceCommand::Access(parse_access_action(&command.options))),
+        "logging" => Some(VoiceCommand::Logging(parse_logging_action(
+            &command.options,
+        ))),
         _ => None,
     }
 }
@@ -2199,6 +2358,34 @@ fn interaction_actor(interaction: &Interaction) -> Option<(Snowflake, bool)> {
             .and_then(|member| member.permissions),
     );
     Some((user.id.get(), is_admin))
+}
+
+fn parse_logging_action(options: &[CommandDataOption]) -> LoggingAction {
+    let Some(sub) = options.first() else {
+        return LoggingAction::Invalid;
+    };
+    let CommandOptionValue::SubCommand(args) = &sub.value else {
+        return LoggingAction::Invalid;
+    };
+    let arg = |name: &str| args.iter().find(|option| option.name == name);
+    match sub.name.as_str() {
+        "show" => LoggingAction::Show,
+        "level" => arg("level")
+            .and_then(|option| match &option.value {
+                CommandOptionValue::String(value) => Some(LoggingAction::Level(value.clone())),
+                _ => None,
+            })
+            .unwrap_or(LoggingAction::Invalid),
+        "channel" => LoggingAction::Channel(arg("channel").and_then(|option| match option.value {
+            CommandOptionValue::Channel(channel) => Some(channel.get()),
+            _ => None,
+        })),
+        "mention" => LoggingAction::Mention(arg("role").and_then(|option| match option.value {
+            CommandOptionValue::Role(role) => Some(role.get()),
+            _ => None,
+        })),
+        _ => LoggingAction::Invalid,
+    }
 }
 
 fn parse_access_action(options: &[CommandDataOption]) -> AccessAction {
@@ -2274,6 +2461,7 @@ impl VoiceCommand {
             Self::Access(_) => "access",
             Self::Reclaim => "reclaim",
             Self::Transfer { .. } => "transfer",
+            Self::Logging(_) => "logging",
         }
     }
 }
@@ -2337,6 +2525,8 @@ pub fn ephemeral_response(content: &str) -> InteractionResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerStatus {
     pub tracked_rooms: usize,
+    /// Current permission-health findings, rendered for `/setup`.
+    pub health: Vec<String>,
     pub failures: Vec<String>,
     pub halted: bool,
 }
@@ -2491,6 +2681,52 @@ async fn execute_access<S: RoomPersistence>(
     }
 }
 
+/// Render the settings for `/logging show` and as the confirmation after a change.
+fn logging_summary(settings: &LoggingSettings) -> String {
+    let level = match settings.level {
+        DetailLevel::Off => "off (no notices are sent)",
+        DetailLevel::Brief => "brief",
+        DetailLevel::Full => "full",
+    };
+    let channel = match settings.channel_id {
+        Some(channel) => format!("<#{channel}>"),
+        None => "not set (falls back to the server's system channel, then a DM, then the creator channel's chat)".to_owned(),
+    };
+    let mention = match settings.mention_role_id {
+        Some(role) => format!("<@&{role}>"),
+        None => "none".to_owned(),
+    };
+    format!("Log level: {level}\nLog channel: {channel}\nMentioned on errors: {mention}")
+}
+
+/// Apply one `/logging` action: read, change, save. A failed read or write
+/// changes nothing and says so.
+async fn execute_logging<S: RoomPersistence>(
+    store: &S,
+    guild_id: Snowflake,
+    action: LoggingAction,
+) -> String {
+    let Ok(mut settings) = store.logging_settings(guild_id).await else {
+        return "Could not read the logging settings. Nothing was changed; try again.".to_owned();
+    };
+    match action {
+        LoggingAction::Show => return logging_summary(&settings),
+        LoggingAction::Invalid => {
+            return "Unknown /logging option. Use show, level, channel or mention.".to_owned()
+        }
+        LoggingAction::Level(raw) => match parse_detail_level(&raw) {
+            Ok(level) => settings.level = level,
+            Err(error) => return format!("{error} Nothing was changed."),
+        },
+        LoggingAction::Channel(channel) => settings.channel_id = channel,
+        LoggingAction::Mention(role) => settings.mention_role_id = role,
+    }
+    match store.save_logging_settings(guild_id, &settings).await {
+        Ok(()) => format!("Saved.\n{}", logging_summary(&settings)),
+        Err(_) => "Could not save the logging settings. Nothing was changed; try again.".to_owned(),
+    }
+}
+
 fn create_error_text(error: RoomHttpError) -> String {
     match error {
         RoomHttpError::Unauthorized => "Voice rooms are paused: Discord refused the bot credential. Tell an admin to fix the token, then restart the bot.".to_owned(),
@@ -2617,6 +2853,21 @@ where
             reply(ephemeral_response(&text)).await;
             true
         }
+        VoiceCommand::Logging(action) => {
+            if !member.is_admin {
+                reply(ephemeral_response(
+                    "You need Manage Channels to use /logging.",
+                ))
+                .await;
+                return true;
+            }
+            // Same lock as `/access`: admin-only and rare, so one lock is enough.
+            let _serialized = runtime.access_lock.lock().await;
+            let (store, _) = runtime.make_pair();
+            let text = execute_logging(&store, guild_id, action).await;
+            reply(ephemeral_response(&text)).await;
+            true
+        }
         VoiceCommand::Setup => {
             let (store, _) = runtime.make_pair();
             let (creators, store_error) = match store.creators(guild_id).await {
@@ -2628,9 +2879,15 @@ where
                 guild_id,
                 creators,
                 tracked_rooms: status.as_ref().map_or(0, |status| status.tracked_rooms),
-                failures: status
-                    .as_ref()
-                    .map_or_else(Vec::new, |status| status.failures.clone()),
+                // Current health findings first: they are live, failures are history.
+                failures: status.as_ref().map_or_else(Vec::new, |status| {
+                    status
+                        .health
+                        .iter()
+                        .chain(status.failures.iter())
+                        .cloned()
+                        .collect()
+                }),
                 halted: status.as_ref().is_some_and(|status| status.halted),
                 store_error,
             });

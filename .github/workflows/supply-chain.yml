@@ -14,8 +14,10 @@ name: supply-chain
 # Org convention for every change that lands on main (TogetherWeOwn GitHub standard):
 #   * PR title = Conventional Commits header: `type(scope): summary`, <= 100 chars, no trailing period.
 #     Types: feat fix perf refactor test docs build ci chore revert style security.
-#     Put the card ID in the body (`Refs: TOG-1234`), not in the title.
-#   * PR body explains what changed, why, and how it was tested.
+#   * PR body follows .github/pull_request_template.md: what changed, why, and how it was tested.
+#   * This repo is public. No card reference is required, and an internal tracker ID (a `TOG-` or
+#     `PAP-` prefix followed by digits) must not appear in a title, body, commit subject or branch
+#     name. pr-lint warns on one in the title, body or a commit subject; it does not fail yet.
 #   * Repos are squash-merge only and the squash commit title is the PR title, so the history on
 #     main is one conventional commit per PR. The push job below flags any commit that bypasses it
 #     (for example a merge call that passes its own commit_title).
@@ -46,9 +48,6 @@ permissions: {}
 concurrency:
   group: supply-chain-${{ github.event.pull_request.number || inputs.pr_number || github.sha }}
   cancel-in-progress: true
-
-env:
-  REQUIRE_CARD_REF: "true"
 
 jobs:
   pr-lint:
@@ -85,9 +84,9 @@ jobs:
 
           def resolve_overflow(body, head_ref, head_repo_name, base_ref):
               # Native overflow PRs carry only a single-line link in the
-              # visible body; the full notes (including the card footer) live
+              # visible body; the full notes (including the generated footer) live
               # in release-notes.md on the derived notes branch. Resolve that
-              # file before the card-reference gate, without weakening it: the
+              # file before the body gates, without weakening them: the
               # link must be the exact native sentence and its branch must be
               # exactly this PR's own notes branch in this same repository,
               # targeting main. A non-link body passes through untouched, so
@@ -117,7 +116,7 @@ jobs:
               # .content read silently resolves empty notes at that size.
               # Read the authenticated raw representation instead, which
               # carries the bytes at any size; an empty body still fails
-              # closed before the card-reference gate.
+              # closed before the body gates.
               stored = subprocess.check_output([
                   "gh", "api", f"repos/{repo}/contents/release-notes.md?ref={overflow_branch}",
                   "-H", "Accept: application/vnd.github.raw",
@@ -152,8 +151,8 @@ jobs:
               body = os.environ.get("EVENT_BODY", "")
               author = os.environ.get("EVENT_AUTHOR", "")
               # Ordinary edited/reopened PRs can carry the same native overflow
-              # link; resolve it through the same gates so card-reference lint
-              # sees the full notes instead of failing on the link.
+              # link; resolve it through the same gates so body lint sees the
+              # full notes instead of failing on the link.
               body = resolve_overflow(body, os.environ.get("EVENT_HEAD_REF", ""),
                                       os.environ.get("EVENT_HEAD_REPO", ""),
                                       os.environ.get("EVENT_BASE_REF", ""))
@@ -183,15 +182,21 @@ jobs:
           BODY_FILE: ${{ steps.pr.outputs.body_file }}
           AUTHOR: ${{ steps.pr.outputs.author }}
           COMMITS: ${{ toJSON(github.event.commits) }}
+          # Read the PR's commit subjects through the API for the internal-ID warning.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          REPO: ${{ github.repository }}
         shell: python3 {0}
         run: |
-          import json, os, re, sys
+          import json, os, re, subprocess, sys
 
           TYPES = "feat|fix|perf|refactor|test|docs|build|ci|chore|revert|style|security"
           HEADER = re.compile(rf"^({TYPES})(\([A-Za-z0-9._/,-]+\))?!?: \S.*$")
           HELP = ("Expected a Conventional Commits header, e.g. 'fix(auth): refuse expired sudo "
                   "sessions' or 'feat(events): shareable event page'. Allowed types: "
-                  + TYPES.replace("|", ", ") + ". Put the card ID in the body as 'Refs: TOG-1234'.")
+                  + TYPES.replace("|", ", ") + ".")
+          # Internal tracker IDs never belong in a public repo. Warn only, for now.
+          INTERNAL_ID = re.compile(r"\b(?:TOG|PAP)-\d+\b")
 
           def read_body():
               # The body arrives as a file path, never env: stored release
@@ -210,6 +215,29 @@ jobs:
               if text.rstrip().endswith("."):
                   errs.append("ends with a period")
               return errs
+
+          def internal_id_warning(where, text):
+              ids = sorted(set(INTERNAL_ID.findall(text or "")))
+              if ids:
+                  print(f"::warning title=Internal ID::{where} mentions {', '.join(ids)}. This repo "
+                        "is public: remove internal tracker IDs (TOG-, PAP-) and link public "
+                        "GitHub issues instead.")
+
+          def pr_commit_subjects():
+              # Warn-only input: an API failure must never fail the check.
+              number = os.environ.get("PR_NUMBER", "")
+              if not number:
+                  return []
+              try:
+                  out = subprocess.check_output([
+                      "gh", "api", "--paginate", f"repos/{os.environ['REPO']}/pulls/{number}/commits",
+                      "--jq", '.[] | .sha[0:10] + " " + (.commit.message | split("\\n")[0])',
+                  ], text=True)
+              except Exception:
+                  print("::notice title=Commit subjects::Could not read the PR commits; "
+                        "skipped the internal-ID check on commit subjects.")
+                  return []
+              return [line.split(" ", 1) for line in out.splitlines() if " " in line]
 
           failed = False
           if os.environ["EVENT"] == "pull_request":
@@ -230,15 +258,16 @@ jobs:
                   failed = True
                   print("::error title=PR body::The description is empty. Say what changed, why, "
                         "and how it was tested (see the PR template).")
-              if not re.search(r"\bTOG-\d+\b", body):
-                  level = "error" if os.environ["REQUIRE_CARD_REF"] == "true" else "warning"
-                  failed = failed or level == "error"
-                  print(f"::{level} title=Card reference::Add 'Refs: TOG-1234' to the PR body.")
+              internal_id_warning("The PR title", title)
+              internal_id_warning("The PR body", body)
+              for sha, subject in pr_commit_subjects():
+                  internal_id_warning(f"Commit {sha} subject", subject)
           else:
               for c in json.loads(os.environ.get("COMMITS") or "[]") or []:
                   subject = (c.get("message") or "").splitlines()[0] if c.get("message") else ""
                   if subject.startswith(("Merge ", "Revert \"")):
                       continue
+                  internal_id_warning(f"Commit {c.get('id','')[:10]} subject", subject)
                   errs = header_errors(subject)
                   if errs:
                       failed = True

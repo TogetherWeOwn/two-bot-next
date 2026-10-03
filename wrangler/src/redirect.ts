@@ -116,13 +116,28 @@ export function isValidFallback(code: unknown): boolean {
   return code == null || (typeof code === "string" && (code === "" || isValidInviteCode(code)));
 }
 
-/** Fixed vocabulary only: never log error messages, arbitrary names or stacks. */
-export function redirectErrorClass(err: unknown): string {
-  if (err instanceof TypeError) return "TypeError";
-  if (err instanceof RangeError) return "RangeError";
-  if (err instanceof SyntaxError) return "SyntaxError";
-  if (err instanceof Error) return "Error";
-  return "Unknown";
+/**
+ * Fixed vocabulary for redirect failure logs (parity TOG-11183: lookup
+ * failures log `slug` plus a bounded `errorClass` — no credentials or raw
+ * sensitive errors). Never log error messages, stacks, connection strings or
+ * raw error names; log one of these buckets instead:
+ * - `db_unavailable`: the store's own connect/query deadline fired
+ *   (`DbTimeoutError` from redirect-store.ts) — the database did not answer
+ *   in time, so the outage path served fallback/503.
+ * - `internal`: everything else, including non-Error throws and errors with
+ *   attacker-influenced `name`s. One bucket by design: unknown inputs must
+ *   not mint new log values, and a spoofed `name` can at most move a line
+ *   between two safe buckets, never leak text.
+ */
+export type RedirectErrorClass = "db_unavailable" | "internal";
+
+export function redirectErrorClass(err: unknown): RedirectErrorClass {
+  // Name comparison, not an import: redirect-store.ts already imports from
+  // this module, and the Miniflare acceptance embeds this file standalone —
+  // either direction of import would break one of them. The name is only ever
+  // compared, never logged.
+  if (err instanceof Error && err.name === "DbTimeoutError") return "db_unavailable";
+  return "internal";
 }
 
 /** The URL a click is sent on to. Fixed host — never built from the path. */

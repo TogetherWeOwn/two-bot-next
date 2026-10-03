@@ -46,6 +46,22 @@ import {
 import { connectPostgres } from "./redirect-db.ts";
 import { forwardedFlagVars, type ForwardedFlagEnv } from "./container-env.ts";
 import {
+  ACTIONS_PATH,
+  RECEIVER_BIND,
+  RECEIVER_PORT,
+  REQUEST_TIMEOUT_MS,
+  allowlistedHeaders,
+  envelope,
+  forwardRequest,
+  handleActionsIngress,
+  ingressEnabled,
+  isActionsRequest,
+  notFound,
+  readBody,
+  receiverEnabled,
+  relayReceiverResponse,
+} from "./internal-actions.ts";
+import {
   EMPTY_STATE,
   evaluateMetrics,
   parseExposition,
@@ -79,6 +95,14 @@ export interface Env extends ForwardedFlagEnv {
   REDIRECT_FALLBACK_CODE?: string;
   /** JSON snapshot of invite_campaigns rows (mapping source without REDIRECT_DB). */
   REDIRECT_MAPPINGS_JSON?: string;
+  /** Staging-only var (wrangler.toml [env.staging.vars]); see internal-actions.ts. */
+  INTERNAL_ACTIONS_INGRESS?: string;
+  /** Operator-set Worker secrets for the private receiver. Never flag-forwarded. */
+  TWO_INTERNAL_ACTIONS?: string;
+  TWO_INTERNAL_CALLERS?: string;
+  TWO_INTERNAL_CHANNEL_KEYS?: string;
+  /** Signing keys: a secret, forwarded by its own explicit line and never logged. */
+  TWO_INTERNAL_KEYS?: string;
 }
 
 // Per-isolate crawler cap (60 burst, 1/sec refill — matches legacy
@@ -185,6 +209,30 @@ function isBotProbeResponse(response: Response): boolean {
   return response.status === 503 && mediaType === "application/json";
 }
 
+// TOG-13044: while the gateway task is failing, the bot serves its fixed
+// phase/class on /readyz for a bounded linger. Container stdout is not in
+// Workers Logs, so the keepalive re-emits those two tokens as a structured
+// warn. Strict tokens only: nothing else from the probe body is ever logged.
+const FAILURE_TOKEN = /^[a-z0-9_]{1,32}$/;
+const MAX_PROBE_BODY_BYTES = 64 * 1024;
+
+function gatewayFailure(body: ArrayBuffer): { phase: string; class: string } | null {
+  if (body.byteLength > MAX_PROBE_BODY_BYTES) return null;
+  try {
+    const report: unknown = JSON.parse(new TextDecoder().decode(body));
+    const field = (report as { gateway_failure?: unknown } | null)?.gateway_failure;
+    if (typeof field !== "object" || field === null) return null;
+    const { phase, class: errorClass } = field as Record<string, unknown>;
+    if (typeof phase === "string" && typeof errorClass === "string"
+      && FAILURE_TOKEN.test(phase) && FAILURE_TOKEN.test(errorClass)) {
+      return { phase, class: errorClass };
+    }
+  } catch {
+    // Not the bot's JSON: nothing to report.
+  }
+  return null;
+}
+
 function containerPort(raw: string | undefined): number {
   if (raw === undefined) return 8080;
   const port = Number(raw);
@@ -207,6 +255,18 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
   const applicationId = env[APPLICATION_ID_KEY];
   if (applicationId !== undefined) vars[APPLICATION_ID_KEY] = applicationId;
   vars["LISTEN_ADDR"] = `0.0.0.0:${port}`;
+  // Private internal-actions receiver (TOG-12980). Dark unless the Operator
+  // sets TWO_INTERNAL_ACTIONS to exactly "1"; any other value forwards nothing,
+  // so a typo cannot crash-loop the gateway (the receiver boots all-or-nothing).
+  // The bind is the Worker's loopback constant, never an Operator-set value.
+  if (receiverEnabled(env)) {
+    if (port === RECEIVER_PORT) throw new Error("BOT_PORT must differ from the internal-actions receiver port");
+    vars["TWO_INTERNAL_ACTIONS"] = "1";
+    vars["TWO_INTERNAL_BIND"] = RECEIVER_BIND;
+    if (env.TWO_INTERNAL_CALLERS) vars["TWO_INTERNAL_CALLERS"] = env.TWO_INTERNAL_CALLERS;
+    if (env.TWO_INTERNAL_CHANNEL_KEYS) vars["TWO_INTERNAL_CHANNEL_KEYS"] = env.TWO_INTERNAL_CHANNEL_KEYS;
+    if (env.TWO_INTERNAL_KEYS) vars["TWO_INTERNAL_KEYS"] = env.TWO_INTERNAL_KEYS;
+  }
   return vars;
 }
 
@@ -228,6 +288,10 @@ export class TwoBotContainer extends Container<Env> {
 
   constructor(ctx: DurableObjectState<{}>, env: Env) {
     super(ctx, env);
+    // The receiver port joins startup port checks only while the receiver is
+    // enabled. Dark never touches the property, so the SDK resolves exactly
+    // the ports it does on base main (`requiredPorts` stays undefined).
+    if (receiverEnabled(env)) this.requiredPorts = [this.defaultPort, RECEIVER_PORT];
     // A deployment can reattach to a running old process. Reconcile before
     // ingress or alarms are delivered, not just before the next cold start.
     this.initialization = ctx.blockConcurrencyWhile(async () => {
@@ -276,6 +340,7 @@ export class TwoBotContainer extends Container<Env> {
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === CONTROL_PATH) return this.control(request);
+    if (url.pathname === ACTIONS_PATH) return this.internalActions(request);
     if (url.pathname !== "/health" && url.pathname !== "/readyz" && url.pathname !== OPS_METRICS_PATH) {
       return new Response("not found", { status: 404 });
     }
@@ -308,6 +373,41 @@ export class TwoBotContainer extends Container<Env> {
         }
       });
     } catch (error) { return refused(error); }
+  }
+
+  /**
+   * Staging-only receiver ingress behind the ownership fence. Re-checks the
+   * Worker's gate, then forwards the exact bytes to the fixed receiver port.
+   * Public ingress never starts the Container: probes and keepalive own that,
+   * so an unauthenticated flood cannot cause a cold start.
+   */
+  private async internalActions(request: Request): Promise<Response> {
+    if (!ingressEnabled(this.env) || !isActionsRequest(request)) return notFound();
+    const checked = allowlistedHeaders(request.headers);
+    if ("refusal" in checked) return checked.refusal;
+    const body = await readBody(request);
+    if ("refusal" in body) return body.refusal;
+    const forward = forwardRequest(
+      `http://c${ACTIONS_PATH}`,
+      checked.headers,
+      body.bytes,
+      AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    );
+    try {
+      return await this.owned(async () => {
+        await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
+        if (!this.ctx.container?.running) return envelope(503, "unavailable", true);
+        try {
+          return await relayReceiverResponse(await this.containerFetch(forward, RECEIVER_PORT));
+        } catch {
+          return envelope(503, "unavailable", true);
+        }
+      });
+    } catch (error) {
+      // Logs the closed ownership reason; the caller only sees the envelope.
+      refused(error);
+      return envelope(503, "unavailable", true);
+    }
   }
 
   private async control(request: Request): Promise<Response> {
@@ -347,7 +447,13 @@ export class TwoBotContainer extends Container<Env> {
   }
 
   override async startAndWaitForPorts(...args: Parameters<Container<Env>["startAndWaitForPorts"]>): Promise<void> {
-    return this.owned(() => super.startAndWaitForPorts(...args));
+    // containerFetch always names one port. While the receiver is enabled its
+    // port is checked with it; the explicit port stays first for the SDK.
+    const [ports, ...rest] = args;
+    const checked = typeof ports === "number" && receiverEnabled(this.env)
+      ? [...new Set([ports, this.defaultPort ?? ports, RECEIVER_PORT])]
+      : ports;
+    return this.owned(() => super.startAndWaitForPorts(checked, ...rest));
   }
 
   override async containerFetch(...args: Parameters<Container<Env>["containerFetch"]>): Promise<Response> {
@@ -405,7 +511,13 @@ export class TwoBotContainer extends Container<Env> {
             status = res.status;
             if (!res.ok) console.warn(`two-bot /readyz unhealthy: ${status}`);
             // Drain rather than cancel the SDK 0.3.7 proxy response pipe.
-            await res.arrayBuffer();
+            const body = await res.arrayBuffer();
+            const failure = isBotProbeResponse(res) ? gatewayFailure(body) : null;
+            if (failure) {
+              console.warn(JSON.stringify({
+                event: "container_gateway_failure", phase: failure.phase, class: failure.class,
+              }));
+            }
           } catch (error) {
             if (error instanceof OwnershipRefused) {
               admitted = false;
@@ -602,6 +714,21 @@ export default {
         forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
         return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
       } catch (error) { return refused(error); }
+    }
+
+    // Staging-only receiver ingress. Dark (no match here, today's behavior)
+    // unless INTERNAL_ACTIONS_INGRESS and TWO_INTERNAL_ACTIONS are both "1".
+    if (url.pathname === ACTIONS_PATH && ingressEnabled(env)) {
+      return handleActionsIngress(
+        request,
+        request.headers.get("cf-connecting-ip") ?? "unknown",
+        async (sanitized) => {
+          // Stamp the fence id server-side; a caller-supplied one was already
+          // dropped by the header allowlist.
+          sanitized.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
+          return env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
+        },
+      );
     }
 
     if (url.pathname === "/health" || url.pathname === "/readyz") {

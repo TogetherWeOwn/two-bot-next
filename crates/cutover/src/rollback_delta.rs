@@ -207,6 +207,12 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // overwrites the creation snapshot).
     TableSpec { table: "voice_text_companions", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec {
+        table: "voice_logging_settings",
+        measure: TableMeasure::Unmeasurable(
+            "mutable per-guild settings row with no timestamp column; no member IDs",
+        ),
+    },
+    TableSpec {
         table: "voice_access_controls",
         measure: TableMeasure::Unmeasurable(
             "mutable per-guild settings row with no timestamp column; no member IDs",
