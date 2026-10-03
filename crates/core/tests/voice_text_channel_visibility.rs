@@ -27,6 +27,7 @@ fn room<'a>(occupants: &'a [u64], admin_ids: &'a [u64]) -> VoiceRoomFacts<'a> {
         category_id: CATEGORY_ID,
         occupants,
         admin_ids,
+        admin_role_ids: &[],
     }
 }
 

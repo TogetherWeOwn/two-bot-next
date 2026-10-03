@@ -3,7 +3,11 @@ use sqlx::ConnectOptions;
 use tokio::sync::Notify;
 use twilight_model::{channel::Channel, guild::Permissions};
 use two_bot::voice_rooms::{RoomWrites, VoiceEventSink, VoiceRuntime, WriteGuard};
-use two_bot_core::voice_rooms::{CreatorChannel, NewRoomSpec, VoiceRoom};
+use two_bot_core::{
+    voice_rooms::{CreatorChannel, NewRoomSpec, VoiceRoom},
+    voice_text_channel::TextChannelPlan,
+    Snowflake,
+};
 use two_bot_cutover::voice_rooms::PgRoomStore;
 use two_bot_discord::voice_rooms::{RoomChannelAttributes, RoomHttpError};
 
@@ -48,6 +52,31 @@ impl RoomWrites for DeleteOnly {
     }
     async fn download_attachment(&self, _: &str, _: usize) -> Result<Vec<u8>, RoomHttpError> {
         panic!("reconciliation must not download an import file");
+    }
+
+    async fn create_companion(
+        &self,
+        _: &TextChannelPlan,
+        _: Snowflake,
+        _: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        panic!("reconciliation must not create a companion");
+    }
+    async fn grant_companion_view(
+        &self,
+        _: Snowflake,
+        _: Snowflake,
+        _: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        panic!("reconciliation must not grant companion view");
+    }
+    async fn revoke_companion_view(
+        &self,
+        _: Snowflake,
+        _: Snowflake,
+        _: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        panic!("reconciliation must not revoke companion view");
     }
 }
 

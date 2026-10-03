@@ -28,8 +28,9 @@ included in that request and never patched afterwards.
   that still is not enough (an explicit deny on the bot), the create is refused.
 - **Per-creator defaults.** `default_limit` (else the creator channel's limit)
   and `private_default` set only the new room's starting state; existing rooms
-  keep theirs. Companion text channels (`text_channels`) stay unsupported until
-  V9 and still refuse the create.
+  keep theirs. The companion text channel (`text_channels`) does not change the
+  voice room's plan: the worker creates it through the same per-guild queue
+  (V9c), after the room exists.
 
 ## Assumptions to verify on staging
 

@@ -1,7 +1,10 @@
 //! Staging-only migration entrypoint (TOG-11572). See `two_bot_cutover::staging_migrate`.
 //!
+//! ```text
 //! staging-migrate --plan|--apply --source-sha <40hex> --staging-host <host>
 //!   --staging-database <db> --recovery-evidence-ref <ref> --acl-plan-ref <ref>
+//! ```
+//!
 //! The database URL comes only from TWO_BOT_STAGING_MIGRATOR_DATABASE_URL.
 //! Exit: 0 ok, 2 refused before any DDL, 1 failed (evidence on stdout).
 

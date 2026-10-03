@@ -88,7 +88,7 @@ impl ChannelModerationStore {
         Self::connect_with_tls(url, pool_max, tls_policy_from_env()?).await
     }
 
-    /// [`connect`] with an explicit TLS policy (tests pass `LocalOnly`).
+    /// [`Self::connect`] with an explicit TLS policy (tests pass `LocalOnly`).
     pub async fn connect_with_tls(
         url: &str,
         pool_max: u32,
