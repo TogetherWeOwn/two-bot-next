@@ -55,6 +55,26 @@ fn event() -> Value {
 }
 
 #[tokio::test]
+async fn recovery_registration_does_not_unpark_unavailable_jobs() {
+    let empty = registered_statuses(&[], &[]).await;
+    assert!(empty.read().await.values().all(|entry| entry.parked));
+    let recovery = Job {
+        name: RECOVERY_JOB_NAME,
+        cadence: Duration::from_secs(30),
+        startup_jitter: Duration::ZERO,
+        timeout: Duration::from_secs(25),
+        action: Arc::new(|| Box::pin(async { Ok(()) })),
+    };
+    let status = registered_statuses(&[recovery], &[]).await;
+    let entries = status.read().await;
+    assert!(!entries[RECOVERY_JOB_NAME].parked);
+    for name in NAMES.into_iter().chain(community_jobs::NAMES) {
+        assert!(entries[name].parked);
+        assert!(!entries[name].running);
+    }
+}
+
+#[tokio::test]
 async fn roster_paginates_and_rejects_failed_or_repeated_pages() {
     let page: Vec<_> = (1..=1000).map(|id| member(id, false, &[])).collect();
     let mock = MockRest::start(

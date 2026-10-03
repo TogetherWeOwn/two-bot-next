@@ -32,6 +32,7 @@ mod force_identify;
 mod member_journey;
 mod persistent;
 mod recovery;
+mod voice;
 
 const GUILD: &str = "2222";
 const TOKEN: &str = "mock-token";
@@ -433,6 +434,8 @@ async fn spawn_runner_until_shutdown(
         pipeline,
         state.clone(),
         db.store.clone(),
+        None,
+        None,
         None,
         shutdown,
     ));

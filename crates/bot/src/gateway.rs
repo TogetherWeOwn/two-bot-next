@@ -20,6 +20,7 @@ use futures_util::StreamExt as _;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use twilight_gateway::{Event, EventTypeFlags, Intents, Message, Session, Shard, ShardId};
+use two_bot::voice_rooms::{build_production_runtime, VoiceEventSink};
 use two_bot_core::gateway_funnel::GatewayFunnelBuffer;
 use two_bot_core::gateway_session::{
     boot_action_with, dispatch_action, invalidates_session, BootAction, DispatchAction,
@@ -27,6 +28,7 @@ use two_bot_core::gateway_session::{
 };
 use two_bot_core::{ComponentStatus, Config, InviteState, Snowflake};
 use two_bot_cutover::gateway_session::GatewaySessionStore;
+use two_bot_cutover::{connect, DB_POOL_MAX_DEFAULT};
 use two_bot_discord::{
     gateway_intents, needs_message_content, InviteSource, LevelingRuntime, OrderedLevelingPipeline,
 };
@@ -213,11 +215,34 @@ enum ReceivedWork {
     Clear(std::time::Duration),
     Dispatch {
         dispatch: Option<Box<ReceivedDispatch>>,
+        /// A MESSAGE_UPDATE decoded from its raw dispatch before Twilight's
+        /// parse, with its receipt stamp. Only set while automod is active.
+        edit: Option<Box<(two_bot_core::automod_runtime::MessageDelivery, String)>>,
         checkpoint: GatewaySession,
         deadline: std::time::Duration,
         generation: u64,
+        /// Cold voice RESUME: reception waits for this commit before IDENTIFY.
+        committed: Option<tokio::sync::oneshot::Sender<()>>,
     },
     Failed,
+}
+
+/// Covers stream termination, receive/checkpoint failures and task
+/// cancellation, not just close frames observed at reception.
+struct VoiceConnectionGuard(Option<Arc<dyn VoiceEventSink>>);
+
+impl Drop for VoiceConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(voice) = &self.0 {
+            voice.disconnect();
+        }
+    }
+}
+
+fn voice_disconnected(voice: Option<&Arc<dyn VoiceEventSink>>) {
+    if let Some(voice) = voice {
+        voice.disconnect();
+    }
 }
 
 /// Raw packets retain unmapped dispatch sequences too. Poll transport separately
@@ -233,39 +258,71 @@ enum ReceivedWork {
 /// stays synchronous under the checkpoint deadline, then deferred awards drain
 /// through the leveling runtime before the cursor commits. Shutdown ends
 /// reception cooperatively so the bounded writer remains supervised through drain.
+///
+/// `voice` is the V1 voice sink (TOG-10093), `None` unless `TWO_VOICE=1` with
+/// token + database configured (see [`build_voice_runtime`]). The serial
+/// writer feeds it after each cache update; reception invalidates occupancy
+/// at every transport loss, so a disconnect is never deferred behind backlog.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_shard<I: InviteSource + 'static>(
     shard: Shard,
     pipeline: Arc<GatewayPipeline<I>>,
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
     runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
+    automod: Option<Arc<crate::automod_gateway::ProductionAutomod>>,
+    voice: Option<Arc<dyn VoiceEventSink>>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), sqlx::Error> {
+    let _voice_connection = VoiceConnectionGuard(voice.clone());
     let generation = Arc::new(AtomicU64::new(0));
     let saved = checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, store.load()).await?;
     // Tickets run beside reception and are cancelled/joined before return.
     let tickets = runtime.as_ref().and_then(|runtime| runtime.start_tickets());
     let receive_generation = Arc::clone(&generation);
+    let automod_enabled = automod.is_some();
+    // The worker dispatches text automations itself once automod has decided.
+    let command_runtime = runtime.clone();
     let receive_state = Arc::clone(&state);
+    let receive_pipeline = Arc::clone(&pipeline);
+    let receive_voice = voice.clone();
     let events = futures_util::stream::unfold(
         (
             shard,
             saved,
             CHECKPOINT_IO_MAX,
             crate::gateway_metrics::Observer::default(),
+            None::<tokio::sync::oneshot::Receiver<()>>,
         ),
-        move |(mut shard, mut received, mut deadline, mut observer)| {
+        move |(mut shard, mut received, mut deadline, mut observer, mut bootstrap)| {
             let state = Arc::clone(&receive_state);
             let generation = Arc::clone(&receive_generation);
             let runtime = runtime.clone();
+            let pipeline = Arc::clone(&receive_pipeline);
+            let voice = receive_voice.clone();
             async move {
                 // Failure is emitted to the ordered worker, never skipped past.
                 let work: Result<Option<ReceivedWork>, sqlx::Error> = async {
+                    if let Some(committed) = bootstrap.take() {
+                        // A cold RESUME replayed missed dispatches but cannot
+                        // populate a fresh cache. IDENTIFY only once RESUMED has
+                        // committed; READY + GuildCreate then rebuild voice state.
+                        if committed.await.is_err() {
+                            return Ok(None);
+                        }
+                        transport_disconnected(&state, &generation).await;
+                        voice_disconnected(voice.as_ref());
+                        // Twilight consumes the boot session from config on
+                        // construction; the config clone starts a fresh IDENTIFY.
+                        shard = Shard::with_config(shard.id(), shard.config().clone());
+                        info!("cold resume committed; requesting voice snapshot via identify");
+                    }
                     while let Some(item) = shard.next().await {
                         let message = match item {
                             Ok(message) => message,
                             Err(error) if matches!(error.kind(), twilight_gateway::error::ReceiveMessageErrorType::Reconnect) => {
                                 transport_disconnected(&state, &generation).await;
+                                voice_disconnected(voice.as_ref());
                                 warn!("gateway reconnect failed; Twilight will retry");
                                 continue;
                             }
@@ -274,6 +331,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         observer.observe(&message, &shard);
                         let Message::Text(text) = message else {
                             transport_disconnected(&state, &generation).await;
+                            voice_disconnected(voice.as_ref());
                             let rejected = matches!(message, Message::Close(Some(ref frame)) if matches!(frame.code, 4007 | 4009));
                             let clear = rejected || shard.session().is_none();
                             if rejected { shard = Shard::with_config(shard.id(), shard.config().clone()); }
@@ -291,6 +349,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             let packet: serde_json::Value = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway session packet".into()))?;
                             let resumable = packet["d"].as_bool().ok_or_else(|| sqlx::Error::InvalidArgument("invalid gateway session flag".into()))?;
                             transport_disconnected(&state, &generation).await;
+                            voice_disconnected(voice.as_ref());
                             if invalidates_session(resumable) { received = None; return Ok(Some(ReceivedWork::Clear(deadline))); }
                         }
                         if header.op != 0 { continue; }
@@ -300,23 +359,54 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing resume URL".into()))?;
                         let checkpoint = GatewaySession { session_id: session.id().to_owned(), sequence, resume_url: resume_url.to_owned(), updated_at_ms: two_bot_core::funnel::now_millis_for_test() };
                         if dispatch_action(received.as_ref(), &checkpoint.session_id, sequence) == DispatchAction::Duplicate { continue; }
-                        let parsed = twilight_gateway::parse(text, EventTypeFlags::all()).map_err(|_| sqlx::Error::InvalidArgument("gateway dispatch parse failed".into()))?;
+                        // A partial MESSAGE_UPDATE omits fields a full Twilight
+                        // Message needs: decode its raw IDs before parsing.
+                        let edit = if automod_enabled {
+                            crate::automod_gateway::partial_edit(&text, crate::automod_gateway::receipt_ms(&observed_at))
+                                .map(|delivery| Box::new((delivery, observed_at.clone())))
+                        } else {
+                            None
+                        };
+                        let parsed = match twilight_gateway::parse(text, EventTypeFlags::all()) {
+                            Ok(parsed) => parsed,
+                            Err(_) if edit.is_some() => None,
+                            Err(_) => return Err(sqlx::Error::InvalidArgument("gateway dispatch parse failed".into())),
+                        };
                         received = Some(checkpoint.clone());
                         let dispatch = parsed.map(|parsed| Box::new(ReceivedDispatch { event: Event::from(parsed), observed_at }));
                         // Detached command ingress must not wait behind the
                         // serial funnel writer's REST/SQL latency. Main's
                         // command claims remain independent of this checkpoint.
+                        // With automod active a create waits in the worker for its
+                        // disposition: rejected creates never reach automations.
                         if let (Some(runtime), Some(dispatch)) = (runtime.as_ref(), dispatch.as_ref()) {
-                            runtime.dispatch(&dispatch.event);
+                            if !(automod_enabled && matches!(dispatch.event, Event::MessageCreate(_))) {
+                                runtime.dispatch(&dispatch.event);
+                            }
                         }
-                        return Ok(Some(ReceivedWork::Dispatch { dispatch, checkpoint, deadline, generation: generation.load(std::sync::atomic::Ordering::Acquire) }));
+                        // Only READY sets the current user, so a RESUMED without
+                        // one is a cold resume across a process restart.
+                        let mut committed = None;
+                        if let (Some(voice), Some(dispatch)) = (voice.as_ref(), dispatch.as_ref()) {
+                            if matches!(dispatch.event, Event::Resumed) && voice.needs_bootstrap(pipeline.cache()) {
+                                let (sender, receiver) = tokio::sync::oneshot::channel();
+                                committed = Some(sender);
+                                bootstrap = Some(receiver);
+                            }
+                        }
+                        return Ok(Some(ReceivedWork::Dispatch { dispatch, edit, checkpoint, deadline, generation: generation.load(std::sync::atomic::Ordering::Acquire), committed }));
                     }
                     Ok(None)
                 }.await;
                 match work {
-                    Ok(Some(work)) => Some((work, (shard, received, deadline, observer))),
+                    Ok(Some(work)) => {
+                        Some((work, (shard, received, deadline, observer, bootstrap)))
+                    }
                     Ok(None) => None,
-                    Err(_) => Some((ReceivedWork::Failed, (shard, received, deadline, observer))),
+                    Err(_) => Some((
+                        ReceivedWork::Failed,
+                        (shard, received, deadline, observer, bootstrap),
+                    )),
                 }
             }
         },
@@ -324,6 +414,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
     info!(shard = ?ShardId::ONE, "gateway shard loop started");
     let handle = tokio::runtime::Handle::current();
     let worker_state = Arc::clone(&state);
+    let worker_voice = voice;
     let stop_state = Arc::clone(&state);
     let result = crate::dispatch::dispatch_bounded(
         // Ending reception is cooperative: dispatch_bounded keeps supervising
@@ -342,23 +433,69 @@ pub async fn run_shard<I: InviteSource + 'static>(
             ReceivedWork::Failed => panic!("gateway receive failed; checkpoint unchanged"),
             ReceivedWork::Dispatch {
                 dispatch,
+                edit,
                 checkpoint,
                 deadline,
                 generation: observed_generation,
+                committed,
             } => {
                 let timer = crate::gateway_metrics::DispatchTimer::start();
                 let mut connected = false;
+                // Automod decides first, in gateway order, once per delivery.
+                let disposition = automod.as_ref().and_then(|automod| {
+                    let (delivery, at) = match (edit, dispatch.as_deref()) {
+                        (Some(edit), _) => *edit,
+                        (None, Some(dispatch)) => (
+                            two_bot_discord::automod::event_to_automod(
+                                &dispatch.event,
+                                crate::automod_gateway::receipt_ms(&dispatch.observed_at),
+                            )?,
+                            dispatch.observed_at.clone(),
+                        ),
+                        (None, None) => return None,
+                    };
+                    Some(handle.block_on(crate::automod_gateway::process(automod, delivery, &at)))
+                });
                 if let Some(dispatch) = dispatch {
-                    connected = matches!(dispatch.event, Event::Ready(_) | Event::Resumed);
-                    // Funnel first (synchronous), then drain deferred XP
-                    // awards through the leveling runtime under the checkpoint
-                    // deadline before the cursor commits. Without a leveling
-                    // runtime the drain is a no-op and the requests stay inert.
-                    let requests = pipeline.collect_at(
-                        &dispatch.event,
-                        &dispatch.observed_at,
-                        two_bot_discord::MessageEligibility::default(),
-                    );
+                    // A cold voice RESUME is followed by IDENTIFY; READY connects.
+                    connected = matches!(dispatch.event, Event::Ready(_) | Event::Resumed)
+                        && committed.is_none();
+                    // Exactly one funnel call per dispatch, then drain deferred
+                    // XP awards through the leveling runtime under the
+                    // checkpoint deadline before the cursor commits. Without a
+                    // leveling runtime the drain is a no-op.
+                    let requests = match disposition {
+                        Some(disposition) => pipeline.collect_at_with_message_disposition(
+                            &dispatch.event,
+                            &dispatch.observed_at,
+                            disposition,
+                        ),
+                        None => pipeline.collect_at(
+                            &dispatch.event,
+                            &dispatch.observed_at,
+                            two_bot_discord::MessageEligibility::default(),
+                        ),
+                    };
+                    // Voice after the cache update, so snapshots are complete.
+                    // Handling never blocks (actor inbox). A transport loss seen
+                    // at reception after this dispatch must still win over any
+                    // snapshot it just published.
+                    if let Some(voice) = worker_voice.as_ref() {
+                        voice.handle(&dispatch.event, pipeline.cache());
+                        if generation.load(Ordering::Acquire) != observed_generation {
+                            voice.disconnect();
+                        }
+                    }
+                    if automod_enabled
+                        && matches!(dispatch.event, Event::MessageCreate(_))
+                        && crate::automod_gateway::runs_text_automations(disposition)
+                    {
+                        if let Some(runtime) = command_runtime.as_ref() {
+                            // Detached spawn from the blocking worker needs the runtime.
+                            let _guard = handle.enter();
+                            runtime.dispatch(&dispatch.event);
+                        }
+                    }
                     if !requests.is_empty() {
                         handle
                             .block_on(checkpoint_io(&worker_state, &generation, deadline, async {
@@ -400,6 +537,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             "gateway ready; checkpoint committed"
                         );
                     }
+                }
+                if let Some(committed) = committed {
+                    let _ = committed.send(());
                 }
             }
         },
@@ -548,6 +688,65 @@ pub async fn build_persistent_pipeline(
     })
     .await
     .map_err(|_| sqlx::Error::InvalidArgument("gateway baseline deadline exceeded".into()))?
+}
+
+/// Build the V1 voice sink, or `None` when voice stays off.
+///
+/// Voice needs all three: the `TWO_VOICE=1` gate, a Discord token
+/// (single-attempt REST), and a Postgres URL for the pre-migrated sqlx store.
+/// Anything missing — or any construction failure — degrades to voice-off
+/// with a warn; the gateway and /readyz keep working. Secrets never appear
+/// in the logs.
+pub async fn build_voice_runtime(
+    config: &Config,
+    voice_enabled: bool,
+) -> Option<Arc<dyn VoiceEventSink>> {
+    if !voice_enabled {
+        return None;
+    }
+    let token = match config
+        .discord_token
+        .as_ref()
+        .map(|secret| secret.expose().as_str())
+        .filter(|token| !token.is_empty())
+    {
+        Some(token) => token,
+        None => {
+            warn!("TWO_VOICE=1 but no discord token; voice rooms disabled");
+            return None;
+        }
+    };
+    let database_url = match config
+        .database_url
+        .as_ref()
+        .map(|secret| secret.expose().as_str())
+        .filter(|url| !url.is_empty())
+    {
+        Some(url) => url,
+        None => {
+            warn!("TWO_VOICE=1 but no database URL; voice rooms disabled");
+            return None;
+        }
+    };
+    // Migrations belong to the operator's migrator role, never the DML-only
+    // runtime credential. Voice consumes the already-migrated schema.
+    let db = match connect(database_url, DB_POOL_MAX_DEFAULT, true).await {
+        Ok(db) => db,
+        Err(_) => {
+            warn!("voice database unavailable; voice rooms disabled");
+            return None;
+        }
+    };
+    match build_production_runtime(token, db.pool().clone()) {
+        Ok(runtime) => {
+            info!("voice rooms enabled; gateway sink attached");
+            Some(Arc::new(runtime))
+        }
+        Err(err) => {
+            warn!(error = %err, "voice HTTP setup failed; voice rooms disabled");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -842,6 +1041,75 @@ mod tests {
                 assert_eq!(result.unwrap()[0].uses, 7);
             }
             server.await.unwrap();
+        }
+    }
+
+    fn voice_config(token: Option<&str>, database_url: Option<&str>) -> Config {
+        Config {
+            discord_token: token.map(|value| two_bot_core::Secret::new(value.to_owned())),
+            database_url: database_url.map(|value| two_bot_core::Secret::new(value.to_owned())),
+            listen_addr: "0.0.0.0:8080".to_owned(),
+            guild_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_runtime_off_without_gate() {
+        let config = voice_config(Some("token"), Some("postgres://localhost/unused"));
+        assert!(build_voice_runtime(&config, false).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn voice_runtime_off_without_token() {
+        let config = voice_config(None, Some("postgres://localhost/unused"));
+        assert!(build_voice_runtime(&config, true).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn voice_runtime_off_without_database() {
+        let config = voice_config(Some("token"), None);
+        assert!(build_voice_runtime(&config, true).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn voice_runtime_off_on_bad_database_url() {
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let capture = Capture(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // Fails at URL validation: no socket is ever opened. Diagnostics must
+        // remain useful without exposing the rejected credential-bearing value.
+        let url = "fixture-invalid-scheme://fixture-user:fixture-db-password@agent-testdb/db";
+        let config = voice_config(Some("fixture-discord-token"), Some(url));
+        assert!(build_voice_runtime(&config, true).await.is_none());
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("voice database unavailable; voice rooms disabled"));
+        for secret in [
+            url,
+            "fixture-user",
+            "fixture-db-password",
+            "fixture-invalid-scheme",
+            "fixture-discord-token",
+        ] {
+            assert!(!output.contains(secret));
         }
     }
 }
