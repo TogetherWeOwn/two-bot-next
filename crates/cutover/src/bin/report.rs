@@ -1,4 +1,5 @@
-//! Read-only cutover integrity reports (TOG-11152).
+//! Read-only cutover integrity reports (TOG-11152) plus the voice ghost-channel
+//! count (TOG-13548).
 //!
 //! `report voice-reconcile` pairs `voice_session_start` / `voice_session_end`
 //! halves per (guild, member) and recovers durations where the stored rows
@@ -6,6 +7,11 @@
 //! `report leave-gap` classifies members with a `member_join` row, no
 //! `member_leave` row, and gone from the roster (port of legacy
 //! `scripts/leave-gap.ts` + `src/analytics/memberLeaveGap.ts`).
+//! `report voice-ghosts` diffs tracked `voice_rooms` rows against the guild's
+//! live voice channels: tracked-present, tracked-gone (the runtime
+//! `reconcile` forget class) and untracked-present. Existence only —
+//! Discord REST lists channels but not their voice occupants, so occupancy
+//! classes belong to a gateway-derived snapshot, not to this report.
 //!
 //! Read-only by construction: the only SQL is SELECT (the pool opens with
 //! migrations off, so the tool cannot build schema by accident), the single
@@ -22,10 +28,12 @@
 //! report voice-reconcile --guild <snowflake> [--days <N>] [--seed]
 //! report leave-gap --guild <snowflake> [--days <N>] [--floor <ISO>]
 //!   [--discord-base <url>] [--seed]
+//! report voice-ghosts --guild <snowflake> [--discord-base <url>] [--seed]
 //! ```
 //!
 //! Env: TWO_DATABASE_URL; leave-gap live mode also needs DISCORD_TOKEN (or
-//! DISCORD_BOT_TOKEN). Exit 0 on a report (gaps are findings, not failure),
+//! DISCORD_BOT_TOKEN); voice-ghosts live mode needs it too (one channel-list
+//! GET). Exit 0 on a report (gaps are findings, not failure),
 //! 1 on database/roster failure, 2 on usage errors, 3 on a bad --floor.
 
 // Operator CLI reports intentionally use stdout; runtime/library modules do not.
@@ -39,9 +47,11 @@ use two_bot_cutover::leave_gap::{
     build_seed_gap_data, classify_leave_gaps, fetch_leave_gap_feeds, RosterMember,
 };
 use two_bot_cutover::rest::RestClient;
+use two_bot_cutover::voice_ghosts::{build_seed_ghost_data, count_ghosts, is_live_voice_kind};
 use two_bot_cutover::voice_reconcile::{
     build_seed_halves, fetch_voice_halves, reconcile_voice_halves,
 };
+use two_bot_cutover::voice_rooms::PgRoomStore;
 
 /// Roster pages are full member JSON: cap the scan or a large guild costs
 /// unbounded reads (legacy `ROSTER_MAX_PAGES = 20`, 1000 members/page).
@@ -51,9 +61,10 @@ const ROSTER_MAX_MEMBERS: usize = 20_000;
 const USAGE: &str = "Usage:\n  \
     report voice-reconcile --guild <snowflake> [--days <N>] [--seed]\n  \
     report leave-gap --guild <snowflake> [--days <N>] [--floor <ISO>] [--discord-base <url>] [--seed]\n  \
+    report voice-ghosts --guild <snowflake> [--discord-base <url>] [--seed]\n  \
     (a bare `report voice-reconcile 30` means the last 30 days, as in legacy)\n\
-    Read-only integrity reports as JSON on stdout (SELECTs plus one bounded roster GET at most;\n\
-    never writes report data). Env: TWO_DATABASE_URL; leave-gap live mode also needs\n\
+    Read-only integrity reports as JSON on stdout (SELECTs plus one bounded roster/channel GET at most;\n\
+    never writes report data). Env: TWO_DATABASE_URL; leave-gap and voice-ghosts live mode also need\n\
     DISCORD_TOKEN (or DISCORD_BOT_TOKEN). Exit 0 report printed; 1 database/roster failure;\n\
     2 usage error; 3 bad --floor.";
 
@@ -316,6 +327,142 @@ async fn leave_gap(args: Args) -> i32 {
     0
 }
 
+/// One bounded channel listing: the guild's channel ids filtered to live
+/// voice kinds. A ceiling hit is impossible here (one page), but an
+/// unreadable listing refuses loudly instead of diffing against a partial
+/// listing presented as complete. Returns the ids plus the run's own
+/// Discord request count.
+async fn bounded_live_voice(guild: &str, proxy: Option<String>) -> (Vec<u64>, u64) {
+    let guild_id: Id<GuildMarker> = match guild.parse::<u64>().map(Id::new) {
+        Ok(id) => id,
+        Err(_) => {
+            eprintln!("report: --guild must be a Discord snowflake");
+            std::process::exit(2);
+        }
+    };
+    // Loopback mock: ungoverned transport, zero writes. Production: the
+    // shared durable send admission, same as every REST-calling operator tool.
+    let rest = match proxy {
+        Some(base) => RestClient::with_proxy("report-channels-read".to_owned(), Some(base)),
+        None => {
+            let token = std::env::var("DISCORD_TOKEN")
+                .or_else(|_| std::env::var("DISCORD_BOT_TOKEN"))
+                .unwrap_or_default();
+            if token.trim().is_empty() {
+                eprintln!("report: DISCORD_TOKEN (or DISCORD_BOT_TOKEN) is not set. The channel read needs it.");
+                std::process::exit(1);
+            }
+            match RestClient::from_env(token, None).await {
+                Ok(client) => client,
+                Err(_) => {
+                    eprintln!("report: channel client unavailable; check admission authority");
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+    match rest.guild_channels(guild_id).await {
+        Ok(Some(channels)) => {
+            let live: Vec<u64> = channels
+                .iter()
+                .filter(|c| is_live_voice_kind(c.kind))
+                .map(|c| c.id.get())
+                .collect();
+            let requests = rest.requests();
+            eprintln!(
+                "report: channel read complete ({} channels, {} live voice, {requests} discord requests)",
+                channels.len(),
+                live.len(),
+            );
+            (live, requests)
+        }
+        Ok(None) => {
+            eprintln!(
+                "report: channel read failed - refusing the empty result instead of counting it."
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("report: channel read refused ({e}) - a partial listing is never presented as complete.");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn voice_ghosts(args: Args) -> i32 {
+    for key in args.values.keys() {
+        if !matches!(key.as_str(), "guild" | "discord-base") {
+            usage_error(&format!("unknown argument --{key}"));
+        }
+    }
+    for flag in &args.flags {
+        if flag != "seed" {
+            usage_error(&format!("unknown argument --{flag}"));
+        }
+    }
+    if !args.positionals.iter().all(|p| p == "voice-ghosts") {
+        usage_error("unexpected positional argument");
+    }
+    let seeded = args.has("seed");
+    if seeded {
+        let (tracked, live) = build_seed_ghost_data();
+        let counts = count_ghosts(&tracked, &live);
+        let report = serde_json::json!({
+            "tool": "voice-ghosts",
+            "mode": "seeded-demo",
+            "guild": "seed-guild",
+            "tracked_rooms": tracked.len(),
+            "tracked_present": counts.tracked_present.iter().map(u64::to_string).collect::<Vec<_>>(),
+            "tracked_gone": counts.tracked_gone.iter().map(u64::to_string).collect::<Vec<_>>(),
+            "untracked_present": counts.untracked_present.iter().map(u64::to_string).collect::<Vec<_>>(),
+            "clean": counts.is_clean(),
+            "discordRequests": 0,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
+        return 0;
+    }
+
+    let guild = require_guild_read(&args, "guild");
+    let proxy = args.values.get("discord-base").cloned();
+    let db = open_db(&args, true).await;
+    let store = PgRoomStore::new(db.pool().clone());
+    let guild_id: u64 = guild.parse().unwrap_or_else(|_| {
+        eprintln!("report: --guild must be a Discord snowflake");
+        std::process::exit(2);
+    });
+    let tracked = store.rooms_in_guild(guild_id).await.unwrap_or_else(|_| {
+        eprintln!(
+            "report: query failed; check authorized database/schema (no migrations are applied)"
+        );
+        std::process::exit(1);
+    });
+    // Close before the network: the tracked rows are in hand, and a stalled
+    // channel read must not hold pool connections.
+    db.close().await;
+    let (live, discord_requests) = bounded_live_voice(&guild, proxy).await;
+    let counts = count_ghosts(&tracked, &live);
+    let report = serde_json::json!({
+        "tool": "voice-ghosts",
+        "guild": guild,
+        "tracked_rooms": tracked.len(),
+        "live_voice_channels": live.len(),
+        "tracked_present": counts.tracked_present.iter().map(u64::to_string).collect::<Vec<_>>(),
+        "tracked_gone": counts.tracked_gone.iter().map(u64::to_string).collect::<Vec<_>>(),
+        "untracked_present": counts.untracked_present.iter().map(u64::to_string).collect::<Vec<_>>(),
+        "clean": counts.is_clean(),
+        "discordRequests": discord_requests,
+        "note": "existence only: occupant and manageability classes need a gateway-derived snapshot, not this report.",
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
+    0
+}
+
 #[tokio::main]
 async fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -329,9 +476,10 @@ async fn main() {
     let code = match subcommand.as_str() {
         "voice-reconcile" => voice_reconcile(args).await,
         "leave-gap" => leave_gap(args).await,
-        "" => usage_error("pass a report (voice-reconcile | leave-gap)"),
+        "voice-ghosts" => voice_ghosts(args).await,
+        "" => usage_error("pass a report (voice-reconcile | leave-gap | voice-ghosts)"),
         other => usage_error(&format!(
-            "unknown report \"{other}\" (voice-reconcile | leave-gap)"
+            "unknown report \"{other}\" (voice-reconcile | leave-gap | voice-ghosts)"
         )),
     };
     std::process::exit(code);
