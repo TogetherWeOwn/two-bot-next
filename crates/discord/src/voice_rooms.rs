@@ -3,8 +3,8 @@
 //! blindly retries a create whose response may have been lost.
 //!
 //! Sources:
-//! https://docs.rs/twilight-http/0.17.1/twilight_http/request/guild/struct.CreateGuildChannel.html
-//! https://docs.discord.com/developers/topics/permissions#permission-overwrites
+//! <https://docs.rs/twilight-http/0.17.1/twilight_http/request/guild/struct.CreateGuildChannel.html>
+//! <https://docs.discord.com/developers/topics/permissions#permission-overwrites>
 
 use std::{
     sync::{
@@ -530,7 +530,7 @@ impl RoomHttp {
 
     /// V4 vote-kick enforcement, first half: move the member out of voice by
     /// clearing their voice channel (`channel_id: null`). Source:
-    /// https://docs.rs/twilight-http/0.17.1/twilight_http/request/guild/member/struct.UpdateGuildMember.html
+    /// <https://docs.rs/twilight-http/0.17.1/twilight_http/request/guild/member/struct.UpdateGuildMember.html>
     /// A 404 means the member already left: the spec cancels the vote when the
     /// target leaves, so treat it as success.
     pub async fn disconnect_member(
