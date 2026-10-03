@@ -43,6 +43,9 @@ export const FORWARDED_FLAGS = [
   "TWO_ONBOARDING_DRY_RUN",
   "TWO_SELF_ROLE_PANELS",
   "TWO_SELF_ROLE_DRY_RUN",
+  // Guild command registry drift CLI and opt-in boot publish (TOG-10860).
+  "TWO_COMMANDS_PUBLISH_ON_BOOT",
+  "TWO_COMMANDS_ALLOW_LIVE_GUILD",
   // Community scorecard, classifier and jobs.
   "TWO_COMMUNITY_SCORECARD",
   "TWO_COMMUNITY_RECOMMENDATIONS",
@@ -72,6 +75,7 @@ export const FORWARDED_FLAGS = [
   "TWO_ANTI_NUKE_PROTECTED_USER_IDS",
   "TWO_ANTI_NUKE_TRUSTED_USER_IDS",
   // Temporary voice rooms.
+  "TWO_VOICE",
   "TWO_TEMP_VOICE",
   "TWO_TEMP_VOICE_CATEGORY_ID",
   "TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS",
@@ -84,6 +88,11 @@ export const FORWARDED_FLAGS = [
   "TWO_TEMP_VOICE_PANEL_CHANNEL_ID",
   "TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS",
   "TWO_TEMP_VOICE_SWEEP_SECONDS",
+  // Template assistant (V12): non-secret endpoint URL + model name; the
+  // endpoint credential (if any) travels as its own Container secret, never
+  // through this flag allowlist.
+  "TWO_ASSISTANT_ENDPOINT",
+  "TWO_ASSISTANT_MODEL",
 ] as const;
 
 export type ForwardedFlag = (typeof FORWARDED_FLAGS)[number];
@@ -104,13 +113,16 @@ const REDIRECT = "go.two.gg redirect is served by the Worker (REDIRECT_*), not t
 export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_DATABASE_URL: "cutover/operator CLI secret; the Container reads DATABASE_URL",
   TWO_STAGING_DATABASE_URL: SECRET,
+  TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: SECRET,
   TWO_RESTORE_URL: SECRET,
   TWO_MODERATION_AUDIT_SECRET: SECRET,
   TWO_ONBOARDING_ROTA_PSEUDONYM_KEY: SECRET,
   TWO_BACKUP_S3_ACCESS_KEY_ID: SECRET,
   TWO_BACKUP_S3_SECRET_ACCESS_KEY: SECRET,
   TWO_DB_POOL_MAX: "cutover CLI pool size, not read by the Container runtime",
+  TWO_DATABASE_TLS: "cutover/operator CLI TLS policy for database_tls::enforce (default required); not read by the Container runtime",
   TWO_ERASURE_ACTOR: "erase-member operator CLI audit actor, set per invocation; not read by the Container runtime",
+  TWO_GUILD_CONFIG_OFFLINE_TEST: "guild-config backup CLI offline-fixture gate, set only by CLI tests; not read by the Container runtime",
   TWO_BACKUP_DIR: BACKUP,
   TWO_BACKUP_KEEP: BACKUP,
   TWO_BACKUP_S3_BUCKET: BACKUP,
@@ -124,7 +136,9 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_ANTI_NUKE_SNAPSHOT_PATH: "filesystem write path; Container disk is ephemeral",
   TWO_HEALTH_BIND_HOST: BIND,
   TWO_HEALTH_PORT: BIND,
+  TWO_INTERNAL_BIND: BIND,
   TWO_INTERNAL_BIND_HOST: BIND,
+  TWO_INTERNAL_CALLERS: CAPABILITY,
   TWO_INTERNAL_PORT: BIND,
   TWO_REDIRECT_BIND_HOST: BIND,
   TWO_REDIRECT_PORT: BIND,

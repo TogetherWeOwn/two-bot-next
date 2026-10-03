@@ -10,8 +10,24 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { setImmediate } from "node:timers/promises";
 import worker, { TwoBotContainer, type Env } from "../src/index.ts";
+import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
+
+const ID = "deployment-A";
+const CONTROL_TOKEN = "synthetic-control-token-not-a-secret-12345";
+const ACTIVE_OWNER = {
+  deploymentId: ID, epoch: 1, phase: "active", actor: "fixture-operator",
+  timestamp: "2026-10-01T00:00:00.000Z", oldEpoch: 0, oldDeploymentId: null,
+};
+const KEEPALIVE = { startedAt: 0, deploymentId: ID, epoch: 1 };
+function probeRequest(input: string, init?: RequestInit): Request {
+  const req = new Request(input, init);
+  req.headers.set(DEPLOYMENT_HEADER, ID);
+  return req;
+}
 
 const WORKER_ENV = {
+  CF_VERSION_METADATA: { id: ID },
+  OWNERSHIP_CONTROL_TOKEN: CONTROL_TOKEN,
   DISCORD_TOKEN: "synthetic-discord-token",
   DATABASE_URL: "synthetic-database-value",
   GUILD_ID: "111222333444555666",
@@ -28,6 +44,26 @@ const EXPECTED_ENV = {
   LISTEN_ADDR: "0.0.0.0:8080",
 };
 
+const PUBLICATION_ENV = {
+  DISCORD_APPLICATION_ID: "2222",
+  TWO_COMMANDS_PUBLISH_ON_BOOT: "1",
+  TWO_COMMANDS_ALLOW_LIVE_GUILD: "1",
+  TWO_AUTOMATIONS: "1",
+  TWO_TEXT_COMMANDS: "0",
+  TWO_ANNOUNCEMENTS: "1",
+  TWO_FEED_POLL_SECONDS: "300",
+  TWO_MODERATION: "1",
+  TWO_OWEN_USER_ID: "333444555666777888",
+  TWO_MODERATION_PROTECTED_ROLE_IDS: "444555666777888999, 555666777888999000",
+  TWO_COMMUNITY_SCORECARD: "1",
+};
+const PUBLICATION_WORKER_ENV = {
+  ...WORKER_ENV,
+  ...PUBLICATION_ENV,
+  DISCORD_API_BASE: "https://not-forwarded.invalid",
+  UNRELATED_SETTING: "not-a-container-var",
+};
+
 type StartConfig = {
   env?: Record<string, string>;
   enableInternet?: boolean;
@@ -35,14 +71,12 @@ type StartConfig = {
   labels?: Record<string, string>;
 };
 
-async function harness(
-  t: TestContext,
-  env: Partial<Env> = WORKER_ENV,
-  values = new Map<string, unknown>(),
-  sqlStore?: DatabaseSync,
-) {
+async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: {
+  owner?: unknown; readError?: boolean; stopError?: boolean; running?: boolean;
+} | Map<string, unknown> = {}, sqlStore?: DatabaseSync) {
   const database = sqlStore ?? new DatabaseSync(":memory:");
   if (!sqlStore) t.after(() => database.close());
+  const flags = options instanceof Map ? {} : options;
   const logs: string[] = [];
   for (const method of ["log", "warn", "error"] as const) {
     t.mock.method(console, method, (...args: unknown[]) => {
@@ -51,11 +85,20 @@ async function harness(
   }
   const starts: StartConfig[] = [];
   const requests: { pathname: string; port: number }[] = [];
+  const values = options instanceof Map ? options
+    : new Map<string, unknown>([[OWNER_KEY, "owner" in flags ? flags.owner : ACTIVE_OWNER]]);
   const gates: Promise<unknown>[] = [];
   let listenerPort = 8080;
   let probeStatus = 503;
+  let probeResponse: ((status: number) => Response) | undefined;
   const runtime = {
-    running: false,
+    running: flags.running ?? false,
+    destroys: 0,
+    async destroy() {
+      this.destroys++;
+      if (flags.stopError) throw new Error("synthetic shutdown failure");
+      this.running = false;
+    },
     start(options: StartConfig) {
       assert.equal(this.running, false, "must not start an already-running container");
       starts.push(structuredClone(options));
@@ -74,18 +117,34 @@ async function harness(
         // Liveness is not readiness, even with a configured token. Preserve
         // gateway-down; a synthetic env fixture is NOT proof of a READY event.
         const status = pathname === "/readyz" ? probeStatus : 200;
-        const response = Response.json({ ready: status === 200, gateway_connected: status === 200 }, { status });
+        const response = probeResponse?.(status)
+          ?? Response.json({ ready: status === 200, gateway_connected: status === 200 }, { status });
         Object.defineProperty(response, "webSocket", { value: null });
         return response;
       },
     }),
   };
   const ctx = {
+    // SDK reconstruction obtains a loopback callback even without host rules.
+    // No outbound request is allowed by this local native-runtime fixture.
+    exports: { ContainerProxy: () => ({ fetch: () => { throw new Error("unexpected outbound request"); } }) },
+    id: { toString: () => "synthetic-do-id" },
     container: runtime,
     storage: {
-      get: async (key: string) => values.get(key),
-      put: async (key: string, value: unknown) => { values.set(key, value); },
-      kv: { get: (key: string) => values.get(key) },
+      get: async (key: string) => {
+        if (key === OWNER_KEY && flags.readError) throw new Error("synthetic storage error");
+        return values.get(key);
+      },
+      put: async (key: string | Record<string, unknown>, value?: unknown) => {
+        if (typeof key === "string") values.set(key, value);
+        else for (const [k, v] of Object.entries(key)) values.set(k, v);
+      },
+      delete: async (key: string) => values.delete(key),
+      kv: {
+        get: (key: string) => values.get(key),
+        put: (key: string, value: unknown) => { values.set(key, value); },
+        delete: (key: string) => values.delete(key),
+      },
       // Execute the SDK's unmodified schedule SQL in real in-memory SQLite.
       sql: {
         exec(query: string, ...bindings: (string | number | null)[]) {
@@ -103,13 +162,14 @@ async function harness(
     },
   };
   const bot = new TwoBotContainer(
-    ctx as unknown as DurableObjectState,
-    env as Env,
+    ctx as unknown as DurableObjectState<{}>,
+    { CF_VERSION_METADATA: { id: ID }, OWNERSHIP_CONTROL_TOKEN: CONTROL_TOKEN, ...env } as Env,
   );
   await Promise.all(gates);
   return {
     bot, runtime, starts, requests, logs, values, ctx, database,
     setProbeStatus: (status: number) => { probeStatus = status; },
+    setProbeResponse: (factory: (status: number) => Response) => { probeResponse = factory; },
     pending: () => database.prepare("SELECT * FROM container_schedules WHERE callback = 'keepalive'").all(),
   };
 }
@@ -124,7 +184,7 @@ async function tickKeepalive(bot: TwoBotContainer) {
 for (const path of ["/health", "/readyz"]) {
   test(`cold fetch ${path} passes Worker env through SDK auto-start`, async (t) => {
     const h = await harness(t);
-    const response = await h.bot.fetch(new Request(`https://worker.invalid${path}`));
+    const response = await h.bot.fetch(probeRequest(`https://worker.invalid${path}`));
     assert.equal(response.status, path === "/readyz" ? 503 : 200);
     assert.equal(h.starts.length, 1);
     assert.deepEqual(h.starts[0]?.env, EXPECTED_ENV);
@@ -133,8 +193,193 @@ for (const path of ["/health", "/readyz"]) {
     assert.ok(h.logs.every((line) =>
       !line.includes(WORKER_ENV.DISCORD_TOKEN) && !line.includes(WORKER_ENV.DATABASE_URL)));
 
-    await h.bot.fetch(new Request(`https://worker.invalid${path}`));
+    await h.bot.fetch(probeRequest(`https://worker.invalid${path}`));
     assert.equal(h.starts.length, 1, "warm probe must not restart the container");
+  });
+}
+
+for (const path of ["/health", "/readyz"]) {
+  // The outer Worker stamps the deployment fence from its own version
+  // identity, so the serving deployment id must match the fenced DO (the
+  // default harness deploys ID). The container still answers with a spoofed
+  // version header: only the outer serving Worker counts for provenance.
+  for (const metadata of [{ id: ID }]) {
+    const provenance = "serving metadata";
+    for (const status of path === "/health" ? [200] : [200, 503]) {
+      test(`outer Worker ${path} (${status}) replaces/removes SDK spoofed version with ${provenance}`, async (t) => {
+        // The container answers with a spoofed version header; only the
+        // outer serving Worker counts for provenance.
+        const h = await harness(t);
+        h.setProbeStatus(status);
+        const body = JSON.stringify(path === "/health" ? { status: "ok" } : {
+          ready: status === 200,
+          components: [["process", "ready"], ["gateway", status === 200 ? "ready" : "unconfigured"]],
+          jobs: {},
+          build_revision: "synthetic-image-revision",
+          build_id: "synthetic-image-build",
+        }, null, 2) + "\n";
+        const statusText = status === 503 ? "Parked" : "Healthy";
+        h.setProbeResponse((status) => new Response(body, {
+          status,
+          statusText,
+          headers: {
+            "content-type": "application/json",
+            "X-Two-Worker-Version": "spoofed-container-version, second-spoof",
+            "x-fixture": "preserved",
+          },
+        }));
+        const response = await worker.fetch(new Request(`https://worker.invalid${path}`), {
+          CF_VERSION_METADATA: metadata,
+          TWO_BOT: { getByName: () => h.bot },
+        } as unknown as Env, {} as ExecutionContext);
+        assert.equal(response.headers.get("x-two-worker-version"), metadata?.id ?? null);
+        assert.equal(response.status, status, "parked readiness must stay 503");
+        assert.equal(response.statusText, statusText);
+        assert.equal(response.headers.get("content-type"), "application/json");
+        assert.equal(response.headers.get("x-fixture"), "preserved");
+        assert.equal(await response.text(), body, "container JSON/build provenance must stay byte-for-byte unchanged");
+        assert.equal(h.starts.length, 1);
+        assert.deepEqual(h.starts[0]?.env, EXPECTED_ENV, "version metadata must never enter container env");
+        assert.ok(h.requests.some((r) => r.pathname === path && r.port === 8080));
+      });
+    }
+
+    test(`SDK native startup failure returns sanitized outer ${path} 500 with ${provenance}`, async (t) => {
+      const h = await harness(t);
+      t.mock.method(h.runtime, "start", () => {
+        throw new Error(`fixture startup failure ${WORKER_ENV.DISCORD_TOKEN} ${WORKER_ENV.DATABASE_URL}`);
+      });
+      const response = await worker.fetch(new Request(`https://worker.invalid${path}`), {
+        CF_VERSION_METADATA: metadata,
+        TWO_BOT: { getByName: () => h.bot },
+      } as unknown as Env, {} as ExecutionContext);
+      assert.equal(response.status, 500);
+      assert.equal(response.headers.get("x-two-worker-version"), metadata?.id ?? null);
+      assert.deepEqual(await response.json(), { ready: false, error_class: "container_unavailable" });
+      assert.ok(h.logs.every((line) =>
+        !line.includes(WORKER_ENV.DISCORD_TOKEN) && !line.includes(WORKER_ENV.DATABASE_URL)));
+    });
+
+    // SDK 0.3.7 containerFetch maps these start errors to text 429 (raw
+    // e.message) and text 503 instead of rejecting or returning 500.
+    for (const [sdkStatus, message] of [
+      [429, "You are requesting too many containers per second"],
+      [503, "There is no container instance that can be provided to this Durable Object"],
+    ] as const) {
+      test(`SDK start ${sdkStatus} returns sanitized outer ${path} 500 with ${provenance}`, async (t) => {
+        const h = await harness(t);
+        t.mock.method(h.runtime, "start", () => {
+          throw new Error(`${message} ${WORKER_ENV.DISCORD_TOKEN} ${WORKER_ENV.DATABASE_URL}`);
+        });
+        const sdkResponse = await h.bot.containerFetch(new Request(`https://worker.invalid${path}`));
+        assert.equal(sdkResponse.status, sdkStatus, "fixture must reach the SDK's synthetic branch");
+        assert.notEqual(sdkResponse.headers.get("content-type")?.split(";")[0], "application/json");
+        await sdkResponse.arrayBuffer();
+        const response = await worker.fetch(new Request(`https://worker.invalid${path}`), {
+          CF_VERSION_METADATA: metadata,
+          TWO_BOT: { getByName: () => h.bot },
+        } as unknown as Env, {} as ExecutionContext);
+        assert.equal(response.status, 500);
+        assert.equal(response.headers.get("x-two-worker-version"), metadata?.id ?? null);
+        const body = await response.text();
+        assert.deepEqual(JSON.parse(body), { ready: false, error_class: "container_unavailable" });
+        for (const secret of [WORKER_ENV.DISCORD_TOKEN, WORKER_ENV.DATABASE_URL]) {
+          assert.ok(!body.includes(secret));
+          assert.ok(h.logs.every((line) => !line.includes(secret)));
+        }
+      });
+    }
+
+    for (const failure of ["lookup", "fetch"]) {
+      test(`Worker DO ${failure} rejection returns sanitized ${path} 500 with ${provenance}`, async (t) => {
+        const h = await harness(t);
+        const reject = () => { throw new Error(`fixture DO failure ${WORKER_ENV.DATABASE_URL}`); };
+        const response = await worker.fetch(new Request(`https://worker.invalid${path}`), {
+          CF_VERSION_METADATA: metadata,
+          TWO_BOT: { getByName: () => failure === "lookup" ? reject() : { fetch: async () => reject() } },
+        } as unknown as Env, {} as ExecutionContext);
+        assert.equal(response.status, 500);
+        assert.equal(response.headers.get("x-two-worker-version"), metadata?.id ?? null);
+        assert.deepEqual(await response.json(), { ready: false, error_class: "container_unavailable" });
+        assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DATABASE_URL)));
+      });
+    }
+  }
+}
+
+// Only 200 and JSON 503 are the bot's own probe answers; anything else that
+// reaches the container port is replaced, whatever its status or media type.
+for (const [status, contentType, forwarded] of [
+  [503, "application/json; charset=utf-8", true],
+  [503, "text/plain", false],
+  [503, null, false],
+  [429, "application/json", false],
+  [404, "application/json", false],
+  [500, "application/json", false],
+] as const) {
+  test(`container /readyz ${status} ${contentType ?? "without content-type"} is ${forwarded ? "forwarded" : "sanitized"}`, async (t) => {
+    const h = await harness(t);
+    h.setProbeStatus(status);
+    const leak = `container body ${WORKER_ENV.DATABASE_URL}`;
+    h.setProbeResponse((s) => {
+      if (s === 200) return Response.json({ status: "ok" });
+      const response = new Response(forwarded ? JSON.stringify({ ready: false }) : leak, { status: s });
+      if (contentType) response.headers.set("content-type", contentType);
+      else response.headers.delete("content-type");
+      return response;
+    });
+    // The fenced DO requires the stamped deployment header even for probes.
+    const response = await h.bot.fetch(probeRequest("https://worker.invalid/readyz"));
+    const body = await response.text();
+    if (forwarded) {
+      assert.equal(response.status, status);
+      assert.deepEqual(JSON.parse(body), { ready: false });
+    } else {
+      assert.equal(response.status, 500);
+      assert.deepEqual(JSON.parse(body), { ready: false, error_class: "container_unavailable" });
+      assert.ok(!body.includes(WORKER_ENV.DATABASE_URL));
+    }
+    assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DATABASE_URL)));
+  });
+}
+
+test("lifecycle error replaces arbitrary exception without inspecting it", async (t) => {
+  const h = await harness(t);
+  const unsafe = { toString() { throw new Error(WORKER_ENV.DISCORD_TOKEN); } };
+  assert.throws(() => h.bot.onError(unsafe), { message: "container_lifecycle_failed" });
+  assert.ok(h.logs.includes(JSON.stringify({ event: "container_error", error_class: "container_lifecycle_failed" })));
+  assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DISCORD_TOKEN)));
+});
+
+test("ownership failure after native startup destroys the unconfirmed process", async (t) => {
+  const h = await harness(t);
+  const start = h.runtime.start.bind(h.runtime);
+  t.mock.method(h.runtime, "start", (config: StartConfig) => {
+    start(config);
+    h.values.delete(OWNER_KEY);
+  });
+  await assert.rejects(h.bot.start(), /not_owner/);
+  assert.equal(h.starts.length, 1);
+  assert.equal(h.runtime.destroys, 1);
+  assert.equal(h.runtime.running, false);
+  assert.equal(h.values.has("two-bot:keepalive:v1"), false);
+  assert.equal((await h.bot.fetch(probeRequest("https://worker.invalid/health"))).status, 503);
+  assert.equal(h.starts.length, 1, "no second start after loss of ownership");
+});
+
+// Without a version identity the outer Worker cannot stamp the deployment
+// fence: the probe is refused, never blamed on the container.
+for (const path of ["/health", "/readyz"]) {
+  test(`outer Worker ${path} without version identity is fenced`, async (t) => {
+    const h = await harness(t);
+    const response = await worker.fetch(new Request(`https://worker.invalid${path}`), {
+      TWO_BOT: { getByName: () => h.bot },
+    } as unknown as Env, {} as ExecutionContext);
+    assert.equal(response.status, 503);
+    assert.equal(response.headers.get("x-two-worker-version"), null);
+    const body = await response.text();
+    assert.deepEqual(JSON.parse(body), { error: "ownership_fenced", reason: "deployment_id_missing" });
+    assert.equal(h.starts.length, 0, "fenced probe must not start the container");
   });
 }
 
@@ -146,7 +391,7 @@ for (const failure of ["lookup", "insert"] as const) {
           const h = await harness(t);
           h.setProbeStatus(status);
           if (warm) {
-            const response = await h.bot.fetch(new Request("https://worker.invalid/health"));
+            const response = await h.bot.fetch(probeRequest("https://worker.invalid/health"));
             await response.arrayBuffer();
             h.bot.deleteSchedules("keepalive");
           }
@@ -162,7 +407,7 @@ for (const failure of ["lookup", "insert"] as const) {
             return exec(query, ...bindings);
           });
           const forwardedBefore = h.requests.filter((r) => r.pathname === path).length;
-          const response = await h.bot.fetch(new Request(`https://worker.invalid${path}`));
+          const response = await h.bot.fetch(probeRequest(`https://worker.invalid${path}`));
           assert.equal(response.status, status, "monitoring must not replace the Container response");
           assert.deepEqual(await response.json(), { ready: status === 200, gateway_connected: status === 200 });
           assert.ok(h.requests.filter((r) => r.pathname === path).length > forwardedBefore);
@@ -172,7 +417,7 @@ for (const failure of ["lookup", "insert"] as const) {
           assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DISCORD_TOKEN) && !line.includes(WORKER_ENV.OPS_ALERT_WEBHOOK_URL)));
 
           failing = false;
-          const retry = await h.bot.fetch(new Request(`https://worker.invalid${path}`));
+          const retry = await h.bot.fetch(probeRequest(`https://worker.invalid${path}`));
           assert.equal(retry.status, status);
           await retry.arrayBuffer();
           await h.bot.onStart();
@@ -192,6 +437,50 @@ test("cold keepalive passes env through the SDK's string-URL fetch path", async 
   assert.ok(h.logs.includes("two-bot /readyz unhealthy: 503"));
 });
 
+for (const path of ["/health", "/readyz", "keepalive", "start", "startAndWaitForPorts"]) {
+  test(`${path} startup forwards only allowlisted publication settings`, async (t) => {
+    const h = await harness(t, PUBLICATION_WORKER_ENV);
+    if (path === "keepalive") {
+      await tickKeepalive(h.bot);
+    } else if (path === "start") {
+      await h.bot.start();
+    } else if (path === "startAndWaitForPorts") {
+      await h.bot.startAndWaitForPorts();
+    } else {
+      await h.bot.fetch(probeRequest(`https://worker.invalid${path}`));
+    }
+    assert.equal(h.starts.length, 1);
+    assert.deepEqual(h.starts[0]?.env, { ...EXPECTED_ENV, ...PUBLICATION_ENV });
+    assert.ok(h.logs.every((line) =>
+      !line.includes(WORKER_ENV.DISCORD_TOKEN) && !line.includes(WORKER_ENV.DATABASE_URL)));
+  });
+}
+
+test("registry feature bindings do not opt in to publication or acknowledge live writes", async (t) => {
+  const { TWO_COMMANDS_PUBLISH_ON_BOOT, TWO_COMMANDS_ALLOW_LIVE_GUILD, ...features } = PUBLICATION_ENV;
+  const h = await harness(t, { ...WORKER_ENV, ...features });
+  await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+  assert.deepEqual(h.starts[0]?.env, { ...EXPECTED_ENV, ...features });
+  assert.equal(h.starts[0]?.env?.["TWO_COMMANDS_PUBLISH_ON_BOOT"], undefined);
+  assert.equal(h.starts[0]?.env?.["TWO_COMMANDS_ALLOW_LIVE_GUILD"], undefined);
+});
+
+for (const value of ["0", "true", ""]) {
+  test(`publication flags preserve exact binding value ${JSON.stringify(value)}`, async (t) => {
+    const h = await harness(t, {
+      ...WORKER_ENV,
+      TWO_COMMANDS_PUBLISH_ON_BOOT: value,
+      TWO_COMMANDS_ALLOW_LIVE_GUILD: value,
+    });
+    await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+    assert.deepEqual(h.starts[0]?.env, {
+      ...EXPECTED_ENV,
+      TWO_COMMANDS_PUBLISH_ON_BOOT: value,
+      TWO_COMMANDS_ALLOW_LIVE_GUILD: value,
+    });
+  });
+}
+
 for (const port of ["9090", "1", "65535", "09090"]) {
   for (const path of ["/health", "/readyz", "keepalive"]) {
     test(`cold ${path} uses BOT_PORT=${port} for both listener and SDK target`, async (t) => {
@@ -201,7 +490,7 @@ for (const port of ["9090", "1", "65535", "09090"]) {
         assert.ok(h.logs.includes("two-bot /readyz unhealthy: 503"));
         assert.ok(!h.logs.some((line) => line.includes("probe failed")));
       } else {
-        const response = await h.bot.fetch(new Request(`https://worker.invalid${path}`, {
+        const response = await h.bot.fetch(probeRequest(`https://worker.invalid${path}`, {
           signal: AbortSignal.timeout(1000),
         }));
         assert.equal(response.status, path === "/readyz" ? 503 : 200);
@@ -232,7 +521,7 @@ test("missing optionals are omitted; token and guild work without DATABASE_URL",
     DISCORD_TOKEN: WORKER_ENV.DISCORD_TOKEN,
     GUILD_ID: WORKER_ENV.GUILD_ID,
   });
-  await h.bot.fetch(new Request("https://worker.invalid/health"));
+  await h.bot.fetch(probeRequest("https://worker.invalid/health"));
   assert.deepEqual(h.starts[0]?.env, {
     DISCORD_TOKEN: WORKER_ENV.DISCORD_TOKEN,
     GUILD_ID: WORKER_ENV.GUILD_ID,
@@ -242,7 +531,7 @@ test("missing optionals are omitted; token and guild work without DATABASE_URL",
 
 test("health-only config never fabricates credentials or gateway readiness", async (t) => {
   const h = await harness(t, { DISCORD_TOKEN: "", DATABASE_URL: "", GUILD_ID: "" });
-  const response = await h.bot.fetch(new Request("https://worker.invalid/readyz"));
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/readyz"));
   assert.equal(response.status, 503);
   assert.deepEqual(h.starts[0]?.env, { LISTEN_ADDR: "0.0.0.0:8080" });
 });
@@ -264,7 +553,7 @@ test("explicit startAndWaitForPorts also uses the class env defaults", async (t)
 
 for (const method of ["start", "startAndWaitForPorts"] as const) {
   test(`${method} preserves SDK envVars replacement precedence`, async (t) => {
-    const h = await harness(t);
+    const h = await harness(t, PUBLICATION_WORKER_ENV);
     const envVars = { ONLY_EXPLICIT: "synthetic-override" };
     if (method === "start") {
       await h.bot.start({ envVars });
@@ -272,7 +561,8 @@ for (const method of ["start", "startAndWaitForPorts"] as const) {
       await h.bot.startAndWaitForPorts({ startOptions: { envVars } });
     }
     assert.deepEqual(h.starts[0]?.env, envVars);
-    assert.deepEqual(h.bot.envVars, EXPECTED_ENV, "per-start override must not mutate defaults");
+    assert.deepEqual(h.bot.envVars, { ...EXPECTED_ENV, ...PUBLICATION_ENV },
+      "per-start override must not mutate defaults");
   });
 }
 
@@ -280,7 +570,7 @@ for (const path of ["/metrics", "/metrics?token=synthetic", "/metrics/", "/metri
   for (const method of ["GET", "HEAD", "POST"]) {
     test(`${method} ${path} is never publicly routed or sent to the container`, async (t) => {
       const h = await harness(t);
-      const request = new Request(`https://worker.invalid${path}`, { method });
+      const request = probeRequest(`https://worker.invalid${path}`, { method });
       const env = {
         ...WORKER_ENV,
         // Even a configured invite campaign cannot make the reserved route public.
@@ -300,10 +590,154 @@ for (const path of ["/metrics", "/metrics?token=synthetic", "/metrics/", "/metri
 
 test("non-probe route remains 404 without starting a container", async (t) => {
   const h = await harness(t);
-  const response = await h.bot.fetch(new Request("https://worker.invalid/debug"));
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/debug"));
   assert.equal(response.status, 404);
   assert.equal(h.starts.length, 0);
 });
+
+for (const options of [
+  { owner: undefined },
+  { owner: { ...ACTIVE_OWNER, deploymentId: "deployment-B" } },
+  { owner: { ...ACTIVE_OWNER, phase: "fenced", deploymentId: null } },
+  { readError: true },
+  { owner: { epoch: -1 } },
+]) {
+  test(`SDK all startup/proxy/keepalive paths fail closed: ${JSON.stringify(options)}`, async (t) => {
+    const h = await harness(t, WORKER_ENV, options);
+    for (const path of ["/health", "/readyz"]) {
+      assert.equal((await h.bot.fetch(probeRequest(`https://worker.invalid${path}`))).status, 503);
+    }
+    await assert.rejects(h.bot.start());
+    await assert.rejects(h.bot.startAndWaitForPorts());
+    await assert.rejects(h.bot.containerFetch("https://container.invalid/health"));
+    await assert.rejects(h.bot.onStart());
+    await h.bot.keepalive(KEEPALIVE, { taskId: "stale-task" });
+    assert.equal(h.starts.length, 0);
+    assert.equal(h.requests.length, 0);
+    assert.equal(h.values.has("two-bot:keepalive:v1"), false);
+  });
+}
+
+test("stale and baseline keepalive payloads neither start nor rearm", async (t) => {
+  const h = await harness(t);
+  const schedule = { taskId: "stale-task" };
+  await h.bot.keepalive({ startedAt: 0 }, schedule);
+  await h.bot.keepalive({ ...KEEPALIVE, epoch: 0 }, schedule);
+  await h.bot.keepalive({ ...KEEPALIVE, deploymentId: "deployment-B" }, schedule);
+  assert.equal(h.pending().length, 0);
+  assert.equal(h.starts.length, 0);
+  assert.equal(h.requests.length, 0);
+  assert.equal(h.values.has("two-bot:keepalive:v1"), false);
+});
+
+test("ownership loss inside a keepalive probe cannot notify or rearm monitoring", async (t) => {
+  const h = await harness(t);
+  const proxy = h.bot.containerFetch.bind(h.bot);
+  t.mock.method(h.bot, "containerFetch", async (...args: Parameters<TwoBotContainer["containerFetch"]>) => {
+    h.values.delete(OWNER_KEY);
+    return proxy(...args);
+  });
+  await tickKeepalive(h.bot);
+  assert.equal(h.starts.length, 0);
+  assert.equal(h.pending().length, 0);
+  assert.equal(h.values.has("two-bot:readiness"), false);
+  assert.ok(h.logs.includes("two-bot ownership refused: not_owner"));
+});
+
+test("DO reconstruction destroys an inactive running process before any probe", async (t) => {
+  const h = await harness(t, { ...WORKER_ENV, CF_VERSION_METADATA: { id: "deployment-B" } }, { running: true });
+  assert.equal(h.runtime.destroys, 1);
+  assert.equal(h.runtime.running, false);
+  assert.equal((await h.bot.fetch(probeRequest("https://worker.invalid/health"))).status, 503);
+  assert.equal(h.starts.length, 0);
+});
+
+function controlRequest(body?: object, token = CONTROL_TOKEN): Request {
+  return probeRequest(`https://worker.invalid${CONTROL_PATH}`, {
+    method: body ? "POST" : "GET",
+    headers: { authorization: `Bearer ${token}` },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+}
+
+test("authenticated takeover is CAS audited, tears down first and never auto-starts", async (t) => {
+  const h = await harness(t);
+  await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+  const result = await h.bot.fetch(controlRequest({ action: "takeover", expectedEpoch: 1, actor: "fixture-operator" }));
+  assert.equal(result.status, 200);
+  const state = await result.json();
+  assert.equal(state.owner.epoch, 2);
+  assert.equal(state.owner.oldEpoch, 1);
+  assert.equal(state.owner.actor, "fixture-operator");
+  assert.ok(Number.isFinite(Date.parse(state.owner.timestamp)));
+  assert.equal(state.running, false);
+  assert.equal(h.runtime.destroys, 1);
+  assert.equal(h.starts.length, 1, "control must not start replacement");
+  assert.deepEqual(h.values.get(`${AUDIT_PREFIX}2:active`), state.owner);
+  assert.equal((await h.bot.fetch(controlRequest({ action: "takeover", expectedEpoch: 1, actor: "fixture-operator" }))).status, 409);
+  await h.bot.keepalive(KEEPALIVE, { taskId: "stale-task" });
+  assert.equal(h.starts.length, 1, "old epoch is harmless even on the same deployment");
+  await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+  assert.equal(h.starts.length, 2);
+});
+
+test("shutdown failure retains durable revocation and refuses warm proxying", async (t) => {
+  const h = await harness(t, WORKER_ENV, { stopError: true });
+  await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+  assert.equal((await h.bot.fetch(controlRequest({ action: "fence", expectedEpoch: 1, actor: "fixture-operator" }))).status, 503);
+  assert.equal((h.values.get(OWNER_KEY) as any).phase, "fenced");
+  const requests = h.requests.length;
+  assert.equal((await h.bot.fetch(probeRequest("https://worker.invalid/health"))).status, 503);
+  assert.equal(h.requests.length, requests);
+});
+
+for (const token of ["", "invalid-token", "x".repeat(4096)]) {
+  test(`unauthenticated control refuses before storage or startup (length ${token.length})`, async (t) => {
+    const h = await harness(t);
+    assert.equal((await h.bot.fetch(controlRequest({ action: "takeover", expectedEpoch: 1, actor: "fixture" }, token))).status, 401);
+    assert.deepEqual(h.values.get(OWNER_KEY), ACTIVE_OWNER);
+    assert.equal(h.starts.length, 0);
+    assert.ok(h.logs.every((line) => !line.includes(CONTROL_TOKEN)));
+  });
+}
+
+test("malformed, oversized and unsafe-actor control input cannot change ownership", async (t) => {
+  const h = await harness(t);
+  for (const body of [
+    { action: "takeover", expectedEpoch: -1, actor: "fixture" },
+    { action: "takeover", expectedEpoch: 1, actor: "fixture\nsecret" },
+    { action: "takeover", expectedEpoch: 1, actor: "fixture", extra: "x".repeat(1024) },
+  ]) assert.equal((await h.bot.fetch(controlRequest(body))).status, 400);
+  assert.deepEqual(h.values.get(OWNER_KEY), ACTIVE_OWNER);
+  assert.equal(h.starts.length, 0);
+});
+
+test("stale Worker ingress cannot impersonate the current deployment through headers", async (t) => {
+  const h = await harness(t, { ...WORKER_ENV, CF_VERSION_METADATA: { id: "deployment-B" } }, {
+    owner: { ...ACTIVE_OWNER, deploymentId: "deployment-B" },
+  });
+  const request = probeRequest("https://worker.invalid/health");
+  request.headers.set(DEPLOYMENT_HEADER, "deployment-B");
+  const env = { ...WORKER_ENV, TWO_BOT: { getByName: () => h.bot } } as unknown as Env;
+  const response = await worker.fetch(request, env, {} as ExecutionContext);
+  assert.equal(response.status, 503, "Worker must overwrite B with its own A identity");
+  assert.equal(h.starts.length, 0);
+});
+
+test("Worker refuses unauthenticated control without ever looking up the DO", async () => {
+  const env = { ...WORKER_ENV, TWO_BOT: { getByName: () => { throw new Error("must not access DO"); } } } as unknown as Env;
+  const response = await worker.fetch(controlRequest(undefined, "invalid"), env, {} as ExecutionContext);
+  assert.equal(response.status, 401);
+});
+
+for (const path of ["/INTERNAL/OWNERSHIP", "/internal/%6fwnership", "//internal/ownership", "/internal/ownership/extra"]) {
+  test(`${path} cannot fall through to an invite redirect`, async () => {
+    const env = { ...WORKER_ENV, REDIRECT_MAPPINGS_JSON: JSON.stringify([{ slug: "internal/ownership", invite_code: "synthetic" }]) } as Env;
+    const response = await worker.fetch(probeRequest(`https://worker.invalid${path}`), env, {} as ExecutionContext);
+    assert.equal(response.status, 404);
+    assert.equal(response.headers.get("location"), null);
+  });
+}
 
 // Readiness monitoring uses synthetic responses only. Global fetch is stubbed
 // in every alert test: no configured webhook, Worker or database is contacted.
@@ -348,7 +782,7 @@ test("real SDK keeps one persistent chain across concurrent health traffic, rest
   const env = { KEEPALIVE_SECONDS: "60" };
   const first = await harness(t, env);
   const responses = await Promise.all(Array.from({ length: 10 }, () =>
-    first.bot.fetch(new Request("https://worker.invalid/health"))));
+    first.bot.fetch(probeRequest("https://worker.invalid/health"))));
   await Promise.all(responses.map((response) => response.arrayBuffer()));
   assert.equal(first.starts.length, 1, "cold startup also invokes onStart");
   assert.equal(first.pending().length, 1);
@@ -378,7 +812,7 @@ test("real SDK keeps one persistent chain across concurrent health traffic, rest
 test("real SDK collapses old duplicate chains and ignores snapshotted stale callbacks", async (t) => {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
   const h = await harness(t, { KEEPALIVE_SECONDS: "60" });
-  for (let i = 0; i < 11; i++) await h.bot.schedule(60, "keepalive", { startedAt: i });
+  for (let i = 0; i < 11; i++) await h.bot.schedule(60, "keepalive", { ...KEEPALIVE, startedAt: i });
   await h.bot.schedule(3600, "onStop", {});
   assert.equal(h.pending().length, 11);
   t.mock.timers.tick(60_000);
@@ -401,7 +835,7 @@ for (const warm of [false, true]) {
       const h = await harness(t, env);
       h.setProbeStatus(status);
       if (warm) {
-        const response = await h.bot.fetch(new Request("https://worker.invalid/health"));
+        const response = await h.bot.fetch(probeRequest("https://worker.invalid/health"));
         await response.arrayBuffer();
       } else {
         await h.bot.onStart();
@@ -443,7 +877,7 @@ for (const futureFirst of [true, false]) {
     t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
     const h = await harness(t, { KEEPALIVE_SECONDS: "60" });
     for (const delay of futureFirst ? [1200, 60] : [60, 1200]) {
-      await h.bot.schedule(delay, "keepalive", { startedAt: Date.now() });
+      await h.bot.schedule(delay, "keepalive", { ...KEEPALIVE, startedAt: Date.now() });
     }
     await h.bot.schedule(3600, "onStop", {});
     t.mock.timers.tick(60_000);
@@ -481,7 +915,7 @@ test("health traffic and onStart during an in-flight SDK alarm do not arm anothe
   await setImmediate();
   assert.ok(probing);
   const responses = await Promise.all(Array.from({ length: 10 }, () =>
-    h.bot.fetch(new Request("https://worker.invalid/health"))));
+    h.bot.fetch(probeRequest("https://worker.invalid/health"))));
   await Promise.all(responses.map((response) => response.arrayBuffer()));
   await h.bot.onStart();
   assert.equal(h.pending().length, 1, "only the currently executing task exists");

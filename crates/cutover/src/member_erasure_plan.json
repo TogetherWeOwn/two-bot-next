@@ -136,6 +136,16 @@
       "predicate": "guild_id = $1 AND (member_id = $2 OR event_id ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR reasons_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))"
     },
     {
+      "table": "containment_incidents",
+      "columns": ["executor_id", "trigger_audit_entry_id", "result_json"],
+      "predicate": "guild_id = $1 AND (executor_id = $2 OR trigger_audit_entry_id IN (SELECT audit_entry_id FROM containment_events WHERE guild_id = $1 AND (executor_id = $2 OR target_id = $2)) OR result_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))"
+    },
+    {
+      "table": "containment_events",
+      "columns": ["executor_id", "target_id"],
+      "predicate": "guild_id = $1 AND (executor_id = $2 OR target_id = $2)"
+    },
+    {
       "table": "operational_audit_log",
       "columns": ["actor_id", "target_id", "metadata_json", "entry_id"],
       "predicate": "guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR metadata_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR entry_id ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))"
@@ -159,6 +169,11 @@
       "table": "tickets",
       "columns": ["opener_id", "claimed_by"],
       "predicate": "guild_id = $1 AND (opener_id = $2 OR claimed_by = $2)"
+    },
+    {
+      "table": "voice_rooms",
+      "columns": ["owner_id", "original_creator_id"],
+      "predicate": "guild_id = $1 AND (owner_id = $2 OR original_creator_id = $2)"
     },
     {
       "table": "members",

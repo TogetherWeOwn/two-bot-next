@@ -56,6 +56,7 @@ pub fn is_identity_column(column: &str) -> bool {
         || column.ends_with("_member_id")
         || column.ends_with("_by")
         || column.ends_with("_author_id")
+        || column.ends_with("_creator_id")
         || matches!(
             column,
             "actor"
@@ -212,6 +213,10 @@ pub async fn erase_member(
             // other state - fresh, started-uncertain, counted, released - must
             // keep its row or a gateway retry could sanction twice.
             ("automod_delivery_claims", "result_json IS NULL"),
+            // An in-flight or uncertain incident is the anti-nuke block and
+            // receipt: removing it could release a block or let a retry
+            // re-contain. Only settled incidents are erased.
+            ("containment_incidents", "state IN ('containing', 'uncertain')"),
         ] {
             let entry = plan
                 .tables
@@ -300,6 +305,7 @@ mod tests {
             "member_id",
             "inviter_id",
             "matched_author_id",
+            "original_creator_id",
             "created_by",
             "actor",
         ] {

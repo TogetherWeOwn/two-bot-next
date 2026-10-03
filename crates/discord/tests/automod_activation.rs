@@ -23,8 +23,8 @@ use twilight_model::{
 };
 use two_bot_core::automod_runtime::{
     AutomodClaimLedger, AutomodMatch, AutomodRuntime, AutomodScope, CompletionKind, DeliveryKey,
-    FunnelDisposition, LedgerClaim, MessageDelivery, MessageSubject, StoredOutcome, TargetFacts,
-    ViolationRecord, STAGING_GUILD_ID,
+    FunnelDisposition, LedgerClaim, MessageDelivery, MessageDeliveryKind, MessageSubject,
+    StoredOutcome, TargetFacts, ViolationRecord, STAGING_GUILD_ID,
 };
 use two_bot_core::commands::PERM_MODERATE_MEMBERS;
 use two_bot_core::{
@@ -517,7 +517,9 @@ async fn ladder_deletes_then_warns_then_times_out() {
             ScriptedResponse::status(204),
             ScriptedResponse::status(204),
             ScriptedResponse::status(204),
-            ScriptedResponse::json(200, json!({})),
+            // The timeout PATCH gets the member receipt Discord echoes back;
+            // the admission contract treats an id-less body as unreadable.
+            ScriptedResponse::json(200, json!({"user": {"id": AUTHOR}})),
         ],
         ScriptedResponse::status(500),
     )
@@ -602,7 +604,11 @@ async fn duplicate_delivery_is_processed_once() {
         again,
         Activation {
             disposition: FunnelDisposition::None,
-            outcome: ActivationOutcome::Duplicate,
+            outcome: ActivationOutcome::Duplicate(Some(StoredOutcome {
+                matched: true,
+                deleted: true,
+                outcome: CompletionKind::Deleted,
+            })),
         }
     );
     assert_eq!(
@@ -610,6 +616,124 @@ async fn duplicate_delivery_is_processed_once() {
         vec![("DELETE".to_owned(), delete_path("3002"))]
     );
     assert_eq!(ledger.violations(), 1);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn crash_before_checkpoint_restores_the_funnel_once_without_resending() {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let ledger = MemLedger::default();
+    let clean = create_event("5001", "clean");
+    let blocked = create_event("5002", "blocked");
+    let deliver = |event: &Event| event_to_automod(event, 1_790_726_400_000).unwrap();
+
+    // First run settles both claims, then dies before its checkpoint commits:
+    // none of its funnel writes survive.
+    let first = AutomodActivation::new(
+        runtime(true),
+        ledger.clone(),
+        StaticFacts::allowed(),
+        executor(&mock),
+    );
+    for event in [&clean, &blocked] {
+        first.process(deliver(event), AT).await;
+    }
+
+    let restarted = AutomodActivation::new(
+        runtime(true),
+        ledger.clone(),
+        StaticFacts::allowed(),
+        executor(&mock),
+    );
+    let awards = Awards::default();
+    let pipeline = Pipeline::new(
+        MemStore::new(),
+        Some(awards.clone()),
+        Some(awards.clone()),
+        NoInvites,
+        NoClassification,
+    );
+
+    let result = restarted.process(deliver(&clean), AT).await;
+    assert_eq!(result.disposition, FunnelDisposition::None);
+    let disposition = result.uncommitted_disposition(MessageDeliveryKind::Create);
+    assert_eq!(disposition, FunnelDisposition::Accept);
+    pipeline.handle_with_message_disposition(&clean, disposition);
+    assert_eq!(
+        awards.0.load(Ordering::SeqCst),
+        2,
+        "one fact + one XP award"
+    );
+
+    let result = restarted.process(deliver(&blocked), AT).await;
+    let disposition = result.uncommitted_disposition(MessageDeliveryKind::Create);
+    assert_eq!(disposition, FunnelDisposition::CaptureOnly);
+    pipeline.handle_with_message_disposition(&blocked, disposition);
+    assert_eq!(
+        awards.0.load(Ordering::SeqCst),
+        3,
+        "the matched message adds its fact but no XP"
+    );
+    assert_eq!(
+        calls(&mock),
+        vec![("DELETE".to_owned(), delete_path("5002"))],
+        "the crashed run's delete is never resent"
+    );
+    // An update never awards, whatever the claim says.
+    assert_eq!(
+        result.uncommitted_disposition(MessageDeliveryKind::Update),
+        FunnelDisposition::None
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn mode_change_after_crash_funnels_the_message_once() {
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let ledger = MemLedger::default();
+    let clean = create_event("5101", "clean");
+    let delivery = || event_to_automod(&clean, 1_790_726_400_000).unwrap();
+
+    // Dry-run settles the claim and crashes before the checkpoint commits.
+    let preview = AutomodActivation::new(
+        runtime(false),
+        ledger.clone(),
+        StaticFacts::allowed(),
+        executor(&mock),
+    );
+    preview.process(delivery(), AT).await;
+
+    // The enforce restart owns a different claim for the same message.
+    let enforce = AutomodActivation::new(
+        runtime(true),
+        ledger.clone(),
+        StaticFacts::allowed(),
+        executor(&mock),
+    );
+    let awards = Awards::default();
+    let pipeline = Pipeline::new(
+        MemStore::new(),
+        Some(awards.clone()),
+        Some(awards.clone()),
+        NoInvites,
+        NoClassification,
+    );
+    let result = enforce.process(delivery(), AT).await;
+    let disposition = result.uncommitted_disposition(MessageDeliveryKind::Create);
+    assert_eq!(disposition, FunnelDisposition::Accept);
+    pipeline.handle_with_message_disposition(&clean, disposition);
+
+    assert_eq!(ledger.claims(), 2);
+    assert_eq!(
+        awards.0.load(Ordering::SeqCst),
+        2,
+        "one fact + one XP award"
+    );
+    assert!(calls(&mock).is_empty());
     mock.shutdown().await;
 }
 
@@ -638,7 +762,7 @@ async fn uncertain_delete_retains_claim_and_sends_no_timeout() {
     );
     assert_eq!(
         retry.outcome,
-        ActivationOutcome::Duplicate,
+        ActivationOutcome::Duplicate(None),
         "no auto-resend"
     );
     assert_eq!(

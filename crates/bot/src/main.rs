@@ -6,11 +6,15 @@
 //! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
 mod activation;
+#[cfg(test)]
+mod admission_test_support;
 mod audit_runtime;
+mod automod_gateway;
 mod backup_cli;
 mod command_runtime;
 #[cfg(test)]
 mod command_runtime_tests;
+mod commands_cli;
 mod community_jobs;
 mod database_roles_cli;
 #[cfg(test)]
@@ -28,19 +32,31 @@ mod jobs;
 mod lifecycle_tests;
 mod metrics_http;
 mod preflight;
+mod schedule_runtime;
+mod scheduled_jobs;
 mod server;
+// TOG-10292: boot composes the gated service below; fixture-only seams keep
+// the module-level allowance.
+#[allow(dead_code)]
+mod self_role_handlers;
+#[allow(dead_code)]
+mod self_role_runtime;
+mod shutdown;
 mod ticket_runtime;
+#[cfg(test)]
+#[path = "../../core/tests/support/tracing_capture.rs"]
+mod tracing_capture;
 mod website_jobs;
 
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
 use tracing::info;
-use two_bot_core::{ComponentStatus, Config};
+use two_bot_core::{ComponentStatus, Config, VoiceGates};
 
 use gateway::{
-    build_persistent_pipeline, build_shard, ensure_crypto_provider, intents_from_env, run_shard,
-    GatewayState,
+    build_persistent_pipeline, build_shard, build_voice_runtime, ensure_crypto_provider,
+    intents_from_env, run_shard, GatewayState,
 };
 use server::SharedState;
 use website_jobs::serve;
@@ -62,6 +78,9 @@ async fn main() {
     // Operator CLI (TOG-9881): backup/restore + sealed guild-config snapshot.
     // No subcommand falls through to the gateway path below. sqlx is linked
     // (core `db` feature) so these paths can open Postgres directly.
+    if cli_args.first().is_some_and(|arg| arg == "commands") {
+        std::process::exit(commands_cli::dispatch(&cli_args[1..]).await);
+    }
     if !cli_args.is_empty() && cli_args[0] != "--help" && cli_args[0] != "-h" {
         let code = backup_cli::dispatch(&cli_args).await;
         // 100 = not a backup subcommand: fall through to serve.
@@ -96,17 +115,23 @@ async fn main() {
     let activation = activation::BootActivation::from_config(&config);
     activation.log_refusals();
     let gateway = Arc::new(RwLock::new(GatewayState::new(&config)));
-    let listener = server::bind(&config.listen_addr)
-        .await
-        .unwrap_or_else(|err| {
-            tracing::error!(error = %err, "container listener failed");
-            std::process::exit(1);
-        });
+    let listener = server::bind(&config.listen_addr).await.unwrap_or_else(|_| {
+        tracing::error!(
+            startup_phase = "listener_bind",
+            error_class = "listener_bind_failed",
+            "container listener failed"
+        );
+        std::process::exit(1);
+    });
     let gateway_url = match std::env::var("DISCORD_GATEWAY_URL") {
         Ok(url) => Some(url),
         Err(std::env::VarError::NotPresent) => None,
         Err(std::env::VarError::NotUnicode(_)) => {
-            tracing::error!("DISCORD_GATEWAY_URL must be valid UTF-8");
+            tracing::error!(
+                startup_phase = "gateway_override",
+                error_class = "gateway_override_invalid",
+                "DISCORD_GATEWAY_URL must be valid UTF-8"
+            );
             std::process::exit(1);
         }
     };
@@ -114,8 +139,23 @@ async fn main() {
         .as_deref()
         .is_some_and(|url| !gateway::is_loopback_gateway(url))
     {
-        tracing::error!("DISCORD_GATEWAY_URL must be a loopback mock websocket address");
+        tracing::error!(
+            startup_phase = "gateway_override",
+            error_class = "gateway_override_invalid",
+            "DISCORD_GATEWAY_URL must be a loopback mock websocket address"
+        );
         std::process::exit(1);
+    }
+
+    // Opt-in boot command registry sync (TOG-10860) runs before opening the
+    // gateway database so a configured registry is never skipped by a later
+    // DB failure; refusal/failure exits before shard startup. Opt-out is a
+    // no-op and preserves existing server behavior.
+    if let Ok((token, _, guild_id)) = gateway_prerequisites(&config) {
+        if let Err(error) = commands_cli::publish_on_boot(token, guild_id).await {
+            tracing::error!(error = %error, "boot command registry synchronization failed");
+            std::process::exit(1);
+        }
     }
 
     let store = match gateway_prerequisites(&config).ok().map(|(_, url, _)| url) {
@@ -132,7 +172,11 @@ async fn main() {
                 Some(store)
             }
             _ => {
-                tracing::error!("database initialization failed; exiting for supervisor restart");
+                tracing::error!(
+                    startup_phase = "database_init",
+                    error_class = "database_connect_failed",
+                    "database initialization failed; exiting for supervisor restart"
+                );
                 std::process::exit(1);
             }
         },
@@ -143,12 +187,36 @@ async fn main() {
         database: store.as_ref().map(|s| s.pool().clone()),
     };
 
+    // ONE optional self-role service: gateway dispatch and the supervised
+    // recovery job share this Arc. Empty/invalid catalogues, non-staging guilds
+    // and failed identity reads leave the surface and the job unregistered.
+    // The activation fence is evaluated first: a refused self_roles capability
+    // composes no service, so neither dispatch nor the recovery job can run.
+    let self_roles = match (gateway_prerequisites(&config), store.as_ref()) {
+        (Ok((token, _, guild_id)), Some(db))
+            if activation.permitted(two_bot_core::activation::LiveCapability::SelfRoles) =>
+        {
+            self_role_handlers::SelfRoleService::from_env(db.pool().clone(), token, guild_id).await
+        }
+        _ => None,
+    };
+    // V1 voice rooms: per-guild lifecycle actors fed by the gateway sink.
+    // Inert unless TWO_VOICE=1 with token + database present; any failure
+    // degrades to voice-off with a warn, never a boot failure.
+    let voice = build_voice_runtime(&config, VoiceGates::from_env().enabled).await;
+
     let (shutdown, stopping) = tokio::sync::watch::channel(false);
+    // Filled by the gateway task; read by the shared maintenance tick.
+    let automod_slot: automod_gateway::Slot = Arc::default();
     let gateway_task = if let Ok((token, _, guild_id)) = gateway_prerequisites(&config) {
         let token = token.to_owned();
         let state = Arc::clone(&gateway);
+        let slot = Arc::clone(&automod_slot);
+        let self_roles = self_roles.clone();
         Some(tokio::spawn(async move {
             let result: Result<(), sqlx::Error> = async {
+                // Opt-in registry sync already ran before Store::connect; the
+                // gateway task proceeds directly to checkpoint/shard startup.
                 let db = store.ok_or_else(|| {
                     sqlx::Error::InvalidArgument(
                         "DATABASE_URL required for gateway checkpoint".into(),
@@ -160,7 +228,9 @@ async fn main() {
                     guild_id.to_string(),
                     0,
                 );
-                let saved = gateway::load_boot_session(&store).await?;
+                let saved = gateway::load_boot_session(&store)
+                    .await
+                    .map_err(|error| gateway_failure("checkpoint_load_failed", error))?;
                 let onboarding = two_bot_core::OnboardingGates::from_env()
                     .map_err(|_| sqlx::Error::InvalidArgument("invalid onboarding mode".into()))?;
                 // ONE router + REST executor + sqlx stores over the same pool.
@@ -168,16 +238,46 @@ async fn main() {
                 // The ordered leveling path shares this runtime's
                 // executor/pacing for XP awards and role rewards.
                 let runtime = command_runtime::CommandRuntime::from_env(
-                    pool,
+                    pool.clone(),
                     &token,
                     guild_id,
+                    self_roles,
                     onboarding,
                     &activation,
                 );
                 let leveling = runtime.as_ref().map(|runtime| runtime.leveling());
                 let pipeline = Arc::new(
-                    build_persistent_pipeline(&store, guild_id, token.clone(), leveling).await?,
+                    build_persistent_pipeline(&store, guild_id, token.clone(), leveling)
+                        .await
+                        .map_err(|error| gateway_failure("milestones_load_failed", error))?,
                 );
+                // Automod shares the command runtime's REST executor; it never
+                // builds a private client, router or timer.
+                let vars: std::collections::HashMap<String, String> = std::env::vars().collect();
+                let automod = match automod_gateway::resolve(&vars, guild_id).map_err(|reason| {
+                    tracing::error!(reason, "automod configuration rejected");
+                    sqlx::Error::InvalidArgument(reason.into())
+                })? {
+                    Some(resolved) => {
+                        let executor = match runtime.as_ref() {
+                            Some(runtime) => runtime.executor(),
+                            None => two_bot_discord::ActionExecutor::with_proxy(
+                                token.clone(),
+                                std::env::var("DISCORD_API_BASE")
+                                    .ok()
+                                    .filter(|value| !value.is_empty()),
+                            )
+                            .map_err(|_| {
+                                sqlx::Error::InvalidArgument("automod REST executor failed".into())
+                            })?,
+                        };
+                        let automod = automod_gateway::build(resolved, pool, executor);
+                        let _ = slot.set(Arc::clone(&automod));
+                        info!("automod activation wired into the gateway loop");
+                        Some(automod)
+                    }
+                    None => None,
+                };
                 let shard = build_shard(
                     token,
                     intents_from_env(&activation),
@@ -194,16 +294,21 @@ async fn main() {
                     Arc::clone(&state),
                     store,
                     runtime,
+                    automod,
+                    voice,
                     async move {
                         server::shutdown_requested(stopping).await;
                     },
                 )
                 .await
+                .map_err(|error| gateway_failure("gateway_runtime_failed", error))
             }
             .await;
             if result.is_err() {
                 // Do not print sqlx errors: configuration errors may contain a URL.
                 tracing::error!(
+                    startup_phase = "durable_gateway",
+                    error_class = "gateway_runtime_failed",
                     "durable gateway failed; checkpoint unchanged, readiness unavailable"
                 );
                 let mut state = state.write().await;
@@ -223,21 +328,43 @@ async fn main() {
         None
     };
 
-    let http = serve(&config, listener, state, shutdown.clone());
+    let http = serve(
+        &config,
+        listener,
+        state,
+        shutdown.clone(),
+        self_roles,
+        automod_slot,
+    );
     let result = match gateway_task {
         Some(task) => supervise_gateway(task, http, gateway, shutdown).await,
         None => http.await,
     };
-    if let Err(err) = result {
-        tracing::error!(error = %err, "container service failed");
+    if result.is_err() {
+        tracing::error!(
+            startup_phase = "service_supervisor",
+            error_class = "container_service_failed",
+            "container service failed"
+        );
         std::process::exit(1);
     }
 }
 
-/// `--help` covers both the gateway server and the backup CLI.
+/// Fixed operation classes only: neither SQLx errors nor their sources are logged.
+fn gateway_failure(error_class: &'static str, error: sqlx::Error) -> sqlx::Error {
+    tracing::error!(
+        startup_phase = "durable_gateway",
+        error_class,
+        "configured gateway operation failed"
+    );
+    error
+}
+
+/// `--help` covers the gateway server and both operator CLI surfaces.
+// Stdout lives in the CLI modules; the entrypoint only dispatches.
 async fn print_backup_help_and_exit() -> ! {
-    println!("{}", preflight::USAGE);
-    print!("{}", erasure_cli::USAGE);
+    commands_cli::print_all_usage();
+    backup_cli::print_server_usage();
     let code = backup_cli::dispatch(&["--help".to_owned()]).await;
     std::process::exit(code);
 }
@@ -271,14 +398,7 @@ async fn supervise_gateway(
     state: Arc<RwLock<GatewayState>>,
     shutdown: tokio::sync::watch::Sender<bool>,
 ) -> std::io::Result<()> {
-    supervise_gateway_bounded(
-        task,
-        http,
-        state,
-        shutdown,
-        dispatch::DISPATCH_DRAIN_MAX + std::time::Duration::from_secs(5),
-    )
-    .await
+    supervise_gateway_bounded(task, http, state, shutdown, shutdown::deadline()).await
 }
 
 async fn supervise_gateway_bounded(
@@ -328,7 +448,13 @@ async fn supervise_gateway_bounded(
         }
     })
     .await
-    .unwrap_or_else(|_| Err(std::io::Error::other("service shutdown deadline exceeded")))
+    .unwrap_or_else(|_| {
+        tracing::error!(
+            deadline_ms = shutdown_max.as_millis() as u64,
+            "shutdown_deadline_exceeded: abandoning in-flight work"
+        );
+        Err(std::io::Error::other("service shutdown deadline exceeded"))
+    })
 }
 
 /// Probe /health over plain HTTP using only tokio (no client dependency).

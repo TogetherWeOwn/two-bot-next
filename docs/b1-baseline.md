@@ -96,27 +96,78 @@ appears. A live-network scratch deploy was not possible from this sandbox
 ## Rust runtime image PR gate
 
 The independent `container smoke` job in `.github/workflows/check.yml` builds
-this repository's Dockerfile on hosted `linux/amd64`, loads it into local Docker,
-and uses BuildKit's `gha` cache. It never pushes an image or receives deployment
-credentials. It also runs on `main` and workflow dispatch (including release
-check dispatches). The existing required `check` job is unchanged.
+this repository's Dockerfile on `linux/amd64`, loads it into local Docker,
+and uses BuildKit's `gha` cache. It now uses the self-hosted CI runner (the
+original measurement below used a hosted runner). It never pushes an image or
+receives deployment credentials. Automatic pull-request CI is the validation
+route; no workflow dispatch is needed for this repair. The existing required
+`check` job is unchanged.
 
 `scripts/container-smoke.py` prints both sizes in bytes and MiB to the log and
-job summary and fails above these calibrated ceilings:
+job summary and fails above these calibrated ceilings. The measurements and
+headroom below are historical, not measurements of the current PR head:
 
-| Artifact | Definition | Measured | Maximum | Headroom |
+| Artifact | Historical definition | Measured | Maximum | Headroom |
 |---|---|---|---|---|
 | Runtime image | Docker image inspect `Size` (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
-| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 7.01 MiB / 7,346,736 bytes | 11 MiB / 11,534,336 bytes | 3.99 MiB / 56.9% |
+| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 10.30 MiB / 10,805,344 bytes | 15 MiB / 15,728,640 bytes | 4.70 MiB / 45.6% |
 
 Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
 at source `307b50708ec42e8fc4744c1b804216a22a17625e`. Ceilings allow roughly
 25% image growth rounded up to the next 8 MiB, and roughly 40% binary growth
 rounded up to the next MiB. Base-image/toolchain changes must remeasure and
-justify any future budget increase. Docker is not available in the controller
+justify any future budget increase. Recalibrated 2026-10-01 for the S4 self-role
+runtime (TOG-10292): PR head measured 10,805,344 bytes (10.30 MiB) on the
+ephemeral runner vs main baseline 10,377,112 bytes (9.90 MiB) at `ec49663`;
+growth is linked runtime/handlers/REST plus previously-dead domain/store code
+with no new dependencies, release profile already minimal (opt-level=z, lto,
+strip). Per calibration (measured * 1.4 rounded up to the next MiB):
+10.30 * 1.4 = 14.42 -> 15 MiB. Docker is not available in the controller
 workspace; offline fixture sizes are not measurements.
 
-The hosted parked-mode contract passed, including SIGTERM exit 0 in 0.095 s.
+### Docker history image measurement and immutable-ID pinning
+
+Docker 29.8.1 with the containerd image store reports packed content plus
+unpacked snapshot usage in inspect `Size`; that is not the uncompressed-layer
+budget metric. See the exact-version
+[Moby inspect implementation](https://github.com/moby/moby/blob/docker-v29.8.1/daemon/containerd/image_inspect.go),
+[size accounting](https://github.com/moby/moby/blob/docker-v29.8.1/daemon/containerd/image_list.go),
+and [Docker's containerd storage documentation](https://docs.docker.com/engine/storage/containerd/).
+The original runner's storage backend was not recorded, so its historical
+number is not proof that a current image fits the limit.
+
+The gate reuses merged main [PR #145](https://github.com/TogetherWeOwn/two-bot-next/pull/145)'s
+metric: **summed uncompressed Docker history layer bytes**, from
+`docker history --no-trunc --human=false --format '{{.Size}}' IMAGE_ID`.
+This is Docker history accounting, not unique tar-export bytes,
+merged-filesystem size or compressed registry transfer size. The tag is
+inspected once and its `Id` is used for history, binary measurement, the
+runtime container and the no-server healthcheck probe. The storage-driver
+inspect `Size` is printed for diagnosis only, never used as a fallback.
+
+Each history record must contain a nonempty, nonnegative integer byte count.
+Missing output, malformed/blank/negative records and an all-zero sum fail
+before any containers are created. Zero-size metadata layers are accepted
+alongside positive layers. History uses the existing 30-second Docker
+subprocess timeout; a timeout or nonzero exit aborts measurement without
+falling back to inspect `Size`. Offline fixtures cover this validation,
+separate history/daemon sizes, immutable-ID use and subprocess failures.
+
+The earlier **52/52 offline fixtures for the archive-parser implementation
+are historical and superseded**, not current-head validation. That parser
+failed real CI with `missing image config` in
+[run 36829502178, job 110273465190](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36829502178/job/110273465190).
+The unused streamed-archive helper and its archive-specific builders/tests
+have been removed in favor of main's history metric; the smoke/runtime
+contract fixtures remain.
+
+The **112 MiB image and 10 MiB binary ceilings are unchanged**. Real current-head
+CI must still record the corrected image size and pass the runtime contract and
+both one-byte-budget negative checks; fixture success alone cannot establish
+compliance. No current-head image-fit claim is made here. This measurement
+repair does not change the Dockerfile, runtime base, CA assets or configured user.
+
+The historical hosted parked-mode contract passed, including SIGTERM exit 0 in 0.095 s.
 Manual log verification confirmed both deliberate one-byte-budget invocations
 failed with the corresponding `exceeds size budget` error and that the CI
 negative-test step passed. This exercises real measured artifacts, not mocks.

@@ -29,7 +29,7 @@
     "",
     "JSON is authoritative; each `parity.section` + `parity.row` copies every source table cell except Map. Repeated ClientReady, attendance and member-event surfaces remain separate. Only DROP-prefixed Maps without an S/B/NEW slice or TOG owner are excluded; mixed mapped/DROP rows remain covered in either order, including mapped replacement work. §7 is prose: one explicit catalogue entry covers env_only/cold/hot. Adding a table there also requires entries. §12 copies every cell of its addition and Redirect tables except the disposition, under the same DROP rule. §13 covers each `ported`/`carded`/`gap` ledger row (commit link, area, change and status); `dropped` rows, including every history-rewrite replay, are excluded because their features stay mapped in §§1–8. Each §12/§13 entry lists `owner`: exactly the TOG cards its disposition names, in order (a `ported` row without a card names its owning slice); a changed status, row or owner card is stale until the entry is updated.",
     "",
-    "Run `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py` and `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v`. CI runs both offline before Cargo. After editing JSON, regenerate Markdown with `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py --render > docs/soak-checklist.md`. Source drift, missing/stale/duplicate rows, missing or stale owner cards, empty steps/evidence, invalid statuses, waivers missing reason or approver, missing automated commands, missing voice links or Markdown drift fail the gate.",
+    "Run `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py` and `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v`. CI runs both offline before Cargo. After editing JSON, regenerate Markdown with `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py --render > docs/soak-checklist.md`. Source drift, missing/stale/duplicate rows, missing or stale owner cards, empty steps/evidence, invalid statuses, waivers missing reason or approver, missing automated commands, automated Cargo commands naming an unknown `-p` package, a missing test target or no matching test (read offline from source, never run), missing voice links or Markdown drift fail the gate.",
     "",
     "## Existing fixture entry points",
     "",
@@ -1152,8 +1152,8 @@
       "parity": {
         "section": 5,
         "row": [
-          "`internal_nonces`, `internal_idempotency`, `internal_action_log`, `internal_discord_events`",
-          "website-callback replay guard, idempotency, audit, dedupe"
+          "`internal_nonces`, `internal_clock_high_water`, `internal_idempotency`, `internal_action_log`, `internal_discord_events`",
+          "website-callback replay guard (plus its F8 clock high-water mark), idempotency, audit, dedupe"
         ]
       },
       "status": "waived",
@@ -1673,7 +1673,7 @@
         "section": 8,
         "row": [
           "Automod (staging-only unless live-approved; `dryRun` unless `ENFORCE=1`; 6 filters; sanctions `1:delete,2:warn,3:timeout:600`; target-protection before delete)",
-          "bad-word NFKC matching, invite/link checks, `bat/cmd/…` attachment blocklist"
+          "bad-word NFKC matching, invite/link checks, `bat/cmd/…` attachment blocklist; whitespace edge accepted ([TOG-12582](/TOG/issues/TOG-12582)): legacy JS `\\s` treats U+FEFF as blank and U+0085 as non-blank while Rust `split_whitespace` does the opposite, but both collapse to empty-vs-nonempty only for these two codepoints and all repeat-expiry blanks stay agreed (NEL: [TOG-10052](/TOG/issues/TOG-10052), format chars: [TOG-10048](/TOG/issues/TOG-10048))"
         ]
       },
       "status": "manual",
@@ -1995,6 +1995,42 @@
       "status": "waived",
       "action": "Force a store lookup failure for a known slug in TOG-11183’s local redirect fixture.",
       "expected": "The log names the slug and a bounded `errorClass` from the fixed classifier; no credentials or raw error text.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-15",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Staging rollout gate receipt: intended Worker version at 100% traffic, `/readyz` 200 with compiled revision/build ID, allowlisted receipt fields, plus Neon `channel_binding` acceptance",
+          "[staging-rollout-gate.md](staging-rollout-gate.md), `scripts/staging_rollout.py`, `crates/core/src/database_url.rs` (#156)"
+        ]
+      },
+      "owner": [
+        "TOG-9699"
+      ],
+      "status": "manual",
+      "action": "Attach the staging rollout-gate receipt for the deployed soak build: require the intended Worker version at 100% traffic, `/readyz` 200 with the exact compiled revision/build ID and only allowlisted receipt fields, then a control-plane re-check; a 503 or a previous-instance response never passes.",
+      "expected": "The deployed soak build serves the intended Worker version at 100% traffic with `/readyz` 200 carrying the compiled revision/build ID; the receipt carries only allowlisted fields. The gate refuses stale-instance responses.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s12-16",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Bootstrap migration accepts the `Security` release-notes section in `migrate-release-notes`",
+          "`scripts/migrate-release-notes.cjs`, [releases.md](releases.md) (#329)"
+        ]
+      },
+      "owner": [
+        "TOG-12801"
+      ],
+      "status": "waived",
+      "action": "Run the `migrate-release-notes` bootstrap fixture with a hand-written `Security` section in Unreleased: confirm the migration preserves the Security tail, removes Unreleased, and stays idempotent; confirm any other section still fails closed.",
+      "expected": "`Security` migrates alongside Added/Fixed/Changed/Notes; unknown sections fail closed; later releases do not repeat the bootstrap tail.",
       "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
       "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
       "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"

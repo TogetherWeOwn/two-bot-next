@@ -3,6 +3,7 @@
 //! an opt-in. Locally: TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/postgres
 //! python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test gate_stuck_report
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sqlx::postgres::{PgPoolOptions, PgSslMode};
@@ -12,6 +13,9 @@ use two_bot_cutover::legacy_copy::options::guarded_target;
 const GUILD: &str = "1545644954272137297";
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+// Parallel tests share one pid and can read the same clock tick.
+static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 
 struct TestDb {
     admin: PgPool,
@@ -23,9 +27,10 @@ struct TestDb {
 impl TestDb {
     async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let name = format!(
-            "two_bot_test_gate_{}_{}",
+            "two_bot_test_gate_{}_{}_{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+            NEXT_DB.fetch_add(1, Ordering::Relaxed)
         );
         let url = format!("postgres://agent_test:@agent-testdb:5432/{name}");
         // Never read an application URL or substitute its credentials.
@@ -81,21 +86,25 @@ impl TestDb {
         command
             .env_clear()
             .env("TWO_DATABASE_URL", &self.url)
+            .env("TWO_DATABASE_TLS", "local-only")
             .env("TWO_DB_POOL_MAX", "1")
             .args(args)
             .args(["--guild", GUILD]);
         command.output().unwrap()
     }
 
-    async fn seed(&self, sql: &'static str) -> TestResult {
-        sqlx::raw_sql(sql).execute(&self.pool).await?;
+    async fn seed(&self, sql: &str) -> TestResult {
+        // Seed SQL is static string literals at the call sites; the wrapper
+        // copies into an Arc so no 'static borrow escapes this method.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     async fn snapshot(&self) -> Result<serde_json::Value, sqlx::Error> {
-        // Tables only: sequences (relkind 'S') have no composite row type,
-        // so to_jsonb(t) on them fails with 42809. The snapshot asserts the
-        // report wrote no rows; sequences carry none.
+        // Tables only: sequences (e.g. events_id_seq from BIGSERIAL) hold no
+        // row data and cannot be selected as rowsets.
         let names: Vec<String> = sqlx::query_scalar(
             "SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
              WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') ORDER BY c.relname",

@@ -9,6 +9,8 @@
 
 use std::collections::BTreeSet;
 
+use serde::{Deserialize, Serialize};
+
 use crate::Snowflake;
 
 /// Default companion name when no name is configured (or it sanitises empty).
@@ -19,7 +21,7 @@ pub const MAX_TEXT_CHANNEL_NAME_CHARS: usize = 100;
 
 /// Per-creator text-channel settings. The runtime snapshots these at room
 /// creation: later changes only affect channels created afterwards.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextChannelSettings {
     /// Per-creator `/textchannels` toggle. Off by default; off yields no plan.
     pub enabled: bool,

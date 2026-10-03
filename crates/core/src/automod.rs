@@ -403,8 +403,9 @@ impl RepeatTracker {
         let digest = digest_content(normalized);
         let keep = policy.repeated_message_count.max(1) as usize;
         let matches_window = |rows: &[RepeatRow]| {
-            // Include this revision once, then the nearest preceding rows in
-            // its interval, retaining legacy last-N observation semantics.
+            // Include this revision once, then up to `keep` preceding rows
+            // in its interval, matching legacy `MemoryRepeatTracker.observe`
+            // (the new row plus up to `count` earlier rows).
             rows.iter()
                 .rev()
                 .filter(|row| {
@@ -412,7 +413,7 @@ impl RepeatTracker {
                         && row.at_ms >= cutoff
                         && row.at_ms <= message.observed_timestamp_ms
                 })
-                .take(keep - 1)
+                .take(keep)
                 .filter(|row| row.digest == digest)
                 .count()
                 + 1

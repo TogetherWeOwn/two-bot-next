@@ -10,7 +10,11 @@ const USER: &str = "123456789012345678";
 
 async fn cli(args: &[&str], database_url: Option<&str>, actor: Option<&str>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_two-bot"));
-    command.env_clear().args(args).kill_on_drop(true);
+    command
+        .env_clear()
+        .env("TWO_DATABASE_TLS", "local-only")
+        .args(args)
+        .kill_on_drop(true);
     if let Some(url) = database_url {
         command.env("TWO_DATABASE_URL", url);
     }
