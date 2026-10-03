@@ -156,6 +156,7 @@ pub(crate) enum RegistrySyncError {
 
 impl CommandRuntime {
     /// Compose all feature slices over the same router, executor and pool.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build(
         pool: Pool<Postgres>,
         executor: ActionExecutor,
