@@ -53,6 +53,7 @@ pub mod gateway_funnel;
 pub mod gateway_session;
 pub mod handlers;
 pub mod health;
+pub mod help;
 pub mod inactivity;
 #[cfg(feature = "db")]
 pub mod inactivity_store;
@@ -212,6 +213,7 @@ pub use health::{
     classify_voice_error, ComponentStatus, HealthReport, VoiceComponent, VoiceDiagnostic,
     VoiceFailureKind, VoiceHealthReport, VoicePermission, VoicePermissionScope, VoiceReadiness,
 };
+pub use help::help_text;
 pub use inactivity::{
     flag_inactive, inactivity_cutoff_ms, member_inactive_event_key, parse_inactivity_days,
     select_inactive, should_flag, FlaggedMember, InactivityCandidate, InactivityOutcome,

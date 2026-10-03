@@ -238,7 +238,9 @@ pub const PERM_MANAGE_CHANNELS: u64 = 16;
 pub const PERM_MANAGE_GUILD: u64 = 32;
 pub const PERM_MANAGE_EVENTS: u64 = 8589934592;
 
-/// Always-published core commands (two-bot `CORE_COMMAND_DATA` = leveling).
+/// Always-published core commands (two-bot `CORE_COMMAND_DATA` = leveling,
+/// plus the Next-only `/help` discovery surface — legacy has no help command,
+/// see the `help` row in the registry golden exceptions).
 #[must_use]
 pub fn core_commands() -> Vec<CommandDefinition> {
     vec![
@@ -246,8 +248,12 @@ pub fn core_commands() -> Vec<CommandDefinition> {
             CommandOption::new("member", "Show another member.", CommandOptionType::User),
         ]),
         CommandDefinition::new("leaderboard", "Show the server XP leaderboard."),
+        CommandDefinition::new("help", HELP_DESCRIPTION),
     ]
 }
+
+/// Discovery reply entry point, shared by the registry golden fixture.
+pub const HELP_DESCRIPTION: &str = "Show this server's live commands, grouped by who can use them.";
 
 /// Merge the authoritative guild command set.
 ///
@@ -428,16 +434,21 @@ mod tests {
     #[test]
     fn core_commands_match_legacy_names() {
         let core = core_commands();
-        assert_eq!(core.len(), 2);
+        assert_eq!(core.len(), 3);
         assert_eq!(core[0].name, "rank");
         assert_eq!(core[1].name, "leaderboard");
+        assert_eq!(core[2].name, "help");
         // Guild-only, DM off (legacy `setDMPermission(false)`).
         assert!(core.iter().all(|c| !c.dm_permission));
-        // `rank` has one optional `member` user option; `leaderboard` none.
+        // `rank` has one optional `member` user option; `leaderboard` and the
+        // Next-only `help` take none; `help` is open to everyone.
         assert_eq!(core[0].options.len(), 1);
         assert_eq!(core[0].options[0].kind, 6);
         assert!(core[0].options[0].required.is_none());
         assert!(core[1].options.is_empty());
+        assert!(core[2].options.is_empty());
+        assert_eq!(core[2].description, HELP_DESCRIPTION);
+        assert!(core[2].default_member_permissions.is_none());
     }
 
     #[test]

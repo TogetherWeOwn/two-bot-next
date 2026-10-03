@@ -472,6 +472,13 @@ impl InteractionRouter {
                 gate: RowGate::Always,
                 permission_refusal: None,
             },
+            // Next-only discovery surface (TOG-13622): always on, open to
+            // everyone, answered from the live publish set.
+            "help" => Row {
+                handler: HandlerId::Help,
+                gate: RowGate::Always,
+                permission_refusal: None,
+            },
             // Scorecard check-in gates `ManageEvents` both in the published
             // definition (`feature_commands.rs`) and at dispatch (`rsvp.rs`
             // `require_manage_events`): Discord picker hiding is not
@@ -711,6 +718,7 @@ mod tests {
         let cases: &[(&str, HandlerId)] = &[
             ("rank", HandlerId::Rank),
             ("leaderboard", HandlerId::Leaderboard),
+            ("help", HandlerId::Help),
             ("ban", HandlerId::Moderation(ModerationAction::Ban)),
             ("tempban", HandlerId::Moderation(ModerationAction::TempBan)),
             ("kick", HandlerId::Moderation(ModerationAction::Kick)),
@@ -743,7 +751,7 @@ mod tests {
             ("feed-remove", HandlerId::FeedRemove),
             ("feed-list", HandlerId::FeedList),
         ];
-        assert_eq!(cases.len(), 27, "all 27 builtins covered");
+        assert_eq!(cases.len(), 28, "all 28 builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1218,20 +1226,20 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 2 core + 1 scorecard + 8 automation + 7 announcement + 9 moderation
-        // + 1 custom = 28, in legacy publish order, guild-only throughout.
-        assert_eq!(set.len(), 28);
-        assert_eq!(&names[..3], ["rank", "leaderboard", "attendance"]);
+        // 3 core + 1 scorecard + 8 automation + 7 announcement + 9 moderation
+        // + 1 custom = 29, in legacy publish order, guild-only throughout.
+        assert_eq!(set.len(), 29);
+        assert_eq!(&names[..4], ["rank", "leaderboard", "help", "attendance"]);
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
         assert_eq!(
-            &names[18..27],
+            &names[19..28],
             [
                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(names[27], "faq");
+        assert_eq!(names[28], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1246,7 +1254,7 @@ mod tests {
         });
         let set = off.publish_set(&[]).expect("core-only set");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard"]);
+        assert_eq!(names, ["rank", "leaderboard", "help"]);
     }
 
     #[test]
@@ -1267,7 +1275,7 @@ mod tests {
         // invocation refuses at dispatch, so publishing burns the ceiling.
         let set = off.publish_set(&[row()]).expect("core-only set");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard"]);
+        assert_eq!(names, ["rank", "leaderboard", "help"]);
         // Over-limit stored catalogs no longer fail the publish either.
         let crowded: Vec<_> = (0..99)
             .map(|i| CustomCommand {
@@ -1277,7 +1285,7 @@ mod tests {
             })
             .collect();
         let set = off.publish_set(&crowded).expect("core-only set");
-        assert_eq!(set.len(), 2);
+        assert_eq!(set.len(), 3);
     }
 
     #[test]
