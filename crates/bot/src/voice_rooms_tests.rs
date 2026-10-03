@@ -4035,13 +4035,6 @@ fn notice_text_is_bounded() {
     assert!(notice_text(&failure, DetailLevel::Full).chars().count() <= NOTICE_MAX_CHARS);
 }
 
-fn user_option(name: &str, id: u64) -> CommandDataOption {
-    CommandDataOption {
-        name: name.to_owned(),
-        value: CommandOptionValue::User(Id::new(id)),
-    }
-}
-
 #[allow(deprecated)]
 fn component_interaction(custom_id: &str, with_guild: bool) -> Interaction {
     let mut interaction = voice_interaction(None, None, with_guild);
