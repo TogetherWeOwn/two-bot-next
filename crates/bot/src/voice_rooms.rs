@@ -36,13 +36,14 @@ use twilight_model::{
 use two_bot_core::{
     now_iso,
     voice_rooms::{
-        category_full_message, voice_commands, ActionQueue, CreatorChannel, NewRoomSpec,
-        ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, RoomPosition, TextCompanion,
-        VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN, QUEUE_MAX_ATTEMPTS,
-        RENAME_MIN_INTERVAL_MS,
+        category_full_message, is_usable_channel_name, voice_commands, ActionQueue, CreatorChannel,
+        NewRoomSpec, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, RoomPosition,
+        TextCompanion, VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN,
+        QUEUE_MAX_ATTEMPTS, RENAME_MIN_INTERVAL_MS,
     },
     voice_text_channel::{
-        occupancy_diff, text_channel_plan, OverwriteTarget, TextChannelPlan, VoiceRoomFacts,
+        admin_view_roles, occupancy_diff, text_channel_plan, OverwriteTarget, TextChannelPlan,
+        VoiceRoomFacts, DEFAULT_TEXT_CHANNEL_NAME, MAX_TEXT_CHANNEL_NAME_CHARS,
     },
     voice_utilities::{invite_render, ping_render},
     CommandDefinition, Snowflake,
@@ -75,6 +76,14 @@ pub trait RoomPersistence: Send + Sync {
         &self,
         creator: &CreatorChannel,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// The creator row for one channel, if an admin marked it (V9d
+    /// `/textchannels` edits this row through the [`Self::add_creator`]
+    /// upsert; the settings snapshot on existing companions never changes).
+    fn creator_for(
+        &self,
+        guild: Snowflake,
+        channel: Snowflake,
+    ) -> impl Future<Output = Result<Option<CreatorChannel>, StoreError>> + Send;
     fn persist(&self, room: &VoiceRoom) -> impl Future<Output = Result<(), StoreError>> + Send;
     fn forget(
         &self,
@@ -113,6 +122,14 @@ impl RoomPersistence for PgRoomStore {
     async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), StoreError> {
         self.add_creator(creator).await.map_err(store_error)?;
         Ok(())
+    }
+
+    async fn creator_for(
+        &self,
+        guild: Snowflake,
+        channel: Snowflake,
+    ) -> Result<Option<CreatorChannel>, StoreError> {
+        self.creator_for(guild, channel).await.map_err(store_error)
     }
 
     async fn persist(&self, room: &VoiceRoom) -> Result<(), StoreError> {
@@ -354,6 +371,21 @@ impl LiveState {
             &bot.roles,
             channel.permission_overwrites.as_deref().unwrap_or_default(),
         )
+    }
+
+    /// Guild roles holding Manage Channels (V9d AC7), read from the live role
+    /// snapshot so a role promoted later is covered the next time a plan or
+    /// protected set is built, with no per-room overwrite update.
+    fn admin_role_ids(&self, guild: Snowflake) -> Vec<Snowflake> {
+        let Some(bot) = self.bot.as_ref() else {
+            return Vec::new();
+        };
+        let roles: Vec<(Snowflake, u64)> = bot
+            .roles
+            .iter()
+            .map(|role| (role.id.get(), role.permissions.bits()))
+            .collect();
+        admin_view_roles(guild, &roles)
     }
 
     fn humans(&self, channel: Snowflake) -> usize {
@@ -665,24 +697,19 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
     }
 
-    /// IDs that keep companion View even after leaving the room (V9c): the
-    /// viewer role (when set) and the bot itself (V9 AC6). Admin-role members
-    /// join this set under V9d; until then the creation/join grants cover
-    /// occupying admins, and the bot id is always protected.
-    fn protected_ids(&self, companion: &TextCompanion) -> Vec<Snowflake> {
-        let mut protected = Vec::with_capacity(2);
+    /// IDs that keep companion View even after leaving the room: the viewer
+    /// role (when set), every Manage Channels admin role (V9d AC7) and the
+    /// bot itself (V9 AC6). Admin roles are resolved live, so a role promoted
+    /// later is protected without touching existing rooms. Takes the live
+    /// state the caller already holds: re-reading the lock here could
+    /// deadlock behind a queued gateway publish.
+    fn protected_ids(&self, live: &LiveState, companion: &TextCompanion) -> Vec<Snowflake> {
+        let mut protected = Vec::with_capacity(3);
         if let Some(viewer) = companion.settings.viewer_role_id {
             protected.push(viewer);
         }
-        if let Some(bot) = self
-            .live
-            .inner
-            .read()
-            .expect("live voice lock")
-            .bot
-            .as_ref()
-            .map(|bot| bot.member_id)
-        {
+        protected.extend(live.admin_role_ids(self.live.guild_id));
+        if let Some(bot) = live.bot.as_ref().map(|bot| bot.member_id) {
             protected.push(bot);
         }
         protected
@@ -731,8 +758,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .filter(|(_, member)| member.channel_id == Some(channel_id) && member.bot != Some(true))
             .map(|(member_id, _)| *member_id)
             .collect();
-        // Admin-role occupants ride the occupant grants for now; V9d resolves
-        // Manage Channels admins into Role overwrites plus the protected set.
+        // Manage Channels admins ride `Role` View allows, resolved live so a
+        // later promotion is covered. Administrator roles and the guild owner
+        // bypass overwrites; occupying admins also get the occupant grants.
+        let admin_role_ids = live.admin_role_ids(self.live.guild_id);
         let admin_ids: &[Snowflake] = &[];
         let facts = VoiceRoomFacts {
             guild_id: self.live.guild_id,
@@ -740,6 +769,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             category_id,
             occupants: &occupants,
             admin_ids,
+            admin_role_ids: &admin_role_ids,
         };
         let Some(plan) = text_channel_plan(&settings, &facts) else {
             return;
@@ -832,7 +862,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 .get(&channel)
                 .cloned()
                 .unwrap_or_default();
-            let protected = self.protected_ids(companion);
+            let protected = self.protected_ids(&live, companion);
             let diff = occupancy_diff(&before, &current, &protected);
             if !diff.grants.is_empty() || !diff.revokes.is_empty() {
                 view_syncs.push((channel, text_channel_id, diff));
@@ -1693,6 +1723,8 @@ enum ActorCommand {
         seed: u64,
         created_at: String,
     },
+    /// A new or edited creator row (`/create`, `/textchannels`): the worker
+    /// swaps it in for rooms created from here on.
     CreatorAdded(CreatorChannel),
     /// One-shot worker snapshot for `/setup` (room count, failures, halt).
     Status(oneshot::Sender<WorkerStatus>),
@@ -1852,6 +1884,15 @@ where
     fn creator_added(&self, creator: &CreatorChannel, channel: Channel) {
         if let Some(actor) = self.live_actor(creator.guild_id) {
             actor.live.upsert_channel(channel);
+            let _ = actor.tx.send(ActorCommand::CreatorAdded(creator.clone()));
+        }
+    }
+
+    /// Hand an edited creator row to the guild worker (V9d `/textchannels`).
+    /// Only rooms created afterwards read it: each companion keeps the
+    /// settings snapshot taken when it was created.
+    fn creator_updated(&self, creator: &CreatorChannel) {
+        if let Some(actor) = self.live_actor(creator.guild_id) {
             let _ = actor.tx.send(ActorCommand::CreatorAdded(creator.clone()));
         }
     }
@@ -2176,6 +2217,79 @@ pub fn decide_create_channel(request: CreateChannelRequest) -> CreateChannelPlan
     }
 }
 
+/// `/textchannels` input after parsing. Unset options keep the stored value;
+/// `enabled` defaults to on, so naming a channel or role also switches the
+/// companions on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextChannelsRequest {
+    pub enabled: Option<bool>,
+    pub name: Option<String>,
+    pub viewer_role: Option<Snowflake>,
+}
+
+/// What `/textchannels` means for one creator channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextChannelsPlan {
+    Update(CreatorChannel),
+    Refuse { message: String },
+}
+
+/// Fold a `/textchannels` request into the creator row, or refuse. Pure: the
+/// handler reads the row, runs this, then stores the result. The stored
+/// row only governs rooms created afterwards (snapshot rule).
+#[must_use]
+pub fn decide_text_channels(
+    creator: Option<CreatorChannel>,
+    request: &TextChannelsRequest,
+) -> TextChannelsPlan {
+    let refuse = |message: &str| TextChannelsPlan::Refuse {
+        message: message.to_owned(),
+    };
+    let Some(mut creator) = creator else {
+        return refuse("That channel is not a voice-room creator. Pick one made with /create.");
+    };
+    creator.text_channels = request.enabled.unwrap_or(true);
+    if let Some(name) = &request.name {
+        if !is_usable_channel_name(name) {
+            return TextChannelsPlan::Refuse {
+                message: format!(
+                    "Give the companion channel a name of 1 to {} characters, then try again.",
+                    MAX_TEXT_CHANNEL_NAME_CHARS
+                ),
+            };
+        }
+        creator.text_channel_name = Some(name.trim().to_owned());
+    }
+    if let Some(role) = request.viewer_role {
+        creator.text_viewer_role_id = Some(role);
+    }
+    if creator.validate().is_err() {
+        return refuse("Those companion settings are not valid. Check the name and role.");
+    }
+    TextChannelsPlan::Update(creator)
+}
+
+fn text_channels_summary(creator: &CreatorChannel) -> String {
+    let channel_id = creator.channel_id;
+    if !creator.text_channels {
+        return format!(
+            "Companion text channels are off for <#{channel_id}>. Rooms already open keep theirs; new rooms get none."
+        );
+    }
+    let name = creator
+        .text_channel_name
+        .as_deref()
+        .unwrap_or(DEFAULT_TEXT_CHANNEL_NAME);
+    let viewers = match creator.text_viewer_role_id {
+        None => "occupants and admins".to_owned(),
+        Some(role) if role == creator.guild_id => "everyone".to_owned(),
+        Some(role) => format!("occupants, admins and <@&{role}>"),
+    };
+    format!(
+        "Companion text channels are on for <#{channel_id}>: named `{name}`, visible to {viewers}. Applies to rooms created from now on; open rooms keep their settings."
+    )
+}
+
 /// `/setup` input: creator rows plus live worker state for the guild.
 /// `store_error` is `Some` when the creator read failed — the panel surfaces
 /// it instead of rendering an empty list as "no creators".
@@ -2264,10 +2378,16 @@ pub fn voice_command_set(gates: &VoiceGates) -> Vec<CommandDefinition> {
 /// A voice slash command carried by an interaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoiceCommand {
-    Create { name: String },
+    Create {
+        name: String,
+    },
     Setup,
     Ping,
     Invite,
+    TextChannels {
+        channel_id: Snowflake,
+        request: TextChannelsRequest,
+    },
 }
 
 /// Guild the interaction was invoked in. `PartialMember` carries no guild, so
@@ -2304,13 +2424,40 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
         "setup" => Some(VoiceCommand::Setup),
         "ping" => Some(VoiceCommand::Ping),
         "invite" => Some(VoiceCommand::Invite),
+        "textchannels" => {
+            let mut channel_id = 0;
+            let mut request = TextChannelsRequest {
+                enabled: None,
+                name: None,
+                viewer_role: None,
+            };
+            for option in &command.options {
+                match (option.name.as_str(), &option.value) {
+                    ("channel", CommandOptionValue::Channel(id)) => channel_id = id.get(),
+                    ("enabled", CommandOptionValue::Boolean(value)) => {
+                        request.enabled = Some(*value);
+                    }
+                    ("name", CommandOptionValue::String(value)) => {
+                        request.name = Some(value.clone());
+                    }
+                    ("viewer-role", CommandOptionValue::Role(id)) => {
+                        request.viewer_role = Some(id.get());
+                    }
+                    _ => {}
+                }
+            }
+            Some(VoiceCommand::TextChannels {
+                channel_id,
+                request,
+            })
+        }
         _ => None,
     }
 }
 
-/// `/create` needs Manage Channels; admins pass everywhere. `/setup` is
-/// view-open, so this gate applies to `/create` only. Fail closed on
-/// missing permissions.
+/// `/create` and `/textchannels` need Manage Channels; admins pass
+/// everywhere. `/setup` is view-open, so this gate applies to the other two.
+/// Fail closed on missing permissions.
 fn may_create(permissions: Option<Permissions>) -> bool {
     permissions.is_some_and(|permissions| {
         permissions.intersects(Permissions::ADMINISTRATOR | Permissions::MANAGE_CHANNELS)
@@ -2527,6 +2674,41 @@ where
                     })
                     .await
                 }
+            };
+            reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::TextChannels {
+            channel_id,
+            request,
+        } => {
+            let permissions = interaction
+                .member
+                .as_ref()
+                .and_then(|member| member.permissions);
+            if !may_create(permissions) {
+                reply(ephemeral_response(
+                    "You need Manage Channels to use /textchannels.",
+                ))
+                .await;
+                return true;
+            }
+            let (store, _) = runtime.make_pair();
+            let text = match store.creator_for(guild_id, channel_id).await {
+                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Ok(creator) => match decide_text_channels(creator, &request) {
+                    TextChannelsPlan::Refuse { message } => message,
+                    TextChannelsPlan::Update(creator) => match store.add_creator(&creator).await {
+                        Ok(()) => {
+                            runtime.creator_updated(&creator);
+                            text_channels_summary(&creator)
+                        }
+                        Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
+                        Err(error) => {
+                            format!("Could not save the companion settings ({error:?}). Try again.")
+                        }
+                    },
+                },
             };
             reply(ephemeral_response(&text)).await;
             true

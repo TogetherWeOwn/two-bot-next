@@ -22,8 +22,12 @@ fn permissions() -> Permissions {
 }
 
 fn role(permissions: Permissions) -> Role {
+    role_with(GUILD, permissions)
+}
+
+fn role_with(id: u64, permissions: Permissions) -> Role {
     serde_json::from_value(json!({
-        "id": "100", "name": "everyone", "color": 0, "hoist": false,
+        "id": id.to_string(), "name": "everyone", "color": 0, "hoist": false,
         "managed": false, "mentionable": false, "position": 0,
         "colors": { "primary_color": 0, "secondary_color": null, "tertiary_color": null },
         "permissions": permissions.bits().to_string(), "flags": 0
@@ -115,8 +119,23 @@ impl RoomPersistence for Store {
             .lock()
             .unwrap()
             .push(format!("add_creator:{}", creator.channel_id));
-        self.creators.lock().unwrap().push(creator.clone());
+        let mut creators = self.creators.lock().unwrap();
+        creators.retain(|row| row.channel_id != creator.channel_id);
+        creators.push(creator.clone());
         Ok(())
+    }
+    async fn creator_for(
+        &self,
+        _: u64,
+        channel: u64,
+    ) -> Result<Option<CreatorChannel>, StoreError> {
+        Ok(self
+            .creators
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|row| row.channel_id == channel)
+            .cloned())
     }
     async fn persist(&self, room: &VoiceRoom) -> Result<(), StoreError> {
         self.trace
@@ -187,6 +206,7 @@ struct Http {
     companion_errors: Mutex<VecDeque<RoomHttpError>>,
     view_errors: Mutex<VecDeque<RoomHttpError>>,
     created_attributes: Mutex<Vec<RoomChannelAttributes>>,
+    companion_plans: Mutex<Vec<TextChannelPlan>>,
     after_create: Option<Hook>,
     before_move: Option<Hook>,
     before_delete: Option<Hook>,
@@ -204,6 +224,7 @@ impl Http {
             companion_errors: Mutex::new(VecDeque::new()),
             view_errors: Mutex::new(VecDeque::new()),
             created_attributes: Mutex::new(Vec::new()),
+            companion_plans: Mutex::new(Vec::new()),
             after_create: None,
             before_move: None,
             before_delete: None,
@@ -301,6 +322,7 @@ impl RoomWrites for Http {
             "create_companion:{}:{}:{bot_id}",
             plan.room_id, plan.name
         ));
+        self.companion_plans.lock().unwrap().push(plan.clone());
         if let Some(error) = self.companion_errors.lock().unwrap().pop_front() {
             return Err(error);
         }
@@ -960,7 +982,7 @@ fn voice_command_set_is_gated_on_two_voice() {
         .iter()
         .map(|definition| definition.name.clone())
         .collect();
-    assert_eq!(names, ["create", "setup", "ping", "invite"]);
+    assert_eq!(names, ["create", "setup", "ping", "invite", "textchannels"]);
     let off = VoiceGates::from_map(&Default::default());
     assert!(voice_command_set(&off).is_empty());
 }
@@ -1272,6 +1294,254 @@ fn parse_ignores_unowned_commands() {
     ping.kind = InteractionType::Ping;
     ping.data = None;
     assert_eq!(parse_voice_command(&ping), None);
+}
+
+fn typed_option(name: &str, value: CommandOptionValue) -> CommandDataOption {
+    CommandDataOption {
+        name: name.to_owned(),
+        value,
+    }
+}
+
+fn textchannels_interaction(
+    options: Vec<CommandDataOption>,
+    permissions: Option<Permissions>,
+) -> Interaction {
+    voice_interaction(
+        Some(command_data("textchannels", options)),
+        permissions,
+        true,
+    )
+}
+
+#[test]
+fn parse_textchannels_extracts_every_option() {
+    let interaction = textchannels_interaction(
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("enabled", CommandOptionValue::Boolean(false)),
+            typed_option("name", CommandOptionValue::String("lounge".to_owned())),
+            typed_option("viewer-role", CommandOptionValue::Role(Id::new(42))),
+        ],
+        Some(Permissions::MANAGE_CHANNELS),
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::TextChannels {
+            channel_id: CREATOR,
+            request: TextChannelsRequest {
+                enabled: Some(false),
+                name: Some("lounge".to_owned()),
+                viewer_role: Some(42),
+            },
+        })
+    );
+}
+
+#[test]
+fn parse_textchannels_leaves_unset_options_unset() {
+    let interaction = textchannels_interaction(
+        vec![typed_option(
+            "channel",
+            CommandOptionValue::Channel(Id::new(CREATOR)),
+        )],
+        Some(Permissions::MANAGE_CHANNELS),
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::TextChannels {
+            channel_id: CREATOR,
+            request: TextChannelsRequest {
+                enabled: None,
+                name: None,
+                viewer_role: None,
+            },
+        })
+    );
+}
+
+fn request(enabled: Option<bool>, name: Option<&str>, role: Option<u64>) -> TextChannelsRequest {
+    TextChannelsRequest {
+        enabled,
+        name: name.map(str::to_owned),
+        viewer_role: role,
+    }
+}
+
+fn plan_creator(plan: TextChannelsPlan) -> CreatorChannel {
+    match plan {
+        TextChannelsPlan::Update(creator) => creator,
+        TextChannelsPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    }
+}
+
+#[test]
+fn decide_text_channels_defaults_to_on_and_keeps_unset_fields() {
+    let base = CreatorChannel::new(GUILD, CREATOR);
+    let creator = plan_creator(decide_text_channels(
+        Some(base.clone()),
+        &request(None, None, None),
+    ));
+    assert!(creator.text_channels, "omitted toggle turns companions on");
+    assert_eq!(creator.text_channel_name, None);
+    assert_eq!(creator.text_viewer_role_id, None);
+    assert_eq!(creator.name_template, base.name_template);
+}
+
+#[test]
+fn decide_text_channels_stores_trimmed_name_and_viewer_role() {
+    let creator = plan_creator(decide_text_channels(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &request(Some(true), Some("  lounge  "), Some(42)),
+    ));
+    assert_eq!(creator.text_channel_name.as_deref(), Some("lounge"));
+    assert_eq!(creator.text_viewer_role_id, Some(42));
+    // @everyone is a valid viewer role (companion visible to all).
+    let everyone = plan_creator(decide_text_channels(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &request(None, None, Some(GUILD)),
+    ));
+    assert_eq!(everyone.text_viewer_role_id, Some(GUILD));
+}
+
+#[test]
+fn decide_text_channels_off_keeps_stored_name_and_role() {
+    let mut on = CreatorChannel::new(GUILD, CREATOR);
+    on.text_channels = true;
+    on.text_channel_name = Some("lounge".to_owned());
+    on.text_viewer_role_id = Some(42);
+    let off = plan_creator(decide_text_channels(
+        Some(on),
+        &request(Some(false), None, None),
+    ));
+    assert!(!off.text_channels);
+    assert_eq!(off.text_channel_name.as_deref(), Some("lounge"));
+    assert_eq!(off.text_viewer_role_id, Some(42));
+}
+
+#[test]
+fn decide_text_channels_refuses_bad_input() {
+    let base = || Some(CreatorChannel::new(GUILD, CREATOR));
+    for bad in [
+        decide_text_channels(None, &request(None, None, None)),
+        decide_text_channels(base(), &request(None, Some("   "), None)),
+        decide_text_channels(base(), &request(None, Some(""), None)),
+        decide_text_channels(
+            base(),
+            &request(
+                None,
+                Some(&"x".repeat(MAX_TEXT_CHANNEL_NAME_CHARS + 1)),
+                None,
+            ),
+        ),
+    ] {
+        assert!(matches!(bad, TextChannelsPlan::Refuse { .. }), "{bad:?}");
+    }
+    // A name at the ceiling is accepted.
+    assert!(matches!(
+        decide_text_channels(
+            base(),
+            &request(None, Some(&"x".repeat(MAX_TEXT_CHANNEL_NAME_CHARS)), None)
+        ),
+        TextChannelsPlan::Update(_)
+    ));
+}
+
+#[test]
+fn text_channels_summary_reports_the_stored_settings() {
+    let mut creator = CreatorChannel::new(GUILD, CREATOR);
+    assert!(text_channels_summary(&creator).contains("off"));
+    creator.text_channels = true;
+    let text = text_channels_summary(&creator);
+    assert!(text.contains("on for <#200>"), "{text}");
+    assert!(text.contains(DEFAULT_TEXT_CHANNEL_NAME), "{text}");
+    assert!(text.contains("occupants and admins"), "{text}");
+    creator.text_viewer_role_id = Some(42);
+    assert!(text_channels_summary(&creator).contains("<@&42>"));
+    creator.text_viewer_role_id = Some(GUILD);
+    assert!(text_channels_summary(&creator).contains("everyone"));
+}
+
+#[tokio::test]
+async fn handle_textchannels_refuses_without_manage_channels() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = textchannels_interaction(
+        vec![typed_option(
+            "channel",
+            CommandOptionValue::Channel(Id::new(CREATOR)),
+        )],
+        Some(Permissions::VIEW_CHANNEL),
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(response_text(response.as_ref().expect("reply")).contains("Manage Channels"));
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("add_creator")));
+}
+
+#[tokio::test]
+async fn handle_textchannels_saves_settings_for_a_creator_channel() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = textchannels_interaction(
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("name", CommandOptionValue::String("lounge".to_owned())),
+            typed_option("viewer-role", CommandOptionValue::Role(Id::new(42))),
+        ],
+        Some(Permissions::MANAGE_CHANNELS),
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(text.contains("on for <#200>"), "{text}");
+    assert!(text.contains("lounge"), "{text}");
+    assert!(text.contains("<@&42>"), "{text}");
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("add_creator:{CREATOR}")));
+}
+
+#[tokio::test]
+async fn handle_textchannels_refuses_a_channel_that_is_not_a_creator() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = textchannels_interaction(
+        vec![typed_option(
+            "channel",
+            CommandOptionValue::Channel(Id::new(CREATOR + 1)),
+        )],
+        Some(Permissions::ADMINISTRATOR),
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(response_text(response.as_ref().expect("reply")).contains("/create"));
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("add_creator")));
+}
+
+#[tokio::test]
+async fn handle_textchannels_surfaces_store_failures() {
+    // The runtime factory builds a fresh store per command, so a failing
+    // write is exercised through the pure decision + a store directly.
+    let store = Store::new(Trace::default());
+    *store.add_creator_error.lock().unwrap() = Some(StoreError::Unavailable);
+    let creator = plan_creator(decide_text_channels(
+        store.creator_for(GUILD, CREATOR).await.unwrap(),
+        &request(Some(true), None, None),
+    ));
+    assert_eq!(
+        store.add_creator(&creator).await,
+        Err(StoreError::Unavailable)
+    );
 }
 
 #[test]
@@ -1883,4 +2153,127 @@ async fn unknown_companion_outcome_adopts_visible_channel_without_repost() {
         "adopted channel persisted: {calls:?}"
     );
     assert_eq!(worker.companions[&500].text_channel_id, 600);
+}
+
+// --- V9d admin roles and the settings snapshot ------------------------------
+
+const ADMIN_ROLE: u64 = 777;
+const ADMINISTRATOR_ROLE: u64 = 778;
+const LATE_ADMIN_ROLE: u64 = 779;
+
+fn snapshot_with_roles(extra_roles: Vec<Role>) -> GuildSnapshot {
+    let mut snapshot = snapshot(&[], vec![]);
+    snapshot.bot.roles.extend(extra_roles);
+    snapshot
+}
+
+fn admin_roles() -> Vec<Role> {
+    vec![
+        role_with(ADMIN_ROLE, Permissions::MANAGE_CHANNELS),
+        role_with(ADMINISTRATOR_ROLE, Permissions::ADMINISTRATOR),
+        role_with(780, Permissions::VIEW_CHANNEL),
+    ]
+}
+
+fn snapshot_companion(viewer_role_id: Option<u64>) -> TextCompanion {
+    TextCompanion {
+        guild_id: GUILD,
+        room_channel_id: 500,
+        text_channel_id: 700,
+        settings: two_bot_core::voice_text_channel::TextChannelSettings {
+            enabled: true,
+            configured_name: None,
+            viewer_role_id,
+        },
+        created_at: NOW.to_owned(),
+    }
+}
+
+#[test]
+fn admin_role_ids_keep_manage_channels_roles_only() {
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot_with_roles(admin_roles()));
+    let state = live.inner.read().unwrap();
+    // Manage Channels role qualifies. @everyone (this snapshot gives it
+    // Manage Channels), the Administrator role (bypasses overwrites) and a
+    // role without the bit do not.
+    assert_eq!(state.admin_role_ids(GUILD), vec![ADMIN_ROLE]);
+}
+
+#[tokio::test]
+async fn companion_plan_carries_admin_roles() {
+    let (live, store, http, trace) = companion_fixture();
+    live.publish(snapshot_with_roles(admin_roles()));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    join_with_companion(&mut worker, MEMBER, &mut now).await;
+    let plans = worker.http.companion_plans.lock().unwrap().clone();
+    assert_eq!(plans.len(), 1, "{:?}", trace.lock().unwrap());
+    let roles: Vec<u64> = plans[0]
+        .overwrites
+        .iter()
+        .filter_map(|overwrite| match overwrite.target {
+            OverwriteTarget::Role(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(roles, vec![ADMIN_ROLE], "{:?}", plans[0].overwrites);
+}
+
+#[tokio::test]
+async fn later_promoted_admin_role_covers_new_companions_without_room_updates() {
+    let (live, store, http, trace) = companion_fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    join_with_companion(&mut worker, MEMBER, &mut now).await;
+    // The role is promoted after the first companion exists.
+    worker.live.publish(snapshot_with_roles(vec![role_with(
+        LATE_ADMIN_ROLE,
+        Permissions::MANAGE_CHANNELS,
+    )]));
+    worker.reconcile();
+    let calls_after_promotion = trace.lock().unwrap().clone();
+    assert!(
+        !calls_after_promotion
+            .iter()
+            .any(|call| call.contains(&LATE_ADMIN_ROLE.to_string())),
+        "existing companions are not rewritten: {calls_after_promotion:?}"
+    );
+    let state = worker.live.inner.read().unwrap();
+    assert_eq!(state.admin_role_ids(GUILD), vec![LATE_ADMIN_ROLE]);
+}
+
+#[tokio::test]
+async fn protected_ids_hold_viewer_admin_roles_and_the_bot() {
+    let (live, store, http, _) = companion_fixture();
+    live.publish(snapshot_with_roles(admin_roles()));
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let state = worker.live.inner.read().unwrap();
+    let protected = worker.protected_ids(&state, &snapshot_companion(Some(42)));
+    assert_eq!(protected, vec![42, ADMIN_ROLE, 999]);
+    // No viewer role: admin roles and the bot stay protected.
+    let protected = worker.protected_ids(&state, &snapshot_companion(None));
+    assert_eq!(protected, vec![ADMIN_ROLE, 999]);
+}
+
+#[tokio::test]
+async fn creator_edit_applies_to_new_rooms_only() {
+    let (live, store, http, _) = companion_fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    join_with_companion(&mut worker, MEMBER, &mut now).await;
+    let before = worker.companions[&500].settings.clone();
+    // `/textchannels` swaps in an edited creator row.
+    let mut edited = text_creator();
+    edited.text_channel_name = Some("lounge".to_owned());
+    edited.text_viewer_role_id = Some(42);
+    apply_command(&mut worker, ActorCommand::CreatorAdded(edited));
+    assert_eq!(
+        worker.companions[&500].settings, before,
+        "the existing companion keeps its creation-time snapshot"
+    );
+    assert_eq!(
+        worker.creators[&CREATOR].text_channel_name.as_deref(),
+        Some("lounge")
+    );
 }

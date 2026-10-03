@@ -1101,6 +1101,35 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         ),
         CommandDefinition::new("ping", "Show the bot's response latency"),
         CommandDefinition::new("invite", "Show this server's invite link"),
+        CommandDefinition::new(
+            "textchannels",
+            "Toggle companion text channels for one creator channel",
+        )
+        .permissions(PERM_MANAGE_CHANNELS)
+        .options(vec![
+            CommandOption::new(
+                "channel",
+                "Creator voice channel to configure",
+                CommandOptionType::Channel,
+            )
+            .required(),
+            CommandOption::new(
+                "enabled",
+                "Turn companion text channels on or off (default on)",
+                CommandOptionType::Boolean,
+            ),
+            CommandOption::new(
+                "name",
+                "Companion channel name (default voice-chat)",
+                CommandOptionType::String,
+            )
+            .max_length(MAX_TEXT_CHANNEL_NAME_CHARS as u32),
+            CommandOption::new(
+                "viewer-role",
+                "Extra role that may view companions (@everyone for all)",
+                CommandOptionType::Role,
+            ),
+        ]),
     ]
 }
 
@@ -1734,7 +1763,7 @@ mod tests {
         let defs = voice_commands();
         assert_eq!(
             defs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-            ["create", "setup", "ping", "invite"]
+            ["create", "setup", "ping", "invite", "textchannels"]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
         assert_eq!(
@@ -1748,10 +1777,40 @@ mod tests {
         assert_eq!(defs[1].default_member_permissions, None);
         assert!(defs[1].options.is_empty());
         // `/ping` and `/invite` are open to everyone and take no options.
-        for def in &defs[2..] {
+        for def in &defs[2..4] {
             assert_eq!(def.default_member_permissions, None);
             assert!(def.options.is_empty());
         }
+        // `/textchannels` is admin-gated like `/create`: a required creator
+        // channel plus optional toggle, name and viewer role.
+        assert_eq!(
+            defs[4].default_member_permissions,
+            Some(PERM_MANAGE_CHANNELS.to_string())
+        );
+        let options: Vec<(&str, u8, bool)> = defs[4]
+            .options
+            .iter()
+            .map(|option| {
+                (
+                    option.name.as_str(),
+                    option.kind,
+                    option.required == Some(true),
+                )
+            })
+            .collect();
+        assert_eq!(
+            options,
+            vec![
+                ("channel", CommandOptionType::Channel.as_u8(), true),
+                ("enabled", CommandOptionType::Boolean.as_u8(), false),
+                ("name", CommandOptionType::String.as_u8(), false),
+                ("viewer-role", CommandOptionType::Role.as_u8(), false),
+            ]
+        );
+        assert_eq!(
+            defs[4].options[2].max_length,
+            Some(MAX_TEXT_CHANNEL_NAME_CHARS as u32)
+        );
         // Merges cleanly alongside the other slices, first-wins.
         let merged = merge_commands(
             &[feature_commands(), moderation_commands(), voice_commands()],
@@ -1762,6 +1821,7 @@ mod tests {
         assert!(merged.iter().any(|d| d.name == "setup"));
         assert!(merged.iter().any(|d| d.name == "ping"));
         assert!(merged.iter().any(|d| d.name == "invite"));
+        assert!(merged.iter().any(|d| d.name == "textchannels"));
 
         assert!(!VoiceGates::from_map(&Default::default()).enabled);
         let vars: HashMap<String, String> = [("TWO_VOICE".to_owned(), "1".to_owned())]

@@ -64,7 +64,10 @@ pub const OCCURRENCE_ID_MAX_CHARS: usize = 128;
 pub enum CommandOptionType {
     String = 3,
     Integer = 4,
+    Boolean = 5,
     User = 6,
+    Channel = 7,
+    Role = 8,
 }
 
 impl CommandOptionType {
