@@ -518,13 +518,23 @@ impl ResponseGate {
     }
 }
 
-type ResponseQueue = Arc<Mutex<VecDeque<(ScriptedResponse, Option<Arc<ResponseGate>>)>>>;
+/// A response successfully written to the mock socket, not merely scheduled.
+#[derive(Debug, Clone)]
+pub struct RestResponse {
+    pub path: String,
+    pub status: u16,
+    pub sent_at: std::time::Instant,
+}
+
+type RestResponder =
+    Arc<dyn Fn(&RestRequest) -> (ScriptedResponse, Option<Arc<ResponseGate>>) + Send + Sync>;
 
 /// The running scripted REST double.
 pub struct MockRest {
     /// Listener address; `origin()` renders the `DISCORD_API_BASE` override.
     pub addr: SocketAddr,
     recorded: Arc<Mutex<Vec<RestRequest>>>,
+    responses: Arc<Mutex<Vec<RestResponse>>>,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -598,18 +608,51 @@ impl MockRest {
         body_delay: Option<Duration>,
         first_receipt: Option<ReceiptHold>,
     ) -> Self {
+        let queue = Mutex::new(script);
+        Self::serve(
+            Arc::new(move |_: &RestRequest| {
+                queue
+                    .lock()
+                    .expect("queue")
+                    .pop_front()
+                    .unwrap_or_else(|| (default.clone(), None))
+            }),
+            body_delay,
+            first_receipt,
+        )
+        .await
+    }
+
+    /// Route-aware stateful fixture for concurrent feature orchestration.
+    pub async fn with_responder(
+        responder: impl Fn(&RestRequest) -> ScriptedResponse + Send + Sync + 'static,
+    ) -> Self {
+        Self::serve(
+            Arc::new(move |request: &RestRequest| (responder(request), None)),
+            Some(Duration::ZERO),
+            None,
+        )
+        .await
+    }
+
+    async fn serve(
+        responder: RestResponder,
+        body_delay: Option<Duration>,
+        first_receipt: Option<ReceiptHold>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind rest");
         let addr = listener.local_addr().expect("rest addr");
         let recorded = Arc::new(Mutex::new(Vec::new()));
-        let queue = Arc::new(Mutex::new(script));
+        let responses = Arc::new(Mutex::new(Vec::new()));
         let handle = {
             let recorded = Arc::clone(&recorded);
+            let responses = Arc::clone(&responses);
             tokio::spawn(async move {
                 rest_task(
                     listener,
                     recorded,
-                    queue,
-                    default,
+                    responses,
+                    responder,
                     body_delay,
                     first_receipt,
                 )
@@ -619,6 +662,7 @@ impl MockRest {
         Self {
             addr,
             recorded,
+            responses,
             handle: Some(handle),
         }
     }
@@ -633,7 +677,11 @@ impl MockRest {
         self.recorded.lock().expect("recorded").clone()
     }
 
-    /// Stop the listener.
+    pub fn responses(&self) -> Vec<RestResponse> {
+        self.responses.lock().expect("responses").clone()
+    }
+
+    /// Stop the listener and its owned connection tasks.
     pub async fn shutdown(mut self) {
         if let Some(handle) = self.handle.take() {
             handle.abort();
@@ -661,32 +709,33 @@ fn ungated(
 async fn rest_task(
     listener: TcpListener,
     recorded: Arc<Mutex<Vec<RestRequest>>>,
-    queue: ResponseQueue,
-    default: ScriptedResponse,
+    responses: Arc<Mutex<Vec<RestResponse>>>,
+    responder: RestResponder,
     body_delay: Option<Duration>,
     mut first_receipt: Option<ReceiptHold>,
 ) {
-    let mut handlers = tokio::task::JoinSet::new();
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            break;
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = connections.join_next(), if !connections.is_empty() => continue,
         };
+        let Ok((stream, _)) = accepted else { break };
         let recorded = Arc::clone(&recorded);
-        let queue = Arc::clone(&queue);
-        let default = default.clone();
+        let responses = Arc::clone(&responses);
+        let responder = Arc::clone(&responder);
         let receipt = first_receipt.take();
-        handlers.spawn(async move {
-            handle_rest(stream, recorded, queue, default, body_delay, receipt).await
+        connections.spawn(async move {
+            handle_rest(stream, recorded, responses, responder, body_delay, receipt).await
         });
-        while handlers.try_join_next().is_some() {}
     }
 }
 
 async fn handle_rest(
     mut stream: TcpStream,
     recorded: Arc<Mutex<Vec<RestRequest>>>,
-    queue: ResponseQueue,
-    default: ScriptedResponse,
+    responses: Arc<Mutex<Vec<RestResponse>>>,
+    responder: RestResponder,
     body_delay: Option<Duration>,
     receipt: Option<ReceiptHold>,
 ) {
@@ -697,18 +746,15 @@ async fn handle_rest(
         let _ = receipt.entered.send(());
         let _ = receipt.release.await;
     }
-    recorded.lock().expect("recorded").push(RestRequest {
+    let request = RestRequest {
         method: method.clone(),
         path: path.clone(),
         headers,
         body: body.clone(),
         received_at: tokio::time::Instant::now(),
-    });
-    let (mut next, gate) = queue
-        .lock()
-        .expect("queue")
-        .pop_front()
-        .unwrap_or_else(|| (default.clone(), None));
+    };
+    let (mut next, gate) = responder(&request);
+    recorded.lock().expect("recorded").push(request);
     if let Some(gate) = &gate {
         gate.arrived.notify_one();
         gate.released.notified().await;
@@ -757,7 +803,13 @@ async fn handle_rest(
     // The echo self-heal above may replace an empty scripted body; deliver
     // whichever body the receipt contract chose. A declared length beyond the
     // delivered bytes truncates on connection close.
-    let _ = stream.write_all(&body).await;
+    if stream.write_all(&body).await.is_ok() {
+        responses.lock().expect("responses").push(RestResponse {
+            path,
+            status: next.status,
+            sent_at: std::time::Instant::now(),
+        });
+    }
     if let Some(gate) = gate {
         gate.completed.notify_one();
     }
