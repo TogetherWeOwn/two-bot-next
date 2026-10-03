@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{PgPool, Row};
 use two_bot_core::backup::dump::{dump, restore, DbDumpError};
 use two_bot_core::backup::dump_file::{
@@ -594,11 +595,12 @@ async fn allocate_owned_sequences(
     }
     assert!(allocated.contains_key(&("internal_idempotency".into(), "intent_id".into())));
     assert!(allocated.contains_key(&("internal_action_log".into(), "audit_id".into())));
-    assert_eq!(
-        allocated[&("members".into(), "backup_identity".into())].1,
-        3,
-        "test identity uses a non-default increment"
-    );
+    // Fresh drill targets run real migrations only: the test-only
+    // backup_identity allocator does not exist there. Every caller that has
+    // it keeps this increment pinned.
+    if let Some((_, increment)) = allocated.get(&("members".into(), "backup_identity".into())) {
+        assert_eq!(*increment, 3, "test identity uses a non-default increment");
+    }
     allocated
 }
 
@@ -622,16 +624,24 @@ async fn assert_default_inserts(
         ("internal_action_log", "audit_id", "INSERT INTO internal_action_log (intent_id, phase, caller_hash, action, resolved_role_id) VALUES (83, 'intent', repeat('b', 64), 'role.assign', '100000000000000010') RETURNING audit_id"),
         ("moderation_member_bans", "generation", "INSERT INTO moderation_member_bans (request_id, guild_id, user_id, state, created_at) VALUES ('post-restore:ban', '100000000000000001', '100000000000000012', 'prepared', now()) RETURNING generation"),
     ];
-    assert_eq!(
-        inserts
-            .iter()
-            .map(|(table, column, _)| (table.to_string(), column.to_string()))
-            .collect::<BTreeSet<_>>(),
-        allocations.keys().cloned().collect(),
-        "new owned sequences need a valid DEFAULT INSERT case"
-    );
+    let cases: BTreeSet<(String, String)> = inserts
+        .iter()
+        .map(|(table, column, _)| (table.to_string(), column.to_string()))
+        .collect();
+    for key in allocations.keys() {
+        assert!(
+            cases.contains(key),
+            "new owned sequences need a valid DEFAULT INSERT case: {key:?}"
+        );
+    }
     for (table, column, statement) in inserts {
-        let (allocated, increment) = allocations[&(table.to_owned(), column.to_owned())];
+        // Fresh drill targets run real migrations only: the test-only
+        // backup_identity allocator has no target column there, so its case
+        // is covered by the reused-target callers instead.
+        let Some((allocated, increment)) = allocations.get(&(table.to_owned(), column.to_owned()))
+        else {
+            continue;
+        };
         let inserted: i64 = sqlx::query_scalar(audited(statement.to_owned()))
             .fetch_one(pool)
             .await
@@ -641,6 +651,15 @@ async fn assert_default_inserts(
             allocated + increment,
             "{table}.{column} default INSERT must not collide"
         );
+    }
+    let has_test_identity: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'members'::regclass AND attname = 'backup_identity')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    if !has_test_identity {
+        return;
     }
     let identity: String = sqlx::query_scalar("SELECT attidentity::text FROM pg_attribute WHERE attrelid = 'members'::regclass AND attname = 'backup_identity'").fetch_one(pool).await.unwrap();
     assert_eq!(identity, "a", "restore must not weaken GENERATED ALWAYS");
@@ -1549,44 +1568,60 @@ async fn schema_version(pool: &PgPool) -> (i64, String, i64) {
     .unwrap()
 }
 
-fn assert_drill_verified(output: &Output, archive: &Path, tables: &[String]) {
+/// Parse the retained-evidence directory from a successful shipped script
+/// invocation. The unit now allocates a NEW migrated scratch database per run
+/// via `two-bot restore-drill` (retained evidence), instead of restoring into
+/// a reused scratch target with `two-bot restore --force`, so there are no
+/// per-table count lines on stdout: row fidelity is asserted against the
+/// retained `verified.json` receipt and the allocated target below.
+fn assert_drill_verified(output: &Output, archive: &Path) -> PathBuf {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "drill failed");
     assert!(
         stdout.contains(&format!(
-            "drill: restoring {} into the scratch database",
+            "drill: restoring {} into a NEW migrated scratch database",
             archive.display()
         )),
         "the drill must select the newest archive, not the older decoy"
     );
     assert_eq!(stdout.lines().last(), Some("RESTORE VERIFIED"));
     assert!(!stdout.contains("MISMATCH"));
-    assert!(!stderr.contains("WARNING"), "no baseline rows initialized");
     assert!(
-        !stderr.contains("does not have"),
-        "no archived column dropped"
+        !stderr.contains("RESTORE FAILED"),
+        "drill must not fail a retained scratch rehearsal"
     );
-    let verified = stdout
+    let dir = stdout
         .lines()
-        .filter(|line| line.contains(" manifest ") && line.ends_with(" ok"))
-        .count();
-    assert_eq!(verified, tables.len(), "one verified count line per table");
-    for table in tables {
-        assert!(
-            stdout
-                .lines()
-                .any(|line| line.trim_start().starts_with(&format!("{table} "))
-                    && line.ends_with(" ok")),
-            "{table} restored with a matching count"
-        );
-    }
+        .find_map(|line| line.strip_prefix("restore-drill: retained evidence "))
+        .expect("drill retains its evidence directory on stdout");
+    PathBuf::from(dir)
+}
+
+/// Direct pool to a drill-allocated target (or the `postgres` allocator).
+/// Branch harnesses use an explicit `PgConnectOptions`, never a fenced URL.
+async fn drill_target_pool(name: &str) -> PgPool {
+    PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            PgConnectOptions::new_without_pgpass()
+                .host("agent-testdb")
+                .port(5432)
+                .username("agent_test")
+                .password("")
+                .database(name)
+                .ssl_mode(PgSslMode::Disable),
+        )
+        .await
+        .expect("connect to retained drill target")
 }
 
 /// The shipped monthly drill on the complete migrated schema (TOG-11804): the
-/// built `two-bot backup`, then the restore drill unit's own ExecStart script,
-/// into an independent freshly migrated scratch database, twice. CI's backup
-/// CLI step supplies the binary; without TWO_BOT_TEST_BACKUP_BIN this skips.
+/// built `two-bot backup`, then the restore drill unit's own ExecStart script
+/// twice, as the monthly timer does. Each run allocates a NEW migrated scratch
+/// database and retains its evidence; nothing restores into a reused target.
+/// CI's backup CLI step supplies the binary; without TWO_BOT_TEST_BACKUP_BIN
+/// this skips.
 #[tokio::test]
 async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema() {
     let Some(binary) = std::env::var_os("TWO_BOT_TEST_BACKUP_BIN").map(PathBuf::from) else {
@@ -1645,44 +1680,96 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
     assert_archive_matches(&contents, &before);
     assert_eq!(contents.manifest.events_sequence, 107);
 
-    // Independent, freshly migrated scratch target, as the drill unit expects.
-    let target = database().await.expect("test bootstrap already configured");
-    let pool = target.pool();
-    assert_eq!(schema_version(pool).await, version);
-    sqlx::raw_sql(
-        "CREATE TABLE schema_migrations (id TEXT PRIMARY KEY); \
-         INSERT INTO schema_migrations VALUES ('destination-ledger-only'); \
-         ALTER TABLE members ADD COLUMN backup_identity BIGINT GENERATED ALWAYS AS IDENTITY \
-             (START WITH 17 INCREMENT BY 3) UNIQUE;",
-    )
-    .execute(pool)
-    .await
-    .unwrap();
-    let guard_before = triggers(pool).await;
+    // Each run allocates a NEW migrated scratch database and retains its
+    // evidence, as the drill unit does. Nothing restores into a reused target.
+    let guard_before = triggers(source).await;
     let script = shipped_drill_script(&directory.0, &binary);
-    let target_url = fixture_url(&target);
-    // Month one restores into a dirtied scratch; month two into the previous
-    // drill's result, as the monthly timer does.
-    let mut floors = BTreeMap::new();
+    let evidence_root = directory.path("drill-evidence");
+    std::fs::create_dir(&evidence_root).expect("pre-provision retained drill evidence root");
+    let mut evidence_dirs = Vec::new();
     for month in 1..=2 {
-        dirty_target(pool).await;
-        // Keep the floors in force before the last restore, as the
-        // reversed-rows caller does: dirty_target hands out target-only
-        // identities whose rows restore wipes, but the allocator must not
-        // rewind onto them.
-        floors.extend(allocation_floors(pool, &contents.manifest.sequence_marks).await);
-        let cas_before = next_cas_token(pool).await;
         let drill = shipped_cli(
             Command::new("/usr/bin/bash")
                 .args(["-o", "pipefail", "-c", script.as_str()])
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin")
                 .env("TWO_DATABASE_TLS", "local-only")
-                .env("TWO_RESTORE_URL", &target_url),
+                .env(
+                    "TWO_RESTORE_DRILL_BOOTSTRAP_URL",
+                    "postgres://agent_test:@agent-testdb:5432/postgres",
+                )
+                .env("TWO_RESTORE_DRILL_EVIDENCE_DIR", &evidence_root),
             &format!("restore drill, month {month}"),
         );
-        assert_drill_verified(&drill, archive, &tables);
-        let after = snapshot(pool, &tables).await;
+        let dir = assert_drill_verified(&drill, archive);
+        assert!(
+            dir.starts_with(&evidence_root),
+            "drill retains evidence under the provisioned root"
+        );
+        evidence_dirs.push(dir);
+    }
+    assert_eq!(evidence_dirs.len(), 2);
+    assert_ne!(
+        evidence_dirs[0], evidence_dirs[1],
+        "consecutive drills retain independent evidence"
+    );
+    let cas_before = next_cas_token(source).await;
+    let mut drill_targets = Vec::new();
+    for (index, dir) in evidence_dirs.iter().enumerate() {
+        let month = index + 1;
+        let receipt: Value = serde_json::from_slice(
+            &std::fs::read(dir.join("verified.json")).expect("retained verified receipt"),
+        )
+        .expect("verified receipt is JSON");
+        assert_eq!(
+            receipt["status"],
+            json!("verified"),
+            "month {month}: retained receipt"
+        );
+        let target_name = receipt["target_database"]
+            .as_str()
+            .expect("verified receipt names its target")
+            .to_owned();
+        assert!(
+            target_name.starts_with("two_next_restore_drill_"),
+            "month {month}: drill allocates its own target"
+        );
+        // The retained copy must be the newest published archive, not the decoy.
+        let retained = std::fs::read(dir.join("archive.ndjson.gz")).expect("retained archive copy");
+        assert_eq!(
+            retained.len() as u64,
+            std::fs::metadata(archive).unwrap().len(),
+            "month {month}: retained archive matches the published newest"
+        );
+        assert_eq!(
+            receipt["archive"]["bytes"],
+            json!(retained.len() as u64),
+            "month {month}: receipt bytes match the retained copy"
+        );
+        assert_eq!(
+            receipt["quarantined_unbans"],
+            json!(0),
+            "month {month}: terminal fixture expiry stays terminal"
+        );
+        // The test-only backup_identity column rides the archive but has no
+        // migrated target column; restore reports it dropped, never lost rows.
+        assert_eq!(
+            receipt["dropped_columns"],
+            json!({"members": ["backup_identity"]}),
+            "month {month}: only the test backup_identity column drops"
+        );
+        assert_eq!(
+            receipt["missing_member_ban_ownership"],
+            json!(false),
+            "month {month}: ban ownership evidence present"
+        );
+        assert!(
+            receipt["restored"].as_object().is_some(),
+            "month {month}: receipt reports per-table restored counts"
+        );
+
+        let pool = drill_target_pool(&target_name).await;
+        let after = snapshot(&pool, &tables).await;
         for table in &tables {
             eprintln!(
                 "drill: month {month} {table:32} source {:5} restored {:5}",
@@ -1690,44 +1777,92 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
                 after[table].rows.len()
             );
         }
-        assert_eq!(after, before, "month {month}: every archived row");
-        assert_fresh_cas_tokens(pool, cas_before).await;
-        assert_eq!(triggers(pool).await, guard_before);
+        // The test-only backup_identity column rides the archive but has no
+        // migrated target column; restore drops it (see receipt above) while
+        // every real column round-trips exactly.
+        let mut expected = before.clone();
+        if let Some(members) = expected.get_mut("members") {
+            if let Some(index) = members
+                .columns
+                .iter()
+                .position(|(name, _)| name == "backup_identity")
+            {
+                members.columns.remove(index);
+                for row in &mut members.rows {
+                    row.remove(index);
+                }
+            }
+        }
+        assert_eq!(after, expected, "month {month}: every archived row");
+        assert_fresh_cas_tokens(&pool, cas_before).await;
+        assert_eq!(
+            triggers(&pool).await,
+            guard_before,
+            "month {month}: guards survive"
+        );
         let cooldowns: i64 = sqlx::query_scalar("SELECT count(*) FROM xp_cooldowns")
-            .fetch_one(pool)
+            .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(cooldowns, 0, "excluded throttles are not replayed");
-    }
-    assert_guards_work(pool).await;
+        assert_eq!(
+            cooldowns, 0,
+            "month {month}: excluded throttles are not replayed"
+        );
+        assert_guards_work(&pool).await;
 
-    let allocations = allocate_owned_sequences(pool, false, &floors).await;
-    for ((table, column), (next, increment)) in &allocations {
-        eprintln!("drill: sequence {table}.{column} resumed at {next} (increment {increment})");
+        let floors = allocation_floors(&pool, &contents.manifest.sequence_marks).await;
+        let allocations = allocate_owned_sequences(&pool, false, &floors).await;
+        for ((table, column), (next, increment)) in &allocations {
+            eprintln!(
+                "drill: month {month} sequence {table}.{column} resumed at {next} (increment {increment})"
+            );
+        }
+        assert_default_inserts(&pool, &allocations).await;
+        let allocated_version: i64 =
+            sqlx::query_scalar("SELECT nextval('guild_settings_version_seq')")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            allocated_version, 84,
+            "month {month}: standalone settings version resumes beyond restored max"
+        );
+        eprintln!(
+            "drill: month {month} sequence guild_settings_version_seq resumed at {allocated_version}"
+        );
+        let inserted_version: i64 = sqlx::query_scalar("INSERT INTO guild_settings (guild_id, key, value, version, updated_by) VALUES ('100000000000000001', 'TWO_BACKUP_TEST', 'true', nextval('guild_settings_version_seq'), 'post-restore') RETURNING version").fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            inserted_version, 85,
+            "month {month}: settings version keeps allocating"
+        );
+        for (table, statement) in [
+            ("internal_nonces", "INSERT INTO internal_nonces SELECT * FROM internal_nonces WHERE nonce_hash = repeat('a', 64)"),
+            ("internal_discord_events", "INSERT INTO internal_discord_events SELECT * FROM internal_discord_events WHERE event_hash = repeat('3', 64)"),
+            ("internal_idempotency", "INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) VALUES (repeat('b', 64), repeat('c', 64), 'role.assign', repeat('d', 64), 'in_flight')"),
+            ("feed_deliveries", "INSERT INTO feed_deliveries SELECT * FROM feed_deliveries WHERE item_key = 'backup:item:pending'"),
+            ("self_role_panel_claims", "INSERT INTO self_role_panel_claims SELECT * FROM self_role_panel_claims"),
+            ("automod_delivery_claims", "INSERT INTO automod_delivery_claims SELECT * FROM automod_delivery_claims"),
+        ] {
+            assert_sqlstate(&sqlx::query(audited(statement.to_owned())).execute(&pool).await.unwrap_err(), "23505");
+            eprintln!("drill: month {month} replay refused (23505) in {table}");
+        }
+        pool.close().await;
+        drill_targets.push(target_name);
     }
-    assert_default_inserts(pool, &allocations).await;
-    let allocated_version: i64 = sqlx::query_scalar("SELECT nextval('guild_settings_version_seq')")
-        .fetch_one(pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        allocated_version, 84,
-        "standalone settings version resumes beyond restored max"
+    assert_eq!(drill_targets.len(), 2);
+    assert_ne!(
+        drill_targets[0], drill_targets[1],
+        "consecutive drills allocate independent targets"
     );
-    eprintln!("drill: sequence guild_settings_version_seq resumed at {allocated_version}");
-    let inserted_version: i64 = sqlx::query_scalar("INSERT INTO guild_settings (guild_id, key, value, version, updated_by) VALUES ('100000000000000001', 'TWO_BACKUP_TEST', 'true', nextval('guild_settings_version_seq'), 'post-restore') RETURNING version").fetch_one(pool).await.unwrap();
-    assert_eq!(inserted_version, 85);
-    for (table, statement) in [
-        ("internal_nonces", "INSERT INTO internal_nonces SELECT * FROM internal_nonces WHERE nonce_hash = repeat('a', 64)"),
-        ("internal_discord_events", "INSERT INTO internal_discord_events SELECT * FROM internal_discord_events WHERE event_hash = repeat('3', 64)"),
-        ("internal_idempotency", "INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) VALUES (repeat('b', 64), repeat('c', 64), 'role.assign', repeat('d', 64), 'in_flight')"),
-        ("feed_deliveries", "INSERT INTO feed_deliveries SELECT * FROM feed_deliveries WHERE item_key = 'backup:item:pending'"),
-        ("self_role_panel_claims", "INSERT INTO self_role_panel_claims SELECT * FROM self_role_panel_claims"),
-        ("automod_delivery_claims", "INSERT INTO automod_delivery_claims SELECT * FROM automod_delivery_claims"),
-    ] {
-        assert_sqlstate(&sqlx::query(audited(statement.to_owned())).execute(pool).await.unwrap_err(), "23505");
-        eprintln!("drill: replay refused (23505) in {table}");
+    // Only the two generated drill-owned targets verified above are removed.
+    // The shipped allocator never drops databases or prunes drill evidence.
+    let admin = drill_target_pool("postgres").await;
+    for name in &drill_targets {
+        sqlx::query(audited(format!("DROP DATABASE \"{name}\"")))
+            .execute(&admin)
+            .await
+            .unwrap();
     }
-    target.close().await.unwrap();
+    admin.close().await;
     db.close().await.unwrap();
 }
