@@ -84,6 +84,7 @@ impl World {
             bot: BotAccess {
                 member_id: BOT,
                 guild_owner_id: 998,
+                system_channel_id: None,
                 member_roles: vec![],
                 roles: vec![everyone(bot_permissions)],
             },
@@ -220,10 +221,13 @@ fn a_missing_chosen_source_channel_fails_closed() {
 }
 
 #[test]
-fn text_channels_remain_unsupported_until_v9() {
+fn the_text_channel_toggle_does_not_change_the_voice_room_plan() {
+    // The companion is created by the worker (V9c); the voice room itself is
+    // planned identically whether or not the creator enables the toggle.
     let mut world = World::new(full());
+    let without = world.plan().unwrap();
     world.settings.text_channels = true;
-    assert_eq!(world.plan(), Err(RoomHttpError::InvalidRequest));
+    assert_eq!(world.plan().unwrap(), without);
 }
 
 #[test]

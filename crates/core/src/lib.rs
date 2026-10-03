@@ -61,6 +61,8 @@ pub mod internal_action_store;
 pub mod internal_actions;
 pub mod internal_settings;
 pub mod invites;
+#[cfg(feature = "db")]
+pub mod join_risk_store;
 pub mod leveling;
 #[cfg(feature = "db")]
 pub mod leveling_store;
@@ -69,6 +71,9 @@ pub mod lfg;
 pub mod lfg_store;
 pub mod mac;
 pub mod member_leave_gap;
+pub mod member_moderation;
+#[cfg(feature = "db")]
+pub mod member_moderation_store;
 pub mod membership;
 pub mod message_safety;
 pub mod metrics;

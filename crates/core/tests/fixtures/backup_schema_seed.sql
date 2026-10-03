@@ -59,6 +59,24 @@ VALUES ('100000000000000001', 'backup:moderation:key', 'lockdown', 'backup-reque
         '2026-08-01T10:00:00.000Z', '2026-08-01T10:00:01.000Z', 'backup-moderation-claim');
 INSERT INTO moderation_channel_executions (channel_id, guild_id, idempotency_key, claim_token)
 VALUES ('100000000000000003', '100000000000000001', 'backup:moderation:key', 'backup-channel-claim');
+INSERT INTO moderation_warnings (id, guild_id, user_id, actor_id, reason, request_id, created_at)
+VALUES ('backup:warning', '100000000000000001', '100000000000000005', '100000000000000002',
+        'backup warning', 'backup:warning:request', '2026-08-01T10:00:00.000Z');
+-- Gapped generations, and a retry ticket past both: restore must resume the
+-- shared ownership sequence beyond every restored allocation from it.
+INSERT INTO moderation_member_bans
+    (request_id, guild_id, user_id, generation, state, created_at, completed_at)
+VALUES ('backup:ban:temp', '100000000000000001', '100000000000000005', 4, 'accepted',
+        '2026-08-01T10:00:00.000Z', '2026-08-01T10:00:01.000Z'),
+       ('backup:ban:refused', '100000000000000001', '100000000000000006', 7, 'rejected',
+        '2026-08-01T10:00:02.000Z', '2026-08-01T10:00:03.000Z');
+-- Terminal: restore quarantines only staged/pending/running expiries.
+INSERT INTO moderation_scheduled_unbans
+    (request_id, guild_id, user_id, execute_at, reason, state, created_at, completed_at,
+     claimed_at, claim_token, dispatch_uncertain, retry_generation)
+VALUES ('backup:ban:temp', '100000000000000001', '100000000000000005',
+        '2026-08-02T10:00:00.000Z', 'backup tempban', 'done', '2026-08-01T10:00:00.000Z',
+        '2026-08-02T10:00:02.000Z', '2026-08-02T10:00:01.000Z', 'backup-unban-claim', FALSE, 12);
 
 INSERT INTO containment_events
     (audit_entry_id, guild_id, executor_id, action, target_id, weight, occurred_at, state, reason,
@@ -380,10 +398,44 @@ VALUES ('100000000000000001', '100000000000000033', '100000000000000036',
         TRUE, NULL, NULL, '2026-08-01T10:00:00.123456Z'),
        ('100000000000000001', '100000000000000034', '100000000000000037',
         TRUE, 'Squad chat', '100000000000000001', '2026-08-02T10:00:00Z');
--- Guild room-command controls: one configured guild (creation off, required
--- role, a restricted command and a fail-closed empty list), one defaulted.
+-- Guild room-command controls (0227, on main): one configured guild (creation
+-- off, required role, a restricted command and a fail-closed empty list), one
+-- defaulted.
 INSERT INTO voice_access_controls (guild_id, room_creation_enabled, required_role_id,
   command_roles)
 VALUES ('100000000000000001', FALSE, '100000000000000040',
         '{"kick": ["100000000000000041", "100000000000000042"], "template": []}'::jsonb),
        ('100000000000000002', TRUE, NULL, '{}'::jsonb);
+-- Guild room logging: one configured guild (full detail, channel, mention
+-- role), one at the stored defaults.
+INSERT INTO voice_logging_settings (guild_id, detail_level, log_channel_id,
+  mention_role_id)
+VALUES ('100000000000000001', 'full', '100000000000000050', '100000000000000051'),
+       ('100000000000000002', 'brief', NULL, NULL);
+
+-- V11b configuration (0229): one row in every section, including a command
+-- restriction with roles and one without, so every table round-trips.
+INSERT INTO voice_channel_templates (guild_id, channel_id, name_template, status_template)
+VALUES ('100000000000000001', '100000000000000040', 'Lounge {n}', NULL),
+       ('100000000000000001', '100000000000000041', 'Stage', 'LIVE');
+INSERT INTO voice_game_aliases (guild_id, game, alias)
+VALUES ('100000000000000001', 'Some Game', 'SG');
+INSERT INTO voice_random_lists (guild_id, name) VALUES ('100000000000000001', 'rooms');
+INSERT INTO voice_random_list_choices (guild_id, list_name, position, choice)
+VALUES ('100000000000000001', 'rooms', 0, 'den'),
+       ('100000000000000001', 'rooms', 1, 'crew');
+INSERT INTO voice_logging (guild_id, channel_id, detail)
+VALUES ('100000000000000001', '100000000000000042', 'lifecycle');
+INSERT INTO voice_logging_mention_members (guild_id, member_id)
+VALUES ('100000000000000001', '100000000000000002');
+INSERT INTO voice_logging_mention_roles (guild_id, role_id)
+VALUES ('100000000000000001', '100000000000000043');
+INSERT INTO voice_guild_settings (guild_id, creation_enabled, unique_names, no_game_label,
+  force_single_game, count_members_without_activity, time_zone, text_channel_name,
+  text_viewer_role_id, command_role_id)
+VALUES ('100000000000000001', TRUE, TRUE, 'General', FALSE, TRUE, 'Europe/London',
+        'voice-chat', NULL, '100000000000000043');
+INSERT INTO voice_command_roles (guild_id, command)
+VALUES ('100000000000000001', 'kick'), ('100000000000000001', 'limit');
+INSERT INTO voice_command_role_members (guild_id, command, role_id)
+VALUES ('100000000000000001', 'kick', '100000000000000043');

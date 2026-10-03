@@ -27,6 +27,15 @@ BEGIN
       INSERT INTO moderation_idempotency
         (guild_id, idempotency_key, action, request_hash, state, claimed_at, completed_at, result_json)
         VALUES (g, k, 'warn', 'fixture', 'done', '2026-10-01T00:00:00Z', '2026-10-01T00:00:01Z', '{}');
+      INSERT INTO moderation_warnings
+        (id, guild_id, user_id, actor_id, reason, request_id, created_at)
+        VALUES ('w-' || k, g, u, u, 'fixture', 'w-' || k, now());
+      INSERT INTO moderation_scheduled_unbans
+        (request_id, guild_id, user_id, execute_at, reason, state, created_at, completed_at)
+        VALUES ('u-' || k, g, u, now(), 'fixture', 'completed', now(), now());
+      INSERT INTO moderation_member_bans
+        (request_id, guild_id, user_id, state, created_at)
+        VALUES ('b-' || k, g, u, 'accepted', now());
       INSERT INTO automod_violations
         (guild_id, user_id, violation_count, last_filter, last_message_id, updated_at)
         VALUES (g, u, 1, 'fixture', 'm-' || k, '2026-10-01T00:00:00Z');
@@ -118,6 +127,7 @@ BEGIN
       INSERT INTO voice_rooms
         (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at)
         VALUES (g, 'v-' || k, 'vc-' || g, u, u, '7', '2026-10-01T00:00:00Z');
+      INSERT INTO voice_logging_mention_members (guild_id, member_id) VALUES (g, u);
       -- Explicit exceptions are seeded too: erasure must not change safety policy.
       INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
         VALUES (g, 'fixture_' || u, to_jsonb(u), 1, u);

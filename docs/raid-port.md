@@ -132,10 +132,39 @@ independent enable switch. Anti-nuke dry-run does **not** suppress risk evidence
 or staff messages. Preserve session-mode refusal of armed anti-nuke and the
 adapter's contained-restart skips. Do not infer activation from a pure proposal.
 
-Runtime integration remains on this parent's retained work: transactional store
-and migrations, gateway calls after join recording, live raid tuning, startup
-fences, log/delivery through the shared REST executor, and staging soak. The
-executor seam is TOG-10076; no private production HTTP client is added here.
+Runtime integration is split across this parent's retained work (TOG-10430).
+**Landed — raid watch:** `crates/bot/src/raid_runtime.rs`. The pipeline hands
+each non-bot join to a registered `JoinObserver` after the funnel rows are
+written (`Pipeline::set_join_observer`), so an alert problem can never cost the
+join record. A single worker owns the volatile `RaidWatch`, re-reads
+`TWO_RAID_JOIN_THRESHOLD` / `TWO_RAID_WINDOW_SECONDS` through the settings store
+at most every 15 s (hot-wired keys; a failed read keeps the last good values),
+logs `raid_alert` first, and posts the staff message through the shared
+`ActionExecutor` only to the boot-time `DISCORD_STAFF_ALERT_CHANNEL_ID` when the
+bot can View and Send there, with empty allowed mentions. Missing channel,
+denied permission and send failure are logged and never retried; the cooldown is
+consumed at proposal. It is always on (legacy parity) and independent of
+`TWO_ANTI_NUKE`. `DISCORD_STAFF_ALERT_CHANNEL_ID` is not hot-wired and is not yet
+forwarded into the Container by the Worker, so staging stays log-only until a
+separate change classifies it. **Landed — join-risk delivery:**
+`crates/bot/src/join_risk_runtime.rs`. The pipeline takes one observer, so risk
+chains behind the raid watch in a fan-out and both stay behind the funnel's join
+row. The chain is built only under exact `TWO_ANTI_NUKE=1` on the staging guild;
+otherwise it is the raid watch alone. Per join the worker rebuilds the
+`JoinRiskPolicy` from live hot tuning (`TWO_JOIN_RISK_THRESHOLD`,
+`TWO_JOIN_RISK_WINDOW_SECONDS`, `TWO_BULK_JOIN_WINDOW_UNTIL`), derives account
+age from the member snowflake, claims through `JoinRiskStore::record`, logs the
+evidence first, and posts `staff_message(persisted)` through the shared
+`RaidDelivery` post with the same View/Send and empty-mentions checks.
+Duplicates, undeliverable channels and failed sends are never retried.
+Dry-run and session mode do not suppress evidence or messages; arming stays
+refused without explicit dry-run `0` outside session mode, and R2 has no armed
+path. **Remaining:** staging soak. The executor seam is TOG-10076; no
+private production HTTP client is added here. The transactional join-risk
+claim store (`join_risk_store`, migration `0360_join_risk_flags.sql`, legacy
+0015 shape) serializes per-guild event-ID claims, counts prior rows by
+processing-time `created_at`, scores with the current join, and persists the
+evidence in one transaction — but is not wired to the gateway or executor.
 
 `raid.rs` unit tests cover strict clocks/age/window/cooldown boundaries, reverse
 arrival, dedupe-before-prune, fractional/live tuning, guild isolation, payload

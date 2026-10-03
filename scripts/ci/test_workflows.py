@@ -9,7 +9,9 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 STATIC_FALSE = "${{ false }}"
 JOB_INVENTORY = {
-    "check.yml": {"check", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
+    # Branch keeps the moderation-db job; main #84 added the supply-chain job.
+    # The pin must be the union of both sides.
+    "check.yml": {"check", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
                   "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain"},
     "deploy-production.yml": {"guard", "production"},
     "deploy-staging.yml": {"deploy"},
@@ -96,12 +98,14 @@ def staging_dispatch_errors(workflow):
 def staging_migrate_errors(workflow):
     """Manual staging-only SQLx migration runner (TOG-11572).
 
-    Dispatch-only with exactly the six reviewed inputs (plan/apply defaulting
-    to plan, everything else required), reading the pre-existing
-    staging-migrate Environment binding, main-branch dispatches only, and the
-    routed runner for job 'migrate'. No push/pull_request/schedule trigger, no
-    production path, no wrangler/probe markers: anything else is an activation
-    route and must fail closed.
+    Dispatch-only with exactly the seven reviewed inputs (plan/apply
+    defaulting to plan, the six identity/evidence inputs required, and the
+    plan-bound expected_pending list optional at dispatch but required by the
+    runner for apply), reading the pre-existing staging-migrate Environment
+    binding, main-branch dispatches only, and the routed runner for job
+    'migrate'. No push/pull_request/schedule trigger, no production path, no
+    wrangler/probe markers: anything else is an activation route and must fail
+    closed.
     """
     name = "staging-migrate.yml"
     errors = []
@@ -110,7 +114,7 @@ def staging_migrate_errors(workflow):
         errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
     inputs = ((on.get("workflow_dispatch") or {}).get("inputs") or {})
     expected = {"mode", "source_sha", "staging_host", "staging_database",
-                "recovery_evidence_ref", "acl_plan_ref"}
+                "recovery_evidence_ref", "acl_plan_ref", "expected_pending"}
     if set(inputs) != expected:
         errors.append(f"{name}: workflow_dispatch inputs must be exactly {sorted(expected)}")
     else:
@@ -119,10 +123,16 @@ def staging_migrate_errors(workflow):
                 or set(mode.get("options") or []) != {"plan", "apply"}
                 or mode.get("default") != "plan"):
             errors.append(f"{name}: mode must be plan/apply defaulting to plan")
-        for key in expected - {"mode"}:
+        for key in expected - {"mode", "expected_pending"}:
             field = inputs.get(key) or {}
             if str(field.get("required")).lower() != "true":
                 errors.append(f"{name}: input {key} must be required")
+        pending = inputs.get("expected_pending") or {}
+        if (str(pending.get("required")).lower() != "false"
+                or pending.get("default") != ""
+                or "ascending" not in str(pending.get("description")).lower()):
+            errors.append(f"{name}: expected_pending must stay optional, default empty, "
+                          "and documented as the ascending reviewed plan list")
     job = (workflow.get("jobs") or {}).get("migrate", {})
     if job.get("environment") != "staging-migrate":
         errors.append(f"{name}:migrate: must read the staging-migrate Environment binding")

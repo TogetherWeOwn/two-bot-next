@@ -17,7 +17,10 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use super::commands::{CommandDefinition, CommandOption, CommandOptionType, PERM_MANAGE_CHANNELS};
+use super::commands::{
+    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, PERM_MANAGE_CHANNELS,
+    PERM_MANAGE_GUILD,
+};
 use super::voice_text_channel::{
     TextChannelPlan, TextChannelSettings, MAX_TEXT_CHANNEL_NAME_CHARS,
 };
@@ -702,6 +705,30 @@ pub enum RoomAction {
         name: String,
         seed: u64,
     },
+    /// Create the V9 companion text channel for an already-created room.
+    /// The full [`TextChannelPlan`] (name, category, creation-time overwrites
+    /// plus settings snapshot) rides the action so a later `/textchannels`
+    /// change cannot alter this channel; overwrites are never patched after
+    /// the POST. `channel_id()` is `None` (like `CreateRoom`): the companion
+    /// is keyed by its room, and room-scoped suspend/drop must not cancel a
+    /// creation whose outcome is unknown — the dispatch rechecks the store.
+    CreateCompanion {
+        room_channel_id: Snowflake,
+        plan: TextChannelPlan,
+    },
+    /// Grant one occupant View on the companion (V9 join). Never a deny.
+    GrantCompanionView {
+        room_channel_id: Snowflake,
+        text_channel_id: Snowflake,
+        member_id: Snowflake,
+    },
+    /// Delete one occupant's overwrite on the companion (V9 leave). The
+    /// overwrite is deleted, never replaced with a deny.
+    RevokeCompanionView {
+        room_channel_id: Snowflake,
+        text_channel_id: Snowflake,
+        member_id: Snowflake,
+    },
     MoveMember {
         member_id: Snowflake,
         channel_id: Snowflake,
@@ -709,9 +736,24 @@ pub enum RoomAction {
     DeleteRoom {
         channel_id: Snowflake,
     },
+    /// V2 caretaker succession: persist an ownership handoff the worker
+    /// already applied to its tracked row. No Discord write; rename, privacy
+    /// and Join-channel follow-ups belong to later slices.
+    UpdateOwnership {
+        channel_id: Snowflake,
+        owner_id: Snowflake,
+        original_creator_id: Snowflake,
+    },
     RenameRoom {
         channel_id: Snowflake,
         name: String,
+    },
+    /// V4 enforcement for a passed vote: deny the member Connect on this room
+    /// channel only, then disconnect them. Both writes are idempotent, so a
+    /// retried action is safe.
+    KickMember {
+        channel_id: Snowflake,
+        member_id: Snowflake,
     },
 }
 
@@ -731,13 +773,26 @@ impl RoomAction {
     }
 
     /// The room channel this action touches, if any (suspend/drop scope).
+    /// Companion view edits scope to their room: once the room is gone its
+    /// companion is deleted, so pending grants/revokes for it are dropped
+    /// with it. `CreateCompanion` scopes to no channel (like `CreateRoom`).
     #[must_use]
     pub fn channel_id(&self) -> Option<Snowflake> {
         match self {
-            Self::CreateRoom { .. } => None,
+            Self::CreateRoom { .. } | Self::CreateCompanion { .. } => None,
             Self::MoveMember { channel_id, .. }
             | Self::DeleteRoom { channel_id }
-            | Self::RenameRoom { channel_id, .. } => Some(*channel_id),
+            | Self::UpdateOwnership { channel_id, .. }
+            | Self::RenameRoom { channel_id, .. }
+            | Self::GrantCompanionView {
+                room_channel_id: channel_id,
+                ..
+            }
+            | Self::RevokeCompanionView {
+                room_channel_id: channel_id,
+                ..
+            }
+            | Self::KickMember { channel_id, .. } => Some(*channel_id),
         }
     }
 }
@@ -1044,7 +1099,11 @@ impl ActionQueue {
 
 /// V1 slash-command shapes. `/create` makes a new creator channel (admin
 /// only); `/setup` is the viewable-by-anyone status panel whose actions
-/// need admin (enforced by the handler, V1 runtime slice).
+/// need admin (enforced by the handler, V1 runtime slice). V2 ownership:
+/// `/reclaim` takes back a room as the original creator (or claims one whose
+/// owner is gone); `/transfer` hands a room to a member in it and makes them
+/// the remembered creator. Both act on the caller's current room; typed
+/// refusals from the ownership core become ephemeral replies, never state.
 #[must_use]
 pub fn voice_commands() -> Vec<CommandDefinition> {
     vec![
@@ -1066,6 +1125,35 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         ),
         CommandDefinition::new("ping", "Show the bot's response latency"),
         CommandDefinition::new("invite", "Show this server's invite link"),
+        CommandDefinition::new(
+            "textchannels",
+            "Toggle companion text channels for one creator channel",
+        )
+        .permissions(PERM_MANAGE_CHANNELS)
+        .options(vec![
+            CommandOption::new(
+                "channel",
+                "Creator voice channel to configure",
+                CommandOptionType::Channel,
+            )
+            .required(),
+            CommandOption::new(
+                "enabled",
+                "Turn companion text channels on or off (default on)",
+                CommandOptionType::Boolean,
+            ),
+            CommandOption::new(
+                "name",
+                "Companion channel name (default voice-chat)",
+                CommandOptionType::String,
+            )
+            .max_length(MAX_TEXT_CHANNEL_NAME_CHARS as u32),
+            CommandOption::new(
+                "viewer-role",
+                "Extra role that may view companions (@everyone for all)",
+                CommandOptionType::Role,
+            ),
+        ]),
         CommandDefinition::new(
             "access",
             "Set who can create voice rooms and use room commands",
@@ -1128,6 +1216,93 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
             .required()
             .max_length(32)]),
         ]),
+        CommandDefinition::new(
+            "reclaim",
+            "Take back ownership of your temporary voice room",
+        ),
+        CommandDefinition::new(
+            "transfer",
+            "Hand your temporary voice room to a member in it",
+        )
+        .options(vec![CommandOption::new(
+            "member",
+            "Member in the room to make the new owner",
+            CommandOptionType::User,
+        )
+        .required()]),
+        CommandDefinition::new(
+            "logging",
+            "Set where room health notices go and how much they say",
+        )
+        .permissions(PERM_MANAGE_CHANNELS)
+        .options(vec![
+            CommandOption::new(
+                "show",
+                "Show the current logging settings",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "level",
+                "Set how much the bot logs, or turn logging off",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "level",
+                "How much to log",
+                CommandOptionType::String,
+            )
+            .required()
+            .choices(vec![
+                CommandChoice {
+                    name: "Off".to_owned(),
+                    value: "off".to_owned(),
+                },
+                CommandChoice {
+                    name: "Brief".to_owned(),
+                    value: "brief".to_owned(),
+                },
+                CommandChoice {
+                    name: "Full".to_owned(),
+                    value: "full".to_owned(),
+                },
+            ])]),
+            CommandOption::new(
+                "channel",
+                "Set or clear the channel notices are sent to",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "channel",
+                "Notice channel; leave empty to use the automatic fallback",
+                CommandOptionType::Channel,
+            )]),
+            CommandOption::new(
+                "mention",
+                "Set or clear the role mentioned on errors",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "role",
+                "Role to mention; leave empty to clear it",
+                CommandOptionType::Role,
+            )]),
+        ]),
+        CommandDefinition::new(
+            "export",
+            "Download this server's voice configuration as a versioned JSON file",
+        )
+        .permissions(PERM_MANAGE_GUILD),
+        CommandDefinition::new(
+            "import",
+            "Preview a voice configuration file before applying it",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![CommandOption::new(
+            "file",
+            "Voice configuration JSON file from /export",
+            CommandOptionType::Attachment,
+        )
+        .required()]),
     ]
 }
 
@@ -1385,6 +1560,63 @@ mod tests {
             }),
             Some(RoomAction::DeleteRoom { channel_id: 502 })
         );
+        assert_eq!(q.pop_due(GUILD, 0), None);
+    }
+
+    #[test]
+    fn ownership_handoff_is_urgent_and_channel_scoped() {
+        let q = ActionQueue::new();
+        q.enqueue(
+            GUILD,
+            RoomAction::RenameRoom {
+                channel_id: 500,
+                name: "slow".to_owned(),
+            },
+        );
+        q.enqueue(
+            GUILD,
+            RoomAction::UpdateOwnership {
+                channel_id: 501,
+                owner_id: MEMBER,
+                original_creator_id: MEMBER,
+            },
+        );
+        // The urgent handoff jumps the earlier rename.
+        assert_eq!(
+            q.pop_due(GUILD, 0).map(|a| {
+                q.mark_succeeded(&a);
+                a.action
+            }),
+            Some(RoomAction::UpdateOwnership {
+                channel_id: 501,
+                owner_id: MEMBER,
+                original_creator_id: MEMBER,
+            })
+        );
+        // Suspension and forget-drops cover the handoff like any other
+        // channel-scoped write.
+        q.enqueue(
+            GUILD,
+            RoomAction::UpdateOwnership {
+                channel_id: 502,
+                owner_id: MEMBER,
+                original_creator_id: MEMBER,
+            },
+        );
+        q.suspend(GUILD, 502);
+        assert_eq!(
+            q.pop_due(GUILD, 0).map(|a| {
+                q.mark_succeeded(&a);
+                a.action
+            }),
+            Some(RoomAction::RenameRoom {
+                channel_id: 500,
+                name: "slow".to_owned(),
+            })
+        );
+        assert_eq!(q.pop_due(GUILD, 0), None);
+        q.resume(GUILD, 502);
+        assert_eq!(q.drop_for_channel(GUILD, 502), 1);
         assert_eq!(q.pop_due(GUILD, 0), None);
     }
 
@@ -1761,7 +1993,19 @@ mod tests {
         let defs = voice_commands();
         assert_eq!(
             defs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-            ["create", "setup", "ping", "invite", "access"]
+            [
+                "create",
+                "setup",
+                "ping",
+                "invite",
+                "textchannels",
+                "access",
+                "reclaim",
+                "transfer",
+                "logging",
+                "export",
+                "import"
+            ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
         assert_eq!(
@@ -1779,9 +2023,40 @@ mod tests {
             assert_eq!(def.default_member_permissions, None);
             assert!(def.options.is_empty());
         }
+        // `/textchannels` is admin-gated like `/create`: a required creator
+        // channel plus optional toggle, name and viewer role.
+        assert_eq!(
+            defs[4].default_member_permissions,
+            Some(PERM_MANAGE_CHANNELS.to_string())
+        );
+        let options: Vec<(&str, u8, bool)> = defs[4]
+            .options
+            .iter()
+            .map(|option| {
+                (
+                    option.name.as_str(),
+                    option.kind,
+                    option.required == Some(true),
+                )
+            })
+            .collect();
+        assert_eq!(
+            options,
+            vec![
+                ("channel", CommandOptionType::Channel.as_u8(), true),
+                ("enabled", CommandOptionType::Boolean.as_u8(), false),
+                ("name", CommandOptionType::String.as_u8(), false),
+                ("viewer-role", CommandOptionType::Role.as_u8(), false),
+            ]
+        );
+        assert_eq!(
+            defs[4].options[2].max_length,
+            Some(MAX_TEXT_CHANNEL_NAME_CHARS as u32)
+        );
         // `/access` is admin-gated and is all sub-commands, each with its
         // required options listed before the optional ones.
-        let access = &defs[4];
+        let access = &defs[5];
+        let logging = &defs[8];
         assert_eq!(
             access.default_member_permissions,
             Some(PERM_MANAGE_CHANNELS.to_string())
@@ -1794,7 +2069,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["show", "creation", "role", "restrict", "unrestrict"]
         );
-        for sub in &access.options {
+        assert_eq!(
+            logging.default_member_permissions,
+            Some(PERM_MANAGE_CHANNELS.to_string())
+        );
+        assert_eq!(
+            logging
+                .options
+                .iter()
+                .map(|o| o.name.as_str())
+                .collect::<Vec<_>>(),
+            ["show", "level", "channel", "mention"]
+        );
+        for sub in access.options.iter().chain(&logging.options) {
             assert_eq!(sub.kind, CommandOptionType::SubCommand.as_u8());
             let required_first = sub
                 .options
@@ -1803,6 +2090,32 @@ mod tests {
                 .all(|o| o.required != Some(true));
             assert!(required_first, "{} lists a required option late", sub.name);
         }
+        // `/export` takes no options; `/import` takes one required file
+        // attachment. Both are Manage Server (Manage Guild) gated.
+        let export = &defs[9];
+        let import = &defs[10];
+        for def in [export, import] {
+            assert_eq!(
+                def.default_member_permissions,
+                Some(PERM_MANAGE_GUILD.to_string())
+            );
+        }
+        assert!(export.options.is_empty());
+        assert_eq!(import.options.len(), 1);
+        assert_eq!(import.options[0].name, "file");
+        assert_eq!(
+            import.options[0].kind,
+            CommandOptionType::Attachment.as_u8()
+        );
+        assert!(import.options[0].required == Some(true));
+        // `/reclaim` takes no options; `/transfer` names its recipient.
+        assert_eq!(defs[6].default_member_permissions, None);
+        assert!(defs[6].options.is_empty());
+        assert_eq!(defs[7].default_member_permissions, None);
+        assert_eq!(defs[7].options.len(), 1);
+        assert_eq!(defs[7].options[0].name, "member");
+        assert_eq!(defs[7].options[0].kind, CommandOptionType::User as u8);
+        assert!(defs[7].options[0].required == Some(true));
         // Merges cleanly alongside the other slices, first-wins.
         let merged = merge_commands(
             &[feature_commands(), moderation_commands(), voice_commands()],
@@ -1813,6 +2126,11 @@ mod tests {
         assert!(merged.iter().any(|d| d.name == "setup"));
         assert!(merged.iter().any(|d| d.name == "ping"));
         assert!(merged.iter().any(|d| d.name == "invite"));
+        assert!(merged.iter().any(|d| d.name == "textchannels"));
+        assert!(merged.iter().any(|d| d.name == "access"));
+        assert!(merged.iter().any(|d| d.name == "reclaim"));
+        assert!(merged.iter().any(|d| d.name == "transfer"));
+        assert!(merged.iter().any(|d| d.name == "logging"));
 
         assert!(!VoiceGates::from_map(&Default::default()).enabled);
         let vars: HashMap<String, String> = [("TWO_VOICE".to_owned(), "1".to_owned())]

@@ -4,6 +4,7 @@ use sqlx::{postgres::PgConnectOptions, postgres::PgPoolOptions, PgPool, Postgres
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use two_bot_core::voice_access::AccessControls;
+use two_bot_core::voice_logging::{DetailLevel, LoggingSettings};
 use two_bot_core::voice_rooms::{
     CreatorChannel, PermissionSource, RoomPosition, TextCompanion, VoiceRoom,
 };
@@ -126,6 +127,36 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     assert_eq!(store.rooms_for_owner(100, 300).await?, vec![first.clone()]);
     assert!(store.rooms_in_guild(101).await?.is_empty());
 
+    // V2 caretaker handoff: owner fields move on the tracked row, nothing
+    // else changes, and a missing row reports false instead of erroring.
+    // The handoff also stamps `owner_touched_at` for the rollback delta.
+    let touched_before: String =
+        sqlx::query_scalar("SELECT owner_touched_at::text FROM voice_rooms WHERE guild_id = '100' AND channel_id = '500'")
+            .fetch_one(pool)
+            .await?;
+    assert!(store.update_ownership(100, 500, 301, 300).await?);
+    let handed = VoiceRoom {
+        owner_id: 301,
+        ..first.clone()
+    };
+    assert_eq!(store.room_for(100, 500).await?, Some(handed.clone()));
+    // Channel 501 (`second`) already belongs to owner 301, so both rows
+    // now list under 301 in channel order.
+    assert_eq!(
+        store.rooms_for_owner(100, 301).await?,
+        vec![handed.clone(), second.clone()]
+    );
+    assert!(store.rooms_for_owner(100, 300).await?.is_empty());
+    let touched_after: String =
+        sqlx::query_scalar("SELECT owner_touched_at::text FROM voice_rooms WHERE guild_id = '100' AND channel_id = '500'")
+            .fetch_one(pool)
+            .await?;
+    assert!(
+        touched_after >= touched_before,
+        "handoff must not move the rollback stamp backwards"
+    );
+    assert!(!store.update_ownership(100, 599, 301, 300).await?);
+
     // V9b companion records: creation snapshot round-trips, insert-once, and
     // get/delete per room. The snapshot decodes back into the pure settings.
     let companion = TextCompanion {
@@ -149,6 +180,18 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     );
     assert_eq!(store.companion_for(101, 500).await?, None);
     assert_eq!(store.companion_for(100, 501).await?, None);
+    // V9c worker load: guild-scoped companion listing for startup
+    // reconciliation, ordered by room.
+    let mut companion_two = companion.clone();
+    companion_two.room_channel_id = 501;
+    companion_two.text_channel_id = 601;
+    assert!(store.add_companion(&companion_two).await?);
+    assert_eq!(
+        store.companions_in_guild(100).await?,
+        vec![companion.clone(), companion_two.clone()]
+    );
+    assert!(store.companions_in_guild(101).await?.is_empty());
+    assert_eq!(store.remove_companion(100, 501).await?, Some(companion_two));
     assert_eq!(
         store.remove_companion(101, 500).await?,
         None,
@@ -162,12 +205,14 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     assert!(store.remove_creator(100, 200).await?);
     assert!(!store.remove_creator(100, 200).await?);
     let restarted = PgRoomStore::new(pool.clone());
+    // Channel 500 still carries the handoff above, so the reload sees
+    // `handed` (not the pre-handoff `first`) alongside `second`.
     assert_eq!(
         restarted.rooms_in_guild(100).await?,
-        vec![first.clone(), second.clone()]
+        vec![handed.clone(), second.clone()]
     );
     assert_eq!(restarted.remove_room(101, 500).await?, None);
-    assert_eq!(restarted.remove_room(100, 500).await?, Some(first));
+    assert_eq!(restarted.remove_room(100, 500).await?, Some(handed));
     assert_eq!(restarted.remove_room(100, 500).await?, None);
     assert_eq!(restarted.rooms_in_guild(100).await?, vec![second]);
 
@@ -186,7 +231,8 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
             .await
             .is_err()
     );
-    verify_access_controls(&store, pool).await
+    verify_access_controls(&store, pool).await?;
+    verify_logging_settings(&store, pool).await
 }
 
 async fn verify_access_controls(store: &PgRoomStore, pool: &PgPool) -> TestResult {
@@ -245,5 +291,67 @@ async fn verify_access_controls(store: &PgRoomStore, pool: &PgPool) -> TestResul
     .execute(pool)
     .await
     .is_err());
+    Ok(())
+}
+
+async fn verify_logging_settings(store: &PgRoomStore, pool: &PgPool) -> TestResult {
+    // A never-configured guild reads as the defaults.
+    assert_eq!(
+        store.logging_settings(100).await?,
+        LoggingSettings::default()
+    );
+
+    let settings = LoggingSettings {
+        level: DetailLevel::Full,
+        channel_id: Some(u64::MAX),
+        mention_role_id: Some(7),
+    };
+    store.save_logging_settings(100, &settings).await?;
+    assert_eq!(store.logging_settings(100).await?, settings);
+    assert_eq!(
+        PgRoomStore::new(pool.clone()).logging_settings(100).await?,
+        settings
+    );
+    assert_eq!(
+        store.logging_settings(101).await?,
+        LoggingSettings::default(),
+        "settings are per guild"
+    );
+
+    // Saving replaces the whole row: clearing the channel and mention sticks.
+    let off = LoggingSettings {
+        level: DetailLevel::Off,
+        channel_id: None,
+        mention_role_id: None,
+    };
+    store.save_logging_settings(100, &off).await?;
+    assert_eq!(store.logging_settings(100).await?, off);
+
+    // Refused before the database: zero ids.
+    for bad in [
+        LoggingSettings {
+            channel_id: Some(0),
+            ..off
+        },
+        LoggingSettings {
+            mention_role_id: Some(0),
+            ..off
+        },
+    ] {
+        assert!(store.save_logging_settings(100, &bad).await.is_err());
+    }
+    assert_eq!(store.logging_settings(100).await?, off);
+
+    // The table's own checks hold when SQL bypasses the adapter.
+    for statement in [
+        "UPDATE voice_logging_settings SET detail_level = 'loud' WHERE guild_id = '100'",
+        "UPDATE voice_logging_settings SET log_channel_id = '0' WHERE guild_id = '100'",
+        "UPDATE voice_logging_settings SET mention_role_id = '0' WHERE guild_id = '100'",
+    ] {
+        assert!(
+            sqlx::query(statement).execute(pool).await.is_err(),
+            "{statement}"
+        );
+    }
     Ok(())
 }

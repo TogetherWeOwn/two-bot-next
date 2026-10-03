@@ -109,18 +109,33 @@ pub const DUMP_TABLES: &[&str] = &[
     "internal_action_log",
     "internal_discord_events",
     "moderation_channel_executions",
+    "moderation_member_bans",
     "invite_campaigns",
     "voice_creators",
     "voice_rooms",
     "voice_text_companions",
     "voice_access_controls",
+    "voice_logging_settings",
+    // V11b configuration tables (0229). Guild-keyed, no foreign keys, so order
+    // among them is free.
+    "voice_channel_templates",
+    "voice_game_aliases",
+    "voice_random_lists",
+    "voice_random_list_choices",
+    "voice_logging",
+    "voice_logging_mention_members",
+    "voice_logging_mention_roles",
+    "voice_guild_settings",
+    "voice_command_roles",
+    "voice_command_role_members",
 ];
 
 /// Frozen v3 tables no longer created by cutover migrations. Keep their data
 /// when they exist, but do not require nonexistent legacy subsystems on Rust.
 pub const OPTIONAL_LEGACY_TABLES: &[&str] = &[
-    "moderation_warnings",
-    "moderation_scheduled_unbans",
+    // Main #255 (0370) migrated containment_events/containment_incidents;
+    // this branch's 0110 migrated moderation_warnings/moderation_scheduled_unbans.
+    // Both pairs leave optional-legacy in the merged tree.
     "automation_commands",
 ];
 

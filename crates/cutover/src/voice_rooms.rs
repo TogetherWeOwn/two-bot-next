@@ -4,17 +4,20 @@
 //! errors to the caller. Callers must persist a created channel before moving
 //! its owner and compensate a failed write by deleting that new channel.
 //!
-//! Parameter binding: https://docs.rs/sqlx/0.9.0/sqlx/fn.query.html
+//! Parameter binding: <https://docs.rs/sqlx/0.9.0/sqlx/fn.query.html>
 
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
 use two_bot_core::voice_access::{validate_access_controls, AccessControls};
+use two_bot_core::voice_logging::{parse_detail_level, LoggingSettings};
 use two_bot_core::voice_rooms::{
     CreatorChannel, PermissionSource, RoomPosition, TextCompanion, VoiceRoom,
 };
 use two_bot_core::{format_iso_millis, parse_iso_millis, Snowflake};
+
+use super::voice_config_store::PgVoiceConfigStore;
 
 #[derive(Debug, Clone)]
 pub struct PgRoomStore {
@@ -25,6 +28,14 @@ impl PgRoomStore {
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// V11 configuration persistence (`/export` reads, `/import` writes)
+    /// over this store's pool. Snapshot and apply each run in one
+    /// transaction; apply never touches live rooms or companions.
+    #[must_use]
+    pub fn voice_configs(&self) -> PgVoiceConfigStore {
+        PgVoiceConfigStore::new(self.pool.clone())
     }
 
     pub async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), sqlx::Error> {
@@ -142,6 +153,31 @@ impl PgRoomStore {
             != 0)
     }
 
+    /// Persist a V2 ownership handoff on an already-tracked room. Only the
+    /// owner fields move: seed, creator channel and timestamp stay insert-once
+    /// like [`PgRoomStore::add_room`]. Returns false when no row exists.
+    pub async fn update_ownership(
+        &self,
+        guild_id: Snowflake,
+        channel_id: Snowflake,
+        owner_id: Snowflake,
+        original_creator_id: Snowflake,
+    ) -> Result<bool, sqlx::Error> {
+        Ok(sqlx::query(
+            "UPDATE voice_rooms
+             SET owner_id = $3, original_creator_id = $4, owner_touched_at = now()
+             WHERE guild_id = $1 AND channel_id = $2",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(owner_id.to_string())
+        .bind(original_creator_id.to_string())
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            != 0)
+    }
+
     pub async fn room_for(
         &self,
         guild_id: Snowflake,
@@ -226,6 +262,24 @@ impl PgRoomStore {
         .await?
         .rows_affected()
             != 0)
+    }
+
+    /// Every companion tracked in a guild, for worker load and startup
+    /// reconciliation (V9c): each row carries its creation-time settings
+    /// snapshot, so later `/textchannels` changes never alter it.
+    pub async fn companions_in_guild(
+        &self,
+        guild_id: Snowflake,
+    ) -> Result<Vec<TextCompanion>, sqlx::Error> {
+        sqlx::query(
+            "SELECT * FROM voice_text_companions WHERE guild_id = $1 ORDER BY room_channel_id",
+        )
+        .bind(guild_id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(decode_companion)
+        .collect()
     }
 
     pub async fn companion_for(
@@ -318,6 +372,52 @@ impl PgRoomStore {
         .await?;
         Ok(())
     }
+
+    /// The guild's logging settings, or the defaults when never configured.
+    pub async fn logging_settings(
+        &self,
+        guild_id: Snowflake,
+    ) -> Result<LoggingSettings, sqlx::Error> {
+        sqlx::query(
+            "SELECT detail_level, log_channel_id, mention_role_id
+             FROM voice_logging_settings WHERE guild_id = $1",
+        )
+        .bind(guild_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(decode_logging_settings)
+        .transpose()
+        .map(Option::unwrap_or_default)
+    }
+
+    /// Replace the guild's logging settings atomically (one upsert). Refuses
+    /// zero channel and role IDs before touching the database.
+    pub async fn save_logging_settings(
+        &self,
+        guild_id: Snowflake,
+        settings: &LoggingSettings,
+    ) -> Result<(), sqlx::Error> {
+        if settings.channel_id == Some(0) || settings.mention_role_id == Some(0) {
+            return Err(invalid_argument("logging ids must be nonzero"));
+        }
+        sqlx::query(
+            "INSERT INTO voice_logging_settings
+             (guild_id, detail_level, log_channel_id, mention_role_id)
+             VALUES ($1,$2,$3,$4)
+             ON CONFLICT (guild_id) DO UPDATE SET
+               detail_level = EXCLUDED.detail_level,
+               log_channel_id = EXCLUDED.log_channel_id,
+               mention_role_id = EXCLUDED.mention_role_id",
+        )
+        .bind(guild_id.to_string())
+        .bind(settings.level.as_str())
+        .bind(settings.channel_id.map(|id| id.to_string()))
+        .bind(settings.mention_role_id.map(|id| id.to_string()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 fn decode_access_controls(row: &PgRow) -> Result<AccessControls, sqlx::Error> {
@@ -350,6 +450,22 @@ fn decode_access_controls(row: &PgRow) -> Result<AccessControls, sqlx::Error> {
     };
     validate_access_controls(&controls).map_err(invalid_argument)?;
     Ok(controls)
+}
+
+fn decode_logging_settings(row: &PgRow) -> Result<LoggingSettings, sqlx::Error> {
+    let parse_id = |value: Option<String>| {
+        value
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .map_err(|error| sqlx::Error::Decode(Box::new(error)))
+    };
+    let level = parse_detail_level(row.try_get::<&str, _>("detail_level")?)
+        .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+    Ok(LoggingSettings {
+        level,
+        channel_id: parse_id(row.try_get("log_channel_id")?)?,
+        mention_role_id: parse_id(row.try_get("mention_role_id")?)?,
+    })
 }
 
 fn invalid_argument(error: impl std::fmt::Display) -> sqlx::Error {

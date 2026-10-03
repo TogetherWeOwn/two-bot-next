@@ -1,0 +1,120 @@
+name: Bug report
+description: Something is broken or behaving unexpectedly
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Fill out the sections below so we can reproduce and triage quickly.
+
+        > **Security issues:** Do not file a vulnerability here. Follow [SECURITY.md](https://github.com/TogetherWeOwn/two-bot-next/blob/main/SECURITY.md).
+        >
+        > **Privacy notice:** Several fields below accept logs, config, or transcript output that may contain **personally identifiable information (PII)**: Discord user, guild, channel, or role IDs, usernames in file paths, bot or API tokens, webhook URLs, connection strings, or message content. Before you paste:
+        > 1. Review for sensitive data.
+        > 2. Redact usernames, paths, IDs, tokens, and URLs (for example, replace `/Users/yourname/` with `/Users/REDACTED/`).
+        > 3. For heavy output, run it through a local anonymizer such as **[presidio-anonymizer](https://microsoft.github.io/presidio/)** or **[scrub](https://github.com/dssg/scrub)**.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-submission checklist
+      description: Please confirm each of these before filing.
+      options:
+        - label: I searched existing open and closed issues and this is not a duplicate.
+          required: true
+        - label: I can reproduce this on the latest release or on `main`.
+          required: true
+        - label: I redacted every token, ID, URL, and username from what I paste below.
+          required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug. Name the command, event, endpoint, or runbook step involved.
+      placeholder: When I do X, Y happens instead of Z.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps a maintainer can follow to reproduce the bug. Start from a clean checkout where possible.
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Release tag or commit
+      description: The release tag (for example `v0.2.0`) or the commit SHA you are running.
+      placeholder: e.g. v0.2.0 or 80772eea
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area affected
+      description: Which part of the repo does this touch? Pick the closest match.
+      options:
+        - Gateway and event handling (crates/discord, crates/bot)
+        - Commands and moderation (crates/core)
+        - Storage and migrations (crates/store, sql/)
+        - Cutover and backup tooling (crates/cutover)
+        - Cloudflare Worker wrapper (wrangler/)
+        - Container image and deploy
+        - CI and release automation (.github/, scripts/)
+        - Documentation
+        - Unsure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - Local build
+        - CI
+        - Staging container
+        - Production container
+        - Other
+    validations:
+      required: false
+
+  - type: input
+    id: toolchain
+    attributes:
+      label: Rust toolchain and operating system
+      description: Output of `rustc --version`, and your operating system, if you built locally.
+      placeholder: e.g. rustc 1.90.0, Ubuntu 24.04
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or output
+      description: |
+        Paste error messages, panics, or stack traces. This renders as a code block.
+
+        **PII warning:** Logs often contain IDs, paths, and URLs. Redact before you paste.
+      render: shell
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that helps, such as when it started, what changed, or links to related issues.

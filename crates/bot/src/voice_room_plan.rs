@@ -173,10 +173,9 @@ fn placement(input: &RoomPlanInput<'_>) -> Option<u64> {
 /// snapshot data that cannot be honoured.
 pub(crate) fn plan_room(input: &RoomPlanInput<'_>) -> Result<RoomChannelAttributes, RoomHttpError> {
     let settings = input.settings;
-    // Companion text channels are V9; never create a room that ignores them.
-    if settings.text_channels {
-        return Err(RoomHttpError::InvalidRequest);
-    }
+    // The companion text channel (`settings.text_channels`) is not part of the
+    // voice-channel attributes: the worker creates it through the same
+    // per-guild queue (V9c), so the toggle never blocks room planning.
     let base_limit = match settings.default_limit {
         Some(limit) => u16::try_from(limit).map_err(|_| RoomHttpError::InvalidRequest)?,
         None => u16::try_from(input.creator.user_limit.unwrap_or(0))
