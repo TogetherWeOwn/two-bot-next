@@ -98,6 +98,19 @@ impl ModerationAction {
         }
     }
 
+    /// Discord permission display name for denial copy (TOG-13624): what the
+    /// member sees in Server Settings → Roles, not the internal action id.
+    #[must_use]
+    pub fn discord_permission_name(self) -> &'static str {
+        match self {
+            Self::Ban | Self::TempBan => "Ban Members",
+            Self::Kick => "Kick Members",
+            Self::Timeout | Self::Warn => "Moderate Members",
+            Self::Purge => "Manage Messages",
+            Self::Slowmode | Self::Lockdown | Self::Unlock => "Manage Channels",
+        }
+    }
+
     /// Discord permission gate (legacy `permissionFor` + builder flags).
     #[must_use]
     pub fn required_permission(self) -> u64 {

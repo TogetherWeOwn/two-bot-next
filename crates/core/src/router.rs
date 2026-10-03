@@ -78,22 +78,26 @@ pub const LFG_PREFIX: &str = "two:lfg:";
 pub const SELF_ROLE_PREFIX: &str = "two:self-role:";
 
 // --- refusal texts ------------------------------------------------------------
+// Actionable denials (TOG-13624): every refusal names the Discord permission,
+// who to ask, or the admin-only enable path. Legacy one-liners live in git
+// history; these are what Discord shows.
 
-/// Legacy-exact (`src/automations/discord.ts` `AUTOMATIONS_DISABLED_REPLY`).
-pub const AUTOMATIONS_DISABLED_REPLY: &str = "Automations are disabled on this server.";
-/// Legacy-exact (automation + feed handlers).
-pub const MANAGE_SERVER_REQUIRED: &str = "Manage Server permission is required.";
-/// Legacy-exact (LFG handlers).
-pub const MANAGE_EVENTS_REQUIRED: &str = "Manage Events permission is required.";
+/// Automations gate: env-gated, not a Discord role — say who enables it.
+pub const AUTOMATIONS_DISABLED_REPLY: &str = "Automations are disabled on this server. Ask a server admin to enable them in the bot configuration — this is a host setting, not a Discord role.";
+/// Automation + feed handlers: Discord permission name plus who grants it.
+pub const MANAGE_SERVER_REQUIRED: &str =
+    "You need the Manage Server permission to use this command. Ask a server admin to grant it.";
+/// LFG / attendance handlers: Discord permission name plus who grants it.
+pub const MANAGE_EVENTS_REQUIRED: &str =
+    "You need the Manage Events permission to use this command. Ask a server admin to grant it.";
 /// Legacy-exact (`src/moderation/commands.ts` guild fence).
 pub const GUILD_RESTRICTED_REPLY: &str = "This command is restricted to the configured guild.";
-/// Port shape for the unified router (legacy never registered the handler, so
-/// it stayed silent; the router refuses explicitly instead).
-pub const ANNOUNCEMENTS_DISABLED_REPLY: &str = "Announcements are disabled on this server.";
-/// Port shape, same rationale as above.
-pub const MODERATION_DISABLED_REPLY: &str = "Moderation is not enabled on this server.";
-/// Port shape, same rationale as above.
-pub const SCORECARD_DISABLED_REPLY: &str = "Attendance capture is not enabled on this server.";
+/// Announcement gate: env-gated, not a Discord role — say who enables it.
+pub const ANNOUNCEMENTS_DISABLED_REPLY: &str = "Announcements are disabled on this server. Ask a server admin to enable them in the bot configuration — this is a host setting, not a Discord role.";
+/// Moderation gate: env-gated, not a Discord role — say who enables it.
+pub const MODERATION_DISABLED_REPLY: &str = "Moderation is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.";
+/// Scorecard gate: env-gated, not a Discord role — say who enables it.
+pub const SCORECARD_DISABLED_REPLY: &str = "Attendance capture is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.";
 
 // --- handler identity ----------------------------------------------------------
 
@@ -106,6 +110,7 @@ pub const SCORECARD_DISABLED_REPLY: &str = "Attendance capture is not enabled on
 pub enum HandlerId {
     Rank,
     Leaderboard,
+    Help,
     ScorecardAttendance,
     AutomationAdmin,
     AutomationCustom,
@@ -241,7 +246,8 @@ pub enum RouterRefusal {
 }
 
 impl RouterRefusal {
-    /// Legacy reply text for this refusal.
+    /// User-facing denial text: Discord permission names and a next step, never
+    /// an internal action id.
     #[must_use]
     pub fn message(self) -> String {
         match self {
@@ -252,10 +258,14 @@ impl RouterRefusal {
             Self::ManageServerRequired => MANAGE_SERVER_REQUIRED.to_owned(),
             Self::ManageEventsRequired => MANAGE_EVENTS_REQUIRED.to_owned(),
             Self::GuildRestricted => GUILD_RESTRICTED_REPLY.to_owned(),
-            // Legacy `src/moderation/policy.ts`: `Missing required permission
-            // for ${request.action}` where the action is `moderation.ban`, ….
+            // Names the Discord permission (Ban Members, …) and the slash
+            // command, not the internal `moderation.ban` action id.
             Self::ModerationPermission(action) => {
-                format!("Missing required permission for {}", action.action_name())
+                format!(
+                    "You need the {} permission to use /{}. Ask a server moderator or admin to grant it.",
+                    action.discord_permission_name(),
+                    action.command_name()
+                )
             }
         }
     }
@@ -841,18 +851,30 @@ mod tests {
     }
 
     #[test]
-    fn refusal_texts_match_legacy() {
-        assert_eq!(
-            RouterRefusal::AutomationsDisabled.message(),
-            "Automations are disabled on this server."
-        );
+    fn refusal_texts_are_actionable() {
+        // Disabled features name the admin-only enable path (host setting, not
+        // a Discord role).
+        for refusal in [
+            RouterRefusal::AutomationsDisabled,
+            RouterRefusal::AnnouncementsDisabled,
+            RouterRefusal::ModerationDisabled,
+            RouterRefusal::ScorecardDisabled,
+        ] {
+            let text = refusal.message();
+            assert!(
+                text.contains("server admin") && text.contains("host setting, not a Discord role"),
+                "{refusal:?} names the enable path: {text}"
+            );
+        }
+        // Permission denials name the Discord permission and who grants it —
+        // never an internal action id.
         assert_eq!(
             RouterRefusal::ManageServerRequired.message(),
-            "Manage Server permission is required."
+            "You need the Manage Server permission to use this command. Ask a server admin to grant it."
         );
         assert_eq!(
             RouterRefusal::ManageEventsRequired.message(),
-            "Manage Events permission is required."
+            "You need the Manage Events permission to use this command. Ask a server admin to grant it."
         );
         assert_eq!(
             RouterRefusal::GuildRestricted.message(),
@@ -860,8 +882,31 @@ mod tests {
         );
         assert_eq!(
             RouterRefusal::ModerationPermission(ModerationAction::Ban).message(),
-            "Missing required permission for moderation.ban"
+            "You need the Ban Members permission to use /ban. Ask a server moderator or admin to grant it."
         );
+        assert_eq!(
+            RouterRefusal::ModerationPermission(ModerationAction::Kick).message(),
+            "You need the Kick Members permission to use /kick. Ask a server moderator or admin to grant it."
+        );
+        assert_eq!(
+            RouterRefusal::ModerationPermission(ModerationAction::Timeout).message(),
+            "You need the Moderate Members permission to use /timeout. Ask a server moderator or admin to grant it."
+        );
+        assert_eq!(
+            RouterRefusal::ModerationPermission(ModerationAction::Purge).message(),
+            "You need the Manage Messages permission to use /purge. Ask a server moderator or admin to grant it."
+        );
+        assert_eq!(
+            RouterRefusal::ModerationPermission(ModerationAction::Slowmode).message(),
+            "You need the Manage Channels permission to use /slowmode. Ask a server moderator or admin to grant it."
+        );
+        for action in ModerationAction::ALL {
+            let text = RouterRefusal::ModerationPermission(action).message();
+            assert!(
+                !text.contains("moderation."),
+                "{action:?} must not leak the internal id: {text}"
+            );
+        }
     }
 
     #[test]
