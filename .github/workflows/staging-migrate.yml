@@ -27,7 +27,7 @@ on:
         description: Reference to approved recovery evidence (card/document, no URL secrets)
         required: true
       acl_plan_ref:
-        description: Reference to the reviewed ACL sequence
+        description: Bare reference to the reviewed ACL sequence (card/document ref, no @/URL/whitespace; a non-bare ref is refused before any DDL)
         required: true
       expected_pending:
         description: Ascending comma-separated versions the reviewed plan listed (apply refuses unless it matches; empty when none pending)
@@ -84,7 +84,14 @@ jobs:
           RECOVERY_REF: ${{ inputs.recovery_evidence_ref }}
           ACL_REF: ${{ inputs.acl_plan_ref }}
           EXPECTED_PENDING: ${{ inputs.expected_pending }}
+        # `shell: bash` runs with `-eo pipefail`. The container's default `sh`
+        # has no pipefail, so a refusal (exit 2) or failure (exit 1) piped into
+        # `tee` left the job green with nothing migrated. `set -o pipefail`
+        # is belt-and-braces for the same guarantee if the shell key is ever
+        # re-targeted; the workflow-policy test pins both.
+        shell: bash
         run: |
+          set -o pipefail
           ./target/debug/staging-migrate "--$MODE" --source-sha "$SOURCE_SHA" \
             --staging-host "$STAGING_HOST" --staging-database "$STAGING_DATABASE" \
             --recovery-evidence-ref "$RECOVERY_REF" --acl-plan-ref "$ACL_REF" \
