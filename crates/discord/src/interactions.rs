@@ -305,6 +305,7 @@ fn option_to_twilight(opt: &two_bot_core::commands::CommandOption) -> CommandOpt
         4 => CommandOptionType::Integer,
         5 => CommandOptionType::Boolean,
         6 => CommandOptionType::User,
+        7 => CommandOptionType::Channel,
         8 => CommandOptionType::Role,
         _ => CommandOptionType::String,
     };

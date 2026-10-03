@@ -15,12 +15,25 @@ use tracing::{instrument::WithSubscriber, Instrument};
 use two_bot_core::{ComponentStatus, HealthReport};
 
 use crate::gateway::GatewayState;
+use crate::gateway_failure::{FailureSlot, GatewayFailure};
 
 /// Readiness reflects the live database, not only successful boot.
 #[derive(Clone)]
 pub struct SharedState {
     pub gateway: Arc<RwLock<GatewayState>>,
     pub database: Option<sqlx::PgPool>,
+    /// Why the gateway task last stopped (TOG-13044); empty until it fails.
+    pub failure: FailureSlot,
+}
+
+impl SharedState {
+    pub fn new(gateway: Arc<RwLock<GatewayState>>, database: Option<sqlx::PgPool>) -> Self {
+        Self {
+            gateway,
+            database,
+            failure: FailureSlot::default(),
+        }
+    }
 }
 
 /// Build the router (split out for tests: no socket needed).
@@ -63,6 +76,10 @@ struct ReadinessReport {
     health: HealthReport,
     // Informational component: not included in HealthReport::ready().
     jobs: std::collections::BTreeMap<String, crate::jobs::JobStatus>,
+    /// Fixed-vocabulary phase/class of the last gateway task failure; absent
+    /// while none has happened. Never carries error text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gateway_failure: Option<GatewayFailure>,
     build_revision: &'static str,
     build_id: &'static str,
 }
@@ -94,6 +111,7 @@ async fn readyz(
         Json(ReadinessReport {
             health,
             jobs,
+            gateway_failure: state.failure.get(),
             build_revision: option_env!("BOT_BUILD_REVISION").unwrap_or("unknown"),
             build_id: option_env!("BOT_BUILD_ID").unwrap_or("unknown"),
         }),
@@ -235,10 +253,7 @@ mod tests {
     use tower::ServiceExt as _;
 
     fn state(s: GatewayState) -> SharedState {
-        SharedState {
-            gateway: Arc::new(RwLock::new(s)),
-            database: None,
-        }
+        SharedState::new(Arc::new(RwLock::new(s)), None)
     }
 
     #[tokio::test]
@@ -385,6 +400,44 @@ mod tests {
                 ["token_invalid", "ready"]
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn readyz_reports_the_gateway_failure_only_once_one_is_recorded() {
+        use crate::gateway_failure::FailureClass;
+        let shared = state(GatewayState::Armed);
+        let fetch = |shared: SharedState| async move {
+            let response = router(shared)
+                .oneshot(
+                    Request::builder()
+                        .uri("/readyz")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let bytes = axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        assert!(fetch(shared.clone()).await.get("gateway_failure").is_none());
+        for class in FailureClass::ALL {
+            shared
+                .failure
+                .record(GatewayFailure::durable_gateway(class));
+            let json = fetch(shared.clone()).await;
+            assert_eq!(
+                json["gateway_failure"],
+                serde_json::json!({"phase": "durable_gateway", "class": class.as_str()})
+            );
+            // The component breakdown is untouched by the new field.
+            assert_eq!(
+                json["components"][1],
+                serde_json::json!(["gateway", "starting"])
+            );
+        }
     }
 
     #[test]
