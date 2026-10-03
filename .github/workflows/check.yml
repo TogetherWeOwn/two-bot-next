@@ -543,6 +543,12 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test internal_member_store -- --ignored
 
+      - name: Internal member moderation executor (mock REST and CI service only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test internal_member_moderation -- --include-ignored
+
       - name: Internal event executor mirror acceptance (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
         env:

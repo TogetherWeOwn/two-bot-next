@@ -28,6 +28,8 @@ pub mod internal_actions;
 pub mod internal_channel_moderation;
 pub mod internal_events;
 #[cfg(feature = "db")]
+pub mod internal_member_moderation;
+#[cfg(feature = "db")]
 pub mod leveling_runtime;
 #[cfg(feature = "db")]
 pub mod lfg_interactions;
