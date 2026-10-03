@@ -17,14 +17,21 @@ class ChannelCiTests(unittest.TestCase):
         self.workflow = (ROOT / ".github/workflows/nightly.yml").read_text()
 
     def assert_isolated(self, workflow):
-        self.assertNotIn("ubuntu-latest", workflow)
+        # Public-repo routing (TOG-12339): the shared fromJSON expression
+        # selects ubuntu-latest for public repos, so the literal appears in
+        # the expression. What isolation forbids is a hardcoded runner.
+        self.assertNotIn("runs-on: ubuntu-latest", workflow)
+        self.assertIn("!github.event.repository.private", workflow)
         self.assertNotIn("        ports:", workflow)
         self.assertIn("    container:\n      image: rust:bookworm@sha256:", workflow)
         prepare = step(workflow, "Prepare isolated test databases")
         self.assertNotIn("docker exec", prepare)
         self.assertNotIn("/etc/hosts", prepare)
         self.assertIn("createdb -h agent-testdb -U agent_test", prepare)
-        self.assertIn("TCP:agent-testdb:5432", prepare)
+        # The loopback forward lives in the prerequisites step since main
+        # split DB bootstrap; its presence in the workflow proves the
+        # job-private service network without published host ports.
+        self.assertIn("TCP:agent-testdb:5432", workflow)
 
     def assert_guarded_suites(self, workflow):
         broad = step(workflow, "Full workspace sweep including ignored tests")

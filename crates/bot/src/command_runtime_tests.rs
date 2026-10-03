@@ -1770,7 +1770,7 @@ async fn channel_sticky_and_feed_commands_share_one_runtime_and_complete_registr
             .await
             .unwrap();
     assert_eq!(audits.len(), 1);
-    assert_eq!(audits[0].0, "slowmode");
+    assert_eq!(audits[0].0, "moderation.slowmode");
     assert_eq!(db.audits().await.len(), 1, "sticky still audited");
     assert!(
         db.feed_audits().await.is_empty(),
