@@ -198,6 +198,38 @@ pub fn find_mirror_in_page(
         .next()
 }
 
+/// Hourly mirror recheck cadence (parity §5 / soak s5-09: the
+/// `operational_audit_log` hourly mirror recheck). The TOG-12240 retry sweep
+/// runtime owns the timer and the Discord reads; this constant is only the
+/// pure due-gate boundary it compares against.
+pub const MIRROR_RECHECK_INTERVAL_MS: u64 = 60 * 60 * 1000;
+
+/// Pure due gate for the hourly mirror recheck: true once at least one hour
+/// has elapsed since `last_recheck_ms`. Times are unix millis. A `now_ms`
+/// behind `last_recheck_ms` (clock skew or a fresh process with a persisted
+/// cursor) saturates to "not due" rather than underflowing — the recheck is
+/// a bounded skip, never a catch-up burst.
+#[must_use]
+pub fn mirror_recheck_due(last_recheck_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(last_recheck_ms) >= MIRROR_RECHECK_INTERVAL_MS
+}
+
+/// Why a mirror recheck tick recorded nothing (house skip pattern per the
+/// scheduled-events precedent TOG-12700: a failed or malformed read keeps the
+/// last good state in place, only a good response replaces it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorRecheckSkip {
+    /// Recheck not due yet: no Discord read runs, last good state keeps.
+    NotDue,
+    /// Discord answered but the payload was unusable (malformed row): keeps
+    /// the last good state, never publishes the malformed snapshot.
+    InvalidResponse,
+    /// The read itself failed (transport / rate-limit / 5xx): keeps the last
+    /// good state. Distinct from `InvalidResponse` so operators can tell a
+    /// dead wire apart from a corrupt body.
+    DiscordReadFailed,
+}
+
 /// Oldest message id on the page — the next page's `before` cursor, and the
 /// value compared against the boundary to know when a scan has passed below
 /// every id that could still match.
