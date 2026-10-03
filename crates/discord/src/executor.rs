@@ -2654,16 +2654,24 @@ impl ActionExecutor {
                     .map_err(|_| DiscordError::Timeout)??;
             match res.status {
                 200 => {
-                    let published: Vec<twilight_model::application::command::Command> =
-                        serde_json::from_slice(&res.body).map_err(|_| {
-                            DiscordError::Unavailable("invalid command registry receipt".to_owned())
-                        })?;
+                    let parsed: Result<
+                        Vec<twilight_model::application::command::Command>,
+                        DiscordError,
+                    > = serde_json::from_slice(&res.body).map_err(|_| {
+                        DiscordError::Unavailable("invalid command registry receipt".to_owned())
+                    });
+                    // A 200 is definite: Discord stored the full replacement.
+                    // Release durable admission before validating the receipt
+                    // so an unreadable or short body cannot poison the next
+                    // boot's bootstrap (alive restart held the lane and failed
+                    // with custom_commands_init_failed).
+                    res.complete().await;
+                    let published = parsed?;
                     if published.len() != commands.len() {
                         return Err(DiscordError::Unavailable(
                             "incomplete command registry receipt".to_owned(),
                         ));
                     }
-                    res.complete().await;
                     return Ok(());
                 }
                 429 => {
