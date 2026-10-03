@@ -437,7 +437,8 @@ async fn router_cleans_failed_posts_but_preserves_unreadable_acceptance() {
         if let Some(history) = history {
             script.push(history);
         }
-        let mock = MockRest::start(script, ScriptedResponse::json(200, json!({"id": "5900"}))).await;
+        let mock =
+            MockRest::start(script, ScriptedResponse::json(200, json!({"id": "5900"}))).await;
         let rt = runtime(db.pool.clone(), &mock, true);
         rt.handle(&create(id, PERM_MANAGE_EVENTS)).await.unwrap();
         let post = format!("lfg-{id}");
