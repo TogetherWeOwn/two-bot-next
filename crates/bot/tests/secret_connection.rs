@@ -13,6 +13,7 @@ fn backup_connection_failure_does_not_echo_database_url() {
         .arg("backup")
         .env_clear()
         .env("TWO_DATABASE_URL", url)
+        .env("TWO_DATABASE_TLS", "local-only")
         .env("TWO_BACKUP_DIR", &dir)
         .output()
         .unwrap();

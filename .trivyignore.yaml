@@ -1,0 +1,4 @@
+# No accepted vulnerabilities. HIGH/CRITICAL (including unfixed) fail CI.
+# Any exception must name id, paths, statement (reason + reviewer/evidence),
+# and expired_at. See docs/supply-chain.md; never add a blanket suppression.
+vulnerabilities: []
