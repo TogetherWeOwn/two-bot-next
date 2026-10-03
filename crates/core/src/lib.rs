@@ -32,6 +32,8 @@ pub mod community_store;
 pub mod config;
 pub mod containment;
 #[cfg(feature = "db")]
+pub mod containment_store;
+#[cfg(feature = "db")]
 pub mod custom_command_service;
 #[cfg(feature = "db")]
 pub mod custom_command_store;
@@ -102,6 +104,7 @@ pub mod tickets;
 pub mod voice;
 pub mod voice_access;
 pub mod voice_alias;
+pub mod voice_alias_core;
 pub mod voice_assistant_cap;
 pub mod voice_assistant_request;
 pub mod voice_assistant_validate;

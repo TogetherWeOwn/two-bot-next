@@ -8,6 +8,7 @@
 #[cfg(test)]
 mod admission_test_support;
 mod audit_runtime;
+mod automod_gateway;
 mod backup_cli;
 mod command_runtime;
 #[cfg(test)]
@@ -196,9 +197,12 @@ async fn main() {
     let voice = build_voice_runtime(&config, VoiceGates::from_env().enabled).await;
 
     let (shutdown, stopping) = tokio::sync::watch::channel(false);
+    // Filled by the gateway task; read by the shared maintenance tick.
+    let automod_slot: automod_gateway::Slot = Arc::default();
     let gateway_task = if let Ok((token, _, guild_id)) = gateway_prerequisites(&config) {
         let token = token.to_owned();
         let state = Arc::clone(&gateway);
+        let slot = Arc::clone(&automod_slot);
         let self_roles = self_roles.clone();
         Some(tokio::spawn(async move {
             let result: Result<(), sqlx::Error> = async {
@@ -225,7 +229,11 @@ async fn main() {
                 // The ordered leveling path shares this runtime's
                 // executor/pacing for XP awards and role rewards.
                 let runtime = command_runtime::CommandRuntime::from_env(
-                    pool, &token, guild_id, self_roles, onboarding,
+                    pool.clone(),
+                    &token,
+                    guild_id,
+                    self_roles,
+                    onboarding,
                 );
                 if let Some(runtime) = &runtime {
                     let config = gateway_commands::GatewayCommandConfig::from_map(
@@ -240,6 +248,33 @@ async fn main() {
                         .await
                         .map_err(|error| gateway_failure("milestones_load_failed", error))?,
                 );
+                // Automod shares the command runtime's REST executor; it never
+                // builds a private client, router or timer.
+                let vars: std::collections::HashMap<String, String> = std::env::vars().collect();
+                let automod = match automod_gateway::resolve(&vars, guild_id).map_err(|reason| {
+                    tracing::error!(reason, "automod configuration rejected");
+                    sqlx::Error::InvalidArgument(reason.into())
+                })? {
+                    Some(resolved) => {
+                        let executor = match runtime.as_ref() {
+                            Some(runtime) => runtime.executor(),
+                            None => two_bot_discord::ActionExecutor::with_proxy(
+                                token.clone(),
+                                std::env::var("DISCORD_API_BASE")
+                                    .ok()
+                                    .filter(|value| !value.is_empty()),
+                            )
+                            .map_err(|_| {
+                                sqlx::Error::InvalidArgument("automod REST executor failed".into())
+                            })?,
+                        };
+                        let automod = automod_gateway::build(resolved, pool, executor);
+                        let _ = slot.set(Arc::clone(&automod));
+                        info!("automod activation wired into the gateway loop");
+                        Some(automod)
+                    }
+                    None => None,
+                };
                 let shard = build_shard(
                     token,
                     intents_from_env(),
@@ -256,6 +291,7 @@ async fn main() {
                     Arc::clone(&state),
                     store,
                     runtime,
+                    automod,
                     voice,
                     async move {
                         server::shutdown_requested(stopping).await;
@@ -289,7 +325,14 @@ async fn main() {
         None
     };
 
-    let http = serve(&config, listener, state, shutdown.clone(), self_roles);
+    let http = serve(
+        &config,
+        listener,
+        state,
+        shutdown.clone(),
+        self_roles,
+        automod_slot,
+    );
     let result = match gateway_task {
         Some(task) => supervise_gateway(task, http, gateway, shutdown).await,
         None => http.await,

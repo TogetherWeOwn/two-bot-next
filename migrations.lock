@@ -189,6 +189,10 @@
       "sha256": "5f5986ae81173571aaea237bff45f09d6e23256f5023ed7a3570697796da791d",
       "justification": "TOG-11045: add durable token-wide Discord send admission; no existing migration SQL changed."
     },
+    "crates/cutover/migrations/0370_containment_claims.sql": {
+      "sha256": "e4af118aa85ad503a90528157f3ece4c7043df4b0180eaf245a64de3fd0e3edf",
+      "justification": "Add legacy-shaped containment event and incident claim tables for the durable claim store (TOG-12239); no audit listener or containment arming."
+    },
     "crates/cutover/migrations/0390_legacy_copy_presence.sql": {
       "justification": "Baseline legacy-copy migration merged in PR #113 before this guard; no SQL changes.",
       "sha256": "bdd289d14af6cb28609daced594c476b4b9aceee4ddf4bef40dbe5018480ce95"
