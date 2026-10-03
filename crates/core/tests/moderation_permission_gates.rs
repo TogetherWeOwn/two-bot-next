@@ -132,6 +132,14 @@ fn denied_copy(action: ModerationAction) -> String {
     format!("Missing required permission for {}", action.action_name())
 }
 
+fn router_denied_copy(action: ModerationAction) -> String {
+    format!(
+        "You need the {} permission to use /{}. Ask a server moderator or admin to grant it.",
+        action.discord_permission_name(),
+        action.command_name()
+    )
+}
+
 #[test]
 fn permission_bits_match_legacy_per_action() {
     assert_eq!(ModerationAction::Ban.required_permission(), 1 << 2);
@@ -172,7 +180,7 @@ fn role_matrix_matches_permission_gates() {
 }
 
 #[test]
-fn router_allows_or_refuses_per_role_with_legacy_copy() {
+fn router_allows_or_refuses_per_role_with_actionable_copy() {
     let router = router();
     let roles = roles();
     for action in member_actions() {
@@ -205,22 +213,28 @@ fn router_allows_or_refuses_per_role_with_legacy_copy() {
                 };
                 assert_eq!(
                     refusal.message(),
-                    denied_copy(action),
+                    router_denied_copy(action),
                     "{} denied copy for {}",
                     role.name,
                     action.command_name(),
                 );
                 // Pin the literal copy so a silent reword breaks loudly.
                 let literal = match action {
-                    ModerationAction::Ban => "Missing required permission for moderation.ban",
+                    ModerationAction::Ban => {
+                        "You need the Ban Members permission to use /ban. Ask a server moderator or admin to grant it."
+                    }
                     ModerationAction::TempBan => {
-                        "Missing required permission for moderation.tempban"
+                        "You need the Ban Members permission to use /tempban. Ask a server moderator or admin to grant it."
                     }
-                    ModerationAction::Kick => "Missing required permission for moderation.kick",
+                    ModerationAction::Kick => {
+                        "You need the Kick Members permission to use /kick. Ask a server moderator or admin to grant it."
+                    }
                     ModerationAction::Timeout => {
-                        "Missing required permission for moderation.timeout"
+                        "You need the Moderate Members permission to use /timeout. Ask a server moderator or admin to grant it."
                     }
-                    ModerationAction::Warn => "Missing required permission for moderation.warn",
+                    ModerationAction::Warn => {
+                        "You need the Moderate Members permission to use /warn. Ask a server moderator or admin to grant it."
+                    }
                     _ => unreachable!("member verbs only"),
                 };
                 assert_eq!(refusal.message(), literal);
