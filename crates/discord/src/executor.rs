@@ -3087,9 +3087,6 @@ fn raw_get_route(path: &str) -> Result<Route<'static>, String> {
         Some((b, q)) => (b, q),
         None => (path, ""),
     };
-    if base == "/users/@me" && query.is_empty() {
-        return Ok(Route::GetCurrentUser);
-    }
     // Route borrows nothing here (u64/bool fields); the 'static bound is
     // satisfied because no borrowed variant is constructed.
     if let Some(id) = base.strip_prefix("/guilds/") {
