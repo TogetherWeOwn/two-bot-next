@@ -174,17 +174,17 @@ const PRIMARY_REFUSALS: &[(&str, RouterRefusal, &str)] = &[
     (
         "rsvp",
         RouterRefusal::AnnouncementsDisabled,
-        "Announcements are disabled on this server.",
+        "Announcements are disabled on this server. Ask a server admin to enable them in the bot configuration — this is a host setting, not a Discord role.",
     ),
     (
         "lfg",
         RouterRefusal::ManageEventsRequired,
-        "Manage Events permission is required.",
+        "You need the Manage Events permission to use this command. Ask a server admin to grant it.",
     ),
     (
         "ban",
         RouterRefusal::ModerationPermission(ModerationAction::Ban),
-        "Missing required permission for moderation.ban",
+        "You need the Ban Members permission to use /ban. Ask a server moderator or admin to grant it.",
     ),
 ];
 
@@ -247,17 +247,17 @@ fn disabled_features_refuse_with_documented_copy() {
         (
             "rsvp",
             RouterRefusal::AnnouncementsDisabled,
-            "Announcements are disabled on this server.",
+            "Announcements are disabled on this server. Ask a server admin to enable them in the bot configuration — this is a host setting, not a Discord role.",
         ),
         (
             "lfg",
             RouterRefusal::AnnouncementsDisabled,
-            "Announcements are disabled on this server.",
+            "Announcements are disabled on this server. Ask a server admin to enable them in the bot configuration — this is a host setting, not a Discord role.",
         ),
         (
             "ban",
             RouterRefusal::ModerationDisabled,
-            "Moderation is not enabled on this server.",
+            "Moderation is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.",
         ),
     ] {
         let outcome = slash_outcome(&off, name);
