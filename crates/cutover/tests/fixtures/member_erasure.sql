@@ -118,6 +118,7 @@ BEGIN
       INSERT INTO voice_rooms
         (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at)
         VALUES (g, 'v-' || k, 'vc-' || g, u, u, '7', '2026-10-01T00:00:00Z');
+      INSERT INTO voice_logging_mention_members (guild_id, member_id) VALUES (g, u);
       -- Explicit exceptions are seeded too: erasure must not change safety policy.
       INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
         VALUES (g, 'fixture_' || u, to_jsonb(u), 1, u);
