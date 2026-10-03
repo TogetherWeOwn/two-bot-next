@@ -100,12 +100,12 @@ fn containment_settings_defaults_and_bad_values() {
         ("TWO_ANTI_NUKE_WINDOW_SECONDS", "30.5"),
         ("TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS", "90"),
         ("TWO_ANTI_NUKE_HEAT_THRESHOLD", "8"),
-        ("DISCORD_STAFF_ALERT_CHANNEL_ID", "12"),
+        ("DISCORD_STAFF_ALERT_CHANNEL_ID", "123456789012345678"),
     ]));
     assert_eq!(set.window_ms, 30_500);
     assert_eq!(set.max_age_ms, 90_000);
     assert_eq!(set.heat_threshold, 8);
-    assert_eq!(set.staff_channel.as_deref(), Some("12"));
+    assert_eq!(set.staff_channel.as_deref(), Some("123456789012345678"));
 
     // Unusable values never disable containment.
     for bad in ["0", "-3", "abc", "NaN", "inf"] {
@@ -118,7 +118,7 @@ fn containment_settings_defaults_and_bad_values() {
         assert_eq!(parsed.max_age_ms, 120_000, "{bad}");
         assert_eq!(parsed.heat_threshold, 5, "{bad}");
     }
-    for bad in ["not-a-channel", "1234567890123456789012"] {
+    for bad in ["12", "not-a-channel", "1234567890123456789012"] {
         let parsed =
             ContainmentSettings::from_vars(&vars(&[("DISCORD_STAFF_ALERT_CHANNEL_ID", bad)]));
         assert_eq!(parsed.staff_channel, None, "{bad}");
