@@ -19,7 +19,7 @@ use two_bot_core::{
     funnel::now_millis_for_test,
     FeatureGates,
 };
-use two_bot_discord::ActionExecutor;
+use two_bot_discord::{ActionExecutor, DiscordError};
 
 use crate::{
     command_runtime::new_id,
@@ -294,7 +294,11 @@ async fn deliver(
                 .await
             {
                 Ok(id) if valid_id(&id) => id,
-                Err(err) if err.is_safe_pre_mutation() => {
+                // Only a pre-wire guard refusal proves nothing reached the
+                // transport. A wire rejection (even a definitive-looking
+                // 403) stays pending: the stable per-item nonce has only a
+                // short dedupe window, so a later repost is not safe.
+                Err(DiscordError::Guard(_)) => {
                     stats.failed += 1;
                     *error = Some(ErrorClass::Rest);
                     if store::release_unposted(pool, &feed.guild_id, post, &token)
