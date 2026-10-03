@@ -538,6 +538,10 @@ impl CommandRuntime {
                 })
             }
             Event::Resumed => {
+                // Saved sessions emit RESUMED without READY: wake ticket
+                // maintenance through the shared ticket scope before the
+                // registry sync, exactly as the ordered surface does.
+                self.dispatch_ticket_connection(event);
                 let runtime = Arc::clone(self);
                 self.spawn(2, async move {
                     runtime.publish_registry(None).await;
