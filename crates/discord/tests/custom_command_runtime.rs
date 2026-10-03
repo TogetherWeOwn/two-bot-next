@@ -714,7 +714,7 @@ async fn disabled_and_unknown_dynamic_rows_and_failed_delivery() {
         .unwrap());
     assert_eq!(
         bodies(&mock)[0]["data"]["content"],
-        "Automations are disabled on this server."
+        "Automations are disabled on this server. Ask a server admin to enable them in the bot configuration — this is a host setting, not a Discord role."
     );
     assert!(!runtime
         .handle_interaction(&slash(41, "unknown", 0, &[]), None)

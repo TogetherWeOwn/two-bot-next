@@ -363,7 +363,10 @@ async fn unknown_command_reply_matches_the_documented_text() {
         .on_interaction(&slash("not-a-command", Vec::new()))
         .await;
     let content = immediate_content(&mock.requests());
-    assert_eq!(content, "I don't recognize that command. It may have been removed or renamed — pick it again from the / command list.");
+    assert_eq!(
+        content,
+        "I don't recognize that command. It may have been removed or renamed — pick it again from the / command list."
+    );
     assert_eq!(content, UNKNOWN_COMMAND_REPLY);
     mock.shutdown().await;
 }
@@ -385,7 +388,10 @@ async fn permission_denied_reply_matches_the_router_refusal() {
     interaction.member.as_mut().unwrap().permissions = Some(Permissions::empty());
     runtime.on_interaction(&interaction).await;
     let content = immediate_content(&mock.requests());
-    assert_eq!(content, "You need the Manage Server permission to use this command. Ask a server admin to grant it.");
+    assert_eq!(
+        content,
+        "You need the Manage Server permission to use this command. Ask a server admin to grant it."
+    );
     assert_eq!(content, RouterRefusal::ManageServerRequired.message());
     mock.shutdown().await;
 }
