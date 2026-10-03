@@ -387,8 +387,9 @@ class WorkflowSurfaceTests(unittest.TestCase):
     # What a step must not do on a rust=false PR: that run never installs the
     # toolchain (no `cargo`) and never creates `two_bot_test_ci`, so any step
     # that needs either must carry the selector guard. TOG-12945: send
-    # admission, reengagement, staging migrate and the Docker manifests check
-    # ran unguarded and failed every non-Rust PR.
+    # admission, reengagement, staging migrate, the Docker manifests check
+    # and the onboarding prompt-store/shared-runtime steps ran unguarded and
+    # failed every non-Rust PR.
     NEEDS_RUST = re.compile(
         r"\bcargo\b|\bcreatedb\b|\bdropdb\b|two_bot_test_ci|TEST_DATABASE_URL"
         r"|rust-toolchain|rust-cache|cargo-deny|check-docker-manifests\.py")
