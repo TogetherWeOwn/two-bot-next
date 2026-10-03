@@ -184,6 +184,9 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_ci_single_core.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_ci_postgres_storage.py' -v
 
+      - name: Scratch drill schema provenance (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_restore_drill_schema.py' -v
+
       - name: parity soak checklist coverage (offline)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py
@@ -307,7 +310,11 @@ jobs:
 
       - name: Prepare isolated test databases
         if: needs.job-inputs.outputs.rust != 'false'
-        run: createdb -h agent-testdb -U agent_test two_bot_test_ci
+        run: |
+          createdb -h agent-testdb -U agent_test two_bot_test_ci
+          createdb -h agent-testdb -U agent_test two_next_backup_ci
+          createdb -h agent-testdb -U agent_test two_next_backup_publication_ci
+          printf 'PAPERCLIP_RUN_SCRATCH_DIR=%s/two-bot-check-scratch\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: Verify disposable Postgres defaults
         if: needs.job-inputs.outputs.rust != 'false'
@@ -347,11 +354,27 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test --workspace --lib --bins --features two-bot-core/db --locked
 
-      - name: cargo test (integration, including website acceptance)
+      # The standalone backup fixture has its own scratch-only URL guard.
+      # Supplying it here executes the round trip rather than its local skip.
+      - name: cargo test (integration, including website acceptance and backup round trip)
         if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test --workspace --test '*' --features two-bot-core/db --locked
+          TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_ci
+          PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
+        # The publication regression has its own guarded DB and actual binary
+        # in the dedicated step below; never feed it the round-trip fixture URL.
+        run: cargo test --workspace --test '*' --features two-bot-core/db --locked -- --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump
+
+      - name: Backup publication faults (actual CLI, dedicated CI service database)
+        if: needs.job-inputs.outputs.rust != 'false'
+        env:
+          TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_publication_ci
+          TWO_BOT_TEST_BACKUP_BIN: ${{ github.workspace }}/target/debug/two-bot
+          PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-publication-tests
+        run: |
+          cargo build -p two-bot --locked
+          cargo test -p two-bot-core --features db --locked --test backup_dump_publication -- --nocapture
 
       - name: Native v3 and real backup CLI regressions (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
@@ -533,6 +556,57 @@ jobs:
       - name: Real binary lifecycle acceptance (CI service only, under 60 s)
         if: needs.job-inputs.outputs.rust != 'false'
         run: timeout 60s cargo test -p two-bot --locked --test alive -- --ignored --nocapture
+
+      - name: Consecutive retained restore drills (actual CLI, CI service only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot --locked --test restore_drill -- --ignored --nocapture
+
+      # NOTE: cargo-deny runs earlier in this job (TOG-12134 disk hygiene);
+      # do not re-add it here.
+
+  moderation-db:
+    name: moderation db
+    permissions:
+      contents: read
+    needs: [job-inputs]
+    # Skip when the selector sees no Rust inputs (not a required check).
+    if: needs.job-inputs.outputs.rust != 'false'
+    # Runner routing: see the note on the first job above.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'moderation-db') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 15
+    # Each job container has a private service network; never publish a fixed
+    # host port on the shared self-hosted runner Docker host.
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    services:
+      agent-testdb:
+        image: postgres:17
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d postgres"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      MEMBER_TESTDB: agent-testdb
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        if: needs.job-inputs.outputs.rust != 'false'
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Check feature-gated moderation store
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
+      - name: Test SQL ledger on ephemeral Postgres
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-core --features db --locked --test member_moderation_db -- --ignored
 
   parity-docs:
     name: parity docs

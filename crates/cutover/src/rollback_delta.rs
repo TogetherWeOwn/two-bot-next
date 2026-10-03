@@ -161,6 +161,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     },
     TableSpec { table: "moderation_idempotency", measure: TableMeasure::Columns(&["claimed_at"]) },
     TableSpec { table: "moderation_lockdowns", measure: TableMeasure::Columns(&["locked_at"]) },
+    TableSpec { table: "moderation_member_bans", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "moderation_scheduled_unbans", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "moderation_warnings", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "operational_audit_log", measure: TableMeasure::Columns(&["occurred_at"]) },
