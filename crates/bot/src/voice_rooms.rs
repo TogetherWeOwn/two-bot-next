@@ -45,11 +45,16 @@ use two_bot_core::{
         VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN, RENAME_MIN_INTERVAL_MS,
     },
     voice_utilities::{invite_render, ping_render},
+    voice_vote_kick::{
+        VoteBallot, VoteClock, VoteKickCore, VoteKickError, VoteKickRef, VoteKickStatus,
+        VoteKickUpdate, VoteRoomFacts,
+    },
     CommandDefinition, Snowflake,
 };
 use two_bot_cutover::voice_rooms::PgRoomStore;
 use two_bot_discord::voice_rooms::{
-    can_manage_room, effective_permissions, RoomChannelAttributes, RoomHttp, RoomHttpError,
+    can_enforce_kick, can_manage_room, effective_permissions, RoomChannelAttributes, RoomHttp,
+    RoomHttpError,
 };
 
 pub type WriteGuard = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -316,6 +321,18 @@ impl LiveState {
             .filter(|member| member.channel_id == Some(channel) && member.bot != Some(true))
             .count()
     }
+
+    /// Human occupants of one channel, sorted for deterministic vote facts.
+    fn occupants(&self, channel: Snowflake) -> Vec<Snowflake> {
+        let mut ids: Vec<Snowflake> = self
+            .members
+            .iter()
+            .filter(|(_, member)| member.channel_id == Some(channel) && member.bot != Some(true))
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
 }
 
 /// Shared with the gateway, not locked across network/database awaits.
@@ -456,6 +473,17 @@ impl LiveGuild {
                 )
         })
     }
+
+    /// Guard for a passed vote's writes: evidence must be authoritative and the
+    /// room channel must still exist. The target having left is not a reason to
+    /// skip the room-scoped Connect deny.
+    fn room_guard(&self, channel: Snowflake) -> WriteGuard {
+        let live = self.clone();
+        Arc::new(move || {
+            let state = live.inner.read().expect("live voice lock");
+            state.ready && state.channels.contains_key(&channel)
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -502,6 +530,32 @@ pub struct GuildRoomWorker<S, H> {
     denied: HashMap<Snowflake, (u64, Option<Permissions>)>,
     failures: VecDeque<LifecycleFailure>,
     halted: bool,
+    votes: VoteKickCore,
+    /// Every vote started this session, by its initiating interaction ID. A
+    /// button carries only that ID; guild, room and target come from here, never
+    /// from the payload.
+    vote_refs: HashMap<Snowflake, VoteKickRef>,
+    active_votes: Vec<VoteKickRef>,
+}
+
+/// Why `/kick` could not start or accept a ballot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KickRefusal {
+    /// Live voice evidence is not authoritative (disconnected or not yet
+    /// published), so no occupancy-based decision may be made.
+    Unavailable,
+    /// The channel is not a tracked temporary room.
+    NotARoom,
+    Vote(VoteKickError),
+}
+
+/// Monotonic actor time handed to the vote core.
+struct ActorClock(u64);
+
+impl VoteClock for ActorClock {
+    fn now_ms(&self) -> u64 {
+        self.0
+    }
 }
 
 impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
@@ -538,6 +592,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             denied: HashMap::new(),
             failures: VecDeque::new(),
             halted: false,
+            votes: VoteKickCore::new(),
+            vote_refs: HashMap::new(),
+            active_votes: Vec::new(),
         })
     }
 
@@ -674,6 +731,133 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .unwrap_or_default();
         self.desired_names.insert(channel, name.to_owned());
         Some(self.renames.propose(channel, current, name, now_ms))
+    }
+
+    /// Owner, original creator and human occupants of a tracked room. `None`
+    /// unless live evidence is authoritative and the room is tracked.
+    fn kick_facts(
+        &self,
+        room_id: Snowflake,
+    ) -> Result<(Snowflake, Snowflake, Vec<Snowflake>), KickRefusal> {
+        let live = self.live.inner.read().expect("live voice lock");
+        if !live.ready || self.halted {
+            return Err(KickRefusal::Unavailable);
+        }
+        let room = self.rooms.get(&room_id).ok_or(KickRefusal::NotARoom)?;
+        Ok((
+            room.owner_id,
+            room.original_creator_id,
+            live.occupants(room_id),
+        ))
+    }
+
+    /// Fold a vote update into worker state: forget finished votes and queue the
+    /// room-scoped enforcement exactly once (the core emits the decision only on
+    /// the first transition to passed).
+    fn settle_vote(&mut self, update: VoteKickUpdate) -> VoteKickUpdate {
+        if update.status != VoteKickStatus::Active {
+            self.active_votes.retain(|vote| vote.id != update.vote.id);
+        }
+        if let Some(kick) = update.kick {
+            self.queue.enqueue(
+                self.live.guild_id,
+                RoomAction::KickMember {
+                    channel_id: kick.room_id,
+                    member_id: kick.target_id,
+                },
+            );
+        }
+        update
+    }
+
+    /// Start a vote in `room_id`. `vote_id` must be the unique initiating
+    /// interaction ID. Starting casts no ballot.
+    pub fn kick_start(
+        &mut self,
+        vote_id: Snowflake,
+        room_id: Snowflake,
+        initiator_id: Snowflake,
+        target_id: Snowflake,
+        now_ms: u64,
+    ) -> Result<VoteKickUpdate, KickRefusal> {
+        let (owner_id, original_creator_id, occupants) = self.kick_facts(room_id)?;
+        let facts = VoteRoomFacts {
+            guild_id: self.live.guild_id,
+            room_id,
+            owner_id,
+            original_creator_id,
+            occupants: &occupants,
+        };
+        let update = self
+            .votes
+            .start(vote_id, facts, initiator_id, target_id, &ActorClock(now_ms))
+            .map_err(KickRefusal::Vote)?;
+        self.vote_refs.insert(vote_id, update.vote);
+        self.active_votes.push(update.vote);
+        Ok(self.settle_vote(update))
+    }
+
+    /// Cast one ballot button press, addressed by vote ID. The core rejects
+    /// repeats and voters who are not current occupants other than the target.
+    pub fn kick_cast(
+        &mut self,
+        vote_id: Snowflake,
+        voter_id: Snowflake,
+        ballot: VoteBallot,
+        now_ms: u64,
+    ) -> Result<VoteKickUpdate, KickRefusal> {
+        let reference = *self
+            .vote_refs
+            .get(&vote_id)
+            .ok_or(KickRefusal::Vote(VoteKickError::UnknownVote))?;
+        let (owner_id, original_creator_id, occupants) = self.kick_facts(reference.room_id)?;
+        let facts = VoteRoomFacts {
+            guild_id: self.live.guild_id,
+            room_id: reference.room_id,
+            owner_id,
+            original_creator_id,
+            occupants: &occupants,
+        };
+        let update = self
+            .votes
+            .cast(reference, facts, voter_id, ballot, &ActorClock(now_ms))
+            .map_err(KickRefusal::Vote)?;
+        Ok(self.settle_vote(update))
+    }
+
+    /// Timer entry: expire votes and react to roster, ownership and room-delete
+    /// changes. Returns the updates that finished a vote. Skipped while live
+    /// evidence is not authoritative: a stale roster must not cancel a vote.
+    pub fn kick_refresh(&mut self, now_ms: u64) -> Vec<VoteKickUpdate> {
+        if self.active_votes.is_empty() {
+            return Vec::new();
+        }
+        let ready = self.live.inner.read().expect("live voice lock").ready;
+        if !ready || self.halted {
+            return Vec::new();
+        }
+        let mut finished = Vec::new();
+        for reference in self.active_votes.clone() {
+            let (owner_id, original_creator_id, occupants) =
+                self.kick_facts(reference.room_id).unwrap_or_default();
+            let facts = VoteRoomFacts {
+                guild_id: self.live.guild_id,
+                room_id: reference.room_id,
+                owner_id,
+                original_creator_id,
+                occupants: &occupants,
+            };
+            // A room that is gone has no occupants, so the core cancels the vote.
+            let Ok(update) = self.votes.refresh(reference, facts, &ActorClock(now_ms)) else {
+                self.active_votes.retain(|vote| vote.id != reference.id);
+                continue;
+            };
+            let update = self.settle_vote(update);
+            if update.status != VoteKickStatus::Active {
+                finished.push(update);
+            }
+        }
+        finished
     }
 
     pub fn failures(&self) -> &VecDeque<LifecycleFailure> {
@@ -1027,6 +1211,60 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                 }
             }
+            RoomAction::KickMember {
+                channel_id,
+                member_id,
+            } => {
+                let permissions = self
+                    .live
+                    .inner
+                    .read()
+                    .expect("live voice lock")
+                    .permissions(self.live.guild_id, channel_id);
+                let result = if !self.rooms.contains_key(&channel_id) {
+                    // The room is gone and its overwrites went with it.
+                    Ok(())
+                } else if !can_enforce_kick(permissions) {
+                    Err(RoomHttpError::AccessDenied)
+                } else {
+                    let guard = self.live.room_guard(channel_id);
+                    // Deny first so the target cannot rejoin between the writes.
+                    match self
+                        .http
+                        .deny_connect(channel_id, member_id, guard.clone())
+                        .await
+                    {
+                        Ok(()) => {
+                            self.http
+                                .disconnect(self.live.guild_id, member_id, guard)
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        self.queue.mark_succeeded(&action);
+                    }
+                    Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
+                        self.queue.mark_rate_limited(
+                            self.live.guild_id,
+                            retry_after_ms,
+                            elapsed_ms(now_ms, started),
+                            action,
+                        );
+                    }
+                    Err(RoomHttpError::UnknownOutcome) => {
+                        // Both writes are idempotent, so a retry is safe.
+                        self.queue.mark_failed(
+                            action,
+                            "Discord kick outcome unknown".to_owned(),
+                            elapsed_ms(now_ms, started),
+                        );
+                    }
+                    Err(error) => self.complete_error(action, channel_id, error),
+                }
+            }
             RoomAction::RenameRoom { channel_id, name } => {
                 let valid = {
                     let live = self.live.inner.read().expect("live voice lock");
@@ -1133,7 +1371,24 @@ enum ActorCommand {
     CreatorAdded(CreatorChannel),
     /// One-shot worker snapshot for `/setup` (room count, failures, halt).
     Status(oneshot::Sender<WorkerStatus>),
+    /// V4: start a vote-kick; the reply carries the vote state or the refusal.
+    KickStart {
+        vote_id: Snowflake,
+        room_id: Snowflake,
+        initiator_id: Snowflake,
+        target_id: Snowflake,
+        reply: oneshot::Sender<KickReply>,
+    },
+    /// V4: cast one ballot, addressed by vote ID.
+    KickBallot {
+        vote_id: Snowflake,
+        voter_id: Snowflake,
+        ballot: VoteBallot,
+        reply: oneshot::Sender<KickReply>,
+    },
 }
+
+pub type KickReply = Result<VoteKickUpdate, KickRefusal>;
 
 /// Per-guild actor registry. Actors spawn lazily on the first complete
 /// snapshot and exit when their guild leaves (sender dropped) or their store
@@ -1264,6 +1519,54 @@ where
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         actor.tx.send(ActorCommand::Status(reply)).ok()?;
+        inbox.await.ok()
+    }
+
+    /// Start a vote-kick through the guild actor. `vote_id` is the initiating
+    /// interaction ID. `None` when the guild has no live actor.
+    pub async fn kick_start(
+        &self,
+        guild: Snowflake,
+        vote_id: Snowflake,
+        room_id: Snowflake,
+        initiator_id: Snowflake,
+        target_id: Snowflake,
+    ) -> Option<KickReply> {
+        let actor = self.live_actor(guild)?;
+        let (reply, inbox) = oneshot::channel();
+        actor
+            .tx
+            .send(ActorCommand::KickStart {
+                vote_id,
+                room_id,
+                initiator_id,
+                target_id,
+                reply,
+            })
+            .ok()?;
+        inbox.await.ok()
+    }
+
+    /// Cast one ballot through the guild actor. `None` when the guild has no
+    /// live actor.
+    pub async fn kick_ballot(
+        &self,
+        guild: Snowflake,
+        vote_id: Snowflake,
+        voter_id: Snowflake,
+        ballot: VoteBallot,
+    ) -> Option<KickReply> {
+        let actor = self.live_actor(guild)?;
+        let (reply, inbox) = oneshot::channel();
+        actor
+            .tx
+            .send(ActorCommand::KickBallot {
+                vote_id,
+                voter_id,
+                ballot,
+                reply,
+            })
+            .ok()?;
         inbox.await.ok()
     }
 
@@ -1418,7 +1721,11 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
             biased;
             command = inbox.recv() => {
                 let Some(command) = command else { break };
-                apply_command(worker, command);
+                let now_ms = start
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                apply_command(worker, command, now_ms);
             }
             _ = timer.tick() => {
                 worker.reconcile();
@@ -1426,6 +1733,9 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
                     .elapsed()
                     .as_millis()
                     .min(u128::from(u64::MAX)) as u64;
+                // Expire votes and react to roster changes before the queue
+                // drains, so a passed vote's enforcement is dispatchable now.
+                worker.kick_refresh(now_ms);
                 // Return to the inbox after each await. Evidence is already
                 // live, but creator configuration/status commands must not sit
                 // behind a 64-write burst either.
@@ -1438,6 +1748,7 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
 fn apply_command<S: RoomPersistence, H: RoomWrites>(
     worker: &mut GuildRoomWorker<S, H>,
     command: ActorCommand,
+    now_ms: u64,
 ) {
     match command {
         ActorCommand::Reconcile => worker.reconcile(),
@@ -1460,6 +1771,24 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
                 failures: worker.failures().iter().map(failure_line).collect(),
                 halted: worker.halted(),
             });
+        }
+        ActorCommand::KickStart {
+            vote_id,
+            room_id,
+            initiator_id,
+            target_id,
+            reply,
+        } => {
+            let _ =
+                reply.send(worker.kick_start(vote_id, room_id, initiator_id, target_id, now_ms));
+        }
+        ActorCommand::KickBallot {
+            vote_id,
+            voter_id,
+            ballot,
+            reply,
+        } => {
+            let _ = reply.send(worker.kick_cast(vote_id, voter_id, ballot, now_ms));
         }
     }
 }
