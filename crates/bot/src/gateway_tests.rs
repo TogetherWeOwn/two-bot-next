@@ -497,10 +497,10 @@ async fn pending_readyz_request_observes_drain_after_database_acquisition() {
 
     let db = TestDb::new().await;
     let gateway = Arc::new(RwLock::new(GatewayState::Connected));
-    let app = crate::server::router(crate::server::SharedState {
-        gateway: gateway.clone(),
-        database: Some(db.pool.clone()),
-    });
+    let app = crate::server::router(crate::server::SharedState::new(
+        gateway.clone(),
+        Some(db.pool.clone()),
+    ));
     // Hold every connection so the real ping waits in pool acquisition.
     let mut held = Vec::new();
     for _ in 0..db.pool.options().get_max_connections() {

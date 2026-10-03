@@ -99,6 +99,18 @@ class Client:
             # Even Cloudflare's error envelope may include configuration values.
             if authenticated:
                 raise GateError("api_http_failure") from None
+            # Only the bot's own parked-readiness answer (JSON 503, the Worker's
+            # probe allowlist) keeps its body: the gate echoes strict tokens from
+            # it. Every other error body is discarded (TOG-13044).
+            headers = error.headers if error.headers is not None else {}
+            media = (headers.get("content-type") or "").split(";")[0].strip().lower()
+            if error.code == 503 and media == "application/json":
+                try:
+                    body = error.read(MAX_BODY + 1)
+                except (OSError, ValueError):
+                    return error.code, {}, b""
+                if len(body) <= MAX_BODY:
+                    return error.code, headers, body
             return error.code, {}, b""
         except (URLError, TimeoutError, OSError):
             if authenticated:
@@ -295,6 +307,18 @@ def rollout_observation(row):
     return " ".join(parts)
 
 
+def gateway_failure(report):
+    # The bot's fixed phase/class for a failed gateway task, as `phase:class`;
+    # anything that is not two strict tokens is dropped, never echoed.
+    failure = report.get("gateway_failure")
+    if not isinstance(failure, dict):
+        return None
+    parts = [failure.get("phase"), failure.get("class")]
+    if all(isinstance(part, str) and TOKEN.fullmatch(part) for part in parts):
+        return ":".join(parts)
+    return None
+
+
 def runtime_observation(status, headers, body, version, revision, build_id):
     # Only component names/states that fit a strict token are echoed; the probe
     # body and headers are service output and are otherwise discarded.
@@ -308,9 +332,27 @@ def runtime_observation(status, headers, body, version, revision, build_id):
         parts.append("identity=" + ("match" if headers.get("x-two-worker-version") == version
                                     and report.get("build_revision") == revision
                                     and report.get("build_id") == build_id else "mismatch"))
+        failure = gateway_failure(report)
+        if failure:
+            parts.append("gateway_failure=" + failure)
     except GateError:
         parts.append("body=unreadable")
     return " ".join(parts)
+
+
+def unconverged_failure(client, url, version, revision, build_id):
+    # Best effort while the rollout has not converged, so the timeout log can
+    # name why the gateway never became ready: the failure of THIS build only.
+    # An older Worker or image (identity mismatch) never contributes.
+    _, headers, body = client.request(url + "/readyz")
+    try:
+        report = mapping(decode(body))
+    except GateError:
+        return None
+    if (headers.get("x-two-worker-version") != version or report.get("build_revision") != revision
+            or report.get("build_id") != build_id):
+        return None
+    return gateway_failure(report)
 
 
 def staging_url():
@@ -371,6 +413,7 @@ def verify(args, client):
     url = staging_url()
     pinned = None
     while time.monotonic() < client.deadline:
+        probed = False
         app = application(client)
         require(app["id"] == baseline["application_id"]
                 and app["durable_objects"]["namespace_id"] == baseline["namespace_id"], "application_identity_drift")
@@ -386,6 +429,7 @@ def verify(args, client):
                 require(mapping(app.get("configuration")).get("image") == image, "application_image_drift")
                 active_worker(client, version)
                 status, headers, body = client.request(url + "/readyz")
+                probed = True
                 client.observation = "rollout=converged " + runtime_observation(
                     status, headers, body, version, baseline["revision"], baseline["build_id"])
                 if runtime_ready(status, headers, body, version, baseline["revision"], baseline["build_id"]):
@@ -411,6 +455,11 @@ def verify(args, client):
                         return
         # Warming is allowed, but never acceptance evidence; discard the body.
         client.request(url + "/health")
+        # Only once this build's rollout exists: before that nothing of ours runs.
+        if pinned is not None and not probed:
+            failure = unconverged_failure(client, url, version, baseline["revision"], baseline["build_id"])
+            if failure:
+                client.observation += " gateway_failure=" + failure
         time.sleep(max(0, min(5, client.deadline - time.monotonic())))
     raise GateError("rollout_timeout")
 

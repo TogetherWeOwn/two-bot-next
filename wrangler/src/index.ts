@@ -185,6 +185,30 @@ function isBotProbeResponse(response: Response): boolean {
   return response.status === 503 && mediaType === "application/json";
 }
 
+// TOG-13044: while the gateway task is failing, the bot serves its fixed
+// phase/class on /readyz for a bounded linger. Container stdout is not in
+// Workers Logs, so the keepalive re-emits those two tokens as a structured
+// warn. Strict tokens only: nothing else from the probe body is ever logged.
+const FAILURE_TOKEN = /^[a-z0-9_]{1,32}$/;
+const MAX_PROBE_BODY_BYTES = 64 * 1024;
+
+function gatewayFailure(body: ArrayBuffer): { phase: string; class: string } | null {
+  if (body.byteLength > MAX_PROBE_BODY_BYTES) return null;
+  try {
+    const report: unknown = JSON.parse(new TextDecoder().decode(body));
+    const field = (report as { gateway_failure?: unknown } | null)?.gateway_failure;
+    if (typeof field !== "object" || field === null) return null;
+    const { phase, class: errorClass } = field as Record<string, unknown>;
+    if (typeof phase === "string" && typeof errorClass === "string"
+      && FAILURE_TOKEN.test(phase) && FAILURE_TOKEN.test(errorClass)) {
+      return { phase, class: errorClass };
+    }
+  } catch {
+    // Not the bot's JSON: nothing to report.
+  }
+  return null;
+}
+
 function containerPort(raw: string | undefined): number {
   if (raw === undefined) return 8080;
   const port = Number(raw);
@@ -405,7 +429,13 @@ export class TwoBotContainer extends Container<Env> {
             status = res.status;
             if (!res.ok) console.warn(`two-bot /readyz unhealthy: ${status}`);
             // Drain rather than cancel the SDK 0.3.7 proxy response pipe.
-            await res.arrayBuffer();
+            const body = await res.arrayBuffer();
+            const failure = isBotProbeResponse(res) ? gatewayFailure(body) : null;
+            if (failure) {
+              console.warn(JSON.stringify({
+                event: "container_gateway_failure", phase: failure.phase, class: failure.class,
+              }));
+            }
           } catch (error) {
             if (error instanceof OwnershipRefused) {
               admitted = false;

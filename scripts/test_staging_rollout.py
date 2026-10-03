@@ -659,6 +659,35 @@ class ClientSanitizationTests(OfflineTestCase):
         )
         self.assertEqual(client.request(URL + "/readyz"), (503, {}, b""))
 
+    def test_unauthenticated_503_keeps_the_body_only_when_it_is_json(self):
+        body = b'{"gateway_failure":{"phase":"durable_gateway","class":"checkpoint_load_failed"}}'
+        for headers in [{"content-type": "application/json"},
+                        {"content-type": "Application/JSON; charset=utf-8"}]:
+            with self.subTest(headers=headers):
+                client = rollout.Client(ACCOUNT, SENTINEL)
+                client.opener.open.side_effect = HTTPError(URL, 503, "x", headers, io.BytesIO(body))
+                self.assertEqual(client.request(URL + "/readyz"), (503, headers, body))
+        for code, headers in [(503, {"content-type": "text/plain"}), (503, {}),
+                              (500, {"content-type": "application/json"}),
+                              (429, {"content-type": "application/json"})]:
+            with self.subTest(code=code, headers=headers):
+                client = rollout.Client(ACCOUNT, SENTINEL)
+                client.opener.open.side_effect = HTTPError(
+                    URL, code, SENTINEL, headers, io.BytesIO(SENTINEL.encode()))
+                self.assertEqual(client.request(URL + "/readyz"), (code, {}, b""))
+
+    def test_unauthenticated_json_503_body_is_size_bounded_and_read_errors_discard_it(self):
+        client = rollout.Client(ACCOUNT, SENTINEL)
+        big = io.BytesIO(b" " * (rollout.MAX_BODY + 1))
+        client.opener.open.side_effect = HTTPError(
+            URL, 503, "x", {"content-type": "application/json"}, big)
+        self.assertEqual(client.request(URL + "/readyz"), (503, {}, b""))
+        broken = Mock()
+        broken.read.side_effect = OSError(SENTINEL)
+        client.opener.open.side_effect = HTTPError(
+            URL, 503, "x", {"content-type": "application/json"}, broken)
+        self.assertEqual(client.request(URL + "/readyz"), (503, {}, b""))
+
     def test_api_error_envelope_does_not_expose_upstream_errors(self):
         client = rollout.Client(ACCOUNT, SENTINEL)
         body = json.dumps({"success": False, "errors": [{"message": SENTINEL}],
@@ -1006,6 +1035,129 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(client.observation,
                          "rollout=progressing instances=active:1,healthy:0,failed:0,starting:1")
         self.assert_no_secret_saved_or_printed()
+
+    def readyz_body(self, failure, **extra):
+        body = {"build_revision": REVISION, "build_id": BUILD_ID,
+                "components": [["process", "ready"], ["gateway", "down"]], **extra}
+        if failure is not None:
+            body["gateway_failure"] = failure
+        return json.dumps(body).encode()
+
+    def test_timeout_names_the_gateway_failure_class_from_a_converged_rollout(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        _, headers, _ = ready_response()
+        failure = {"phase": "durable_gateway", "class": "checkpoint_load_failed"}
+        self.clock.now = 100
+        client = verify_client()
+        client.request_routes[URL + "/readyz"] = [(503, headers, self.readyz_body(failure))]
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertEqual(
+            client.observation,
+            "rollout=converged readyz=503 components=process:ready,gateway:down identity=match "
+            "gateway_failure=durable_gateway:checkpoint_load_failed")
+
+    def test_hostile_gateway_failure_values_are_dropped_from_the_observation(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        _, headers, _ = ready_response()
+        hostile = [
+            {"phase": "durable_gateway", "class": "postgres://user:" + SENTINEL + "@db/app"},
+            {"phase": "durable_gateway", "class": SENTINEL},
+            {"phase": "durable_gateway", "class": "Checkpoint_Load_Failed"},
+            {"phase": "durable_gateway", "class": "a" * 33},
+            {"phase": "", "class": "checkpoint_load_failed"},
+            {"phase": "durable gateway", "class": "checkpoint_load_failed"},
+            {"phase": "durable_gateway", "class": "checkpoint_load_failed\n"},
+            {"phase": "durable_gateway", "class": 7},
+            {"phase": "durable_gateway"},
+            "durable_gateway:checkpoint_load_failed", None, ["durable_gateway", "x"],
+        ]
+        for value in hostile:
+            with self.subTest(value=value):
+                self.clock.now = 100
+                client = verify_client()
+                body = self.readyz_body(None, gateway_failure=value)
+                client.request_routes[URL + "/readyz"] = [(503, headers, body)]
+                self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+                self.assertEqual(
+                    client.observation,
+                    "rollout=converged readyz=503 components=process:ready,gateway:down identity=match")
+                self.assertNotIn(SENTINEL, client.observation)
+        self.assert_no_secret_saved_or_printed()
+
+    def test_failure_with_extra_keys_prints_only_the_two_tokens(self):
+        self.assertEqual(
+            rollout.runtime_observation(
+                503, {"x-two-worker-version": VERSION},
+                self.readyz_body({"phase": "durable_gateway", "class": "gateway_runtime_failed",
+                                  "error": SENTINEL}),
+                VERSION, REVISION, BUILD_ID),
+            "readyz=503 components=process:ready,gateway:down identity=match "
+            "gateway_failure=durable_gateway:gateway_runtime_failed")
+
+    def unconverged_client(self, readyz):
+        pending = completed_row()
+        pending["status"] = "progressing"
+        pending["health"] = {"instances": {"active": 0, "healthy": 0, "failed": 0, "starting": 1,
+                                           "scheduling": 0}}
+        client = verify_client()
+        client.api_routes[DETAIL_PATH] = [pending]
+        client.request_routes[URL + "/readyz"] = [readyz]
+        return client
+
+    def test_unconverged_rollout_still_surfaces_the_gateway_failure_of_this_build(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        failure = {"phase": "durable_gateway", "class": "automod_config_invalid"}
+        self.clock.now = 100
+        client = self.unconverged_client(
+            (503, {"x-two-worker-version": VERSION}, self.readyz_body(failure)))
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertEqual(
+            client.observation,
+            "rollout=progressing instances=active:0,healthy:0,failed:0,starting:1,scheduling:0 "
+            "gateway_failure=durable_gateway:automod_config_invalid")
+        self.assert_no_evidence()
+
+    def test_unconverged_rollout_ignores_a_failure_from_another_worker_or_image(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        failure = {"phase": "durable_gateway", "class": "automod_config_invalid"}
+        stale = json.loads(self.readyz_body(failure))
+        stale["build_id"] = "999999-1"
+        for headers, body in [({"x-two-worker-version": OLD_VERSION}, self.readyz_body(failure)),
+                              ({}, self.readyz_body(failure)),
+                              ({"x-two-worker-version": VERSION}, json.dumps(stale).encode()),
+                              ({"x-two-worker-version": VERSION}, SENTINEL.encode()),
+                              ({"x-two-worker-version": VERSION}, b"[]"),
+                              ({}, b"")]:
+            with self.subTest(headers=headers):
+                self.clock.now = 100
+                client = self.unconverged_client((503, headers, body))
+                self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+                self.assertEqual(client.observation,
+                                 "rollout=progressing instances=active:0,healthy:0,failed:0,starting:1,scheduling:0")
+        self.assert_no_secret_saved_or_printed()
+
+    def test_main_prints_the_gateway_failure_in_the_last_observation(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        argv = ["staging_rollout.py", "verify", "--receipt", self.args.receipt,
+                "--output", self.args.output, "--evidence", self.args.evidence]
+        _, headers, _ = ready_response()
+        body = self.readyz_body({"phase": "durable_gateway", "class": "milestones_load_failed"})
+        client = verify_client()
+        client.request_routes[URL + "/readyz"] = [(503, headers, body)]
+        self.stdout.seek(0)
+        self.stdout.truncate()
+        with patch.object(sys, "argv", argv), patch.object(rollout, "Client", return_value=client):
+            self.assertEqual(rollout.main(), 1)
+        self.assertEqual(self.stdout.getvalue().splitlines(), [
+            "staging rollout gate failed: rollout_timeout",
+            "last observation before timeout: rollout=converged readyz=503 "
+            "components=process:ready,gateway:down identity=match "
+            "gateway_failure=durable_gateway:milestones_load_failed"])
 
     def test_main_prints_last_observation_only_for_rollout_timeout(self):
         self.prepare_baseline()
