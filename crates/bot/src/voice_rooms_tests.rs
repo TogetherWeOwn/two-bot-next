@@ -3049,7 +3049,7 @@ async fn creator_edit_applies_to_new_rooms_only() {
     let mut edited = text_creator();
     edited.text_channel_name = Some("lounge".to_owned());
     edited.text_viewer_role_id = Some(42);
-    apply_command(&mut worker, ActorCommand::CreatorAdded(edited));
+    apply_command(&mut worker, ActorCommand::CreatorAdded(edited), now);
     assert_eq!(
         worker.companions[&500].settings, before,
         "the existing companion keeps its creation-time snapshot"
