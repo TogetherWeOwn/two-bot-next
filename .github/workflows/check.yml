@@ -343,6 +343,10 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
 
+      - name: voice room store regressions (CI service only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-cutover --test voice_rooms_store --locked -- --ignored
+
       - name: Docker dependency-layer manifests (offline)
         run: python3 scripts/check-docker-manifests.py
 
