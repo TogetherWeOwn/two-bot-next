@@ -117,6 +117,9 @@ pub struct RoomChannelAttributes {
     pub video_quality_mode: Option<VideoQualityMode>,
     pub nsfw: bool,
     pub user_limit: u16,
+    /// Create-time sorting position (V8 placement); `None` lets Discord append.
+    pub position: Option<u64>,
+    /// Empty means "include no overrides": the room syncs to its category.
     pub overwrites: Vec<PermissionOverwrite>,
 }
 
@@ -149,6 +152,7 @@ impl RoomChannelAttributes {
             video_quality_mode: channel.video_quality_mode,
             nsfw: channel.nsfw.unwrap_or(false),
             user_limit,
+            position: None,
             overwrites,
         })
     }
@@ -460,8 +464,15 @@ impl RoomHttp {
             .create_guild_channel(Id::new(guild_id), name)
             .kind(ChannelType::GuildVoice)
             .nsfw(attributes.nsfw)
-            .user_limit(attributes.user_limit)
-            .permission_overwrites(&attributes.overwrites);
+            .user_limit(attributes.user_limit);
+        // An empty list is omitted rather than sent, so a category-synced room
+        // really syncs instead of being created with an explicit empty set.
+        if !attributes.overwrites.is_empty() {
+            request = request.permission_overwrites(&attributes.overwrites);
+        }
+        if let Some(position) = attributes.position {
+            request = request.position(position);
+        }
         if let Some(parent_id) = attributes.parent_id {
             request = request.parent_id(Id::new(parent_id));
         }
@@ -733,6 +744,7 @@ mod tests {
                 video_quality_mode: Some(VideoQualityMode::Full),
                 nsfw: true,
                 user_limit: 8,
+                position: None,
                 overwrites: overrides,
             }
         );

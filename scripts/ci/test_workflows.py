@@ -10,17 +10,26 @@ ROOT = Path(__file__).resolve().parents[2]
 STATIC_FALSE = "${{ false }}"
 JOB_INVENTORY = {
     "check.yml": {"check", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
-                  "community-db", "feeds-db", "tickets-postgres", "worker"},
+                  "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain"},
     "deploy-production.yml": {"guard", "production"},
     "deploy-staging.yml": {"deploy"},
     "nightly.yml": {"pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
-    "release.yml": {"release-please", "dispatch-checks"},
+    "release.yml": {"release-please", "dispatch-checks", "sbom-target", "release-sbom",
+                    "attach-sbom"},
     "staging-migrate.yml": {"migrate"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
+    # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
+    # `image` builds/scans the untrusted ref with pinned actions only; `verify`
+    # runs the local validation/evidence/preflight scripts without ever
+    # checking out inputs.ref (CodeQL cache-poisoning gate).
+    "sbom.yml": {"image", "verify"},
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
-REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml"}
+# TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
+REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml",
+                   ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
+                   ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml"}
 # Main's runner routing (#265, 2026-10-02): the repo is public and the org's
 # self-hosted runner group refuses public repos, so every job routes through
 # one expression — public repo -> GitHub-hosted, private -> CI_OVERFLOW_* switch
@@ -59,13 +68,13 @@ def runner_allowed(job_id, runs_on):
 
 
 def staging_dispatch_errors(workflow):
-    """The suspended staging workflow keeps exactly one fenced dispatch input.
+    """The active staging workflow keeps exactly one fenced dispatch input.
 
-    `release_fence` exists on main (TOG-11143) so post-handoff re-activation
-    is explicit and auditable; it defaults to false and the job-level
-    `if: ${{ false }}` stays authoritative while suspension holds. Anything
+    `release_fence` exists on main (TOG-11143) so post-handoff release of an
+    uninitialized/parked singleton is explicit and auditable; it defaults to
+    false and the deploy job itself runs unconditionally (TOG-12856). Anything
     else in the dispatch block (an arming switch, a deploy flag, a default of
-    true) is an activation route around the static suspension.
+    true) is an unreviewed deploy route outside the pinned shape.
     """
     name = "deploy-staging.yml"
     errors = []
@@ -123,7 +132,7 @@ def staging_migrate_errors(workflow):
         errors.append(f"{name}:migrate: must use the routed runner expression for job 'migrate'")
     text = str(job).lower()
     if job.get("uses") is not None or any(marker in text for marker in DEPLOY_MARKERS):
-        errors.append(f"{name}:migrate: deployment/probe alternative outside suspended workflow")
+        errors.append(f"{name}:migrate: deployment/probe alternative outside approved deploy workflows")
     return errors
 
 
@@ -142,9 +151,10 @@ def production_errors(workflow):
     if ("environment" in guard or "uses" in guard
             or any(marker in str(guard).lower() for marker in DEPLOY_MARKERS)):
         errors.append(f"{name}:guard: deployment/probe alternative outside the production job")
-    # Lexical regression pins on the guard script. A suspended staging run
-    # concludes `skipped`, not `success`, so while deploy-staging is statically
-    # disabled every production SHA still needs a staging deploy that succeeded.
+    # Lexical regression pins on the guard script. deploy-staging runs
+    # execute (TOG-12856), so every production SHA needs a staging deploy
+    # run on that SHA that concluded `success` (a `skipped` run does not
+    # satisfy the guard).
     script = "\n".join(step.get("run", "") for step in guard.get("steps", []))
     for required in ("actions/workflows/deploy-staging.yml/runs", 'status="success"',
                      'refuse(f"deploy-staging has no successful run on {sha}")',
@@ -155,7 +165,34 @@ def production_errors(workflow):
     return errors
 
 
-def suspension_errors(workflows):
+def staging_active_errors(workflow):
+    """The deploy job is live (TOG-12856): no static suspension guard.
+
+    The job must carry no `if:` at all — unconditional on both the push/main
+    and workflow_dispatch triggers — while keeping the `staging` environment
+    scope, the routed runner for job 'deploy', the fenced `release_fence`
+    dispatch shape, default-deny top-level permissions and the least-privilege
+    per-job grant. A job-level condition would silently skip deploys on some
+    SHAs and leave the production guard refusing those SHAs; step-level
+    guards are not an equivalent gate, so any job condition fails closed.
+    """
+    name = "deploy-staging.yml"
+    errors = []
+    job = (workflow.get("jobs") or {}).get("deploy", {})
+    if "if" in job:
+        errors.append(f"{name}:deploy: a job condition would silently skip staging deploys")
+    if job.get("environment") != "staging":
+        errors.append(f"{name}:deploy: must stay scoped to the staging environment")
+    if not runner_allowed("deploy", job.get("runs-on")):
+        errors.append(f"{name}:deploy: must use the routed runner expression for job 'deploy'")
+    for step in job.get("steps", []):
+        if step.get("if") == STATIC_FALSE:
+            errors.append(f"{name}:deploy: a statically-disabled step would report success without deploying")
+            break
+    return errors
+
+
+def workflow_policy_errors(workflows):
     errors = []
     # Fail closed on new workflows/jobs, including reusable-workflow alternatives.
     # An intentional addition needs an explicit policy change and independent review.
@@ -170,26 +207,25 @@ def suspension_errors(workflows):
             continue
         if name == "deploy-staging.yml":
             errors.extend(staging_dispatch_errors(workflow))
+            errors.extend(staging_active_errors(workflow))
         if name == "staging-migrate.yml":
             # Manual runner (TOG-11572): pinned shape above, not the
-            # suspended-deploy policy. The generic environment/marker scan
+            # staging-deploy policy. The generic environment/marker scan
             # below would flag its staging-migrate Environment binding.
             errors.extend(staging_migrate_errors(workflow))
             continue
         for job_id, job in jobs.items():
-            if name == "deploy-staging.yml":
-                if job.get("if") != STATIC_FALSE:
-                    errors.append(f"{name}:{job_id}: deployment/probes are not statically disabled")
-                if job_id == "deploy":
-                    continue  # the dispatch shape is pinned by staging_dispatch_errors above
+            if name == "deploy-staging.yml" and job_id == "deploy":
+                continue  # the live deploy route: pinned by the staging checks above
             else:
-                # Retargeting a known CI job must not create an activation bypass.
+                # Retargeting a known CI job must not create an unapproved
+                # deploy/probe route outside the deploy workflows.
                 text = str(job).lower()
                 uses = job.get("uses")
                 if ("environment" in job
                         or (uses is not None and REUSABLE_CALLS.get((name, job_id)) != uses)
                         or any(marker in text for marker in DEPLOY_MARKERS)):
-                    errors.append(f"{name}:{job_id}: deployment/probe alternative outside suspended workflow")
+                    errors.append(f"{name}:{job_id}: deployment/probe alternative outside approved deploy workflows")
     return errors
 
 
@@ -197,30 +233,34 @@ class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.workflows = load_workflows()
 
-    def test_staging_is_suspended_for_push_and_dispatch(self):
+    def test_staging_runs_unconditionally_for_push_and_dispatch(self):
         staging = self.workflows["deploy-staging.yml"]
         self.assertEqual(staging_dispatch_errors(staging), [])
-        self.assertEqual(suspension_errors(self.workflows), [])
+        self.assertEqual(staging_active_errors(staging), [])
+        self.assertEqual(workflow_policy_errors(self.workflows), [])
         self.assertEqual(staging["jobs"]["deploy"]["environment"], "staging")
+        self.assertNotIn("if", staging["jobs"]["deploy"])
 
-    def test_removing_or_mutating_guard_fails(self):
-        for guard in (None, "true", "${{ true }}", "${{ vars.ENABLE_STAGING }}",
-                      "${{ github.ref == 'refs/heads/main' }}", "${{ inputs.deploy }}"):
+    def test_any_job_condition_on_staging_deploy_fails(self):
+        # The live deploy job carries no `if` at all: a job-level condition
+        # would silently skip deploys on some SHAs (including the old
+        # `if: ${{ false }}` suspension), leaving the production guard
+        # refusing those SHAs with no deploy ever running.
+        for guard in ("${{ false }}", "true", "${{ true }}", "${{ vars.ENABLE_STAGING }}",
+                      "${{ github.ref == 'refs/heads/main' }}", "${{ inputs.deploy }}",
+                      "${{ always() }}"):
             with self.subTest(guard=guard):
                 workflows = deepcopy(self.workflows)
-                job = workflows["deploy-staging.yml"]["jobs"]["deploy"]
-                if guard is None:
-                    job.pop("if", None)
-                else:
-                    job["if"] = guard
-                self.assertTrue(suspension_errors(workflows))
+                workflows["deploy-staging.yml"]["jobs"]["deploy"]["if"] = guard
+                self.assertTrue(workflow_policy_errors(workflows))
+                self.assertTrue(staging_active_errors(workflows["deploy-staging.yml"]))
 
     def test_dispatch_inputs_cannot_arm_the_release_fence(self):
         # The workflow_dispatch inputs block must not gain an arming switch:
-        # an attacker-readable input that the (suspended) steps could consult
-        # would be an activation route around the static `if: false`. Each
+        # an attacker-readable input the steps could consult would be an
+        # unreviewed deploy route outside the pinned dispatch shape. Each
         # mutation below must trip staging_dispatch_errors (surfaced through
-        # suspension_errors on the real inventory).
+        # workflow_policy_errors on the real inventory).
         for dispatch in ({"inputs": {"deploy": {"description": "deploy now", "type": "boolean", "default": False}}},
                          {"inputs": {"release_fence": {"description": "x", "type": "boolean", "default": True}}},
                          {"inputs": {"enable": {"description": "x", "type": "boolean", "default": False}}},
@@ -229,25 +269,27 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(dispatch=dispatch):
                 workflows = deepcopy(self.workflows)
                 workflows["deploy-staging.yml"]["on"]["workflow_dispatch"] = dispatch
-                self.assertTrue(suspension_errors(workflows))
+                self.assertTrue(workflow_policy_errors(workflows))
 
-    def test_step_level_guard_is_not_sufficient(self):
+    def test_step_level_skip_is_not_a_deploy(self):
+        # Neutering the live job step-by-step would report success without
+        # deploying, which the production guard would then accept as a
+        # successful staging run. Any step-level static disable fails closed.
         workflows = deepcopy(self.workflows)
         job = workflows["deploy-staging.yml"]["jobs"]["deploy"]
-        job.pop("if", None)
         for step in job["steps"]:
             step["if"] = STATIC_FALSE
-        self.assertTrue(suspension_errors(workflows))
+        self.assertTrue(workflow_policy_errors(workflows))
 
-    def test_new_job_or_workflow_is_not_an_activation_route(self):
+    def test_new_job_or_workflow_is_not_an_unapproved_deploy_route(self):
         for name in self.workflows:
             with self.subTest(name=name):
                 workflows = deepcopy(self.workflows)
                 workflows[name]["jobs"]["alternate"] = {"uses": "./.github/workflows/deploy-staging.yml"}
-                self.assertTrue(suspension_errors(workflows))
+                self.assertTrue(workflow_policy_errors(workflows))
         workflows = deepcopy(self.workflows)
         workflows["alternate.yml"] = {"jobs": {"deploy": {"run": "wrangler deploy"}}}
-        self.assertTrue(suspension_errors(workflows))
+        self.assertTrue(workflow_policy_errors(workflows))
 
     def test_retargeting_known_job_fails(self):
         for change in ({"environment": "staging"}, {"uses": "./.github/workflows/deploy-staging.yml"},
@@ -256,7 +298,7 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(change=change):
                 workflows = deepcopy(self.workflows)
                 workflows["check.yml"]["jobs"]["worker"].update(change)
-                self.assertTrue(suspension_errors(workflows))
+                self.assertTrue(workflow_policy_errors(workflows))
 
     def test_reusable_call_cannot_be_retargeted(self):
         for target in ("./.github/workflows/deploy-staging.yml", "./.github/workflows/deploy-production.yml",
@@ -264,7 +306,7 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(target=target):
                 workflows = deepcopy(self.workflows)
                 workflows["nightly.yml"]["jobs"]["pipeline-benchmark"]["uses"] = target
-                self.assertTrue(suspension_errors(workflows))
+                self.assertTrue(workflow_policy_errors(workflows))
 
     def test_production_route_is_dispatch_only_and_gated(self):
         production = self.workflows["deploy-production.yml"]
@@ -309,7 +351,7 @@ class WorkflowTests(unittest.TestCase):
         # retargeted runner, wrangler/probe step) must fail closed here.
         migrate = self.workflows["staging-migrate.yml"]
         self.assertEqual(staging_migrate_errors(migrate), [])
-        self.assertEqual(suspension_errors(self.workflows), [])
+        self.assertEqual(workflow_policy_errors(self.workflows), [])
 
         def mutated(change):
             workflow = deepcopy(migrate)
@@ -377,12 +419,6 @@ class WorkflowTests(unittest.TestCase):
             for job_id, job in workflow["jobs"].items():
                 with self.subTest(workflow=name, job=job_id):
                     expected = {"contents": "read"}
-                    if (name, job_id) == ("deploy-staging.yml", "deploy"):
-                        # The suspended staging job carries no per-job grant:
-                        # top-level `permissions: {}` is the default-deny and
-                        # nothing on a statically-disabled job needs a token.
-                        self.assertNotIn("permissions", job)
-                        continue
                     if (name, job_id) == ("supply-chain.yml", "pr-lint"):
                         expected["pull-requests"] = "read"
                     elif (name, job_id) == ("deploy-production.yml", "guard"):
@@ -391,6 +427,9 @@ class WorkflowTests(unittest.TestCase):
                         expected = {"contents": "write", "pull-requests": "write"}
                     elif (name, job_id) == ("release.yml", "dispatch-checks"):
                         expected = {"actions": "write"}
+                    elif (name, job_id) == ("release.yml", "attach-sbom"):
+                        # TOG-10893: uploads verified SBOMs to the published tag.
+                        expected = {"contents": "write"}
                     self.assertEqual(job["permissions"], expected)
                     for step in job.get("steps", []):
                         if step.get("uses", "").startswith("actions/checkout@"):

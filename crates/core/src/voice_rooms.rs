@@ -1099,6 +1099,8 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
             "setup",
             "Show voice-room status, health and creator channels",
         ),
+        CommandDefinition::new("ping", "Show the bot's response latency"),
+        CommandDefinition::new("invite", "Show this server's invite link"),
     ]
 }
 
@@ -1732,7 +1734,7 @@ mod tests {
         let defs = voice_commands();
         assert_eq!(
             defs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-            ["create", "setup"]
+            ["create", "setup", "ping", "invite"]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
         assert_eq!(
@@ -1745,6 +1747,11 @@ mod tests {
         // `/setup` is viewable by anyone; handler actions need admin.
         assert_eq!(defs[1].default_member_permissions, None);
         assert!(defs[1].options.is_empty());
+        // `/ping` and `/invite` are open to everyone and take no options.
+        for def in &defs[2..] {
+            assert_eq!(def.default_member_permissions, None);
+            assert!(def.options.is_empty());
+        }
         // Merges cleanly alongside the other slices, first-wins.
         let merged = merge_commands(
             &[feature_commands(), moderation_commands(), voice_commands()],
@@ -1753,6 +1760,8 @@ mod tests {
         .expect("voice merges cleanly");
         assert!(merged.iter().any(|d| d.name == "create"));
         assert!(merged.iter().any(|d| d.name == "setup"));
+        assert!(merged.iter().any(|d| d.name == "ping"));
+        assert!(merged.iter().any(|d| d.name == "invite"));
 
         assert!(!VoiceGates::from_map(&Default::default()).enabled);
         let vars: HashMap<String, String> = [("TWO_VOICE".to_owned(), "1".to_owned())]

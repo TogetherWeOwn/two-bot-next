@@ -81,6 +81,15 @@ BEGIN
          reasons_json, bulk_join_window, flagged, created_at)
         VALUES (k, g, u, '2026-09-01T00:00:00Z', '2026-10-01T00:00:00Z', 'fixture', 3,
           '[]', false, true, '2026-10-01T00:00:00Z');
+      INSERT INTO containment_events
+        (audit_entry_id, guild_id, executor_id, action, target_id, weight, occurred_at, state,
+         reason, created_at)
+        VALUES (k, g, u, 'ban', u, 1, '2026-10-01T00:00:00Z', 'contain', 'fixture',
+          '2026-10-01T00:00:00Z');
+      INSERT INTO containment_incidents
+        (id, guild_id, executor_id, trigger_audit_entry_id, heat, state, result_json, started_at,
+         completed_at)
+        VALUES (k, g, u, k, 3, 'contained', '{}', '2026-10-01T00:00:00Z', '2026-10-01T00:00:01Z');
       INSERT INTO operational_audit_log
         (entry_id, event_kind, guild_id, occurred_at, actor_id, target_id, metadata_json, created_at)
         VALUES (k, 'fixture', g, now(), u, u, '{}', now());
