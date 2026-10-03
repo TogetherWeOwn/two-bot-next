@@ -95,6 +95,9 @@ observation is complete. For Rust stdout/stderr, use the affected container's
 logs in the Cloudflare dashboard. Wrangler 4.147.0 has no `containers logs`
 subcommand; do not invent one. Container inspection may list account-wide
 resources: match the affected environment/application before taking any action.
+No Cloudflare API reaches container stdout either, so voice-event emission has
+no CI read path; follow [staging voice-event verification](staging-voice-event-verification.md)
+for the dashboard procedure.
 
 Rust uses formatted `tracing` logs, configured by `RUST_LOG`, fallback
 `two_bot=info`; it does not consume legacy `LOG_LEVEL`. This wrapper currently
