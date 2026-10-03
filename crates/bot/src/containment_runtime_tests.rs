@@ -636,8 +636,7 @@ async fn containment_worker_wrong_application_id_claims_nothing() {
     for request in mock.requests() {
         assert_eq!(request.method, "GET", "no REST beyond the identity reads");
         assert!(
-            request.path == "/api/v10/users/@me"
-                || request.path == "/api/v10/applications/@me",
+            request.path == "/api/v10/users/@me" || request.path == "/api/v10/applications/@me",
             "identity read only: {}",
             request.path
         );
