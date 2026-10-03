@@ -169,6 +169,20 @@ async fn real_sqlx_runner_cases() -> TestResult {
         .run("--apply", Some(migrator.clone()), "other-host", &db)
         .await;
     assert_eq!(code, 2);
+    // Production-like and empty pins refuse before any DDL.
+    let (code, _, err) = fx
+        .run(
+            "--apply",
+            Some(migrator.clone()),
+            "ep-prod-fixture.us-east-2.aws.neon.tech",
+            &db,
+        )
+        .await;
+    assert_eq!(code, 2, "{err}");
+    let (code, _, _) = fx.run("--apply", Some(migrator.clone()), "", &db).await;
+    assert_eq!(code, 2);
+    let (code, _, _) = fx.run("--apply", Some(migrator.clone()), &host, "").await;
+    assert_eq!(code, 2);
     // A login that cannot SET ROLE two_bot_migrator is refused.
     let outsider = fx.url(&fx.outsider, &fx.database);
     let (code, _, err) = fx.run("--apply", Some(outsider), &host, &db).await;
