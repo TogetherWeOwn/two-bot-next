@@ -457,8 +457,8 @@ async fn vote_kick_deny_is_member_scoped_connect_only_on_that_room() {
     assert_eq!(
         requests[0].body,
         json!({
-            "id": "300", "type": 1,
             "allow": "0", "deny": Permissions::CONNECT.bits().to_string(),
+            "type": 1,
         })
     );
     assert!(requests[0].bot_authenticated);
