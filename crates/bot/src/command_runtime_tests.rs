@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -605,6 +605,10 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "feed-add"
                         | "feed-remove"
                         | "feed-list"
+                        | "purge"
+                        | "slowmode"
+                        | "lockdown"
+                        | "unlock"
                         | "lfg"
                         | "lfg-close"
                         | "schedule"
@@ -765,6 +769,55 @@ async fn dispatch_spawns_interaction_work_off_the_shard_loop() {
     .await;
     let callbacks = mock.posts_to("/callback").await;
     assert_eq!(callbacks.len(), 1);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn bounded_dispatch_keeps_publication_independent_and_cancels_on_gateway_exit() {
+    let (mock, origin) = MockRest::start_script(
+        (0..17)
+            .map(|_| RestResponse {
+                status: 200,
+                body: None,
+                delay: Duration::from_secs(30),
+            })
+            .collect(),
+    )
+    .await;
+    let runtime = runtime_without_db(gates(false, false), false, origin);
+    let guard = runtime.dispatch_guard();
+    let event = Event::InteractionCreate(Box::new(InteractionCreate(slash(
+        "sticky-remove",
+        Some(CHANNEL),
+        Vec::new(),
+    ))));
+    for _ in 0..16 {
+        assert!(runtime.dispatch(&event));
+    }
+    for _ in 0..100 {
+        assert!(
+            !runtime.dispatch(&event),
+            "no spawned waiters on saturation"
+        );
+    }
+    assert!(
+        runtime.dispatch(&ready()),
+        "registry has separate admission"
+    );
+    assert!(
+        !runtime.dispatch(&ready()),
+        "overlapping registry sync coalesces"
+    );
+    wait_for(|| mock.requests().len() == 17, "all admitted work started").await;
+    assert_eq!(mock.posts_to("/callback").await.len(), 16);
+    drop(guard);
+    wait_for(
+        || Arc::strong_count(&runtime) == 1,
+        "all scoped work cancelled",
+    )
+    .await;
+    assert!(!runtime.dispatch(&event), "closed scope refuses new work");
+    assert_eq!(mock.requests().len(), 17, "rejected work never sent HTTP");
     mock.shutdown().await;
 }
 
@@ -1536,13 +1589,8 @@ async fn ready_publish_withholds_gated_off_feed_commands() {
 async fn duplicate_ready_republishes_the_identical_set() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
-    runtime.dispatch(&ready());
-    runtime.dispatch(&ready());
-    wait_for(
-        || mock.requests().iter().filter(|r| r.method == "PUT").count() == 2,
-        "second registry publish PUT",
-    )
-    .await;
+    runtime.publish_registry(Some(1111)).await;
+    runtime.publish_registry(Some(1111)).await;
     let puts: Vec<_> = mock
         .requests()
         .into_iter()
@@ -1798,17 +1846,21 @@ impl TestDb {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let url = std::env::var("TWO_GATEWAY_TEST_DATABASE_URL")
             .expect("set the dedicated test URL; runtime DATABASE_URL is never used");
-        let options = PgConnectOptions::from_str(&url).expect("test URL");
-        assert!(matches!(
-            options.get_host(),
-            "agent-testdb" | "localhost" | "127.0.0.1"
-        ));
-        assert_eq!(options.get_username(), "agent_test");
-        assert_eq!(options.get_database(), Some("agent_test"));
-        // Unix sockets and `options=` query overrides would bypass the
-        // host/credential allowlist above; reject both outright.
-        assert!(options.get_socket().is_none());
-        assert!(options.get_options().is_none());
+        let ci = std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true");
+        let host = match url.as_str() {
+            "postgres://agent_test:@agent-testdb:5432/agent_test" => "agent-testdb",
+            "postgresql://agent_test@localhost:5432/agent_test" if ci => "localhost",
+            _ => panic!("non-test database refused"),
+        };
+        assert!(std::env::var_os("PGOPTIONS").is_none());
+        // Do not read .pgpass or inherit credentials, TLS or URL overrides.
+        let options = PgConnectOptions::new_without_pgpass()
+            .host(host)
+            .port(5432)
+            .username("agent_test")
+            .password("")
+            .database("agent_test")
+            .ssl_mode(PgSslMode::Disable);
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .connect_with(options.clone())
@@ -1998,6 +2050,309 @@ impl TestDb {
         .await
         .expect("automation audit rows")
     }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb or CI service"]
+async fn channel_sticky_and_feed_commands_share_one_runtime_and_complete_registry() {
+    let db = TestDb::new().await;
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = CommandRuntime::new(
+        db.pool.clone(),
+        executor_at(origin),
+        router_with_commands(RouterGates {
+            moderation: true,
+            ..gates(true, true)
+        }),
+        GUILD,
+        true,
+    );
+    runtime.publish_registry(Some(1111)).await;
+    let published: serde_json::Value = serde_json::from_slice(&mock.requests()[0].body).unwrap();
+    let names: Vec<_> = published
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|command| command["name"].as_str().unwrap())
+        .collect();
+    for name in [
+        "slowmode",
+        "purge",
+        "lockdown",
+        "unlock",
+        "sticky",
+        "feed-list",
+        "rank",
+    ] {
+        assert!(names.contains(&name), "complete registry includes {name}");
+    }
+    for (id, name) in [
+        (101, "slowmode"),
+        (102, "sticky-remove"),
+        (103, "feed-list"),
+    ] {
+        let options = if name == "slowmode" {
+            vec![
+                option("seconds", CommandOptionValue::Integer(0)),
+                option(
+                    "reason",
+                    CommandOptionValue::String("shared runtime test".to_owned()),
+                ),
+            ]
+        } else {
+            Vec::new()
+        };
+        let mut interaction = slash(name, Some(CHANNEL), options);
+        interaction.id = Id::new(id);
+        interaction.member.as_mut().unwrap().permissions = Some(Permissions::all());
+        runtime.on_interaction(&interaction).await;
+    }
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 3, "each slice owns exactly one defer");
+    for callback in callbacks {
+        let body: serde_json::Value = serde_json::from_slice(&callback.body).unwrap();
+        assert_eq!(body["type"], 5);
+        assert_eq!(body["data"]["flags"], 64);
+    }
+    let requests = mock.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.method == "PATCH" && r.path.ends_with("/@original"))
+            .count(),
+        3
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.method == "PATCH" && r.path.ends_with("/channels/3333"))
+            .count(),
+        1
+    );
+    let audits: Vec<(String, String)> =
+        sqlx::query_as("SELECT action, outcome FROM moderation_audit")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].0, "moderation.slowmode");
+    assert_eq!(db.audits().await.len(), 1, "sticky still audited");
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "feed-list stays read-only"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb or CI service"]
+async fn gateway_keeps_checkpointing_and_heartbeating_during_channel_rest_work() {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio::sync::{mpsc, oneshot, RwLock};
+    use tokio_websockets::{Message as WsMessage, ServerBuilder};
+    use two_bot_cutover::gateway_session::GatewaySessionStore;
+
+    let db = TestDb::new().await;
+    let (mock, origin) = MockRest::start_script(vec![
+        RestResponse::status(200), // READY registry publication.
+        RestResponse::status(200), // Ephemeral defer.
+        RestResponse {
+            delay: Duration::from_secs(30), // Channel mutation, cancelled in flight.
+            ..RestResponse::status(200)
+        },
+    ])
+    .await;
+    let runtime = CommandRuntime::new(
+        db.pool.clone(),
+        executor_at(origin),
+        router_with_commands(RouterGates {
+            moderation: true,
+            ..gates(true, true)
+        }),
+        GUILD,
+        true,
+    );
+    let mut interaction = slash(
+        "slowmode",
+        Some(CHANNEL),
+        vec![
+            option("seconds", CommandOptionValue::Integer(0)),
+            option(
+                "reason",
+                CommandOptionValue::String("gateway test".to_owned()),
+            ),
+        ],
+    );
+    interaction.member.as_mut().unwrap().permissions = Some(Permissions::all());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let gateway_url = url.clone();
+    let (published_tx, published_rx) = oneshot::channel();
+    let (mutating_tx, mutating_rx) = oneshot::channel();
+    let (heartbeat_tx, mut heartbeat_rx) = mpsc::channel(4);
+    let gateway = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (_, mut ws) = ServerBuilder::new().accept(stream).await.unwrap();
+        ws.send(WsMessage::text(
+            serde_json::json!({"op":10,"d":{"heartbeat_interval":1000}}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let mut published_rx = Some(published_rx);
+        let mut mutating_rx = Some(mutating_rx);
+        let mut dispatched = false;
+        while let Some(Ok(message)) = ws.next().await {
+            let Some(text) = message.as_text() else {
+                continue;
+            };
+            let packet: serde_json::Value = serde_json::from_str(text).unwrap();
+            match packet["op"].as_u64() {
+                Some(2) => {
+                    ws.send(WsMessage::text(
+                        serde_json::json!({
+                            "op":0,"s":1,"t":"READY","d":{
+                                "v":10,"session_id":"channel-test","resume_gateway_url":gateway_url,
+                                "guilds":[],"shard":[0,1],
+                                "application":{"id":"1111","flags":0},
+                                "user":{"id":"999","username":"mock","discriminator":"0",
+                                    "avatar":null,"bot":true,"mfa_enabled":false,"verified":true}
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                    published_rx.take().unwrap().await.unwrap();
+                    ws.send(WsMessage::text(
+                        serde_json::json!({
+                            "op":0,"s":2,"t":"INTERACTION_CREATE","d":interaction
+                        })
+                        .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                    mutating_rx.take().unwrap().await.unwrap();
+                    ws.send(WsMessage::text(serde_json::json!({
+                        "op":0,"s":3,"t":"GUILD_MEMBER_REMOVE","d":{
+                            "guild_id":GUILD_S,"user":{"id":"77","username":"mock-member","discriminator":"0"}
+                        }
+                    }).to_string())).await.unwrap();
+                    dispatched = true;
+                }
+                Some(1) => {
+                    ws.send(WsMessage::text("{\"op\":11,\"d\":null}".to_owned()))
+                        .await
+                        .unwrap();
+                    if dispatched {
+                        heartbeat_tx.send(()).await.unwrap();
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    crate::gateway::ensure_crypto_provider();
+    let shard = crate::gateway::build_shard(
+        "mock-token".to_owned(),
+        twilight_gateway::Intents::empty(),
+        None,
+        Some(&url),
+    );
+    let store = GatewaySessionStore::new(db.pool.clone(), GUILD_S.to_owned(), 0);
+    let runner = tokio::spawn(crate::gateway::run_shard(
+        shard,
+        Arc::new(crate::gateway::build_pipeline(Vec::new(), None)),
+        Arc::new(RwLock::new(crate::gateway::GatewayState::Armed)),
+        store.clone(),
+        None,
+        Some(Arc::clone(&runtime)),
+        None,
+        None,
+        std::future::pending::<()>(),
+    ));
+    wait_for(|| mock.requests().len() == 1, "READY publication").await;
+    published_tx.send(()).unwrap();
+    wait_for(
+        || {
+            mock.requests()
+                .iter()
+                .any(|r| r.method == "PATCH" && r.path.ends_with("/channels/3333"))
+        },
+        "channel mutation entered",
+    )
+    .await;
+    mutating_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if store.load().await.unwrap().is_some_and(|s| s.sequence == 3) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        heartbeat_rx.recv().await.unwrap();
+    })
+    .await
+    .expect("gateway progressed while channel REST was pending");
+    assert_eq!(
+        mock.requests().len(),
+        3,
+        "effect has not completed or repeated"
+    );
+    runner.abort();
+    assert!(runner.await.unwrap_err().is_cancelled());
+    wait_for(
+        || Arc::strong_count(&runtime) == 1,
+        "command scope cancellation",
+    )
+    .await;
+    let lanes: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_channel_executions")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(lanes, 1, "cancellation retains uncertain channel ownership");
+    let state: String = sqlx::query_scalar("SELECT state FROM moderation_idempotency")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "in_flight");
+    assert!(
+        !runtime.dispatch(&Event::InteractionCreate(Box::new(InteractionCreate(
+            slash("slowmode", Some(CHANNEL), Vec::new()),
+        ))))
+    );
+    gateway.abort();
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb or CI service"]
+async fn disabled_channel_commands_defer_audit_and_refuse_without_channel_effects() {
+    let db = TestDb::new().await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+    let request = slash(
+        "slowmode",
+        Some(CHANNEL),
+        vec![
+            option("seconds", CommandOptionValue::Integer(0)),
+            option(
+                "reason",
+                CommandOptionValue::String("disabled test".to_owned()),
+            ),
+        ],
+    );
+    runtime.on_interaction(&request).await;
+    let reply = mock.deferred_reply();
+    assert_eq!(reply["content"], two_bot_core::MODERATION_DISABLED_REPLY);
+    assert_eq!(mock.requests().len(), 2, "only defer and edit");
+    let outcome: String = sqlx::query_scalar("SELECT outcome FROM moderation_audit")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(outcome, "refused");
+    mock.shutdown().await;
+    db.close().await;
 }
 
 async fn db_runtime(db: &TestDb, script: Vec<u16>) -> (Arc<CommandRuntime>, MockRest) {

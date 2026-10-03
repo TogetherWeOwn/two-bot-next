@@ -2779,6 +2779,8 @@ impl ActionExecutor {
 
     /// Complete an acknowledged interaction by editing its original response.
     /// Like the initial callback, this bypasses the paced moderation lane.
+    /// Single attempt with bounded errors: never repeat an accepted effect after
+    /// an edit failure or expose the interaction token in a returned error.
     /// The original callback decides ephemerality; edits retain it.
     pub async fn edit_interaction_response(
         &self,
@@ -2786,10 +2788,8 @@ impl ActionExecutor {
         interaction_token: &str,
         content: &str,
     ) -> Result<(), DiscordError> {
-        let application =
-            Id::<ApplicationMarker>::new_checked(application_id).ok_or_else(|| {
-                DiscordError::Rejected(format!("bad application id: {application_id}"))
-            })?;
+        let application = Id::<ApplicationMarker>::new_checked(application_id)
+            .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
         let content = two_bot_core::message_safety::content(content);
         let mentions = AllowedMentions::default();
         let req = Self::request_of(

@@ -10,9 +10,17 @@ pub mod audit_mirror;
 pub mod automod;
 pub mod automod_activation;
 pub mod channel_access;
+#[cfg(feature = "db")]
+pub mod channel_moderation;
 pub mod command_registry;
 pub mod executor;
 mod executor_metrics;
+
+#[cfg(feature = "db")]
+pub use channel_moderation::{
+    register_channel_handlers, ChannelModerationRuntime, ChannelReply, ChannelResponseError,
+    ChannelRuntimeError,
+};
 pub mod intents;
 pub mod interactions;
 pub mod internal_actions;
