@@ -36,8 +36,9 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 The supervisor records all three job metrics centrally after each completed
 attempt. Individual periodic jobs need no instrumentation. The current scheduled
 labels are `counter`, `rank`, `scheduled_events`, `presence_probe`,
-`community_scorecard`, `inactivity` and `audit_retry` (the last three may be
-parked by configuration).
+`community_scorecard`, `inactivity`, `audit_retry`, `self_role_recovery` and
+`scheduled_messages` (the 15 s scheduled-message ticker). The community, audit,
+recovery and ticker names may be parked by configuration.
 All allowlisted series are exposed from process startup at zero, even before the
 first run. A zero success timestamp does not distinguish a parked, never-started,
 still-running or always-failing job; use `/readyz` job status for that distinction.
@@ -117,7 +118,7 @@ as dynamic labels.
   `two_bot_job_consecutive_failures{job}` — `job` is one of
   `invite_snapshot`, `session_checkpoint`, `counter`, `rank`,
   `scheduled_events`, `presence_probe`, `community_scorecard`, `inactivity`,
-  `audit_retry`, `other`; `outcome` is `success` or `failure`.
+  `audit_retry`, `scheduled_messages`, `other`; `outcome` is `success` or `failure`.
   `session_checkpoint` records successful durable gateway commits; zero means
   never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
 - `two_bot_handler_duration_seconds` histogram buckets (`le`, seconds):

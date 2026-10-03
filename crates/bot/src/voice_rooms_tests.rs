@@ -77,6 +77,8 @@ struct Store {
     creators: Mutex<Vec<CreatorChannel>>,
     rooms: Mutex<HashMap<u64, VoiceRoom>>,
     persist_error: Option<StoreError>,
+    access: Mutex<AccessControls>,
+    access_error: Option<StoreError>,
     forget_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
     after_persist: Option<Hook>,
@@ -89,6 +91,8 @@ impl Store {
             creators: Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)]),
             rooms: Mutex::new(HashMap::new()),
             persist_error: None,
+            access: Mutex::new(AccessControls::default()),
+            access_error: None,
             forget_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
             after_persist: None,
@@ -99,6 +103,12 @@ impl Store {
 impl RoomPersistence for Store {
     async fn creators(&self, _: u64) -> Result<Vec<CreatorChannel>, StoreError> {
         Ok(self.creators.lock().unwrap().clone())
+    }
+    async fn access_controls(&self, _: u64) -> Result<AccessControls, StoreError> {
+        match self.access_error {
+            Some(error) => Err(error),
+            None => Ok(self.access.lock().unwrap().clone()),
+        }
     }
     async fn rooms(&self, _: u64) -> Result<Vec<VoiceRoom>, StoreError> {
         Ok(self.rooms.lock().unwrap().values().cloned().collect())
@@ -744,8 +754,10 @@ async fn successive_creates_reserve_category_slots_before_gateway_echoes() {
 }
 
 #[tokio::test]
-async fn lacking_manage_roles_uses_category_overwrites_not_creator_overwrites() {
-    use twilight_model::channel::permission_overwrite::PermissionOverwriteType;
+async fn lacking_manage_roles_creates_without_overrides_so_the_room_syncs_to_its_category() {
+    use twilight_model::channel::permission_overwrite::{
+        PermissionOverwrite, PermissionOverwriteType,
+    };
     let (live, store, http, _) = fixture();
     let overwrite = PermissionOverwrite {
         id: Id::new(GUILD),
@@ -761,10 +773,25 @@ async fn lacking_manage_roles_uses_category_overwrites_not_creator_overwrites() 
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
-    assert_eq!(
-        worker.http.created_attributes.lock().unwrap()[0].overwrites,
-        [overwrite]
-    );
+    // The bot cannot set overrides without Manage Roles: none are sent, so
+    // Discord syncs the new room to the category it is created in.
+    let created = worker.http.created_attributes.lock().unwrap();
+    assert_eq!(created[0].parent_id, Some(CATEGORY));
+    assert!(created[0].overwrites.is_empty());
+}
+
+#[tokio::test]
+async fn created_rooms_carry_the_owner_override_and_a_placement_from_the_start() {
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    let created = worker.http.created_attributes.lock().unwrap();
+    assert!(created[0]
+        .overwrites
+        .iter()
+        .any(|overwrite| overwrite.id.get() == MEMBER));
+    assert!(created[0].position.is_some());
 }
 
 #[test]
@@ -872,7 +899,7 @@ fn voice_command_set_is_gated_on_two_voice() {
         .iter()
         .map(|definition| definition.name.clone())
         .collect();
-    assert_eq!(names, ["create", "setup"]);
+    assert_eq!(names, ["create", "setup", "ping", "invite"]);
     let off = VoiceGates::from_map(&Default::default());
     assert!(voice_command_set(&off).is_empty());
 }
@@ -1097,6 +1124,186 @@ fn parse_create_without_name_defaults_blank_for_refusal() {
 fn parse_setup_command() {
     let interaction = voice_interaction(Some(command_data("setup", Vec::new())), None, true);
     assert_eq!(parse_voice_command(&interaction), Some(VoiceCommand::Setup));
+}
+
+#[test]
+fn parse_ping_and_invite_commands() {
+    for (name, expected) in [
+        ("ping", VoiceCommand::Ping),
+        ("invite", VoiceCommand::Invite),
+    ] {
+        let interaction = voice_interaction(Some(command_data(name, Vec::new())), None, true);
+        assert_eq!(parse_voice_command(&interaction), Some(expected));
+        let guildless = voice_interaction(Some(command_data(name, Vec::new())), None, false);
+        assert_eq!(parse_voice_command(&guildless), None);
+    }
+}
+
+#[test]
+fn interaction_latency_counts_from_the_snowflake_timestamp() {
+    let created_ms = DISCORD_EPOCH_MS + 1_000_000;
+    let id = (created_ms - DISCORD_EPOCH_MS) << 22;
+    assert_eq!(interaction_latency_ms(id, created_ms + 42), 42);
+    // The worker and sequence bits below the timestamp never count as time.
+    assert_eq!(interaction_latency_ms(id | 0x3F_FFFF, created_ms + 42), 42);
+    // A host clock behind Discord's saturates instead of underflowing.
+    assert_eq!(interaction_latency_ms(id, created_ms - 5), 0);
+    assert_eq!(interaction_latency_ms(u64::MAX, 0), 0);
+}
+
+#[tokio::test]
+async fn ping_replies_ephemerally_without_touching_store_or_http() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = voice_interaction(Some(command_data("ping", Vec::new())), None, true);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let response = response.expect("ping reply");
+    assert!(response_text(&response).starts_with("Pong! "));
+    assert_eq!(
+        response.data.as_ref().and_then(|data| data.flags),
+        Some(MessageFlags::EPHEMERAL)
+    );
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn invite_renders_the_vanity_code_or_the_fixed_notice() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = voice_interaction(Some(command_data("invite", Vec::new())), None, true);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(&response.expect("invite reply")),
+        two_bot_core::voice_utilities::NO_INVITE_CONFIGURED
+    );
+    let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
+    let writer = seen.clone();
+    handle_voice_interaction_with(&runtime, &interaction, Some("abc-123"), |response| {
+        *writer.lock().unwrap() = Some(response);
+        async {}
+    })
+    .await;
+    let response = seen.lock().unwrap().clone().expect("invite reply");
+    assert_eq!(
+        response_text(&response),
+        "Join the server: https://discord.gg/abc-123"
+    );
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+fn gated_runtime(
+    trace: Trace,
+    controls: AccessControls,
+    access_error: Option<StoreError>,
+) -> VoiceRuntime<Store, Http> {
+    VoiceRuntime::new(
+        move || {
+            let mut store = Store::new(trace.clone());
+            *store.access.lock().unwrap() = controls.clone();
+            store.access_error = access_error;
+            (store, Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+}
+
+fn with_roles(mut interaction: Interaction, roles: &[u64]) -> Interaction {
+    interaction.member.as_mut().expect("member").roles =
+        roles.iter().map(|role| Id::new(*role)).collect();
+    interaction
+}
+
+#[tokio::test]
+async fn creation_switch_off_refuses_new_rooms() {
+    let (live, store, http, _) = fixture();
+    *store.access.lock().unwrap() = AccessControls {
+        room_creation_enabled: false,
+        ..AccessControls::default()
+    };
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .unwrap();
+    assert!(!worker.accept_join(ticket, "new room".to_owned(), 7, NOW.to_owned()));
+    assert!(!worker.dispatch_one(0).await);
+    assert!(worker.tracked().is_empty());
+}
+
+#[tokio::test]
+async fn required_role_gates_members_but_never_admins() {
+    let controls = AccessControls {
+        required_role: Some(9),
+        ..AccessControls::default()
+    };
+    let runtime = gated_runtime(Trace::default(), controls, None);
+    let ping = || voice_interaction(Some(command_data("ping", Vec::new())), None, true);
+
+    let (owned, response) = handle_capture(&runtime, &ping()).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(&response.expect("denial")),
+        access_denied_text(AccessDenyReason::RequiredRole)
+    );
+
+    let (_, response) = handle_capture(&runtime, &with_roles(ping(), &[9])).await;
+    assert!(response_text(&response.expect("ping")).starts_with("Pong! "));
+
+    let admin = voice_interaction(
+        Some(command_data("ping", Vec::new())),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
+    let (_, response) = handle_capture(&runtime, &admin).await;
+    assert!(response_text(&response.expect("ping")).starts_with("Pong! "));
+}
+
+#[tokio::test]
+async fn per_command_restriction_applies_only_to_that_command() {
+    let controls = AccessControls {
+        command_roles: [("invite".to_owned(), vec![7])].into(),
+        ..AccessControls::default()
+    };
+    let runtime = gated_runtime(Trace::default(), controls, None);
+    let invite = || voice_interaction(Some(command_data("invite", Vec::new())), None, true);
+    let ping = voice_interaction(Some(command_data("ping", Vec::new())), None, true);
+
+    let (_, response) = handle_capture(&runtime, &ping).await;
+    assert!(response_text(&response.expect("ping")).starts_with("Pong! "));
+    let (_, response) = handle_capture(&runtime, &invite()).await;
+    assert_eq!(
+        response_text(&response.expect("denial")),
+        access_denied_text(AccessDenyReason::CommandRestricted)
+    );
+    let (_, response) = handle_capture(&runtime, &with_roles(invite(), &[7])).await;
+    assert_eq!(
+        response_text(&response.expect("invite")),
+        two_bot_core::voice_utilities::NO_INVITE_CONFIGURED
+    );
+}
+
+#[tokio::test]
+async fn unreadable_settings_fail_closed_for_members_only() {
+    let runtime = gated_runtime(
+        Trace::default(),
+        AccessControls::default(),
+        Some(StoreError::Unavailable),
+    );
+    let member = voice_interaction(Some(command_data("ping", Vec::new())), None, true);
+    let (owned, response) = handle_capture(&runtime, &member).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("notice")).contains("unavailable"));
+
+    let admin = voice_interaction(
+        Some(command_data("ping", Vec::new())),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
+    let (_, response) = handle_capture(&runtime, &admin).await;
+    assert!(response_text(&response.expect("ping")).starts_with("Pong! "));
 }
 
 #[test]
@@ -1393,7 +1600,7 @@ async fn responder_defers_before_any_create_and_completes_once() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());
     let replies = Replies::new(trace.clone());
-    VoiceResponder::respond(&runtime, &replies, &create_interaction()).await;
+    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None).await;
     assert_eq!(
         *trace.lock().unwrap(),
         ["defer", "create", "add_creator:500", "complete"]
@@ -1421,7 +1628,7 @@ async fn responder_failed_or_ambiguous_ack_never_executes_or_retries() {
         let runtime = test_runtime(trace.clone());
         let mut replies = Replies::new(trace.clone());
         replies.defer_error = Some(error);
-        VoiceResponder::respond(&runtime, &replies, &create_interaction()).await;
+        VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None).await;
         assert_eq!(*trace.lock().unwrap(), ["defer"]);
         assert!(replies.completed.lock().unwrap().is_empty());
     }
@@ -1433,7 +1640,7 @@ async fn responder_completion_failure_does_not_repeat_channel_creation() {
     let runtime = test_runtime(trace.clone());
     let mut replies = Replies::new(trace.clone());
     replies.complete_error = Some(RoomHttpError::UnknownOutcome);
-    VoiceResponder::respond(&runtime, &replies, &create_interaction()).await;
+    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None).await;
     assert_eq!(
         *trace.lock().unwrap(),
         ["defer", "create", "add_creator:500", "complete"]

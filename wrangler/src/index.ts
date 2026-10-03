@@ -37,7 +37,12 @@ import {
   redirectErrorClass,
   type RedirectClick,
 } from "./redirect.ts";
-import { RedirectStore, parseMappingsSnapshot } from "./redirect-store.ts";
+import {
+  CampaignLookupCache,
+  DB_TIMEOUT_MS,
+  RedirectStore,
+  parseMappingsSnapshot,
+} from "./redirect-store.ts";
 import { connectPostgres } from "./redirect-db.ts";
 import { forwardedFlagVars, type ForwardedFlagEnv } from "./container-env.ts";
 import {
@@ -101,13 +106,29 @@ function missCacheFor(env: Env): RedirectMissCache {
 // the Worker and is unaffected.
 const healthBuckets = new TokenBuckets();
 
+// Store instances are request-scoped, but the lookup cache must survive
+// across requests to blunt repeated lookups — so it lives here beside the
+// miss cache, keyed (and reset) on the same configuration identity. A changed
+// snapshot or mapping source must not inherit another config's entries.
+let redirectLookupKey = "";
+let redirectLookupCache = new CampaignLookupCache();
+function lookupCacheFor(env: Env): CampaignLookupCache {
+  const raw = env.REDIRECT_MAPPINGS_JSON;
+  const key = `${env.REDIRECT_DB === undefined ? "snapshot" : "live"}:${typeof raw === "string" ? raw : typeof raw}`;
+  if (key !== redirectLookupKey) {
+    redirectLookupKey = key;
+    redirectLookupCache = new CampaignLookupCache();
+  }
+  return redirectLookupCache;
+}
+
 function redirectStore(env: Env): RedirectStore {
   const raw = env.REDIRECT_MAPPINGS_JSON;
   const snapshot = raw === undefined || raw === "" ? [] : parseMappingsSnapshot(raw);
   // Without the binding there is no connector: the store serves the snapshot
   // and drops clicks (logged, never faked) exactly as before TOG-12194.
   const connect = env.REDIRECT_DB === undefined ? undefined : connectPostgres;
-  return new RedirectStore(env.REDIRECT_DB, connect, snapshot);
+  return new RedirectStore(env.REDIRECT_DB, connect, snapshot, DB_TIMEOUT_MS, lookupCacheFor(env));
 }
 
 interface KeepalivePayload {

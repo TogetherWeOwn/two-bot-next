@@ -38,7 +38,7 @@ Each table reports `{table, status, columns?, count?, reason?}`. `status` is
 column, with a reason: `community_scorecard_attempts`,
 `guild_settings_revision`, `level_role_rewards`,
 `lfg_roles`, `moderation_channel_executions`, `rank_ladder`,
-`web_contract_meta`), or `missing` (table absent
+`self_role_exchange_baselines`, `web_contract_meta`), or `missing` (table absent
 from this database, e.g. a partially migrated one). Every classified table
 appears exactly once: the unit test fails on any unclassified
 `sql/database_role_matrix.sql` / backup-allowlist table, and on any spec

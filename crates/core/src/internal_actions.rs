@@ -1,12 +1,11 @@
-//! Website-to-bot internal actions: pure-domain half of `POST /internal/actions`.
+//! Website-to-bot internal actions: authentication and domain checks.
 //!
 //! Ports `src/internal/*` from legacy two-bot (frozen `main`, card acceptance
-//! criteria) as framework-free data plus pure functions. The axum route, the
-//! twilight Discord calls land in later slices in the bot crate. The durable
-//! guards live in `internal_action_store` behind the `db` feature; this
-//! module owns the order of the checks and every refusal the caller can see, so
-//! the whole pipeline below is unit-testable without Discord, Postgres, or a
-//! socket.
+//! criteria) as framework-free data plus pure functions. The Axum listener and
+//! Discord executor are separate concerns. Durable guards live in
+//! `internal_action_store` behind `db`; [`AuthenticatedRequest`] bridges its
+//! async nonce commit to the shared post-replay checks. The in-memory
+//! [`authorize`] path remains unit-testable without Discord, Postgres or sockets.
 //!
 //! Legacy map (`src/internal/*.ts`):
 //! - `signing.ts` — HMAC-SHA256 `sha256=` over
@@ -171,7 +170,7 @@ impl std::fmt::Debug for SigningKey {
 pub enum KeySpecError {
     #[error("TWO_INTERNAL_KEYS entries must be \"key-id:secret\"")]
     MalformedEntry,
-    #[error("TWO_INTERNAL_KEYS: secret for \"{0}\" is shorter than 32 characters")]
+    #[error("TWO_INTERNAL_KEYS: secret for \"{0}\" is shorter than 32 bytes")]
     SecretTooShort(String),
     #[error("TWO_INTERNAL_ACTIONS=1 but no signing keys are configured")]
     NoKeys,
@@ -1543,6 +1542,153 @@ impl std::fmt::Debug for AuthDecision {
     }
 }
 
+/// A signature-verified, fresh request, before replay protection or JSON parsing.
+/// The raw bytes and authenticated headers stay bound together across an async
+/// database wait. No `Clone` or `Debug`: this is a one-use capability, not a log.
+pub struct AuthenticatedRequest<'a> {
+    key_id: &'a str,
+    #[cfg(feature = "db")]
+    timestamp: &'a str,
+    #[cfg(feature = "db")]
+    skew_seconds: u64,
+    nonce: &'a str,
+    raw: &'a [u8],
+    guarded_ms: u64,
+}
+
+/// A request whose nonce has been committed. Only this type can perform the
+/// post-replay checks. Neither type exposes a public constructor.
+///
+/// ```compile_fail
+/// use two_bot_core::internal_actions::{AuthenticatedRequest, NonceBurnedRequest};
+/// fn skip_commit(request: AuthenticatedRequest<'_>) {
+///     let _ = NonceBurnedRequest(request);
+/// }
+/// ```
+pub struct NonceBurnedRequest<'a>(AuthenticatedRequest<'a>);
+
+impl<'a> AuthenticatedRequest<'a> {
+    /// Authenticate headers and exact bytes without parsing JSON or touching
+    /// replay/rate-limit state. Malformed authenticated bodies must reach the
+    /// nonce burn; unverified requests must never reach it.
+    pub fn verify(
+        headers: &AuthHeaders<'a>,
+        raw: &'a [u8],
+        keys: &KeyRing,
+        skew_seconds: u64,
+        now_ms: u64,
+        clock: &mut ClockGuard,
+    ) -> Result<Self, ActionError> {
+        if headers.key_id.is_empty()
+            || headers.timestamp.is_empty()
+            || headers.nonce.is_empty()
+            || headers.signature.is_empty()
+        {
+            return Err(auth_failure("missing_auth_headers"));
+        }
+        if !valid_nonce_format(headers.nonce) {
+            return Err(auth_failure("bad_nonce_format"));
+        }
+        if !keys.verify(
+            headers.key_id,
+            headers.signature,
+            headers.timestamp,
+            headers.nonce,
+            raw,
+        ) {
+            return Err(auth_failure("bad_signature"));
+        }
+        // Authenticate before touching the guard: a forged request cannot move
+        // the high-water mark and lock legitimate callers out.
+        let guarded_ms = clock.evaluate(now_ms).map_err(|rollback| {
+            ActionError::new(
+                ErrorCode::StaleRequest,
+                format!("Timestamp is outside the ±{skew_seconds}s window"),
+                format!(
+                    "clock_rollback: observed {roll}ms against high-water {mark}ms",
+                    roll = rollback.observed_ms,
+                    mark = rollback.high_water_ms
+                ),
+            )
+        })?;
+        if !within_skew(headers.timestamp, skew_seconds, guarded_ms / 1000) {
+            return Err(ActionError::new(
+                ErrorCode::StaleRequest,
+                format!("Timestamp is outside the ±{skew_seconds}s window"),
+                "stale_timestamp",
+            ));
+        }
+        Ok(Self {
+            key_id: headers.key_id,
+            #[cfg(feature = "db")]
+            timestamp: headers.timestamp,
+            #[cfg(feature = "db")]
+            skew_seconds,
+            nonce: headers.nonce,
+            raw,
+            guarded_ms,
+        })
+    }
+
+    /// Re-check freshness against database time and commit the nonce before any
+    /// JSON, bucket or action check. Only a successful new burn grants the next
+    /// stage. Cancellation/DB failure never grants a volatile fallback.
+    #[cfg(feature = "db")]
+    pub async fn burn_durably(
+        self,
+        store: &crate::internal_action_store::InternalActionStore,
+    ) -> Result<NonceBurnedRequest<'a>, ActionError> {
+        use crate::internal_action_store::InternalStoreError;
+
+        // The store's commit-time clock and retention use this fixed window.
+        // Do not silently widen a caller's narrower window during a DB wait.
+        if self.skew_seconds != SKEW_SECONDS {
+            return Err(ActionError::new(
+                ErrorCode::Internal,
+                "Server misconfigured: durable nonce skew mismatch",
+                "nonce_skew_mismatch",
+            ));
+        }
+        match store.burn_nonce(self.nonce, self.timestamp).await {
+            Ok(true) => Ok(NonceBurnedRequest(self)),
+            Ok(false) => Err(replayed_nonce()),
+            Err(InternalStoreError::InvalidInput) => Err(ActionError::new(
+                ErrorCode::StaleRequest,
+                "Request expired before nonce commit",
+                "stale_timestamp",
+            )),
+            Err(_) => Err(ActionError::new(
+                ErrorCode::Internal,
+                "Internal action storage unavailable",
+                "nonce_store_unavailable",
+            )),
+        }
+    }
+}
+
+impl NonceBurnedRequest<'_> {
+    /// Continue only after the nonce burn. Uses the same signed bytes, never a
+    /// separately supplied/re-serialized payload. Idempotency and per-verb
+    /// validation still belong before execution, not inside authentication.
+    pub fn authorize(
+        self,
+        flags: &InternalFlags,
+        has_store: bool,
+        has_settings: bool,
+        buckets: &mut TokenBuckets,
+    ) -> Result<AuthDecision, ActionError> {
+        authorize_burned(self.0, flags, has_store, has_settings, buckets)
+    }
+}
+
+fn replayed_nonce() -> ActionError {
+    ActionError::new(
+        ErrorCode::Replayed,
+        "This nonce has already been used",
+        "replayed_nonce",
+    )
+}
+
 /// Authorise one request against the load-bearing check order:
 ///
 /// 1. headers present → 2. signature (unknown id and bad signature are one
@@ -1574,48 +1720,7 @@ pub fn authorize(
     buckets: &mut TokenBuckets,
     clock: &mut ClockGuard,
 ) -> Result<AuthDecision, ActionError> {
-    if headers.key_id.is_empty()
-        || headers.timestamp.is_empty()
-        || headers.nonce.is_empty()
-        || headers.signature.is_empty()
-    {
-        return Err(auth_failure("missing_auth_headers"));
-    }
-    if !valid_nonce_format(headers.nonce) {
-        return Err(auth_failure("bad_nonce_format"));
-    }
-    if !keys.verify(
-        headers.key_id,
-        headers.signature,
-        headers.timestamp,
-        headers.nonce,
-        raw,
-    ) {
-        return Err(auth_failure("bad_signature"));
-    }
-    // Fail closed on clock rollback (F8): evaluate the freshness clock against
-    // the high-water mark before trusting it. Within tolerance the mark itself
-    // decides freshness, so a sweep can never reopen a window the mark has
-    // already passed; past tolerance the decision refuses without burning.
-    let guarded_ms = clock.evaluate(now_ms).map_err(|rollback| {
-        ActionError::new(
-            ErrorCode::StaleRequest,
-            format!("Timestamp is outside the ±{skew_seconds}s window"),
-            format!(
-                "clock_rollback: observed {roll}ms against high-water {mark}ms",
-                roll = rollback.observed_ms,
-                mark = rollback.high_water_ms
-            ),
-        )
-    })?;
-    let guarded_secs = guarded_ms / 1000;
-    if !within_skew(headers.timestamp, skew_seconds, guarded_secs) {
-        return Err(ActionError::new(
-            ErrorCode::StaleRequest,
-            format!("Timestamp is outside the ±{skew_seconds}s window"),
-            "stale_timestamp",
-        ));
-    }
+    let verified = AuthenticatedRequest::verify(headers, raw, keys, skew_seconds, now_ms, clock)?;
     // The skew is configurable independently of the cache TTL, so enforce the
     // coverage relation on the live pair: a nonce must still be live at every
     // instant its signed timestamp is fresh. A skew-180/TTL-240 wiring would
@@ -1634,17 +1739,23 @@ pub fn authorize(
             "nonce_ttl_too_short",
         ));
     }
-    if !nonces.offer(headers.nonce, guarded_ms) {
-        return Err(ActionError::new(
-            ErrorCode::Replayed,
-            "This nonce has already been used",
-            "replayed_nonce",
-        ));
+    if !nonces.offer(verified.nonce, verified.guarded_ms) {
+        return Err(replayed_nonce());
     }
+    NonceBurnedRequest(verified).authorize(flags, has_store, has_settings, buckets)
+}
+
+fn authorize_burned(
+    verified: AuthenticatedRequest<'_>,
+    flags: &InternalFlags,
+    has_store: bool,
+    has_settings: bool,
+    buckets: &mut TokenBuckets,
+) -> Result<AuthDecision, ActionError> {
     let per_key = buckets.take(
-        &format!("key:{}", headers.key_id),
+        &format!("key:{}", verified.key_id),
         DEFAULT_BUCKET,
-        guarded_ms,
+        verified.guarded_ms,
     );
     if !per_key.allowed {
         return Err(ActionError::new(
@@ -1655,7 +1766,7 @@ pub fn authorize(
         .with_retry_after(per_key.retry_after_secs));
     }
 
-    let body = parse_body_object(raw)?;
+    let body = parse_body_object(verified.raw)?;
     let action = match body.get("action").and_then(Value::as_str) {
         Some(a) if !a.is_empty() => a.to_owned(),
         _ => {
@@ -1670,9 +1781,9 @@ pub fn authorize(
 
     if action == "guild.add_member" {
         let per_action = buckets.take(
-            &format!("key:{}:add_member", headers.key_id),
+            &format!("key:{}:add_member", verified.key_id),
             ADD_MEMBER_BUCKET,
-            guarded_ms,
+            verified.guarded_ms,
         );
         if !per_action.allowed {
             return Err(ActionError::new(
@@ -1685,7 +1796,7 @@ pub fn authorize(
     }
 
     Ok(AuthDecision {
-        key_id: headers.key_id.to_owned(),
+        key_id: verified.key_id.to_owned(),
         action,
         body,
     })
@@ -2590,12 +2701,14 @@ mod tests {
 
     #[test]
     fn catalog_counts_match_legacy_census() {
-        // Shared legacy census: hot 41 / cold 28 / env_only 48. Count the
-        // actual entries, not just representatives of each class.
+        // Shared legacy census: hot 41 / cold 28 / env_only 48, plus the
+        // receiver's combined bind and caller mapping (both env-only),
+        // plus the two template-assistant endpoint keys (both env-only).
+        // Count actual entries, not just representatives of each class.
         for (class, expected) in [
             (SettingClass::Hot, 41),
             (SettingClass::Cold, 28),
-            (SettingClass::EnvOnly, 48),
+            (SettingClass::EnvOnly, 52),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),
@@ -3125,6 +3238,72 @@ mod tests {
             buckets,
             clock,
         )
+    }
+
+    #[test]
+    fn staged_verification_authenticates_before_advancing_clock() {
+        let vector = vec1();
+        let headers = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
+        let now = vector.timestamp.parse::<u64>().unwrap() * 1000;
+        let keys = ring();
+        let mut clock = ClockGuard::new();
+        let changed_body = format!("{}\n", vector.body);
+        let error = AuthenticatedRequest::verify(
+            &headers,
+            changed_body.as_bytes(),
+            &keys,
+            SKEW_SECONDS,
+            now + 300_000,
+            &mut clock,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, ErrorCode::Unauthorized);
+        assert_eq!(clock.high_water_ms(), None);
+        assert!(AuthenticatedRequest::verify(
+            &headers,
+            vector.body.as_bytes(),
+            &keys,
+            SKEW_SECONDS,
+            now,
+            &mut clock,
+        )
+        .is_ok());
+        assert_eq!(clock.high_water_ms(), Some(now));
+    }
+
+    #[test]
+    fn staged_verification_clamps_small_rollbacks_and_refuses_large_ones() {
+        use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
+
+        let vector = vec1();
+        let headers = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
+        let now = vector.timestamp.parse::<u64>().unwrap() * 1000;
+        let keys = ring();
+        let mut clock = ClockGuard::restore(now);
+        let verified = AuthenticatedRequest::verify(
+            &headers,
+            vector.body.as_bytes(),
+            &keys,
+            SKEW_SECONDS,
+            now - CLOCK_SKEW_TOLERANCE_MS,
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(verified.guarded_ms, now);
+        let error = AuthenticatedRequest::verify(
+            &headers,
+            vector.body.as_bytes(),
+            &keys,
+            SKEW_SECONDS,
+            now - CLOCK_SKEW_TOLERANCE_MS - 1,
+            &mut clock,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, ErrorCode::StaleRequest);
+        assert!(error.log_reason.starts_with("clock_rollback:"));
+        assert_eq!(clock.high_water_ms(), Some(now));
     }
 
     #[test]
