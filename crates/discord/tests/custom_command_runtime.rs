@@ -518,18 +518,18 @@ async fn management_republishes_whole_registry_and_dynamic_execution_audits_deli
     let base = probe.publish_set(&[]).expect("base registry size").len();
     let mock = MockRest::start(
         vec![
-            registry_receipt(base, 4400), // sync_registry PUT
-            ScriptedResponse::status(204), // #20 defer
-            registry_receipt(base + 1, 4500), // create PUT
+            registry_receipt(base, 4400),                       // sync_registry PUT
+            ScriptedResponse::status(204),                      // #20 defer
+            registry_receipt(base + 1, 4500),                   // create PUT
             ScriptedResponse::json(200, json!({"id": "9001"})), // #20 complete
-            ScriptedResponse::status(204), // #21 defer
+            ScriptedResponse::status(204),                      // #21 defer
             ScriptedResponse::json(200, json!({"id": "9001"})), // #21 complete
-            ScriptedResponse::status(204), // #22 defer
+            ScriptedResponse::status(204),                      // #22 defer
             ScriptedResponse::json(200, json!({"id": "9001"})), // #22 complete
-            ScriptedResponse::status(204), // #23 defer
-            registry_receipt(base, 4600), // remove PUT
+            ScriptedResponse::status(204),                      // #23 defer
+            registry_receipt(base, 4600),                       // remove PUT
             ScriptedResponse::json(200, json!({"id": "9001"})), // #23 complete
-            ScriptedResponse::status(204), // #24 defer
+            ScriptedResponse::status(204),                      // #24 defer
             ScriptedResponse::json(200, json!({"id": "9001"})), // #24 complete
         ],
         ScriptedResponse::status(500),
@@ -655,8 +655,8 @@ async fn collision_and_audit_failure_do_not_mutate_and_publish_failure_is_honest
 
     let mock = MockRest::start(
         vec![
-            ScriptedResponse::status(204),          // defer
-            ScriptedResponse::status(403),          // registry publish (no retry)
+            ScriptedResponse::status(204),                      // defer
+            ScriptedResponse::status(403),                      // registry publish (no retry)
             ScriptedResponse::json(200, json!({"id": "9000"})), // honest partial-result edit
         ],
         ScriptedResponse::status(500),
