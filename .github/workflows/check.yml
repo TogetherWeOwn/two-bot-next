@@ -318,6 +318,10 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot --locked onboarding_ -- --include-ignored
 
+      - name: raid runtime acceptance (mock Discord and CI service only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot --locked raid_runtime_ -- --include-ignored
+
       - name: automod durable dedupe (CI service container only)
         if: needs.job-inputs.outputs.rust != 'false'
         env:
