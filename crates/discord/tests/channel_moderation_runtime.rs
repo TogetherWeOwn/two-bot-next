@@ -110,6 +110,7 @@ fn router(enabled: bool) -> InteractionRouter {
     let mut router = InteractionRouter::new(RouterGates {
         configured_guild: Some(GUILD.parse().unwrap()),
         moderation: enabled,
+        voice: false,
         scorecard: false,
         automations: false,
         announcements: false,
