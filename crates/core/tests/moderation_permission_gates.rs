@@ -6,10 +6,12 @@
 //!
 //! Layers:
 //! - router (`InteractionRouter::route_slash`): resolved Discord permission
-//!   bits against the parity §1 table. Denied copy is
-//!   `RouterRefusal::ModerationPermission(action).message()`.
+//!   bits against the parity §1 table. Denied copy is the actionable
+//!   `RouterRefusal::ModerationPermission(action).message()` (Discord
+//!   permission name, slash command, and granter — never the internal id).
 //! - policy (`assert_moderation_allowed`): same bits plus target/hierarchy
-//!   checks. Denied copy is the `PolicyError` display text.
+//!   checks. Denied copy is the `PolicyError` display text (legacy
+//!   `Missing required permission for moderation.*`).
 //!
 //! Synthetic fixtures only: literal permission bits, synthetic snowflake ids,
 //! no Discord, no network, no database, no guild dependency.
@@ -128,16 +130,15 @@ fn policy_request(
     }
 }
 
-fn denied_copy(action: ModerationAction) -> String {
-    format!("Missing required permission for {}", action.action_name())
+/// Post-425 router denial: Discord permission name, slash command, granter.
+fn router_denied_copy(action: ModerationAction) -> String {
+    use two_bot_core::RouterRefusal;
+    RouterRefusal::ModerationPermission(action).message()
 }
 
-fn router_denied_copy(action: ModerationAction) -> String {
-    format!(
-        "You need the {} permission to use /{}. Ask a server moderator or admin to grant it.",
-        action.discord_permission_name(),
-        action.command_name()
-    )
+/// Policy-layer denial: legacy `PolicyError` display text (unchanged by #425).
+fn policy_denied_copy(action: ModerationAction) -> String {
+    format!("Missing required permission for {}", action.action_name())
 }
 
 #[test]
@@ -218,7 +219,8 @@ fn router_allows_or_refuses_per_role_with_actionable_copy() {
                     role.name,
                     action.command_name(),
                 );
-                // Pin the literal copy so a silent reword breaks loudly.
+                // Pin the post-425 actionable copy so a silent reword breaks
+                // loudly. Never the internal `moderation.*` id.
                 let literal = match action {
                     ModerationAction::Ban => {
                         "You need the Ban Members permission to use /ban. Ask a server moderator or admin to grant it."
@@ -238,6 +240,10 @@ fn router_allows_or_refuses_per_role_with_actionable_copy() {
                     _ => unreachable!("member verbs only"),
                 };
                 assert_eq!(refusal.message(), literal);
+                assert!(
+                    !refusal.message().contains("moderation."),
+                    "router copy must not leak the internal id"
+                );
             }
         }
     }
@@ -269,7 +275,7 @@ fn policy_allows_or_refuses_per_role_with_legacy_copy() {
                 let copy = verdict.expect_err("denied").to_string();
                 assert_eq!(
                     copy,
-                    denied_copy(action),
+                    policy_denied_copy(action),
                     "{} policy copy for {}",
                     role.name,
                     action.command_name(),

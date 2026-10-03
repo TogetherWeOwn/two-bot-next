@@ -17,9 +17,11 @@
 //! - allowed input routes to its handler; the router itself owes no reply
 //!   (`response_for_slash` is `None` — success text belongs to the feature).
 //! - disabled features and missing permissions refuse with the documented
-//!   ephemeral copy (`RouterRefusal::message`), never silence.
-//! - unknown names get the uniform stale-interaction reply; foreign guilds
-//!   are fenced (`Ignore`, except moderation's documented refusal).
+//!   actionable copy (`RouterRefusal::message`): Discord permission names,
+//!   who grants them, or the admin-only host-setting enable path.
+//! - unknown slash names get the re-pick reply; stale components get the
+//!   expired-control reply; foreign guilds are fenced (`Ignore`, except
+//!   moderation's documented refusal).
 //!
 //! Dev-only: never ships in the release binary.
 
@@ -169,7 +171,9 @@ const TOP_FIVE: &[(&str, HandlerId)] = &[
     ("ban", HandlerId::Moderation(ModerationAction::Ban)),
 ];
 
-/// The primary refusal each gated command owes, with the documented copy.
+/// The primary refusal each gated command owes, with the documented
+/// post-425 actionable copy (permission names, granter, or admin-only
+/// host-setting enable path).
 const PRIMARY_REFUSALS: &[(&str, RouterRefusal, &str)] = &[
     (
         "rsvp",
