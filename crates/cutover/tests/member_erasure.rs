@@ -218,6 +218,34 @@ async fn unresolved_side_effect_guards_refuse_without_deleting_any_rows() {
             .unwrap()
     );
     assert_eq!(audit_count(db.pool()).await, 0);
+    sqlx::query("UPDATE moderation_idempotency SET state = 'done' WHERE guild_id = $1")
+        .bind(GUILD)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    for state in ["containing", "uncertain"] {
+        sqlx::query(
+            "UPDATE containment_incidents SET state = $3 WHERE guild_id = $1 AND executor_id = $2",
+        )
+        .bind(GUILD)
+        .bind(USER)
+        .bind(state)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            erase_member(
+                db.pool(),
+                GUILD,
+                USER,
+                ErasureMode::Execute { actor: ACTOR }
+            )
+            .await
+            .is_err(),
+            "{state} incident must refuse erasure"
+        );
+        assert_eq!(audit_count(db.pool()).await, 0);
+    }
     db.close().await.unwrap();
 }
 

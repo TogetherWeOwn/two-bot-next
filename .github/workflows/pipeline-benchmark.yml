@@ -11,8 +11,7 @@ on:
       - 'scripts/*pipeline_bench*'
       - 'docs/pipeline-benchmark-baseline.json'
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-pipeline-benchmark-${{ github.event.pull_request.number || github.ref }}
@@ -20,6 +19,8 @@ concurrency:
 
 jobs:
   benchmark:
+    permissions:
+      contents: read
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'benchmark') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 20
@@ -44,6 +45,10 @@ jobs:
           persist-credentials: false
       - name: Job-container prerequisites
         run: |
+          # On hosted/overflow runners the job container's root does not own
+          # the runner-owned checkout, so Git refuses it as dubious ownership
+          # (same fix as check.yml prerequisites).
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends python3 >/dev/null
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master

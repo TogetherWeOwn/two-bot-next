@@ -25,12 +25,13 @@ import {
   isValidInviteCode,
   isValidFallback,
   isValidSlug,
+  redirectErrorClass,
   type Campaign,
   type RedirectClick,
   type RedirectDeps,
 } from "../src/redirect.ts";
 
-import { parseMappingsSnapshot, RedirectStore } from "../src/redirect-store.ts";
+import { DbTimeoutError, parseMappingsSnapshot, RedirectStore } from "../src/redirect-store.ts";
 
 const GUILD = "111222333444555666";
 const CODE = "aB3xY9";
@@ -98,12 +99,12 @@ function harness(opts: {
     errors,
     call: async (method, path, caller = "caller-1") => {
       const res = await handleRedirect(method, path, caller, deps);
-      // Mirror the Worker entry: record after the 302, swallow failures.
+      // Mirror the Worker entry: record after the 302, classify failures.
       if (res.click) {
         await deps
           .recordClick(res.click)
           .catch((err: unknown) =>
-            errors.push(`invite_click_record_failed ${String(err)}`),
+            errors.push(`invite_click_record_failed ${JSON.stringify({ campaign: res.click!.campaign, errorClass: redirectErrorClass(err) })}`),
           );
       }
       return res;
@@ -568,21 +569,49 @@ describe("configuration and campaign ingress fail closed", () => {
   test("lookup error logs only a validated slug and a fixed error class", async () => {
     const secret = "postgres://fixture:secret-value@fixture/db?visitor=203.0.113.44";
     for (const [thrown, errorClass] of [
-      [new Error(secret), "Error"], [new TypeError(secret), "TypeError"],
-      [new RangeError(secret), "RangeError"], [secret, "Unknown"],
-      [{ name: secret, message: secret }, "Unknown"],
-      [Object.assign(new Error(secret), { name: secret }), "Error"],
+      [new DbTimeoutError(), "db_unavailable"],
+      [new Error(secret), "internal"], [new TypeError(secret), "internal"],
+      [new RangeError(secret), "internal"], [new SyntaxError(secret), "internal"],
+      [secret, "internal"],
+      [{ name: secret, message: secret }, "internal"],
+      [Object.assign(new Error(secret), { name: secret }), "internal"],
+      [Object.assign(new Error("masked"), { name: "DbTimeoutError" }), "db_unavailable"],
+      [null, "internal"], [undefined, "internal"], [42, "internal"],
     ] as const) {
       const h = harness({ fallback: null });
       h.deps.lookup = async () => { throw thrown; };
       assert.equal((await h.call("GET", "/reddit?visitor=203.0.113.44", secret)).status, 503);
       assert.deepEqual(h.errors, [`invite_redirect_lookup_failed ${JSON.stringify({ slug: "reddit", errorClass })}`]);
+      assert.ok(!h.errors.join("\n").includes(secret), `lookup log leaked the secret: ${h.errors}`);
     }
     const h = harness({ outage: true });
     for (const path of ["/postgres:secret-value", "/reddit%0a", "/" + "x".repeat(100)]) {
       assert.equal((await h.call("GET", path)).status, 404);
     }
     assert.deepEqual(h.errors, []);
+  });
+
+  test("redirectErrorClass maps every input into the fixed vocabulary", () => {
+    const secret = "postgres://fixture:secret-value@fixture/db";
+    const inputs: unknown[] = [
+      new DbTimeoutError(),
+      new Error(secret), new TypeError(secret),
+      new RangeError(secret), new SyntaxError(secret),
+      secret, { name: secret, message: secret },
+      Object.assign(new Error(secret), { name: secret }),
+      // A spoofed name moves the line between two safe buckets, never leaks.
+      Object.assign(new Error("masked"), { name: "DbTimeoutError" }),
+      null, undefined, 42, true,
+    ];
+    const seen = new Set<string>();
+    for (const input of inputs) {
+      const cls = redirectErrorClass(input);
+      assert.ok(cls === "db_unavailable" || cls === "internal", `unbounded class: ${String(cls)}`);
+      assert.ok(!cls.includes("secret-value") && !cls.includes("postgres://"));
+      seen.add(cls);
+    }
+    assert.deepEqual([...seen].sort(), ["db_unavailable", "internal"]);
+    assert.equal(redirectErrorClass(new DbTimeoutError()), "db_unavailable");
   });
 });
 

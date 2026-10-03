@@ -6,9 +6,12 @@
 //! network, no gateway, no writes. Exit 0 with a JSON report when every input
 //! is present, exit 1 naming the missing item otherwise, exit 2 on usage.
 //!
-//! Usage: preconditions [--repo-root <path>]
+//! Usage: preconditions [--repo-root `<path>`]
 //!   The report is JSON on stdout; missing-item lines go to stderr. URLs and
 //!   secrets never appear: only relative paths and section names are named.
+
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
 
 use std::path::{Path, PathBuf};
 

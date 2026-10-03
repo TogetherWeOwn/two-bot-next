@@ -79,7 +79,9 @@ A pure plan is **not** permission to execute it. A subsequent adapter must:
    guild/executor event claims and incident claims separately; recheck incident
    blockers inside the incident transaction. After starting an incident, persist
    the trigger as `Contain`. Core proposals alone provide **no** concurrency or
-   restart guarantee.
+   restart guarantee. `containment_store` (migration
+   `0370_containment_claims.sql`, legacy 0015 shape) now provides these claims
+   but is not wired to the gateway, executor or any arming path.
 5. Capture complete role/member snapshots, perform whole-plan preflight before
    writes, enforce the 5s request timeout, and never automatically retry unknown
    outcomes. Use the shared executor boundary rather than duplicating it.
@@ -98,6 +100,10 @@ uncertainty, safe-role preservation and whole-plan preflight. The in-process
 `containment_acceptance` suite uses a scripted Discord double to test threshold
 crossing, dry-run, preflight refusal, ordered partial failure and no automatic
 retry. Its claimed-evidence fixture is **not** evidence of durable dedupe or
-concurrent incident serialization. Gateway, database, startup gates, real HTTP,
-alert delivery, restart and staging soak acceptance remain unimplemented and
-untested by this slice.
+concurrent incident serialization. The ignored `containment_store` suite
+(agent-testdb or the CI Postgres service) covers exactly-once audit-ID claims
+under concurrency, serialized heat, one concurrent incident per guild/executor,
+the in-transaction blocker recheck, dispositions across a reconnect and an
+upgrade from the legacy 0015 schema. Gateway hooks, executor delivery, startup
+gates, real HTTP, alert delivery and staging soak acceptance remain
+unimplemented and untested.

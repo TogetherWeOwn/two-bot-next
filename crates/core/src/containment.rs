@@ -3,9 +3,9 @@
 //! Ports legacy `two-bot` at `d5d1179348feb9157bcac8c875de9399d4f5c76a`:
 //! `src/moderation/{containment,containmentStore,containmentDiscord}.ts`.
 //! Inputs are explicit timestamps, claimed evidence, incidents and role snapshots.
-//! This module neither claims durable records nor executes Discord requests.
-//! The future adapter must serialize claims and enforce the staging/identity
-//! fence before executing a plan; see `docs/containment.md`.
+//! This module neither claims durable records nor executes Discord requests;
+//! `containment_store` serializes claims. The future adapter must enforce the
+//! staging/identity fence before executing a plan; see `docs/containment.md`.
 
 use std::collections::HashSet;
 
@@ -205,6 +205,17 @@ impl ContainmentPolicy {
             heat_threshold,
             ..Self::default()
         })
+    }
+
+    /// Occurrence-heat window; also the incident cooldown from processing time.
+    #[must_use]
+    pub fn window_ms(&self) -> i64 {
+        self.window_ms
+    }
+
+    #[must_use]
+    pub fn heat_threshold(&self) -> u64 {
+        self.heat_threshold
     }
 
     #[must_use]

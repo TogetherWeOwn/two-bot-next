@@ -5,11 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 # Explicit version on the intra-workspace dep (see crates/bot/Cargo.toml):
 # cargo-deny `wildcards = "deny"` rejects version-less deps.
 [dependencies]
 two-bot-core = { version = "0.2.0", path = "../core" }
 bytes = { workspace = true }
+hex = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { version = "1", default-features = false }
@@ -18,6 +22,7 @@ hyper-util = { workspace = true, features = ["http2"] }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -32,9 +37,12 @@ default = []
 db = ["two-bot-core/db", "dep:sqlx"]
 # Explicit service-DB acceptance lane; no credentialed Discord traffic.
 db-tests = ["db"]
+# Loopback-only origin seam for downstream acceptance tests; never enabled by runtime.
+test-support = []
 
 # Local Discord doubles and measurement drivers only; none ship in release.
 [dev-dependencies]
+axum = { workspace = true }
 anyhow = { workspace = true }
 two-bot-cutover = { version = "0.2.0", path = "../cutover" }
 sqlx = { workspace = true }

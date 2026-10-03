@@ -568,7 +568,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
-### s5-02: `internal_nonces`, `internal_idempotency`, `internal_action_log`, `internal_discord_events` — website-callback replay guard, idempotency, audit, dedupe
+### s5-02: `internal_nonces`, `internal_clock_high_water`, `internal_idempotency`, `internal_action_log`, `internal_discord_events` — website-callback replay guard (plus its F8 clock high-water mark), idempotency, audit, dedupe
 
 - **Method:** `waived` (not an execution verdict).
 - **Action:** Send signed synthetic actions, replay nonce/idempotency key, and repeat Discord callback in CI store fixtures.
@@ -857,7 +857,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** 3 verifier retries ≤30s; REST/internal §6 bounds; 5 joins/60s +900s raid cooldown; ticket 300s; executor cooldown; 5m audit lease,1h recheck,≤25 claims.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
-### s8-05: Automod (staging-only unless live-approved; `dryRun` unless `ENFORCE=1`; 6 filters; sanctions `1:delete,2:warn,3:timeout:600`; target-protection before delete) — bad-word NFKC matching, invite/link checks, `bat/cmd/…` attachment blocklist
+### s8-05: Automod (staging-only unless live-approved; `dryRun` unless `ENFORCE=1`; 6 filters; sanctions `1:delete,2:warn,3:timeout:600`; target-protection before delete) — bad-word NFKC matching, invite/link checks, `bat/cmd/…` attachment blocklist; whitespace edge accepted ([TOG-12582](/TOG/issues/TOG-12582)): legacy JS `\s` treats U+FEFF as blank and U+0085 as non-blank while Rust `split_whitespace` does the opposite, but both collapse to empty-vs-nonempty only for these two codepoints and all repeat-expiry blanks stay agreed (NEL: [TOG-10052](/TOG/issues/TOG-10052), format chars: [TOG-10048](/TOG/issues/TOG-10048))
 
 - **Method:** `manual` (not an execution verdict).
 - **Action:** In disposable approved staging channel with dryRun enabled, send one benign fixture per six configured filters; use local mocks for enforced ladder and protected-target deletion.
@@ -1018,6 +1018,24 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** The log names the slug and a bounded `errorClass` from the fixed classifier; no credentials or raw error text.
 - **Evidence:** Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
 - **Owner:** [TOG-11183](/TOG/issues/TOG-11183)
+- **Reason:** Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+
+### s12-15: Staging rollout gate receipt: intended Worker version at 100% traffic, `/readyz` 200 with compiled revision/build ID, allowlisted receipt fields, plus Neon `channel_binding` acceptance
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** Attach the staging rollout-gate receipt for the deployed soak build: require the intended Worker version at 100% traffic, `/readyz` 200 with the exact compiled revision/build ID and only allowlisted receipt fields, then a control-plane re-check; a 503 or a previous-instance response never passes.
+- **Expected:** The deployed soak build serves the intended Worker version at 100% traffic with `/readyz` 200 carrying the compiled revision/build ID; the receipt carries only allowlisted fields. The gate refuses stale-instance responses.
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-9699](/TOG/issues/TOG-9699)
+
+### s12-16: Bootstrap migration accepts the `Security` release-notes section in `migrate-release-notes`
+
+- **Method:** `waived` (not an execution verdict).
+- **Action:** Run the `migrate-release-notes` bootstrap fixture with a hand-written `Security` section in Unreleased: confirm the migration preserves the Security tail, removes Unreleased, and stays idempotent; confirm any other section still fails closed.
+- **Expected:** `Security` migrates alongside Added/Fixed/Changed/Notes; unknown sections fail closed; later releases do not repeat the bootstrap tail.
+- **Evidence:** Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
+- **Owner:** [TOG-12801](/TOG/issues/TOG-12801)
 - **Reason:** Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 

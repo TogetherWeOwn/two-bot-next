@@ -5,7 +5,7 @@
 mod database_guard;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, LazyLock,
 };
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use tokio::task::JoinHandle;
 use tokio_websockets::{Message, ServerBuilder};
 use twilight_gateway::{ConfigBuilder, Intents, Shard, ShardId};
@@ -30,21 +30,66 @@ use crate::gateway::{
 mod deadline;
 mod force_identify;
 mod member_journey;
+mod onboarding;
 mod persistent;
 mod recovery;
+mod voice;
 
 const GUILD: &str = "2222";
 const TOKEN: &str = "mock-token";
+
+/// `GatewaySessionStore` serializes every checkpoint on
+/// `pg_advisory_xact_lock(hashtextextended('gateway:{guild}:{shard}', 0))`.
+/// An advisory lock belongs to the database, not to a schema, so all the
+/// schema-isolated `TestDb`s of one process (same guild, same shard) contend
+/// on a single key. A test that holds that key on purpose to block a
+/// checkpoint therefore also stalls every sibling test's checkpoint past
+/// `CHECKPOINT_IO_MAX`; the sibling's worker then panics "gateway checkpoint
+/// failed" and the test hangs until its own deadline.
+///
+/// Ordinary tests hold this fence shared for the life of their `TestDb`; a test
+/// that holds the checkpoint key (`TestDb::exclusive*`) holds it exclusively,
+/// so it runs alone while the rest queue in `TestDb::new`. The serial CI step
+/// (`--test-threads=1`) is unaffected.
+static CHECKPOINT_KEY_FENCE: LazyLock<Arc<RwLock<()>>> = LazyLock::new(Arc::default);
+
+/// Held only for its `Drop`.
+#[allow(dead_code)]
+enum CheckpointKeyFence {
+    Shared(OwnedRwLockReadGuard<()>),
+    Exclusive(OwnedRwLockWriteGuard<()>),
+}
 
 struct TestDb {
     pool: PgPool,
     admin: PgPool,
     schema: String,
     store: GatewaySessionStore,
+    // Declared last: released only after `close` has dropped the schema.
+    _fence: CheckpointKeyFence,
 }
 
 impl TestDb {
     async fn new() -> Self {
+        Self::with_pool_max(3).await
+    }
+
+    async fn with_pool_max(pool_max: u32) -> Self {
+        let fence = CheckpointKeyFence::Shared(CHECKPOINT_KEY_FENCE.clone().read_owned().await);
+        Self::create(pool_max, fence).await
+    }
+
+    /// For a test that takes `gateway:{GUILD}:0` itself; see [`CHECKPOINT_KEY_FENCE`].
+    async fn exclusive() -> Self {
+        Self::exclusive_with_pool_max(3).await
+    }
+
+    async fn exclusive_with_pool_max(pool_max: u32) -> Self {
+        let fence = CheckpointKeyFence::Exclusive(CHECKPOINT_KEY_FENCE.clone().write_owned().await);
+        Self::create(pool_max, fence).await
+    }
+
+    async fn create(pool_max: u32, fence: CheckpointKeyFence) -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let options = database_guard::test_options();
         let admin = PgPoolOptions::new()
@@ -68,7 +113,7 @@ impl TestDb {
             .await
             .expect("create isolated schema");
         let pool = PgPoolOptions::new()
-            .max_connections(3)
+            .max_connections(pool_max)
             .connect_with(options.options([("search_path", schema.clone())]))
             .await
             .expect("scoped test pool");
@@ -82,7 +127,18 @@ impl TestDb {
             admin,
             schema,
             store,
+            _fence: fence,
         }
+    }
+
+    async fn independent_pool(&self, pool_max: u32) -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(pool_max)
+            .connect_with(
+                database_guard::test_options().options([("search_path", self.schema.clone())]),
+            )
+            .await
+            .expect("independent scoped test pool")
     }
 
     async fn close(self) {
@@ -364,6 +420,38 @@ async fn wait_sequence(store: &GatewaySessionStore, sequence: u64) {
     .expect("checkpoint deadline");
 }
 
+// A visible checkpoint precedes the runner's in-memory readiness update.
+async fn wait_connected(state: &RwLock<GatewayState>) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while *state.read().await != GatewayState::Connected {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("gateway connected deadline");
+}
+
+#[tokio::test(start_paused = true)]
+async fn readiness_wait_requires_connected_state() {
+    let state = Arc::new(RwLock::new(GatewayState::Armed));
+    let waiting_state = state.clone();
+    let waiting = tokio::spawn(async move { wait_connected(&waiting_state).await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(50)).await;
+    assert!(!waiting.is_finished(), "Armed is not ready");
+    *state.write().await = GatewayState::Connected;
+    tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("connected state observed")
+        .expect("readiness waiter");
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "gateway connected deadline")]
+async fn readiness_wait_has_a_bounded_deadline() {
+    wait_connected(&RwLock::new(GatewayState::Armed)).await;
+}
+
 async fn spawn_runner(
     db: &TestDb,
     url: &str,
@@ -401,6 +489,9 @@ async fn spawn_runner_until_shutdown(
         pipeline,
         state.clone(),
         db.store.clone(),
+        None,
+        None,
+        None,
         None,
         shutdown,
     ));
@@ -504,7 +595,7 @@ async fn gateway_resume_after_restart_has_no_duplicate_funnel_rows_and_is_ready(
     assert_eq!(auth["d"]["session_id"], "fresh-session");
     wait_sequence(&db.store, 3).await;
     assert_eq!(db.count().await, 1);
-    assert_eq!(*state.read().await, GatewayState::Connected);
+    wait_connected(&state).await;
     runner.abort();
     let _ = runner.await;
     second.task.abort();
@@ -539,7 +630,7 @@ async fn gateway_invalid_session_falls_back_to_identify_and_replaces_checkpoint(
             .session_id,
         "fresh-session"
     );
-    assert_eq!(*state.read().await, GatewayState::Connected);
+    wait_connected(&state).await;
     runner.abort();
     let _ = runner.await;
     mock.task.abort();

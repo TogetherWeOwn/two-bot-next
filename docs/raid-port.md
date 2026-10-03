@@ -47,6 +47,34 @@ and [concurrent join scoring](https://github.com/TogetherWeOwn/two-bot/blob/d5d1
   tuning differs; repeat text's “more joins” is the current count, not a delta.
   Span rounding is the legacy nonnegative `Math.round` behavior.
 
+## Historical replay
+
+`scan_joins_for_bursts` replays recorded joins through a **fresh** `RaidWatch`
+per call, as legacy `scanJoinsForBursts` did
+([raidWatch.ts](https://github.com/TogetherWeOwn/two-bot/blob/d5d1179348feb9157bcac8c875de9399d4f5c76a/src/analytics/raidWatch.ts#L170-L196)),
+so a threshold can be checked against history before it ships. Options are one
+fixed snapshot (`RaidScanOptions`, defaulting to the values above); nothing
+carries between calls. Window, dedupe, cooldown and `repeat` stay per guild
+inside one call, so one replay over two distant raids yields a second alert
+marked `repeat`.
+
+- Input need not be sorted. Joins are stably sorted by **parsed instant**, with
+  input order on ties. Legacy sorted the raw strings (`localeCompare`), which
+  only matches chronological order for uniform `toISOString` output; mixed
+  offsets or precision now replay in true occurrence order (`docs/parity.md`).
+- A timestamp that is not strict RFC 3339 (explicit offset required) is
+  skipped, like legacy `Date.parse` NaN. Legacy also accepted non-RFC 3339
+  shapes such as date-only or offset-less strings; the port skips those, so an
+  export must emit RFC 3339. Sub-millisecond digits truncate.
+- `crates/core/tests/raid_replay.rs` replays the legacy scenarios
+  ([unit.raidwatch.test.ts](https://github.com/TogetherWeOwn/two-bot/blob/d5d1179348feb9157bcac8c875de9399d4f5c76a/test/unit.raidwatch.test.ts#L74-L130)):
+  1,015 joins over 56 minutes give 3-6 cooldown-spaced alerts; each 15-join
+  small raid alerts once at count 5; 7 joins 8 minutes apart never alert; a
+  10-ID cap with a 10-second cooldown truncates the follow-up alert.
+- The replay is pure: no database read or runtime wiring is added. The manual
+  `raid-list` tool ([TOG-10867](/TOG/issues/TOG-10867)) does not call it in this
+  slice.
+
 ## Join-risk decisions
 
 `JoinRiskPolicy::prepare` ignores bots and other guilds. Joining members are not
@@ -104,10 +132,14 @@ independent enable switch. Anti-nuke dry-run does **not** suppress risk evidence
 or staff messages. Preserve session-mode refusal of armed anti-nuke and the
 adapter's contained-restart skips. Do not infer activation from a pure proposal.
 
-Runtime integration remains on this parent's retained work: transactional store
-and migrations, gateway calls after join recording, live raid tuning, startup
-fences, log/delivery through the shared REST executor, and staging soak. The
-executor seam is TOG-10076; no private production HTTP client is added here.
+Runtime integration remains on this parent's retained work: gateway calls after
+join recording, live raid tuning, startup fences, log/delivery through the
+shared REST executor, and staging soak. The executor seam is TOG-10076; no
+private production HTTP client is added here. The transactional join-risk
+claim store (`join_risk_store`, migration `0360_join_risk_flags.sql`, legacy
+0015 shape) serializes per-guild event-ID claims, counts prior rows by
+processing-time `created_at`, scores with the current join, and persists the
+evidence in one transaction — but is not wired to the gateway or executor.
 
 `raid.rs` unit tests cover strict clocks/age/window/cooldown boundaries, reverse
 arrival, dedupe-before-prune, fractional/live tuning, guild isolation, payload

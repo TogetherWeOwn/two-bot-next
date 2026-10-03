@@ -277,6 +277,49 @@ Wrangler lists the ten most recent versions/deployments. Select the actual
 previously healthy version from your deployment record; never silently choose
 "latest" or omit the rollback ID.
 
+### Staging-only migration runner
+
+`.github/workflows/staging-migrate.yml` (manual, staging-only, no production
+path) runs `staging-migrate --plan|--apply` from `crates/cutover/src/bin/staging_migrate.rs`.
+It embeds this crate's migrations through the SQLx **0.9.0 library** (no
+`sqlx-cli`; the pin is asserted against `Cargo.lock`), keeps the ledger in
+`public._sqlx_migrations`, and runs `SET ROLE two_bot_migrator` in SQLx's
+per-connection `after_connect`, verifying `current_user` on every connection.
+Invocation (secret-free; the URL comes only from the existing
+`TWO_BOT_STAGING_MIGRATOR_DATABASE_URL` binding):
+
+```text
+staging-migrate --plan --source-sha <40hex> --staging-host <host> \
+  --staging-database <db> --recovery-evidence-ref <ref> --acl-plan-ref <ref>
+```
+
+It refuses (exit 2, before any DDL) when the binding is absent, the target does
+not equal the named staging identity, the database name does not contain
+`staging` or looks like production, the login cannot assume `two_bot_migrator`,
+a reference is missing, or the ledger has a failed/incomplete row, a SHA-384
+mismatch, an unknown version or a non-prefix order. It never resets, reverts,
+restores, creates roles or grants. The sanitized JSON manifest (source SHA,
+per-migration SHA-384, ledger before/after, applied count) is the evidence; on
+failure the ledger-after is preserved, not repaired.
+
+The workflow runs only when dispatched from `main` and reads the binding from
+the `staging-migrate` GitHub environment. That environment must have a required
+reviewer and a main-only deployment-branch rule, and the binding must be an
+environment secret, not a repository secret; otherwise a workflow edited on
+another branch could read it. This change does not create the environment or
+the secret.
+
+Prerequisites the legitimate principal must verify **before dispatch** (the
+runner cannot, and this change does not claim them): the real staging Neon
+identity; that the dedicated migrator binding already exists; the
+`staging-migrate` environment protections above; and a complete
+recovery set covering the Next schema, `_sqlx_migrations` ledger, object
+ownership, ACLs and logins. The generic legacy backup omits Next tables and the
+SQLx history, and unverified Neon PITR is not a working recovery. Apply the
+reviewed ACL sequence in `docs/database-roles.md` so other shared-database
+services keep their access. Real SQLx proof runs only against disposable CI
+services (`crates/cutover/tests/staging_migrate_db.rs`).
+
 ### Redeploy the approved revision
 
 With the correct revision already selected in a separate clean operator checkout,
@@ -378,12 +421,39 @@ Source: [`gateway.rs`](../crates/bot/src/gateway.rs),
 [`durable store`](../crates/cutover/src/gateway_session.rs),
 [recovery notes](gateway-recovery.md).
 
+### Force-fresh IDENTIFY (first production boot only)
+
+First production boot only: the age policy above alone would RESUME a
+checkpoint up to 15 minutes old, so the first production boot arms a one-shot
+directive to force a fresh IDENTIFY instead. Authority and full contract:
+[Force-fresh IDENTIFY](gateway-recovery.md#force-fresh-identify-first-production-boot).
+`TWO_DATABASE_URL` is the bot database the target Container uses; `GUILD_ID`
+is that Container's configured guild, and `--guild` must equal it. Quoted
+verbatim from the authority (only the `two-bot` binary ships in the image;
+run from an operator checkout):
+
+```sh
+# 1. Dry run (default): prints guild, shard 0, checkpoint age and directive; writes nothing.
+cargo run -p two-bot-cutover --bin gateway-force-identify --locked -- --guild "$GUILD_ID"
+# 2. Arm. The live guild also needs --allow-live-guild.
+cargo run -p two-bot-cutover --bin gateway-force-identify --locked -- \
+  --guild "$GUILD_ID" --apply --reason "first production boot" --allow-live-guild
+# 3. Start the bot, then re-run the dry run: the directive shows "consumed at ...".
+```
+
+The live (production) guild refuses without `--allow-live-guild`. One-shot
+consume semantics: of two concurrent boot reads, exactly one consumes the
+directive; the directive never deletes or rewrites `gateway_sessions` — the
+bot's existing discard path clears the checkpoint before IDENTIFY, and the
+next boot after READY has no directive and RESUMEs normally.
+
 ## Containment, kill switches and feature flags
 
 **Do not confuse a ported core contract with an active control.** The current
 binary runs the gateway/cache/funnel pipeline. It does not start audit delivery,
-automod sanction workers, moderation/slash-command handlers, internal-action
-HTTP, or the settings poller. The Worker does not forward the feature vars.
+automod sanction workers, moderation/slash-command handlers, or the settings
+poller. Internal-action HTTP is the dark-by-default private receiver (see the
+Internal actions row). The Worker forwards only the reviewed `TWO_*` flags.
 There is no binary audit-halt command or hot-reload/admin endpoint to recommend.
 
 For unexpected writes: first identify the actual writer (legacy bot, next image,
@@ -400,7 +470,7 @@ tokens, or redeploy with an unreviewed wiring change during this docs procedure.
 | Automations/announcements/text | `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`; text needs automations **and** `TWO_TEXT_COMMANDS=1`. | Library gates; no command publishing/job service wired. |
 | Onboarding | `TWO_ONBOARDING_MODE=legacy|session|anchor`, default legacy; `TWO_ONBOARDING_DRY_RUN=1`. | Core only; session/anchor roles and dry-run are not active runtime switches. |
 | Community scorecard | `TWO_COMMUNITY_SCORECARD=1`; recommendations on unless `TWO_COMMUNITY_RECOMMENDATIONS=0`. | Core/store present; no scorecard scheduler wired. |
-| Internal actions | Moderation requires `TWO_INTERNAL_ALLOW_MODERATION=1` **and** `TWO_MODERATION=1`; other verbs have allow flags. | Durable replay store/executor ports do not create an HTTP listener or authorize writes. |
+| Internal actions | Moderation requires `TWO_INTERNAL_ALLOW_MODERATION=1` **and** `TWO_MODERATION=1`; other verbs have allow flags. | Only the private `announcement.post` receiver exists, and only in staging: dark until the Operator sets the Worker secret `TWO_INTERNAL_ACTIONS` to `1` last; unset it to go dark again. Reachable solely through the staging Worker ingress for `POST /internal/actions`; production has none. The other allow flags still authorize nothing. See [staging ingress](internal-actions-receiver.md#staging-ingress-default-dark). |
 | Settings hot reload | Typed catalogue/store with env-only secret/moderation keys. | Poller/runtime rebuilding remains follow-up; no promise of changes applying without restart. |
 
 Source: [`automod.rs`](../crates/core/src/automod.rs),
@@ -487,6 +557,8 @@ or existing operator handoff; see [backup.md](backup.md) for unit contracts.
 | HTTP 200 health but persistent 503 ready | Listener works, gateway does not. Read `gateway` state and startup logs. Never soften readiness or count the scaffold-era deploy gate as recovery. |
 | Reconnect / RESUME refused | Follow [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery); 4007/4009 force fresh IDENTIFY. Preserve the durable checkpoint, don't hand-edit sequence or start another shard. |
 | Discord REST 429 / suspected breaker | The legacy shared global/route 429 breaker is absent; current gateway binary also has no wired REST action executor to reset. The ported executor honors retry-after (body then header, fallback 1 s, +250 ms, cap 60 s). Moderation uses one timed attempt; paced kick/publishing have bounded attempts, but paced GET 429 retries are not count-bounded. Do not claim every REST request has five retries, hammer Discord, replay uncertain moderation writes, or invent a breaker-reset command. Identify the real writer and use its verified containment. See [`executor.rs`](../crates/discord/src/executor.rs). |
+| `POST /internal/actions` 404 on staging | The route is dark unless the Worker var `INTERNAL_ACTIONS_INGRESS` (staging env) **and** the secret `TWO_INTERNAL_ACTIONS` are both exactly `1`. Wrong method, a trailing slash or any query string is also 404 by design. Production is always 404. |
+| `POST /internal/actions` 503 `unavailable` | The container is not running (public ingress never starts it; wait for the probe or keepalive), the ownership fence refused this deployment, or the receiver answered something other than its JSON envelope. Check `/readyz` and ownership status; do not retry-loop a signed request with a new nonce. |
 | Ready but feature inactive | Gateway readiness says nothing about library-only commands/jobs/kill switches. Check [runtime boundaries](#containment-kill-switches-and-feature-flags), not extra environment guesses. |
 | Worker restored but Rust regression remains | Worker-version rollback did not prove image rollback. Inspect the active image and use a schema-compatible full redeploy of the known-good pair. |
 | Backup/drill red | Preserve valid archives; inspect exit status, verifier line, table counts and off-box receipt. Rehearse only on a prepared test database. No automatic promotion to a production restore. |
@@ -500,6 +572,7 @@ operation; this inventory is not a request to create, rotate or delete one.
 | Surface | Names | Boundary |
 |---|---|---|
 | Gateway Worker secrets forwarded to container | `DISCORD_TOKEN`, `DATABASE_URL` | Current runtime spellings. `GUILD_ID` is also stored as a Worker secret in staging, but is an identifier, not a credential. |
+| Staging private receiver (default dark) | `TWO_INTERNAL_KEYS` (signing key), `TWO_INTERNAL_CALLERS`, `TWO_INTERNAL_CHANNEL_KEYS`, `TWO_INTERNAL_ACTIONS` | Staging Worker secrets set by the Operator only, never `wrangler.toml` vars and never in production. `TWO_INTERNAL_ACTIONS=1` is set last. The key is generated on the Operator host and never printed; see the [enable order](internal-actions-receiver.md#enable-order-and-rollback). |
 | Staging deployment CI secrets | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` | Existing deploy workflow; no personal credential substitution. `STAGING_WORKER_URL` is a repository **variable**. |
 | Backup database connections | `TWO_DATABASE_URL`, `TWO_RESTORE_URL` | Different source/target names; scratch-only in examples. |
 | Off-box upload | `TWO_BACKUP_S3_ACCESS_KEY_ID`, `TWO_BACKUP_S3_SECRET_ACCESS_KEY` | Provisioned S3/R2 destination only; see backup.md for non-secret endpoint/bucket settings. |
