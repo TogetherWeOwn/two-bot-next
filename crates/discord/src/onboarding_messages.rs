@@ -53,7 +53,7 @@ fn option(
     }
 }
 
-/// Source: https://docs.rs/twilight-model/0.17.1/twilight_model/channel/message/component/struct.SelectMenu.html
+/// Source: <https://docs.rs/twilight-model/0.17.1/twilight_model/channel/message/component/struct.SelectMenu.html>
 pub fn picker_components(
     picker: Option<PickerKind>,
     member_roles: &[&str],
