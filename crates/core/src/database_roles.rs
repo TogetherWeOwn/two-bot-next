@@ -140,73 +140,57 @@ mod tests {
     fn matrix_covers_every_migrated_object_and_contract_view() {
         // New tables, sequences and trigger functions must be deliberately
         // included rather than silently receiving wildcard permissions.
-        // No database connection is needed.
-        for migration in [
-            include_str!("../../cutover/migrations/0001_funnel.sql"),
-            include_str!("../../cutover/migrations/0002_leveling.sql"),
-            include_str!("../../cutover/migrations/0110_moderation_member.sql"),
-            include_str!("../../cutover/migrations/0111_moderation_ban_ownership.sql"),
-            include_str!("../../cutover/migrations/0112_moderation_legacy_timestamps.sql"),
-            include_str!("../../cutover/migrations/0113_moderation_unban_retry_order.sql"),
-            include_str!("../../cutover/migrations/0114_moderation_member_runtime_grants.sql"),
-            include_str!("../../cutover/migrations/0120_channel_moderation.sql"),
-            include_str!("../../cutover/migrations/0130_custom_commands.sql"),
-            include_str!("../../cutover/migrations/0140_scheduled_messages.sql"),
-            include_str!("../../cutover/migrations/0141_scheduled_messages_legacy_upgrade.sql"),
-            include_str!("../../cutover/migrations/0150_sticky_messages.sql"),
-            include_str!("../../cutover/migrations/0160_rsvp.sql"),
-            include_str!("../../cutover/migrations/0170_lfg.sql"),
-            include_str!("../../cutover/migrations/0200_self_roles.sql"),
-            include_str!("../../cutover/migrations/0205_self_role_exchange_receipts.sql"),
-            include_str!("../../cutover/migrations/0206_self_role_exchange_baselines.sql"),
-            include_str!("../../cutover/migrations/0210_tickets.sql"),
-            include_str!("../../cutover/migrations/0220_automod.sql"),
-            include_str!("../../cutover/migrations/0221_automod_delivery_claims.sql"),
-            include_str!("../../cutover/migrations/0222_automod_counted_claim.sql"),
-            include_str!("../../cutover/migrations/0223_automod_preserved_match.sql"),
-            include_str!("../../cutover/migrations/0224_voice_rooms.sql"),
-            include_str!("../../cutover/migrations/0225_voice_inherit_limit.sql"),
-            include_str!("../../cutover/migrations/0226_voice_text_channels.sql"),
-            include_str!("../../cutover/migrations/0227_voice_access_controls.sql"),
-            include_str!("../../cutover/migrations/0228_voice_logging_settings.sql"),
-            include_str!("../../cutover/migrations/0229_voice_config.sql"),
-            include_str!("../../cutover/migrations/0300_website_contract.sql"),
-            include_str!("../../cutover/migrations/0310_presence_probe.sql"),
-            include_str!("../../cutover/migrations/0311_community_scorecard.sql"),
-            include_str!("../../cutover/migrations/0312_community_scorecard_attempts.sql"),
-            include_str!("../../cutover/migrations/0320_gateway_sessions.sql"),
-            include_str!("../../cutover/migrations/0321_gateway_boot_directives.sql"),
-            include_str!("../../cutover/migrations/0330_guild_settings.sql"),
-            include_str!("../../cutover/migrations/0331_guild_settings_versions.sql"),
-            include_str!("../../cutover/migrations/0332_guild_settings_allocator.sql"),
-            include_str!("../../cutover/migrations/0333_guild_settings_revision.sql"),
-            include_str!("../../cutover/migrations/0334_guild_settings_cas.sql"),
-            include_str!("../../cutover/migrations/0340_operational_audit.sql"),
-            include_str!("../../cutover/migrations/0350_internal_actions.sql"),
-            include_str!("../../cutover/migrations/0353_internal_clock_high_water.sql"),
-            include_str!("../../cutover/migrations/0361_discord_send_admission.sql"),
-            include_str!("../../cutover/migrations/0362_gateway_onboarding_jobs.sql"),
-        ] {
-            let mut table = None;
+        // Enumerate the migrations directory so a new CREATE without a matrix
+        // row fails CI. No database connection is needed. Our 0130 custom
+        // commands migration is covered automatically: the file lives in-tree.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cutover/migrations");
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("migrations directory")
+            .map(|entry| entry.expect("migration entry").path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql"))
+            .collect();
+        paths.sort();
+        assert!(!paths.is_empty(), "no migrations found");
+        for path in paths {
+            let migration = std::fs::read_to_string(&path).expect("migration file readable");
+            let mut table: Option<String> = None;
             for line in migration.lines() {
                 if let Some(rest) = line.strip_prefix("CREATE TABLE ") {
                     let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
-                    let name = rest.split_whitespace().next().unwrap();
-                    let name = name.strip_prefix("public.").unwrap_or(name);
+                    let raw = rest.split_whitespace().next().unwrap();
+                    let raw = raw.strip_prefix("public.").unwrap_or(raw);
+                    let name = raw
+                        .trim_matches(|c| c == '"' || c == '(')
+                        .trim_end_matches('(')
+                        .to_owned();
                     let kind = if name == "discord_send_admission" {
                         "admission"
+                    } else if name == "member_erasure_audit" || name == "invite_campaigns" {
+                        "migrator"
                     } else {
                         "table"
                     };
-                    assert!(MATRIX.contains(&format!("'public', '{name}', '{kind}'")));
+                    assert!(
+                        MATRIX.contains(&format!("'public', '{name}', '{kind}'")),
+                        "missing matrix row for {name} ({kind}) from {}",
+                        path.display()
+                    );
                     table = Some(name);
                 } else if let Some(rest) = line.strip_prefix("CREATE SEQUENCE ") {
                     let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
                     let name = rest.split_whitespace().next().unwrap();
-                    assert!(MATRIX.contains(&format!("'public', '{name}', 'sequence'")));
+                    assert!(
+                        MATRIX.contains(&format!("'public', '{name}', 'sequence'")),
+                        "missing matrix sequence {name} from {}",
+                        path.display()
+                    );
                 } else if let Some(rest) = line.strip_prefix("CREATE OR REPLACE FUNCTION ") {
                     let name = rest.split_whitespace().next().unwrap();
-                    assert!(MATRIX.contains(&format!("'public', '{name}', 'function'")));
+                    assert!(
+                        MATRIX.contains(&format!("'public', '{name}', 'function'")),
+                        "missing matrix function {name} from {}",
+                        path.display()
+                    );
                 } else {
                     let mut words = line.split_whitespace();
                     if let (Some(column), Some(_)) = (
@@ -217,7 +201,7 @@ mod tests {
                                 .any(|serial| kind.eq_ignore_ascii_case(serial))
                         }),
                     ) {
-                        let table = table.expect("serial column outside table");
+                        let table = table.clone().expect("serial column outside table");
                         assert!(MATRIX
                             .contains(&format!("'public', '{table}_{column}_seq', 'sequence'")));
                     }

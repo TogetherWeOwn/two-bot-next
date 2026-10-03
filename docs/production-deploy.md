@@ -6,23 +6,27 @@ on push, PR or schedule. The B4 cutover executor (TOG-9699) dispatches it from
 `main`. Agents never do. The cutover gates in [cutover.md](cutover.md) still
 apply.
 
-**Before the first dispatch**, a repository admin must set up three things.
+**Before the first dispatch**, a repository admin verifies three things. The
+first and the branch policy were verified live on 2026-10-03 (commands under
+Verification in the change that wrote this); re-check them before dispatching,
+since Environment settings can drift.
 
-1. Create the `production` GitHub Environment with at least one required
-   reviewer, and restrict deployment branches to the single custom branch
-   `main`. Turn on prevent self-review.
-2. Set the `PRODUCTION_WORKER_URL` variable to the production Worker's
-   `https://` URL. It must differ from `STAGING_WORKER_URL`.
+1. The `production` GitHub Environment has at least one required reviewer
+   with prevent self-review on, and restricts deployment branches to the
+   single custom branch `main`. Live state: one required reviewer,
+   self-review blocked, custom branch policy `main` only.
+2. The `PRODUCTION_WORKER_URL` variable holds the production Worker's
+   `https://` URL. It must differ from `STAGING_WORKER_URL`. The deploy job
+   refuses when it is unset, not an `https://` URL, or equal to staging.
 3. Optionally add production-scoped `CLOUDFLARE_API_TOKEN` /
-   `CLOUDFLARE_ACCOUNT_ID` secrets. Environment secrets override the repository
-   secrets that staging uses.
+   `CLOUDFLARE_ACCOUNT_ID` secrets. Environment secrets override the
+   repository secrets that staging uses.
 
-Until the Environment exists with reviewers and a main-only branch policy, the
+Until the Environment has reviewers and a main-only branch policy, the
 `sha guard` job refuses every dispatch. A job that names a missing Environment
 makes GitHub create it with no protection, so the guard checks before the
-deploy job can run. This repository is private. GitHub offers required
-reviewers on private repositories only on the Enterprise plan; on Free, Pro
-and Team plans, the guard keeps refusing.
+deploy job can run. This repository is public, so required reviewers work on
+every plan; no Enterprise plan is needed.
 
 **Deploy.** Dispatch with `sha` set to a full 40-character commit that is on
 `main`. That commit needs green `check` and `worker check` runs (from GitHub

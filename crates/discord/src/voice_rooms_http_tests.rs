@@ -159,7 +159,7 @@ async fn ephemeral_defer_then_edit_original_use_token_only_and_no_mentions() {
         .await
         .unwrap();
     mock.api
-        .complete_interaction(Id::new(1), "interaction-token", "Created <#600>")
+        .complete_interaction(Id::new(1), "interaction-token", "Created <#600>", &[], None)
         .await
         .unwrap();
     let requests = mock.state.recorded.lock().unwrap();
@@ -177,6 +177,9 @@ async fn ephemeral_defer_then_edit_original_use_token_only_and_no_mentions() {
     );
     assert_eq!(requests[1].body["content"], "Created <#600>");
     assert_eq!(requests[1].body["allowed_mentions"]["parse"], json!([]));
+    // A plain text edit leaves attachments and components untouched.
+    assert!(requests[1].body.get("attachments").is_none());
+    assert!(requests[1].body.get("components").is_none());
     assert!(requests.iter().all(|request| !request.bot_authenticated));
 }
 
