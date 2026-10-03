@@ -709,6 +709,14 @@ pub enum RoomAction {
     DeleteRoom {
         channel_id: Snowflake,
     },
+    /// V2 caretaker succession: persist an ownership handoff the worker
+    /// already applied to its tracked row. No Discord write; rename, privacy
+    /// and Join-channel follow-ups belong to later slices.
+    UpdateOwnership {
+        channel_id: Snowflake,
+        owner_id: Snowflake,
+        original_creator_id: Snowflake,
+    },
     RenameRoom {
         channel_id: Snowflake,
         name: String,
@@ -737,6 +745,7 @@ impl RoomAction {
             Self::CreateRoom { .. } => None,
             Self::MoveMember { channel_id, .. }
             | Self::DeleteRoom { channel_id }
+            | Self::UpdateOwnership { channel_id, .. }
             | Self::RenameRoom { channel_id, .. } => Some(*channel_id),
         }
     }
@@ -1321,6 +1330,63 @@ mod tests {
             }),
             Some(RoomAction::DeleteRoom { channel_id: 502 })
         );
+        assert_eq!(q.pop_due(GUILD, 0), None);
+    }
+
+    #[test]
+    fn ownership_handoff_is_urgent_and_channel_scoped() {
+        let q = ActionQueue::new();
+        q.enqueue(
+            GUILD,
+            RoomAction::RenameRoom {
+                channel_id: 500,
+                name: "slow".to_owned(),
+            },
+        );
+        q.enqueue(
+            GUILD,
+            RoomAction::UpdateOwnership {
+                channel_id: 501,
+                owner_id: MEMBER,
+                original_creator_id: MEMBER,
+            },
+        );
+        // The urgent handoff jumps the earlier rename.
+        assert_eq!(
+            q.pop_due(GUILD, 0).map(|a| {
+                q.mark_succeeded(&a);
+                a.action
+            }),
+            Some(RoomAction::UpdateOwnership {
+                channel_id: 501,
+                owner_id: MEMBER,
+                original_creator_id: MEMBER,
+            })
+        );
+        // Suspension and forget-drops cover the handoff like any other
+        // channel-scoped write.
+        q.enqueue(
+            GUILD,
+            RoomAction::UpdateOwnership {
+                channel_id: 502,
+                owner_id: MEMBER,
+                original_creator_id: MEMBER,
+            },
+        );
+        q.suspend(GUILD, 502);
+        assert_eq!(
+            q.pop_due(GUILD, 0).map(|a| {
+                q.mark_succeeded(&a);
+                a.action
+            }),
+            Some(RoomAction::RenameRoom {
+                channel_id: 500,
+                name: "slow".to_owned(),
+            })
+        );
+        assert_eq!(q.pop_due(GUILD, 0), None);
+        q.resume(GUILD, 502);
+        assert_eq!(q.drop_for_channel(GUILD, 502), 1);
         assert_eq!(q.pop_due(GUILD, 0), None);
     }
 

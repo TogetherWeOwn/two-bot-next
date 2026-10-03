@@ -34,6 +34,9 @@ use twilight_model::{
 };
 use two_bot_core::{
     now_iso,
+    voice_ownership::{
+        decide_ownership, OwnershipDecision, OwnershipRequest, RoomMember, RoomOwnership,
+    },
     voice_rooms::{
         category_full_message, voice_commands, ActionQueue, CreatorChannel, NewRoomSpec,
         PermissionSource, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, RoomPosition,
@@ -71,6 +74,13 @@ pub trait RoomPersistence: Send + Sync {
         creator: &CreatorChannel,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
     fn persist(&self, room: &VoiceRoom) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// Persist a V2 caretaker/command handoff on an already-tracked room.
+    /// Returns `Ok(true)` when the row existed, `Ok(false)` when the tracked
+    /// row has no database counterpart (deleted out-of-band).
+    fn update_ownership(
+        &self,
+        room: &VoiceRoom,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
     fn forget(
         &self,
         guild: Snowflake,
@@ -104,6 +114,17 @@ impl RoomPersistence for PgRoomStore {
             return Err(StoreError::Conflict);
         }
         Ok(())
+    }
+
+    async fn update_ownership(&self, room: &VoiceRoom) -> Result<bool, StoreError> {
+        self.update_ownership(
+            room.guild_id,
+            room.channel_id,
+            room.owner_id,
+            room.original_creator_id,
+        )
+        .await
+        .map_err(store_error)
     }
 
     async fn forget(&self, guild: Snowflake, channel: Snowflake) -> Result<(), StoreError> {
@@ -226,6 +247,19 @@ struct MemberState {
     channel_id: Option<Snowflake>,
     bot: Option<bool>,
     transition: u64,
+    /// Wall-clock millis when the current continuous stay in `channel_id`
+    /// began. Leave/rejoin resets it; same-channel updates keep it. This is
+    /// the V2 caretaker ordering source ("longest-present member").
+    joined_at_ms: u64,
+}
+
+/// Wall-clock millis for V2 tenure stamps. Coarse ordering only: equal
+/// stamps fall back to ascending member id in `decide_ownership`.
+fn wall_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Default)]
@@ -267,6 +301,24 @@ impl LiveState {
             .filter(|member| member.channel_id == Some(channel) && member.bot != Some(true))
             .count()
     }
+
+    /// Current occupants of one room as a V2 ownership snapshot. Unknown
+    /// identity counts as human, matching [`LiveState::humans`]: never treat
+    /// incomplete bot data as a bot.
+    fn occupants(&self, channel: Snowflake) -> Vec<RoomMember> {
+        let mut members: Vec<RoomMember> = self
+            .members
+            .iter()
+            .filter(|(_, member)| member.channel_id == Some(channel))
+            .map(|(member_id, member)| RoomMember {
+                member_id: *member_id,
+                joined_at_ms: member.joined_at_ms,
+                is_bot: member.bot == Some(true),
+            })
+            .collect();
+        members.sort_by_key(|member| member.member_id);
+        members
+    }
 }
 
 /// Shared with the gateway, not locked across network/database awaits.
@@ -300,6 +352,11 @@ impl LiveGuild {
             .into_iter()
             .map(|channel| (channel.id.get(), channel))
             .collect();
+        // One shared stamp: bootstrap order is unknown, so tenure ties
+        // break by member id until transitions establish real seniority.
+        // A snapshot rebuild resets tenure — tenure is continuous tracked
+        // presence in this session, not a durable fact.
+        let published_at_ms = wall_ms();
         live.members = snapshot
             .members
             .into_iter()
@@ -310,6 +367,7 @@ impl LiveGuild {
                         channel_id: Some(member.channel_id),
                         bot: member.bot,
                         transition: 0,
+                        joined_at_ms: published_at_ms,
                     },
                 )
             })
@@ -341,6 +399,18 @@ impl LiveGuild {
         channel: Option<Snowflake>,
         bot: Option<bool>,
     ) -> Option<JoinTicket> {
+        self.voice_update_at(member, channel, bot, wall_ms())
+    }
+
+    /// Deterministic tenure seam: `voice_update` stamps the wall clock;
+    /// tests pin `now_ms` to control caretaker ordering.
+    fn voice_update_at(
+        &self,
+        member: Snowflake,
+        channel: Option<Snowflake>,
+        bot: Option<bool>,
+        now_ms: u64,
+    ) -> Option<JoinTicket> {
         let mut live = self.inner.write().expect("live voice lock");
         if let Some(previous) = live.members.get_mut(&member) {
             if previous.channel_id == channel {
@@ -357,6 +427,7 @@ impl LiveGuild {
                 channel_id: channel,
                 bot,
                 transition,
+                joined_at_ms: now_ms,
             },
         );
         channel.filter(|_| live.ready).map(|creator_id| JoinTicket {
@@ -561,6 +632,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return;
         }
         let mut empty = Vec::new();
+        let mut occupied = Vec::new();
         for channel in self.rooms.keys().copied() {
             if !live.channels.contains_key(&channel) {
                 self.queue.resume(self.live.guild_id, channel);
@@ -587,20 +659,84 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 continue;
             }
             self.queue.resume(self.live.guild_id, channel);
-            if live.humans(channel) == 0
-                && !self.moves.contains_key(&channel)
-                && !self
+            let move_pending = self.moves.contains_key(&channel)
+                || self
                     .uncertain_moves
                     .get(&channel)
-                    .is_some_and(|ticket| live.ticket_valid(*ticket))
-            {
+                    .is_some_and(|ticket| live.ticket_valid(*ticket));
+            if live.humans(channel) == 0 && !move_pending {
                 empty.push(channel);
+            } else if live.humans(channel) > 0 && !move_pending {
+                occupied.push(channel);
             }
         }
         drop(live);
         for channel in empty {
             self.queue_delete(channel, false);
         }
+        for channel in occupied {
+            self.apply_succession(channel);
+        }
+    }
+
+    /// V2 caretaker succession: when the tracked owner is gone but humans
+    /// remain, hand the room to the longest-present occupant (spec
+    /// `docs/voice-rooms.md` §V2). The worker row updates first so the next
+    /// tick is idempotent; the queued [`RoomAction::UpdateOwnership`] persists
+    /// the handoff. Skipped while the owner's move is still in flight and
+    /// while occupancy is uncertain after a successful move.
+    fn apply_succession(&mut self, channel: Snowflake) {
+        if self.moves.contains_key(&channel) {
+            return;
+        }
+        let (room, occupants) = {
+            let live = self.live.inner.read().expect("live voice lock");
+            if !live.ready {
+                return;
+            }
+            let Some(room) = self.rooms.get(&channel).cloned() else {
+                return;
+            };
+            if self
+                .uncertain_moves
+                .get(&channel)
+                .is_some_and(|ticket| live.ticket_valid(*ticket))
+            {
+                return;
+            }
+            (room, live.occupants(channel))
+        };
+        if occupants.is_empty()
+            || occupants
+                .iter()
+                .any(|member| member.member_id == room.owner_id)
+        {
+            return;
+        }
+        let ownership = RoomOwnership {
+            owner_id: room.owner_id,
+            original_creator_id: room.original_creator_id,
+        };
+        let next = match decide_ownership(ownership, &occupants, OwnershipRequest::Reconcile) {
+            Ok(OwnershipDecision::Changed { next, .. }) => next,
+            Ok(_) => return,
+            Err(error) => {
+                warn!(channel_id = channel, %error, "voice succession refused");
+                return;
+            }
+        };
+        let mut updated = room;
+        updated.owner_id = next.owner_id;
+        updated.original_creator_id = next.original_creator_id;
+        self.rooms.insert(channel, updated);
+        self.queue.enqueue(
+            self.live.guild_id,
+            RoomAction::UpdateOwnership {
+                channel_id: channel,
+                owner_id: next.owner_id,
+                original_creator_id: next.original_creator_id,
+            },
+        );
     }
 
     pub fn propose_name(
@@ -995,6 +1131,57 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     Err(error) => {
                         self.deletes.remove(&channel_id);
                         self.complete_error(action, channel_id, error);
+                    }
+                }
+            }
+            RoomAction::UpdateOwnership {
+                channel_id,
+                owner_id,
+                original_creator_id,
+            } => {
+                // No Discord write: the worker row already carries this
+                // handoff. A stale action (a newer succession moved the row,
+                // or the room was forgotten) persists nothing.
+                let Some(room) = self.rooms.get(&channel_id).cloned() else {
+                    self.queue.mark_succeeded(&action);
+                    return true;
+                };
+                if room.owner_id != owner_id || room.original_creator_id != original_creator_id {
+                    self.queue.mark_succeeded(&action);
+                    return true;
+                }
+                match self.store.update_ownership(&room).await {
+                    Ok(true) => {
+                        self.queue.mark_succeeded(&action);
+                    }
+                    Ok(false) => {
+                        // Tracked but no database row (deleted out-of-band):
+                        // never retry a write that cannot land. The handoff
+                        // stays in the worker row and surfaces below.
+                        self.record(LifecycleFailure::Persistence {
+                            channel_id: Some(channel_id),
+                            error: StoreError::Conflict,
+                        });
+                        self.queue.mark_succeeded(&action);
+                    }
+                    Err(StoreError::CredentialRefused) => {
+                        self.record(LifecycleFailure::Persistence {
+                            channel_id: Some(channel_id),
+                            error: StoreError::CredentialRefused,
+                        });
+                        self.halted = true;
+                        self.queue.mark_succeeded(&action);
+                    }
+                    Err(error) => {
+                        self.record(LifecycleFailure::Persistence {
+                            channel_id: Some(channel_id),
+                            error,
+                        });
+                        self.queue.mark_failed(
+                            action,
+                            "voice-room persistence unavailable".to_owned(),
+                            elapsed_ms(now_ms, started),
+                        );
                     }
                 }
             }

@@ -131,6 +131,20 @@ impl RoomPersistence for Store {
             .insert(room.channel_id, room.clone());
         Ok(())
     }
+    async fn update_ownership(&self, room: &VoiceRoom) -> Result<bool, StoreError> {
+        self.trace.lock().unwrap().push(format!(
+            "update_ownership:{}:{}",
+            room.channel_id, room.owner_id
+        ));
+        let mut rooms = self.rooms.lock().unwrap();
+        if let Some(stored) = rooms.get_mut(&room.channel_id) {
+            stored.owner_id = room.owner_id;
+            stored.original_creator_id = room.original_creator_id;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
     async fn forget(&self, _: u64, channel: u64) -> Result<(), StoreError> {
         self.trace.lock().unwrap().push(format!("forget:{channel}"));
         if let Some(error) = self.forget_errors.lock().unwrap().pop_front() {
@@ -469,6 +483,85 @@ async fn reconnect_only_prunes_tracked_empty_channels_and_counts_unknown_members
     assert!(!calls.contains(&"delete:501".to_owned()));
     assert!(!calls.iter().any(|call| call.contains("900")));
     assert_eq!(worker.tracked().len(), 2);
+}
+
+#[tokio::test]
+async fn owner_leave_hands_room_to_earliest_joiner_and_persists() {
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    // Owner 300 alone first; 302 arrives, then 301. Caretaker is 302 by
+    // earliest join time even though 301 sorts first by id.
+    live.publish(snapshot(
+        &[500],
+        vec![VoiceMember {
+            member_id: MEMBER,
+            channel_id: 500,
+            bot: Some(false),
+        }],
+    ));
+    live.voice_update_at(302, Some(500), Some(false), 1_000);
+    live.voice_update_at(301, Some(500), Some(false), 2_000);
+    live.voice_update_at(MEMBER, None, Some(false), 3_000);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reconcile();
+    let tracked = worker.tracked().get(&500).expect("tracked room");
+    assert_eq!(tracked.owner_id, 302);
+    assert_eq!(tracked.original_creator_id, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&"update_ownership:500:302".to_owned()));
+    // Idempotent: the next tick sees the owner present and enqueues nothing.
+    let queued = worker.queue.pending_counts(GUILD);
+    worker.reconcile();
+    assert_eq!(worker.queue.pending_counts(GUILD), queued);
+}
+
+#[tokio::test]
+async fn succession_skips_present_owners_and_pending_moves() {
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.publish(snapshot(
+        &[500],
+        vec![
+            VoiceMember {
+                member_id: MEMBER,
+                channel_id: 500,
+                bot: Some(false),
+            },
+            VoiceMember {
+                member_id: 301,
+                channel_id: 500,
+                bot: Some(false),
+            },
+        ],
+    ));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Owner present: no handoff.
+    worker.reconcile();
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, MEMBER);
+    // Owner leaves while their move is still in flight: succession waits
+    // for the inbound owner instead of handing the room off.
+    worker.moves.insert(
+        500,
+        JoinTicket {
+            member_id: MEMBER,
+            creator_id: CREATOR,
+            generation: 0,
+            transition: 0,
+        },
+    );
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 4_000);
+    worker.reconcile();
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, MEMBER);
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call.starts_with("update_ownership")));
 }
 
 #[tokio::test]
