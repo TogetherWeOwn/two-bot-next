@@ -128,7 +128,8 @@ async fn run(args: Args) -> Result<i32, String> {
     }
 
     let reason = args.get("reason").ok_or("execute requires --reason")?;
-    if reason.trim().is_empty() || reason.len() > 512 {
+    // Discord counts audit reasons in UTF-16 units, like the moderation seam.
+    if reason.trim().is_empty() || reason.encode_utf16().count() > 512 {
         return Err(
             "reason must be nonempty and within 512 characters (Discord audit bound)".into(),
         );

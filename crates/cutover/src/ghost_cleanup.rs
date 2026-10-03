@@ -58,9 +58,7 @@ where
         }
 
         fn visit_u64<E: de::Error>(self, v: u64) -> Result<Snowflake, E> {
-            if v == 0 {
-                return Err(E::custom("channel_id must be non-zero"));
-            }
+            check_snapshot_digits(v).map_err(E::custom)?;
             Ok(v)
         }
 
@@ -68,11 +66,25 @@ where
             if v <= 0 {
                 return Err(E::custom("channel_id must be non-zero"));
             }
+            check_snapshot_digits(v as Snowflake).map_err(E::custom)?;
             Ok(v as Snowflake)
         }
     }
 
     deserializer.deserialize_any(SnowflakeVisitor)
+}
+
+/// Integer snapshot ids get the same 17–20-digit snowflake shape the string
+/// path enforces: Discord counts UTF-16 units, and ids outside this band are
+/// typos, not channels.
+fn check_snapshot_digits(v: Snowflake) -> Result<(), String> {
+    let digits = v.to_string().len();
+    if !(17..=20).contains(&digits) {
+        return Err(format!(
+            "invalid channel_id \"{v}\": not a Discord snowflake"
+        ));
+    }
+    Ok(())
 }
 
 fn parse_snapshot_id(raw: &str) -> Result<Snowflake, String> {
@@ -328,6 +340,15 @@ mod tests {
             )
             .is_err()
         );
+        // Integer ids get the same 17–20-digit shape as string ids.
+        assert!(parse_snapshot(
+            r#"[{"channel_id": 42, "human_occupants": 0, "manageable": true}]"#
+        )
+        .is_err());
+        assert!(parse_snapshot(
+            r#"[{"channel_id": -5, "human_occupants": 0, "manageable": true}]"#
+        )
+        .is_err());
     }
 
     #[test]
