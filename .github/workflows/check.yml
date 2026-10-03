@@ -279,7 +279,7 @@ jobs:
 
       - name: audit database regressions (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo test -p two-bot-core --features db --test audit_store --test audit_service --locked -- --ignored
+        run: cargo test -p two-bot-core --features db --test audit_store --test audit_service --test containment_store --locked -- --ignored
 
       - name: LFG store regressions (CI service container only)
         if: needs.job-inputs.outputs.rust != 'false'
