@@ -12,7 +12,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
-    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
