@@ -113,6 +113,34 @@ whole watch so the rollback dispatch never has to hunt for it.
   dispatch needs. At +48 h record sign-off or extend the watch on the
   execution card.
 
+### Signal thresholds (budgets and rollback triggers)
+
+Numeric budgets the executor applies to the rows above. Thresholds only: this
+table installs no monitor and assumes no `/metrics` endpoint; each row names
+its source, and observation uses the paths in [cutover.md](cutover.md)
+§48-hour watch (read-only polls, deployment events, moderator observations).
+
+Watch cadence is one read-only poll every 60 s. The keepalive probes `/readyz`
+every `KEEPALIVE_SECONDS` (default 60 s) and raises `container_unready_alert`
+after 10 consecutive failed samples (≈10 min); see
+[container-readiness.md](container-readiness.md). That alert is a finding, not
+acceptance.
+
+| Signal | Budget (stay green) | Rollback-trigger value | Source |
+|---|---|---|---|
+| `readyz` 503 recovery | First 200 within 60 s of a restart or deploy event | 503 sustained past 60 s post-event: freeze writers, investigate; roll back if no recovery path is identified by the checkpoint | [staging-soak.md](staging-soak.md) acceptance (redeploy gap under 60 s); [cutover.md](cutover.md) §48-hour watch |
+| Restart loop | Zero unplanned restarts; each restart re-IDENTIFYs or RESUMEs from a checkpoint at most 15 min old | Second unplanned restart within 60 min, or two consecutive starts never reaching 200: freeze writers, evaluate rollback | [gateway-recovery.md](gateway-recovery.md) (15-min policy, supervision); [cutover.md](cutover.md) §48-hour watch |
+| Session-start (IDENTIFY/RESUME) | One session start per clean restart, against the Discord limit of 1000 IDENTIFYs per 24 h per token | More than 3 fresh IDENTIFYs in 1 h, an invalid-session storm (opcode 9 `d: false`, close 4007/4009), or under 10% of the daily allowance left: investigate; roll back if the gateway cannot hold a session | [Discord gateway session-start limits](https://docs.discord.com/developers/events/gateway); [gateway-recovery.md](gateway-recovery.md); [cutover.md](cutover.md) §48-hour watch |
+| REST 429 | At most 10% 429s per keepalive window (minimum 10 requests); rolling invalid-response count under 5000 per 600 s | Breaker open (5000 invalid per 600 s), or 429 share above 10% across consecutive windows after containment: stop the workload, freeze writers; roll back if the new revision caused it | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [rest-guard.md](rest-guard.md); [runbook.md](runbook.md) Alert: REST 429 |
+| REST 5xx and action latency | Routine actions finish inside the 5 s single-attempt deadline; 429 `retry-after + 250 ms` honored, 5xx backoff 500…8000 ms | Same route failing 3 times in a row, or any uncertain send without a recorded disposition: freeze that writer and reconcile; roll back if the failing path shipped in this revision | [rest-guard.md](rest-guard.md); [pacing-backoff-acceptance.md](pacing-backoff-acceptance.md); [metrics.md](metrics.md#off-container-scrape-and-alert-rules) job-failure rule |
+| Bot token | Zero 401s on bot-authenticated endpoints | First latched `token_invalid`: stop retries, freeze writers; no rollback until provisioning is corrected through the governed path | [rest-guard.md](rest-guard.md) |
+| Unban queue | Every due unban executed within 60 s of expiry (two 30 s sweeps, at most 25 jobs per sweep) | Any unban more than 5 min overdue without a named disposition is an incident; zero unexplained overdue is required for GO at each checkpoint | [member-moderation.md](member-moderation.md); [cutover.md](cutover.md) §§T-minus, 48-hour watch |
+| Scheduled jobs | Last success within twice the job cadence; fewer than 3 consecutive failures | `job_stale` or 3 consecutive failures on a watch-critical job (unban sweep, session checkpoint): freeze the consumer, fix the dependency; roll back if the regression shipped in this revision | [metrics.md](metrics.md#off-container-scrape-and-alert-rules) |
+| DB pool | Idle connections above zero, below max | Pool at max with zero idle for 3 consecutive keepalive samples: do not restart to free it; freeze writers, fix the holder; roll back if a new query path holds checkouts | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [runbook.md](runbook.md) Alert: DB pool |
+| RSS and placement | RSS steady within 25% of the soak-measured value on the `basic` (1 GiB) placement | Sustained growth above 25%, sustained use above 75% of placement, or any OOM-kill: freeze writers, investigate or roll back | [b1-baseline.md](b1-baseline.md) (`basic` verdict, 25% comparator policy); [cutover.md](cutover.md) §48-hour watch |
+| Event continuity | Zero unexplained gaps or duplicated effects versus independent moderator observations | Any unexplained gap or duplicated execution is a stop condition: freeze writers, evaluate rollback | [cutover.md](cutover.md) §48-hour watch; [staging-soak.md](staging-soak.md) acceptance |
+| Shutdown drain | SIGTERM drain completes inside 35 s (`SHUTDOWN_TIMEOUT_SECONDS` default) | `shutdown_deadline_exceeded` (exit 1): the restart reads the last committed checkpoint; repeated misses block GO until investigated | [configuration.md](configuration.md) |
+
 ## Deploy-timer mapping (parity §4)
 
 Verified 2026-10-02 against [parity.md](parity.md) §4 "Scheduled jobs &
