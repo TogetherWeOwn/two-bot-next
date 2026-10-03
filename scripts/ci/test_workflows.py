@@ -9,18 +9,29 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 STATIC_FALSE = "${{ false }}"
 JOB_INVENTORY = {
+    # Branch keeps the moderation-db job; main #84 added the supply-chain job.
+    # The pin must be the union of both sides.
     "check.yml": {"check", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
-                  "community-db", "feeds-db", "tickets-postgres", "worker"},
+                  "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain"},
     "deploy-production.yml": {"guard", "production"},
     "deploy-staging.yml": {"deploy"},
     "nightly.yml": {"pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
-    "release.yml": {"release-please", "dispatch-checks"},
+    "release.yml": {"release-please", "dispatch-checks", "sbom-target", "release-sbom",
+                    "attach-sbom"},
     "staging-migrate.yml": {"migrate"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
+    # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
+    # `image` builds/scans the untrusted ref with pinned actions only; `verify`
+    # runs the local validation/evidence/preflight scripts without ever
+    # checking out inputs.ref (CodeQL cache-poisoning gate).
+    "sbom.yml": {"image", "verify"},
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
-REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml"}
+# TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
+REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml",
+                   ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
+                   ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml"}
 # Main's runner routing (#265, 2026-10-02): the repo is public and the org's
 # self-hosted runner group refuses public repos, so every job routes through
 # one expression — public repo -> GitHub-hosted, private -> CI_OVERFLOW_* switch
@@ -418,6 +429,9 @@ class WorkflowTests(unittest.TestCase):
                         expected = {"contents": "write", "pull-requests": "write"}
                     elif (name, job_id) == ("release.yml", "dispatch-checks"):
                         expected = {"actions": "write"}
+                    elif (name, job_id) == ("release.yml", "attach-sbom"):
+                        # TOG-10893: uploads verified SBOMs to the published tag.
+                        expected = {"contents": "write"}
                     self.assertEqual(job["permissions"], expected)
                     for step in job.get("steps", []):
                         if step.get("uses", "").startswith("actions/checkout@"):

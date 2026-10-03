@@ -15,8 +15,8 @@ use serde_json::Value;
 use twilight_model::channel::Message;
 use two_bot_core::automod_runtime::{
     AutomodClaimLedger, AutomodEffect, AutomodMatch, AutomodRuntime, CompletionKind, DeliveryKey,
-    FunnelDisposition, Inspection, LedgerClaim, MessageDelivery, MessageSubject, PlanOutcome,
-    StoredOutcome, TargetFacts, TargetGate, ViolationRecord,
+    FunnelDisposition, Inspection, LedgerClaim, MessageDelivery, MessageDeliveryKind,
+    MessageSubject, PlanOutcome, StoredOutcome, TargetFacts, TargetGate, ViolationRecord,
 };
 use two_bot_core::containment::DANGEROUS_PERMISSIONS;
 use two_bot_core::{ModerationPolicy, ModerationTarget};
@@ -75,7 +75,8 @@ pub enum ActivationOutcome {
     /// Outside the activation fence: no claim, ordinary funnel path.
     Bypassed,
     /// An in-flight or settled delivery: nothing inspected, awarded or sent.
-    Duplicate,
+    /// A settled claim carries its stored receipt; an in-flight one has none.
+    Duplicate(Option<StoredOutcome>),
     /// Enrichment, identity, claim or target facts were unavailable. Nothing
     /// was counted or sent; an unmutated claim was released.
     Unavailable,
@@ -89,6 +90,27 @@ pub enum ActivationOutcome {
 pub struct Activation {
     pub disposition: FunnelDisposition,
     pub outcome: ActivationOutcome,
+}
+
+impl Activation {
+    /// Funnel disposition for a dispatch whose checkpoint has NOT committed.
+    ///
+    /// The funnel's writes commit with the gateway checkpoint, so a dispatch
+    /// that reaches `process` is by construction not yet in the funnel: it is
+    /// either new, or a replay after a crash between the claim write and the
+    /// checkpoint. A settled claim then restores the funnel exactly once from
+    /// its stored receipt (matched → capture only, clean → accept); an
+    /// in-flight claim has no verdict and captures facts only. Neither resends
+    /// a Discord effect. An in-process redelivery must still use
+    /// `disposition` (cache-only): it is already in the funnel.
+    #[must_use]
+    pub fn uncommitted_disposition(&self, kind: MessageDeliveryKind) -> FunnelDisposition {
+        match &self.outcome {
+            ActivationOutcome::Duplicate(Some(receipt)) => kind.funnel(receipt.matched),
+            ActivationOutcome::Duplicate(None) => kind.funnel(true),
+            _ => self.disposition,
+        }
+    }
 }
 
 pub struct AutomodActivation<L, F> {
@@ -144,8 +166,14 @@ impl<L: AutomodClaimLedger, F: AutomodFacts> AutomodActivation<L, F> {
             }
         };
         let (claim, matched) = match claim {
-            LedgerClaim::InFlight | LedgerClaim::Replayed(_) => {
-                return activation(FunnelDisposition::None, ActivationOutcome::Duplicate);
+            LedgerClaim::InFlight => {
+                return activation(FunnelDisposition::None, ActivationOutcome::Duplicate(None));
+            }
+            LedgerClaim::Replayed(stored) => {
+                return activation(
+                    FunnelDisposition::None,
+                    ActivationOutcome::Duplicate(Some(stored)),
+                );
             }
             // The store never preserves a dry-run decision; replay without
             // re-inspecting so swept repeat history cannot change the verdict.
