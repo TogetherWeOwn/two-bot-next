@@ -2126,9 +2126,10 @@ mod tests {
                 .all(|o| o.required != Some(true));
             assert!(required_first, "{} lists a required option late", sub.name);
         }
-        // `/kick` is open to every occupant; the worker refuses
+        // `/votekick` is open to every occupant; the worker refuses
         // non-occupant initiators and protected targets.
         let kick = &defs[11];
+        assert_eq!(kick.name, "votekick");
         assert_eq!(kick.default_member_permissions, None);
         assert_eq!(
             kick.options
