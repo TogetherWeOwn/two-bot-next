@@ -38,18 +38,18 @@ use tracing::{debug, error, info, warn};
 use twilight_model::guild::audit_log::AuditLogEventType;
 use two_bot_core::backup::guild_config::STAGING_BOT_APPLICATION_ID;
 use two_bot_core::containment::{
-    plan_quarantine, ContainmentAlert, ContainmentDisposition, ContainmentIncident,
-    ContainmentIncidentState, ContainmentPolicy, ContainmentReason, ContainmentRole,
-    DestructiveAction, DestructiveAuditEvent, IncidentClaim, QuarantinePlan,
-    CONTAINMENT_ALERT_EVENT, CONTAINMENT_SUPPRESSED_EVENT, DEFAULT_CONTAINMENT_HEAT_THRESHOLD,
-    DEFAULT_CONTAINMENT_MAX_AGE_MS, DEFAULT_CONTAINMENT_WINDOW_MS,
+    plan_quarantine, quarantine_outcome, ContainmentAlert, ContainmentDisposition,
+    ContainmentIncident, ContainmentIncidentState, ContainmentPolicy, ContainmentReason,
+    ContainmentRole, DestructiveAction, DestructiveAuditEvent, QuarantineFailure, QuarantinePlan,
+    DEFAULT_CONTAINMENT_HEAT_THRESHOLD, DEFAULT_CONTAINMENT_MAX_AGE_MS,
+    DEFAULT_CONTAINMENT_WINDOW_MS,
 };
-use two_bot_core::containment_store::{ContainmentStore, EventClaim};
+use two_bot_core::containment_store::{ContainmentStore, EventClaim, IncidentClaim};
 use two_bot_core::onboarding::MentionPolicy;
 use two_bot_core::settings::SettingsCache;
 use two_bot_cutover::parse::snowflake_to_date_ms;
 use two_bot_cutover::settings::SettingsStore;
-use two_bot_discord::{ActionExecutor, AuditEntryObserver, AuditLogObservation};
+use two_bot_discord::{ActionExecutor, AuditEntryObserver, AuditLogObservation, DiscordError};
 
 use crate::join_risk_runtime::AntiNukeFences;
 use crate::raid_runtime::{Delivery, RaidDelivery, QUEUE_CAPACITY};
@@ -256,26 +256,22 @@ fn processing_now_ms(fallback_ms: i64) -> i64 {
         .unwrap_or(fallback_ms)
 }
 
-fn role_snapshot(body: &serde_json::Value) -> Vec<ContainmentRole> {
-    body.as_array()
-        .map(|roles| {
-            roles
-                .iter()
-                .filter_map(|role| {
-                    let id = role.get("id")?.as_str()?;
-                    let position = role.get("position")?.as_i64()?;
-                    let permissions = role.get("permissions")?.as_str()?.parse::<u64>().ok()?;
-                    let managed = role.get("managed")?.as_bool()?;
-                    Some(ContainmentRole {
-                        id: id.to_owned(),
-                        position,
-                        permissions,
-                        managed,
-                    })
-                })
-                .collect()
+/// Fail closed: any malformed role (or a non-array body) refuses the whole
+/// snapshot, so a dropped managed or higher-than-bot role can never let the
+/// plan remove the others against the whole-plan preflight rule.
+fn role_snapshot(body: &serde_json::Value) -> Option<Vec<ContainmentRole>> {
+    let roles = body.as_array()?;
+    roles
+        .iter()
+        .map(|role| {
+            Some(ContainmentRole {
+                id: role.get("id")?.as_str()?.to_owned(),
+                position: role.get("position")?.as_i64()?,
+                permissions: role.get("permissions")?.as_str()?.parse::<u64>().ok()?,
+                managed: role.get("managed")?.as_bool()?,
+            })
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 struct ContainmentWorker<S> {
@@ -316,7 +312,7 @@ impl<S: SettingsSource> ContainmentWorker<S> {
                 None
             }
         };
-        let (Some(bot)) = bot_id else {
+        let Some(bot) = bot_id else {
             return;
         };
         if !verified {
@@ -414,7 +410,7 @@ impl<S: SettingsSource> ContainmentWorker<S> {
                     state = ?state,
                     heat,
                     threshold = policy.heat_threshold(),
-                    CONTAINMENT_SUPPRESSED_EVENT
+                    "containment_alert_suppressed"
                 );
                 return;
             }
@@ -428,7 +424,11 @@ impl<S: SettingsSource> ContainmentWorker<S> {
             .await;
     }
 
-    /// Plan, execute (armed only) and report one started incident.
+    /// Plan, execute (armed only) and report one started incident. The state
+    /// follows the `docs/containment.md` decision contract via
+    /// [`quarantine_outcome`]: partial success then failure is uncertain, an
+    /// empty successful plan is contained, a first-removal timeout/429/5xx is
+    /// uncertain, and definitive rejection with nothing removed is refused.
     async fn contain(
         &self,
         settings: &ContainmentSettings,
@@ -439,54 +439,43 @@ impl<S: SettingsSource> ContainmentWorker<S> {
     ) {
         let dry_run = !self.armed;
         let threshold = settings.heat_threshold;
-        let outcome = match self
+        let completion = match self
             .plan(&incident.guild_id, &incident.executor_id, dry_run)
             .await
         {
-            PlanOutcome::DryRun => ContainmentIncidentState::DryRun,
-            PlanOutcome::Refused => ContainmentIncidentState::Refused,
-            // Zero confirmed removals is a failed containment, not a
-            // contained one: the first removal already failed.
-            PlanOutcome::Removed(removed) if removed.is_empty() => ContainmentIncidentState::Failed,
-            PlanOutcome::Removed(removed) => {
-                return self
-                    .finish(
-                        settings,
-                        event,
-                        incident,
-                        heat,
-                        threshold,
-                        ContainmentIncidentState::Contained,
-                        removed,
-                        now_ms,
-                    )
-                    .await;
-            }
-            PlanOutcome::Failed => ContainmentIncidentState::Failed,
-        };
-        if self
-            .store
-            .complete_incident(
-                &incident.id,
-                outcome,
-                &serde_json::json!({"outcome": outcome.outcome_label()}),
+            PlanOutcome::DryRun => Completion {
+                heat,
+                threshold,
+                outcome: ContainmentIncidentState::DryRun,
+                removed: Vec::new(),
                 now_ms,
-            )
-            .await
-            .is_err()
-        {
-            error!(incident_id = %incident.id, "containment_store_failed: incident not completed");
-        }
-        self.alert(
-            settings,
-            event,
-            incident,
-            heat,
-            threshold,
-            outcome,
-            Vec::new(),
-        )
-        .await;
+            },
+            PlanOutcome::Refused => Completion {
+                heat,
+                threshold,
+                outcome: ContainmentIncidentState::Refused,
+                removed: Vec::new(),
+                now_ms,
+            },
+            PlanOutcome::Removed { removed, failure } => {
+                let outcome = quarantine_outcome(&removed, failure);
+                Completion {
+                    heat,
+                    threshold,
+                    outcome,
+                    removed,
+                    now_ms,
+                }
+            }
+            PlanOutcome::Failed => Completion {
+                heat,
+                threshold,
+                outcome: ContainmentIncidentState::Failed,
+                removed: Vec::new(),
+                now_ms,
+            },
+        };
+        self.finish(settings, event, incident, completion).await;
     }
 
     /// Snapshot roles and plan. Armed execution of removals happens in
@@ -532,7 +521,13 @@ impl<S: SettingsSource> ContainmentWorker<S> {
             .get_json(&format!("/guilds/{guild}/roles"))
             .await
         {
-            Ok(Some(body)) => role_snapshot(&body),
+            Ok(Some(body)) => match role_snapshot(&body) {
+                Some(snapshot) => snapshot,
+                None => {
+                    error!("containment_snapshot_failed: guild roles malformed");
+                    return PlanOutcome::Failed;
+                }
+            },
             Ok(None) | Err(_) => {
                 error!("containment_snapshot_failed: guild roles unreadable");
                 return PlanOutcome::Failed;
@@ -552,6 +547,7 @@ impl<S: SettingsSource> ContainmentWorker<S> {
                     return PlanOutcome::Failed;
                 }
                 let mut removed = Vec::new();
+                let mut failure: Option<QuarantineFailure> = None;
                 for role_id in role_ids {
                     match self
                         .executor
@@ -565,13 +561,15 @@ impl<S: SettingsSource> ContainmentWorker<S> {
                         .await
                     {
                         Ok(()) => removed.push(role_id),
-                        Err(_) => {
+                        Err(error) if is_already_gone(&error) => removed.push(role_id),
+                        Err(error) => {
                             error!(role_id = %role_id, "containment_removal_failed: stopping");
+                            failure = Some(quarantine_failure(&error));
                             break;
                         }
                     }
                 }
-                PlanOutcome::Removed(removed)
+                PlanOutcome::Removed { removed, failure }
             }
         }
     }
@@ -582,30 +580,25 @@ impl<S: SettingsSource> ContainmentWorker<S> {
         settings: &ContainmentSettings,
         event: &DestructiveAuditEvent,
         incident: &ContainmentIncident,
-        heat: u64,
-        threshold: u64,
-        outcome: ContainmentIncidentState,
-        removed: Vec<String>,
-        now_ms: i64,
+        completion: Completion,
     ) {
         if self
             .store
             .complete_incident(
                 &incident.id,
-                outcome,
+                completion.outcome,
                 &serde_json::json!({
-                    "outcome": outcome.outcome_label(),
-                    "removed_role_ids": removed,
+                    "outcome": completion.outcome.outcome_label(),
+                    "removed_role_ids": completion.removed,
                 }),
-                now_ms,
+                completion.now_ms,
             )
             .await
             .is_err()
         {
             error!(incident_id = %incident.id, "containment_store_failed: incident not completed");
         }
-        self.alert(settings, event, incident, heat, threshold, outcome, removed)
-            .await;
+        self.alert(settings, event, incident, &completion).await;
     }
 
     /// Log first, then post the staff alert with empty allowed mentions.
@@ -615,26 +608,29 @@ impl<S: SettingsSource> ContainmentWorker<S> {
         settings: &ContainmentSettings,
         event: &DestructiveAuditEvent,
         incident: &ContainmentIncident,
-        heat: u64,
-        threshold: u64,
-        outcome: ContainmentIncidentState,
-        removed: Vec<String>,
+        completion: &Completion,
     ) {
         // Always log first. If the post fails the evidence still exists.
         error!(
             incident_id = %incident.id,
             executor_id = %incident.executor_id,
             action = event.action.as_str(),
-            heat,
-            threshold,
-            outcome = outcome.outcome_label(),
-            CONTAINMENT_ALERT_EVENT
+            heat = completion.heat,
+            threshold = completion.threshold,
+            outcome = completion.outcome.outcome_label(),
+            "containment_alert"
         );
         let Some(channel) = settings.staff_channel.as_deref() else {
             return;
         };
-        let message = ContainmentAlert::from_trigger(event, heat, threshold, outcome, removed)
-            .staff_message();
+        let message = ContainmentAlert::from_trigger(
+            event,
+            completion.heat,
+            completion.threshold,
+            completion.outcome,
+            completion.removed.clone(),
+        )
+        .staff_message();
         // The shared executor always sends empty allowed mentions; refuse a
         // proposal that asks for anything else rather than widen that boundary.
         if message.mentions != MentionPolicy::None {
@@ -659,8 +655,40 @@ impl<S: SettingsSource> ContainmentWorker<S> {
 enum PlanOutcome {
     DryRun,
     Refused,
-    Removed(Vec<String>),
+    Removed {
+        removed: Vec<String>,
+        failure: Option<QuarantineFailure>,
+    },
     Failed,
+}
+
+/// Resolved incident outcome with confirmed removals. One struct keeps
+/// `finish`/`alert` under the `too_many_arguments` limit.
+struct Completion {
+    heat: u64,
+    threshold: u64,
+    outcome: ContainmentIncidentState,
+    removed: Vec<String>,
+    now_ms: i64,
+}
+
+/// The decision contract treats HTTP 404 on role removal as success: the role
+/// is already gone. `set_member_role` only accepts 200/204, so a 404 surfaces
+/// here as a rejection mentioning 404 and is reclaimed on this path.
+fn is_already_gone(error: &DiscordError) -> bool {
+    matches!(error, DiscordError::Rejected(detail) if detail.contains("404"))
+}
+
+/// Map the transport outcome onto the quarantine decision contract: timeouts,
+/// unavailability and rate limits are uncertain; definitive rejections and
+/// local guard refusals (which never reached the wire) are rejected.
+fn quarantine_failure(error: &DiscordError) -> QuarantineFailure {
+    match error {
+        DiscordError::Timeout => QuarantineFailure::Timeout,
+        DiscordError::Unavailable(_) => QuarantineFailure::Unavailable,
+        DiscordError::RateLimited => QuarantineFailure::RateLimited,
+        DiscordError::Rejected(_) | DiscordError::Guard(_) => QuarantineFailure::Rejected,
+    }
 }
 
 fn log_disposition(disposition: &ContainmentDisposition) {
