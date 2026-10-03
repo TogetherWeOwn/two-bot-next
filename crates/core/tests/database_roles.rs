@@ -226,60 +226,21 @@ fn migration_files() -> Vec<(i64, String)> {
 }
 
 async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
-    // Real migration files, not a reduced fixture that omits trigger/sequence paths.
-    for migration in [
-        include_str!("../../cutover/migrations/0001_funnel.sql"),
-        include_str!("../../cutover/migrations/0002_leveling.sql"),
-        include_str!("../../cutover/migrations/0110_moderation_member.sql"),
-        include_str!("../../cutover/migrations/0111_moderation_ban_ownership.sql"),
-        include_str!("../../cutover/migrations/0112_moderation_legacy_timestamps.sql"),
-        include_str!("../../cutover/migrations/0113_moderation_unban_retry_order.sql"),
-        include_str!("../../cutover/migrations/0114_moderation_member_runtime_grants.sql"),
-        include_str!("../../cutover/migrations/0120_channel_moderation.sql"),
-        include_str!("../../cutover/migrations/0121_channel_claim_generation.sql"),
-        include_str!("../../cutover/migrations/0122_channel_lockdown_generation.sql"),
-        include_str!("../../cutover/migrations/0123_channel_execution_fence.sql"),
-        include_str!("../../cutover/migrations/0124_channel_shared_timestamps.sql"),
-        include_str!("../../cutover/migrations/0140_scheduled_messages.sql"),
-        include_str!("../../cutover/migrations/0141_scheduled_messages_legacy_upgrade.sql"),
-        include_str!("../../cutover/migrations/0150_sticky_messages.sql"),
-        include_str!("../../cutover/migrations/0160_rsvp.sql"),
-        include_str!("../../cutover/migrations/0170_lfg.sql"),
-        include_str!("../../cutover/migrations/0190_onboarding.sql"),
-        include_str!("../../cutover/migrations/0200_self_roles.sql"),
-        include_str!("../../cutover/migrations/0203_self_role_pending_exchange.sql"),
-        include_str!("../../cutover/migrations/0205_self_role_exchange_receipts.sql"),
-        include_str!("../../cutover/migrations/0206_self_role_exchange_baselines.sql"),
-        include_str!("../../cutover/migrations/0210_tickets.sql"),
-        include_str!("../../cutover/migrations/0220_automod.sql"),
-        include_str!("../../cutover/migrations/0221_automod_delivery_claims.sql"),
-        include_str!("../../cutover/migrations/0222_automod_counted_claim.sql"),
-        include_str!("../../cutover/migrations/0223_automod_preserved_match.sql"),
-        include_str!("../../cutover/migrations/0224_voice_rooms.sql"),
-        include_str!("../../cutover/migrations/0225_voice_inherit_limit.sql"),
-        include_str!("../../cutover/migrations/0226_voice_text_channels.sql"),
-        include_str!("../../cutover/migrations/0227_voice_access_controls.sql"),
-        include_str!("../../cutover/migrations/0228_voice_logging_settings.sql"),
-        include_str!("../../cutover/migrations/0229_voice_config.sql"),
-        include_str!("../../cutover/migrations/0300_website_contract.sql"),
-        include_str!("../../cutover/migrations/0310_presence_probe.sql"),
-        include_str!("../../cutover/migrations/0311_community_scorecard.sql"),
-        include_str!("../../cutover/migrations/0312_community_scorecard_attempts.sql"),
-        include_str!("../../cutover/migrations/0320_gateway_sessions.sql"),
-        include_str!("../../cutover/migrations/0321_gateway_boot_directives.sql"),
-        include_str!("../../cutover/migrations/0330_guild_settings.sql"),
-        include_str!("../../cutover/migrations/0331_guild_settings_versions.sql"),
-        include_str!("../../cutover/migrations/0332_guild_settings_allocator.sql"),
-        include_str!("../../cutover/migrations/0333_guild_settings_revision.sql"),
-        include_str!("../../cutover/migrations/0334_guild_settings_cas.sql"),
-        include_str!("../../cutover/migrations/0340_operational_audit.sql"),
-        include_str!("../../cutover/migrations/0350_internal_actions.sql"),
-        include_str!("../../cutover/migrations/0353_internal_clock_high_water.sql"),
-        include_str!("../../cutover/migrations/0361_discord_send_admission.sql"),
-        include_str!("../../cutover/migrations/0362_gateway_onboarding_jobs.sql"),
-    ] {
+    // Every real migration file in version order, not a reduced fixture that
+    // omits trigger/sequence paths or newer tables. A new migration without a
+    // matrix row fails the offline coverage test and drifts here.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cutover/migrations");
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .expect("migrations directory")
+        .map(|entry| entry.expect("migration entry").path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql"))
+        .collect();
+    paths.sort();
+    assert!(!paths.is_empty(), "no migrations found");
+    for path in paths {
+        let sql = std::fs::read_to_string(&path).expect("migration file readable");
         // Never grant a shared cluster role: isolate names even in migrations.
-        execute(pool, isolated(migration, roles)).await?;
+        execute(pool, isolated(&sql, roles)).await?;
     }
     sqlx::raw_sql("CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);")
         .execute(pool)
@@ -402,6 +363,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     // ticket foreign key. Delete the transcript before its parent ticket.
     as_role(pool, &roles[1], "INSERT INTO public.tickets (id, guild_id, channel_id, opener_id, status, created_at) VALUES ('ticket-probe', 'g', 'c', 'm', 'open', '2026-01-01T00:00:00Z'); SELECT * FROM public.tickets; UPDATE public.tickets SET claimed_by = 'staff' WHERE id = 'ticket-probe'; INSERT INTO public.ticket_transcripts (ticket_id, guild_id, channel_id, opener_id, claimed_by, content, message_count, created_at, purge_after) VALUES ('ticket-probe', 'g', 'c', 'm', 'staff', 'probe', 1, '2026-01-01T00:00:00Z', '2026-04-01T00:00:00Z'); SELECT * FROM public.ticket_transcripts; UPDATE public.ticket_transcripts SET content = 'updated probe' WHERE ticket_id = 'ticket-probe'; DELETE FROM public.ticket_transcripts WHERE ticket_id = 'ticket-probe'; DELETE FROM public.tickets WHERE id = 'ticket-probe'").await?;
     automod_runtime_role_regression(pool, roles).await?;
+    role_matrix_b2_regression(pool, roles).await?;
     for view in [
         "contract_meta",
         "live_counts",
@@ -512,6 +474,14 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
          "REVOKE EXECUTE ON FUNCTION public.guild_settings_advance_revision() FROM PUBLIC".to_owned()),
         (format!("GRANT SELECT (member_id) ON web_v1.members TO {reader} WITH GRANT OPTION"),
          format!("REVOKE SELECT (member_id) ON web_v1.members FROM {reader}")),
+        (format!("REVOKE SELECT ON public.feed_relays FROM {runtime}"),
+         format!("GRANT SELECT ON public.feed_relays TO {runtime}")),
+        (format!("GRANT SELECT ON public.member_erasure_audit TO {runtime}"),
+         format!("REVOKE SELECT ON public.member_erasure_audit FROM {runtime}")),
+        (format!("GRANT SELECT ON public.invite_campaigns TO {reader}"),
+         format!("REVOKE SELECT ON public.invite_campaigns FROM {reader}")),
+        (format!("REVOKE SELECT ON public.member_erasure_audit FROM {migrator}"),
+         format!("GRANT SELECT ON public.member_erasure_audit TO {migrator}")),
     ] {
         execute(pool, change.clone()).await?;
         require(!findings(pool, roles).await?.is_empty(), &format!("missed drift: {change}"))?;
@@ -795,6 +765,181 @@ async fn automod_runtime_role_regression(
     Ok(())
 }
 
+async fn role_matrix_b2_regression(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
+    // PR-B2: six runtime tables allow runtime DML; two migrator-only tables
+    // allow the migrator and deny runtime/reader. Feeds, join-risk,
+    // containment and the channel-execution fence are gateway-written;
+    // erasure audit is operator-only and invite campaigns is a redirect
+    // store with no gateway path (see feeds_store, join_risk_store,
+    // containment_store, channel_moderation_store; erasure_cli is
+    // operator-only; invite_campaigns has no runtime caller).
+    as_role(
+        pool,
+        &roles[1],
+        r#"INSERT INTO public.feed_relays
+            (id, guild_id, channel_id, kind, source, created_by, created_at, updated_at)
+            VALUES ('role-probe-feed', 'g', 'c', 'rss', 'https://example.com/rss',
+                    'tester', now(), now());
+        SELECT * FROM public.feed_relays WHERE id = 'role-probe-feed';
+        UPDATE public.feed_relays SET last_checked_at = now() WHERE id = 'role-probe-feed';
+        INSERT INTO public.feed_deliveries
+            (feed_id, item_key, nonce, state, first_seen_at)
+            VALUES ('role-probe-feed', 'item1', 'n1', 'pending', now());
+        SELECT * FROM public.feed_deliveries WHERE feed_id = 'role-probe-feed';
+        UPDATE public.feed_deliveries SET state = 'delivered', delivered_at = now()
+            WHERE feed_id = 'role-probe-feed' AND item_key = 'item1';
+        DELETE FROM public.feed_deliveries WHERE feed_id = 'role-probe-feed';
+        DELETE FROM public.feed_relays WHERE id = 'role-probe-feed';"#,
+    )
+    .await?;
+    as_role(
+        pool,
+        &roles[1],
+        r#"INSERT INTO public.join_risk_flags
+            (event_id, guild_id, member_id, account_created_at, joined_at, source,
+             score, reasons_json, bulk_join_window, flagged, created_at)
+            VALUES ('risk-probe', 'g', 'm', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                    'test', 5, '[]', false, true, '2026-01-01T00:00:00Z');
+        SELECT * FROM public.join_risk_flags WHERE event_id = 'risk-probe';
+        UPDATE public.join_risk_flags SET flagged = false WHERE event_id = 'risk-probe';
+        DELETE FROM public.join_risk_flags WHERE event_id = 'risk-probe';"#,
+    )
+    .await?;
+    as_role(
+        pool,
+        &roles[1],
+        r#"INSERT INTO public.moderation_idempotency
+            (guild_id, idempotency_key, action, request_hash, state, claimed_at)
+            VALUES ('g', 'probe-exec', 'lockdown', 'hash', 'claimed', '2026-01-01T00:00:00Z');
+        INSERT INTO public.moderation_channel_executions
+            (channel_id, guild_id, idempotency_key, claim_token)
+            VALUES ('c', 'g', 'probe-exec', 'tok');
+        SELECT * FROM public.moderation_channel_executions WHERE channel_id = 'c';
+        UPDATE public.moderation_channel_executions SET claim_token = 'tok2' WHERE channel_id = 'c';
+        DELETE FROM public.moderation_channel_executions WHERE channel_id = 'c';
+        DELETE FROM public.moderation_idempotency WHERE guild_id = 'g' AND idempotency_key = 'probe-exec';"#,
+    )
+    .await?;
+    as_role(
+        pool,
+        &roles[1],
+        r#"INSERT INTO public.containment_events
+            (audit_entry_id, guild_id, action, weight, occurred_at, state, reason, created_at)
+            VALUES ('contain-probe', 'g', 'test', 1, '2026-01-01T00:00:00Z', 'observe', 'probe',
+                    '2026-01-01T00:00:00Z');
+        SELECT * FROM public.containment_events WHERE audit_entry_id = 'contain-probe';
+        UPDATE public.containment_events SET state = 'ignored' WHERE audit_entry_id = 'contain-probe';
+        INSERT INTO public.containment_incidents
+            (id, guild_id, executor_id, trigger_audit_entry_id, heat, state, started_at)
+            VALUES ('incident-probe', 'g', 'e', 'contain-probe', 10, 'containing',
+                    '2026-01-01T00:00:00Z');
+        SELECT * FROM public.containment_incidents WHERE id = 'incident-probe';
+        UPDATE public.containment_incidents SET state = 'contained' WHERE id = 'incident-probe';
+        DELETE FROM public.containment_incidents WHERE id = 'incident-probe';
+        DELETE FROM public.containment_events WHERE audit_entry_id = 'contain-probe';"#,
+    )
+    .await?;
+    // Migrator-only: the migrator writes; runtime and reader are denied.
+    as_role(
+        pool,
+        &roles[0],
+        r#"INSERT INTO public.member_erasure_audit (actor) VALUES ('role-probe');
+        SELECT * FROM public.member_erasure_audit WHERE actor = 'role-probe';
+        DELETE FROM public.member_erasure_audit WHERE actor = 'role-probe';
+        INSERT INTO public.invite_campaigns (slug, invite_code, label, created_at)
+            VALUES ('role-probe-1', 'code1', 'probe', now());
+        SELECT * FROM public.invite_campaigns WHERE slug = 'role-probe-1';
+        UPDATE public.invite_campaigns SET label = 'probe2' WHERE slug = 'role-probe-1';
+        DELETE FROM public.invite_campaigns WHERE slug = 'role-probe-1';"#,
+    )
+    .await?;
+    for table in [
+        "feed_relays",
+        "feed_deliveries",
+        "join_risk_flags",
+        "moderation_channel_executions",
+        "containment_events",
+        "containment_incidents",
+    ] {
+        let relation = format!("public.{table}");
+        require(
+            sqlx::query_scalar::<_, bool>(
+                r#"SELECT has_table_privilege($1::text, $3::text, 'SELECT')
+                    AND has_table_privilege($1::text, $3::text, 'INSERT')
+                    AND has_table_privilege($1::text, $3::text, 'UPDATE')
+                    AND has_table_privilege($1::text, $3::text, 'DELETE')
+                    AND NOT has_table_privilege($1::text, $3::text, 'TRUNCATE, REFERENCES, TRIGGER')
+                    AND NOT has_table_privilege($2::text, $3::text, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')"#,
+            )
+            .bind(&roles[1])
+            .bind(&roles[2])
+            .bind(&relation)
+            .fetch_one(pool)
+            .await?,
+            &format!("b2 runtime least-privilege ACL differs: {relation}"),
+        )?;
+        denied(pool, &roles[1], &format!("TRUNCATE {relation}")).await?;
+        let update = match table {
+            "feed_relays" => format!("UPDATE {relation} SET source = 'forbidden'"),
+            "feed_deliveries" => format!("UPDATE {relation} SET state = 'delivered'"),
+            "join_risk_flags" => format!("UPDATE {relation} SET flagged = false"),
+            "moderation_channel_executions" => {
+                format!("UPDATE {relation} SET claim_token = 'forbidden'")
+            }
+            "containment_events" => format!("UPDATE {relation} SET state = 'ignored'"),
+            "containment_incidents" => format!("UPDATE {relation} SET state = 'contained'"),
+            _ => unreachable!("b2 runtime table"),
+        };
+        for sql in [
+            format!("SELECT * FROM {relation}"),
+            format!("INSERT INTO {relation} DEFAULT VALUES"),
+            update,
+            format!("DELETE FROM {relation}"),
+        ] {
+            denied(pool, &roles[2], &sql).await?;
+        }
+    }
+    for table in ["member_erasure_audit", "invite_campaigns"] {
+        let relation = format!("public.{table}");
+        require(
+            sqlx::query_scalar::<_, bool>(
+                r#"SELECT NOT has_table_privilege($1::text, $3::text, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
+                    AND NOT has_table_privilege($2::text, $3::text, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')"#,
+            )
+            .bind(&roles[1])
+            .bind(&roles[2])
+            .bind(&relation)
+            .fetch_one(pool)
+            .await?,
+            &format!("b2 migrator-only table exposed: {relation}"),
+        )?;
+        let (insert, update) = match table {
+            "member_erasure_audit" => (
+                format!("INSERT INTO {relation} (actor) VALUES ('denied-probe')"),
+                format!("UPDATE {relation} SET actor = 'denied'"),
+            ),
+            "invite_campaigns" => (
+                format!(
+                    "INSERT INTO {relation} (slug, invite_code, label) VALUES ('denied-probe-1', 'c', 'l')"
+                ),
+                format!("UPDATE {relation} SET label = 'denied'"),
+            ),
+            _ => unreachable!("b2 migrator table"),
+        };
+        for sql in [
+            format!("SELECT * FROM {relation}"),
+            insert,
+            update,
+            format!("DELETE FROM {relation}"),
+            format!("TRUNCATE {relation}"),
+        ] {
+            denied(pool, &roles[1], &sql).await?;
+            denied(pool, &roles[2], &sql).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn verifier_gap_regressions(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     let (migrator, runtime, reader) = (&roles[0], &roles[1], &roles[2]);
     // Catalog probes inspect privileges only; never read password verifiers or files.
@@ -901,16 +1046,14 @@ async fn transactional_drift(
 /// Staging ledger before the first bootstrap: the 29 migration versions the
 /// pending set is computed against. Pending versions are derived as every
 /// other source version, so later migrations join the pending set unlisted.
-/// Three pending versions create tables with no object-matrix row yet (0370
-/// containment claims, 0410 member erasure audit, 0411 invite campaigns);
-/// they stay out of this rehearsal until the matrix backfill lands, and the
-/// backfill removes this exclusion. A new migration that creates an
+/// Every pending version now has an object-matrix row (the matrix backfill
+/// covers 0370 containment claims, 0410 member erasure audit and 0411 invite
+/// campaigns), so no version is excluded. A new migration that creates an
 /// unmatrixed table fails this test at the final verify, by design.
 const STAGING_LEDGER29: [i64; 29] = [
     1, 2, 120, 121, 122, 123, 140, 141, 150, 160, 170, 180, 190, 200, 210, 300, 310, 311, 320, 330,
     331, 332, 333, 334, 340, 350, 351, 360, 390,
 ];
-const PENDING_EXCLUDED_WITHOUT_MATRIX_ROW: [i64; 3] = [370, 410, 411];
 
 /// The ephemeral self-grant must be gone after the plan commits: the
 /// executing identity cannot SET the migrator group anymore. Runs inside a
@@ -1061,12 +1204,9 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         .await
         .unwrap();
     // Apply every pending migration as a SET ROLE member, then record them.
-    // Versions without a matrix row are excluded until the backfill lands.
     let mut pending = Vec::new();
     for (version, migration) in &all {
-        if !STAGING_LEDGER29.contains(version)
-            && !PENDING_EXCLUDED_WITHOUT_MATRIX_ROW.contains(version)
-        {
+        if !STAGING_LEDGER29.contains(version) {
             sqlx::raw_sql(sqlx::AssertSqlSafe(migration.clone()))
                 .execute(&migrator_pool)
                 .await
