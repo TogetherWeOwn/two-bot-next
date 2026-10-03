@@ -200,7 +200,7 @@ async fn router_runs_create_signup_full_switch_leave_close_with_audit() {
             ScriptedResponse::status(204),
             ScriptedResponse::json(200, json!({"id": "5000"})),
         ],
-        ScriptedResponse::json(200, json!({})),
+        ScriptedResponse::json(200, json!({"id": "5900"})),
     )
     .await;
     let rt = runtime(db.pool.clone(), &mock, true);
@@ -316,7 +316,7 @@ async fn router_persists_post_and_roles_before_discord_accepts() {
             ScriptedResponse::status(204),
             ScriptedResponse::json(200, json!({"id": "5001"})),
         ],
-        ScriptedResponse::json(200, json!({})),
+        ScriptedResponse::json(200, json!({"id": "5900"})),
     )
     .await;
     let rt = std::sync::Arc::new(runtime(db.pool.clone(), &mock, true));
@@ -372,7 +372,7 @@ async fn router_recovers_ambiguous_post_by_own_nonce_without_duplicate_send() {
         ScriptedResponse::json(200, json!([
             {"id": "5999", "nonce": nonce, "channel_id": CHANNEL, "author": {"id": "9999"}},
             {"id": "5002", "nonce": nonce, "channel_id": CHANNEL, "author": {"id": BOT.to_string()}}
-        ]))], ScriptedResponse::json(200, json!({}))).await;
+        ]))], ScriptedResponse::json(200, json!({"id": "5900"}))).await;
     let rt = runtime(db.pool.clone(), &mock, true);
     rt.handle(&create(7301, PERM_MANAGE_EVENTS)).await.unwrap();
     assert_eq!(last_reply(&mock), "LFG posted: `lfg-7301`.");
@@ -427,7 +427,7 @@ async fn router_cleans_failed_posts_but_preserves_unreadable_acceptance() {
         ),
         (
             7404,
-            ScriptedResponse::json(200, json!({})),
+            ScriptedResponse::json(200, json!({"id": "5900"})),
             Some(ScriptedResponse::json(200, json!({"not": "history"}))),
             true,
         ),
@@ -437,7 +437,7 @@ async fn router_cleans_failed_posts_but_preserves_unreadable_acceptance() {
         if let Some(history) = history {
             script.push(history);
         }
-        let mock = MockRest::start(script, ScriptedResponse::json(200, json!({}))).await;
+        let mock = MockRest::start(script, ScriptedResponse::json(200, json!({"id": "5900"}))).await;
         let rt = runtime(db.pool.clone(), &mock, true);
         rt.handle(&create(id, PERM_MANAGE_EVENTS)).await.unwrap();
         let post = format!("lfg-{id}");
@@ -506,7 +506,7 @@ async fn router_recovers_persisted_post_without_replacing_closed_roles_or_signup
         .unwrap();
     let mock = MockRest::start(vec![ScriptedResponse::status(204),
         ScriptedResponse::json(200, json!([{"id": "5003", "nonce": lfg::lfg_nonce(&post.id), "channel_id": CHANNEL, "author": {"id": BOT.to_string()}}]))],
-        ScriptedResponse::json(200, json!({}))).await;
+        ScriptedResponse::json(200, json!({"id": "5900"}))).await;
     let rt = runtime(db.pool.clone(), &mock, true);
     rt.handle(&create(7501, PERM_MANAGE_EVENTS)).await.unwrap();
     let stored = store::get_lfg(&db.pool, GUILD, &post.id)
@@ -575,7 +575,7 @@ async fn router_refuses_cross_guild_post_targeting_including_id_only_leave() {
     )
     .await
     .unwrap();
-    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({}))).await;
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id": "5900"}))).await;
     let rt = runtime(db.pool.clone(), &mock, true);
     rt.handle(&select(7601, &post.id, 3334, "__leave__"))
         .await
@@ -676,8 +676,8 @@ async fn queued_lfg_work_leaves_pool_connections_for_the_gateway() {
     store::put_lfg(&db.pool, &post, &roles, true).await.unwrap();
     // The first message edit stays unanswered: its execution holds the lock.
     let (mock, gate) = MockRest::start_gated(
-        vec![ScriptedResponse::json(200, json!({}))],
-        ScriptedResponse::json(200, json!({})),
+        vec![ScriptedResponse::json(200, json!({"id": "5900"}))],
+        ScriptedResponse::json(200, json!({"id": "5900"})),
     )
     .await;
     let executor = std::sync::Arc::new(
