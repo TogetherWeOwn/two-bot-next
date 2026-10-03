@@ -504,6 +504,7 @@ async fn spawn_runner_until_shutdown(
         state.clone(),
         db.store.clone(),
         None,
+        None,
         commands,
         None,
         None,
