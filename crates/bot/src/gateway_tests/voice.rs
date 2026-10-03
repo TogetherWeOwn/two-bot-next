@@ -46,6 +46,9 @@ impl RoomWrites for DeleteOnly {
     async fn rename(&self, _: u64, _: &str) -> Result<(), RoomHttpError> {
         panic!("reconciliation must not rename a room");
     }
+    async fn download_attachment(&self, _: &str, _: usize) -> Result<Vec<u8>, RoomHttpError> {
+        panic!("reconciliation must not download an import file");
+    }
 }
 
 struct RecordingVoice {

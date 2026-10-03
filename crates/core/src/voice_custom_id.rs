@@ -16,6 +16,10 @@
 //!   runtime casts the ballot with `voice_vote_kick::VoteKickCore::cast`.
 //! - `/name` panel custom / restore buttons plus the custom-name modal,
 //!   bound to the room.
+//! - V11 `/import` preview Confirm / Cancel buttons, bound to the uploading
+//!   member and the previewed diff's content hash. Confirm re-reads current
+//!   state and re-diffs; a concurrent change yields a new preview instead of
+//!   applying.
 //!
 //! Every encoded id starts with `two:voice:` (never `two:lfg:` or
 //! `two:self-role:`) and is at most 100 characters, Discord's component-id
@@ -36,7 +40,7 @@ pub const MAX_VOICE_CUSTOM_ID_CHARS: usize = 100;
 
 /// A decoded voice component id. Component ids are Discord-signed but still
 /// parsed as untrusted input: only exactly-shaped ids decode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoiceAction {
     /// V3 private-join Approve button for one pending request.
     JoinApprove { room_id: Snowflake, request_id: u64 },
@@ -54,7 +58,16 @@ pub enum VoiceAction {
     NameRestore { room_id: Snowflake },
     /// `/name` custom-name modal submit.
     NameModal { room_id: Snowflake },
+    /// V11 `/import` preview Confirm button, bound to the uploading member
+    /// and the previewed diff's content hash (16 lowercase hex chars).
+    ImportConfirm { member_id: Snowflake, hash: String },
+    /// V11 `/import` preview Cancel button, bound like Confirm. Cancel and
+    /// expiry write nothing.
+    ImportCancel { member_id: Snowflake, hash: String },
 }
+
+/// Length of a diff content hash in a component id: 16 lowercase hex chars.
+pub const IMPORT_HASH_CHARS: usize = 16;
 
 /// Component id for a private-join decision button, bound to the room and the
 /// request id the owner is answering.
@@ -94,6 +107,20 @@ pub fn name_restore_custom_id(room_id: Snowflake) -> String {
 #[must_use]
 pub fn name_modal_custom_id(room_id: Snowflake) -> String {
     format!("{VOICE_CUSTOM_ID_PREFIX}name-modal:{room_id}")
+}
+
+/// Component id for the `/import` preview Confirm button. `hash` is the
+/// previewed diff's content hash ([`IMPORT_HASH_CHARS`] lowercase hex chars);
+/// the runtime recomputes it against fresh state before applying.
+#[must_use]
+pub fn import_confirm_custom_id(member_id: Snowflake, hash: &str) -> String {
+    format!("{VOICE_CUSTOM_ID_PREFIX}import-confirm:{member_id}:{hash}")
+}
+
+/// Component id for the `/import` preview Cancel button, bound like Confirm.
+#[must_use]
+pub fn import_cancel_custom_id(member_id: Snowflake, hash: &str) -> String {
+    format!("{VOICE_CUSTOM_ID_PREFIX}import-cancel:{member_id}:{hash}")
 }
 
 /// Parse a component id; `None` for anything outside the voice namespace,
@@ -141,12 +168,32 @@ pub fn parse_voice_custom_id(custom_id: &str) -> Option<VoiceAction> {
                 _ => VoiceAction::NameModal { room_id },
             }
         }
+        "import-confirm" | "import-cancel" => {
+            let member_id = parse_id(parts.next()?)?;
+            let hash = parse_hash(parts.next()?)?;
+            if verb == "import-confirm" {
+                VoiceAction::ImportConfirm { member_id, hash }
+            } else {
+                VoiceAction::ImportCancel { member_id, hash }
+            }
+        }
         _ => return None,
     };
     if parts.next().is_some() {
         return None;
     }
     Some(action)
+}
+
+/// Diff content hash: exactly [`IMPORT_HASH_CHARS`] hex chars, as produced
+/// by the import preview. Anything else is untrusted input, not a button
+/// this runtime bound.
+fn parse_hash(value: &str) -> Option<String> {
+    if value.len() == IMPORT_HASH_CHARS && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Some(value.to_owned())
+    } else {
+        None
+    }
 }
 
 /// Canonical nonzero decimal id. Rejects empties, signs, whitespace, hex and

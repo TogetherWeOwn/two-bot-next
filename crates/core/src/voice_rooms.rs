@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::commands::{
     CommandChoice, CommandDefinition, CommandOption, CommandOptionType, PERM_MANAGE_CHANNELS,
+    PERM_MANAGE_GUILD,
 };
 use super::voice_text_channel::{
     TextChannelPlan, TextChannelSettings, MAX_TEXT_CHANNEL_NAME_CHARS,
@@ -1187,6 +1188,22 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::Role,
             )]),
         ]),
+        CommandDefinition::new(
+            "export",
+            "Download this server's voice configuration as a versioned JSON file",
+        )
+        .permissions(PERM_MANAGE_GUILD),
+        CommandDefinition::new(
+            "import",
+            "Preview a voice configuration file before applying it",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![CommandOption::new(
+            "file",
+            "Voice configuration JSON file from /export",
+            CommandOptionType::Attachment,
+        )
+        .required()]),
     ]
 }
 
@@ -1820,7 +1837,7 @@ mod tests {
         let defs = voice_commands();
         assert_eq!(
             defs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-            ["create", "setup", "ping", "invite", "access", "logging"]
+            ["create", "setup", "ping", "invite", "access", "logging", "export", "import"]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
         assert_eq!(
@@ -1875,6 +1892,24 @@ mod tests {
                 .all(|o| o.required != Some(true));
             assert!(required_first, "{} lists a required option late", sub.name);
         }
+        // `/export` takes no options; `/import` takes one required file
+        // attachment. Both are Manage Server (Manage Guild) gated.
+        let export = &defs[6];
+        let import = &defs[7];
+        for def in [export, import] {
+            assert_eq!(
+                def.default_member_permissions,
+                Some(PERM_MANAGE_GUILD.to_string())
+            );
+        }
+        assert!(export.options.is_empty());
+        assert_eq!(import.options.len(), 1);
+        assert_eq!(import.options[0].name, "file");
+        assert_eq!(
+            import.options[0].kind,
+            CommandOptionType::Attachment.as_u8()
+        );
+        assert!(import.options[0].required == Some(true));
         // Merges cleanly alongside the other slices, first-wins.
         let merged = merge_commands(
             &[feature_commands(), moderation_commands(), voice_commands()],

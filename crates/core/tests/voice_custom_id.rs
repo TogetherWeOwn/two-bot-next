@@ -2,9 +2,9 @@
 
 use proptest::prelude::*;
 use two_bot_core::voice_custom_id::{
-    join_custom_id, kick_custom_id, name_custom_custom_id, name_modal_custom_id,
-    name_restore_custom_id, parse_voice_custom_id, VoiceAction, MAX_VOICE_CUSTOM_ID_CHARS,
-    VOICE_CUSTOM_ID_PREFIX,
+    import_cancel_custom_id, import_confirm_custom_id, join_custom_id, kick_custom_id,
+    name_custom_custom_id, name_modal_custom_id, name_restore_custom_id, parse_voice_custom_id,
+    VoiceAction, IMPORT_HASH_CHARS, MAX_VOICE_CUSTOM_ID_CHARS, VOICE_CUSTOM_ID_PREFIX,
 };
 use two_bot_core::voice_private::JoinDecision;
 use two_bot_core::voice_vote_kick::VoteBallot;
@@ -166,6 +166,70 @@ fn rejects_garbage_overlong_and_non_numeric() {
         "two:voice:name-custom:0",
         "two:voice:name-restore:0",
         "two:voice:name-modal:0",
+    ] {
+        assert_eq!(parse_voice_custom_id(id), None, "{id}");
+    }
+}
+
+fn content_hash() -> impl Strategy<Value = String> {
+    (0u64..=u64::MAX).prop_map(|hash| format!("{hash:016x}"))
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Import confirm/cancel ids round-trip, stay in the voice namespace
+    /// and fit Discord's 100-character limit even for 20-digit snowflakes.
+    #[test]
+    fn round_trip_import(member_id in nonzero_id(), hash in content_hash()) {
+        prop_assert_eq!(hash.len(), IMPORT_HASH_CHARS);
+        prop_assert_eq!(
+            parse_voice_custom_id(&import_confirm_custom_id(member_id, &hash)),
+            Some(VoiceAction::ImportConfirm {
+                member_id,
+                hash: hash.clone(),
+            })
+        );
+        prop_assert_eq!(
+            parse_voice_custom_id(&import_cancel_custom_id(member_id, &hash)),
+            Some(VoiceAction::ImportCancel {
+                member_id,
+                hash,
+            })
+        );
+        prop_assert!(
+            import_confirm_custom_id(u64::MAX, &"f".repeat(IMPORT_HASH_CHARS)).len()
+                <= MAX_VOICE_CUSTOM_ID_CHARS
+        );
+    }
+}
+
+#[test]
+fn golden_import_shapes_bind_member_and_hash() {
+    assert_eq!(
+        import_confirm_custom_id(300, "0123456789abcdef"),
+        "two:voice:import-confirm:300:0123456789abcdef"
+    );
+    assert_eq!(
+        import_cancel_custom_id(300, "0123456789abcdef"),
+        "two:voice:import-cancel:300:0123456789abcdef"
+    );
+}
+
+#[test]
+fn rejects_malformed_import_hashes() {
+    // Wrong segment count, zero member, short/long/non-hex hashes.
+    for id in [
+        "two:voice:import-confirm:300",
+        "two:voice:import-confirm:300:0123456789abcdef:extra",
+        "two:voice:import-confirm:0:0123456789abcdef",
+        "two:voice:import-cancel:0:0123456789abcdef",
+        "two:voice:import-confirm:300:0123456789abcde",
+        "two:voice:import-confirm:300:0123456789abcdef0",
+        "two:voice:import-confirm:300:0123456789abcdeg",
+        "two:voice:import-confirm:300:----------------",
+        "two:voice:import-confirm:300:",
+        "two:voice:import-cancel:300:0123456789abcde ",
     ] {
         assert_eq!(parse_voice_custom_id(id), None, "{id}");
     }

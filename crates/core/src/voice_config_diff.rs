@@ -11,10 +11,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use sha2::{Digest, Sha256};
+
 use crate::voice_config::{
     ChannelTemplates, CreatorConfiguration, GameAlias, GuildInventory, GuildSettings,
     LoggingConfiguration, PermissionSource, RandomList, VoiceConfiguration,
 };
+
+/// Length of [`diff_content_hash`] in hex chars (also the custom-id hash
+/// segment; see `voice_custom_id::IMPORT_HASH_CHARS`).
+pub const DIFF_HASH_CHARS: usize = 16;
 
 /// Discord's message length limit, applied to the whole preview body.
 pub const PREVIEW_CHAR_LIMIT: usize = 2000;
@@ -180,6 +186,21 @@ pub fn apply_diff(current: &VoiceConfiguration, diff: &ConfigDiff) -> VoiceConfi
             .as_ref()
             .map_or_else(|| current.settings.clone(), |change| change.after.clone()),
     }
+}
+
+/// Content hash binding a preview to the exact (`current`, `candidate`) pair
+/// it was rendered from: the first [`DIFF_HASH_CHARS`] hex chars of sha256
+/// over the compact JSON of both, separated by a zero byte. The confirm step
+/// recomputes it against freshly read state; any concurrent change yields a
+/// different hash, and the runtime re-previews instead of applying.
+#[must_use]
+pub fn diff_content_hash(current: &VoiceConfiguration, candidate: &VoiceConfiguration) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(current).unwrap_or_default());
+    hasher.update([0x00]);
+    hasher.update(serde_json::to_vec(candidate).unwrap_or_default());
+    let digest = format!("{:x}", hasher.finalize());
+    digest[..DIFF_HASH_CHARS].to_owned()
 }
 
 /// Compact ephemeral-message body: a summary line, then at most `max_lines`
