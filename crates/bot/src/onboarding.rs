@@ -733,7 +733,7 @@ impl OnboardingRuntime {
     async fn reply(&self, interaction: &Interaction, content: &str) -> Result<(), RuntimeError> {
         tokio::time::timeout(
             Duration::from_secs(5),
-            self.executor.edit_interaction_response(
+            self.executor.edit_interaction_response_with_blocked_retry(
                 interaction.application_id.get(),
                 &interaction.token,
                 content,

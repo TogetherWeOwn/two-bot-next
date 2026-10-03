@@ -828,7 +828,7 @@ impl CommandRuntime {
         }
         if self
             .executor
-            .answer_interaction(
+            .answer_interaction_with_blocked_retry(
                 interaction.id.get(),
                 &interaction.token,
                 &InteractionResponse {
@@ -854,7 +854,11 @@ impl CommandRuntime {
         };
         if self
             .executor
-            .edit_interaction_response(interaction.application_id.get(), &interaction.token, &reply)
+            .edit_interaction_response_with_blocked_retry(
+                interaction.application_id.get(),
+                &interaction.token,
+                &reply,
+            )
             .await
             .is_err()
         {
@@ -1281,7 +1285,7 @@ impl CommandRuntime {
     async fn defer(&self, interaction: &Interaction, command: &str) -> bool {
         match self
             .executor
-            .answer_interaction(
+            .answer_interaction_with_blocked_retry(
                 interaction.id.get(),
                 &interaction.token,
                 &InteractionResponse {
@@ -1305,7 +1309,11 @@ impl CommandRuntime {
     async fn answer(&self, interaction: &Interaction, response: InteractionResponse) {
         if let Err(err) = self
             .executor
-            .answer_interaction(interaction.id.get(), &interaction.token, &response)
+            .answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &response,
+            )
             .await
         {
             warn!(interaction_id = %interaction.id.get(), error = %err, "sticky reply failed");
@@ -1316,7 +1324,7 @@ impl CommandRuntime {
     async fn finish(&self, interaction: &Interaction, content: impl AsRef<str>) {
         if let Err(err) = self
             .executor
-            .edit_interaction_response(
+            .edit_interaction_response_with_blocked_retry(
                 interaction.application_id.get(),
                 &interaction.token,
                 content.as_ref(),

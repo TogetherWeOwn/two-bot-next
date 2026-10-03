@@ -383,7 +383,7 @@ impl InteractionRuntime {
                 ..
             } => {
                 self.executor
-                    .answer_interaction(
+                    .answer_interaction_with_blocked_retry(
                         interaction.id.get(),
                         &interaction.token,
                         &refusal_response(refusal),
@@ -473,7 +473,11 @@ impl InteractionRuntime {
         // Acknowledge before locks, SQL or paced REST can exceed Discord's 3 s window.
         // https://docs.discord.com/developers/interactions/receiving-and-responding#interaction-response
         self.executor
-            .answer_interaction(interaction.id.get(), &interaction.token, &deferred)
+            .answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &deferred,
+            )
             .await?;
         let result = match request {
             Ok(request) => {

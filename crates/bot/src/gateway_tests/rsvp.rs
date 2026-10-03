@@ -835,3 +835,266 @@ async fn exhausted_lane_hold_fences_checkpoint_past_unacked_command() {
     rest.shutdown().await;
     db.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn governed_sticky_defers_through_rsvp_lane_hold() {
+    let db = TestDb::new().await;
+    let seen = Arc::new(AtomicBool::new(false));
+    // A's live-event read holds the single-flight lane for 1.5 s while a
+    // sticky command arrives through the shared governed gate: the sticky
+    // defer must wait out the occupancy instead of failing pre-wire.
+    let rest = lane_holding_rest(Arc::clone(&seen), Duration::from_millis(1500)).await;
+    let admission: Arc<dyn SendAdmission> =
+        Arc::new(PgSendAdmission::new(db.pool.clone(), TOKEN).unwrap());
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let (runner, mut ws) = connect_governed(&db, &rest, admission, Some(receiver)).await;
+    ws.send(Message::text(interaction(2, "going").to_string()))
+        .await
+        .unwrap();
+    wait_flag(&seen).await;
+    let delivered = tokio::time::Instant::now();
+    let mut sticky = interaction(3, "going");
+    sticky["d"]["member"]["permissions"] = json!("32");
+    sticky["d"]["data"]["name"] = json!("sticky");
+    sticky["d"]["data"]["options"] = json!([]);
+    ws.send(Message::text(sticky.to_string())).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let requests = rest.requests();
+            let has_callback = requests.iter().any(|request| {
+                request
+                    .path
+                    .ends_with("/interactions/3/mock-rsvp-3/callback")
+            });
+            let has_edit = requests.iter().any(|request| {
+                request.method == "PATCH"
+                    && request.path.contains("mock-rsvp-3")
+                    && request.path.contains("@original")
+            });
+            if has_callback && has_edit {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("sticky defer/edit deadline");
+    let requests = rest.requests();
+    let callbacks: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request
+                .path
+                .ends_with("/interactions/3/mock-rsvp-3/callback")
+        })
+        .collect();
+    // Exactly one defer reached the wire inside Discord's acknowledgement
+    // window, even though the lane was held for most of that window.
+    assert_eq!(callbacks.len(), 1);
+    assert!(
+        callbacks[0].received_at.duration_since(delivered) < Duration::from_secs(3),
+        "{:?}",
+        callbacks[0].received_at.duration_since(delivered)
+    );
+    let body: Value = serde_json::from_slice(&callbacks[0].body).unwrap();
+    assert_eq!(body["type"], 5);
+    assert_eq!(body["data"]["flags"], 64);
+    let edits: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.method == "PATCH"
+                && request.path.contains("mock-rsvp-3")
+                && request.path.contains("@original")
+        })
+        .collect();
+    assert_eq!(edits.len(), 1);
+    // The RSVP that held the lane still completes exactly once. Poll for
+    // its completion edit: it lands after the same lane hold releases, so a
+    // snapshot taken at the sticky edit may not contain it yet.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let done = rest.requests().iter().any(|request| {
+                request.method == "PATCH"
+                    && request.path.contains("mock-rsvp-2")
+                    && request.path.contains("@original")
+            });
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("rsvp completion deadline");
+    wait_sequence(&db.store, 2).await;
+    let requests = rest.requests();
+    let rsvp_edits: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.method == "PATCH"
+                && request.path.contains("mock-rsvp-2")
+                && request.path.contains("@original")
+        })
+        .collect();
+    assert_eq!(rsvp_edits.len(), 1);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&rsvp_edits[0].body).unwrap()["content"],
+        "RSVP saved: going."
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM announcements_audit_log")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        1
+    );
+    shutdown.send_replace(true);
+    runner.await.unwrap().unwrap();
+    drop(ws);
+    rest.shutdown().await;
+    db.close().await;
+}
+
+/// Occupancy-aware responder: the first and third live-event reads hold the
+/// single-flight lane with a delayed response; every other read passes
+/// through immediately. `seen` fires on each held read so the test can send
+/// the next operation into certain occupancy.
+async fn handoff_rest(seen: Arc<AtomicBool>) -> MockRest {
+    use std::sync::atomic::AtomicUsize;
+    let calls = Arc::new(AtomicUsize::new(0));
+    MockRest::with_responder(move |request| {
+        if request.method == "GET" && request.path.contains("scheduled-events") {
+            seen.store(true, Ordering::Release);
+            let call = calls.fetch_add(1, Ordering::AcqRel);
+            if call == 0 || call == 2 {
+                return ScriptedResponse::json(
+                    200,
+                    json!({"id":EVENT,"guild_id":GUILD,"status":1}),
+                )
+                .delayed(Duration::from_millis(1500));
+            }
+            return ScriptedResponse::json(200, json!({"id":EVENT,"guild_id":GUILD,"status":1}));
+        }
+        if request.method == "PATCH" {
+            return ScriptedResponse::json(200, json!({"id":"99"}));
+        }
+        ScriptedResponse::status(204)
+    })
+    .await
+}
+
+fn governed_executor(
+    rest: &MockRest,
+    admission: Arc<dyn SendAdmission>,
+) -> two_bot_discord::ActionExecutor {
+    ActionExecutor::with_admission(TOKEN.into(), Some(rest.origin()), admission).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn rsvp_lookup_and_completion_edit_wait_out_lane_hold() {
+    let db = TestDb::new().await;
+    let seen = Arc::new(AtomicBool::new(false));
+    let rest = handoff_rest(Arc::clone(&seen)).await;
+    let admission: Arc<dyn SendAdmission> =
+        Arc::new(PgSendAdmission::new(db.pool.clone(), TOKEN).unwrap());
+    let holder = governed_executor(&rest, Arc::clone(&admission));
+    let worker = governed_executor(&rest, Arc::clone(&admission));
+    // Occupy the lane with a first lookup whose delayed response holds it.
+    let occupied = tokio::spawn(async move { holder.get_scheduled_event(GUILD, EVENT).await });
+    wait_flag(&seen).await;
+    // The second lookup must wait out the hold and return the event instead
+    // of converting a pre-wire Blocked lane into a terminal validation error.
+    let start = tokio::time::Instant::now();
+    let event = worker.get_scheduled_event(GUILD, EVENT).await;
+    let waited = start.elapsed();
+    assert_eq!(
+        event.unwrap(),
+        Some(json!({"id":EVENT,"guild_id":GUILD,"status":1}))
+    );
+    assert!(waited >= Duration::from_millis(1000), "{waited:?}");
+    assert!(waited < Duration::from_secs(3), "{waited:?}");
+    assert_eq!(
+        occupied.await.unwrap().unwrap(),
+        Some(json!({"id":EVENT,"guild_id":GUILD,"status":1}))
+    );
+    // Same handoff shape for the completion PATCH: occupy the lane again and
+    // require the final edit to wait instead of losing the RSVP reply.
+    seen.store(false, Ordering::Release);
+    let holder = governed_executor(&rest, Arc::clone(&admission));
+    let occupied = tokio::spawn(async move { holder.get_scheduled_event(GUILD, EVENT).await });
+    wait_flag(&seen).await;
+    let start = tokio::time::Instant::now();
+    worker
+        .edit_interaction_response_with_blocked_retry(1111, "mock-rsvp-9", "RSVP saved: going.")
+        .await
+        .unwrap();
+    let waited = start.elapsed();
+    assert!(waited >= Duration::from_millis(1000), "{waited:?}");
+    assert!(waited < Duration::from_secs(3), "{waited:?}");
+    assert!(occupied.await.unwrap().unwrap().is_some());
+    let patches: Vec<_> = rest
+        .requests()
+        .iter()
+        .filter(|request| request.method == "PATCH")
+        .collect();
+    assert_eq!(patches.len(), 1);
+    rest.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn receipt_callback_total_stays_inside_absolute_budget() {
+    use twilight_model::{
+        channel::message::MessageFlags,
+        http::interaction::{
+            InteractionResponse, InteractionResponseData, InteractionResponseType,
+        },
+    };
+    let db = TestDb::new().await;
+    let seen = Arc::new(AtomicBool::new(false));
+    let rest = MockRest::with_responder(move |request| {
+        if request.method == "GET" && request.path.contains("scheduled-events") {
+            seen.store(true, Ordering::Release);
+            // Occupancy ends 100 ms before the receipt budget does, but the
+            // admitted callback still needs 600 ms of transport.
+            return ScriptedResponse::json(200, json!({"id":EVENT,"guild_id":GUILD,"status":1}))
+                .delayed(Duration::from_millis(2400));
+        }
+        if request.path.ends_with("/callback") {
+            return ScriptedResponse::status(204).delayed(Duration::from_millis(600));
+        }
+        ScriptedResponse::json(200, json!({"id":"99"}))
+    })
+    .await;
+    let admission: Arc<dyn SendAdmission> =
+        Arc::new(PgSendAdmission::new(db.pool.clone(), TOKEN).unwrap());
+    let holder = governed_executor(&rest, Arc::clone(&admission));
+    let worker = governed_executor(&rest, Arc::clone(&admission));
+    let occupied = tokio::spawn(async move { holder.get_scheduled_event(GUILD, EVENT).await });
+    wait_flag(&seen).await;
+    let deferred = InteractionResponse {
+        kind: InteractionResponseType::DeferredChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            flags: Some(MessageFlags::EPHEMERAL),
+            ..Default::default()
+        }),
+    };
+    let start = tokio::time::Instant::now();
+    let result = worker
+        .answer_interaction_with_blocked_retry(9, "mock-rsvp-9", &deferred)
+        .await;
+    let elapsed = start.elapsed();
+    // The absolute budget refuses to overrun the receipt window: the attempt
+    // admitted near the deadline is cut off instead of landing past it.
+    assert!(
+        result.is_err(),
+        "callback unexpectedly succeeded past the window"
+    );
+    assert!(elapsed < Duration::from_millis(2900), "{elapsed:?}");
+    assert!(occupied.await.unwrap().unwrap().is_some());
+    rest.shutdown().await;
+    db.close().await;
+}

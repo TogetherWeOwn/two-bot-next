@@ -131,7 +131,7 @@ pub async fn complete_rsvp_interaction(
         .await
         .unwrap_or_else(|message| message);
     executor
-        .edit_interaction_response(
+        .edit_interaction_response_with_blocked_retry(
             interaction.application_id.get(),
             &interaction.token,
             &content,
