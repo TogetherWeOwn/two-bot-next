@@ -65,6 +65,7 @@ jobs:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
       CARGO_TERM_COLOR: always
+      TWO_CUSTOM_COMMAND_TEST_CI: "1"
       # Disk hygiene for hosted overflow runners (TOG-12134): the integration
       # link step (`cargo test --workspace --test '*'`) links ~70 test
       # binaries and exhausted the job-container overlay (98 MB left, rust-lld
@@ -563,6 +564,14 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
 
+      - name: custom-command Postgres proof
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-core --features db --locked --test custom_command_store -- --ignored
+
+      - name: custom-command routed runtime proof (mock Discord and CI Postgres only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-discord --features db --locked --test custom_command_runtime -- --include-ignored
+
       - name: Durable Discord send admission (isolated DBs and mock HTTP only)
         if: needs.job-inputs.outputs.rust != 'false'
         env:
@@ -1043,6 +1052,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollout.py -v
       - name: Verify staging redirect smoke (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_redirect_smoke.py -v
+      - name: Verify staging automation read smoke (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_automation_read_smoke.py -v
       - name: Verify runner routing for every workflow job
         run: python3 ../scripts/test-runner-routing.py
       - name: Verify offline release lifecycle

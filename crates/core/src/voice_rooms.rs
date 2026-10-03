@@ -91,7 +91,7 @@ pub struct CreatorChannel {
     /// number at or above this.
     pub first_room_number: i64,
     /// V8 `/group`: shared numbering and contiguous block per category.
-    /// Stored by the V11 import and honored by the room planner.
+    /// Stored by the V11 import; honored by the room planner.
     pub group_by_category: bool,
 }
 

@@ -335,12 +335,19 @@ async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<String>>>) {
                 .unwrap_or("")
                 .to_owned();
             recorded.lock().await.push(path.clone());
-            // Serve onboarding's boot identity probe and website event reads
-            // on one REST socket; unknown routes still fail closed.
+            // Serve the custom-command identity probes, onboarding's boot
+            // identity probe and website event reads on one REST socket; the
+            // fixture grounds no raid windows and unknown routes fail closed.
             let (status, body): (&str, &[u8]) =
                 if request_line.starts_with("GET ") && path == "/api/v10/users/@me" {
                     ("200 OK", br#"{"id":"999","bot":true}"#)
-                } else if path.contains("scheduled-events") {
+                } else if path == "/api/v10/applications/@me" {
+                    ("200 OK", b"{\"id\":\"1111\"}")
+                } else if path == "/api/v10/guilds/2222" {
+                    ("200 OK", b"{\"id\":\"2222\",\"name\":\"Alive fixture\"}")
+                } else if path == "/api/v10/applications/1111/guilds/2222/commands"
+                    || path.contains("scheduled-events")
+                {
                     ("200 OK", b"[]")
                 } else {
                     (
