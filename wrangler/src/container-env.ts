@@ -26,6 +26,9 @@ export const FORWARDED_FLAGS = [
   "TWO_MODERATION",
   "TWO_MODERATION_PROTECTED_ROLE_IDS",
   "TWO_OWEN_USER_ID",
+  // Disable-guard escape hatch: explicit boot/CLI override that proceeds
+  // with owed releases. Unset by default so refusal is the default.
+  "TWO_ALLOW_OWED_RELEASES",
   // Automod (gateway intents + AutomodConfig).
   "TWO_AUTOMOD",
   "TWO_AUTOMOD_ALLOWED_DOMAINS",

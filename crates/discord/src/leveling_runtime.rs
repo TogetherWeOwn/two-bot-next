@@ -325,6 +325,14 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         self.pipeline.set_join_observer(observer);
     }
 
+    /// Register the audit-entry observer (containment watch). First wins.
+    pub fn set_audit_entry_observer(
+        &self,
+        observer: std::sync::Arc<dyn crate::pipeline::AuditEntryObserver>,
+    ) {
+        self.pipeline.set_audit_entry_observer(observer);
+    }
+
     /// Drain deferred XP awards without holding the async dispatch lock.
     /// The caller owns ordering (the serial checkpoint writer); this only
     /// preserves the funnel-before-award sequence per dispatch.

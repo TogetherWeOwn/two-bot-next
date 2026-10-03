@@ -28,6 +28,8 @@ pub mod internal_actions;
 pub mod internal_channel_moderation;
 pub mod internal_events;
 #[cfg(feature = "db")]
+pub mod internal_member_moderation;
+#[cfg(feature = "db")]
 pub mod leveling_runtime;
 #[cfg(feature = "db")]
 pub mod lfg_interactions;
@@ -61,6 +63,7 @@ pub use interactions::{
 };
 pub use internal_events::{event_status_name, scheduled_event_body, EventActionError, EventCall};
 pub use pipeline::{
-    build_cache, ChannelClassifier, InviteSource, JoinObservation, JoinObserver, MemPipeline,
-    MessageEligibility, NoClassification, NoInvites, Pipeline, PipelineSnapshots, ScriptedInvites,
+    build_cache, AuditEntryObserver, AuditLogObservation, ChannelClassifier, InviteSource,
+    JoinObservation, JoinObserver, MemPipeline, MessageEligibility, NoClassification, NoInvites,
+    Pipeline, PipelineSnapshots, ScriptedInvites,
 };
