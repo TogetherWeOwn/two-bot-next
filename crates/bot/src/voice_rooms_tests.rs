@@ -996,7 +996,7 @@ fn voice_command_set_is_gated_on_two_voice() {
         .collect();
     assert_eq!(
         names,
-        ["create", "setup", "ping", "invite", "access", "logging"]
+        ["create", "setup", "ping", "invite", "access", "logging", "export", "import"]
     );
     let off = VoiceGates::from_map(&Default::default());
     assert!(voice_command_set(&off).is_empty());
