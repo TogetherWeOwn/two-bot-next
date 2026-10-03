@@ -177,10 +177,13 @@ fn message_inner(message_id: u64, edited: Option<&str>) -> Message {
 
 fn empty_options() -> AuditLogOptionalEntryInfo {
     AuditLogOptionalEntryInfo {
+        auto_moderation_rule_name: None,
+        auto_moderation_rule_trigger_type: None,
         channel_id: None,
         count: None,
         delete_member_days: None,
         id: None,
+        integration_type: None,
         kind: None,
         members_removed: None,
         message_id: None,
@@ -253,7 +256,7 @@ fn member_role_and_nick_change_matches_core_contract() {
         "hyphenated legacy namespace: {}",
         event.entry_id
     );
-    assert_eq!(event.target_id.as_deref(), Some(&MEMBER.to_string()));
+    assert_eq!(event.target_id, Some(MEMBER.to_string()));
     assert!(event.metadata_json.contains("\"nicknameChanged\":true"));
     assert!(event.metadata_json.contains("\"addedRoleIds\":[\"13\"]"));
     assert!(event.metadata_json.contains("\"removedRoleIds\":[\"11\"]"));
@@ -286,8 +289,8 @@ fn voice_join_leave_move_match_legacy_keys() {
         format!("voice_join:{GUILD}:{MEMBER}:none:{CH_VOICE_A}:{AT}")
     );
     assert_eq!(
-        events[0].destination_channel_id.as_deref(),
-        Some(&CH_VOICE_A.to_string())
+        events[0].destination_channel_id,
+        Some(CH_VOICE_A.to_string())
     );
 
     // Move: seeded on A, frame carries B.
@@ -311,10 +314,7 @@ fn voice_join_leave_move_match_legacy_keys() {
         events[0].entry_id,
         format!("voice_leave:{GUILD}:{MEMBER}:{CH_VOICE_A}:none:{AT}")
     );
-    assert_eq!(
-        events[0].source_channel_id.as_deref(),
-        Some(&CH_VOICE_A.to_string())
-    );
+    assert_eq!(events[0].source_channel_id, Some(CH_VOICE_A.to_string()));
 
     // Mute/deafen frame on the same channel: not a boundary, no row.
     let cache = build_cache();
@@ -340,10 +340,7 @@ fn raw_message_edit_and_delete_match_core_contracts() {
         events[0].entry_id,
         format!("message-edit:{GUILD}:{message_id}:2026-09-30T00:01:03.000Z")
     );
-    assert_eq!(
-        events[0].message_id.as_deref(),
-        Some(&message_id.to_string())
-    );
+    assert_eq!(events[0].message_id, Some(message_id.to_string()));
     assert!(
         !events[0]
             .metadata_json
@@ -351,11 +348,11 @@ fn raw_message_edit_and_delete_match_core_contracts() {
         "bodies never enter rows"
     );
 
-    let delete = Event::MessageDelete(Box::new(MessageDelete {
+    let delete = Event::MessageDelete(MessageDelete {
         channel_id: Id::new(CH_TEXT),
         guild_id: Some(Id::new(GUILD)),
         id: Id::new(message_id),
-    }));
+    });
     let events = translate_with(&delete, &cache, AT, 9, None, None);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].kind, AuditKind::MessageDelete);
@@ -365,11 +362,11 @@ fn raw_message_edit_and_delete_match_core_contracts() {
     );
 
     // DM delete (no guild): no row.
-    let dm = Event::MessageDelete(Box::new(MessageDelete {
+    let dm = Event::MessageDelete(MessageDelete {
         channel_id: Id::new(CH_TEXT),
         guild_id: None,
         id: Id::new(message_id),
-    }));
+    });
     assert!(translate_with(&dm, &cache, AT, 9, None, None).is_empty());
 }
 
@@ -465,10 +462,7 @@ fn audit_log_counts_and_channel_options_follow_legacy() {
         None,
     );
     assert_eq!(events.len(), 1);
-    assert_eq!(
-        events[0].source_channel_id.as_deref(),
-        Some(&CH_TEXT.to_string())
-    );
+    assert_eq!(events[0].source_channel_id, Some(CH_TEXT.to_string()));
     assert!(events[0].metadata_json.contains("\"count\":5"));
 
     // Prune reports `members_removed` through the same count slot.
@@ -600,11 +594,11 @@ async fn translated_fixtures_produce_stored_rows() {
                 Some("00:01:03"),
             )),
         )),
-        Event::MessageDelete(Box::new(MessageDelete {
+        Event::MessageDelete(MessageDelete {
             channel_id: Id::new(CH_TEXT),
             guild_id: Some(Id::new(GUILD)),
             id: Id::new(message_id),
-        })),
+        }),
     ];
     let mut events: Vec<AuditEvent> = fixtures
         .iter()
