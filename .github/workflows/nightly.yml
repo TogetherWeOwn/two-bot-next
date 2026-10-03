@@ -62,6 +62,10 @@ jobs:
       TWO_LFG_TESTDB_CI: '1'
       TWO_LEVELING_TEST_CI: '1'
       TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
+      # CI service hosts only; deployed processes default to `required`
+      # (docs/database-tls.md). Without it the in-process `connect` refuses
+      # the loopback test database and voice startup degrades to voice-off.
+      TWO_DATABASE_TLS: local-only
     services:
       agent-testdb:
         image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
@@ -113,13 +117,15 @@ jobs:
           mkdir -p "$RUNNER_TEMP/nightly-workspace" "$RUNNER_TEMP/backup-roundtrip" "$RUNNER_TEMP/backup-publication"
       # Serial execution prevents the ignored stores' shared tables/locks from
       # racing. Sticky/onboarding tests are disposable-DB tests, not Discord calls.
-      # Channel moderation (store, runtime and the discord channel-moderation
-      # executor), feeds_store, legacy_verify_db and raid_list_db require
-      # agent_test, not the two_bot_test_* bootstrap used by TestDatabase
-      # suites. Skip only those tests here, then run ALL guarded suites below
-      # with their accepted URL.
+      # Channel moderation, the discord channel-moderation executor, feeds_store,
+      # legacy_verify_db, raid_list_db, reengagement_list_db, staging_migrate_db
+      # and internal_events require agent_test, not the two_bot_test_* bootstrap
+      # used by TestDatabase suites. Skip only those tests here, then run ALL of
+      # those suites below with their accepted URL.
       # The store suite reads its own TEST_DATABASE_URL and isolates per schema.
       # No ignored suite is permanently excluded.
+      # --no-fail-fast: cargo otherwise stops at the first failing test binary and
+      # hides every later failure, so one red target masked the rest of the sweep.
       - name: Full workspace sweep including ignored tests
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_nightly
@@ -127,7 +133,7 @@ jobs:
           TEST_DATABASE_URL: postgresql://agent_test@agent-testdb:5432/postgres
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/nightly-workspace
         run: >-
-          cargo test --workspace --all-features --locked -- --include-ignored --test-threads=1
+          cargo test --workspace --all-features --locked --no-fail-fast -- --include-ignored --test-threads=1
           --skip channel_moderation_store::
           --skip channel_moderation_store::tests::lockdown_round_trip_stores_and_restores_exact_masks
           --skip channel_moderation_store::tests::repeated_lockdown_preserves_first_masks
@@ -185,6 +191,9 @@ jobs:
           --skip parity_mismatch_cursor_and_read_only_acceptance
           --skip dump_inspect_restore_round_trip
           --skip flags_are_guild_scoped_half_open_deduplicated_and_activity_protected
+          --skip list_is_guild_scoped_selector_shaped_and_read_only
+          --skip real_sqlx_runner_cases
+          --skip database::actions_persist_rows_and_preserve_other_events_and_guilds
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
@@ -220,6 +229,27 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
           cargo test -p two-bot-cutover --all-features --test legacy_verify_db --locked
+          -- --include-ignored --test-threads=1
+      - name: Reengagement list ignored tests with their guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: >-
+          cargo test -p two-bot-cutover --all-features --test reengagement_list_db --locked
+          -- --include-ignored --test-threads=1
+      - name: Staging migration runner ignored tests with their guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: >-
+          cargo test -p two-bot-cutover --all-features --test staging_migrate_db --locked
+          -- --include-ignored --test-threads=1
+      - name: Internal events ignored tests with their guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: >-
+          cargo test -p two-bot-discord --all-features --test internal_events --locked
           -- --include-ignored --test-threads=1
       - name: Raid list ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
