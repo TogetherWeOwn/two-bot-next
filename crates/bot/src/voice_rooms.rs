@@ -29,13 +29,13 @@ use twilight_model::{
         application_command::{CommandDataOption, CommandOptionValue},
         Interaction, InteractionData, InteractionType,
     },
-    channel::{message::MessageFlags, Channel},
+    channel::{message::MessageFlags, permission_overwrite::PermissionOverwriteType, Channel},
     guild::{Permissions, Role},
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
     id::{marker::RoleMarker, Id},
 };
 use two_bot_core::{
-    now_iso,
+    evaluate_permissions as evaluate_health, now_iso,
     voice_access::{
         is_voice_command, may_create_room, may_use_command, validate_access_controls,
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
@@ -46,7 +46,8 @@ use two_bot_core::{
         VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN, RENAME_MIN_INTERVAL_MS,
     },
     voice_utilities::{invite_render, ping_render},
-    CommandDefinition, Snowflake,
+    CommandDefinition, OverwriteTarget, PermissionFinding, PermissionOverwrite as HealthOverwrite,
+    Snowflake, VoicePermission, VoicePermissionScope,
 };
 use two_bot_cutover::voice_rooms::PgRoomStore;
 use two_bot_discord::voice_rooms::{
@@ -391,6 +392,68 @@ impl LiveGuild {
         live.generation += 1;
     }
 
+    /// V10 health check: the bot's missing Manage Channels, Move Members,
+    /// Manage Roles and View Channel permissions across the given creator
+    /// channels and their categories, attributed to the outermost level that
+    /// removes each one. Incomplete cache data (no bot snapshot, a missing
+    /// @everyone or bot role) reports nothing rather than a false failure, and
+    /// the guild owner and Administrator roles never have findings.
+    #[must_use]
+    pub fn permission_findings(&self, creators: &[Snowflake]) -> Vec<PermissionFinding> {
+        let live = self.inner.read().expect("live voice lock");
+        let Some(bot) = live.bot.as_ref() else {
+            return Vec::new();
+        };
+        if bot.member_id == bot.guild_owner_id {
+            return Vec::new();
+        }
+        let Some(everyone) = bot.roles.iter().find(|role| role.id.get() == self.guild_id) else {
+            return Vec::new();
+        };
+        let mut base = everyone.permissions.bits();
+        for role_id in &bot.member_roles {
+            let Some(role) = bot.roles.iter().find(|role| role.id == *role_id) else {
+                return Vec::new();
+            };
+            base |= role.permissions.bits();
+        }
+        let bot_roles: Vec<Snowflake> = bot.member_roles.iter().map(|id| id.get()).collect();
+        let mut findings = Vec::new();
+        for creator_id in creators {
+            let Some(channel) = live.channels.get(creator_id) else {
+                continue;
+            };
+            let category = channel
+                .parent_id
+                .and_then(|parent| live.channels.get(&parent.get()));
+            // A creator outside a category, or whose category is not cached,
+            // has no category-level evidence: only guild and channel scopes.
+            let (category_id, category_overwrites) = category.map_or_else(
+                || (0, Vec::new()),
+                |category| {
+                    (
+                        category.id.get(),
+                        health_overwrites(self.guild_id, category),
+                    )
+                },
+            );
+            for finding in evaluate_health(
+                base,
+                category_id,
+                &category_overwrites,
+                *creator_id,
+                &health_overwrites(self.guild_id, channel),
+                bot.member_id,
+                &bot_roles,
+            ) {
+                if !findings.contains(&finding) {
+                    findings.push(finding);
+                }
+            }
+        }
+        findings
+    }
+
     /// Refresh the bot access snapshot after role changes. Generation is
     /// unchanged: role edits do not invalidate in-flight tickets, they only
     /// affect the next guard evaluation.
@@ -472,6 +535,53 @@ impl LiveGuild {
                         .permissions(live.guild_id, channel),
                 )
         })
+    }
+}
+
+/// Role and member overwrites of one cached channel, in the health core's
+/// shape. @everyone is the role whose id is the guild id.
+fn health_overwrites(guild_id: Snowflake, channel: &Channel) -> Vec<HealthOverwrite> {
+    channel
+        .permission_overwrites
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|overwrite| {
+            let target = match overwrite.kind {
+                PermissionOverwriteType::Role if overwrite.id.get() == guild_id => {
+                    OverwriteTarget::Everyone
+                }
+                PermissionOverwriteType::Role => OverwriteTarget::Role(overwrite.id.get()),
+                PermissionOverwriteType::Member => OverwriteTarget::Member(overwrite.id.get()),
+                _ => return None,
+            };
+            Some(HealthOverwrite {
+                target,
+                allow: overwrite.allow.bits(),
+                deny: overwrite.deny.bits(),
+            })
+        })
+        .collect()
+}
+
+/// One `/setup` line for a missing permission. Ids only: the category or
+/// channel is mentioned, never named.
+#[must_use]
+pub fn health_line(finding: &PermissionFinding) -> String {
+    let permission = match finding.permission {
+        VoicePermission::ManageChannels => "Manage Channels",
+        VoicePermission::MoveMembers => "Move Members",
+        VoicePermission::ManageRoles => "Manage Roles",
+        VoicePermission::ViewChannel => "View Channel",
+    };
+    match (finding.scope, finding.category_id, finding.channel_id) {
+        (VoicePermissionScope::Category, Some(category), _) => format!(
+            "health: the permission override on category <#{category}> removes {permission} from the bot"
+        ),
+        (VoicePermissionScope::Channel, _, Some(channel)) => format!(
+            "health: the permission override on <#{channel}> removes {permission} from the bot"
+        ),
+        _ => format!("health: the bot lacks {permission} for the whole server"),
     }
 }
 
@@ -1487,7 +1597,15 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         }
         ActorCommand::AccessChanged(controls) => worker.access = controls,
         ActorCommand::Status(reply) => {
+            let mut creator_ids: Vec<Snowflake> = worker.creators.keys().copied().collect();
+            creator_ids.sort_unstable();
             let _ = reply.send(WorkerStatus {
+                health: worker
+                    .live
+                    .permission_findings(&creator_ids)
+                    .iter()
+                    .map(health_line)
+                    .collect(),
                 tracked_rooms: worker.tracked().len(),
                 failures: worker.failures().iter().map(failure_line).collect(),
                 halted: worker.halted(),
@@ -1928,6 +2046,8 @@ pub fn ephemeral_response(content: &str) -> InteractionResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerStatus {
     pub tracked_rooms: usize,
+    /// Current permission-health findings, rendered for `/setup`.
+    pub health: Vec<String>,
     pub failures: Vec<String>,
     pub halted: bool,
 }
@@ -2190,9 +2310,15 @@ where
                 guild_id,
                 creators,
                 tracked_rooms: status.as_ref().map_or(0, |status| status.tracked_rooms),
-                failures: status
-                    .as_ref()
-                    .map_or_else(Vec::new, |status| status.failures.clone()),
+                // Current health findings first: they are live, failures are history.
+                failures: status.as_ref().map_or_else(Vec::new, |status| {
+                    status
+                        .health
+                        .iter()
+                        .chain(status.failures.iter())
+                        .cloned()
+                        .collect()
+                }),
                 halted: status.as_ref().is_some_and(|status| status.halted),
                 store_error,
             });
