@@ -360,13 +360,17 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             Err(error) if matches!(error.kind(), twilight_gateway::error::ReceiveMessageErrorType::Reconnect) => {
                                 transport_disconnected(&state, &generation).await;
                                 voice_disconnected(voice.as_ref());
-                                warn!("gateway reconnect failed; Twilight will retry");
+                                warn!(
+                                    msg = "gateway_reconnect_failed",
+                                    "gateway reconnect failed; Twilight will retry"
+                                );
                                 continue;
                             }
                             Err(_) => return Err(sqlx::Error::InvalidArgument("gateway receive failed".into())),
                         };
                         observer.observe(&message, &shard);
                         let Message::Text(text) = message else {
+                            crate::logging::shard_closed(&message);
                             transport_disconnected(&state, &generation).await;
                             voice_disconnected(voice.as_ref());
                             let rejected = matches!(message, Message::Close(Some(ref frame)) if matches!(frame.code, 4007 | 4009));
@@ -472,7 +476,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             }
         },
     );
-    info!(shard = ?ShardId::ONE, "gateway shard loop started");
+    info!(msg = "gateway_started", shard = ?ShardId::ONE, "gateway shard loop started");
     let handle = tokio::runtime::Handle::current();
     let worker_state = Arc::clone(&state);
     let worker_voice = voice;
@@ -517,7 +521,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                 committed,
             } => {
                 let timer = crate::gateway_metrics::DispatchTimer::start();
-                let mut connected = false;
+                let mut connected: Option<&str> = None;
                 let mut onboarding_job = None;
                 // Automod decides first, in gateway order, once per delivery.
                 let disposition = automod.as_ref().and_then(|automod| {
@@ -536,8 +540,11 @@ pub async fn run_shard<I: InviteSource + 'static>(
                 });
                 if let Some(dispatch) = dispatch {
                     // A cold voice RESUME is followed by IDENTIFY; READY connects.
-                    connected = matches!(dispatch.event, Event::Ready(_) | Event::Resumed)
-                        && committed.is_none();
+                    connected = match &dispatch.event {
+                        Event::Ready(_) if committed.is_none() => Some("ready"),
+                        Event::Resumed if committed.is_none() => Some("gateway_resumed"),
+                        _ => None,
+                    };
                     // Capture member state before the cache pipeline mutates it.
                     onboarding_job = writer_onboarding
                         .as_ref()
@@ -640,16 +647,13 @@ pub async fn run_shard<I: InviteSource + 'static>(
                     }
                     writer_signal.notify_one();
                 }
-                if connected {
+                if let Some(msg) = connected {
                     let mut state = handle.block_on(worker_state.write());
                     if *state != GatewayState::Draining
                         && generation.load(Ordering::Acquire) == observed_generation
                     {
                         *state = GatewayState::Connected;
-                        info!(
-                            sequence = checkpoint.sequence,
-                            "gateway ready; checkpoint committed"
-                        );
+                        info!(msg, sequence = checkpoint.sequence, shard = ?ShardId::ONE);
                     }
                 }
                 if let Some(committed) = committed {

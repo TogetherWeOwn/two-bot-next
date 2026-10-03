@@ -411,6 +411,27 @@ async fn checkpoint(db: &TestDb, seq: u64) {
     );
 }
 
+/// Count lines carrying a stable `msg` catalog name (`docs/logging.md`): the
+/// legacy free-text "gateway ready; checkpoint committed" line no longer
+/// exists. Each boot emits exactly one durable READY/RESUMED commit (`ready`
+/// on fresh IDENTIFY, `gateway_resumed` on RESUME replay) and one
+/// `shutdown_started` on SIGTERM.
+fn msg_count(logs: &str, names: &[&str]) -> usize {
+    logs.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| {
+            event
+                .get("msg")
+                .and_then(Value::as_str)
+                .is_some_and(|msg| names.contains(&msg))
+        })
+        .count()
+}
+
+fn ready_commits(logs: &str) -> usize {
+    msg_count(logs, &["ready", "gateway_resumed"])
+}
+
 async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, logs: &Logs) {
     let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = reserved.local_addr().unwrap();
@@ -449,11 +470,7 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         }
         wait_http(bot, addr, "/readyz", 503).await; // Authentication alone isn't ready.
         assert_eq!(
-            logs.lock()
-                .await
-                .lines()
-                .filter(|line| line.contains("gateway ready; checkpoint committed"))
-                .count(),
+            ready_commits(&logs.lock().await),
             boot,
             "no ready log before READY/RESUMED"
         );
@@ -494,30 +511,27 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         drop(rebound);
     }
     let logs = logs.lock().await;
+    assert_eq!(ready_commits(&logs), 2, "ready log on each boot");
     assert_eq!(
-        logs.matches("gateway ready; checkpoint committed").count(),
+        msg_count(&logs, &["shutdown_started"]),
         2,
-        "ready log on each boot"
+        "shutdown log on each SIGTERM"
     );
-    assert_eq!(logs.matches("SIGTERM received; draining").count(), 2);
     assert!(
         logs.find("listening").unwrap() < logs.find("durable gateway initialized").unwrap(),
         "listener must bind before gateway initialization"
     );
-    // LOG_FORMAT=json is not implemented yet (tracing-subscriber lacks json).
-    // If a later binary supports it, check every emitted line, not just READY.
-    if logs
-        .lines()
-        .next()
-        .is_some_and(|line| line.starts_with('{'))
-    {
-        for line in logs.lines() {
-            let event: Value =
-                serde_json::from_str(line).expect("each child log line must be JSON");
-            assert!(event.is_object());
-        }
-    } else {
-        eprintln!("SKIP JSON log assertion: this binary does not support LOG_FORMAT=json yet");
+    // LOG_FORMAT=json is the default (stable `msg` catalog in docs/logging.md);
+    // the child runs with it above, so every emitted line must be a JSON
+    // object with a string `msg`.
+    assert!(logs.lines().next().is_some(), "child must emit logs");
+    for line in logs.lines() {
+        let event: Value = serde_json::from_str(line).expect("each child log line must be JSON");
+        assert!(event.is_object());
+        assert!(
+            event.get("msg").and_then(Value::as_str).is_some(),
+            "each child log line must carry a string msg"
+        );
     }
 }
 

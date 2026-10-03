@@ -11,6 +11,7 @@ use std::sync::Arc;
 use axum::{http::StatusCode, routing::get, Json, Router};
 use tokio::{net::TcpListener, sync::RwLock};
 use tower_http::trace::TraceLayer;
+use tracing::{instrument::WithSubscriber, Instrument};
 use two_bot_core::{ComponentStatus, HealthReport};
 
 use crate::gateway::GatewayState;
@@ -62,7 +63,7 @@ fn router_with_guard(
         .layer(axum::Extension(guard))
         // Internal metrics live on the same listener (Worker never proxies it).
         .merge(crate::metrics_http::router())
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(crate::logging::http_span))
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -173,7 +174,7 @@ fn readiness_report(gateway: GatewayState, database_ready: bool) -> HealthReport
 /// Bind before starting the gateway so liveness never waits for Discord.
 pub async fn bind(addr: &str) -> std::io::Result<TcpListener> {
     let listener = TcpListener::bind(addr).await?;
-    tracing::info!(addr, "listening");
+    tracing::info!(msg = "http_listening", addr, "listening");
     Ok(listener)
 }
 
@@ -184,19 +185,38 @@ pub async fn serve(
     jobs: crate::jobs::SharedStatus,
     shutdown: tokio::sync::watch::Sender<bool>,
 ) -> std::io::Result<()> {
+    serve_with_shutdown(listener, state, jobs, shutdown, shutdown_signal()).await
+}
+
+pub(super) async fn serve_with_shutdown(
+    listener: TcpListener,
+    state: SharedState,
+    jobs: crate::jobs::SharedStatus,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     let gateway = Arc::clone(&state.gateway);
-    axum::serve(listener, router_with_jobs(state, jobs).into_make_service())
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                biased;
-                _ = shutdown_requested(shutdown.subscribe()) => {},
-                _ = shutdown_signal() => {},
+    // Axum spawns the signal future: preserve both the run span and dispatcher.
+    // https://docs.rs/axum/0.8.9/src/axum/serve/mod.rs.html
+    let router = crate::logging::with_http_context(router_with_jobs(state, jobs));
+    axum::serve(listener, router.into_make_service())
+        .with_graceful_shutdown(
+            async move {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_requested(shutdown.subscribe()) => {},
+                    _ = signal => {},
+                }
+                *gateway.write().await = GatewayState::Draining;
+                shutdown.send_replace(true);
+                crate::shutdown::exit_on_second_signal();
             }
-            *gateway.write().await = GatewayState::Draining;
-            shutdown.send_replace(true);
-            crate::shutdown::exit_on_second_signal();
-        })
-        .await
+            .in_current_span()
+            .with_current_subscriber(),
+        )
+        .await?;
+    tracing::info!(msg = "shutdown_completed");
+    Ok(())
 }
 
 /// Observe sticky cancellation, including a stop sent before subscribing or closure.
@@ -218,8 +238,8 @@ async fn shutdown_signal() {
     let mut int = signal(SignalKind::interrupt()).expect("SIGINT handler");
 
     tokio::select! {
-        _ = term.recv() => tracing::info!("SIGTERM received; draining"),
-        _ = int.recv() => tracing::info!("SIGINT received; draining"),
+        _ = term.recv() => tracing::info!(msg = "shutdown_started", signal = "SIGTERM", "SIGTERM received; draining"),
+        _ = int.recv() => tracing::info!(msg = "shutdown_started", signal = "SIGINT", "SIGINT received; draining"),
     }
 }
 
