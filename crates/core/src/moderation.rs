@@ -98,6 +98,19 @@ impl ModerationAction {
         }
     }
 
+    /// Discord permission display name for denial copy (TOG-13624): what the
+    /// member sees in Server Settings → Roles, not the internal action id.
+    #[must_use]
+    pub fn discord_permission_name(self) -> &'static str {
+        match self {
+            Self::Ban | Self::TempBan => "Ban Members",
+            Self::Kick => "Kick Members",
+            Self::Timeout | Self::Warn => "Moderate Members",
+            Self::Purge => "Manage Messages",
+            Self::Slowmode | Self::Lockdown | Self::Unlock => "Manage Channels",
+        }
+    }
+
     /// Discord permission gate (legacy `permissionFor` + builder flags).
     #[must_use]
     pub fn required_permission(self) -> u64 {
@@ -144,7 +157,7 @@ pub fn moderation_commands() -> Vec<CommandDefinition> {
                 .min_value(TEMPBAN_DURATION_MIN_SECONDS),
                 CommandOption::reason(),
             ]),
-        CommandDefinition::new("kick", "Kick a member")
+        CommandDefinition::new("kick", "Kick a member from the server (moderators only)")
             .permissions(PERM_KICK_MEMBERS)
             .options(vec![CommandOption::target(), CommandOption::reason()]),
         CommandDefinition::new("timeout", "Timeout a member")
@@ -595,10 +608,10 @@ mod tests {
     fn full_registry_merges_without_collision() {
         let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
             .expect("slices 1-3 merge cleanly");
-        // 2 core + 16 slice-2 + 9 moderation.
-        assert_eq!(merged.len(), 27);
+        // 3 core + 16 slice-2 + 9 moderation.
+        assert_eq!(merged.len(), 28);
         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(&names[..3], ["rank", "leaderboard", "attendance"]);
+        assert_eq!(&names[..4], ["rank", "leaderboard", "help", "attendance"]);
         assert_eq!(
             &names[18..23],
             ["ban", "tempban", "kick", "timeout", "warn"]

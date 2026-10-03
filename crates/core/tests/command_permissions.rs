@@ -17,6 +17,7 @@ fn all_on() -> RouterGates {
         automations: true,
         announcements: true,
         moderation: true,
+        voice: true,
         tickets: true,
         self_roles: true,
         onboarding_picker: true,
@@ -88,15 +89,21 @@ fn all_30_rows_equal_parity_section1() {
         assert_eq!(row.policy_hook, policy_hook, "parity row {number}");
     }
     assert_eq!(seen, (1..=30).collect::<HashSet<_>>());
-    assert_eq!(COMMAND_PERMISSIONS.len(), 30);
+    // The 30 legacy parity rows plus the Next-only `/help` discovery command
+    // (parity row 31 — legacy has no help command) and the Next-only voice
+    // vote-kick (parity row 32 — legacy has no vote-kick slash).
+    assert_eq!(COMMAND_PERMISSIONS.len(), 32);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        30
+        32
     );
+    let help = command_permission("help").expect("help has a permission row");
+    assert_eq!(help.required_permissions, 0);
+    assert_eq!(help.surface, CommandSurface::BuiltinSlash);
 }
 
 #[test]
@@ -112,7 +119,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 27);
+    assert_eq!(builtins.len(), 29);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published

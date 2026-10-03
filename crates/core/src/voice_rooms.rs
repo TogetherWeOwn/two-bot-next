@@ -1308,24 +1308,37 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         )
         .required()]),
         CommandDefinition::new(
-            "kick",
-            "Start a vote to disconnect a member from your voice room",
+            "votekick",
+            "Start a member vote to disconnect someone from your voice room (they stay on the server)",
         )
         .options(vec![
             CommandOption::new(
                 "member",
-                "Room occupant to put to a vote",
+                "Room occupant to put to a vote, e.g. @Sam",
                 CommandOptionType::User,
             )
             .required(),
             CommandOption::new(
                 "reason",
-                "Why the vote was started (shown on the ballot)",
+                "Why the vote was started (shown on the ballot, optional)",
                 CommandOptionType::String,
             )
             .max_length(512),
         ]),
     ]
+}
+
+/// The Next-only voice vote-kick command as a standalone publishable
+/// definition. Voice vote-kick is Next-new (legacy has no vote-kick slash);
+/// it publishes under its own name so the picker never confuses it with the
+/// moderation `/kick`. The router publishes this (not the whole voice slice)
+/// while `TWO_VOICE=1`.
+#[must_use]
+pub fn vote_kick_command() -> CommandDefinition {
+    voice_commands()
+        .into_iter()
+        .find(|def| def.name == "votekick")
+        .expect("voice slice defines votekick")
 }
 
 /// Voice env gates.
@@ -2027,7 +2040,7 @@ mod tests {
                 "logging",
                 "export",
                 "import",
-                "kick"
+                "votekick"
             ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
@@ -2113,9 +2126,10 @@ mod tests {
                 .all(|o| o.required != Some(true));
             assert!(required_first, "{} lists a required option late", sub.name);
         }
-        // `/kick` is open to every occupant; the worker refuses
+        // `/votekick` is open to every occupant; the worker refuses
         // non-occupant initiators and protected targets.
         let kick = &defs[11];
+        assert_eq!(kick.name, "votekick");
         assert_eq!(kick.default_member_permissions, None);
         assert_eq!(
             kick.options
@@ -2153,9 +2167,8 @@ mod tests {
         assert_eq!(defs[7].options[0].kind, CommandOptionType::User as u8);
         assert!(defs[7].options[0].required == Some(true));
         // Merges cleanly alongside the other slices, first-wins.
-        // Moderation's `kick` sorts before the voice one, so the shared
-        // merge keeps the moderation definition; runtime dispatch (not the
-        // published shape) decides vote-kick versus moderation kick.
+        // The voice vote-kick publishes as `votekick`, so it never collides
+        // with the moderation `kick`; each keeps its own name end to end.
         let merged = merge_commands(
             &[feature_commands(), moderation_commands(), voice_commands()],
             &[],

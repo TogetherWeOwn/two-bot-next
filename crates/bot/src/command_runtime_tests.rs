@@ -265,6 +265,7 @@ fn gates(automations: bool, announcements: bool) -> RouterGates {
         automations,
         announcements,
         moderation: false,
+        voice: false,
         tickets: false,
         self_roles: false,
         onboarding_picker: false,
@@ -577,6 +578,39 @@ async fn refused_interaction_is_answered_ephemerally_via_executor() {
 }
 
 #[tokio::test]
+async fn help_answers_immediately_from_the_live_publish_set() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    // All feature gates on: the reply must equal the rendered live set.
+    let router_gates = RouterGates {
+        scorecard: true,
+        moderation: true,
+        ..gates(true, true)
+    };
+    let runtime = runtime_without_db(router_gates, true, origin);
+    runtime
+        .on_interaction(&slash("help", Some(CHANNEL), Vec::new()))
+        .await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1, "one immediate callback, no defer");
+    let reply: serde_json::Value =
+        serde_json::from_slice(&callbacks[0].body).expect("callback json");
+    assert_eq!(reply["type"], 4, "immediate response, not a defer");
+    assert_eq!(reply["data"]["flags"], 64, "ephemeral");
+    let content = reply["data"]["content"].as_str().expect("content");
+    let defs = router_with_commands(router_gates)
+        .publish_set(&[])
+        .expect("live set");
+    assert_eq!(content, two_bot_core::help_text(&defs));
+    assert!(content.contains("/help"), "lists itself");
+    assert!(content.contains("/ban"), "lists gated commands");
+    assert!(
+        content.contains("needs Ban Members"),
+        "marks the gate: {content}"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn published_unwired_commands_reply_without_defer_or_store_work() {
     for router_gates in [
         gates(false, false),
@@ -616,11 +650,13 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "schedule-list"
                         | "rank"
                         | "leaderboard"
+                        | "help"
                 )
             })
             .collect();
         assert!(!unwired.contains(&"rank"));
         assert!(!unwired.contains(&"leaderboard"));
+        assert!(!unwired.contains(&"help"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }
@@ -704,7 +740,7 @@ async fn unknown_command_replies_ephemerally_without_other_effects() {
     assert_eq!(reply["data"]["flags"], 64);
     assert_eq!(
         reply["data"]["content"],
-        two_bot_core::router::replies::UNKNOWN_INTERACTION_REPLY
+        two_bot_core::router::replies::UNKNOWN_COMMAND_REPLY
     );
     assert_eq!(
         reply["data"]["allowed_mentions"]["parse"],
@@ -3359,6 +3395,16 @@ fn kick_slash() -> Interaction {
     interaction
 }
 
+fn votekick_slash() -> Interaction {
+    let mut interaction = slash(
+        "votekick",
+        Some(CHANNEL),
+        vec![option("member", CommandOptionValue::User(Id::new(303)))],
+    );
+    interaction.member.as_mut().unwrap().permissions = Some(Permissions::all());
+    interaction
+}
+
 fn moderation_gates() -> RouterGates {
     RouterGates {
         configured_guild: Some(GUILD),
@@ -3368,32 +3414,28 @@ fn moderation_gates() -> RouterGates {
 }
 
 #[tokio::test]
-async fn claimed_kick_stays_silent_for_the_voice_sink() {
+async fn votekick_stays_silent_for_the_voice_sink() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(moderation_gates(), false, origin);
-    // Claimed (target in a tracked room): the voice sink answers the vote,
-    // so the router sends no callback at all.
-    runtime.set_voice_kick_claim(Arc::new(|_, _| Box::pin(async move { Some(500u64) })));
-    runtime.on_interaction(&kick_slash()).await;
+    // The voice sink answers the vote, so the router sends no callback at
+    // all — never an unknown-command reply that would double-answer it.
+    runtime.on_interaction(&votekick_slash()).await;
     assert!(
         mock.posts_to("/callback").await.is_empty(),
-        "claimed kick sends no router callback"
+        "votekick sends no router callback"
     );
     assert!(mock.requests().is_empty(), "no other REST effects");
     mock.shutdown().await;
 }
 
 #[tokio::test]
-async fn unclaimed_kick_keeps_the_moderation_path() {
+async fn kick_keeps_the_moderation_path() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(moderation_gates(), false, origin.clone());
-    // No claim wired: pre-existing behavior, one unavailable callback.
-    runtime.on_interaction(&kick_slash()).await;
-    // Claim wired but target outside any tracked room: same path.
-    runtime.set_voice_kick_claim(Arc::new(|_, _| Box::pin(async move { None })));
+    // `/kick` is always the moderation kick now; votes go through `/votekick`.
     runtime.on_interaction(&kick_slash()).await;
     let callbacks = mock.posts_to("/callback").await;
-    assert_eq!(callbacks.len(), 2, "both unclaimed kicks answer");
+    assert_eq!(callbacks.len(), 1, "moderation kick answers");
     for callback in callbacks {
         let reply: serde_json::Value = serde_json::from_slice(&callback.body).unwrap();
         assert_eq!(reply["type"], 4, "immediate response, not a defer");

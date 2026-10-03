@@ -475,17 +475,6 @@ async fn main() {
                             }
                             None => None,
                         };
-                    // V4 `kick` collision: when the voice sink owns a kick
-                    // target (tracked room), the router yields so the vote
-                    // is answered exactly once. Both runtimes exist only
-                    // inside this task, so the claim wires here.
-                    if let (Some(runtime), Some(voice)) = (runtime.as_ref(), voice.as_ref()) {
-                        let voice = Arc::clone(voice);
-                        runtime.set_voice_kick_claim(Arc::new(move |guild, member| {
-                            let voice = Arc::clone(&voice);
-                            Box::pin(async move { voice.kick_claim_room(guild, member).await })
-                        }));
-                    }
                     let shard = build_shard(
                         token,
                         intents_from_env(),

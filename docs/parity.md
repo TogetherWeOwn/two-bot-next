@@ -76,6 +76,14 @@ golden exception or a claim of whole-baseline registry parity.
 | `rsvp-attendance` | docs/parity.md §1 #12 / #25 | Rename only the RSVP-totals `attendance` (its option is `event-id`); scorecard keeps `attendance`. No option, choice, description or permission waiver. |
 | `attendance` | docs/parity.md §1 #12 bound | Advertise `max_length` 128 on the scorecard `event-occurrence` option; every other field stays legacy-identical. |
 | `rota-acknowledge` | docs/parity.md §1 #13 / §9 drop 1 | Remove the staging-only command; no replacement. |
+| `help` | docs/parity.md §1 help | Add the Next-only `/help` discovery command (no legacy counterpart): always published, open to everyone, guild-only, no options. Answers from the live publish set with grouped permission hints. |
+| `votekick` | docs/parity.md §1 voice vote-kick | Add the Next-only voice vote-kick command (legacy has no vote-kick slash): publishes as `/votekick` while `TWO_VOICE=1` so the picker shows it next to the moderation `/kick`; the voice sink answers votes, ballots and refusals. Restriction key stays `kick`. |
+| `kick` | docs/parity.md §1 #5 copy | Picker copy only: description names the server kick as moderator-only to contrast with `/votekick`. Options, bounds and permissions stay legacy-identical. |
+| `attendance` | docs/parity.md §1 #12 copy | Picker copy only: description names the scorecard check-in, and `event-occurrence` says where to find the id with an example. Options, bounds and permissions stay legacy-identical. |
+| `rsvp` | docs/parity.md §1 #24 copy | Picker copy only: `event-id` says where to find the id with an example. Options, bounds and permissions stay legacy-identical. |
+| `rsvp-attendance` | docs/parity.md §1 #25 copy | Picker copy only: description drops the legacy bot name, and `event-id` says where to find the id with an example. Options, bounds and permissions stay legacy-identical. |
+| `lfg` | docs/parity.md §1 #26 copy | Picker copy only: `starts-at` shows an ISO-8601 example and `roles` documents the `role:Label:count` format with an example. Options, bounds and permissions stay legacy-identical. |
+| `lfg-close` | docs/parity.md §1 #27 copy | Picker copy only: `id` says it comes from the posted signup. Options, bounds and permissions stay legacy-identical. |
 
 These are the complete behavioural exceptions, mirrored by the test allowlist.
 Only equivalent guild-API representation defaults are canonicalized: omitted
