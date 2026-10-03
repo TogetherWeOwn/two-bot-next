@@ -1929,7 +1929,10 @@ mod tests {
         let defs = voice_commands();
         assert_eq!(
             defs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-            ["create", "setup", "ping", "invite", "access", "reclaim", "transfer", "logging", "export", "import"]
+            [
+                "create", "setup", "ping", "invite", "access", "reclaim", "transfer", "logging",
+                "export", "import"
+            ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
         assert_eq!(

@@ -4088,7 +4088,6 @@ where
         VoiceCommand::Import { file_id } => {
             handle_import_upload(runtime, interaction, guild_id, file_id, inventory, reply).await
         }
-        }
     }
 }
 
