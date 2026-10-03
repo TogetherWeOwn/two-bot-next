@@ -437,7 +437,7 @@ jobs:
 
       - name: onboarding prompt store regressions (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo test -p two-bot-store --features db --test onboarding_store --locked -- --ignored
+        run: cargo test -p two-bot-core --features db --test onboarding_store --locked -- --ignored
 
       - name: onboarding shared runtime acceptance (mock Discord and CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
@@ -477,7 +477,7 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
-        run: cargo test -p two-bot-cutover --test reengagement_list_db --locked -- --ignored
+        run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
 
       - name: settings database regressions (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
@@ -526,12 +526,12 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
-        run: cargo test -p two-bot-discord --features db --locked --test internal_channel_moderation -- --include-ignored
+        run: cargo test -p two-bot-core --features db --locked channel_moderation -- --include-ignored
 
       - name: channel moderation shared-router REST acceptance (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
           env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS cargo test -p two-bot-discord
           --features db --locked --test channel_moderation_runtime -- --include-ignored
@@ -539,7 +539,7 @@ jobs:
       - name: Internal channel moderation executor (mock REST and CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-discord --features db --locked --test internal_channel_moderation -- --include-ignored
 
       - name: Internal-member durable store regressions (CI service only)
@@ -548,11 +548,11 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test internal_member_store -- --ignored
 
-      - name: Internal member moderation executor (mock Discord and CI service only)
+      - name: Internal member moderation executor (mock REST and CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
-        run: cargo test -p two-bot-discord --features db --locked --test internal_member_moderation -- --ignored
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test internal_member_moderation -- --include-ignored
 
       - name: Internal event executor mirror acceptance (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
@@ -597,8 +597,10 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         run: timeout 60s cargo test -p two-bot --locked --test alive -- --ignored --nocapture
 
-      - name: Consecutive retained restore drills (actual CLI, dedicated CI service only)
+      - name: Consecutive retained restore drills (actual CLI, CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked --test restore_drill -- --ignored --nocapture
 
       # NOTE: cargo-deny runs earlier in this job (TOG-12134 disk hygiene);
@@ -695,7 +697,9 @@ jobs:
           POSTGRES_HOST_AUTH_METHOD: trust
         options: >-
           --health-cmd "pg_isready -U agent_test -d agent_test"
-          --health-interval 5s --health-timeout 5s --health-retries 10
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -819,7 +823,7 @@ jobs:
     env:
       IMAGE: two-bot-next:smoke-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -982,14 +986,16 @@ jobs:
           POSTGRES_HOST_AUTH_METHOD: trust
         options: >-
           --health-cmd "pg_isready -U agent_test -d agent_test"
-          --health-interval 5s --health-timeout 5s --health-retries 10
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       TICKET_TEST_DB_HOST: agent-testdb
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@11d5960a326750d5838078e36cf38b85af677262 # placeholder - replaced below
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
           toolchain: stable
       # TOG-11810: dependency build cache, as in the `check` job. The key
@@ -1051,7 +1057,7 @@ jobs:
       - name: Verify staging rollout provenance (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollout.py -v
       - name: Verify staging redirect smoke (offline fixtures)
-        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_automation_read_smoke.py -v
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_redirect_smoke.py -v
       - name: Verify staging automation read smoke (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_automation_read_smoke.py -v
       - name: Verify runner routing for every workflow job
