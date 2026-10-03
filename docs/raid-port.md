@@ -146,8 +146,20 @@ denied permission and send failure are logged and never retried; the cooldown is
 consumed at proposal. It is always on (legacy parity) and independent of
 `TWO_ANTI_NUKE`. `DISCORD_STAFF_ALERT_CHANNEL_ID` is not hot-wired and is not yet
 forwarded into the Container by the Worker, so staging stays log-only until a
-separate change classifies it. **Remaining:** join-risk delivery, startup
-fences, and staging soak. The executor seam is TOG-10076; no
+separate change classifies it. **Landed — join-risk delivery:**
+`crates/bot/src/join_risk_runtime.rs`. The pipeline takes one observer, so risk
+chains behind the raid watch in a fan-out and both stay behind the funnel's join
+row. The chain is built only under exact `TWO_ANTI_NUKE=1` on the staging guild;
+otherwise it is the raid watch alone. Per join the worker rebuilds the
+`JoinRiskPolicy` from live hot tuning (`TWO_JOIN_RISK_THRESHOLD`,
+`TWO_JOIN_RISK_WINDOW_SECONDS`, `TWO_BULK_JOIN_WINDOW_UNTIL`), derives account
+age from the member snowflake, claims through `JoinRiskStore::record`, logs the
+evidence first, and posts `staff_message(persisted)` through the shared
+`RaidDelivery` post with the same View/Send and empty-mentions checks.
+Duplicates, undeliverable channels and failed sends are never retried.
+Dry-run and session mode do not suppress evidence or messages; arming stays
+refused without explicit dry-run `0` outside session mode, and R2 has no armed
+path. **Remaining:** staging soak. The executor seam is TOG-10076; no
 private production HTTP client is added here. The transactional join-risk
 claim store (`join_risk_store`, migration `0360_join_risk_flags.sql`, legacy
 0015 shape) serializes per-guild event-ID claims, counts prior rows by
