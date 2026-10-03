@@ -40,6 +40,7 @@ pub mod self_role_store;
 pub mod settings;
 pub mod staging_migrate;
 pub mod tickets;
+pub mod voice_config_store;
 pub mod voice_reconcile;
 pub mod voice_rooms;
 

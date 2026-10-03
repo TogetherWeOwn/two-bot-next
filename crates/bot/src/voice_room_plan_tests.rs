@@ -84,6 +84,7 @@ impl World {
             bot: BotAccess {
                 member_id: BOT,
                 guild_owner_id: 998,
+                system_channel_id: None,
                 member_roles: vec![],
                 roles: vec![everyone(bot_permissions)],
             },

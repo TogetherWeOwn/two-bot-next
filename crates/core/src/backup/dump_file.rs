@@ -116,6 +116,18 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_text_companions",
     "voice_access_controls",
     "voice_logging_settings",
+    // V11b configuration tables (0229). Guild-keyed, no foreign keys, so order
+    // among them is free.
+    "voice_channel_templates",
+    "voice_game_aliases",
+    "voice_random_lists",
+    "voice_random_list_choices",
+    "voice_logging",
+    "voice_logging_mention_members",
+    "voice_logging_mention_roles",
+    "voice_guild_settings",
+    "voice_command_roles",
+    "voice_command_role_members",
 ];
 
 /// Frozen v3 tables no longer created by cutover migrations. Keep their data

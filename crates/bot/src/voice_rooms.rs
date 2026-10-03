@@ -40,7 +40,10 @@ use two_bot_core::{
         is_voice_command, may_create_room, may_use_command, validate_access_controls,
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
     },
-    voice_logging::{parse_detail_level, DetailLevel, LoggingSettings},
+    voice_logging::{
+        parse_detail_level, resolve_log_target, should_log, DetailLevel, LogTarget,
+        LoggingCandidates, LoggingSettings, RepeatLedger,
+    },
     voice_rooms::{
         category_full_message, voice_commands, ActionQueue, CreatorChannel, NewRoomSpec,
         ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, RoomPosition, VoiceGates,
@@ -185,6 +188,13 @@ fn store_error(error: sqlx::Error) -> StoreError {
     }
 }
 
+/// Where one operator notice is delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeTarget {
+    Channel(Snowflake),
+    DirectMessage(Snowflake),
+}
+
 /// The production adapter performs one attempt and returns 429s to this worker.
 pub trait RoomWrites: Send + Sync {
     fn create(
@@ -227,6 +237,19 @@ pub trait RoomWrites: Send + Sync {
         channel: Snowflake,
         name: &str,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// V10 error notice. `mention_role` is pinged on channel targets only.
+    /// The default refuses, so a writer that cannot post notices fails closed
+    /// (the worker counts the attempt and moves on) instead of dropping them
+    /// silently as delivered.
+    fn send_notice(
+        &self,
+        target: NoticeTarget,
+        content: &str,
+        mention_role: Option<Snowflake>,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send {
+        let _ = (target, content, mention_role);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
 }
 
 impl RoomWrites for RoomHttp {
@@ -278,12 +301,28 @@ impl RoomWrites for RoomHttp {
     async fn rename(&self, channel: Snowflake, name: &str) -> Result<(), RoomHttpError> {
         self.rename_room(channel, name).await
     }
+
+    async fn send_notice(
+        &self,
+        target: NoticeTarget,
+        content: &str,
+        mention_role: Option<Snowflake>,
+    ) -> Result<(), RoomHttpError> {
+        match target {
+            NoticeTarget::Channel(channel) => {
+                self.post_notice(channel, content, mention_role).await
+            }
+            NoticeTarget::DirectMessage(user) => self.direct_notice(user, content).await,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct BotAccess {
     pub member_id: Snowflake,
     pub guild_owner_id: Snowflake,
+    /// The guild's system channel, first stop for V10 error notices.
+    pub system_channel_id: Option<Snowflake>,
     pub member_roles: Vec<Id<RoleMarker>>,
     pub roles: Vec<Role>,
 }
@@ -487,6 +526,14 @@ impl LiveGuild {
         self.inner.write().expect("live voice lock").bot = Some(access);
     }
 
+    /// System channel and owner for V10 notice routing; `None` until the bot
+    /// evidence is published.
+    fn notice_context(&self) -> Option<(Option<Snowflake>, Snowflake)> {
+        let state = self.inner.read().expect("live voice lock");
+        let bot = state.bot.as_ref()?;
+        Some((bot.system_channel_id, bot.guild_owner_id))
+    }
+
     /// Publish before enqueueing the ticket. Same-channel mute/deaf updates do
     /// not create rooms; leaving and returning yields a different ticket even
     /// if an older HTTP call is still awaiting its response.
@@ -654,7 +701,24 @@ pub struct GuildRoomWorker<S, H> {
     compensation: HashSet<Snowflake>,
     denied: HashMap<Snowflake, (u64, Option<Permissions>)>,
     failures: VecDeque<LifecycleFailure>,
+    notices: Vec<NoticeState>,
     halted: bool,
+}
+
+/// Minimum gap between notices about the same failure: one initial notice plus
+/// two repeats ([`two_bot_core::voice_logging::MAX_LOG_SENDS`]) span half an hour.
+const NOTICE_REPEAT_INTERVAL_MS: u64 = 15 * 60 * 1000;
+
+/// Longest notice body; Discord's message limit is 2000 characters.
+const NOTICE_MAX_CHARS: usize = 1500;
+
+/// Repeat bookkeeping for one tracked failure. `last_attempt_ms` is the
+/// actor's monotonic clock, so a restart begins a fresh budget.
+#[derive(Debug, Clone)]
+struct NoticeState {
+    failure: LifecycleFailure,
+    ledger: RepeatLedger,
+    last_attempt_ms: Option<u64>,
 }
 
 impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
@@ -690,6 +754,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             compensation: HashSet::new(),
             denied: HashMap::new(),
             failures: VecDeque::new(),
+            notices: Vec::new(),
             halted: false,
         })
     }
@@ -837,6 +902,141 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     }
     pub fn tracked(&self) -> &HashMap<Snowflake, VoiceRoom> {
         &self.rooms
+    }
+
+    /// Send at most one due error notice per call, per the guild's
+    /// `/logging` settings. Each failure is noticed once plus two repeats at
+    /// least [`NOTICE_REPEAT_INTERVAL_MS`] apart, then stays listed in
+    /// `/setup` but silent. Every delivery attempt counts, delivered or not,
+    /// so an unreachable guild cannot cause unbounded REST traffic. Returns
+    /// whether an attempt was made.
+    pub async fn send_notices(&mut self, now_ms: u64) -> bool {
+        if self.halted {
+            return false;
+        }
+        let failures = &self.failures;
+        self.notices
+            .retain(|state| failures.contains(&state.failure));
+        let due = self.failures.iter().find(|failure| {
+            match self.notices.iter().find(|state| &state.failure == *failure) {
+                None => true,
+                Some(state) => {
+                    state.ledger.should_send()
+                        && match state.last_attempt_ms {
+                            None => true,
+                            Some(last) => now_ms.saturating_sub(last) >= NOTICE_REPEAT_INTERVAL_MS,
+                        }
+                }
+            }
+        });
+        let Some(failure) = due.cloned() else {
+            return false;
+        };
+        let settings = match self.store.logging_settings(self.live.guild_id).await {
+            Ok(settings) => settings,
+            Err(error) => {
+                // Unreadable settings: send nothing, look again next interval.
+                warn!(
+                    guild = self.live.guild_id,
+                    ?error,
+                    "voice notice settings unreadable"
+                );
+                self.note_attempt(&failure, now_ms, false);
+                return false;
+            }
+        };
+        if !should_log(settings.level, false) {
+            self.note_attempt(&failure, now_ms, false);
+            return false;
+        }
+        let text = notice_text(&failure, settings.level);
+        let delivered = self.deliver_notice(&settings, &text).await;
+        if !delivered {
+            warn!(
+                guild = self.live.guild_id,
+                "voice notice had no working destination"
+            );
+        }
+        self.note_attempt(&failure, now_ms, true);
+        true
+    }
+
+    fn note_attempt(&mut self, failure: &LifecycleFailure, now_ms: u64, counted: bool) {
+        let index = match self
+            .notices
+            .iter()
+            .position(|state| &state.failure == failure)
+        {
+            Some(index) => index,
+            None => {
+                self.notices.push(NoticeState {
+                    failure: failure.clone(),
+                    ledger: RepeatLedger::new(),
+                    last_attempt_ms: None,
+                });
+                self.notices.len() - 1
+            }
+        };
+        let state = &mut self.notices[index];
+        state.last_attempt_ms = Some(now_ms);
+        if counted {
+            state.ledger.record_send();
+        }
+    }
+
+    /// First working destination: the configured channel, then the guild
+    /// system channel, a DM to the guild owner, and finally a creator
+    /// channel's chat. A destination that fails is dropped and the next is
+    /// tried.
+    async fn deliver_notice(&self, settings: &LoggingSettings, text: &str) -> bool {
+        let mention = settings.mention_role_id.filter(|role| *role != 0);
+        if let Some(channel) = settings.channel_id.filter(|channel| *channel != 0) {
+            if self
+                .http
+                .send_notice(NoticeTarget::Channel(channel), text, mention)
+                .await
+                .is_ok()
+            {
+                return true;
+            }
+        }
+        let Some((system_channel_id, owner_id)) = self.live.notice_context() else {
+            return false;
+        };
+        let mut candidates = LoggingCandidates {
+            system_channel_id,
+            dm_user_id: Some(owner_id),
+            dm_reachable: true,
+            creator_channel_id: self.creators.keys().min().copied(),
+            setup_user_id: None,
+        };
+        while let Some(target) = resolve_log_target(candidates) {
+            let (notice_target, role) = match target {
+                LogTarget::SystemChannel { channel_id, .. } => {
+                    (NoticeTarget::Channel(channel_id), mention)
+                }
+                LogTarget::DirectMessage { user_id } => {
+                    (NoticeTarget::DirectMessage(user_id), None)
+                }
+                LogTarget::CreatorChat { channel_id } => {
+                    (NoticeTarget::Channel(channel_id), mention)
+                }
+            };
+            if self
+                .http
+                .send_notice(notice_target, text, role)
+                .await
+                .is_ok()
+            {
+                return true;
+            }
+            match target {
+                LogTarget::SystemChannel { .. } => candidates.system_channel_id = None,
+                LogTarget::DirectMessage { .. } => candidates.dm_reachable = false,
+                LogTarget::CreatorChat { .. } => candidates.creator_channel_id = None,
+            }
+        }
+        false
     }
 
     fn record(&mut self, failure: LifecycleFailure) {
@@ -1597,6 +1797,7 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
                 // live, but creator configuration/status commands must not sit
                 // behind a 64-write burst either.
                 worker.dispatch_one(now_ms).await;
+                worker.send_notices(now_ms).await;
             }
         }
     }
@@ -1704,6 +1905,7 @@ fn bot_access_from_cache(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> O
     Some(BotAccess {
         member_id: bot_id.get(),
         guild_owner_id: guild.owner_id().get(),
+        system_channel_id: guild.system_channel_id().map(|id| id.get()),
         member_roles,
         roles,
     })
@@ -2120,6 +2322,22 @@ pub struct WorkerStatus {
     pub health: Vec<String>,
     pub failures: Vec<String>,
     pub halted: bool,
+}
+
+/// Notice body for one failure. `brief` points at `/setup`; `full` adds the
+/// failure itself. Never `off`: callers gate on [`should_log`] first.
+fn notice_text(failure: &LifecycleFailure, level: DetailLevel) -> String {
+    let mut text = match level {
+        DetailLevel::Full => format!(
+            "Voice rooms need attention: {}. Run /setup to see all current problems.",
+            failure_line(failure)
+        ),
+        _ => "Voice rooms need attention. Run /setup to see the current problems.".to_owned(),
+    };
+    if text.chars().count() > NOTICE_MAX_CHARS {
+        text = text.chars().take(NOTICE_MAX_CHARS).collect();
+    }
+    text
 }
 
 fn failure_line(failure: &LifecycleFailure) -> String {

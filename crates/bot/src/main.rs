@@ -36,6 +36,9 @@ mod onboarding;
 #[cfg(test)]
 mod onboarding_tests;
 mod preflight;
+mod raid_runtime;
+#[cfg(test)]
+mod raid_runtime_tests;
 mod restore_drill;
 mod schedule_runtime;
 mod scheduled_jobs;
@@ -348,6 +351,29 @@ async fn main() {
                                 step_failure(FailureClass::MilestonesLoadFailed, error)
                             })?,
                     );
+                    // Join-burst watch is always on, as legacy raid watch was (TWO-56),
+                    // and independent of the anti-nuke flags. It shares the command
+                    // runtime's REST executor and runs behind the funnel's join row.
+                    let raid_executor = match runtime.as_ref() {
+                        Some(runtime) => runtime.executor(),
+                        None => two_bot_discord::ActionExecutor::with_proxy(
+                            token.clone(),
+                            std::env::var("DISCORD_API_BASE")
+                                .ok()
+                                .filter(|value| !value.is_empty()),
+                        )
+                        .map_err(|_| {
+                            step_failure(
+                                FailureClass::RaidExecutorFailed,
+                                sqlx::Error::InvalidArgument("raid REST executor failed".into()),
+                            )
+                        })?,
+                    };
+                    pipeline.set_join_observer(raid_runtime::start_from_env(
+                        pool.clone(),
+                        raid_executor,
+                        guild_id,
+                    ));
                     // Automod shares the command runtime's REST executor; it never
                     // builds a private client, router or timer.
                     let vars: std::collections::HashMap<String, String> =
