@@ -59,6 +59,8 @@ mod self_role_handlers;
 #[allow(dead_code)]
 mod self_role_runtime;
 mod shutdown;
+#[cfg(test)]
+mod smoke_error_contract_tests;
 mod ticket_runtime;
 #[cfg(test)]
 #[path = "../../core/tests/support/tracing_capture.rs"]
