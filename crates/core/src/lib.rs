@@ -60,6 +60,8 @@ pub mod internal_action_store;
 pub mod internal_actions;
 pub mod internal_settings;
 pub mod invites;
+#[cfg(feature = "db")]
+pub mod join_risk_store;
 pub mod leveling;
 #[cfg(feature = "db")]
 pub mod leveling_store;
