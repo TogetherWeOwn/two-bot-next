@@ -40,6 +40,7 @@ use two_bot_core::{
         ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, RoomPosition, VoiceGates,
         VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN, RENAME_MIN_INTERVAL_MS,
     },
+    voice_utilities::{invite_render, ping_render},
     CommandDefinition, Snowflake,
 };
 use two_bot_cutover::voice_rooms::PgRoomStore;
@@ -1650,6 +1651,8 @@ pub fn voice_command_set(gates: &VoiceGates) -> Vec<CommandDefinition> {
 pub enum VoiceCommand {
     Create { name: String },
     Setup,
+    Ping,
+    Invite,
 }
 
 /// Guild the interaction was invoked in. `PartialMember` carries no guild, so
@@ -1684,6 +1687,8 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
             Some(VoiceCommand::Create { name })
         }
         "setup" => Some(VoiceCommand::Setup),
+        "ping" => Some(VoiceCommand::Ping),
+        "invite" => Some(VoiceCommand::Invite),
         _ => None,
     }
 }
@@ -1695,6 +1700,25 @@ fn may_create(permissions: Option<Permissions>) -> bool {
     permissions.is_some_and(|permissions| {
         permissions.intersects(Permissions::ADMINISTRATOR | Permissions::MANAGE_CHANNELS)
     })
+}
+
+/// Discord snowflake epoch (2015-01-01T00:00:00Z) in Unix milliseconds.
+const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
+
+/// Milliseconds between Discord creating an interaction and `now_ms`.
+/// A host clock behind Discord's saturates to zero instead of underflowing.
+#[must_use]
+fn interaction_latency_ms(interaction_id: u64, now_ms: u64) -> u64 {
+    let created_ms = (interaction_id >> 22).saturating_add(DISCORD_EPOCH_MS);
+    now_ms.saturating_sub(created_ms)
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Ephemeral `ChannelMessageWithSource` reply shell.
@@ -1811,6 +1835,22 @@ where
     H: RoomWrites + Send + 'static,
     F: Future<Output = ()> + Send,
 {
+    handle_voice_interaction_with(runtime, interaction, None, reply).await
+}
+
+/// [`handle_voice_interaction`] with the guild's vanity invite code, which
+/// only the gateway cache knows. `None` renders the "no invite" notice.
+pub async fn handle_voice_interaction_with<S, H, F>(
+    runtime: &VoiceRuntime<S, H>,
+    interaction: &Interaction,
+    invite_code: Option<&str>,
+    reply: impl FnOnce(InteractionResponse) -> F + Send,
+) -> bool
+where
+    S: RoomPersistence + Send + 'static,
+    H: RoomWrites + Send + 'static,
+    F: Future<Output = ()> + Send,
+{
     let Some(command) = parse_voice_command(interaction) else {
         return false;
     };
@@ -1818,6 +1858,15 @@ where
         return false;
     };
     match command {
+        VoiceCommand::Ping => {
+            let latency = interaction_latency_ms(interaction.id.get(), unix_now_ms());
+            reply(ephemeral_response(&ping_render(latency))).await;
+            true
+        }
+        VoiceCommand::Invite => {
+            reply(ephemeral_response(&invite_render(invite_code))).await;
+            true
+        }
         VoiceCommand::Setup => {
             let (store, _) = runtime.make_pair();
             let (creators, store_error) = match store.creators(guild_id).await {
@@ -1868,6 +1917,17 @@ where
             true
         }
     }
+}
+
+/// The invoking guild's vanity invite code from the gateway cache, if any.
+fn vanity_code_from_cache(
+    cache: &DefaultInMemoryCache,
+    interaction: &Interaction,
+) -> Option<String> {
+    let guild_id = interaction.guild_id?;
+    cache
+        .guild(guild_id)
+        .and_then(|guild| guild.vanity_url_code().map(str::to_owned))
 }
 
 /// Reply seam for deterministic responder tests; errors are sanitized.
@@ -1937,13 +1997,18 @@ where
         Self { runtime, replies }
     }
 
-    async fn respond(runtime: &VoiceRuntime<S, H>, replies: &R, interaction: &Interaction) {
+    async fn respond_with(
+        runtime: &VoiceRuntime<S, H>,
+        replies: &R,
+        interaction: &Interaction,
+        invite_code: Option<&str>,
+    ) {
         if let Err(error) = replies.defer(interaction).await {
             warn!(interaction_id = interaction.id.get(), %error,
                 "voice acknowledgement failed; command not executed");
             return;
         }
-        handle_voice_interaction(runtime, interaction, |response| async move {
+        handle_voice_interaction_with(runtime, interaction, invite_code, |response| async move {
             if let Err(error) = replies.complete(interaction, response).await {
                 warn!(interaction_id = interaction.id.get(), %error,
                     "voice response completion failed; not retried");
@@ -1969,10 +2034,11 @@ where
                 return;
             }
             let interaction = created.0.clone();
+            let invite_code = vanity_code_from_cache(cache, &interaction);
             let runtime = Arc::clone(&self.runtime);
             let replies = Arc::clone(&self.replies);
             tokio::spawn(async move {
-                Self::respond(&runtime, &replies, &interaction).await;
+                Self::respond_with(&runtime, &replies, &interaction, invite_code.as_deref()).await;
             });
         }
     }

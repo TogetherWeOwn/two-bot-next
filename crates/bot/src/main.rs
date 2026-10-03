@@ -33,6 +33,7 @@ mod metrics_http;
 mod preflight;
 mod restore_drill;
 mod schedule_runtime;
+mod scheduled_jobs;
 mod server;
 // TOG-10292: boot composes the gated service below; fixture-only seams keep
 // the module-level allowance.
