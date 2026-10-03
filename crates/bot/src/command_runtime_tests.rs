@@ -1897,10 +1897,13 @@ async fn gateway_keeps_checkpointing_and_heartbeating_during_channel_rest_work()
     let store = GatewaySessionStore::new(db.pool.clone(), GUILD_S.to_owned(), 0);
     let runner = tokio::spawn(crate::gateway::run_shard(
         shard,
-        Arc::new(crate::gateway::build_pipeline(Vec::new())),
+        Arc::new(crate::gateway::build_pipeline(Vec::new(), None)),
         Arc::new(RwLock::new(crate::gateway::GatewayState::Armed)),
         store.clone(),
+        None,
         Some(Arc::clone(&runtime)),
+        None,
+        None,
         std::future::pending::<()>(),
     ));
     wait_for(|| mock.requests().len() == 1, "READY publication").await;

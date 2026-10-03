@@ -196,7 +196,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0120_channel_moderation.sql"),
         include_str!("../../cutover/migrations/0121_channel_claim_generation.sql"),
         include_str!("../../cutover/migrations/0122_channel_lockdown_generation.sql"),
-        include_str!("../../cutover/migrations/0123_channel_execution.sql"),
+        include_str!("../../cutover/migrations/0123_channel_execution_fence.sql"),
         include_str!("../../cutover/migrations/0124_channel_shared_timestamps.sql"),
         include_str!("../../cutover/migrations/0140_scheduled_messages.sql"),
         include_str!("../../cutover/migrations/0141_scheduled_messages_legacy_upgrade.sql"),
