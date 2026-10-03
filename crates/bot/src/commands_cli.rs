@@ -27,6 +27,7 @@ pub fn print_all_usage() {
     print!("{USAGE}");
     println!("{}", crate::preflight::USAGE);
     print!("{}", crate::erasure_cli::USAGE);
+    print!("{}", crate::moderation_cli::USAGE);
 }
 
 #[derive(Debug, PartialEq, Eq)]

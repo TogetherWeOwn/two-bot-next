@@ -20,7 +20,7 @@ restores, token rotation, and live-guild changes need their separate authorizati
    returning success alone does not prove recovery.
 
 All npm commands below run **from the repository root** and use the pinned
-Wrangler 4.143.1 through `wrangler/package.json`. Use only the already-authorized
+Wrangler 4.147.0 through `wrangler/package.json`. Use only the already-authorized
 Cloudflare connection. An authentication/permission failure is a stop: report
 it, do not try another credential, elevate access, or use a personal token.
 Examples target `staging`; do not substitute `production` without its own gate.
@@ -92,7 +92,7 @@ invocation, unsampled; production traces are off (`wrangler/wrangler.toml`).
 
 `logs` is **Worker/DO tail**, not Rust stdout. Stop it when the bounded incident
 observation is complete. For Rust stdout/stderr, use the affected container's
-logs in the Cloudflare dashboard. Wrangler 4.143.1 has no `containers logs`
+logs in the Cloudflare dashboard. Wrangler 4.147.0 has no `containers logs`
 subcommand; do not invent one. Container inspection may list account-wide
 resources: match the affected environment/application before taking any action.
 

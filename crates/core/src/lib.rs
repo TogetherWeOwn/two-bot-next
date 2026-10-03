@@ -39,6 +39,7 @@ pub mod containment_store;
 pub mod database_roles;
 pub mod database_tls;
 pub mod database_url;
+pub mod disable_preflight;
 pub mod events;
 pub mod evidence;
 pub mod expected_joins;
