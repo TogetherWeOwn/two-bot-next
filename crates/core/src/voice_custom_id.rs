@@ -185,11 +185,15 @@ pub fn parse_voice_custom_id(custom_id: &str) -> Option<VoiceAction> {
     Some(action)
 }
 
-/// Diff content hash: exactly [`IMPORT_HASH_CHARS`] hex chars, as produced
-/// by the import preview. Anything else is untrusted input, not a button
-/// this runtime bound.
+/// Diff content hash: exactly [`IMPORT_HASH_CHARS`] lowercase hex chars, as
+/// produced by the import preview. Anything else is untrusted input, not a
+/// button this runtime bound.
 fn parse_hash(value: &str) -> Option<String> {
-    if value.len() == IMPORT_HASH_CHARS && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if value.len() == IMPORT_HASH_CHARS
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         Some(value.to_owned())
     } else {
         None

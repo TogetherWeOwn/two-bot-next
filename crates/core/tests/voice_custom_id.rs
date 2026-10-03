@@ -218,7 +218,8 @@ fn golden_import_shapes_bind_member_and_hash() {
 
 #[test]
 fn rejects_malformed_import_hashes() {
-    // Wrong segment count, zero member, short/long/non-hex hashes.
+    // Wrong segment count, zero member, short/long/non-hex hashes. Hashes
+    // are lowercase hex; uppercase is rejected.
     for id in [
         "two:voice:import-confirm:300",
         "two:voice:import-confirm:300:0123456789abcdef:extra",
@@ -227,6 +228,7 @@ fn rejects_malformed_import_hashes() {
         "two:voice:import-confirm:300:0123456789abcde",
         "two:voice:import-confirm:300:0123456789abcdef0",
         "two:voice:import-confirm:300:0123456789abcdeg",
+        "two:voice:import-confirm:300:0123456789ABCDEF",
         "two:voice:import-confirm:300:----------------",
         "two:voice:import-confirm:300:",
         "two:voice:import-cancel:300:0123456789abcde ",

@@ -199,7 +199,7 @@ pub fn diff_content_hash(current: &VoiceConfiguration, candidate: &VoiceConfigur
     hasher.update(serde_json::to_vec(current).unwrap_or_default());
     hasher.update([0x00]);
     hasher.update(serde_json::to_vec(candidate).unwrap_or_default());
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = hex::encode(hasher.finalize());
     digest[..DIFF_HASH_CHARS].to_owned()
 }
 

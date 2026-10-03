@@ -2369,7 +2369,11 @@ pub fn plan_import_preview(
             message: format!("Could not import that file: {error} Nothing was changed."),
         };
     }
-    let diff = diff_configuration(current, &remaining, inventory);
+    // Diff the full upload, not the pruned remainder: `diff_configuration`
+    // re-skips unknown channels itself, so diffing `remaining` would always
+    // report an empty skipped list and an unknown-channels-only file would
+    // read as `No changes`. The pruned `remaining` stays the candidate.
+    let diff = diff_configuration(current, &incoming, inventory);
     let text = render_preview(&diff, MAX_IMPORT_PREVIEW_LINES);
     if diff.change_count() == 0 {
         return ImportDecision::Notice { text };
@@ -3407,6 +3411,13 @@ where
         reply(denial).await;
         return true;
     }
+    // Cancel needs no inventory: dropping a pending preview must work even
+    // when the guild cache is briefly unavailable.
+    if !confirm {
+        runtime.cancel_pending_import(guild_id, member_id, &hash);
+        reply(ephemeral_response("Import cancelled. Nothing was changed.")).await;
+        return true;
+    }
     let Some(inventory) = inventory else {
         reply(ephemeral_response(
             "Voice configuration is unavailable right now. Try again shortly.",
@@ -3414,11 +3425,6 @@ where
         .await;
         return true;
     };
-    if !confirm {
-        runtime.cancel_pending_import(guild_id, member_id, &hash);
-        reply(ephemeral_response("Import cancelled. Nothing was changed.")).await;
-        return true;
-    }
     let Some(candidate) = runtime.take_pending_import(guild_id, member_id, &hash) else {
         reply(ephemeral_response(
             "That preview expired. Nothing was changed; upload the file again for a fresh preview.",

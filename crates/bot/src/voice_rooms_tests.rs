@@ -2961,6 +2961,59 @@ async fn import_skips_unknown_channels_and_confirms_remainder() {
 }
 
 #[tokio::test]
+async fn import_unknown_channels_only_reports_without_confirm() {
+    let trace = Trace::default();
+    let mut incoming = full_config();
+    incoming.creators.push(config_codec::CreatorConfiguration {
+        channel_id: "999".to_owned(),
+        name_template: "{game}".to_owned(),
+        status_template: None,
+        default_limit: 0,
+        always_private: false,
+        text_channels: false,
+        position: config_codec::RoomPosition::Above,
+        first_number: 1,
+        group_by_category: false,
+        permission_source: config_codec::PermissionSource::Creator {},
+    });
+    let bytes = serde_json::to_vec(&incoming).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), full_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let response = response.expect("notice");
+    let text = response_text(&response);
+    assert!(text.contains("unknown channel"), "{text}");
+    assert!(text.contains("999"), "{text}");
+    assert!(response
+        .data
+        .as_ref()
+        .and_then(|data| data.components.as_ref())
+        .is_none());
+    assert_eq!(*shared.lock().unwrap(), full_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_cancel_needs_no_inventory() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let preview = preview.expect("preview");
+    let (_, cancel_id) = preview_buttons(&preview);
+
+    let cancel = component_interaction(&cancel_id, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &cancel, None).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("cancelled")).contains("cancelled"));
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
 async fn import_cancel_writes_nothing_and_consumes_the_preview() {
     let trace = Trace::default();
     let bytes = serde_json::to_vec(&full_config()).unwrap();
