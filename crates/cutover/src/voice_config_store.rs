@@ -29,12 +29,12 @@
 
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
+use two_bot_core::voice_assistant_request::DEFAULT_NO_GAME_LABEL;
 use two_bot_core::voice_config::{
     ChannelTemplates, CommandRoles, CreatorConfiguration, GameAlias, GuildSettings, LogDetail,
     LoggingConfiguration, PermissionSource, RandomList, RoomPosition, VoiceConfiguration,
     VOICE_CONFIG_VERSION,
 };
-use two_bot_core::voice_assistant_request::DEFAULT_NO_GAME_LABEL;
 use two_bot_core::voice_text_channel::DEFAULT_TEXT_CHANNEL_NAME;
 
 /// Defaults reported for a guild that has never been configured.
@@ -120,38 +120,37 @@ impl PgVoiceConfigStore {
                 }),
             }
         }
-        let logging = match sqlx::query(
-            "SELECT channel_id, detail FROM voice_logging WHERE guild_id = $1",
-        )
-        .bind(&guild)
-        .fetch_optional(&mut *tx)
-        .await?
-        {
-            None => None,
-            Some(row) => Some(LoggingConfiguration {
-                channel_id: row.try_get("channel_id")?,
-                detail: match row.try_get::<&str, _>("detail")? {
-                    "errors" => LogDetail::Errors,
-                    "lifecycle" => LogDetail::Lifecycle,
-                    "verbose" => LogDetail::Verbose,
-                    _ => return Err(invalid_argument("unknown logging detail")),
-                },
-                mention_member_ids: sqlx::query_scalar(
-                    "SELECT member_id FROM voice_logging_mention_members
+        let logging =
+            match sqlx::query("SELECT channel_id, detail FROM voice_logging WHERE guild_id = $1")
+                .bind(&guild)
+                .fetch_optional(&mut *tx)
+                .await?
+            {
+                None => None,
+                Some(row) => Some(LoggingConfiguration {
+                    channel_id: row.try_get("channel_id")?,
+                    detail: match row.try_get::<&str, _>("detail")? {
+                        "errors" => LogDetail::Errors,
+                        "lifecycle" => LogDetail::Lifecycle,
+                        "verbose" => LogDetail::Verbose,
+                        _ => return Err(invalid_argument("unknown logging detail")),
+                    },
+                    mention_member_ids: sqlx::query_scalar(
+                        "SELECT member_id FROM voice_logging_mention_members
                      WHERE guild_id = $1 ORDER BY length(member_id), member_id",
-                )
-                .bind(&guild)
-                .fetch_all(&mut *tx)
-                .await?,
-                mention_role_ids: sqlx::query_scalar(
-                    "SELECT role_id FROM voice_logging_mention_roles
+                    )
+                    .bind(&guild)
+                    .fetch_all(&mut *tx)
+                    .await?,
+                    mention_role_ids: sqlx::query_scalar(
+                        "SELECT role_id FROM voice_logging_mention_roles
                      WHERE guild_id = $1 ORDER BY length(role_id), role_id",
-                )
-                .bind(&guild)
-                .fetch_all(&mut *tx)
-                .await?,
-            }),
-        };
+                    )
+                    .bind(&guild)
+                    .fetch_all(&mut *tx)
+                    .await?,
+                }),
+            };
         let mut command_roles: Vec<CommandRoles> = Vec::new();
         // A command with no roles is a row in `voice_command_roles` alone.
         for row in sqlx::query(
@@ -186,8 +185,7 @@ impl PgVoiceConfigStore {
                 unique_names: row.try_get("unique_names")?,
                 no_game_label: row.try_get("no_game_label")?,
                 force_single_game: row.try_get("force_single_game")?,
-                count_members_without_activity: row
-                    .try_get("count_members_without_activity")?,
+                count_members_without_activity: row.try_get("count_members_without_activity")?,
                 time_zone: row.try_get("time_zone")?,
                 text_channel_name: row.try_get("text_channel_name")?,
                 text_viewer_role_id: row.try_get("text_viewer_role_id")?,
@@ -235,7 +233,9 @@ impl PgVoiceConfigStore {
             return Err(invalid_argument("unsupported voice configuration version"));
         }
         if config.guild_id != guild {
-            return Err(invalid_argument("configuration belongs to a different guild"));
+            return Err(invalid_argument(
+                "configuration belongs to a different guild",
+            ));
         }
         let mut tx = self.pool.begin().await?;
         // One writer per guild: concurrent applies would otherwise interleave
@@ -473,8 +473,20 @@ async fn write_settings(
     .bind(settings.count_members_without_activity)
     .bind(&settings.time_zone)
     .bind(&settings.text_channel_name)
-    .bind(settings.text_viewer_role_id.as_deref().map(snowflake).transpose()?)
-    .bind(settings.command_role_id.as_deref().map(snowflake).transpose()?)
+    .bind(
+        settings
+            .text_viewer_role_id
+            .as_deref()
+            .map(snowflake)
+            .transpose()?,
+    )
+    .bind(
+        settings
+            .command_role_id
+            .as_deref()
+            .map(snowflake)
+            .transpose()?,
+    )
     .execute(&mut **tx)
     .await?;
     for restriction in &settings.command_roles {
