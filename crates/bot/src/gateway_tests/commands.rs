@@ -220,12 +220,11 @@ async fn wait_audit_ok(pool: &PgPool, expected: i64) {
 async fn wait_audit_result(pool: &PgPool, id: &str) -> (String, String) {
     tokio::time::timeout(BOUND, async {
         loop {
-            if let Ok(fact) = sqlx::query_as(
-                "SELECT outcome, reason FROM automation_audit_log WHERE id = $1",
-            )
-            .bind(id)
-            .fetch_one(pool)
-            .await
+            if let Ok(fact) =
+                sqlx::query_as("SELECT outcome, reason FROM automation_audit_log WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(pool)
+                    .await
             {
                 return fact;
             }
@@ -641,7 +640,10 @@ async fn ready_registry_failure_or_application_mismatch_warns_and_remains_retrya
         if mismatch {
             // The context check fails before any REST write.
             assert_eq!(rest.requests().len(), 2);
-            assert!(rest.requests().iter().all(|request| request.method != "PUT"));
+            assert!(rest
+                .requests()
+                .iter()
+                .all(|request| request.method != "PUT"));
             let error = probe
                 .publish_registry_checked(Some(7777))
                 .await
