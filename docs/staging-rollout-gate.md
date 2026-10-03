@@ -1,13 +1,36 @@
 # Intended staging rollout acceptance
 
-When enabled, `deploy-staging.yml` runs `scripts/staging_rollout.py` before and
-after a successful Wrangler deployment. The `deploy` job is currently suspended
-(`if: ${{ false }}`); the chain below is the intended gate on re-activation
-(re-enable tracked on [TOG-12852](/TOG/issues/TOG-12852)). Ownership-control
-`preflight` (before prepare) and `deployment-takeover` (after deploy) steps
+`deploy-staging.yml` runs `scripts/staging_rollout.py` in three modes around a
+successful Wrangler deployment: `prepare` (before), `receipt` (after the deploy,
+before ownership moves) and `verify` (after ownership moves). The workflow runs
+on every push to `main` and on manual dispatch
+([TOG-12856](/TOG/issues/TOG-12856)). The `staging` ownership-control steps
+`preflight` (before prepare) and `deployment-takeover` (after the receipt gate)
 flank the gate but live outside `staging_rollout.py`. The gate does not
 accept a health response from an old singleton. This is a **staging-only** gate,
 not production authorization or a migration tool.
+
+## Step order and why
+
+1. `preflight` -> `prepare` -> `wrangler deploy` -> `receipt` ->
+   `deployment-takeover` -> `verify`.
+2. Once `wrangler deploy` succeeds the new Worker version is already at 100%
+   traffic. Ownership transfer does not choose what serves; it lets that version's
+   singleton run the bot.
+3. `receipt` (steps 3-4 below) needs only Wrangler's output file, local Docker and
+   the Worker versions API, so it runs **before** ownership moves. A malformed,
+   stale or wrong-environment receipt therefore never hands ownership to an
+   unverified version ([TOG-12939](/TOG/issues/TOG-12939): the first real run
+   failed here, after takeover, because the receipt gate had never seen real
+   Wrangler output).
+4. `verify` (steps 5-7) needs an owning singleton: a parked singleton answers
+   `/readyz` 503 by design, so rollout convergence and runtime readiness cannot be
+   checked before takeover. `verify` repeats the receipt checks first.
+5. If `verify` goes red, staging stays owned by the already-serving version and the
+   job is red on `main`. There is deliberately **no automatic fence**: a fence would
+   park every later push deploy until a manual `release_fence` dispatch. Re-run the
+   deploy (or dispatch it) after fixing the cause; production deploys are separate,
+   manual and cutover-owned.
 
 ## Provenance chain
 
@@ -26,9 +49,16 @@ not production authorization or a migration tool.
    identity. Prepare also requires the `CF_VERSION_METADATA` version-metadata
    binding in the staging config and sets `rollout_kind: full_auto`.
 3. Read the **fresh** `WRANGLER_OUTPUT_FILE_PATH` NDJSON only after Wrangler exits
-   successfully. Require one pinned 4.143.1 session and one staging deploy record
-   with the expected Worker name, fresh timestamp and concrete Worker version.
-   Raw session arguments/log paths are never published.
+   successfully. Wrangler writes one `wrangler-session` record per invocation and
+   `wrangler-action` first runs `wrangler --version`, so a healthy deploy has two:
+   the version probe and the `deploy` session. Require every session to be the
+   pinned 4.143.1 (record `version` 1), exactly one `deploy` session and at most
+   one `--version` probe; any other session fails closed. Require exactly one
+   staging deploy record with the expected Worker name, fresh timestamp and
+   concrete Worker version. Raw session arguments/log paths are never published.
+   A rejected receipt prints one allowlisted line (record-type counts plus each
+   session's `version`, `wrangler_version` and invocation class) before the fixed
+   failure code.
 4. Resolve that exact Worker version's `TWO_BOT`/`TwoBotContainer` namespace through
    the versions API and match it to the application. Find the unique local
    Cloudflare registry tag for the expected application and Worker UUID prefix;

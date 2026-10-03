@@ -82,12 +82,26 @@ def date(offset=0):
     return datetime.fromtimestamp(STARTED + offset, timezone.utc).isoformat()
 
 
+def session(args, version="4.143.1"):
+    # Shape documented by Cloudflare and produced by wrangler's yargs `.check()` for
+    # EVERY invocation. The sentinel rides in `log_file_path` and the deploy `--config`
+    # path so any accidental print or persistence of those fields is caught.
+    return {"type": "wrangler-session", "version": 1, "wrangler_version": version,
+            "command_line_args": args,
+            "log_file_path": f"/home/runner/.config/.wrangler/logs/{SENTINEL}.log",
+            "timestamp": date()}
+
+
 def receipts():
+    # Real order from deploy-staging run 37085860812 (TOG-12939): wrangler-action probes
+    # `wrangler --version` first, then runs `wrangler deploy`; each writes a session.
     return [
-        {"type": "wrangler-session", "version": 1, "wrangler_version": "4.143.1"},
+        session(["--version"]),
+        session(["deploy", "--config", f"/tmp/{SENTINEL}/staging-deploy.json", "--env", "staging"]),
         {
             "type": "deploy", "version": 1,
-            "worker_name": "two-bot-next-staging",
+            "worker_name": "two-bot-next-staging", "worker_tag": "tag",
+            "targets": [URL],
             "wrangler_environment": "staging", "worker_name_overridden": False,
             "timestamp": date(), "version_id": VERSION,
         },
@@ -239,7 +253,7 @@ class DeployReceiptTests(OfflineTestCase):
 
     def test_stale_deploy(self):
         records = receipts()
-        records[1]["timestamp"] = date(-1)
+        records[2]["timestamp"] = date(-1)
         self.assert_gate("stale_deploy_receipt", rollout.deploy_version, records, STARTED)
 
     def test_wrong_environment_worker_override_and_schema(self):
@@ -249,48 +263,102 @@ class DeployReceiptTests(OfflineTestCase):
                            ("worker_name_overridden", None), ("version", 2)]:
             with self.subTest(key=key, value=value):
                 records = receipts()
-                records[1][key] = value
+                records[2][key] = value
                 self.assert_gate("wrong_deploy_receipt", rollout.deploy_version, records, STARTED)
 
     def test_missing_or_ambiguous_deploy(self):
-        for records in [receipts()[:1], receipts() + [receipts()[1]]]:
+        for records in [receipts()[:2], receipts() + [receipts()[2]]]:
             with self.subTest(count=len(records)):
                 self.assert_gate("deploy_receipt_missing_or_ambiguous",
                                  rollout.deploy_version, records, STARTED)
 
-    def test_missing_ambiguous_or_wrong_wrangler_session(self):
-        wrong = receipts()
-        wrong[0]["wrangler_version"] = "4.142.0"
-        schema = receipts()
-        schema[0]["version"] = 2
-        for records in [receipts()[1:], receipts() + [receipts()[0]], wrong, schema]:
-            with self.subTest(records=records):
+    def test_real_wrangler_action_sequence_is_version_probe_then_deploy_session(self):
+        # TOG-12939: run 37085860812 wrote TWO sessions (probe + deploy) and the old
+        # `len(sessions) == 1` gate rejected a healthy deployment.
+        records = receipts()
+        self.assertEqual([row["type"] for row in records], ["wrangler-session", "wrangler-session", "deploy"])
+        self.assertEqual(rollout.deploy_version(records, STARTED), VERSION)
+
+    def test_deploy_session_without_version_probe_is_accepted(self):
+        self.assertEqual(rollout.deploy_version(receipts()[1:], STARTED), VERSION)
+        self.assertEqual(rollout.deploy_version([receipts()[1], receipts()[2], session(["-v"])], STARTED), VERSION)
+
+    def test_wrangler_sessions_must_be_one_deploy_plus_at_most_one_probe(self):
+        deploy = receipts()[1]
+        probe = receipts()[0]
+        record = receipts()[2]
+        cases = {
+            "no_session": [record],
+            "probe_only": [probe, record],
+            "two_deploy_sessions": [probe, deploy, deploy, record],
+            "two_probes": [probe, probe, deploy, record],
+            "extra_other_command": [probe, deploy, session(["secret", "put", "X"]), record],
+            "version_with_extra_flag": [session(["--version", "--help"]), deploy, record],
+            "probe_wrong_wrangler": [session(["--version"], "4.142.0"), deploy, record],
+            "deploy_wrong_wrangler": [probe, session(["deploy"], "4.142.0"), record],
+            "deploy_unversioned_wrangler": [probe, session(["deploy"], None), record],
+        }
+        for name, records in cases.items():
+            with self.subTest(name=name):
                 self.assert_gate("wrong_wrangler_receipt", rollout.deploy_version, records, STARTED)
+
+    def test_wrangler_session_schema_and_args_shape_fail_closed(self):
+        for key, value in [("version", 2), ("version", None), ("command_line_args", None),
+                           ("command_line_args", "deploy"), ("command_line_args", ["deploy", 1]),
+                           ("command_line_args", []), ("command_line_args", ["undeploy"])]:
+            with self.subTest(key=key, value=value):
+                records = receipts()
+                records[1][key] = value
+                self.assert_gate("wrong_wrangler_receipt", rollout.deploy_version, records, STARTED)
+        missing = receipts()
+        del missing[1]["command_line_args"]
+        self.assert_gate("wrong_wrangler_receipt", rollout.deploy_version, missing, STARTED)
+
+    def test_failure_summary_is_allowlisted_counts_and_versions_only(self):
+        records = receipts() + [{"type": "build", "message": SENTINEL}]
+        records[0]["wrangler_version"] = SENTINEL
+        records[1]["version"] = True
+        summary = rollout.receipt_summary(records)
+        self.assertEqual(json.loads(summary.removeprefix("wrangler receipt shape: ")), {
+            "records": {"wrangler-session": 2, "deploy": 1, "other": 1},
+            "sessions": [{"version": 1, "wrangler_version": "?", "invocation": "version-probe"},
+                         {"version": "?", "wrangler_version": "4.143.1", "invocation": "deploy"}],
+        })
+        self.assertNotIn(SENTINEL, summary)
+        self.assertNotIn("/home/runner", summary)
+        self.assertNotIn("staging-deploy", summary)
+
+    def test_failure_summary_bounds_sessions_and_marks_unrecognized(self):
+        records = [session(["secret", "put", "X"]) for _ in range(40)]
+        summary = json.loads(rollout.receipt_summary(records).removeprefix("wrangler receipt shape: "))
+        self.assertEqual(summary["records"]["wrangler-session"], 40)
+        self.assertEqual(len(summary["sessions"]), 10)
+        self.assertEqual({row["invocation"] for row in summary["sessions"]}, {"unrecognized"})
 
     def test_missing_deploy_fields_fail_closed(self):
         for key in ["worker_name", "wrangler_environment", "worker_name_overridden", "version"]:
             with self.subTest(key=key):
                 records = receipts()
-                del records[1][key]
+                del records[2][key]
                 self.assert_gate("wrong_deploy_receipt", rollout.deploy_version, records, STARTED)
 
     def test_invalid_missing_or_naive_timestamp(self):
         for value in [None, "not-a-date", "2027-01-15T08:00:00", 1]:
             with self.subTest(value=value):
                 records = receipts()
-                records[1]["timestamp"] = value
+                records[2]["timestamp"] = value
                 self.assert_gate("invalid_timestamp", rollout.deploy_version, records, STARTED)
 
     def test_worker_version_must_be_uuid_even_though_other_ids_are_opaque(self):
         for version in [NAMESPACE, APPLICATION_ID, "12345678", VERSION.upper()]:
             with self.subTest(version=version):
                 records = receipts()
-                records[1]["version_id"] = version
+                records[2]["version_id"] = version
                 self.assert_gate("invalid_worker_version", rollout.deploy_version, records, STARTED)
 
     def test_unsafe_deploy_identity(self):
         records = receipts()
-        records[1]["version_id"] = "../" + SENTINEL
+        records[2]["version_id"] = "../" + SENTINEL
         self.assert_gate("invalid_identity", rollout.deploy_version, records, STARTED)
 
 
@@ -685,6 +753,20 @@ class DeploymentWiringTests(unittest.TestCase):
         deploy = [step for step in steps if "command: deploy --config" in step]
         verify = [step for step in steps if "python3 ../scripts/staging_rollout.py verify" in step]
         self.assertEqual((len(prepare), len(deploy), len(verify)), (1, 1, 1))
+        # TOG-12939 ordering: the receipt gate runs after the deploy and BEFORE ownership
+        # transfers; the runtime gate (needs an owning singleton) runs after it.
+        receipt = [step for step in steps if "python3 ../scripts/staging_rollout.py receipt" in step]
+        takeover = [step for step in steps if "ownership-control.mjs deployment-takeover" in step]
+        self.assertEqual((len(receipt), len(takeover)), (1, 1))
+        self.assertLess(steps.index(deploy[0]), steps.index(receipt[0]))
+        self.assertLess(steps.index(receipt[0]), steps.index(takeover[0]))
+        self.assertLess(steps.index(takeover[0]), steps.index(verify[0]))
+        self.assertNotRegex(receipt[0], r"(?m)^\s*(?:if|continue-on-error):")
+        self.assertNotIn("|| true", receipt[0])
+        self.assertIn("set -euo pipefail", receipt[0])
+        self.assertIn('--receipt "$ROLLOUT_DIR/baseline.json"', receipt[0])
+        self.assertIn('--output "$WRANGLER_OUTPUT_FILE_PATH"', receipt[0])
+        self.assertNotIn("--evidence", receipt[0])
         # GitHub rejects the whole workflow if job-level env uses the runner context.
         job_header = source.split("    steps:\n", 1)[0]
         self.assertNotIn("runner.", job_header)
@@ -762,7 +844,9 @@ class OrchestrationTests(OfflineTestCase):
         self.assertNotIn(SENTINEL, self.stdout.getvalue())
         self.assertNotIn(SENTINEL, self.stderr.getvalue())
         for path in self.root.rglob("*"):
-            if path.is_file():
+            # The Wrangler NDJSON is the gate's INPUT; its sessions legitimately carry
+            # the sentinel in log_file_path and the deploy --config path.
+            if path.is_file() and path != Path(self.args.output):
                 self.assertNotIn(SENTINEL, path.read_text(), str(path))
 
     def assert_no_evidence(self):
@@ -872,15 +956,15 @@ class OrchestrationTests(OfflineTestCase):
     def test_verify_ndjson_rejections_happen_before_image_or_api_probes(self):
         self.prepare_baseline()
         stale = receipts()
-        stale[1]["timestamp"] = date(-1)
+        stale[2]["timestamp"] = date(-1)
         wrong_env = receipts()
-        wrong_env[1]["wrangler_environment"] = "production"
+        wrong_env[2]["wrangler_environment"] = "production"
         wrong_wrangler = receipts()
-        wrong_wrangler[0]["wrangler_version"] = "4.142.0"
+        wrong_wrangler[1]["wrangler_version"] = "4.142.0"
         for records, code in [(stale, "stale_deploy_receipt"),
                               (wrong_env, "wrong_deploy_receipt"),
-                              (receipts()[:1], "deploy_receipt_missing_or_ambiguous"),
-                              (receipts() + [receipts()[1]], "deploy_receipt_missing_or_ambiguous"),
+                              (receipts()[:2], "deploy_receipt_missing_or_ambiguous"),
+                              (receipts() + [receipts()[2]], "deploy_receipt_missing_or_ambiguous"),
                               (wrong_wrangler, "wrong_wrangler_receipt"),
                               ([None], "invalid_api_schema")]:
             with self.subTest(code=code):
@@ -890,6 +974,84 @@ class OrchestrationTests(OfflineTestCase):
                 self.assertEqual(client.calls, [])
                 self.assert_no_evidence()
         self.docker.assert_not_called()
+
+    def test_receipt_mode_checks_only_deploy_provenance_and_never_touches_rollout_or_runtime(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        rollout.receipt(self.args, client)
+        self.assertEqual(client.calls, [("api", NAMESPACE_PATH)])
+        self.docker.assert_called_once_with(VERSION, REVISION, BUILD_ID)
+        self.assertIn("ownership may transfer", self.stdout.getvalue())
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_receipt_mode_rejects_every_bad_receipt_before_ownership_would_transfer(self):
+        self.prepare_baseline()
+        stale = receipts()
+        stale[2]["timestamp"] = date(-1)
+        two_deploy_sessions = receipts()
+        two_deploy_sessions.insert(1, receipts()[1])
+        for records, code in [(stale, "stale_deploy_receipt"),
+                              (two_deploy_sessions, "wrong_wrangler_receipt"),
+                              (receipts()[:2], "deploy_receipt_missing_or_ambiguous")]:
+            with self.subTest(code=code):
+                self.write_deploy_output(records)
+                client = verify_client()
+                self.assert_gate(code, rollout.receipt, self.args, client)
+                self.assertEqual(client.calls, [])
+        self.docker.assert_not_called()
+
+    def test_receipt_mode_checks_worker_namespace_and_image(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        changed = bindings()
+        changed["resources"]["bindings"][0]["namespace_id"] = "f" * 64
+        client.api_routes[NAMESPACE_PATH] = [changed]
+        self.assert_gate("worker_namespace_changed", rollout.receipt, self.args, client)
+        self.docker.side_effect = rollout.GateError("image_build_mismatch")
+        self.assert_gate("image_build_mismatch", rollout.receipt, self.args, verify_client())
+
+    def test_main_receipt_mode_runs_without_a_verify_deadline_or_evidence(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        argv = ["staging_rollout.py", "receipt", "--receipt", self.args.receipt,
+                "--output", self.args.output]
+        with patch.object(sys, "argv", argv), \
+                patch.object(rollout, "Client", return_value=client) as made:
+            self.assertEqual(rollout.main(), 0)
+        self.assertIsNone(made.call_args.args[2])
+        self.assert_no_evidence()
+
+    def test_failed_receipt_prints_only_the_allowlisted_shape_in_both_modes(self):
+        # TOG-12939: the first real run only said `wrong_wrangler_receipt`.
+        self.prepare_baseline()
+        records = receipts()
+        records.insert(1, receipts()[1])  # two `deploy` sessions
+        self.write_deploy_output(records)
+        for mode, extra in [("receipt", []), ("verify", ["--evidence", self.args.evidence])]:
+            with self.subTest(mode=mode):
+                self.stdout.truncate(0)
+                self.stdout.seek(0)
+                argv = ["staging_rollout.py", mode, "--receipt", self.args.receipt,
+                        "--output", self.args.output, *extra]
+                with patch.object(sys, "argv", argv), \
+                        patch.object(rollout, "Client", return_value=verify_client()):
+                    self.assertEqual(rollout.main(), 1)
+                lines = self.stdout.getvalue().splitlines()
+                self.assertEqual(lines[-1], "staging rollout gate failed: wrong_wrangler_receipt")
+                shape = json.loads(lines[-2].removeprefix("wrangler receipt shape: "))
+                self.assertEqual(shape["records"], {"wrangler-session": 3, "deploy": 1, "other": 0})
+                self.assertEqual([row["invocation"] for row in shape["sessions"]],
+                                 ["version-probe", "deploy", "deploy"])
+                self.assertEqual({row["wrangler_version"] for row in shape["sessions"]}, {"4.143.1"})
+                joined = "\n".join(lines)
+                for forbidden in (SENTINEL, "command_line_args", "log_file_path", "/home/runner", "--env"):
+                    self.assertNotIn(forbidden, joined)
+                self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
 
     def test_no_new_rollout_times_out_without_real_waits_or_evidence(self):
         self.prepare_baseline()

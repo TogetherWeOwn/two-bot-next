@@ -83,6 +83,26 @@ jobs:
           environment: staging
           wranglerVersion: "4.143.1"
           command: deploy --config ${{ env.ROLLOUT_DIR }}/staging-deploy.json --env staging
+      # TOG-12939 ordering. The new Worker version is already at 100% traffic once
+      # `wrangler deploy` succeeds, so ownership transfer cannot choose what serves.
+      # Runtime/rollout readiness needs the new singleton to OWN the bot (a parked
+      # process answers /readyz 503 by design), so that gate must follow takeover.
+      # The deploy receipt (pinned Wrangler session, staging deploy record, image
+      # labels, Worker namespace) needs none of that and is checked FIRST, so a bad
+      # receipt never hands ownership to an unverified version. If the post-takeover
+      # gate goes red, staging stays owned by the already-serving version and the job
+      # is red on main; staging is not fenced automatically because a fence would
+      # park every later push deploy until a manual release_fence dispatch.
+      - name: Verify Wrangler deploy receipt before ownership transfer
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          STAGING_URL: ${{ vars.STAGING_WORKER_URL }}
+        run: |
+          set -euo pipefail
+          python3 ../scripts/staging_rollout.py receipt \
+            --receipt "$ROLLOUT_DIR/baseline.json" \
+            --output "$WRANGLER_OUTPUT_FILE_PATH"
       - name: Transfer staging ownership to the deployed version
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}

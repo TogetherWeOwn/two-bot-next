@@ -136,10 +136,48 @@ def rollouts(client, app_id):
     return rows
 
 
+def invocation(session):
+    """Classify a `wrangler-session` record by its CLI args; the args are never printed."""
+    args = session.get("command_line_args")
+    if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+        return None
+    if args[:1] == ["deploy"]:
+        return "deploy"
+    return "version-probe" if args in (["--version"], ["-v"]) else None
+
+
+def short(value):
+    # Only small integers and dotted numeric versions are ever echoed back.
+    if type(value) is int and 0 <= value < 1000:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,3}(\.[0-9]{1,3}){2}", value):
+        return value
+    return "?"
+
+
+def receipt_summary(records):
+    """Allowlisted shape of a rejected receipt: type counts, pinned versions, invocation class."""
+    counts = {kind: sum(1 for row in records if row.get("type") == kind)
+              for kind in ("wrangler-session", "deploy")}
+    counts["other"] = len(records) - sum(counts.values())
+    sessions = [{"version": short(row.get("version")), "wrangler_version": short(row.get("wrangler_version")),
+                 "invocation": invocation(row) or "unrecognized"}
+                for row in records if row.get("type") == "wrangler-session"]
+    return "wrangler receipt shape: " + json.dumps({"records": counts, "sessions": sessions[:10]},
+                                                    sort_keys=True)
+
+
 def deploy_version(records, started):
+    # Wrangler writes a session record for EVERY invocation, and wrangler-action
+    # probes `wrangler --version` before it deploys (TOG-12939). Accept that one
+    # probe, but only next to exactly one `deploy` session, and require every
+    # session to be the pinned Wrangler.
     sessions = [row for row in records if row.get("type") == "wrangler-session"]
-    require(len(sessions) == 1 and sessions[0].get("version") == 1
-            and sessions[0].get("wrangler_version") == WRANGLER, "wrong_wrangler_receipt")
+    kinds = [invocation(row) for row in sessions]
+    require(all(row.get("version") == 1 and row.get("wrangler_version") == WRANGLER for row in sessions)
+            and kinds.count("deploy") == 1 and kinds.count("version-probe") <= 1
+            and len(kinds) == kinds.count("deploy") + kinds.count("version-probe"),
+            "wrong_wrangler_receipt")
     rows = [row for row in records if row.get("type") == "deploy"]
     require(len(rows) == 1, "deploy_receipt_missing_or_ambiguous")
     row = rows[0]
@@ -311,12 +349,28 @@ def prepare(args, client):
     print("staging rollout baseline recorded")
 
 
-def verify(args, client):
+def deployed_identity(args, client):
+    """Provenance that needs only Wrangler's output, Docker and the versions API."""
     baseline = mapping(decode(Path(args.receipt).read_bytes()))
     records = [mapping(decode(line)) for line in Path(args.output).read_bytes().splitlines() if line.strip()]
-    version = deploy_version(records, baseline["started"])
+    try:
+        version = deploy_version(records, baseline["started"])
+    except GateError:
+        print(receipt_summary(records))
+        raise
     image = docker_image(version, baseline["revision"], baseline["build_id"])
     require(worker_namespace(client, version) == baseline["namespace_id"], "worker_namespace_changed")
+    return baseline, version, image
+
+
+def receipt(args, client):
+    # Runs BEFORE ownership transfer: an unverifiable deploy must not become the owner.
+    deployed_identity(args, client)
+    print("wrangler deploy receipt verified; ownership may transfer")
+
+
+def verify(args, client):
+    baseline, version, image = deployed_identity(args, client)
     url = staging_url()
     pinned = None
     while time.monotonic() < client.deadline:
@@ -361,7 +415,7 @@ def verify(args, client):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["prepare", "verify"])
+    parser.add_argument("mode", choices=["prepare", "receipt", "verify"])
     parser.add_argument("--receipt", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--config", default="wrangler.toml")
@@ -371,7 +425,7 @@ def main():
     try:
         deadline = time.monotonic() + 300 if args.mode == "verify" else None
         client = Client(os.environ.get("CLOUDFLARE_ACCOUNT_ID"), os.environ.get("CLOUDFLARE_API_TOKEN"), deadline)
-        (prepare if args.mode == "prepare" else verify)(args, client)
+        {"prepare": prepare, "receipt": receipt, "verify": verify}[args.mode](args, client)
     except GateError as error:
         print(f"staging rollout gate failed: {error}")
         return 1
