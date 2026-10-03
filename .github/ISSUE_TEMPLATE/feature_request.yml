@@ -1,0 +1,63 @@
+name: Feature request
+description: Propose a new capability
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for a new capability. To improve something that already exists, use the **Enhancement** form instead.
+
+        Check the [parity matrix](https://github.com/TogetherWeOwn/two-bot-next/blob/main/docs/parity.md) and [CONTRIBUTING.md](https://github.com/TogetherWeOwn/two-bot-next/blob/main/CONTRIBUTING.md) first. The bot replaces an existing TypeScript bot, so planned parity work may already cover your idea.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area affected
+      description: Where would this primarily live?
+      options:
+        - Gateway and event handling (crates/discord, crates/bot)
+        - Commands and moderation (crates/core)
+        - Storage and migrations (crates/store, sql/)
+        - Cutover and backup tooling (crates/cutover)
+        - Cloudflare Worker wrapper (wrangler/)
+        - Container image and deploy
+        - CI and release automation (.github/, scripts/)
+        - Documentation
+        - Cross-cutting (several of the above)
+        - Unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What are you trying to do that is hard or impossible today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: Describe the feature you want. How should it work?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you considered and why you ruled them out.
+
+  - type: textarea
+    id: parity
+    attributes:
+      label: Parity or roadmap link
+      description: Does this relate to a row in `docs/parity.md` or to an open issue? Link it.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Mockups, examples from other bots, related issues, and so on.

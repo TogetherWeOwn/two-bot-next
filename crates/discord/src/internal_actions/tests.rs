@@ -1,8 +1,15 @@
 #![cfg(test)]
 
 use super::*;
+use crate::test_clock::{
+    advance, mark_progress, stall_watchdog, stall_watchdog_on, ClockHold, STALL_GRACE,
+};
 use serde_json::json;
-use std::{io, sync::Mutex};
+use std::{
+    io,
+    sync::{atomic::AtomicU64, Mutex},
+};
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -11,6 +18,10 @@ use tokio::{
 
 #[cfg(feature = "db-tests")]
 mod admission;
+
+/// Private counter: this fixture must stall-detect without borrowing progress
+/// from concurrently running sibling fixtures.
+static ISOLATED_PROGRESS: AtomicU64 = AtomicU64::new(0);
 
 const CHANNEL: &str = "333333333333333333";
 const MESSAGE: &str = "444444444444444444";
@@ -21,10 +32,14 @@ struct Reply {
     status: u16,
     headers: String,
     body: String,
-    delay: Duration,
-    body_delay: Duration,
+    stall_response: bool,
+    stall_body: bool,
     truncate: bool,
     disconnect: bool,
+    /// Real-time header delay for the Postgres admission journeys only; the
+    /// frozen-clock fixtures model slowness with `stall_*` and `advance`.
+    #[cfg(feature = "db-tests")]
+    delay: Duration,
 }
 
 impl Reply {
@@ -33,10 +48,12 @@ impl Reply {
             status,
             headers: String::new(),
             body: body.into(),
-            delay: Duration::ZERO,
-            body_delay: Duration::ZERO,
+            stall_response: false,
+            stall_body: false,
             truncate: false,
             disconnect: false,
+            #[cfg(feature = "db-tests")]
+            delay: Duration::ZERO,
         }
     }
 
@@ -60,16 +77,42 @@ struct Recorded {
 struct MockDiscord {
     origin: String,
     requests: Arc<Mutex<Vec<Recorded>>>,
+    request_received: Arc<tokio::sync::Notify>,
+    response_received: Arc<tokio::sync::Notify>,
+    clock_released: Arc<tokio::sync::Notify>,
+    stall_response: bool,
     task: JoinHandle<()>,
+    _clock_hold: ClockHold,
 }
 
 impl MockDiscord {
     async fn start(reply: Reply) -> Self {
-        Self::start_sequence(vec![reply]).await
+        stall_watchdog(STALL_GRACE, Self::start_inner(reply))
+            .await
+            .expect("mock setup must finish without advancing Tokio time")
     }
 
     /// The nth request gets the nth reply; the last one repeats.
     async fn start_sequence(replies: Vec<Reply>) -> Self {
+        stall_watchdog(STALL_GRACE, Self::start_inner_sequence(replies))
+            .await
+            .expect("mock setup must finish without advancing Tokio time")
+    }
+
+    async fn start_inner(reply: Reply) -> Self {
+        Self::start_inner_sequence(vec![reply]).await
+    }
+
+    async fn start_inner_sequence(replies: Vec<Reply>) -> Self {
+        let clock_hold = ClockHold::start().await;
+        let clock_released = clock_hold.released.clone();
+        let request_received = Arc::new(tokio::sync::Notify::new());
+        let response_received = Arc::new(tokio::sync::Notify::new());
+        let received = request_received.clone();
+        let stall_response = replies
+            .first()
+            .map(|reply| reply.stall_response)
+            .unwrap_or(false);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -128,6 +171,8 @@ impl MockDiscord {
                         serde_json::from_slice(&bytes[head_end..head_end + content_length]).unwrap()
                     },
                 });
+                received.notify_one();
+                mark_progress();
                 let reply = {
                     let seen = seen.lock().unwrap();
                     replies[(seen.len() - 1).min(replies.len() - 1)].clone()
@@ -135,13 +180,21 @@ impl MockDiscord {
                 if reply.disconnect {
                     continue;
                 }
-                tokio::time::sleep(reply.delay).await;
+                #[cfg(feature = "db-tests")]
+                if !reply.delay.is_zero() {
+                    tokio::time::sleep(reply.delay).await;
+                }
+                if reply.stall_response {
+                    std::future::pending::<()>().await;
+                }
                 let response = format!(
                     "HTTP/1.1 {} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{}connection: close\r\n\r\n",
                     reply.status, reply.body.len(), reply.headers,
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
-                tokio::time::sleep(reply.body_delay).await;
+                if reply.stall_body {
+                    std::future::pending::<()>().await;
+                }
                 let end = if reply.truncate {
                     reply.body.len() / 2
                 } else {
@@ -150,10 +203,16 @@ impl MockDiscord {
                 let _ = socket.write_all(&reply.body.as_bytes()[..end]).await;
             }
         });
+        mark_progress();
         Self {
             origin,
             requests,
+            request_received,
+            response_received,
+            clock_released,
+            stall_response,
             task,
+            _clock_hold: clock_hold,
         }
     }
 
@@ -166,13 +225,8 @@ impl MockDiscord {
         let mut executor =
             AnnouncementExecutor::new(Arc::new(client), keys, CooldownGovernor::new());
         executor.api_origin = self.origin.clone();
-        executor
-    }
-
-    fn deadline_executor(&self, keys: HashMap<String, String>) -> AnnouncementExecutor {
-        // Short deadlines belong only to intentional header/body timeout tests.
-        let mut executor = self.executor(keys);
         executor.timeout = Duration::from_millis(100);
+        executor.response_received = Some(self.response_received.clone());
         executor
     }
 
@@ -200,33 +254,86 @@ fn announcement(content: &str) -> Map<String, Value> {
 }
 
 async fn run_once(executor: &AnnouncementExecutor, body: &Map<String, Value>) -> ExecutionOutcome {
-    // A hidden retry loop must fail the test rather than hang for minutes.
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        executor.execute("announcement.post", body),
-    )
+    run_action(executor, "announcement.post", body).await
+}
+
+async fn run_action(
+    executor: &AnnouncementExecutor,
+    action: &str,
+    body: &Map<String, Value>,
+) -> ExecutionOutcome {
+    stall_watchdog(STALL_GRACE, async {
+        let start = tokio::time::Instant::now();
+        let outcome = executor.execute(action, body).await;
+        mark_progress();
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "socket I/O advanced the clock"
+        );
+        outcome
+    })
     .await
-    .unwrap()
+    .expect("HTTP fixture must finish without advancing Tokio time")
 }
 
-#[tokio::test]
-async fn classification_fixture_keeps_default_deadline_and_timeout_fixture_is_explicit() {
-    let mock = MockDiscord::start(Reply::success()).await;
-    let executor = mock.executor(keys());
-    let production = AnnouncementExecutor::new(
-        Arc::clone(&executor.twilight),
-        keys(),
-        CooldownGovernor::new(),
-    );
-    assert_eq!(executor.timeout, production.timeout);
-    assert_eq!(
-        mock.deadline_executor(keys()).timeout,
-        Duration::from_millis(100)
-    );
-    assert_eq!(mock.count(), 0);
+async fn run_until_timeout(
+    mock: &MockDiscord,
+    executor: &AnnouncementExecutor,
+    body: &Map<String, Value>,
+) -> ExecutionOutcome {
+    stall_watchdog(STALL_GRACE, async {
+        let ready = if mock.stall_response {
+            &mock.request_received
+        } else {
+            &mock.response_received
+        };
+        let pending = executor.execute("announcement.post", body);
+        tokio::pin!(pending);
+        tokio::select! {
+            outcome = &mut pending => panic!("stalled request finished before its deadline: {outcome:?}"),
+            () = ready.notified() => {}
+        }
+        mark_progress();
+        // Cross the deadline only after request/client-header acquisition.
+        let tick = Duration::from_millis(1);
+        advance(executor.timeout - tick).await;
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        advance(tick + tick).await;
+        pending.await
+    })
+    .await
+    .expect("deadline fixture must finish after controlled advancement")
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
+async fn watchdog_cancels_never_ready_barriers_and_hidden_timers_and_releases_hold() {
+    for hidden_timer in [false, true] {
+        let mock = MockDiscord::start(Reply::success()).await;
+        let released = mock.clock_released.clone();
+        let start = tokio::time::Instant::now();
+        let result = stall_watchdog_on(&ISOLATED_PROGRESS, Duration::from_millis(20), async move {
+            let _mock = mock;
+            if hidden_timer {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            } else {
+                let never_ready = tokio::sync::Notify::new();
+                never_ready.notified().await;
+            }
+        })
+        .await;
+        assert_eq!(
+            result,
+            Err("frozen-clock fixture made no progress before the watchdog")
+        );
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        stall_watchdog(STALL_GRACE, released.notified())
+            .await
+            .expect("cancelled fixture must release its blocking clock hold");
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn twilight_posts_exact_mapped_route_and_mention_safe_payload() {
     let mock = MockDiscord::start(Reply::success()).await;
     let executor = mock.executor(keys());
@@ -272,7 +379,7 @@ async fn twilight_posts_exact_mapped_route_and_mention_safe_payload() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn refuses_bad_inputs_missing_mapping_and_every_other_core_verb_without_http() {
     let mock = MockDiscord::start(Reply::success()).await;
     let executor = mock.executor(keys());
@@ -283,14 +390,12 @@ async fn refuses_bad_inputs_missing_mapping_and_every_other_core_verb_without_ht
         }
         assert!(!AnnouncementExecutor::supports(action));
         assert_eq!(
-            executor.execute(action, &announcement("ok")).await,
+            run_action(&executor, action, &announcement("ok")).await,
             ExecutionOutcome::NoEffect(Refusal::ActionNotAllowed)
         );
     }
     assert_eq!(
-        executor
-            .execute("attacker-controlled-verb", &Map::new())
-            .await,
+        run_action(&executor, "attacker-controlled-verb", &Map::new()).await,
         ExecutionOutcome::NoEffect(Refusal::ActionNotAllowed)
     );
     for value in [
@@ -333,7 +438,7 @@ async fn refuses_bad_inputs_missing_mapping_and_every_other_core_verb_without_ht
     assert_eq!(mock.count(), 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn utf16_ceiling_is_preserved_for_non_ascii_content() {
     let mock = MockDiscord::start(Reply::success()).await;
     let executor = mock.executor(keys());
@@ -346,7 +451,7 @@ async fn utf16_ceiling_is_preserved_for_non_ascii_content() {
     assert_eq!(mock.count(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn definite_discord_rejections_and_rate_limit_are_one_attempt() {
     for status in [400, 401, 403, 404, 405, 413, 415, 422, 429] {
         // Error content is deliberately malformed and sensitive; status alone
@@ -369,7 +474,7 @@ async fn definite_discord_rejections_and_rate_limit_are_one_attempt() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn rate_limits_preserve_timing_and_conservative_scope_for_shared_governor() {
     let channel = CooldownScope::Channel(Id::new(CHANNEL.parse().unwrap()));
     for (headers, body, scope, delay) in [
@@ -447,25 +552,26 @@ async fn rate_limits_preserve_timing_and_conservative_scope_for_shared_governor(
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn broken_rate_limit_bodies_retain_headers_and_definite_no_effect() {
     let mut slow = Reply::new(429, r#"{"retry_after":1,"global":true}"#);
-    slow.body_delay = Duration::from_secs(1);
+    slow.stall_body = true;
     let mut truncated = slow.clone();
-    truncated.body_delay = Duration::ZERO;
+    truncated.stall_body = false;
     truncated.truncate = true;
     let oversized = Reply::new(429, "x".repeat(MAX_RESPONSE_BYTES + 1));
     for mut reply in [slow, truncated, oversized] {
         reply.headers = "Retry-After: 6.5\r\nX-RateLimit-Global: true\r\n".to_owned();
-        let slow_body = !reply.body_delay.is_zero();
+        let stalled = reply.stall_body;
         let mock = MockDiscord::start(reply).await;
-        let executor = if slow_body {
-            mock.deadline_executor(keys())
+        let executor = mock.executor(keys());
+        let outcome = if stalled {
+            run_until_timeout(&mock, &executor, &announcement("ok")).await
         } else {
-            mock.executor(keys())
+            run_once(&executor, &announcement("ok")).await
         };
         assert_eq!(
-            run_once(&executor, &announcement("ok")).await,
+            outcome,
             ExecutionOutcome::RateLimited(RateLimitCooldown {
                 scope: CooldownScope::Global,
                 retry_after_ms: Some(6500),
@@ -475,7 +581,7 @@ async fn broken_rate_limit_bodies_retain_headers_and_definite_no_effect() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn redirects_request_timeout_and_server_errors_remain_unknown_without_retry() {
     for status in [202, 204, 301, 307, 408, 500, 502, 503, 504] {
         let mock = MockDiscord::start(Reply::new(status, "provider-secret")).await;
@@ -488,14 +594,14 @@ async fn redirects_request_timeout_and_server_errors_remain_unknown_without_retr
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn timeout_and_lost_response_are_unknown_and_not_retried() {
     let mut delayed = Reply::success();
-    delayed.delay = Duration::from_secs(1);
+    delayed.stall_response = true;
     let mock = MockDiscord::start(delayed).await;
-    let executor = mock.deadline_executor(keys());
+    let executor = mock.executor(keys());
     assert_eq!(
-        run_once(&executor, &announcement("private-message")).await,
+        run_until_timeout(&mock, &executor, &announcement("private-message")).await,
         ExecutionOutcome::Unknown(UnknownReason::Timeout)
     );
     assert_eq!(mock.count(), 1);
@@ -511,7 +617,7 @@ async fn timeout_and_lost_response_are_unknown_and_not_retried() {
     assert_eq!(mock.count(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn invalid_success_receipts_are_unknown_instead_of_cached_failures() {
     for response in [
         "not-json".to_owned(),
@@ -532,14 +638,14 @@ async fn invalid_success_receipts_are_unknown_instead_of_cached_failures() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn deadline_covers_success_body_and_truncated_body_is_unknown() {
     let mut slow_body = Reply::success();
-    slow_body.body_delay = Duration::from_secs(1);
+    slow_body.stall_body = true;
     let mock = MockDiscord::start(slow_body).await;
-    let executor = mock.deadline_executor(keys());
+    let executor = mock.executor(keys());
     assert_eq!(
-        run_once(&executor, &announcement("ok")).await,
+        run_until_timeout(&mock, &executor, &announcement("ok")).await,
         ExecutionOutcome::Unknown(UnknownReason::Timeout)
     );
     assert_eq!(mock.count(), 1);
@@ -555,7 +661,7 @@ async fn deadline_covers_success_body_and_truncated_body_is_unknown() {
     assert_eq!(mock.count(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn missing_authentication_is_local_no_effect() {
     let mock = MockDiscord::start(Reply::success()).await;
     let mut executor = mock.executor(keys());
@@ -587,7 +693,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn outcomes_debug_serialization_and_logs_never_echo_sensitive_values() {
     let logs = LogBuffer(Arc::new(Mutex::new(Vec::new())));
     let subscriber = tracing_subscriber::fmt()
@@ -669,10 +775,10 @@ fn posted_in(channel: &str) -> Reply {
     )
 }
 
-// Loopback sends run on live time: a paused clock auto-advances to the request
-// deadline while IO is pending. Time is paused only between sends, and every
-// expiry is driven by `advance`, never by sleeping.
-#[tokio::test]
+// Cooldown sends run on a frozen clock: the fixture's clock hold inhibits idle
+// auto-advance while loopback I/O is pending, so `run_once` observes zero
+// elapsed time and every expiry is driven by `advance`, never by sleeping.
+#[tokio::test(start_paused = true)]
 async fn channel_cooldown_refuses_that_channel_without_http_while_others_proceed() {
     let mock = MockDiscord::start_sequence(vec![
         rate_limited("Retry-After: 60\r\nX-RateLimit-Scope: user\r\n"),
@@ -689,23 +795,19 @@ async fn channel_cooldown_refuses_that_channel_without_http_while_others_proceed
             retry_after_ms: Some(60_000),
         })
     );
-    tokio::time::pause();
     for shared in [&executor, &clone] {
         assert_eq!(run_once(shared, &announcement("second")).await, COOLING);
     }
     assert_eq!(mock.count(), 1);
-    tokio::time::resume();
     assert!(matches!(
         run_once(&clone, &other_channel()).await,
         ExecutionOutcome::Posted(_)
     ));
     assert_eq!(mock.count(), 2);
 
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(59)).await;
+    advance(Duration::from_secs(59)).await;
     assert_eq!(run_once(&executor, &announcement("held")).await, COOLING);
-    tokio::time::advance(Duration::from_secs(1)).await;
-    tokio::time::resume();
+    advance(Duration::from_secs(1)).await;
     assert!(matches!(
         run_once(&executor, &announcement("after expiry")).await,
         ExecutionOutcome::Posted(_)
@@ -713,7 +815,7 @@ async fn channel_cooldown_refuses_that_channel_without_http_while_others_proceed
     assert_eq!(mock.count(), 3);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn global_cooldown_refuses_every_channel_without_http_until_expiry() {
     let mock = MockDiscord::start_sequence(vec![
         rate_limited("Retry-After: 30\r\nX-RateLimit-Global: true\r\n"),
@@ -728,16 +830,14 @@ async fn global_cooldown_refuses_every_channel_without_http_until_expiry() {
             retry_after_ms: Some(30_000),
         })
     );
-    tokio::time::pause();
     for elapsed in [0, 29] {
-        tokio::time::advance(Duration::from_secs(elapsed)).await;
+        advance(Duration::from_secs(elapsed)).await;
         for body in [announcement("again"), other_channel()] {
             assert_eq!(run_once(&executor.clone(), &body).await, COOLING);
         }
     }
     assert_eq!(mock.count(), 1);
-    tokio::time::advance(Duration::from_secs(1)).await;
-    tokio::time::resume();
+    advance(Duration::from_secs(1)).await;
     assert!(matches!(
         run_once(&executor, &other_channel()).await,
         ExecutionOutcome::Posted(_)
@@ -745,7 +845,7 @@ async fn global_cooldown_refuses_every_channel_without_http_until_expiry() {
     assert_eq!(mock.count(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn repeated_rate_limits_end_each_intent_and_feed_every_cooldown() {
     let mock = MockDiscord::start(rate_limited(
         "Retry-After: 1\r\nX-RateLimit-Scope: user\r\n",
@@ -758,10 +858,8 @@ async fn repeated_rate_limits_end_each_intent_and_feed_every_cooldown() {
             run_once(&executor, &announcement("again")).await,
             ExecutionOutcome::RateLimited(_)
         ));
-        tokio::time::pause();
         assert_eq!(run_once(&executor, &announcement("again")).await, COOLING);
         assert_eq!(mock.count(), round);
-        tokio::time::advance(Duration::from_secs(1)).await;
-        tokio::time::resume();
+        advance(Duration::from_secs(1)).await;
     }
 }

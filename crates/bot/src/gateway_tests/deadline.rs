@@ -4,7 +4,7 @@ use super::*;
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn checkpoint_lock_wait_fails_closed_before_heartbeat_and_restart_recovers() {
-    let db = TestDb::new().await;
+    let db = TestDb::exclusive().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let gateway_url = url.clone();

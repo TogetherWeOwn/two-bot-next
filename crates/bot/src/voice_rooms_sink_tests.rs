@@ -20,6 +20,16 @@ impl RoomPersistence for Arc<Store> {
     ) -> Result<(), StoreError> {
         self.as_ref().save_access_controls(guild, controls).await
     }
+    async fn logging_settings(&self, guild: u64) -> Result<LoggingSettings, StoreError> {
+        self.as_ref().logging_settings(guild).await
+    }
+    async fn save_logging_settings(
+        &self,
+        guild: u64,
+        settings: &LoggingSettings,
+    ) -> Result<(), StoreError> {
+        self.as_ref().save_logging_settings(guild, settings).await
+    }
     async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), StoreError> {
         self.as_ref().add_creator(creator).await
     }

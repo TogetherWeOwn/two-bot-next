@@ -232,6 +232,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0225_voice_inherit_limit.sql"),
         include_str!("../../cutover/migrations/0226_voice_text_channels.sql"),
         include_str!("../../cutover/migrations/0227_voice_access_controls.sql"),
+        include_str!("../../cutover/migrations/0228_voice_logging_settings.sql"),
         include_str!("../../cutover/migrations/0300_website_contract.sql"),
         include_str!("../../cutover/migrations/0310_presence_probe.sql"),
         include_str!("../../cutover/migrations/0311_community_scorecard.sql"),
@@ -311,7 +312,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "CREATE TABLE public.migrator_probe (id int)",
     )
     .await?;
-    as_role(pool, &roles[1], "INSERT INTO public.voice_creators (guild_id, channel_id) VALUES ('100', '200'); SELECT * FROM public.voice_creators; UPDATE public.voice_creators SET default_limit = 5 WHERE guild_id = '100'; INSERT INTO public.voice_rooms (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at) VALUES ('100', '500', '200', '300', '300', '7', now()); SELECT * FROM public.voice_rooms; UPDATE public.voice_rooms SET owner_id = '301' WHERE guild_id = '100'; INSERT INTO public.voice_text_companions (guild_id, room_channel_id, text_channel_id, text_channels, created_at) VALUES ('100', '500', '600', TRUE, now()); SELECT * FROM public.voice_text_companions; INSERT INTO public.voice_access_controls (guild_id) VALUES ('100'); SELECT * FROM public.voice_access_controls; UPDATE public.voice_access_controls SET room_creation_enabled = FALSE WHERE guild_id = '100'; DELETE FROM public.voice_access_controls WHERE guild_id = '100'; DELETE FROM public.voice_text_companions WHERE guild_id = '100'; DELETE FROM public.voice_rooms WHERE guild_id = '100'; DELETE FROM public.voice_creators WHERE guild_id = '100'").await?;
+    as_role(pool, &roles[1], "INSERT INTO public.voice_creators (guild_id, channel_id) VALUES ('100', '200'); SELECT * FROM public.voice_creators; UPDATE public.voice_creators SET default_limit = 5 WHERE guild_id = '100'; INSERT INTO public.voice_rooms (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at) VALUES ('100', '500', '200', '300', '300', '7', now()); SELECT * FROM public.voice_rooms; UPDATE public.voice_rooms SET owner_id = '301' WHERE guild_id = '100'; INSERT INTO public.voice_text_companions (guild_id, room_channel_id, text_channel_id, text_channels, created_at) VALUES ('100', '500', '600', TRUE, now()); SELECT * FROM public.voice_text_companions; INSERT INTO public.voice_access_controls (guild_id) VALUES ('100'); SELECT * FROM public.voice_access_controls; UPDATE public.voice_access_controls SET room_creation_enabled = FALSE WHERE guild_id = '100'; INSERT INTO public.voice_logging_settings (guild_id) VALUES ('100'); SELECT * FROM public.voice_logging_settings; UPDATE public.voice_logging_settings SET detail_level = 'full' WHERE guild_id = '100'; DELETE FROM public.voice_logging_settings WHERE guild_id = '100'; DELETE FROM public.voice_access_controls WHERE guild_id = '100'; DELETE FROM public.voice_text_companions WHERE guild_id = '100'; DELETE FROM public.voice_rooms WHERE guild_id = '100'; DELETE FROM public.voice_creators WHERE guild_id = '100'").await?;
     denied(pool, &roles[2], "SELECT * FROM public.voice_creators").await?;
     denied(pool, &roles[2], "SELECT * FROM public.voice_rooms").await?;
     denied(
@@ -324,6 +325,12 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         pool,
         &roles[2],
         "SELECT * FROM public.voice_access_controls",
+    )
+    .await?;
+    denied(
+        pool,
+        &roles[2],
+        "SELECT * FROM public.voice_logging_settings",
     )
     .await?;
     // Invoker trigger DML must work without runtime direct function EXECUTE.
