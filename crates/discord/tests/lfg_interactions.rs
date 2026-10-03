@@ -427,7 +427,7 @@ async fn router_cleans_failed_posts_but_preserves_unreadable_acceptance() {
         ),
         (
             7404,
-            ScriptedResponse::json(200, json!({"id": "5900"})),
+            ScriptedResponse::json(200, json!({})),
             Some(ScriptedResponse::json(200, json!({"not": "history"}))),
             true,
         ),
