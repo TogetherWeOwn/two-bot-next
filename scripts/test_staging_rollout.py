@@ -84,7 +84,10 @@ def date(offset=0):
 
 def receipts():
     return [
-        {"type": "wrangler-session", "version": 1, "wrangler_version": "4.143.1"},
+        {
+            "type": "wrangler-session", "version": 1, "wrangler_version": "4.143.1",
+            "command_line_args": ["deploy", "--config", "staging-deploy.json", "--env", "staging"],
+        },
         {
             "type": "deploy", "version": 1,
             "worker_name": "two-bot-next-staging",
@@ -258,12 +261,34 @@ class DeployReceiptTests(OfflineTestCase):
                 self.assert_gate("deploy_receipt_missing_or_ambiguous",
                                  rollout.deploy_version, records, STARTED)
 
+    def test_wrangler_action_version_probe_is_accepted_beside_the_deploy_session(self):
+        # wrangler-action runs `wrangler --version` first; Wrangler records that too.
+        for flag in ("--version", "-v"):
+            with self.subTest(flag=flag):
+                probe = {"type": "wrangler-session", "version": 1,
+                         "wrangler_version": "4.143.1", "command_line_args": [flag]}
+                self.assertEqual(rollout.deploy_version([probe] + receipts(), STARTED), VERSION)
+                self.assertEqual(rollout.deploy_version(receipts() + [probe], STARTED), VERSION)
+
     def test_missing_ambiguous_or_wrong_wrangler_session(self):
         wrong = receipts()
         wrong[0]["wrangler_version"] = "4.142.0"
         schema = receipts()
         schema[0]["version"] = 2
-        for records in [receipts()[1:], receipts() + [receipts()[0]], wrong, schema]:
+        no_args = receipts()
+        del no_args[0]["command_line_args"]
+        bad_args = receipts()
+        bad_args[0]["command_line_args"] = ["deploy", 1]
+        probe = {"type": "wrangler-session", "version": 1,
+                 "wrangler_version": "4.143.1", "command_line_args": ["--version"]}
+        wrong_probe = dict(probe, wrangler_version="4.142.0")
+        schema_probe = dict(probe, version=2)
+        other_command = dict(probe, command_line_args=["secret", "put", "X"])
+        no_args_probe = {key: value for key, value in probe.items() if key != "command_line_args"}
+        for records in [receipts()[1:], receipts() + [receipts()[0]], wrong, schema, no_args,
+                        bad_args, receipts()[1:] + [probe],
+                        [wrong_probe] + receipts(), [schema_probe] + receipts(),
+                        [other_command] + receipts(), [no_args_probe] + receipts()]:
             with self.subTest(records=records):
                 self.assert_gate("wrong_wrangler_receipt", rollout.deploy_version, records, STARTED)
 

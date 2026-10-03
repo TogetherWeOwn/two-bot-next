@@ -81,6 +81,11 @@
       "predicate": "guild_id = $1 AND (created_by = $2 OR updated_by = $2)"
     },
     {
+      "table": "automation_commands",
+      "columns": ["created_by", "updated_by"],
+      "predicate": "guild_id = $1 AND (created_by = $2 OR updated_by = $2)"
+    },
+    {
       "table": "scheduled_messages",
       "columns": ["created_by", "updated_by"],
       "predicate": "guild_id = $1 AND (created_by = $2 OR updated_by = $2)"

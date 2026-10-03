@@ -16,6 +16,7 @@ use two_bot_discord::executor::ActionExecutor;
 use crate::{
     audit_runtime, community_jobs,
     jobs::{self, ErrorClass, Job},
+    scheduled_jobs,
     self_role_handlers::{SelfRoleService, RECOVERY_JOB_NAME},
     server,
 };
@@ -123,6 +124,7 @@ pub async fn serve(
     shutdown: watch::Sender<bool>,
     self_roles: Option<Arc<SelfRoleService>>,
     automod: crate::automod_gateway::Slot,
+    receiver: Option<crate::internal_action_http::BoundReceiver>,
 ) -> std::io::Result<()> {
     let mut registered = Vec::new();
     let mut parked = Vec::new();
@@ -179,6 +181,7 @@ pub async fn serve(
                         }),
                     });
                 }
+                registered.push(scheduled_jobs::register(context.clone()));
                 let registration = community_jobs::register(context.clone());
                 registered.extend(registration.jobs);
                 parked = registration.parked;
@@ -200,8 +203,21 @@ pub async fn serve(
         registered.push(service.recovery_job());
     }
     let status = registered_statuses(&registered, &parked).await;
-    let http = server::serve(listener, gateway, status.clone(), shutdown.clone());
-    serve_jobs(registered, status, shutdown, http).await
+    let public = server::serve(listener, gateway, status.clone(), shutdown.clone());
+    let http = async {
+        match receiver {
+            Some(receiver) => {
+                serve_listeners(
+                    public,
+                    receiver.serve(shutdown.subscribe()),
+                    shutdown.clone(),
+                )
+                .await
+            }
+            None => public.await,
+        }
+    };
+    serve_jobs(registered, status, shutdown.clone(), http).await
 }
 
 async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::SharedStatus {
@@ -209,6 +225,7 @@ async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::Share
         .into_iter()
         .chain(community_jobs::NAMES)
         .chain(audit_runtime::NAMES)
+        .chain(scheduled_jobs::NAMES)
         .chain([RECOVERY_JOB_NAME])
         .collect();
     if crate::automod_gateway::enabled() {
@@ -233,6 +250,33 @@ async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::Share
         }
     }
     status
+}
+
+/// First listener termination stops admission everywhere and drains its sibling.
+/// Both futures stay owned by serve_jobs; its existing HTTP drain bound applies.
+pub(crate) async fn serve_listeners(
+    public: impl std::future::Future<Output = std::io::Result<()>>,
+    private: impl std::future::Future<Output = std::io::Result<()>>,
+    shutdown: watch::Sender<bool>,
+) -> std::io::Result<()> {
+    tokio::pin!(public, private);
+    let (public_finished, first) = tokio::select! {
+        result = &mut public => (true, result),
+        result = &mut private => (false, result),
+    };
+    let unexpected = !*shutdown.borrow();
+    shutdown.send_replace(true);
+    let sibling = if public_finished {
+        private.await
+    } else {
+        public.await
+    };
+    first?;
+    sibling?;
+    if unexpected {
+        return Err(std::io::Error::other("HTTP listener stopped unexpectedly"));
+    }
+    Ok(())
 }
 
 pub(crate) const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
