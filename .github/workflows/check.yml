@@ -303,6 +303,7 @@ jobs:
         run: createdb -h agent-testdb -U agent_test two_bot_test_ci
 
       - name: Verify disposable Postgres defaults
+        if: needs.job-inputs.outputs.rust != 'false'
         run: |
           python3 - <<'PY'
           import json
