@@ -811,6 +811,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             if !live.channels.contains_key(&text_channel_id) {
                 continue;
             }
+            // Suspended (access-lost) rooms skip view syncs along with the
+            // rest of their lane: grants/revokes enqueue once access returns
+            // and the diff is recomputed from the last synced occupancy.
+            if self.queue.is_suspended(self.live.guild_id, channel) {
+                continue;
+            }
             let current: Vec<Snowflake> = live
                 .members
                 .iter()
