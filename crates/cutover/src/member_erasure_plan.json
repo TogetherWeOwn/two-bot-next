@@ -181,6 +181,11 @@
       "predicate": "guild_id = $1 AND (owner_id = $2 OR original_creator_id = $2)"
     },
     {
+      "table": "voice_logging_mention_members",
+      "columns": ["member_id"],
+      "predicate": "guild_id = $1 AND member_id = $2"
+    },
+    {
       "table": "members",
       "columns": ["member_id"],
       "predicate": "guild_id = $1 AND member_id = $2"

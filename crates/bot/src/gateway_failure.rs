@@ -50,6 +50,8 @@ pub enum FailureClass {
     AutomodConfigInvalid,
     /// Building the automod REST executor.
     AutomodExecutorFailed,
+    /// Building the raid-watch REST executor (join-burst observer).
+    RaidExecutorFailed,
     /// Anything that fails once the shard is running.
     GatewayRuntimeFailed,
     /// The gateway task panicked.
@@ -59,7 +61,7 @@ pub enum FailureClass {
 impl FailureClass {
     /// Every variant, for the vocabulary tests.
     #[cfg(test)]
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::StoreUnavailable,
         Self::GatewayPoolConnectFailed,
         Self::CheckpointLoadFailed,
@@ -69,6 +71,7 @@ impl FailureClass {
         Self::MilestonesLoadFailed,
         Self::AutomodConfigInvalid,
         Self::AutomodExecutorFailed,
+        Self::RaidExecutorFailed,
         Self::GatewayRuntimeFailed,
         Self::GatewayTaskPanicked,
     ];
@@ -85,6 +88,7 @@ impl FailureClass {
             Self::MilestonesLoadFailed => "milestones_load_failed",
             Self::AutomodConfigInvalid => "automod_config_invalid",
             Self::AutomodExecutorFailed => "automod_executor_failed",
+            Self::RaidExecutorFailed => "raid_executor_failed",
             Self::GatewayRuntimeFailed => "gateway_runtime_failed",
             Self::GatewayTaskPanicked => "gateway_task_panicked",
         }
@@ -174,14 +178,15 @@ mod tests {
                 FailureClass::MilestonesLoadFailed => 6,
                 FailureClass::AutomodConfigInvalid => 7,
                 FailureClass::AutomodExecutorFailed => 8,
-                FailureClass::GatewayRuntimeFailed => 9,
-                FailureClass::GatewayTaskPanicked => 10,
+                FailureClass::RaidExecutorFailed => 9,
+                FailureClass::GatewayRuntimeFailed => 10,
+                FailureClass::GatewayTaskPanicked => 11,
             }
         }
         for (position, class) in FailureClass::ALL.into_iter().enumerate() {
             assert_eq!(index(class), position);
         }
-        assert_eq!(FailureClass::ALL.len(), 11);
+        assert_eq!(FailureClass::ALL.len(), 12);
     }
 
     #[test]
