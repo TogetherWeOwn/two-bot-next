@@ -18,7 +18,7 @@
 //!   (`response_for_slash` is `None` — success text belongs to the feature).
 //! - disabled features and missing permissions refuse with the documented
 //!   ephemeral copy (`RouterRefusal::message`), never silence.
-//! - unknown names get the uniform stale-interaction reply; foreign guilds
+//! - unknown names get the unknown-command reply (re-pick from `/`); foreign guilds
 //!   are fenced (`Ignore`, except moderation's documented refusal).
 //!
 //! Dev-only: never ships in the release binary.
@@ -39,7 +39,7 @@ use twilight_model::{
 };
 use two_bot_core::{
     commands::{PERM_BAN_MEMBERS, PERM_MANAGE_EVENTS},
-    router::replies::UNKNOWN_INTERACTION_REPLY,
+    router::replies::UNKNOWN_COMMAND_REPLY,
     HandlerId, InteractionRouter, ModerationAction, RouterGates, RouterRefusal, SlashOutcome,
 };
 use two_bot_discord::{refusal_response, response_for_slash, route_interaction, RoutedInteraction};
@@ -359,7 +359,7 @@ fn unknown_names_get_the_uniform_stale_reply() {
         assert_eq!(outcome, SlashOutcome::Unknown, "{name} is unknown");
         let response = response_for_slash(&outcome).expect("unknown answers");
         let json = serde_json::to_value(&response).expect("serializes");
-        assert_eq!(json["data"]["content"], UNKNOWN_INTERACTION_REPLY);
+        assert_eq!(json["data"]["content"], UNKNOWN_COMMAND_REPLY);
         assert_eq!(json["data"]["flags"], 64, "ephemeral");
     }
 }
