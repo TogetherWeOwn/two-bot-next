@@ -30,6 +30,9 @@ mod jobs;
 #[cfg(test)]
 mod lifecycle_tests;
 mod metrics_http;
+mod onboarding;
+#[cfg(test)]
+mod onboarding_tests;
 mod preflight;
 mod schedule_runtime;
 mod scheduled_jobs;
@@ -199,8 +202,9 @@ async fn main() {
     let (shutdown, stopping) = tokio::sync::watch::channel(false);
     // Filled by the gateway task; read by the shared maintenance tick.
     let automod_slot: automod_gateway::Slot = Arc::default();
-    let gateway_task = if let Ok((token, _, guild_id)) = gateway_prerequisites(&config) {
+    let gateway_task = if let Ok((token, url, guild_id)) = gateway_prerequisites(&config) {
         let token = token.to_owned();
+        let url = url.to_owned();
         let state = Arc::clone(&gateway);
         let slot = Arc::clone(&automod_slot);
         let self_roles = self_roles.clone();
@@ -213,18 +217,23 @@ async fn main() {
                         "DATABASE_URL required for gateway checkpoint".into(),
                     )
                 })?;
+                // Feature work (onboarding, shared commands) holds connections
+                // across Discord I/O: keep the ordered checkpoint writer on its
+                // own single-connection pool so it can never be starved.
+                let gateway_db =
+                    two_bot_cutover::connect(&url, gateway::GATEWAY_POOL_MAX, true).await?;
                 let pool = db.pool().clone();
                 let store = two_bot_cutover::gateway_session::GatewaySessionStore::new(
-                    pool.clone(),
+                    gateway_db.pool().clone(),
                     guild_id.to_string(),
                     0,
                 );
                 let saved = gateway::load_boot_session(&store)
                     .await
                     .map_err(|error| gateway_failure("checkpoint_load_failed", error))?;
-                let onboarding = two_bot_core::OnboardingGates::from_env()
+                let gates = two_bot_core::OnboardingGates::from_env()
                     .map_err(|_| sqlx::Error::InvalidArgument("invalid onboarding mode".into()))?;
-                // ONE router + REST executor + sqlx stores over the same pool.
+                // ONE router + REST executor + sqlx stores over the feature pool.
                 // Bad command env gates still park only the command surface.
                 // The ordered leveling path shares this runtime's
                 // executor/pacing for XP awards and role rewards.
@@ -233,8 +242,30 @@ async fn main() {
                     &token,
                     guild_id,
                     self_roles,
-                    onboarding,
+                    gates,
                 );
+                // Onboarding renders through that same executor: one shared
+                // admission lane and pacing, never a private Discord client.
+                // Its identity probe honors the mock REST seam through the
+                // executor's `DISCORD_API_BASE` proxy. A parked command
+                // runtime (bad env gates) parks onboarding too.
+                let onboarding = match runtime.as_ref() {
+                    Some(runtime) => Some(Arc::new(
+                        onboarding::OnboardingRuntime::from_env(
+                            pool.clone(),
+                            runtime.executor(),
+                            guild_id,
+                        )
+                        .await
+                        .map_err(|_| {
+                            sqlx::Error::InvalidArgument("onboarding initialization failed".into())
+                        })?,
+                    )),
+                    None => {
+                        tracing::warn!("command runtime parked; onboarding runtime disabled");
+                        None
+                    }
+                };
                 let leveling = runtime.as_ref().map(|runtime| runtime.leveling());
                 let pipeline = Arc::new(
                     build_persistent_pipeline(&store, guild_id, token.clone(), leveling)
@@ -283,6 +314,7 @@ async fn main() {
                     pipeline,
                     Arc::clone(&state),
                     store,
+                    onboarding,
                     runtime,
                     automod,
                     voice,

@@ -230,6 +230,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0350_internal_actions.sql"),
         include_str!("../../cutover/migrations/0353_internal_clock_high_water.sql"),
         include_str!("../../cutover/migrations/0361_discord_send_admission.sql"),
+        include_str!("../../cutover/migrations/0362_gateway_onboarding_jobs.sql"),
     ] {
         sqlx::raw_sql(migration).execute(pool).await?;
     }
@@ -331,6 +332,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         $cas$;"#,
     )
     .await?;
+    as_role(pool, &roles[1], "SELECT * FROM public.gateway_onboarding_jobs; INSERT INTO public.gateway_onboarding_jobs (guild_id, shard_id, session_id, seq, occurred_at_ms) VALUES ('roles', 0, 'roles', 1, 0); UPDATE public.gateway_onboarding_jobs SET state = 'running', attempts = attempts + 1 WHERE guild_id = 'roles'; DELETE FROM public.gateway_onboarding_jobs WHERE guild_id = 'roles'").await?;
     // Migration 0200 relations are runtime-operated: event claims and panel
     // lane leases must work under the least-privilege login.
     as_role(pool, &roles[1], "SELECT * FROM public.self_role_audit; INSERT INTO public.self_role_audit (event_id, guild_id, panel_id, member_id, source_id, source, operation, outcome, added_role_ids, removed_role_ids, created_at) VALUES ('roles-probe', 'g', 'p', 'm', 's', 'button', 'add', 'processing', '[]', '[]', '2026-01-01T00:00:00Z'); UPDATE public.self_role_audit SET reason = 'probe' WHERE event_id = 'roles-probe'; DELETE FROM public.self_role_audit WHERE event_id = 'roles-probe'").await?;
@@ -380,6 +382,9 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "UPDATE public.discord_send_admission SET in_flight = FALSE",
         "DELETE FROM public.discord_send_admission",
         "SELECT * FROM public.members",
+        "SELECT * FROM public.gateway_onboarding_jobs",
+        "INSERT INTO public.gateway_onboarding_jobs (guild_id, shard_id, session_id, seq, occurred_at_ms) VALUES ('reader', 0, 'reader', 1, 0)",
+        "SELECT nextval('public.gateway_onboarding_jobs_id_seq')",
         "INSERT INTO public.members (member_id) VALUES ('test')",
         "SELECT * FROM public.self_role_audit",
         "SELECT * FROM public.self_role_panel_claims",
@@ -425,6 +430,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         (format!("GRANT CREATE ON SCHEMA public TO {runtime}"),
          format!("REVOKE CREATE ON SCHEMA public FROM {runtime}")),
         (format!("GRANT {migrator} TO {reader}"), format!("REVOKE {migrator} FROM {reader}")),
+        (format!("REVOKE SELECT ON public.gateway_onboarding_jobs FROM {runtime}"),
+         format!("GRANT SELECT ON public.gateway_onboarding_jobs TO {runtime}")),
         (format!("REVOKE SELECT ON web_v1.members FROM {reader}"),
          format!("GRANT SELECT ON web_v1.members TO {reader}")),
         (format!("REVOKE UPDATE ON public.tickets FROM {runtime}"),

@@ -200,6 +200,7 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
         db.store.clone(),
         None,
         None,
+        None,
         Some(voice.clone()),
         std::future::pending(),
     ));
