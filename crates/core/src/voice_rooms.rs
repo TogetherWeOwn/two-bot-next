@@ -1053,7 +1053,11 @@ impl ActionQueue {
 
 /// V1 slash-command shapes. `/create` makes a new creator channel (admin
 /// only); `/setup` is the viewable-by-anyone status panel whose actions
-/// need admin (enforced by the handler, V1 runtime slice).
+/// need admin (enforced by the handler, V1 runtime slice). V2 ownership:
+/// `/reclaim` takes back a room as the original creator (or claims one whose
+/// owner is gone); `/transfer` hands a room to a member in it and makes them
+/// the remembered creator. Both act on the caller's current room; typed
+/// refusals from the ownership core become ephemeral replies, never state.
 #[must_use]
 pub fn voice_commands() -> Vec<CommandDefinition> {
     vec![
@@ -1075,6 +1079,20 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         ),
         CommandDefinition::new("ping", "Show the bot's response latency"),
         CommandDefinition::new("invite", "Show this server's invite link"),
+        CommandDefinition::new(
+            "reclaim",
+            "Take back ownership of your temporary voice room",
+        ),
+        CommandDefinition::new(
+            "transfer",
+            "Hand your temporary voice room to a member in it",
+        )
+        .options(vec![CommandOption::new(
+            "member",
+            "Member in the room to make the new owner",
+            CommandOptionType::User,
+        )
+        .required()]),
     ]
 }
 
@@ -1765,7 +1783,7 @@ mod tests {
         let defs = voice_commands();
         assert_eq!(
             defs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-            ["create", "setup", "ping", "invite"]
+            ["create", "setup", "ping", "invite", "reclaim", "transfer"]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
         assert_eq!(
@@ -1779,10 +1797,18 @@ mod tests {
         assert_eq!(defs[1].default_member_permissions, None);
         assert!(defs[1].options.is_empty());
         // `/ping` and `/invite` are open to everyone and take no options.
-        for def in &defs[2..] {
+        for def in &defs[2..4] {
             assert_eq!(def.default_member_permissions, None);
             assert!(def.options.is_empty());
         }
+        // `/reclaim` takes no options; `/transfer` names its recipient.
+        assert_eq!(defs[4].default_member_permissions, None);
+        assert!(defs[4].options.is_empty());
+        assert_eq!(defs[5].default_member_permissions, None);
+        assert_eq!(defs[5].options.len(), 1);
+        assert_eq!(defs[5].options[0].name, "member");
+        assert_eq!(defs[5].options[0].kind, CommandOptionType::User as u8);
+        assert!(defs[5].options[0].required == Some(true));
         // Merges cleanly alongside the other slices, first-wins.
         let merged = merge_commands(
             &[feature_commands(), moderation_commands(), voice_commands()],
@@ -1793,6 +1819,8 @@ mod tests {
         assert!(merged.iter().any(|d| d.name == "setup"));
         assert!(merged.iter().any(|d| d.name == "ping"));
         assert!(merged.iter().any(|d| d.name == "invite"));
+        assert!(merged.iter().any(|d| d.name == "reclaim"));
+        assert!(merged.iter().any(|d| d.name == "transfer"));
 
         assert!(!VoiceGates::from_map(&Default::default()).enabled);
         let vars: HashMap<String, String> = [("TWO_VOICE".to_owned(), "1".to_owned())]
