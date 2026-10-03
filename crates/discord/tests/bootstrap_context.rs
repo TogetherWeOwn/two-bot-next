@@ -164,9 +164,14 @@ async fn only_200_is_accepted_and_status_errors_never_retry_or_leak_bodies() {
 
     tokio::time::timeout(Duration::from_secs(2), async {
         for status in statuses {
+            // Shared executor taxonomy: documented client refusals reject;
+            // any other unexpected status (including 2xx that is not the
+            // accepted 200) is unavailable, never a retry with the body.
             let expected = match status {
                 429 => DiscordError::RateLimited,
-                503 => DiscordError::Unavailable("Discord returned 503".to_owned()),
+                201 | 204 | 503 => {
+                    DiscordError::Unavailable(format!("Discord returned {status}"))
+                }
                 _ => DiscordError::Rejected(format!("Discord refused the request with {status}")),
             };
             assert_eq!(
