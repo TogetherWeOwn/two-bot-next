@@ -29,6 +29,9 @@ mod gateway_metrics;
 mod gateway_tests;
 mod internal_action_http;
 mod jobs;
+mod join_risk_runtime;
+#[cfg(test)]
+mod join_risk_runtime_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 mod metrics_http;
@@ -369,10 +372,18 @@ async fn main() {
                             )
                         })?,
                     };
-                    pipeline.set_join_observer(raid_runtime::start_from_env(
+                    let raid =
+                        raid_runtime::start_from_env(pool.clone(), raid_executor.clone(), guild_id);
+                    // Join-risk delivery (R2) shares the raid observer slot:
+                    // the pipeline takes one observer, so risk chains behind
+                    // the raid watch and both stay behind the funnel's join
+                    // row. Without exact TWO_ANTI_NUKE=1 on the staging guild
+                    // the chain is the raid watch alone.
+                    pipeline.set_join_observer(join_risk_runtime::chain_from_env(
                         pool.clone(),
                         raid_executor,
                         guild_id,
+                        raid,
                     ));
                     // Automod shares the command runtime's REST executor; it never
                     // builds a private client, router or timer.

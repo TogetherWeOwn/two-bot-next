@@ -200,6 +200,31 @@ async fn scheduled_runtime_probe(pool: &PgPool, role: &str) -> Result<(), sqlx::
     Ok(())
 }
 
+/// Every cutover migration in source order, read from the directory so a new
+/// migration is exercised without updating a hardcoded list.
+fn migration_files() -> Vec<(i64, String)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cutover/migrations");
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .expect("cutover migrations directory")
+        .map(|entry| entry.expect("migration entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+        .collect();
+    entries.sort();
+    entries
+        .iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .expect("migration file name")
+                .to_string_lossy();
+            let digits: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let version: i64 = digits.parse().expect("migration version prefix");
+            let sql = std::fs::read_to_string(path).expect("read migration");
+            (version, sql)
+        })
+        .collect()
+}
+
 async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     // Every real migration file in version order, not a reduced fixture that
     // omits trigger/sequence paths or newer tables. A new migration without a
@@ -1013,6 +1038,235 @@ async fn transactional_drift(
     .await;
     tx.rollback().await?;
     result
+}
+
+/// Staging ledger before the first bootstrap: the 29 migration versions the
+/// pending set is computed against. Pending versions are derived as every
+/// other source version, so later migrations join the pending set unlisted.
+/// Three pending versions create tables with no object-matrix row yet (0370
+/// containment claims, 0410 member erasure audit, 0411 invite campaigns);
+/// they stay out of this rehearsal until the matrix backfill lands, and the
+/// backfill removes this exclusion. A new migration that creates an
+/// unmatrixed table fails this test at the final verify, by design.
+const STAGING_LEDGER29: [i64; 29] = [
+    1, 2, 120, 121, 122, 123, 140, 141, 150, 160, 170, 180, 190, 200, 210, 300, 310, 311, 320, 330,
+    331, 332, 333, 334, 340, 350, 351, 360, 390,
+];
+const PENDING_EXCLUDED_WITHOUT_MATRIX_ROW: [i64; 3] = [370, 410, 411];
+
+/// The ephemeral self-grant must be gone after the plan commits: the
+/// executing identity cannot SET the migrator group anymore. Runs inside a
+/// rolled-back transaction so the pooled connection keeps no role state.
+async fn cannot_set_role(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let result = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET LOCAL ROLE {role}")))
+        .execute(&mut *tx)
+        .await;
+    tx.rollback().await?;
+    match result {
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42501") => Ok(()),
+        _ => Err(sqlx::Error::InvalidArgument(format!(
+            "{role} membership was not revoked"
+        ))),
+    }
+}
+
+#[tokio::test]
+async fn scratch_bootstrap_flow_from_staging_ledger() {
+    let url = match std::env::var("TWO_ROLES_TEST_DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") => TEST_URL.to_owned(),
+        Err(_) => return, // Offline suite: explicitly requested and CI tests never skip.
+    };
+    let options = test_database::test_options(&url).expect("refusing non-test-container target");
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    let (name, roles) = names();
+    let provisioner = format!("{name}_p");
+    let migrator_login = format!("{name}_l");
+    // Non-superuser CREATEROLE provisioning identity owning the scratch
+    // database, plus a plain login that becomes the dedicated migrator login.
+    // Trust auth on the disposable cluster takes the empty password, exactly
+    // like the existing acceptance test.
+    execute(
+        &admin,
+        format!("CREATE ROLE {provisioner} LOGIN CREATEROLE"),
+    )
+    .await
+    .unwrap();
+    execute(&admin, format!("CREATE ROLE {migrator_login} LOGIN"))
+        .await
+        .unwrap();
+    execute(
+        &admin,
+        format!("CREATE DATABASE {name} OWNER {provisioner}"),
+    )
+    .await
+    .unwrap();
+    let provision_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone().username(&provisioner).database(&name))
+        .await
+        .unwrap();
+    // Build the 29-version state as the provisioning identity.
+    let all = migration_files();
+    let mut ledger = 0usize;
+    for (version, migration) in &all {
+        if STAGING_LEDGER29.contains(version) {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(migration.clone()))
+                .execute(&provision_pool)
+                .await
+                .unwrap();
+            ledger += 1;
+        }
+    }
+    require(ledger == STAGING_LEDGER29.len(), "29-state incomplete").unwrap();
+    sqlx::raw_sql(include_str!("../../../sql/web_v1.sql"))
+        .execute(&provision_pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);")
+        .execute(&provision_pool)
+        .await
+        .unwrap();
+    let ledger_rows = STAGING_LEDGER29
+        .iter()
+        .map(|version| format!("({version})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO public._sqlx_migrations (version) VALUES {ledger_rows}"
+    )))
+    .execute(&provision_pool)
+    .await
+    .unwrap();
+    // The default phase still fails closed on the absent relations.
+    let error = execute(
+        &provision_pool,
+        isolated(
+            &database_roles::plan_for_phase(database_roles::Phase::Full),
+            &roles,
+        ),
+    )
+    .await
+    .expect_err("full plan must raise on absent relations");
+    match error {
+        sqlx::Error::Database(error) => {
+            require(
+                error.message().contains("missing relation"),
+                "full plan failed without the strict raise",
+            )
+            .unwrap();
+        }
+        other => panic!("unexpected full-plan error: {other:?}"),
+    }
+    // The refused plan leaves this pooled connection inside an aborted BEGIN;
+    // roll back before reuse or the next statement fails with 25P02.
+    sqlx::raw_sql("ROLLBACK")
+        .execute(&provision_pool)
+        .await
+        .unwrap();
+    // The bootstrap phase transfers the existing objects as the non-superuser
+    // identity, using the ephemeral SET membership for this transaction only.
+    execute(
+        &provision_pool,
+        isolated(
+            &database_roles::plan_for_phase(database_roles::Phase::Bootstrap),
+            &roles,
+        ),
+    )
+    .await
+    .unwrap();
+    cannot_set_role(&provision_pool, &roles[0]).await.unwrap();
+    // Part A equivalent (operator action): the dedicated migrator login joins
+    // the migrator group. It keeps SET membership; the provisioning identity
+    // does not.
+    execute(&admin, format!("GRANT {} TO {migrator_login}", roles[0]))
+        .await
+        .unwrap();
+    let migrator_role = roles[0].clone();
+    let migrator_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |connection, _| {
+            let role = migrator_role.clone();
+            Box::pin(async move {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET ROLE {role}")))
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(options.clone().username(&migrator_login).database(&name))
+        .await
+        .unwrap();
+    // Apply every pending migration as a SET ROLE member, then record them.
+    // Versions without a matrix row are excluded until the backfill lands.
+    let mut pending = Vec::new();
+    for (version, migration) in &all {
+        if !STAGING_LEDGER29.contains(version)
+            && !PENDING_EXCLUDED_WITHOUT_MATRIX_ROW.contains(version)
+        {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(migration.clone()))
+                .execute(&migrator_pool)
+                .await
+                .unwrap();
+            pending.push(*version);
+        }
+    }
+    require(!pending.is_empty(), "no pending migrations applied").unwrap();
+    let pending_rows = pending
+        .iter()
+        .map(|version| format!("({version})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO public._sqlx_migrations (version) VALUES {pending_rows}"
+    )))
+    .execute(&migrator_pool)
+    .await
+    .unwrap();
+    // The full phase is idempotent once every object exists; the ephemeral
+    // grant is re-acquired and revoked on each run.
+    for _ in 0..2 {
+        execute(
+            &provision_pool,
+            isolated(
+                &database_roles::plan_for_phase(database_roles::Phase::Full),
+                &roles,
+            ),
+        )
+        .await
+        .unwrap();
+        cannot_set_role(&provision_pool, &roles[0]).await.unwrap();
+    }
+    // Verify as the superuser: the provisioning identity intentionally keeps
+    // no schema access after the transfer, and catalog inspection needs none.
+    let scratch_admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.database(&name))
+        .await
+        .unwrap();
+    require(
+        findings(&scratch_admin, &roles).await.unwrap().is_empty(),
+        "bootstrap flow drifted",
+    )
+    .unwrap();
+    provision_pool.close().await;
+    migrator_pool.close().await;
+    scratch_admin.close().await;
+    // Clean up even if a privilege probe failed. Only generated owned names.
+    execute(&admin, format!("DROP DATABASE {name}"))
+        .await
+        .unwrap();
+    for role in roles.iter().chain([&provisioner, &migrator_login]) {
+        execute(&admin, format!("DROP ROLE IF EXISTS {role}"))
+            .await
+            .unwrap();
+    }
+    admin.close().await;
 }
 
 #[tokio::test]
