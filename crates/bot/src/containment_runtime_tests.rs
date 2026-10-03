@@ -170,7 +170,7 @@ async fn discord(fixture: Fixture) -> MockRest {
                     json!([
                         {"id":"22","permissions":bits,"position":0,"managed":false},
                         {"id":"77","permissions":"8","position":1,"managed":false},
-                        {"id":"88","permissions":"8","position":5,"managed":false},
+                        {"id":"88","permissions":"0","position":5,"managed":false},
                     ]),
                 )
             }
