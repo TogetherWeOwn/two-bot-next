@@ -9,6 +9,26 @@
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
       "sha256": "e257889e79beb83896f686fecd2116ca653ce0ef9392c622618f720ccd9b712c"
     },
+    "crates/cutover/migrations/0110_moderation_member.sql": {
+      "sha256": "5cac88b239c9a38ead5318f0d1f75bc0ffc1abeaf414d2d8e7bccf6a2da327a4",
+      "justification": "Add reserved member moderation ledger migration for TOG-10078; SQL unchanged during main reconciliation."
+    },
+    "crates/cutover/migrations/0111_moderation_ban_ownership.sql": {
+      "sha256": "844a52f1418acd339e48193fa530bf8a3cd0768379599e4bffedf1bc6d3f467c",
+      "justification": "Add reserved member ban ownership migration for TOG-10078; SQL unchanged during main reconciliation."
+    },
+    "crates/cutover/migrations/0112_moderation_legacy_timestamps.sql": {
+      "sha256": "739be64512d6b22fd72438060366201300a76d954cdd6d19aa08f6947b1eed47",
+      "justification": "Add reserved legacy moderation timestamp migration for TOG-10078; SQL unchanged during main reconciliation."
+    },
+    "crates/cutover/migrations/0113_moderation_unban_retry_order.sql": {
+      "sha256": "974a9bd93ccbf2bcf976521c990265b4caaf552bc2286616e3ed35fd783d1841",
+      "justification": "Add durable exact-claim refusal queue tickets for TOG-10078 without modifying prior migrations."
+    },
+    "crates/cutover/migrations/0114_moderation_member_runtime_grants.sql": {
+      "sha256": "af53bf5cf334d193ab482c4f3c5cc6f858b51632646143648105ab25b51d9d8d",
+      "justification": "Grant existing runtime group narrow member-ledger DML and generation-sequence access for TOG-10078; retain reader/admin boundaries."
+    },
     "crates/cutover/migrations/0120_channel_moderation.sql": {
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
       "sha256": "a1e8df92e0c51e14447ff74dc6d08cb45b871cb53da2b40d7949472762637838"
@@ -220,6 +240,10 @@
     "crates/cutover/migrations/0411_invite_campaigns.sql": {
       "sha256": "289623820243f17a9b0cb327aa600bae9b638f64070614612597cccef224aacf",
       "justification": "TOG-12415: legacy-copy target DDL for the go.two.gg redirect store; same shape as store 0407."
+    },
+    "crates/cutover/migrations/0412_voice_rooms_ownership_touched.sql": {
+      "sha256": "9dfe6648848bc7d42ba7534b710eab36473ac57ad5c4eee26d88d3f453d60b2f",
+      "justification": "Voice V2 ownership handoff stamp so the rollback delta keeps measuring rooms whose owner_id changes in place."
     },
     "crates/store/migrations/0400_initial.sql": {
       "sha256": "49c7136827484e0625cad889208a03e48026acb854282de3a0a9c5aa4d951b00",
