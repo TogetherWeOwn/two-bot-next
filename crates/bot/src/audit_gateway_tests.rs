@@ -398,7 +398,6 @@ fn all_fourteen_audit_log_actions_produce_uncorrelated_rows() {
     }
 }
 
-#[test]
 /// Marker MAC key from the public, non-production vectors shared with the
 /// core MAC acceptance tests; no operational key is embedded in test source.
 fn fixture_mac_key() -> String {
@@ -412,6 +411,7 @@ fn fixture_mac_key() -> String {
         .to_owned()
 }
 
+#[test]
 fn correlated_audit_log_row_matches_moderation_service_shape() {
     let cache = build_cache();
     let secret = fixture_mac_key();
@@ -435,7 +435,7 @@ fn correlated_audit_log_row_matches_moderation_service_shape() {
         &cache,
         AT,
         7,
-        Some(secret),
+        Some(secret.as_str()),
         Some(&bot),
     );
     assert_eq!(events.len(), 1);
