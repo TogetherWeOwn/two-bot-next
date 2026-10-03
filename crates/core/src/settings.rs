@@ -97,6 +97,11 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_REDIRECT_PORT", SettingClass::EnvOnly),
     ("TWO_REDIRECT_TRUSTED_PROXIES", SettingClass::EnvOnly),
     ("DISCORD_API_BASE", SettingClass::EnvOnly),
+    // --- template-assistant endpoint (V12): an OpenAI-compatible base URL
+    // --- plus model name. Env-only like DISCORD_API_BASE: a web form must
+    // --- never redirect the assistant to another address or model. ---
+    ("TWO_ASSISTANT_ENDPOINT", SettingClass::EnvOnly),
+    ("TWO_ASSISTANT_MODEL", SettingClass::EnvOnly),
     // --- capability gates: the TWO_INTERNAL_* namespace (prefix-covered too,
     // --- so the census stays complete and the drift test can see them) ---
     ("TWO_INTERNAL_ACTIONS", SettingClass::EnvOnly),
@@ -767,6 +772,8 @@ mod tests {
         "TWO_ANTI_NUKE_PROTECTED_USER_IDS",
         "TWO_ANTI_NUKE_SNAPSHOT_PATH",
         "TWO_ANTI_NUKE_TRUSTED_USER_IDS",
+        "TWO_ASSISTANT_ENDPOINT",
+        "TWO_ASSISTANT_MODEL",
         "TWO_BACKUP_S3_ACCESS_KEY_ID",
         "TWO_BACKUP_S3_BUCKET",
         "TWO_BACKUP_S3_ENDPOINT",
@@ -821,7 +828,7 @@ mod tests {
             assert_eq!(classify_key(key), Some(SettingClass::EnvOnly), "{key}");
         }
         let expected_total = EXPECTED_HOT.len() + EXPECTED_COLD.len() + EXPECTED_ENV_ONLY.len();
-        assert_eq!(expected_total, 119, "tripwire lists must stay complete");
+        assert_eq!(expected_total, 121, "tripwire lists must stay complete");
         assert_eq!(
             SETTING_CLASSES.len(),
             expected_total,
