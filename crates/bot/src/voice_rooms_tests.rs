@@ -2207,7 +2207,7 @@ async fn responder_defers_before_any_create_and_completes_once() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());
     let replies = Replies::new(trace.clone());
-    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None).await;
+    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None, None).await;
     assert_eq!(
         *trace.lock().unwrap(),
         ["defer", "create", "add_creator:500", "complete"]
@@ -2235,7 +2235,7 @@ async fn responder_failed_or_ambiguous_ack_never_executes_or_retries() {
         let runtime = test_runtime(trace.clone());
         let mut replies = Replies::new(trace.clone());
         replies.defer_error = Some(error);
-        VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None).await;
+        VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None, None).await;
         assert_eq!(*trace.lock().unwrap(), ["defer"]);
         assert!(replies.completed.lock().unwrap().is_empty());
     }
@@ -2247,7 +2247,7 @@ async fn responder_completion_failure_does_not_repeat_channel_creation() {
     let runtime = test_runtime(trace.clone());
     let mut replies = Replies::new(trace.clone());
     replies.complete_error = Some(RoomHttpError::UnknownOutcome);
-    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None).await;
+    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None, None).await;
     assert_eq!(
         *trace.lock().unwrap(),
         ["defer", "create", "add_creator:500", "complete"]
@@ -2671,10 +2671,11 @@ fn import_harness(
 ) -> (VoiceRuntime<Store, Http>, Arc<Mutex<VoiceConfiguration>>) {
     let shared_config = Arc::new(Mutex::new(config));
     let shared_downloads = Arc::new(Mutex::new(downloads.into_iter().collect::<VecDeque<_>>()));
+    let closure_config = shared_config.clone();
     let runtime = VoiceRuntime::new(
         move || {
             let mut store = Store::new(trace.clone());
-            store.config = shared_config.clone();
+            store.config = closure_config.clone();
             let mut http = Http::new(trace.clone());
             http.download_results = shared_downloads.clone();
             (store, http)
