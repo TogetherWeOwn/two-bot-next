@@ -1,7 +1,7 @@
 //! Acceptance for the read-only Next-window delta report (TOG-12022).
 //!
-//! Seeds rows before and after `T_f` across five tables (one timestamptz,
-//! one multi-column GREATEST projection, one ISO-8601 TEXT legacy column),
+//! Seeds rows before and after `T_f` across six tables (one timestamptz,
+//! two multi-column GREATEST projections, one ISO-8601 TEXT legacy column),
 //! then asserts exact summary counts, unmeasurable/missing entries that are
 //! reported rather than skipped, a forbidden write inside the snapshot, and
 //! an NDJSON export. Real SQL, not ignored: like `mee6_import_transaction`,
@@ -92,7 +92,9 @@ impl TestDb {
             include_str!("../migrations/0001_funnel.sql"),
             include_str!("../migrations/0002_leveling.sql"),
             include_str!("../migrations/0210_tickets.sql"),
+            include_str!("../migrations/0224_voice_rooms.sql"),
             include_str!("../migrations/0330_guild_settings.sql"),
+            include_str!("../migrations/0412_voice_rooms_ownership_touched.sql"),
         ] {
             sqlx::raw_sql(migration).execute(&pool).await?;
         }
@@ -106,7 +108,10 @@ impl TestDb {
 
     /// One row on each side of `T_f` per table. The `members` pair proves the
     /// multi-column GREATEST: `m-before` joins before `T_f` and never returns,
-    /// while `m-after` joins before `T_f` but is active after it.
+    /// while `m-after` joins before `T_f` but is active after it. The
+    /// `voice_rooms` pair proves the same for the V2 ownership handoff stamp:
+    /// `room-before` is created and last touched before `T_f`, while
+    /// `room-handoff` is created before `T_f` but handed off after it.
     async fn seed(pool: &Pool<Postgres>) -> TestResult {
         sqlx::raw_sql(
             "INSERT INTO events (event_type, member_id, guild_id, occurred_at, recorded_at, source, idempotency_key) VALUES
@@ -123,7 +128,10 @@ impl TestDb {
              ('t-before', 'g', 'ch-before', 'o1', 'closed', '2026-09-29T12:00:00Z'),
              ('t-after', 'g', 'ch-after', 'o2', 'open', '2026-10-01T12:00:00Z');
              INSERT INTO guild_settings (guild_id, key, value, version, updated_by) VALUES
-             ('g', 'ROLLBACK_DELTA_PROBE', '\"probe\"', 1, 'test');",
+             ('g', 'ROLLBACK_DELTA_PROBE', '\"probe\"', 1, 'test');
+             INSERT INTO voice_rooms (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at, owner_touched_at) VALUES
+             ('g', 'room-before', 'creator-1', 'owner-1', 'owner-1', '7', '2026-09-29T12:00:00Z', '2026-09-29T12:00:00Z'),
+             ('g', 'room-handoff', 'creator-1', 'owner-2', 'owner-1', '8', '2026-09-29T12:00:00Z', '2026-10-01T12:00:00Z');",
         )
         .execute(pool)
         .await?;
@@ -164,7 +172,8 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
         assert_eq!(summary.since, SINCE);
         // Exact post-T_f counts on both storage shapes: timestamptz
         // (events, member_levels, guild_settings), multi-column GREATEST
-        // (members: only the row active after T_f), ISO-8601 TEXT (tickets).
+        // (members: only the row active after T_f; voice_rooms: only the
+        // room handed off after T_f), ISO-8601 TEXT (tickets).
         assert_eq!(
             count_of(&summary, "events"),
             Some(("measured".to_owned(), Some(1)))
@@ -185,6 +194,12 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
             count_of(&summary, "guild_settings"),
             Some(("measured".to_owned(), Some(1)))
         );
+        // Only the room handed off after T_f counts: the room created and
+        // last touched before T_f stays out via the GREATEST projection.
+        assert_eq!(
+            count_of(&summary, "voice_rooms"),
+            Some(("measured".to_owned(), Some(1)))
+        );
         // Unmeasurable tables carry a reason, never a silent skip.
         for table in [
             "community_scorecard_attempts",
@@ -194,6 +209,19 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
             "lfg_roles",
             "moderation_channel_executions",
             "web_contract_meta",
+            "voice_creators",
+            "voice_channel_templates",
+            "voice_game_aliases",
+            "voice_random_lists",
+            "voice_random_list_choices",
+            "voice_logging",
+            "voice_logging_mention_members",
+            "voice_logging_mention_roles",
+            "voice_guild_settings",
+            "voice_command_roles",
+            "voice_command_role_members",
+            "voice_logging_settings",
+            "voice_access_controls",
         ] {
             let entry = summary.tables.iter().find(|t| t.table == table).unwrap_or_else(|| {
                 panic!("classified table {table} missing from report")
@@ -245,15 +273,16 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
         );
         tx.rollback().await?;
 
-        // Export emits one NDJSON line per post-T_f row: 1 + 1 + 2 + 1 + 1.
+        // Export emits one NDJSON line per post-T_f row:
+        // 1 + 1 + 2 + 1 + 1 + 1 (voice_rooms handoff).
         let mut lines = Vec::new();
         let exported = export_delta(&db.pool, SINCE, &mut |line: String| {
             lines.push(line);
             Ok::<(), std::io::Error>(())
         })
         .await?;
-        assert_eq!(exported, 6);
-        assert_eq!(lines.len(), 6);
+        assert_eq!(exported, 7);
+        assert_eq!(lines.len(), 7);
         for line in &lines {
             let value: serde_json::Value = serde_json::from_str(line)?;
             assert!(value.get("table").and_then(|t| t.as_str()).is_some());
