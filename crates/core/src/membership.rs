@@ -118,7 +118,10 @@ pub fn member_observation(page_started_at: &str, joined_at: &str) -> Option<Stri
     Some(normalize_timestamp(page_started_at)?.max(normalize_timestamp(joined_at)?))
 }
 
-pub(crate) fn is_membership(kind: EventType) -> bool {
+/// Whether the event type carries membership presence (join/leave only).
+/// Shared with the sqlx adapter so durable duplicate handling skips row
+/// locks for events that can never carry an observation.
+pub fn is_membership(kind: EventType) -> bool {
     matches!(kind, EventType::MemberJoin | EventType::MemberLeave)
 }
 
@@ -134,7 +137,9 @@ pub(crate) fn observation(row: &StoredRow) -> Option<String> {
     metadata_observation(row).or_else(|| normalize_timestamp(&row.occurred_at))
 }
 
-pub(crate) fn advance_observation(row: &mut StoredRow, hint: &str) {
+/// Monotonic duplicate-hint maximum over persisted metadata. Shared with the
+/// sqlx adapter so durable reconfirmations converge exactly like memory.
+pub fn advance_observation(row: &mut StoredRow, hint: &str) {
     let Some(new) = valid_observation(hint) else {
         return;
     };
@@ -146,7 +151,10 @@ pub(crate) fn advance_observation(row: &mut StoredRow, hint: &str) {
     set_observation(row, hint);
 }
 
-pub(crate) fn set_observation(row: &mut StoredRow, hint: &str) {
+/// Attach an observation hint to a new row. Shared with the sqlx adapter so
+/// durable inserts stamp exactly like memory. No-op unless the row is a
+/// membership event and the hint is a valid observation.
+pub fn set_observation(row: &mut StoredRow, hint: &str) {
     if !is_membership(row.event_type) || valid_observation(hint).is_none() {
         return;
     }
@@ -163,7 +171,9 @@ pub(crate) fn set_observation(row: &mut StoredRow, hint: &str) {
 /// Rebuild from immutable occurrences plus monotonic observation metadata.
 /// Stable row identity breaks equal-occurrence attribution ties; leave wins
 /// equal-observation presence ties. Arrival order is never a tie breaker.
-pub(crate) fn project<'a>(rows: impl Iterator<Item = &'a StoredRow>) -> Option<Membership> {
+/// Shared with the sqlx adapter so the durable read model projects exactly
+/// like memory, from the events log rather than arrival-ordered columns.
+pub fn project<'a>(rows: impl Iterator<Item = &'a StoredRow>) -> Option<Membership> {
     let rows: Vec<_> = rows.collect();
     let join = rows
         .iter()

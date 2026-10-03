@@ -88,6 +88,11 @@ export const FORWARDED_FLAGS = [
   "TWO_TEMP_VOICE_PANEL_CHANNEL_ID",
   "TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS",
   "TWO_TEMP_VOICE_SWEEP_SECONDS",
+  // Template assistant (V12): non-secret endpoint URL + model name; the
+  // endpoint credential (if any) travels as its own Container secret, never
+  // through this flag allowlist.
+  "TWO_ASSISTANT_ENDPOINT",
+  "TWO_ASSISTANT_MODEL",
 ] as const;
 
 export type ForwardedFlag = (typeof FORWARDED_FLAGS)[number];
@@ -108,6 +113,7 @@ const REDIRECT = "go.two.gg redirect is served by the Worker (REDIRECT_*), not t
 export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_DATABASE_URL: "cutover/operator CLI secret; the Container reads DATABASE_URL",
   TWO_STAGING_DATABASE_URL: SECRET,
+  TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: SECRET,
   TWO_RESTORE_URL: SECRET,
   TWO_MODERATION_AUDIT_SECRET: SECRET,
   TWO_ONBOARDING_ROTA_PSEUDONYM_KEY: SECRET,
@@ -130,7 +136,9 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_ANTI_NUKE_SNAPSHOT_PATH: "filesystem write path; Container disk is ephemeral",
   TWO_HEALTH_BIND_HOST: BIND,
   TWO_HEALTH_PORT: BIND,
+  TWO_INTERNAL_BIND: BIND,
   TWO_INTERNAL_BIND_HOST: BIND,
+  TWO_INTERNAL_CALLERS: CAPABILITY,
   TWO_INTERNAL_PORT: BIND,
   TWO_REDIRECT_BIND_HOST: BIND,
   TWO_REDIRECT_PORT: BIND,

@@ -171,7 +171,7 @@ impl std::fmt::Debug for SigningKey {
 pub enum KeySpecError {
     #[error("TWO_INTERNAL_KEYS entries must be \"key-id:secret\"")]
     MalformedEntry,
-    #[error("TWO_INTERNAL_KEYS: secret for \"{0}\" is shorter than 32 characters")]
+    #[error("TWO_INTERNAL_KEYS: secret for \"{0}\" is shorter than 32 bytes")]
     SecretTooShort(String),
     #[error("TWO_INTERNAL_ACTIONS=1 but no signing keys are configured")]
     NoKeys,
@@ -2590,12 +2590,14 @@ mod tests {
 
     #[test]
     fn catalog_counts_match_legacy_census() {
-        // Shared legacy census: hot 41 / cold 28 / env_only 48. Count the
-        // actual entries, not just representatives of each class.
+        // Shared legacy census: hot 41 / cold 28 / env_only 48, plus the
+        // receiver's combined bind and caller mapping (both env-only),
+        // plus the two template-assistant endpoint keys (both env-only).
+        // Count actual entries, not just representatives of each class.
         for (class, expected) in [
             (SettingClass::Hot, 41),
             (SettingClass::Cold, 28),
-            (SettingClass::EnvOnly, 48),
+            (SettingClass::EnvOnly, 52),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),

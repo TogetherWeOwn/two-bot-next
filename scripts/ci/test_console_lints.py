@@ -30,6 +30,7 @@ CLI_MODULES = {
     "crates/cutover/src/bin/reengagement_list.rs",
     "crates/cutover/src/bin/report.rs",
     "crates/cutover/src/bin/rollback_delta.rs",
+    "crates/cutover/src/bin/staging_migrate.rs",
 }
 
 

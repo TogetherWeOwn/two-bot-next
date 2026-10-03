@@ -79,6 +79,10 @@ name = "legacy_copy"
 path = "src/bin/legacy_copy.rs"
 
 [[bin]]
+name = "staging-migrate"
+path = "src/bin/staging_migrate.rs"
+
+[[bin]]
 name = "raid-list"
 path = "src/bin/raid_list.rs"
 
