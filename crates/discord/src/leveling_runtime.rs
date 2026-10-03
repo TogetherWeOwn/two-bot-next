@@ -25,6 +25,8 @@ use two_bot_core::{
     NoopFacts, Snowflake,
 };
 
+use two_bot_core::automod_runtime::FunnelDisposition;
+
 use crate::{
     pipeline::MessageEligibility, ActionExecutor, DiscordError, InviteSource, NoClassification,
     NoInvites, Pipeline, PipelineSnapshots,
@@ -363,6 +365,20 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
     ) -> Vec<AwardRequest> {
         self.pipeline
             .handle_at_with_eligibility(event, at, eligibility);
+        self.pending.take()
+    }
+
+    /// [`Self::collect_at`] under the automod decision: the disposition and the
+    /// replay clock reach the funnel in one call, never `collect_at` as well.
+    /// `CaptureOnly` and `None` queue no award, so XP stays once per message.
+    pub fn collect_at_with_message_disposition(
+        &self,
+        event: &Event,
+        at: &str,
+        disposition: FunnelDisposition,
+    ) -> Vec<AwardRequest> {
+        self.pipeline
+            .handle_at_with_message_disposition(event, at, disposition);
         self.pending.take()
     }
 }
