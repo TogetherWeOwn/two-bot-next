@@ -225,6 +225,30 @@ pub fn plan_placement(request: PlacementRequest<'_>) -> Result<usize, PlacementE
     })
 }
 
+/// Discord `position` to create the new channel with so it takes the slot at
+/// `index` (as returned by [`plan_placement`]) among the category's channels.
+///
+/// The new channel asks for the slot of the channel currently at `index`, so
+/// Discord inserts it there and pushes that channel and everything after it
+/// down; no existing channel is patched. Appending (`index` at or past the
+/// end) asks for one past the last channel's position. Raw positions may be
+/// sparse or negative-free; ties break by ascending ID like `plan_placement`.
+/// This is the single place that encodes the assumed create-time position
+/// semantics, so a staging observation that disagrees changes only this
+/// function.
+#[must_use]
+pub fn position_for_index(category_order: &[CategoryChannel], index: usize) -> u64 {
+    let mut sorted: Vec<&CategoryChannel> = category_order.iter().collect();
+    sorted.sort_by_key(|entry| (entry.position, entry.id));
+    let clamp = |position: i32| u64::try_from(position).unwrap_or(0);
+    match sorted.get(index) {
+        Some(entry) => clamp(entry.position),
+        None => sorted
+            .last()
+            .map_or(0, |last| clamp(last.position).saturating_add(1)),
+    }
+}
+
 /// Resolve a new room's starting limit and privacy from its creator's
 /// `/defaultlimit` and `/alwaysprivate` defaults. Only the validated range
 /// `0..=99` is accepted (0 means unlimited); anything else is refused rather

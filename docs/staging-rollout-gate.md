@@ -1,8 +1,13 @@
 # Intended staging rollout acceptance
 
-`deploy-staging.yml` runs `scripts/staging_rollout.py` before and after a successful
-Wrangler deployment. It does not accept a health response from an old singleton.
-This is a **staging-only** gate, not production authorization or a migration tool.
+When enabled, `deploy-staging.yml` runs `scripts/staging_rollout.py` before and
+after a successful Wrangler deployment. The `deploy` job is currently suspended
+(`if: ${{ false }}`); the chain below is the intended gate on re-activation
+(re-enable tracked on [TOG-12852](/TOG/issues/TOG-12852)). Ownership-control
+`preflight` (before prepare) and `deployment-takeover` (after deploy) steps
+flank the gate but live outside `staging_rollout.py`. The gate does not
+accept a health response from an old singleton. This is a **staging-only** gate,
+not production authorization or a migration tool.
 
 ## Provenance chain
 
@@ -11,11 +16,15 @@ This is a **staging-only** gate, not production authorization or a migration too
    IDs. An absent/ambiguous application or an in-flight prior rollout fails closed.
 2. Generate a temporary JSON Wrangler config from the checked-in TOML. Keep the
    staging Container/DO wiring, use absolute source/build paths, and pass two
-   non-secret Docker build arguments: the exact `GITHUB_SHA` and the unique
-   `GITHUB_RUN_ID-GITHUB_RUN_ATTEMPT`. The Rust `/readyz` response compiles these
-   values into the binary; runtime environment overrides cannot substitute them.
-   OCI revision/build-ID labels repeat them for narrowly scoped image inspection.
-   A redeploy of the same SHA therefore still produces a new image identity.
+   non-secret Docker build arguments as `image_vars`: `BOT_BUILD_REVISION` (the
+   exact `GITHUB_SHA`) and `BOT_BUILD_ID` (the unique
+   `GITHUB_RUN_ID-GITHUB_RUN_ATTEMPT`). The Rust `/readyz` response compiles these
+   values into the binary as `build_revision`/`build_id`; runtime environment
+   overrides cannot substitute them. The `org.opencontainers.image.revision` and
+   `com.togetherweown.build-id` OCI labels repeat them for narrowly scoped image
+   inspection. A redeploy of the same SHA therefore still produces a new image
+   identity. Prepare also requires the `CF_VERSION_METADATA` version-metadata
+   binding in the staging config and sets `rollout_kind: full_auto`.
 3. Read the **fresh** `WRANGLER_OUTPUT_FILE_PATH` NDJSON only after Wrangler exits
    successfully. Require one pinned 4.143.1 session and one staging deploy record
    with the expected Worker name, fresh timestamp and concrete Worker version.
@@ -39,8 +48,9 @@ This is a **staging-only** gate, not production authorization or a migration too
 7. Require the intended Worker version at 100% traffic, `/readyz` **200** with all
    components ready and the exact compiled revision/build ID, and `/health` 200.
    Both responses carry `x-two-worker-version`, overwritten by the outer Worker
-   from its staging version-metadata binding—not trusted from the container.
-   Re-read rollout/Worker control-plane state after the runtime probes.
+   from its `CF_VERSION_METADATA` staging version-metadata binding—not trusted
+   from the container. Re-read rollout/Worker control-plane state after the
+   runtime probes.
 
 ## Bounds and fail-closed cases
 

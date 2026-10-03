@@ -64,6 +64,15 @@ pub const DUMP_TABLES: &[&str] = &[
     "automod_processed_messages",
     "self_role_audit",
     "self_role_panel_claims",
+    "self_role_exchanges",
+    "self_role_exchange_baselines",
+    // Appended after the frozen v3 prefix: per-delivery automod arbitration
+    // (0221 + counted/preserved-match columns in 0222/0223), one-shot gateway
+    // boot directives (0321) and the erasure accountability log (0410). None
+    // carries foreign keys, so order among them is free.
+    "automod_delivery_claims",
+    "gateway_boot_directives",
+    "member_erasure_audit",
     "member_levels",
     "xp_awards",
     "level_role_rewards",
@@ -100,12 +109,10 @@ pub const DUMP_TABLES: &[&str] = &[
     "internal_action_log",
     "internal_discord_events",
     "moderation_channel_executions",
-    "automod_delivery_claims",
-    "gateway_boot_directives",
-    "member_erasure_audit",
     "invite_campaigns",
     "voice_creators",
     "voice_rooms",
+    "voice_text_companions",
 ];
 
 /// Frozen v3 tables no longer created by cutover migrations. Keep their data
@@ -113,8 +120,6 @@ pub const DUMP_TABLES: &[&str] = &[
 pub const OPTIONAL_LEGACY_TABLES: &[&str] = &[
     "moderation_warnings",
     "moderation_scheduled_unbans",
-    "containment_events",
-    "containment_incidents",
     "automation_commands",
 ];
 

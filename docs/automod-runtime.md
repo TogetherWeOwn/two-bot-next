@@ -175,10 +175,50 @@ client, router, timer or task; every read and mutation goes through the shared
    retried, leased or resent; they wait for recorded reconciliation.
 
 `RestAutomodFacts` is the production `AutomodFacts`; `AutomodStore` is the
-production `AutomodClaimLedger`. The bot's gateway loop wiring (calling
-`process` in gateway order, `expire_repeat_history` on the maintenance tick,
-partial-edit routing before parse, text-automation suppression and durable
-funnel idempotency) is the next slice.
+production `AutomodClaimLedger`.
+
+## Gateway loop wiring (TOG-12354)
+
+`crates/bot/src/automod_gateway.rs` plus `gateway.rs` wire the orchestrator
+into the one shared async gateway loop. Active only when `TWO_AUTOMOD=1`;
+otherwise the loop is unchanged.
+
+- **Order.** In the serial dispatch worker, per dispatch and before the funnel,
+  `process` runs once for the translated delivery, bounded by 12 s (a timeout
+  keeps a create capture-only and leaves the claim for reconciliation). The
+  returned disposition goes to `handle_at_with_message_disposition` exactly
+  once; `handle`/`handle_at` is never also called.
+- **Partial MESSAGE_UPDATE.** At reception the raw `d` object is decoded with
+  `PartialEdit::from_dispatch` + `partial_edit_delivery` BEFORE
+  `twilight_gateway::parse`. A parse failure is tolerated only for a dispatch
+  that decoded this way; there is then no event for the funnel and nothing to
+  award. Other parse failures stay fatal.
+- **Production wiring.** `AutomodStore` ledger, `RestAutomodFacts` and the
+  command runtime's `ActionExecutor` (a private executor is built only when the
+  command runtime is parked). Owen comes from `TWO_OWEN_USER_ID` and protected
+  roles from `TWO_MODERATION_PROTECTED_ROLE_IDS`, never from
+  `TWO_AUTOMOD_ENFORCE`. The scope is the configured guild with no live
+  approval, so only the staging guild is ever inspected. An enabled but invalid
+  configuration (including a missing Owen id) fails gateway start rather than
+  running unmoderated.
+- **Maintenance.** `expire_repeat_history` runs on the existing periodic-job
+  supervisor (`automod_expiry`, every 60 s, no I/O); no private timer.
+- **Text automations.** The command runtime's message hook is no longer fired at
+  reception for creates while automod is active; the worker fires it only for an
+  accepted create (`Accept`). Matched, unavailable and timed-out creates are
+  rejected for automations as well as for XP/activity.
+- **Funnel once-per-message.** The funnel's writes commit with the gateway
+  checkpoint, so a dispatch reaching `process` is not yet in the funnel. A
+  replay after a crash between the claim write and the checkpoint finds a
+  settled claim (`Duplicate(Some(receipt))`) or an unsettled one
+  (`Duplicate(None)`) and restores the funnel once from the receipt via
+  `Activation::uncommitted_disposition` (matched → capture only, clean → accept,
+  unsettled → capture only). No Discord effect is resent. A dry-run to enforce
+  change owns a new claim and the same rule applies, so a message is funnelled
+  once either way. Covered by `crash_before_checkpoint_restores_the_funnel_once_without_resending`
+  and `mode_change_after_crash_funnels_the_message_once`.
+
+Staging soak remains a separate gate; this change supplies no live approval.
 
 ## Gates and evidence
 
@@ -213,5 +253,5 @@ cargo clippy --offline --locked -p two-bot-core -p two-bot-discord --features tw
 cargo fmt --all -- --check
 ```
 
-Gateway-loop wiring, durable production funnel integration and staging soak
-remain the follow-up's acceptance gates.
+Staging soak remains the separate acceptance gate. The gateway test double
+for the loop itself is the unit coverage in `crates/bot/src/automod_gateway_tests.rs`.

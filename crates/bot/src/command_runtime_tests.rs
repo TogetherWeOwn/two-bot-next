@@ -294,7 +294,7 @@ fn user(id: u64, bot: bool) -> User {
     }
 }
 
-fn message(id: u64, channel: u64, bot: bool, guild: Option<u64>) -> Message {
+pub(crate) fn message(id: u64, channel: u64, bot: bool, guild: Option<u64>) -> Message {
     Message {
         activity: None,
         application: None,
@@ -337,7 +337,11 @@ fn message(id: u64, channel: u64, bot: bool, guild: Option<u64>) -> Message {
 }
 
 #[allow(deprecated)]
-fn slash(name: &str, channel: Option<u64>, options: Vec<CommandDataOption>) -> Interaction {
+pub(crate) fn slash(
+    name: &str,
+    channel: Option<u64>,
+    options: Vec<CommandDataOption>,
+) -> Interaction {
     Interaction {
         app_permissions: None,
         application_id: Id::new(1111),

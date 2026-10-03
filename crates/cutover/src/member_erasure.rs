@@ -213,6 +213,10 @@ pub async fn erase_member(
             // other state - fresh, started-uncertain, counted, released - must
             // keep its row or a gateway retry could sanction twice.
             ("automod_delivery_claims", "result_json IS NULL"),
+            // An in-flight or uncertain incident is the anti-nuke block and
+            // receipt: removing it could release a block or let a retry
+            // re-contain. Only settled incidents are erased.
+            ("containment_incidents", "state IN ('containing', 'uncertain')"),
         ] {
             let entry = plan
                 .tables

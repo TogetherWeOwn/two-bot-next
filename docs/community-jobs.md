@@ -155,8 +155,9 @@ the env gates below.
   `bot::website_jobs::serve`) resolves the env gates once at boot. A gated-off
   or misconfigured job logs `job_disabled` (warn on `invalid_config`), produces
   no supervised job, and is marked parked in the `/readyz` status map alongside
-  the website jobs. The supervisor's status map therefore always lists all six
-  job names.
+  the website jobs. The supervisor's status map therefore always lists all eight
+  job names (the six website/community jobs plus the audit-retry job and the
+  self-role recovery job, each parked when its service is unregistered).
 
 ## Verification
 
