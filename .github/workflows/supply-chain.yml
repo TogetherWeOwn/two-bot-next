@@ -14,10 +14,13 @@ name: supply-chain
 # Org convention for every change that lands on main (TogetherWeOwn GitHub standard):
 #   * PR title = Conventional Commits header: `type(scope): summary`, <= 100 chars, no trailing period.
 #     Types: feat fix perf refactor test docs build ci chore revert style security.
-#   * PR body follows .github/pull_request_template.md: what changed, why, and how it was tested.
-#   * This repo is public. No card reference is required, and an internal tracker ID (a `TOG-` or
-#     `PAP-` prefix followed by digits) must not appear in a title, body, commit subject or branch
-#     name. pr-lint warns on one in the title, body or a commit subject; it does not fail yet.
+#   * PR body follows .github/pull_request_template.md: Thinking Path, Linked Issues or Issue
+#     Description, What Changed, Verification, Risks, Model Used, Checklist. The rules live in
+#     .github/scripts/pr_standards.py with tests beside it; this job runs both.
+#   * This repo is public. No card reference is required (`REQUIRE_CARD_REF: "false"`), and an
+#     internal tracker ID (a `TOG-` or `PAP-` prefix followed by digits) must not appear in a
+#     title, body, commit subject or branch name. The new body/reference rules warn
+#     (`PR_STANDARDS_MODE: "warn"`); title format and an empty body always fail.
 #   * Repos are squash-merge only and the squash commit title is the PR title, so the history on
 #     main is one conventional commit per PR. The push job below flags any commit that bypasses it
 #     (for example a merge call that passes its own commit_title).
@@ -42,6 +45,13 @@ on:
 
 permissions: {}
 
+env:
+  # Public repo: the body carries no card reference. New body/reference rules
+  # warn while open PRs migrate to the template, then flip to "error".
+  # Title format and an empty body are errors in both modes.
+  REQUIRE_CARD_REF: "false"
+  PR_STANDARDS_MODE: "warn"
+
 # Superseded PR runs (pushes and title/body edits) cancel the in-flight one.
 # Push-to-main runs key on the commit SHA, so every main commit still gets
 # exactly one pr-lint and one gitleaks run.
@@ -59,6 +69,12 @@ jobs:
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'pr-lint') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: true
+
       - name: Resolve PR title/body
         id: pr
         env:
@@ -145,11 +161,13 @@ jobs:
                   raise SystemExit("Dispatch ref/SHA must match an open same-repository PR targeting main")
               title, body, author = pr["title"], pr["body"], pr["author"]["login"]
               body = resolve_overflow(body, pr["headRefName"], head_name, pr["baseRefName"])
+              head_ref = pr["headRefName"]
               event = "pull_request"
           else:
               title = os.environ.get("EVENT_TITLE", "")
               body = os.environ.get("EVENT_BODY", "")
               author = os.environ.get("EVENT_AUTHOR", "")
+              head_ref = os.environ.get("EVENT_HEAD_REF", "")
               # Ordinary edited/reopened PRs can carry the same native overflow
               # link; resolve it through the same gates so body lint sees the
               # full notes instead of failing on the link.
@@ -167,7 +185,8 @@ jobs:
               handle.write(body or "")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              for key, value in {"title": title, "author": author, "event": event}.items():
+              for key, value in {"title": title, "author": author, "event": event,
+                                 "head_ref": head_ref}.items():
                   delimiter = uuid.uuid4().hex
                   while delimiter in (value or "").splitlines():
                       delimiter = uuid.uuid4().hex
@@ -175,108 +194,35 @@ jobs:
               delimiter = uuid.uuid4().hex
               output.write(f"body_file<<{delimiter}\n{body_path}\n{delimiter}\n")
 
-      - name: Check title, body and commits
+      - name: Unit-test the lint
+        run: python3 -m unittest discover -s .github/scripts -p 'test_pr_standards.py'
+
+      - name: Check title, body, branch and commits
         env:
           EVENT: ${{ steps.pr.outputs.event }}
           TITLE: ${{ steps.pr.outputs.title }}
           BODY_FILE: ${{ steps.pr.outputs.body_file }}
           AUTHOR: ${{ steps.pr.outputs.author }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
           COMMITS: ${{ toJSON(github.event.commits) }}
-          # Read the PR's commit subjects through the API for the internal-ID warning.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
-          REPO: ${{ github.repository }}
         shell: python3 {0}
         run: |
-          import json, os, re, subprocess, sys
+          import os, sys
 
-          TYPES = "feat|fix|perf|refactor|test|docs|build|ci|chore|revert|style|security"
-          HEADER = re.compile(rf"^({TYPES})(\([A-Za-z0-9._/,-]+\))?!?: \S.*$")
-          HELP = ("Expected a Conventional Commits header, e.g. 'fix(auth): refuse expired sudo "
-                  "sessions' or 'feat(events): shareable event page'. Allowed types: "
-                  + TYPES.replace("|", ", ") + ".")
-          # Internal tracker IDs never belong in a public repo. Warn only, for now.
-          INTERNAL_ID = re.compile(r"\b(?:TOG|PAP)-\d+\b")
+          # The body travels as a file, never env or step outputs: stored
+          # release notes can exceed the per-string execve limit (E2BIG) that
+          # would otherwise keep this process from starting at all. The gate
+          # reads env, so bridge the two in-process, where no such limit
+          # applies.
+          root = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
+          sys.path.insert(0, os.path.join(root, ".github/scripts"))
+          import pr_standards
 
-          def read_body():
-              # The body arrives as a file path, never env: stored release
-              # notes can exceed the per-string execve limit (E2BIG) that
-              # would otherwise keep this process from starting at all.
-              path = os.environ.get("BODY_FILE", "")
-              with open(path, encoding="utf-8") as handle:
-                  return handle.read()
-
-          def header_errors(text):
-              errs = []
-              if not HEADER.match(text):
-                  errs.append("not a Conventional Commits header")
-              if len(text) > 100:
-                  errs.append(f"{len(text)} chars (max 100)")
-              if text.rstrip().endswith("."):
-                  errs.append("ends with a period")
-              return errs
-
-          def internal_id_warning(where, text):
-              ids = sorted(set(INTERNAL_ID.findall(text or "")))
-              if ids:
-                  print(f"::warning title=Internal ID::{where} mentions {', '.join(ids)}. This repo "
-                        "is public: remove internal tracker IDs (TOG-, PAP-) and link public "
-                        "GitHub issues instead.")
-
-          def pr_commit_subjects():
-              # Warn-only input: an API failure must never fail the check.
-              number = os.environ.get("PR_NUMBER", "")
-              if not number:
-                  return []
-              try:
-                  out = subprocess.check_output([
-                      "gh", "api", "--paginate", f"repos/{os.environ['REPO']}/pulls/{number}/commits",
-                      "--jq", '.[] | .sha[0:10] + " " + (.commit.message | split("\\n")[0])',
-                  ], text=True)
-              except Exception:
-                  print("::notice title=Commit subjects::Could not read the PR commits; "
-                        "skipped the internal-ID check on commit subjects.")
-                  return []
-              return [line.split(" ", 1) for line in out.splitlines() if " " in line]
-
-          failed = False
-          if os.environ["EVENT"] == "pull_request":
-              title = os.environ.get("TITLE", "").strip()
-              body = read_body() or ""
-              author = os.environ.get("AUTHOR", "")
-              if author.endswith("[bot]") and author.startswith(("dependabot", "renovate")):
-                  if header_errors(title):
-                      print(f"::warning::{author} title '{title}' is not conventional; set "
-                            "commit-message.prefix (e.g. chore(deps)) in the bot config.")
-                  sys.exit(0)
-              errs = header_errors(title)
-              if errs:
-                  failed = True
-                  print(f"::error title=PR title::'{title}': {'; '.join(errs)}. {HELP}")
-              text = re.sub(r"<!--.*?-->", "", body, flags=re.S)
-              if len(re.sub(r"\s", "", text)) < 40:
-                  failed = True
-                  print("::error title=PR body::The description is empty. Say what changed, why, "
-                        "and how it was tested (see the PR template).")
-              internal_id_warning("The PR title", title)
-              internal_id_warning("The PR body", body)
-              for sha, subject in pr_commit_subjects():
-                  internal_id_warning(f"Commit {sha} subject", subject)
-          else:
-              for c in json.loads(os.environ.get("COMMITS") or "[]") or []:
-                  subject = (c.get("message") or "").splitlines()[0] if c.get("message") else ""
-                  if subject.startswith(("Merge ", "Revert \"")):
-                      continue
-                  internal_id_warning(f"Commit {c.get('id','')[:10]} subject", subject)
-                  errs = header_errors(subject)
-                  if errs:
-                      failed = True
-                      print(f"::error title=Commit on main::{c.get('id','')[:10]} '{subject}': "
-                            f"{'; '.join(errs)}. Merge PRs with squash and the PR title as the "
-                            "commit title.")
-          if failed:
-              sys.exit(1)
-          print("PR conventions OK")
+          if os.environ.get("EVENT") == "pull_request":
+              with open(os.environ["BODY_FILE"], encoding="utf-8") as handle:
+                  os.environ["BODY"] = handle.read()
+          sys.exit(pr_standards.main())
 
   # name pinned equal to the required-check context: `gitleaks` is required
   # on main. Runs after pr-lint in the same workflow so the pair holds one

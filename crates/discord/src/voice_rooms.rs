@@ -112,6 +112,17 @@ pub fn can_manage_room(permissions: Option<Permissions>) -> bool {
     })
 }
 
+/// V4 vote-kick enforcement: the member-scoped Connect deny is a permission
+/// overwrite write (Manage Roles) and the disconnect is a Move Members write.
+#[must_use]
+pub fn can_enforce_kick(permissions: Option<Permissions>) -> bool {
+    permissions.is_some_and(|permissions| {
+        permissions.contains(
+            Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES | Permissions::MOVE_MEMBERS,
+        )
+    })
+}
+
 /// Attributes captured from the live creator, not from an earlier gateway frame.
 /// Overwrites are resolved by the worker according to PermissionSource, then
 /// included in the POST. No post-create permission patch is needed.
