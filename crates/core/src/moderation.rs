@@ -613,10 +613,10 @@ mod tests {
         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(&names[..4], ["rank", "leaderboard", "help", "attendance"]);
         assert_eq!(
-            &names[18..23],
+            &names[19..24],
             ["ban", "tempban", "kick", "timeout", "warn"]
         );
-        assert_eq!(&names[23..], ["purge", "slowmode", "lockdown", "unlock"]);
+        assert_eq!(&names[24..], ["purge", "slowmode", "lockdown", "unlock"]);
         assert!(merged.iter().all(|d| !d.dm_permission));
     }
 

@@ -415,8 +415,10 @@ mod tests {
                 }
             }
             let actual = merge_commands(&[builtins, duplicates], &custom);
-            if builtin_count + 2 > 100 {
-                prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 2)));
+            // 3 core (rank, leaderboard, help) plus the generated builtins;
+            // the duplicated slice adds no new names.
+            if builtin_count + 3 > 100 {
+                prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 3)));
             } else if expected.len() > 100 {
                 prop_assert_eq!(actual, Err(RegistryError::TotalLimit(expected.len())));
             } else {
@@ -464,7 +466,7 @@ mod tests {
         }];
         let merged = merge_commands(&[extra], &custom).expect("merges");
         let names: Vec<_> = merged.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "rsvp", "faq"]);
+        assert_eq!(names, ["rank", "leaderboard", "help", "rsvp", "faq"]);
     }
 
     #[test]
@@ -477,8 +479,8 @@ mod tests {
         )];
         let rsvp_totals = vec![CommandDefinition::new("attendance", "Show RSVP totals")];
         let merged = merge_commands(&[scorecard, rsvp_totals], &[]).expect("merges");
-        assert_eq!(merged.len(), 3); // rank, leaderboard, attendance×1
-        assert_eq!(merged[2].description, "Record a verified attendee");
+        assert_eq!(merged.len(), 4); // rank, leaderboard, help, attendance×1
+        assert_eq!(merged[3].description, "Record a verified attendee");
     }
 
     #[test]
@@ -507,12 +509,13 @@ mod tests {
         ];
         let merged = merge_commands(&[], &custom).expect("merges");
         let names: Vec<_> = merged.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "faq"]);
+        assert_eq!(names, ["rank", "leaderboard", "help", "faq"]);
     }
 
     #[test]
     fn builtin_limit_enforced() {
-        let extra: Vec<CommandDefinition> = (0..99)
+        // 3 core + 98 fillers = 101: one past the ceiling.
+        let extra: Vec<CommandDefinition> = (0..98)
             .map(|i| CommandDefinition::new(&format!("cmd-{i}"), "filler"))
             .collect();
         let err = merge_commands(&[extra], &[]).expect_err("must exceed 100");
