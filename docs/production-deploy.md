@@ -94,8 +94,12 @@ whole watch so the rollback dispatch never has to hunt for it.
 - `error-class`: fixed vocabulary only, from
   [startup-diagnostics.md](startup-diagnostics.md) —
   `listener_bind_failed`, `gateway_override_invalid`,
-  `database_connect_failed`, `checkpoint_load_failed`,
-  `milestones_load_failed`, `gateway_runtime_failed`,
+  `database_connect_failed`, `store_unavailable`,
+  `gateway_pool_connect_failed`, `checkpoint_load_failed`,
+  `onboarding_gates_invalid`, `onboarding_init_failed`,
+  `milestones_load_failed`, `automod_config_invalid`,
+  `automod_executor_failed`, `gateway_runtime_failed`,
+  `gateway_task_panicked`,
   `container_service_failed`, `container_lifecycle_failed`,
   `container_unavailable`. Never paste raw messages, URLs, credentials or
   backup paths into the log.
