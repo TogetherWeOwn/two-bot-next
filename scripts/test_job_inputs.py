@@ -372,6 +372,58 @@ class WorkflowSurfaceTests(unittest.TestCase):
                  if "job-inputs.outputs." in line]
         self.assertGreaterEqual(len(gated), 10)
 
+    @staticmethod
+    def check_job_steps(text):
+        """Yield (name, body) for each `check` job step; comments dropped."""
+        body = text.split("\n  check:", 1)[1].split("\n  parity-docs:", 1)[0]
+        body = body.split("\n    steps:\n", 1)[1]
+        for block in re.split(r"(?m)^      - (?=\S)", body)[1:]:
+            lines = [line for line in block.splitlines()
+                     if not line.lstrip().startswith("#")]
+            name = re.search(r"name:\s*(.+)", "\n".join(lines))
+            yield (name.group(1).strip() if name else lines[0].strip(),
+                   "\n".join(lines))
+
+    # What a step must not do on a rust=false PR: that run never installs the
+    # toolchain (no `cargo`) and never creates `two_bot_test_ci`, so any step
+    # that needs either must carry the selector guard. TOG-12945: send
+    # admission, reengagement, staging migrate and the Docker manifests check
+    # ran unguarded and failed every non-Rust PR.
+    NEEDS_RUST = re.compile(
+        r"\bcargo\b|\bcreatedb\b|\bdropdb\b|two_bot_test_ci|TEST_DATABASE_URL"
+        r"|rust-toolchain|rust-cache|cargo-deny|check-docker-manifests\.py")
+    # Always-on gates that only touch the checkout and the `agent-testdb`
+    # service; they never need the toolchain or the CI database.
+    ALWAYS_ON = ("Job-container prerequisites",)
+
+    def test_every_rust_or_db_step_in_check_job_is_gated(self):
+        steps = list(self.check_job_steps(self.text))
+        self.assertGreater(len(steps), 40, "step parser lost the check job")
+        for name, body in steps:
+            if name.startswith(self.ALWAYS_ON) or not self.NEEDS_RUST.search(body):
+                continue
+            with self.subTest(step=name):
+                self.assertRegex(
+                    body,
+                    r"(?m)^\s+if:.*needs\.job-inputs\.outputs\.rust != 'false'",
+                    f"{name!r} needs the Rust toolchain or the CI database "
+                    "but is not guarded by the rust selector")
+
+    def test_guard_scan_flags_an_unguarded_db_step(self):
+        # Self-test of the scan: dropping the guard on the step that failed
+        # PR #346 must be caught, and the real step must satisfy it.
+        needle = "      - name: Durable Discord send admission"
+        head, tail = self.text.split(needle, 1)
+        step, rest = tail.split("\n      - name:", 1)
+        guard = "        if: needs.job-inputs.outputs.rust != 'false'\n"
+        self.assertIn(guard, step)
+        weakened = head + needle + step.replace(guard, "") + "\n      - name:" + rest
+        flagged = [name for name, body in self.check_job_steps(weakened)
+                   if self.NEEDS_RUST.search(body)
+                   and not re.search(r"(?m)^\s+if:.*outputs\.rust != 'false'", body)]
+        self.assertEqual(
+            flagged, ["Durable Discord send admission (isolated DBs and mock HTTP only)"])
+
     def test_check_job_needs_parity_docs(self):
         head = self.text.split("\n  check:")[1].split("steps:", 1)[0]
         self.assertIn("parity-docs", head)
