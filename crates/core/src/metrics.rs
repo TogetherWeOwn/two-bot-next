@@ -52,6 +52,8 @@ pub const REST_ROUTES: &[&str] = &[
     "POST /guilds/:guild/scheduled-events",
     "PATCH /guilds/:guild/scheduled-events/:event",
     "DELETE /guilds/:guild/scheduled-events/:event",
+    "POST /guilds/:guild/channels",
+    "DELETE /channels/:channel",
     "other",
 ];
 const RESULTS: &[&str] = &["2xx", "3xx", "4xx", "429", "5xx", "transport"];
