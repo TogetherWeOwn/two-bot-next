@@ -182,13 +182,6 @@ impl StoreSettings {
         }
     }
 
-    /// Re-read on every observation (tests).
-    #[cfg(test)]
-    pub(crate) fn with_max_age(mut self, max_age: Duration) -> Self {
-        self.max_age = max_age;
-        self
-    }
-
     async fn refresh(&mut self) {
         let store = SettingsStore::new(&self.pool);
         let stale = self.cache.as_ref();
