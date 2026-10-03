@@ -4773,14 +4773,16 @@ fn notice_text_is_bounded() {
     assert!(notice_text(&failure, DetailLevel::Full).chars().count() <= NOTICE_MAX_CHARS);
 }
 
+/// Guild-less ballot interaction: the shared builder always attaches a
+/// guild, but unscoped presses must stay silent too.
 #[allow(deprecated)]
-fn component_interaction(custom_id: &str, with_guild: bool) -> Interaction {
-    let mut interaction = voice_interaction(None, None, with_guild);
+fn guildless_component_interaction(custom_id: &str) -> Interaction {
+    let mut interaction = voice_interaction(None, None, false);
     interaction.kind = InteractionType::MessageComponent;
     interaction.data = Some(InteractionData::MessageComponent(Box::new(
-        twilight_model::application::interaction::message_component::MessageComponentInteractionData {
+        MessageComponentInteractionData {
             custom_id: custom_id.to_owned(),
-            component_type: twilight_model::channel::message::component::ComponentType::Button,
+            component_type: ComponentType::Button,
             resolved: None,
             values: Vec::new(),
         },
@@ -4854,7 +4856,7 @@ fn parse_ballot_buttons_by_vote_id() {
             },
         ),
     ] {
-        let interaction = component_interaction(custom_id, true);
+        let interaction = component_interaction(custom_id, None, MEMBER);
         assert_eq!(parse_voice_command(&interaction), Some(expected));
     }
 }
@@ -4868,10 +4870,10 @@ fn parse_foreign_buttons_stay_silent() {
         "votekick:7000",
         "votekick:",
     ] {
-        let interaction = component_interaction(custom_id, true);
+        let interaction = component_interaction(custom_id, None, MEMBER);
         assert_eq!(parse_voice_command(&interaction), None);
     }
-    let guildless = component_interaction("votekick:7000:yes", false);
+    let guildless = guildless_component_interaction("votekick:7000:yes");
     assert_eq!(parse_voice_command(&guildless), None);
 }
 
