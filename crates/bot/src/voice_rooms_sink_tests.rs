@@ -10,6 +10,9 @@ impl RoomPersistence for Arc<Store> {
     async fn rooms(&self, guild: u64) -> Result<Vec<VoiceRoom>, StoreError> {
         self.as_ref().rooms(guild).await
     }
+    async fn access_controls(&self, guild: u64) -> Result<AccessControls, StoreError> {
+        self.as_ref().access_controls(guild).await
+    }
     async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), StoreError> {
         self.as_ref().add_creator(creator).await
     }
