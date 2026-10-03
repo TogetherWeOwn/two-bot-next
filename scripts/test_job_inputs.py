@@ -359,7 +359,7 @@ class WorkflowSurfaceTests(unittest.TestCase):
 
     def test_consumer_jobs_wait_on_selector(self):
         for job in ("check", "community-db", "feeds-db", "tickets-postgres",
-                    "worker"):
+                    "worker", "required-checks"):
             head = self.text.split(f"\n  {job}:")[1].split("steps:", 1)[0]
             with self.subTest(job=job):
                 self.assertIn("job-inputs", head)
