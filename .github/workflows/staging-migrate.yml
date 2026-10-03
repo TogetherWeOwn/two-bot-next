@@ -84,6 +84,10 @@ jobs:
           RECOVERY_REF: ${{ inputs.recovery_evidence_ref }}
           ACL_REF: ${{ inputs.acl_plan_ref }}
           EXPECTED_PENDING: ${{ inputs.expected_pending }}
+        # `shell: bash` runs with `-eo pipefail`. The container's default `sh`
+        # has no pipefail, so a refusal (exit 2) or failure (exit 1) piped into
+        # `tee` left the job green with nothing migrated.
+        shell: bash
         run: |
           ./target/debug/staging-migrate "--$MODE" --source-sha "$SOURCE_SHA" \
             --staging-host "$STAGING_HOST" --staging-database "$STAGING_DATABASE" \
