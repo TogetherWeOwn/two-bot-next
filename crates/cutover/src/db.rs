@@ -83,6 +83,15 @@ pub async fn connect_with_tls(
     Ok(db)
 }
 
+/// Apply the same embedded migrations to an already-authorized pool.
+/// Scratch drills supply explicit test-only options without credential fallback.
+pub async fn migrate_pool(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
+    sqlx::migrate!("./migrations")
+        .run(pool)
+        .await
+        .map_err(|_| sqlx::Error::InvalidArgument("database migration failed".to_owned()))
+}
+
 /// Cutover database handle.
 #[derive(Debug, Clone)]
 pub struct CutoverDb {
@@ -97,10 +106,7 @@ impl CutoverDb {
 
     /// Apply the crate's embedded migrations.
     pub async fn migrate(&self) -> Result<(), sqlx::Error> {
-        sqlx::migrate!("./migrations")
-            .run(&self.pool)
-            .await
-            .map_err(|_| sqlx::Error::InvalidArgument("database migration failed".to_owned()))
+        migrate_pool(&self.pool).await
     }
 
     /// Close idle connections (drains the pool).
