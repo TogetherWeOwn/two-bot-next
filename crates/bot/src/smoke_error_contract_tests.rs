@@ -13,8 +13,8 @@
 //!
 //! | Smoke path | Watch-log class | User reply (exact) |
 //! | --- | --- | --- |
-//! | unknown command | none — expected refusal, not an error | `This interaction is no longer available.` ([`UNKNOWN_INTERACTION_REPLY`], documented in `docs/interaction-replies.md`) |
-//! | permission denied | none — the harness identity lacks rights, the bot is healthy | `Manage Server permission is required.` ([`RouterRefusal::ManageServerRequired`]) |
+//! | unknown command | none — expected refusal, not an error | `I don't recognize that command. It may have been removed or renamed — pick it again from the / command list.` ([`UNKNOWN_COMMAND_REPLY`], documented in `docs/interaction-replies.md`) |
+//! | permission denied | none — the harness identity lacks rights, the bot is healthy | `You need the Manage Server permission to use this command. Ask a server admin to grant it.` ([`RouterRefusal::ManageServerRequired`]) |
 //! | store unavailable | `store_unavailable` — the only path that is a watch-log error | `Feed command failed; try again.` (safe text, never sqlx internals) |
 //! | invalid input | none — the harness sent a bad argument | `Unknown feed kind.` ([`FeedError::InvalidKind`]) |
 //!
@@ -43,7 +43,7 @@ use twilight_model::id::{AnonymizableId, Id};
 use twilight_model::oauth::ApplicationIntegrationMap;
 use twilight_model::user::User;
 use two_bot_core::feeds::FeedError;
-use two_bot_core::router::replies::UNKNOWN_INTERACTION_REPLY;
+use two_bot_core::router::replies::UNKNOWN_COMMAND_REPLY;
 use two_bot_core::{RouterGates, RouterRefusal};
 use two_bot_discord::ActionExecutor;
 
@@ -363,8 +363,8 @@ async fn unknown_command_reply_matches_the_documented_text() {
         .on_interaction(&slash("not-a-command", Vec::new()))
         .await;
     let content = immediate_content(&mock.requests());
-    assert_eq!(content, "This interaction is no longer available.");
-    assert_eq!(content, UNKNOWN_INTERACTION_REPLY);
+    assert_eq!(content, "I don't recognize that command. It may have been removed or renamed — pick it again from the / command list.");
+    assert_eq!(content, UNKNOWN_COMMAND_REPLY);
     mock.shutdown().await;
 }
 
@@ -385,7 +385,7 @@ async fn permission_denied_reply_matches_the_router_refusal() {
     interaction.member.as_mut().unwrap().permissions = Some(Permissions::empty());
     runtime.on_interaction(&interaction).await;
     let content = immediate_content(&mock.requests());
-    assert_eq!(content, "Manage Server permission is required.");
+    assert_eq!(content, "You need the Manage Server permission to use this command. Ask a server admin to grant it.");
     assert_eq!(content, RouterRefusal::ManageServerRequired.message());
     mock.shutdown().await;
 }
@@ -486,7 +486,7 @@ fn failure_replies_are_distinct_per_path() {
     // Triage reads the user text back to the path: four paths sharing one
     // reply would make a red smoke line ambiguous.
     let replies = [
-        UNKNOWN_INTERACTION_REPLY,
+        UNKNOWN_COMMAND_REPLY,
         &RouterRefusal::ManageServerRequired.message(),
         "Feed command failed; try again.",
         &FeedError::InvalidKind.to_string(),
