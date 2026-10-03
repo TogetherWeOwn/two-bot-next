@@ -15,6 +15,9 @@ mod command_runtime;
 mod command_runtime_tests;
 mod commands_cli;
 mod community_jobs;
+mod containment_runtime;
+#[cfg(test)]
+mod containment_runtime_tests;
 mod database_roles_cli;
 #[cfg(test)]
 #[allow(dead_code)]
@@ -421,10 +424,20 @@ async fn main() {
                     // the chain is the raid watch alone.
                     pipeline.set_join_observer(join_risk_runtime::chain_from_env(
                         pool.clone(),
-                        raid_executor,
+                        raid_executor.clone(),
                         guild_id,
                         raid,
                     ));
+                    // Containment (R3) watches the audit-log entry slot, a
+                    // separate observer from the join slot above. Without
+                    // exact TWO_ANTI_NUKE=1 on the staging guild there is no
+                    // observer at all; dry-run is the default and only an
+                    // armed worker executes removals.
+                    if let Some(containment) =
+                        containment_runtime::start_from_env(pool.clone(), raid_executor, guild_id)
+                    {
+                        pipeline.set_audit_entry_observer(containment);
+                    }
                     // Automod shares the command runtime's REST executor; it never
                     // builds a private client, router or timer.
                     let vars: std::collections::HashMap<String, String> =
