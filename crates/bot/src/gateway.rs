@@ -708,52 +708,66 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             })
                             .transpose()
                             .unwrap_or_else(|_| panic!("invalid onboarding job"));
-                        let (_, job_id) = handle
-                            .block_on(checkpoint_io(
-                                &worker_state,
-                                &generation,
-                                deadline,
-                                store.commit_dispatch_with_job(
-                                    &checkpoint,
-                                    pipeline.handlers().store().take_batch(),
-                                    durable_job,
-                                ),
-                            ))
-                            .unwrap_or_else(|_| panic!("gateway checkpoint failed"));
-                        timer.committed();
-                        if let Some(id) = job_id {
-                            if let Some(OnboardingJob::Interaction(interaction)) = onboarding_job {
-                                let ticket = acknowledgement.unwrap_or_else(|| {
-                                    panic!("onboarding interaction missing ingress ticket")
-                                });
-                                writer_live
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .insert(
-                                        id,
-                                        LiveInteraction {
-                                            interaction,
-                                            ticket,
-                                            generation: observed_generation,
-                                        },
-                                    );
+                        let checkpoint_result = handle.block_on(checkpoint_io(
+                            &worker_state,
+                            &generation,
+                            deadline,
+                            store.commit_dispatch_with_job(
+                                &checkpoint,
+                                pipeline.handlers().store().take_batch(),
+                                durable_job,
+                            ),
+                        ));
+                        // A failed checkpoint is recorded on `operation` (the
+                        // worker stops and accepted RSVP drains) instead of
+                        // panicking away accepted commands.
+                        match checkpoint_result {
+                            Ok((_, job_id)) => {
+                                timer.committed();
+                                if let Some(id) = job_id {
+                                    if let Some(OnboardingJob::Interaction(interaction)) =
+                                        onboarding_job
+                                    {
+                                        let ticket = acknowledgement.unwrap_or_else(|| {
+                                            panic!("onboarding interaction missing ingress ticket")
+                                        });
+                                        writer_live
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .insert(
+                                                id,
+                                                LiveInteraction {
+                                                    interaction,
+                                                    ticket,
+                                                    generation: observed_generation,
+                                                },
+                                            );
+                                    }
+                                    writer_signal.notify_one();
+                                }
+                                if connected {
+                                    let mut state = handle.block_on(worker_state.write());
+                                    if *state != GatewayState::Draining
+                                        && generation.load(Ordering::Acquire) == observed_generation
+                                    {
+                                        *state = GatewayState::Connected;
+                                        info!(
+                                            sequence = checkpoint.sequence,
+                                            "gateway ready; checkpoint committed"
+                                        );
+                                    }
+                                }
+                                if let Some(committed) = committed {
+                                    let _ = committed.send(());
+                                }
+                                Ok(())
                             }
-                            writer_signal.notify_one();
-                        }
-                        if connected {
-                            let mut state = handle.block_on(worker_state.write());
-                            if *state != GatewayState::Draining
-                                && generation.load(Ordering::Acquire) == observed_generation
-                            {
-                                *state = GatewayState::Connected;
-                                info!(
-                                    sequence = checkpoint.sequence,
-                                    "gateway ready; checkpoint committed"
-                                );
+                            Err(error) => {
+                                if let Some(committed) = committed {
+                                    let _ = committed.send(());
+                                }
+                                Err(error)
                             }
-                        }
-                        if let Some(committed) = committed {
-                            let _ = committed.send(());
                         }
                     }
                 };

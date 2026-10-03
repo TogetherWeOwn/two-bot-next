@@ -369,7 +369,7 @@ async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<RestRequest>>
                 path: path.clone(),
                 headers,
                 body: request_body,
-                received_at: std::time::Instant::now(),
+                received_at: tokio::time::Instant::now(),
             });
             // Registry and job requests can interleave, so never script replies
             // by arrival order. The fixture grounds no raid windows; only the

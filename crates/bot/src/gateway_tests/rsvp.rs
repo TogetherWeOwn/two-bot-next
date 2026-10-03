@@ -194,7 +194,7 @@ async fn queued_commands(
         .await
         .unwrap();
     wait_requests(&rest, 4).await; // First defer and live-event read are underway.
-    let delivered = std::time::Instant::now();
+    let delivered = tokio::time::Instant::now();
     ws.send(Message::text(interaction(3, "interested").to_string()))
         .await
         .unwrap();
@@ -398,7 +398,7 @@ async fn sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending() {
         .await
         .unwrap();
     wait_requests(&rest, 4).await;
-    let delivered = std::time::Instant::now();
+    let delivered = tokio::time::Instant::now();
     let commands: Vec<_> = [(3, "sticky"), (4, "feed-remove")]
         .into_iter()
         .map(|(sequence, name)| {
