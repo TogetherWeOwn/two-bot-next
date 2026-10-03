@@ -424,8 +424,43 @@ impl HistoricalBanAcceptance {
     }
 }
 
+/// One fenced row for operator reconciliation: a prepared ban intent, a
+/// running unban dispatch, or a quarantined import. Identifiers only —
+///
+/// claim tokens never leave the ledger. Resolving any of these needs the
+/// attempt-fenced methods with authoritative exact-intent evidence, never
+/// age or current remote state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncertainRow {
+    pub request_id: String,
+    pub user_id: String,
+    pub kind: UncertainKind,
+    pub generation: Option<i64>,
+    pub execute_at: Option<String>,
+}
+
+/// Which fence an [`UncertainRow`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UncertainKind {
+    PreparedBan,
+    RunningUnban,
+    QuarantinedUnban,
+}
+
+impl UncertainKind {
+    /// Stable operator-facing name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PreparedBan => "prepared_ban",
+            Self::RunningUnban => "running_unban",
+            Self::QuarantinedUnban => "quarantined_unban",
+        }
+    }
+}
+
 /// Persistence seam for the member slice (legacy `ModerationStore`,
-/// member-slice methods only; lockdown methods belong to TOG-10079).
+/// member-slice methods only).
 /// All timestamps are `YYYY-MM-DDTHH:MM:SS.sssZ` ISO strings, bound with
 /// `::timestamptz` casts by the sqlx implementation (repo convention).
 pub trait MemberModerationStore: Send + Sync {
@@ -642,6 +677,15 @@ pub trait MemberModerationStore: Send + Sync {
         request_id: &str,
         claim_token: &str,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Surface fenced rows for operator reconciliation: prepared ban intents,
+    /// running dispatches and quarantined imports in this guild, ordered by
+    /// request id. Read-only; resolving them needs the attempt-fenced
+    /// methods with authoritative exact-intent evidence.
+    fn surface_uncertain(
+        &self,
+        guild_id: &str,
+    ) -> impl Future<Output = Result<Vec<UncertainRow>, StoreError>> + Send;
 }
 
 // --- execution input + validation -------------------------------------------
@@ -1976,6 +2020,37 @@ impl MemberModerationStore for MemMemberStore {
                 "lost scheduled-unban claim: {request_id}"
             ))),
         }
+    }
+
+    async fn surface_uncertain(&self, guild_id: &str) -> Result<Vec<UncertainRow>, StoreError> {
+        let inner = self.lock();
+        let mut rows: Vec<UncertainRow> = inner
+            .bans
+            .iter()
+            .filter(|(_, row)| row.guild_id == guild_id && row.state == BanState::Prepared)
+            .map(|(request_id, row)| UncertainRow {
+                request_id: request_id.clone(),
+                user_id: row.user_id.clone(),
+                kind: UncertainKind::PreparedBan,
+                generation: Some(row.generation),
+                execute_at: None,
+            })
+            .chain(
+                inner
+                    .unbans
+                    .iter()
+                    .filter(|(_, row)| row.guild_id == guild_id && row.state == UnbanState::Running)
+                    .map(|(request_id, row)| UncertainRow {
+                        request_id: request_id.clone(),
+                        user_id: row.user_id.clone(),
+                        kind: UncertainKind::RunningUnban,
+                        generation: row.retry_generation,
+                        execute_at: Some(row.execute_at.clone()),
+                    }),
+            )
+            .collect();
+        rows.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+        Ok(rows)
     }
 
     async fn requeue_unban(&self, request_id: &str, claim_token: &str) -> Result<(), StoreError> {
@@ -3862,6 +3937,10 @@ mod tests {
             claim_token: &str,
         ) -> Result<(), StoreError> {
             self.inner.requeue_unban(request_id, claim_token).await
+        }
+
+        async fn surface_uncertain(&self, guild_id: &str) -> Result<Vec<UncertainRow>, StoreError> {
+            self.inner.surface_uncertain(guild_id).await
         }
     }
 

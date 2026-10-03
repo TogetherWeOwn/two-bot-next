@@ -38,6 +38,7 @@ use std::sync::{
     Arc,
 };
 
+use crate::member_runtime::MemberRuntime;
 use crate::self_role_handlers::SelfRoleService;
 use sqlx::{Pool, Postgres};
 use tracing::warn;
@@ -56,6 +57,7 @@ use two_bot_core::{
     },
     feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit},
     funnel::now_millis_for_test,
+    moderation::ModerationAction,
     sticky::{
         activity_eligible, decide_activity, normalize_debounce, sticky_removed_reply,
         sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
@@ -125,6 +127,9 @@ pub struct CommandRuntime {
     /// Configured guild (`GUILD_ID`); also the router's guild fence.
     guild_id: u64,
     tickets: Option<Arc<crate::ticket_runtime::TicketRuntime>>,
+    /// Shared member-moderation consumer; its presence opens the five member
+    /// verbs. Absent while moderation is off or the guild is non-staging.
+    member: Option<Arc<MemberRuntime>>,
     /// `TWO_AUTOMATIONS=1`: fast-path gate for the message hook (the router
     /// still answers `/sticky*` refusals when it is off).
     automations: bool,
@@ -166,8 +171,23 @@ impl CommandRuntime {
         guild_id: u64,
         custom_commands: Option<Vec<two_bot_core::CustomCommand>>,
         tickets: Option<Arc<crate::ticket_runtime::TicketRuntime>>,
+        member: Option<Arc<MemberRuntime>>,
     ) -> Arc<Self> {
         let automations = router.gates().automations;
+        let mut router = router;
+        // Registration documents the ownership the router outcome names; the
+        // shared router routes member verbs by name table regardless.
+        if member.is_some() {
+            for action in [
+                ModerationAction::Ban,
+                ModerationAction::TempBan,
+                ModerationAction::Kick,
+                ModerationAction::Timeout,
+                ModerationAction::Warn,
+            ] {
+                router.register(Box::new(SliceHandler(HandlerId::Moderation(action))));
+            }
+        }
         let interactions = two_bot_discord::interactions::InteractionRuntime::with_router(
             router,
             pool.clone(),
@@ -184,6 +204,7 @@ impl CommandRuntime {
             leveling,
             guild_id,
             tickets,
+            member,
             automations,
             registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
@@ -200,7 +221,9 @@ impl CommandRuntime {
     /// `DISCORD_API_BASE` proxy override. Returns `None` (gateway still boots)
     /// when gate parsing or executor construction fails. `self_roles` is the
     /// boot-composed service shared with the recovery job; only its presence
-    /// opens the self-role router surface.
+    /// opens the self-role router surface. `member` is the boot-composed
+    /// member-moderation consumer shared with the unban sweep; only its
+    /// presence opens the five member verbs.
     #[must_use]
     pub fn from_env(
         pool: Pool<Postgres>,
@@ -208,6 +231,7 @@ impl CommandRuntime {
         guild_id: u64,
         self_roles: Option<Arc<SelfRoleService>>,
         onboarding: two_bot_core::OnboardingGates,
+        member: Option<Arc<MemberRuntime>>,
     ) -> Option<Arc<Self>> {
         let features = match FeatureGates::from_env() {
             Ok(features) => features,
@@ -281,6 +305,7 @@ impl CommandRuntime {
             guild_id,
             Some(Vec::new()),
             tickets,
+            member,
         ))
     }
 
@@ -314,6 +339,40 @@ impl CommandRuntime {
             guild_id,
             Some(Vec::new()),
             None,
+            None,
+        )
+    }
+
+    /// Test constructor with the member-moderation consumer attached.
+    #[cfg(test)]
+    pub(crate) fn new_with_member(
+        pool: Pool<Postgres>,
+        executor: ActionExecutor,
+        router: InteractionRouter,
+        guild_id: u64,
+        automations: bool,
+        member: Arc<MemberRuntime>,
+    ) -> Arc<Self> {
+        assert_eq!(automations, router.gates().automations);
+        let leveling = LevelingRuntime::new(
+            pool.clone(),
+            Arc::new(executor.clone()),
+            guild_id,
+            two_bot_core::OnboardingGates {
+                mode: two_bot_core::OnboardingMode::Legacy,
+                dry_run: false,
+            },
+        );
+        Self::build(
+            pool,
+            executor,
+            router,
+            None,
+            leveling,
+            guild_id,
+            Some(Vec::new()),
+            None,
+            Some(member),
         )
     }
 
@@ -636,6 +695,11 @@ impl CommandRuntime {
             "feed-add" => Some(HandlerId::FeedAdd),
             "feed-remove" => Some(HandlerId::FeedRemove),
             "feed-list" => Some(HandlerId::FeedList),
+            "ban" => Some(HandlerId::Moderation(ModerationAction::Ban)),
+            "tempban" => Some(HandlerId::Moderation(ModerationAction::TempBan)),
+            "kick" => Some(HandlerId::Moderation(ModerationAction::Kick)),
+            "timeout" => Some(HandlerId::Moderation(ModerationAction::Timeout)),
+            "warn" => Some(HandlerId::Moderation(ModerationAction::Warn)),
             _ => None,
         };
         if owner != Some(handler) {
@@ -680,7 +744,43 @@ impl CommandRuntime {
                 )
                 .await;
             }
+            "ban" => {
+                self.member_command(interaction, ModerationAction::Ban)
+                    .await;
+            }
+            "tempban" => {
+                self.member_command(interaction, ModerationAction::TempBan)
+                    .await;
+            }
+            "kick" => {
+                self.member_command(interaction, ModerationAction::Kick)
+                    .await;
+            }
+            "timeout" => {
+                self.member_command(interaction, ModerationAction::Timeout)
+                    .await;
+            }
+            "warn" => {
+                self.member_command(interaction, ModerationAction::Warn)
+                    .await;
+            }
             _ => {}
+        }
+    }
+
+    /// One member verb through the shared consumer. The router has already
+    /// fenced the guild, the feature gate and the handler permission; without
+    /// the consumer (moderation off or non-staging) the verb is unavailable.
+    /// The interaction is already deferred by the caller.
+    async fn member_command(&self, interaction: &Interaction, action: ModerationAction) {
+        match &self.member {
+            Some(member) => {
+                crate::member_runtime::handle_command(member, &self.executor, interaction, action)
+                    .await;
+            }
+            None => {
+                self.answer(interaction, ephemeral(UNAVAILABLE_REPLY)).await;
+            }
         }
     }
 

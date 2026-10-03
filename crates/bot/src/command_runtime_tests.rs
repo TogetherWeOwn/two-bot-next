@@ -1014,6 +1014,7 @@ async fn production_build_requires_authoritative_custom_rows_before_full_publica
             GUILD,
             custom_commands,
             None,
+            None,
         );
         runtime.set_identity(1111, 1111);
         runtime.publish_registry(Some(1111)).await;

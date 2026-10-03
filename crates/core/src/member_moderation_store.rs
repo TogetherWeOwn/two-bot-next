@@ -765,6 +765,47 @@ impl MemberModerationStore for PgMemberModerationStore {
         Ok(())
     }
 
+    async fn surface_uncertain(&self, guild_id: &str) -> Result<Vec<UncertainRow>, StoreError> {
+        use crate::member_moderation::{UncertainKind, UncertainRow};
+        self.ensure_guild(guild_id)?;
+        // Identifiers only: claim tokens never leave the ledger. Every fenced
+        // state surfaces — prepared intents, running dispatches, and all
+        // quarantined imports — so the operator reconciles rather than reaps.
+        let rows = sqlx::query(
+            "SELECT request_id, user_id, generation, NULL::text AS execute_at,
+               'prepared_ban' AS kind
+             FROM moderation_member_bans WHERE guild_id = $1 AND state = 'prepared'
+             UNION ALL
+             SELECT request_id, user_id, retry_generation AS generation,
+               execute_at::text AS execute_at,
+               CASE WHEN state = 'quarantined' THEN 'quarantined_unban'
+                 ELSE 'running_unban' END AS kind
+             FROM moderation_scheduled_unbans WHERE guild_id = $1
+               AND (state = 'running' OR dispatch_uncertain OR state = 'quarantined')
+             ORDER BY 1",
+        )
+        .bind(&self.guild_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_error)?;
+        let mut uncertain = Vec::with_capacity(rows.len());
+        for row in rows {
+            let kind = match row.try_get::<String, _>("kind").map_err(db_error)?.as_str() {
+                "prepared_ban" => UncertainKind::PreparedBan,
+                "quarantined_unban" => UncertainKind::QuarantinedUnban,
+                _ => UncertainKind::RunningUnban,
+            };
+            uncertain.push(UncertainRow {
+                request_id: row.try_get("request_id").map_err(db_error)?,
+                user_id: row.try_get("user_id").map_err(db_error)?,
+                kind,
+                generation: row.try_get("generation").map_err(db_error)?,
+                execute_at: row.try_get("execute_at").map_err(db_error)?,
+            });
+        }
+        Ok(uncertain)
+    }
+
     async fn requeue_unban(&self, request: &str, token: &str) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE moderation_scheduled_unbans SET state = 'pending',
