@@ -26,12 +26,6 @@ concurrency:
 jobs:
   supply-chain:
     name: PR SBOM dry-run
-    # Same inventory and gates as releases, but no publishing job or secrets.
-    # The reusable SBOM workflow lives in sbom.yml: supply-chain.yml is
-    # main's folded pr-lint + gitleaks gate (TOG-11810) and has no
-    # workflow_call trigger, so it cannot be called with `uses:`.
-    # A called workflow can only narrow the caller grant; with the default-deny
-    # top level it would otherwise check out this private repo with no token.
     permissions:
       contents: read
     uses: ./.github/workflows/sbom.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
@@ -45,43 +39,18 @@ jobs:
     needs: [self-role-store, supply-chain, parity-docs, job-inputs]
     # Failed, skipped or cancelled dependencies must not make check appear green.
     if: ${{ always() }}
-    # Runner routing (TOG-12339). Every job in every workflow uses this
-    # expression with its own job id; scripts/test-runner-routing.py pins it.
-    # - Public repo: GitHub-hosted ubuntu-latest, free. The org runner group
-    #   refuses public repos, so a self-hosted label would queue forever. An
-    #   event payload without `repository` (schedule) also lands here.
-    # - Private repo: [self-hosted, two-selfhosted], unless repo vars
-    #   CI_OVERFLOW_RUNNER (JSON runs-on, e.g. ["ubuntu-latest"]),
-    #   CI_OVERFLOW_JOBS (JSON job ids) and CI_OVERFLOW_EVENTS (JSON event
-    #   names) all select the job (TOG ops, 2026-10-01). Flip back without a PR
-    #   by deleting CI_OVERFLOW_RUNNER. Hosted minutes then come from the
-    #   included allowance; an rbx1 guard reverts at 45k.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'check') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
-    # Self-hosted runners share one Docker host, so a published 5432 collides
-    # across concurrent jobs. A job container gets its own network namespace:
-    # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
       CARGO_TERM_COLOR: always
-      # Disk hygiene for hosted overflow runners (TOG-12134): the integration
-      # link step (`cargo test --workspace --test '*'`) links ~70 test
-      # binaries and exhausted the job-container overlay (98 MB left, rust-lld
-      # bus error on two consecutive main heads). Line tables keep failure
-      # backtraces useful while cutting binary size; codegen, debug
-      # assertions and test semantics are unchanged. `cargo test` compiles
-      # under the `test` profile, so both profiles are pinned.
       CARGO_PROFILE_DEV_DEBUG: 'line-tables-only'
       CARGO_PROFILE_TEST_DEBUG: 'line-tables-only'
-      # Incremental artifacts multiply with ~70 linked test binaries; a cold
-      # CI link does not reuse them, so skip writing them (TOG-12134).
       CARGO_PROFILE_DEV_INCREMENTAL: 'false'
       CARGO_PROFILE_TEST_INCREMENTAL: 'false'
       TWO_LFG_TESTDB_CI: '1'
       TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
-      # CI service hosts only; deployed processes default to `required`
-      # (docs/database-tls.md).
       TWO_DATABASE_TLS: local-only
     services:
       agent-testdb:
@@ -89,12 +58,7 @@ jobs:
         env:
           POSTGRES_USER: agent_test
           POSTGRES_DB: agent_test
-          # Ephemeral CI service only; tests explicitly use an empty password.
-          # Slice scratch databases are created in the prepare step below.
           POSTGRES_HOST_AUTH_METHOD: trust
-        # PG18 places data and WAL below this volume. Isolate disposable fixture
-        # checkpoint I/O from shared-host disk; keep PostgreSQL defaults intact.
-        # Tmpfs counts against the 2GiB service cap; do not spill it into swap.
         options: >-
           --tmpfs /var/lib/postgresql:rw,size=1073741824
           --memory 2147483648
@@ -107,21 +71,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # The migration guard reads PR base/push-before blobs, including the lock.
           fetch-depth: 0
 
       - name: Job-container prerequisites (loopback forward to agent-testdb)
         run: |
-          # On hosted/overflow runners the job container's root does not own the
-          # runner-owned checkout, so Git refuses it as dubious ownership.
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends python3 python3-pip postgresql-client socat >/dev/null
-          # Disk hygiene for hosted overflow runners (TOG-12134): the package
-          # lists stay on the job-container overlay otherwise.
           rm -rf /var/lib/apt/lists/*
-          # Tests that pin 127.0.0.1/localhost:5432 reach the service through
-          # this job-private forward.
           nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
           for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
           exit 1
@@ -176,7 +133,6 @@ jobs:
         run: python3 scripts/ci/verify-codeowners.py
 
       - name: Audit GitHub Actions workflows
-        # Offline static audits need no GitHub credentials or security-events writes.
         run: '"$RUNNER_TEMP/zizmor/bin/zizmor" --offline --strict-collection --no-progress .github/workflows'
 
       - name: offline build-cache safety regressions
@@ -201,11 +157,6 @@ jobs:
           python3 tests/voice_templates/validate.py
           python3 -m unittest discover -s tests/voice_templates -p 'test_*.py' -v
 
-      # `check all` reads Cargo.lock by default (no --locked flag exists).
-      # deny.toml's allow-list is verified tight: no unmatched allowances.
-      # Runs before the toolchain install and every compile/link step
-      # (TOG-12134): the deny image ships its own toolchain and rustup-syncs
-      # the pinned one, so it must run while the disk is at its freest.
       - name: cargo-deny
         if: needs.job-inputs.outputs.rust != 'false'
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
