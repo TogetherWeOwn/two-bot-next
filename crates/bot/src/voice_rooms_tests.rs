@@ -1585,6 +1585,7 @@ async fn access_changed_refreshes_a_loaded_worker() {
                 room_creation_enabled: after,
                 ..AccessControls::default()
             }),
+            0,
         );
         let ticket = worker
             .live
