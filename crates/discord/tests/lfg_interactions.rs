@@ -6,7 +6,10 @@ mod common;
 use common::{MockRest, ScriptedResponse};
 use serde_json::{json, Value};
 use twilight_model::application::interaction::Interaction;
-use two_bot_core::{commands::PERM_MANAGE_EVENTS, lfg, lfg_store as store, RouterGates};
+use two_bot_core::{
+    commands::PERM_MANAGE_EVENTS, lfg, lfg_store as store, RouterGates,
+    ANNOUNCEMENTS_DISABLED_REPLY, MANAGE_EVENTS_REQUIRED,
+};
 use two_bot_discord::{
     interactions::InteractionRuntime,
     lfg_interactions::{LfgInteractions, LfgRequest},
@@ -627,7 +630,7 @@ async fn router_fences_guild_permissions_and_disabled_announcements() {
     rt.handle(&create(7102, 0)).await.unwrap();
     assert_eq!(
         body(mock.requests().last().unwrap())["data"]["content"],
-        "Manage Events permission is required."
+        MANAGE_EVENTS_REQUIRED
     );
     rt.handle(&close(7103, "foreign", 0)).await.unwrap();
     assert_eq!(mock.requests().len(), 2);
@@ -635,7 +638,7 @@ async fn router_fences_guild_permissions_and_disabled_announcements() {
     off.handle(&create(7104, PERM_MANAGE_EVENTS)).await.unwrap();
     assert_eq!(
         body(mock.requests().last().unwrap())["data"]["content"],
-        "Announcements are disabled on this server."
+        ANNOUNCEMENTS_DISABLED_REPLY
     );
     assert!(!off
         .handle(&select(7105, "foreign", 3333, "tank"))

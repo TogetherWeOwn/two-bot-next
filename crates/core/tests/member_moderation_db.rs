@@ -2360,3 +2360,180 @@ async fn postgres_void_requeues_current_expiry_and_fence_refusal_releases_only_n
         "preserve expiry and retry the never-dispatched key"
     );
 }
+
+// B4 waiver-ledger acceptance (`docs/cutover.md` preconditions, staging-soak
+// s4-10/s5-08): one hermetic fixture pinning the three scheduled-unban areas
+// the cutover table needs a named disposition for — due/overdue queue
+// selection, the pending-claim lifecycle, and failed-claim disposition. Deep
+// edge cases (fair retry ordering, unknown outcomes, quarantine, guild
+// fences) stay in their dedicated tests; this is the citable receipt.
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_scheduled_unban_queue_lifecycle_and_failed_claim_disposition() {
+    use two_bot_core::member_moderation::{DiscordError, MemberError};
+    // OVERDUE is two hours before NOW: a sweep at NOW must still claim it,
+    // not drop it. FUTURE must be retained untouched by every sweep here.
+    const OVERDUE: &str = "2023-11-14T20:13:20.000Z";
+    const FUTURE: &str = "2023-11-15T22:13:20.000Z";
+    let (admin, pool, schema) = database().await;
+    let guild = "100000000000000001";
+    let store = PgMemberModerationStore::new(pool.clone(), guild);
+    accepted_unban(&store, guild, "due-user", "due-expiry", NOW, NOW).await;
+    accepted_unban(
+        &store,
+        guild,
+        "overdue-user",
+        "overdue-expiry",
+        OVERDUE,
+        NOW,
+    )
+    .await;
+    accepted_unban(&store, guild, "future-user", "future-expiry", FUTURE, NOW).await;
+    for request in ["due-expiry", "overdue-expiry", "future-expiry"] {
+        assert_eq!(unban_state(&pool, request).await, "staged");
+    }
+
+    // Due and overdue fire; the future expiry is retained pending.
+    let jobs = store
+        .claim_due_unbans(guild, NOW, 25)
+        .await
+        .expect("due sweep claims");
+    let mut claimed: Vec<&str> = jobs.iter().map(|job| job.request_id.as_str()).collect();
+    claimed.sort_unstable();
+    assert_eq!(claimed, ["due-expiry", "overdue-expiry"]);
+    assert_eq!(unban_state(&pool, "future-expiry").await, "pending");
+    let token = |request: &str| {
+        jobs.iter()
+            .find(|job| job.request_id == request)
+            .expect("claimed")
+            .claim_token
+            .clone()
+    };
+
+    // Pending-claim lifecycle: complete closes, wrong tokens cannot close,
+    // requeue preserves the original expiry and yields a fresh claim.
+    assert!(store
+        .complete_unban("due-expiry", "wrong-token")
+        .await
+        .is_err());
+    store
+        .complete_unban("overdue-expiry", &token("overdue-expiry"))
+        .await
+        .expect("complete overdue");
+    assert_eq!(unban_state(&pool, "overdue-expiry").await, "done");
+    assert!(!store
+        .owns_unban_claim("overdue-expiry", &token("overdue-expiry"))
+        .await
+        .expect("closed ownership"));
+    store
+        .requeue_unban("due-expiry", &token("due-expiry"))
+        .await
+        .expect("requeue due");
+    let row = sqlx::query(
+        "SELECT retry_generation IS NOT NULL AS retried,
+                execute_at = $2::text::timestamptz AS expiry_kept
+         FROM moderation_scheduled_unbans WHERE request_id = $1",
+    )
+    .bind("due-expiry")
+    .bind(NOW)
+    .fetch_one(&pool)
+    .await
+    .expect("requeue row");
+    assert!(row.get::<bool, _>("retried"));
+    assert!(row.get::<bool, _>("expiry_kept"));
+    assert_eq!(unban_state(&pool, "due-expiry").await, "pending");
+    let next = store
+        .claim_due_unbans(guild, NOW, 25)
+        .await
+        .expect("reclaim")
+        .pop()
+        .expect("requeued job");
+    assert_eq!(next.request_id, "due-expiry");
+    assert_ne!(next.claim_token, token("due-expiry"));
+    assert!(store
+        .owns_unban_claim(&next.request_id, &next.claim_token)
+        .await
+        .expect("fresh ownership"));
+    store
+        .complete_unban(&next.request_id, &next.claim_token)
+        .await
+        .expect("complete due");
+    assert!(store
+        .claim_due_unbans(guild, NOW, 25)
+        .await
+        .expect("queue drained")
+        .is_empty());
+
+    // Failed-claim disposition through the real sweep path: a definite
+    // refusal requeues for the next sweep, an uncertain timeout stays
+    // fenced running with no retry position until reconciled.
+    let discord = MockMemberDiscord::new();
+    let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+        1_700_000_000_000
+    });
+    accepted_unban(&store, guild, "refused-user", "refused-expiry", NOW, NOW).await;
+    discord.fail_with("unban", DiscordError::Rejected("already unbanned".into()));
+    assert!(matches!(
+        svc.run_due_unbans(guild).await,
+        Err(MemberError::Discord(DiscordError::Rejected(_)))
+    ));
+    assert_eq!(unban_state(&pool, "refused-expiry").await, "pending");
+    discord.clear_failure("unban");
+    assert_eq!(svc.run_due_unbans(guild).await.expect("retry sweep"), 1);
+    assert_eq!(unban_state(&pool, "refused-expiry").await, "done");
+
+    accepted_unban(&store, guild, "timeout-user", "timeout-expiry", NOW, NOW).await;
+    discord.fail_with("unban", DiscordError::Timeout);
+    assert!(matches!(
+        svc.run_due_unbans(guild).await,
+        Err(MemberError::Discord(DiscordError::Timeout))
+    ));
+    assert_eq!(unban_state(&pool, "timeout-expiry").await, "running");
+    assert_eq!(
+        svc.run_due_unbans(guild)
+            .await
+            .expect("fenced sweep claims nothing"),
+        0
+    );
+    discord.clear_failure("unban");
+    assert_eq!(
+        svc.run_due_unbans(guild)
+            .await
+            .expect("uncertain never retries"),
+        0
+    );
+    let stuck: String = sqlx::query_scalar(
+        "SELECT claim_token FROM moderation_scheduled_unbans WHERE request_id = 'timeout-expiry'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("uncertain token");
+    store
+        .resolve_uncertain_unban(
+            "timeout-expiry",
+            &stuck,
+            two_bot_core::member_moderation::UnbanResolution::Void,
+        )
+        .await
+        .expect("authoritative void requeues");
+    assert_eq!(
+        svc.run_due_unbans(guild).await.expect("reconciled sweep"),
+        1
+    );
+    assert_eq!(unban_state(&pool, "timeout-expiry").await, "done");
+
+    // Receipt counts for the waiver ledger: four unbans done (due, overdue,
+    // refused, timeout), the future expiry still pending. Only the two
+    // sweep-driven unbans carry an unban audit: direct store-level completes
+    // close the claim without dispatching, so they audit nothing.
+    let (done, pending, audits): (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM moderation_scheduled_unbans WHERE state = 'done'),
+                (SELECT COUNT(*) FROM moderation_scheduled_unbans WHERE state = 'pending'),
+                (SELECT COUNT(*) FROM moderation_audit WHERE action = 'moderation.unban_scheduled')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("receipt counts");
+    cleanup(admin, pool, schema).await;
+    assert_eq!((done, pending, audits), (4, 1, 2));
+}

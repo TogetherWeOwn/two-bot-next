@@ -380,6 +380,10 @@ async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<RestRequest>>
                 ("GET", "/api/v10/users/@me") => {
                     ("200 OK", b"{\"id\":\"999\",\"bot\":true}".to_vec())
                 }
+                ("GET", "/api/v10/guilds/2222") => (
+                    "200 OK",
+                    b"{\"id\":\"2222\",\"name\":\"Alive fixture\"}".to_vec(),
+                ),
                 ("PUT", "/api/v10/applications/1111/guilds/2222/commands") => {
                     ("200 OK", registry_echo)
                 }

@@ -27,6 +27,7 @@ use crate::gateway::{
     build_pipeline, ensure_crypto_provider, load_boot_session, run_shard, GatewayState,
 };
 
+mod commands;
 mod deadline;
 mod force_identify;
 mod member_journey;
@@ -460,12 +461,24 @@ async fn spawn_runner(
     JoinHandle<Result<(), sqlx::Error>>,
     Arc<RwLock<GatewayState>>,
 ) {
-    spawn_runner_until_shutdown(db, url, std::future::pending()).await
+    spawn_runner_until_shutdown(db, url, None, std::future::pending()).await
+}
+
+async fn spawn_runner_with_commands(
+    db: &TestDb,
+    url: &str,
+    commands: Option<Arc<crate::command_runtime::CommandRuntime>>,
+) -> (
+    JoinHandle<Result<(), sqlx::Error>>,
+    Arc<RwLock<GatewayState>>,
+) {
+    spawn_runner_until_shutdown(db, url, commands, std::future::pending()).await
 }
 
 async fn spawn_runner_until_shutdown(
     db: &TestDb,
     url: &str,
+    commands: Option<Arc<crate::command_runtime::CommandRuntime>>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> (
     JoinHandle<Result<(), sqlx::Error>>,
@@ -491,7 +504,7 @@ async fn spawn_runner_until_shutdown(
         state.clone(),
         db.store.clone(),
         None,
-        None,
+        commands,
         None,
         None,
         None,
@@ -506,7 +519,7 @@ async fn http_shutdown_stops_the_real_gateway_runner_and_preserves_checkpoint() 
     let db = TestDb::new().await;
     let mut mock = MockGateway::new(false, false).await;
     let (shutdown, mut stopping) = tokio::sync::watch::channel(false);
-    let (runner, state) = spawn_runner_until_shutdown(&db, &mock.url, async move {
+    let (runner, state) = spawn_runner_until_shutdown(&db, &mock.url, None, async move {
         stopping.wait_for(|stopping| *stopping).await.unwrap();
     })
     .await;

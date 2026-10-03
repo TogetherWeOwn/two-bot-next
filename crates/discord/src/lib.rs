@@ -13,6 +13,8 @@ pub mod channel_access;
 #[cfg(feature = "db")]
 pub mod channel_moderation;
 pub mod command_registry;
+#[cfg(feature = "db")]
+pub mod custom_commands;
 pub mod executor;
 mod executor_metrics;
 

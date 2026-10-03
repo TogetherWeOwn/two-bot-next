@@ -101,7 +101,7 @@ use crate::{ActionExecutor, DiscordError};
 use std::{fmt::Debug, future::Future};
 use two_bot_core::router::replies::{
     run_handler, InteractionReply, ReplyError, ReplyOperation, ReplyPolicy, ReplySession,
-    ReplyTransport, UNKNOWN_INTERACTION_REPLY,
+    ReplyTransport, EXPIRED_COMPONENT_REPLY, UNKNOWN_COMMAND_REPLY,
 };
 
 /// Text replies suppress all mentions and respect Discord's content ceiling.
@@ -137,7 +137,7 @@ pub fn deferred_response(ephemeral: bool) -> InteractionResponse {
     }
 }
 
-/// Refusal reply: ephemeral, legacy text, capped at 2000 chars.
+/// Refusal reply: ephemeral, actionable text, capped at 2000 chars.
 #[must_use]
 pub fn refusal_response(refusal: RouterRefusal) -> InteractionResponse {
     text_response(InteractionReply::new(refusal.message(), true))
@@ -148,7 +148,7 @@ pub fn response_for_slash(outcome: &SlashOutcome) -> Option<InteractionResponse>
     match outcome {
         SlashOutcome::Refuse { refusal } => Some(refusal_response(*refusal)),
         SlashOutcome::Unknown => Some(text_response(InteractionReply::new(
-            UNKNOWN_INTERACTION_REPLY,
+            UNKNOWN_COMMAND_REPLY,
             true,
         ))),
         SlashOutcome::Handled { .. } | SlashOutcome::Ignore => None,
@@ -162,7 +162,10 @@ pub fn response_for_slash(outcome: &SlashOutcome) -> Option<InteractionResponse>
 #[cfg(feature = "db")]
 #[derive(Debug)]
 pub struct InteractionRuntime {
-    pub router: InteractionRouter,
+    /// Shared with integration seams that read the same registrations (for
+    /// example the custom-command execution seam): registrations are complete
+    /// once `with_router` returns, so every `Arc` clone reads the same set.
+    pub router: std::sync::Arc<InteractionRouter>,
     pub pool: sqlx::Pool<sqlx::Postgres>,
     pub executor: crate::ActionExecutor,
     pub classifier: two_bot_core::ClassifierConfig,
@@ -310,7 +313,7 @@ impl InteractionRuntime {
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::Lfg)));
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgClose)));
         Self {
-            router,
+            router: std::sync::Arc::new(router),
             pool: pool.clone(),
             executor,
             classifier,
@@ -580,15 +583,15 @@ where
         RoutedInteraction::Slash {
             outcome: SlashOutcome::Unknown,
             ..
-        }
-        | RoutedInteraction::Component {
+        } => Some(InteractionReply::new(UNKNOWN_COMMAND_REPLY, true)),
+        RoutedInteraction::Component {
             outcome: ComponentOutcome::Unknown,
             ..
         }
         | RoutedInteraction::Modal {
             outcome: ComponentOutcome::Unknown,
             ..
-        } => Some(InteractionReply::new(UNKNOWN_INTERACTION_REPLY, true)),
+        } => Some(InteractionReply::new(EXPIRED_COMPONENT_REPLY, true)),
         RoutedInteraction::Slash {
             outcome: SlashOutcome::Ignore,
             ..

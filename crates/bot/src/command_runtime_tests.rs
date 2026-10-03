@@ -704,7 +704,7 @@ async fn unknown_command_replies_ephemerally_without_other_effects() {
     assert_eq!(reply["data"]["flags"], 64);
     assert_eq!(
         reply["data"]["content"],
-        two_bot_core::router::replies::UNKNOWN_INTERACTION_REPLY
+        two_bot_core::router::replies::UNKNOWN_COMMAND_REPLY
     );
     assert_eq!(
         reply["data"]["allowed_mentions"]["parse"],

@@ -20,9 +20,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::voice_room_plan::{plan_room, RoomPlanInput};
+use crate::voice_room_plan::{category_room_ids, plan_room, RoomPlanInput};
 use tokio::sync::{mpsc, oneshot};
-use tracing::warn;
+use tracing::{info, warn};
 use twilight_cache_inmemory::DefaultInMemoryCache;
 use twilight_gateway::Event;
 use twilight_model::{
@@ -49,7 +49,7 @@ use twilight_model::{
     },
 };
 use two_bot_core::{
-    evaluate_permissions as evaluate_health, now_iso,
+    evaluate_permissions as evaluate_health, metrics, now_iso,
     voice_access::{
         is_voice_command, may_create_room, may_use_command, validate_access_controls,
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
@@ -78,7 +78,7 @@ use two_bot_core::{
         category_full_message, is_usable_channel_name, voice_commands, ActionQueue, CreatorChannel,
         NewRoomSpec, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, RoomPosition,
         TextCompanion, VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN,
-        RENAME_MIN_INTERVAL_MS,
+        QUEUE_MAX_ATTEMPTS, RENAME_MIN_INTERVAL_MS,
     },
     voice_text_channel::{
         admin_view_roles, occupancy_diff, text_channel_plan,
@@ -327,6 +327,63 @@ fn store_error(error: sqlx::Error) -> StoreError {
             StoreError::CredentialRefused
         }
         _ => StoreError::Unavailable,
+    }
+}
+
+/// Bounded outcome class for a terminal Discord error (TOG-13543). Rate
+/// limits are retries, never outcomes; callers skip them before reaching
+/// here. `Rejected` status/code values never become labels.
+fn voice_outcome_from_http(error: &RoomHttpError) -> &'static str {
+    match error {
+        RoomHttpError::Cancelled => "cancelled",
+        _ => "discord",
+    }
+}
+
+/// Bounded outcome class for a terminal store error (TOG-13543). All three
+/// variants share one `persistence` outcome to keep cardinality fixed; the
+/// sanitized debug already rides the failure line for `/setup`.
+fn voice_outcome_from_store(_error: &StoreError) -> &'static str {
+    "persistence"
+}
+
+/// Bounded dead-letter family for a queue action (TOG-13543). Companion
+/// creates/grants/revokes share `companion`; unknown shapes share `other`.
+fn voice_dead_action(action: &RoomAction) -> &'static str {
+    match action {
+        RoomAction::CreateRoom { .. } => "create",
+        RoomAction::MoveMember { .. } => "move",
+        RoomAction::DeleteRoom { .. } => "delete",
+        RoomAction::CreateCompanion { .. }
+        | RoomAction::GrantCompanionView { .. }
+        | RoomAction::RevokeCompanionView { .. } => "companion",
+        RoomAction::UpdateOwnership { .. } => "ownership",
+        RoomAction::KickMember { .. } => "kick",
+        RoomAction::RenameRoom { .. } => "rename",
+    }
+}
+
+/// One finished room lifecycle outcome (TOG-13543): a fixed-cardinality
+/// counter plus a token-free log line. Event name `voice_operation` with
+/// `op`/`outcome` fields is the catalog entry coordinated with blocked
+/// TOG-10870 (which owns JSON formatting): no IDs, bodies, tokens or member
+/// data, only the bounded operation and outcome.
+fn observe_voice_operation(op: &'static str, outcome: &'static str) {
+    metrics::global().voice_operation(op, outcome);
+    if outcome == "success" {
+        info!(
+            voice_event = "voice_operation",
+            op = op,
+            outcome = outcome,
+            "voice_operation succeeded"
+        );
+    } else {
+        warn!(
+            voice_event = "voice_operation",
+            op = op,
+            outcome = outcome,
+            "voice_operation failed"
+        );
     }
 }
 
@@ -1288,9 +1345,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
         let mut empty = Vec::new();
         let mut occupied = Vec::new();
+        let mut suspended: u64 = 0;
+        let mut resumed: u64 = 0;
         for channel in self.rooms.keys().copied() {
             if !live.channels.contains_key(&channel) {
                 self.queue.resume(self.live.guild_id, channel);
+                resumed = resumed.saturating_add(1);
                 empty.push(channel);
                 continue;
             }
@@ -1311,9 +1371,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             // Move Members was revoked between the create and move.
             if !accessible && !self.moves.contains_key(&channel) {
                 self.queue.suspend(self.live.guild_id, channel);
+                suspended = suspended.saturating_add(1);
                 continue;
             }
             self.queue.resume(self.live.guild_id, channel);
+            resumed = resumed.saturating_add(1);
             let move_pending = self.moves.contains_key(&channel)
                 || self
                     .uncertain_moves
@@ -1366,6 +1428,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.companion_seen.insert(channel, current);
         }
         drop(live);
+        let delete_enqueued = empty.len() as u64;
         for channel in empty {
             self.queue_delete(channel, false);
         }
@@ -1391,8 +1454,26 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 );
             }
         }
+        let mut succession_enqueued: u64 = 0;
         for channel in occupied {
-            self.apply_succession(channel);
+            if self.apply_succession(channel) {
+                succession_enqueued = succession_enqueued.saturating_add(1);
+            }
+        }
+        metrics::global().voice_reconcile("delete_enqueued", delete_enqueued);
+        metrics::global().voice_reconcile("suspended", suspended);
+        metrics::global().voice_reconcile("resumed", resumed);
+        metrics::global().voice_reconcile("succession_enqueued", succession_enqueued);
+        self.observe_voice_state();
+        if delete_enqueued > 0 || suspended > 0 || resumed > 0 || succession_enqueued > 0 {
+            info!(
+                voice_event = "voice_reconcile",
+                delete_enqueued = delete_enqueued,
+                suspended = suspended,
+                resumed = resumed,
+                succession_enqueued = succession_enqueued,
+                "voice_reconcile planned"
+            );
         }
     }
 
@@ -1402,24 +1483,24 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// tick is idempotent; the queued [`RoomAction::UpdateOwnership`] persists
     /// the handoff. Skipped while the owner's move is still in flight and
     /// while occupancy is uncertain after a successful move.
-    fn apply_succession(&mut self, channel: Snowflake) {
+    fn apply_succession(&mut self, channel: Snowflake) -> bool {
         if self.moves.contains_key(&channel) {
-            return;
+            return false;
         }
         let (room, occupants) = {
             let live = self.live.inner.read().expect("live voice lock");
             if !live.ready {
-                return;
+                return false;
             }
             let Some(room) = self.rooms.get(&channel).cloned() else {
-                return;
+                return false;
             };
             if self
                 .uncertain_moves
                 .get(&channel)
                 .is_some_and(|ticket| live.ticket_valid(*ticket))
             {
-                return;
+                return false;
             }
             (room, live.ownership_snapshot(channel))
         };
@@ -1428,7 +1509,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 .iter()
                 .any(|member| member.member_id == room.owner_id)
         {
-            return;
+            return false;
         }
         let ownership = RoomOwnership {
             owner_id: room.owner_id,
@@ -1436,10 +1517,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         };
         let next = match decide_ownership(ownership, &occupants, OwnershipRequest::Reconcile) {
             Ok(OwnershipDecision::Changed { next, .. }) => next,
-            Ok(_) => return,
+            Ok(_) => return false,
             Err(error) => {
                 warn!(channel_id = channel, %error, "voice succession refused");
-                return;
+                return false;
             }
         };
         let mut updated = room;
@@ -1454,6 +1535,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 original_creator_id: next.original_creator_id,
             },
         );
+        true
     }
 
     /// V2 ownership command (`/reclaim`, `/transfer`), serialized in the guild
@@ -1899,6 +1981,33 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         self.failures.push_back(failure);
     }
 
+    /// Publish current ghost-verification gauges (TOG-13543): tracked rooms
+    /// plus compensation-pending orphans. No IDs leave the process.
+    fn observe_voice_state(&self) {
+        metrics::global().voice_state(self.rooms.len() as u64, self.compensation.len() as u64);
+    }
+
+    /// Retry through the queue budget and observe the dead letter (TOG-13543).
+    /// Returns the queue's release verdict. On the terminal attempt the
+    /// bounded family counter advances and one token-free warn line names
+    /// the family and attempt budget, never the channel, member or reason
+    /// body.
+    fn mark_failed_observed(&self, action: QueuedAction, reason: String, now_ms: u64) -> bool {
+        let family = voice_dead_action(&action.action);
+        let will_dead_letter = action.attempts.saturating_add(1) >= QUEUE_MAX_ATTEMPTS;
+        let released = self.queue.mark_failed(action, reason, now_ms);
+        if will_dead_letter && released {
+            metrics::global().voice_dead_letter(family);
+            warn!(
+                voice_event = "voice_dead_letter",
+                action = family,
+                attempts = QUEUE_MAX_ATTEMPTS,
+                "voice action dead-lettered"
+            );
+        }
+        released
+    }
+
     fn prepare(&self, ticket: JoinTicket) -> Result<RoomChannelAttributes, RoomHttpError> {
         let live = self.live.inner.read().expect("live voice lock");
         if !live.ticket_valid(ticket) {
@@ -1931,6 +2040,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             }
         }
         let bot = live.bot.as_ref().ok_or(RoomHttpError::AccessDenied)?;
+        let grouped = settings.group_by_category;
+        let group_room_ids = if grouped {
+            category_room_ids(channel, &live.channels, &self.rooms)
+        } else {
+            Vec::new()
+        };
         plan_room(&RoomPlanInput {
             guild_id: self.live.guild_id,
             owner_id: ticket.member_id,
@@ -1941,6 +2056,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             rooms: &self.rooms,
             bot,
             bot_permissions: permissions,
+            grouped,
+            group_room_ids: &group_room_ids,
         })
     }
 
@@ -1983,11 +2100,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 creator_id: creator_channel_id,
                                 message: category_full_message(),
                             });
+                            observe_voice_operation("create", "category_full");
                         } else if error != RoomHttpError::Cancelled {
+                            let outcome = voice_outcome_from_http(&error);
                             self.record(LifecycleFailure::Discord {
                                 channel_id: creator_channel_id,
                                 error,
                             });
+                            observe_voice_operation("create", outcome);
                         }
                         self.creations.remove(&action.id);
                         self.queue.mark_succeeded(&action);
@@ -2018,6 +2138,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 // the move. The plan's settings snapshot is the
                                 // creator row at room-creation time, so later
                                 // `/textchannels` changes never alter it.
+                                observe_voice_operation("create", "success");
+                                self.observe_voice_state();
                                 self.enqueue_companion_create(channel_id);
                                 if self
                                     .live
@@ -2039,14 +2161,17 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 }
                             }
                             Err(error) => {
+                                let outcome = voice_outcome_from_store(&error);
                                 self.record(LifecycleFailure::Persistence {
                                     channel_id: Some(channel_id),
                                     error,
                                 });
+                                observe_voice_operation("create", outcome);
                                 if error == StoreError::CredentialRefused {
                                     self.halted = true;
                                 }
                                 self.queue_delete(channel_id, true);
+                                self.observe_voice_state();
                             }
                         }
                     }
@@ -2061,6 +2186,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     Err(error) => {
                         // Unknown create outcomes must never produce another POST.
                         self.creations.remove(&action.id);
+                        if error != RoomHttpError::Cancelled {
+                            observe_voice_operation("create", voice_outcome_from_http(&error));
+                        }
                         self.complete_error(action, creator_channel_id, error);
                     }
                 }
@@ -2098,6 +2226,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         // Occupancy may lag the successful REST response. Wait for
                         // this member's transition or a complete refresh before pruning.
                         self.uncertain_moves.insert(channel_id, ticket);
+                        observe_voice_operation("move", "success");
                     }
                     Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
                         self.queue.mark_rate_limited(
@@ -2110,12 +2239,17 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     Err(RoomHttpError::UnknownOutcome) => {
                         self.moves.remove(&channel_id);
                         self.uncertain_moves.insert(channel_id, ticket);
+                        observe_voice_operation("move", "discord");
                         self.complete_error(action, channel_id, RoomHttpError::UnknownOutcome);
                     }
                     Err(error) => {
                         self.moves.remove(&channel_id);
+                        if error != RoomHttpError::Cancelled {
+                            observe_voice_operation("move", voice_outcome_from_http(&error));
+                        }
                         self.complete_error(action, channel_id, error);
                         self.queue_delete(channel_id, true);
+                        self.observe_voice_state();
                     }
                 }
             }
@@ -2168,7 +2302,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             // Companion Discord delete failed (or its row
                             // write did): retry with the room delete instead
                             // of leaking the text channel.
-                            self.queue.mark_failed(
+                            self.mark_failed_observed(
                                 action,
                                 "companion delete unavailable".to_owned(),
                                 elapsed_ms(now_ms, started),
@@ -2191,17 +2325,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 self.moves.remove(&channel_id);
                                 self.uncertain_moves.remove(&channel_id);
                                 self.desired_names.remove(&channel_id);
+                                observe_voice_operation("delete", "success");
+                                self.observe_voice_state();
                             }
                             Err(error) => {
+                                let outcome = voice_outcome_from_store(&error);
                                 self.record(LifecycleFailure::Persistence {
                                     channel_id: Some(channel_id),
                                     error,
                                 });
                                 if error == StoreError::CredentialRefused {
                                     self.halted = true;
+                                    observe_voice_operation("delete", outcome);
                                     self.queue.mark_succeeded(&action);
                                 } else {
-                                    self.queue.mark_failed(
+                                    self.mark_failed_observed(
                                         action,
                                         "voice-room persistence unavailable".to_owned(),
                                         elapsed_ms(now_ms, started),
@@ -2233,7 +2371,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             channel_id,
                             error: RoomHttpError::AccessDenied,
                         });
-                        self.queue.mark_failed(
+                        observe_voice_operation("delete", "discord");
+                        self.mark_failed_observed(
                             action,
                             "Discord access denied".to_owned(),
                             elapsed_ms(now_ms, started),
@@ -2242,9 +2381,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     Err(RoomHttpError::Cancelled) => {
                         self.queue.mark_succeeded(&action);
                         self.deletes.remove(&channel_id);
+                        observe_voice_operation("delete", "cancelled");
                     }
                     Err(RoomHttpError::UnknownOutcome) => {
-                        self.queue.mark_failed(
+                        self.mark_failed_observed(
                             action,
                             "Discord delete outcome unknown".to_owned(),
                             elapsed_ms(now_ms, started),
@@ -2252,7 +2392,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                     Err(error) => {
                         self.deletes.remove(&channel_id);
+                        if error != RoomHttpError::Cancelled {
+                            observe_voice_operation("delete", voice_outcome_from_http(&error));
+                        }
                         self.complete_error(action, channel_id, error);
+                        self.observe_voice_state();
                     }
                 }
             }
@@ -2339,7 +2483,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             )
                             .await;
                         } else {
-                            self.queue.mark_failed(
+                            self.mark_failed_observed(
                                 action,
                                 "companion create outcome unknown".to_owned(),
                                 elapsed_ms(now_ms, started),
@@ -2426,7 +2570,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             channel_id: Some(channel_id),
                             error,
                         });
-                        self.queue.mark_failed(
+                        self.mark_failed_observed(
                             action,
                             "voice-room persistence unavailable".to_owned(),
                             elapsed_ms(now_ms, started),
@@ -2493,7 +2637,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                     Err(RoomHttpError::UnknownOutcome) => {
                         // Both writes are idempotent, so a retry is safe.
-                        self.queue.mark_failed(
+                        self.mark_failed_observed(
                             action,
                             "Discord kick outcome unknown".to_owned(),
                             elapsed_ms(now_ms, started),
@@ -2635,7 +2779,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     self.companion_channels
                         .insert(room_channel_id, text_channel_id);
                     self.unpersisted_companions.insert(room_channel_id);
-                    self.queue.mark_failed(
+                    self.mark_failed_observed(
                         action.clone(),
                         "companion persistence unavailable".to_owned(),
                         elapsed_ms(now_ms, started),
@@ -2790,7 +2934,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     channel_id: text_channel_id,
                     error,
                 });
-                self.queue.mark_failed(
+                self.mark_failed_observed(
                     action.clone(),
                     if grant {
                         "companion view grant unavailable".to_owned()
@@ -4751,6 +4895,17 @@ async fn execute_create<S: RoomPersistence, H: RoomWrites>(
         Err(error) => {
             let compensation = http.delete(channel_id, always).await;
             let removed = compensation.is_ok();
+            if !removed {
+                // Untracked orphan: reconcile will not delete it, so count it
+                // here with no channel ID. The ephemeral reply above names the
+                // channel for manual cleanup.
+                metrics::global().voice_orphan();
+                warn!(
+                    voice_event = "voice_creator_orphan",
+                    outcome = "manual_needed",
+                    "voice creator orphan needs manual deletion"
+                );
+            }
             match error {
                 StoreError::CredentialRefused if removed => "Voice rooms are paused: the database refused the bot credential, so the new channel was removed. Tell an admin to fix it, then restart the bot.".to_owned(),
                 StoreError::CredentialRefused => format!("Voice rooms are paused: the database refused the bot credential, and removing the new channel failed. Delete <#{channel_id}> manually, then tell an admin to fix the database."),

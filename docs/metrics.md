@@ -30,6 +30,12 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
 | `two_bot_job_last_success_timestamp_seconds{job}` | Last successful completion time in Unix seconds; zero means no success recorded |
 | `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
+| `two_bot_voice_operations_total{op,outcome}` | Finished room create/move/delete outcomes; `op` is `create`, `move` or `delete`, `outcome` is `success`, `category_full`, `discord`, `persistence` or `cancelled`; retries and 429 backoffs are not outcomes |
+| `two_bot_voice_reconcile_actions_total{action}` | Reconcile plan sizes; `action` is `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued` |
+| `two_bot_voice_dead_letters_total{action}` | Queue writes that exhausted `QUEUE_MAX_ATTEMPTS` (10); `action` is `create`, `move`, `delete`, `companion`, `ownership`, `kick`, `rename` or `other` |
+| `two_bot_voice_tracked_rooms` | Rooms tracked in memory; compare with live Discord channels for ghosts |
+| `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
+| `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
 
 ## Job coverage and outcomes
 
@@ -121,6 +127,20 @@ as dynamic labels.
   `audit_retry`, `scheduled_messages`, `other`; `outcome` is `success` or `failure`.
   `session_checkpoint` records successful durable gateway commits; zero means
   never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
+- `two_bot_voice_operations_total{op,outcome}` — `op` is `create`, `move`
+  or `delete`; `outcome` is `success`, `category_full`, `discord`,
+  `persistence` or `cancelled`. `Rejected` status/code values never become
+  labels; all store variants share `persistence`.
+- `two_bot_voice_reconcile_actions_total{action}` — `action` is
+  `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued`.
+- `two_bot_voice_dead_letters_total{action}` — `action` is `create`, `move`,
+  `delete`, `companion`, `ownership`, `kick`, `rename` or `other`.
+- Log fields (coordinated with blocked structured-log work, which owns JSON
+  formatting): `voice_event="voice_operation"` with `op`/`outcome`,
+  `voice_event="voice_reconcile"` with plan counts,
+  `voice_event="voice_dead_letter"` with `action`/`attempts`, and
+  `voice_event="voice_creator_orphan"`. No channel, member, token, body or
+  ID leaves the process in any label or field.
 - `two_bot_handler_duration_seconds` histogram buckets (`le`, seconds):
   `0.001`, `0.005`, `0.01`, `0.05`, `0.1`, `0.5`, `1`, `5`, `+Inf`, plus
   `_sum` and `_count`.
