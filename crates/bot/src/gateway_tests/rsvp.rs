@@ -769,10 +769,19 @@ async fn receipt_callback_waits_out_brief_lane_occupancy() {
         2
     );
     shutdown.send_replace(true);
-    runner.await.unwrap().unwrap();
+    // Bound the shutdown drain: a wedged runner must fail loudly with a
+    // message instead of burning the CI budget with zero output.
+    tokio::time::timeout(Duration::from_secs(30), runner)
+        .await
+        .expect("governed runner shutdown deadline")
+        .unwrap()
+        .unwrap();
     drop(ws);
     rest.shutdown().await;
-    db.close().await;
+    // Bound teardown likewise: dropping the schema must not wait forever.
+    tokio::time::timeout(Duration::from_secs(30), db.close())
+        .await
+        .expect("test schema teardown deadline");
 }
 
 #[tokio::test]
@@ -950,10 +959,19 @@ async fn governed_sticky_defers_through_rsvp_lane_hold() {
         1
     );
     shutdown.send_replace(true);
-    runner.await.unwrap().unwrap();
+    // Bound the shutdown drain: a wedged runner must fail loudly with a
+    // message instead of burning the CI budget with zero output.
+    tokio::time::timeout(Duration::from_secs(30), runner)
+        .await
+        .expect("governed runner shutdown deadline")
+        .unwrap()
+        .unwrap();
     drop(ws);
     rest.shutdown().await;
-    db.close().await;
+    // Bound teardown likewise: dropping the schema must not wait forever.
+    tokio::time::timeout(Duration::from_secs(30), db.close())
+        .await
+        .expect("test schema teardown deadline");
 }
 
 /// Occupancy-aware responder: the first and third live-event reads hold the
