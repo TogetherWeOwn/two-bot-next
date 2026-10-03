@@ -25,6 +25,7 @@ pub mod channel_moderation_store;
 pub mod classify;
 pub mod clock_guard;
 pub mod command_permissions;
+pub mod command_restoration;
 pub mod commands;
 pub mod community;
 pub mod community_snapshots;
