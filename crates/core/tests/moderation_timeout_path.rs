@@ -272,13 +272,21 @@ fn timeout_duration_bounds_accept_edges_refuse_outsiders() {
     );
 }
 
+/// One actor/target refusal case: mutate the request, then the expected error
+/// and its literal copy.
+type ActorRefusalCase = (
+    fn(&mut ModerationActor, &mut Option<ModerationTarget>, &mut Option<i64>),
+    PolicyError,
+    &'static str,
+);
+
+/// One target-shape refusal case: mutate the target, then the expected error
+/// and its literal copy.
+type TargetRefusalCase = (fn(&mut ModerationTarget), PolicyError, &'static str);
+
 #[test]
 fn timeout_policy_refusals_name_the_protection() {
-    let cases: [(
-        fn(&mut ModerationActor, &mut Option<ModerationTarget>, &mut Option<i64>),
-        PolicyError,
-        &str,
-    ); 2] = [
+    let cases: [ActorRefusalCase; 2] = [
         (
             |actor, _, _| actor.permissions = 0,
             PolicyError::ActorMissingPermission(ModerationAction::Timeout),
@@ -309,7 +317,7 @@ fn timeout_policy_refusals_name_the_protection() {
         assert_eq!(err.to_string(), copy);
     }
 
-    let mut target_cases: Vec<(fn(&mut ModerationTarget), PolicyError, &str)> = vec![
+    let mut target_cases: Vec<TargetRefusalCase> = vec![
         (
             |t: &mut ModerationTarget| t.user_id = ACTOR_ID.to_owned(),
             PolicyError::TargetSelf,
