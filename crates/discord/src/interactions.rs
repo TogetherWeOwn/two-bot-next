@@ -228,6 +228,14 @@ impl InteractionRuntime {
         &self,
         interaction: Interaction,
     ) -> Result<crate::rsvp::PreparedRsvp, crate::DiscordError> {
+        // Same application-identity refusal as `handle`/`handle_routed`, before
+        // any callback or store work: the callback route carries no app check.
+        let application_id = self
+            .application_id
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if application_id != 0 && interaction.application_id.get() != application_id {
+            return Ok(crate::rsvp::PreparedRsvp::ignored());
+        }
         crate::rsvp::prepare_rsvp_interaction(&self.router, &self.executor, interaction).await
     }
 
@@ -245,10 +253,12 @@ impl InteractionRuntime {
     }
 
     /// Boot sync also covers persisted-session RESUMED, which has no application
-    /// payload. Resolve the identity with the shared executor before connecting.
+    /// payload. Resolve the identity with the shared executor before connecting,
+    /// and arm this runtime's application fence from the same lookup.
     pub async fn publish_current(&self) -> Result<(), crate::DiscordError> {
-        self.publish(self.executor.current_application_id().await?)
-            .await
+        let application_id = self.executor.current_application_id().await?;
+        self.set_application_id(application_id);
+        self.publish(application_id).await
     }
 
     /// One full registry sync, never an RSVP-only partial replacement.
@@ -334,6 +344,24 @@ impl InteractionRuntime {
     pub fn set_application_id(&self, id: u64) {
         self.application_id
             .store(id, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_bot_user_id(&self) -> u64 {
+        self.bot_user_id.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_application_id(&self) -> u64 {
+        self.application_id
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test-only lazy bot-user resolution: proves a READY-stored identity is
+    /// retained without HTTP even when the identity lookup would fail.
+    #[cfg(test)]
+    pub(crate) async fn test_resolved_bot_user_id(&self) -> u64 {
+        self.bot_user_id().await
     }
 
     /// Execute an outcome from this runtime's shared router without routing twice.

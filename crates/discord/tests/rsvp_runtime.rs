@@ -672,3 +672,23 @@ fn published_names_remain_unique() {
         assert_eq!(published.iter().filter(|c| c.name == name).count(), 1);
     }
 }
+
+#[tokio::test]
+async fn mismatched_application_identity_is_refused_before_any_callback_or_store_work() {
+    let Some((pool, schema)) = pool().await else {
+        return;
+    };
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let runtime = runtime(&pool, &mock);
+    runtime.set_application_id(2222);
+    let mut foreign = rsvp(700, "going");
+    foreign.application_id = twilight_model::id::Id::new(9999);
+    // Same fence as `handle`/`handle_routed`: the split prepare path refuses
+    // before any callback or store work, and complete stays a no-op.
+    let prepared = runtime.prepare(foreign).await.expect("prepare refusal");
+    assert!(!runtime.complete(prepared).await.expect("complete refusal"));
+    assert!(mock.requests().is_empty());
+    assert_eq!(counts(&pool).await, (0, 0, 0));
+    cleanup(pool, schema).await;
+    mock.shutdown().await;
+}

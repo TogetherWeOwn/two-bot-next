@@ -193,6 +193,12 @@ impl CommandRuntime {
         })
     }
 
+    /// Test-only access to the shared interaction surface for identity assertions.
+    #[cfg(test)]
+    pub(crate) fn test_interactions(&self) -> &two_bot_discord::interactions::InteractionRuntime {
+        &self.interactions
+    }
+
     pub(crate) fn set_identity(&self, bot_user_id: u64, application_id: u64) {
         self.interactions.set_bot_user_id(bot_user_id);
         self.interactions.set_application_id(application_id);
@@ -325,7 +331,14 @@ impl CommandRuntime {
     /// Keep the standalone dispatch fallback for gateway callers without it.
     pub(crate) fn dispatch_remaining(self: &Arc<Self>, event: &Event) {
         match event {
-            Event::Ready(_) | Event::Resumed => {
+            Event::Ready(ready) => {
+                // The ordered surface owns registry publication; identity still
+                // initializes here so LFG keeps READY's ids without a REST read.
+                self.set_identity(ready.user.id.get(), ready.application.id.get());
+                self.dispatch_ticket_connection(event);
+                return;
+            }
+            Event::Resumed => {
                 self.dispatch_ticket_connection(event);
                 return;
             }

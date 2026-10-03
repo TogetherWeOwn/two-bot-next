@@ -1,7 +1,11 @@
 #![cfg(test)]
 //! Regression coverage for queued defers, accepted-work drain and RESUMED sync.
 use super::*;
-use two_bot_core::{ClassifierConfig, InteractionRouter, RouterGates};
+use std::sync::atomic::{AtomicBool, Ordering};
+use two_bot_core::{
+    send_admission::{PgSendAdmission, SendAdmission},
+    ClassifierConfig, InteractionRouter, RouterGates,
+};
 use two_bot_discord::{interactions::InteractionRuntime, ActionExecutor};
 
 use crate::discord_test_common::{MockRest, ScriptedResponse};
@@ -136,6 +140,139 @@ async fn connect_with_shutdown(
     (runner, ws)
 }
 
+/// Production-shaped ingress: the ordered runtime and the command runtime send
+/// through the same durable single-flight lane, so a held lane exercises the
+/// receipt-callback retry instead of the ungoverned loopback path.
+async fn spawn_governed(
+    db: &TestDb,
+    url: &str,
+    rest: &MockRest,
+    admission: Arc<dyn SendAdmission>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> JoinHandle<Result<(), sqlx::Error>> {
+    ensure_crypto_provider();
+    let saved = load_boot_session(&db.store).await.unwrap();
+    let shard =
+        crate::gateway::build_shard(TOKEN.into(), Intents::empty(), saved.as_ref(), Some(url));
+    let ordered = Arc::new(InteractionRuntime::with_router(
+        InteractionRouter::new(gates()),
+        db.pool.clone(),
+        ActionExecutor::with_admission(TOKEN.into(), Some(rest.origin()), Arc::clone(&admission))
+            .unwrap(),
+        0,
+        ClassifierConfig::default(),
+    ));
+    tokio::spawn(run_shard(
+        shard,
+        Arc::new(build_pipeline(db.store.milestones().await.unwrap(), None)),
+        Arc::new(RwLock::new(GatewayState::Armed)),
+        db.store.clone(),
+        Some(ordered),
+        None,
+        Some(crate::command_runtime::CommandRuntime::new(
+            db.pool.clone(),
+            ActionExecutor::with_admission(TOKEN.into(), Some(rest.origin()), admission).unwrap(),
+            crate::command_runtime::router_with_commands(gates()),
+            GUILD.parse().unwrap(),
+            true,
+        )),
+        None,
+        None,
+        async move {
+            match shutdown {
+                Some(receiver) => crate::server::shutdown_requested(receiver).await,
+                None => std::future::pending().await,
+            }
+        },
+    ))
+}
+
+async fn connect_governed(
+    db: &TestDb,
+    rest: &MockRest,
+    admission: Arc<dyn SendAdmission>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> (
+    JoinHandle<Result<(), sqlx::Error>>,
+    tokio_websockets::WebSocketStream<tokio::net::TcpStream>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let runner = spawn_governed(db, &url, rest, admission, shutdown).await;
+    let (socket, _) = listener.accept().await.unwrap();
+    let (_, mut ws) = ServerBuilder::new().accept(socket).await.unwrap();
+    ws.send(Message::text(
+        json!({"op":10,"d":{"heartbeat_interval":45000}}).to_string(),
+    ))
+    .await
+    .unwrap();
+    // Accept IDENTIFY, answering any jittered initial heartbeat.
+    loop {
+        let message = ws.next().await.unwrap().unwrap();
+        if !message.is_text() {
+            continue;
+        }
+        let packet: Value = serde_json::from_str(message.as_text().unwrap()).unwrap();
+        if packet["op"] == 2 {
+            break;
+        }
+        if packet["op"] == 1 {
+            ws.send(Message::text("{\"op\":11,\"d\":null}".to_owned()))
+                .await
+                .unwrap();
+        }
+    }
+    ws.send(Message::text(ready(&url, "rsvp-session").to_string()))
+        .await
+        .unwrap();
+    wait_sequence(&db.store, 1).await;
+    (runner, ws)
+}
+
+/// Route-aware mock that holds the send lane on the first live-event read: the
+/// delayed response keeps the request in flight, so the shared single-flight
+/// lane stays occupied until the hold elapses. Sets `seen` the moment the held
+/// read arrives, so the test can send the next command into certain occupancy.
+/// Later reads pass through immediately.
+async fn lane_holding_rest(seen: Arc<AtomicBool>, hold: Duration) -> MockRest {
+    let held = Arc::new(AtomicBool::new(false));
+    MockRest::with_responder(move |request| {
+        if request.method == "GET" && request.path.contains("scheduled-events") {
+            seen.store(true, Ordering::Release);
+            if !held.swap(true, Ordering::AcqRel) {
+                return ScriptedResponse::json(
+                    200,
+                    json!({"id":EVENT,"guild_id":GUILD,"status":1}),
+                )
+                .delayed(hold);
+            }
+            return ScriptedResponse::json(200, json!({"id":EVENT,"guild_id":GUILD,"status":1}));
+        }
+        if request.method == "GET" {
+            return ScriptedResponse::json(200, json!({"id":"1111"}));
+        }
+        if request.method == "PUT" {
+            return ScriptedResponse::status(200);
+        }
+        if request.path.ends_with("/callback") {
+            return ScriptedResponse::status(204);
+        }
+        // Deferred original edits require ID-bearing 200 receipts.
+        ScriptedResponse::json(200, json!({"id":"99"}))
+    })
+    .await
+}
+
+async fn wait_flag(flag: &Arc<AtomicBool>) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !flag.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("lane hold never started");
+}
+
 async fn wait_requests(rest: &MockRest, count: usize) {
     tokio::time::timeout(Duration::from_secs(10), async {
         while rest.requests().len() < count {
@@ -201,7 +338,15 @@ async fn queued_commands(
         .unwrap();
     // Overflow is fatal under the shared dispatcher. Error/shutdown cases stay
     // below capacity so their original cause, not overflow, controls the drain.
-    let last = if overflow { 68 } else { 6 };
+    // The graceful case sends only the two commands: both dispatches are already
+    // funneled before shutdown, so the drain must commit both deterministically.
+    let last = if overflow {
+        68
+    } else if graceful_shutdown {
+        3
+    } else {
+        6
+    };
     for sequence in 4..=last {
         ws.send(Message::text(leave(sequence).to_string()))
             .await
@@ -281,9 +426,10 @@ async fn queued_commands(
             .unwrap()
             .unwrap()
             .unwrap();
-        // The in-flight command commits; queued accepted commands drain but
-        // buffered gateway dispatches are not admitted after shutdown.
-        assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 2);
+        // The in-flight command commits and already-funneled accepted commands
+        // drain through cooperative shutdown; only a fatal worker error stops
+        // the writer from admitting buffered funnel work.
+        assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 3);
         assert_eq!(db.count().await, 0);
         None
     } else if overflow {
@@ -544,6 +690,140 @@ async fn resumed_startup_publishes_full_registry_without_ready() {
     runner.abort();
     let _ = runner.await;
     gateway.task.abort();
+    rest.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn receipt_callback_waits_out_brief_lane_occupancy() {
+    let db = TestDb::new().await;
+    let seen = Arc::new(AtomicBool::new(false));
+    // A's live-event read holds the single-flight lane for 1.5 s: inside B's
+    // 2.5 s retry budget and Discord's three-second acknowledgement window.
+    let rest = lane_holding_rest(Arc::clone(&seen), Duration::from_millis(1500)).await;
+    let admission: Arc<dyn SendAdmission> =
+        Arc::new(PgSendAdmission::new(db.pool.clone(), TOKEN).unwrap());
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let (runner, mut ws) = connect_governed(&db, &rest, admission, Some(receiver)).await;
+    ws.send(Message::text(interaction(2, "going").to_string()))
+        .await
+        .unwrap();
+    // B is sent into certain occupancy: A's read has reached the mock, so the
+    // lane stays held until the delayed response lands.
+    wait_flag(&seen).await;
+    let delivered = tokio::time::Instant::now();
+    ws.send(Message::text(interaction(3, "interested").to_string()))
+        .await
+        .unwrap();
+    wait_sequence(&db.store, 3).await;
+    let requests = rest.requests();
+    let callbacks: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request
+                .path
+                .ends_with("/interactions/3/mock-rsvp-3/callback")
+        })
+        .collect();
+    // Exactly one callback reached the wire: every earlier attempt met the held
+    // lane and backed off instead of failing B outright.
+    assert_eq!(callbacks.len(), 1);
+    let waited = callbacks[0].received_at.duration_since(delivered);
+    assert!(waited > Duration::from_millis(1000), "{waited:?}");
+    assert!(waited < Duration::from_secs(3), "{waited:?}");
+    // Ordered effects still execute once, in gateway dispatch order.
+    let edits: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method == "PATCH" && request.path.contains("@original"))
+        .collect();
+    assert_eq!(edits.len(), 2);
+    assert!(edits[0].path.contains("mock-rsvp-2"));
+    assert!(edits[1].path.contains("mock-rsvp-3"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&edits[0].body).unwrap()["content"],
+        "RSVP saved: going."
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&edits[1].body).unwrap()["content"],
+        "RSVP saved: interested."
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM event_rsvps")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "interested");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM announcements_audit_log")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        2
+    );
+    shutdown.send_replace(true);
+    runner.await.unwrap().unwrap();
+    drop(ws);
+    rest.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn exhausted_lane_hold_fences_checkpoint_past_unacked_command() {
+    let db = TestDb::new().await;
+    let seen = Arc::new(AtomicBool::new(false));
+    // Past B's 2.5 s retry budget but inside the 5 s wire timeout, so A's read
+    // still completes while only B's acknowledgement is lost.
+    let rest = lane_holding_rest(Arc::clone(&seen), Duration::from_millis(3500)).await;
+    let admission: Arc<dyn SendAdmission> =
+        Arc::new(PgSendAdmission::new(db.pool.clone(), TOKEN).unwrap());
+    let (runner, mut ws) = connect_governed(&db, &rest, admission, None).await;
+    ws.send(Message::text(interaction(2, "going").to_string()))
+        .await
+        .unwrap();
+    wait_flag(&seen).await;
+    let delivered = tokio::time::Instant::now();
+    ws.send(Message::text(interaction(3, "interested").to_string()))
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(20), runner)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("interaction acknowledgement failed; checkpoint unchanged"),
+        "{error}"
+    );
+    // The drain waited out A's held read before fencing: B's loss surfaces only
+    // after the lane hold elapses.
+    assert!(delivered.elapsed() >= Duration::from_secs(3));
+    // A committed; the cursor holds there instead of passing never-acked B.
+    assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 2);
+    let status: String = sqlx::query_scalar("SELECT status FROM event_rsvps")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "going");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM announcements_audit_log")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        1
+    );
+    // B never reached the wire: no callback and no original-message edit.
+    let requests = rest.requests();
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.path.contains("mock-rsvp-3")),
+        "{}",
+        requests.len()
+    );
+    drop(ws);
     rest.shutdown().await;
     db.close().await;
 }

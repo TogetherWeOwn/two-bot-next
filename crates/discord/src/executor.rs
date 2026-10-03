@@ -116,6 +116,17 @@ impl DiscordError {
     pub fn is_safe_pre_mutation(&self) -> bool {
         matches!(self, Self::Rejected(_) | Self::Guard(_))
     }
+
+    /// True only for the durable send-admission single-flight refusal: the
+    /// token lane is occupied, so this attempt never reached the wire and a
+    /// bounded receipt-callback retry may re-attempt. Every other error —
+    /// including timeouts, transport failures and rate limits — is uncertain
+    /// or definitive and must never be retried by the callback path.
+    #[must_use]
+    pub fn is_admission_blocked(&self) -> bool {
+        matches!(self, Self::Unavailable(detail)
+            if detail == &two_bot_core::send_admission::AdmissionError::Blocked.to_string())
+    }
 }
 
 /// One moderation mutation the executor carries out (legacy
@@ -2720,6 +2731,35 @@ impl ActionExecutor {
         }
     }
 
+    /// Bounded receipt-callback retry for governed-lane occupancy: re-attempts
+    /// ONLY admission-Blocked failures within a 2.5 s budget (~20 ms sleeps),
+    /// leaving margin below Discord's three-second acknowledgement window. A
+    /// Blocked attempt never reached the wire, so retrying it cannot double-ACK;
+    /// every other error returns immediately with no retry.
+    pub async fn answer_interaction_with_blocked_retry(
+        &self,
+        interaction_id: u64,
+        interaction_token: &str,
+        response: &twilight_model::http::interaction::InteractionResponse,
+    ) -> Result<(), DiscordError> {
+        let start = tokio::time::Instant::now();
+        loop {
+            match self
+                .answer_interaction(interaction_id, interaction_token, response)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) if error.is_admission_blocked() => {
+                    if start.elapsed() >= Duration::from_millis(2500) {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Execute a router reply operation in the unpaced interaction lane.
     /// No automatic retries: a lost callback response may already be an ACK.
     pub async fn execute_reply_operation(
@@ -3267,6 +3307,23 @@ mod tests {
 
     fn never_send_admission(token: &str) -> Arc<dyn SendAdmission> {
         Arc::new(NeverSendAdmission(TokenKey::for_bot_token(token).unwrap()))
+    }
+
+    #[test]
+    fn only_the_canonical_blocked_detail_is_retryable() {
+        assert!(
+            DiscordError::Unavailable(AdmissionError::Blocked.to_string()).is_admission_blocked()
+        );
+        for error in [
+            DiscordError::Unavailable("transport: connection reset".to_owned()),
+            DiscordError::Unavailable("Discord response body unavailable".to_owned()),
+            DiscordError::Unavailable("discord send admission is blocked ".to_owned()),
+            DiscordError::Timeout,
+            DiscordError::RateLimited,
+            DiscordError::Rejected("discord refused the request".to_owned()),
+        ] {
+            assert!(!error.is_admission_blocked(), "{error:?}");
+        }
     }
 
     #[tokio::test]

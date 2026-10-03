@@ -803,6 +803,65 @@ async fn dispatch_remaining_keeps_rsvp_replies_and_registry_with_the_ordered_own
     }
 }
 
+#[tokio::test]
+async fn dispatch_remaining_ready_initializes_identity_without_registry_or_tickets() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(false, false), false, origin);
+    runtime.dispatch_remaining(&ready());
+    // The ordered surface owns publication; identity still initializes here so
+    // LFG keeps READY's ids without a REST read.
+    assert_eq!(runtime.test_interactions().test_bot_user_id(), 1111);
+    assert_eq!(runtime.test_interactions().test_application_id(), 1111);
+    assert_eq!(
+        runtime
+            .test_interactions()
+            .test_resolved_bot_user_id()
+            .await,
+        1111
+    );
+    assert!(mock.requests().is_empty(), "no registry or identity HTTP");
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn dispatch_remaining_ready_wakes_tickets_and_survives_failed_lookup() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    let executor =
+        ActionExecutor::with_proxy("test-token".to_owned(), Some(origin)).expect("mock executor");
+    let tickets = Arc::new(
+        crate::ticket_runtime::TicketRuntime::new(
+            pool.clone(),
+            executor.clone(),
+            crate::ticket_runtime::TicketConfig {
+                guild_id: "100".into(),
+                category_id: "200".into(),
+                panel_channel_id: "700".into(),
+                staff_role_id: "300".into(),
+                cooldown_seconds: 15,
+            },
+        )
+        .unwrap(),
+    );
+    let runtime = CommandRuntime::with_tickets(pool, executor, Arc::clone(&tickets));
+    runtime.dispatch_remaining(&ready());
+    // Tickets wake from READY's bot id with no registry publication.
+    assert_eq!(tickets.readiness_for_test(), (1111, 1));
+    assert!(mock.requests().is_empty(), "no registry HTTP");
+    // The mock is gone: any identity HTTP lookup would fail, but READY's
+    // cached bot id is retained for LFG nonce recovery.
+    mock.shutdown().await;
+    assert_eq!(
+        runtime
+            .test_interactions()
+            .test_resolved_bot_user_id()
+            .await,
+        1111
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Consolidated LFG + sticky/feed runtime (no database)
 // ---------------------------------------------------------------------------

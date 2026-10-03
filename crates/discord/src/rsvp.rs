@@ -45,6 +45,16 @@ impl std::fmt::Debug for PreparedRsvp {
     }
 }
 
+impl PreparedRsvp {
+    /// Fenced-out interaction: no callback, no store work, no completion.
+    pub(crate) fn ignored() -> Self {
+        Self {
+            handled: false,
+            deferred: None,
+        }
+    }
+}
+
 /// Slash commands owned by the RSVP path. A refusal for any other command must
 /// be answered by the shared routed path: this path ignores those names, so
 /// leaving the refusal here would drop the denial silently.
@@ -58,20 +68,22 @@ pub async fn prepare_rsvp_interaction(
     executor: &ActionExecutor,
     interaction: Interaction,
 ) -> Result<PreparedRsvp, DiscordError> {
-    let ignored = || PreparedRsvp {
-        handled: false,
-        deferred: None,
-    };
     let RoutedInteraction::Slash { name, outcome } = route_interaction(router, &interaction, None)
     else {
-        return Ok(ignored());
+        return Ok(PreparedRsvp::ignored());
     };
     if !is_rsvp_command(name.as_str()) {
-        return Ok(ignored());
+        return Ok(PreparedRsvp::ignored());
     }
     if let Some(response) = response_for_slash(&outcome) {
+        // Receipt callbacks wait out brief governed-lane occupancy instead of
+        // dropping the acknowledgement; exhaustion still fails the command.
         executor
-            .answer_interaction(interaction.id.get(), &interaction.token, &response)
+            .answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &response,
+            )
             .await?;
         return Ok(PreparedRsvp {
             handled: true,
@@ -79,16 +91,16 @@ pub async fn prepare_rsvp_interaction(
         });
     }
     let SlashOutcome::Handled { handler } = outcome else {
-        return Ok(ignored());
+        return Ok(PreparedRsvp::ignored());
     };
     if !matches!(
         handler,
         HandlerId::Rsvp | HandlerId::RsvpAttendance | HandlerId::ScorecardAttendance
     ) {
-        return Ok(ignored());
+        return Ok(PreparedRsvp::ignored());
     }
     executor
-        .answer_interaction(
+        .answer_interaction_with_blocked_retry(
             interaction.id.get(),
             &interaction.token,
             &InteractionResponse {
@@ -282,5 +294,34 @@ async fn execute(
             })
         }
         _ => unreachable!("only RSVP handlers execute here"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepared_debug_names_the_handler_never_the_callback_token() {
+        let interaction: Interaction = serde_json::from_value(serde_json::json!({
+            "application_id": "1111", "authorizing_integration_owners": {"0": "2222"},
+            "id": "100", "token": "synthetic-secret-token", "type": 2,
+            "version": 1, "guild_id": "2222",
+            "member": {"permissions": "0", "roles": [], "deaf": false, "mute": false,
+                "flags": 0, "user": {"id": "77", "username": "human", "discriminator": "0"}},
+            "data": {"id": "4444", "name": "rsvp", "type": 1, "options": []}
+        }))
+        .expect("wire interaction");
+        for prepared in [
+            PreparedRsvp::ignored(),
+            PreparedRsvp {
+                handled: true,
+                deferred: Some((HandlerId::Rsvp, interaction)),
+            },
+        ] {
+            let shown = format!("{prepared:?}");
+            assert!(!shown.contains("synthetic-secret-token"), "{shown}");
+            assert!(shown.contains("PreparedRsvp"), "{shown}");
+        }
     }
 }

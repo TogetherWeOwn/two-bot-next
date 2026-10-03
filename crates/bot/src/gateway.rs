@@ -230,26 +230,42 @@ type RsvpAcknowledgement = tokio::task::JoinHandle<
     Result<two_bot_discord::rsvp::PreparedRsvp, two_bot_discord::DiscordError>,
 >;
 
+/// Completes one acknowledged command; returns whether the checkpoint may
+/// advance past it. Only an admission-Blocked preparation exhaustion returns
+/// false: the callback never reached Discord, so the cursor must hold instead
+/// of silently passing a never-acknowledged command. Every other preparation
+/// failure, task failure and completion failure keeps the existing warn-and-
+/// advance behavior.
 async fn complete_acknowledgement(
     runtime: &two_bot_discord::interactions::InteractionRuntime,
     acknowledgement: RsvpAcknowledgement,
-) {
-    let result = match acknowledgement.await {
-        Ok(Ok(prepared)) => runtime.complete(prepared).await,
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(two_bot_discord::DiscordError::Rejected(
-            "interaction acknowledgement task failed".into(),
-        )),
+) -> bool {
+    let prepared = match acknowledgement.await {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(error)) => {
+            if error.is_admission_blocked() {
+                warn!("interaction acknowledgement blocked; checkpoint unchanged");
+                return false;
+            }
+            // Do not replay uncertain effects or log interaction tokens.
+            warn!("interaction response failed; not replaying command");
+            return true;
+        }
+        Err(_) => {
+            warn!("interaction response failed; not replaying command");
+            return true;
+        }
     };
-    if result.is_err() {
+    if runtime.complete(prepared).await.is_err() {
         // Do not replay uncertain effects or log interaction tokens.
         warn!("interaction response failed; not replaying command");
     }
+    true
 }
 
 struct AcceptedRsvp {
     acknowledgement: RsvpAcknowledgement,
-    completed: tokio::sync::oneshot::Sender<()>,
+    completed: tokio::sync::oneshot::Sender<bool>,
 }
 
 /// Reception acknowledges immediately; completion stays serial and supervised
@@ -263,8 +279,8 @@ fn start_rsvp_drain(
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<AcceptedRsvp>();
     let task = tokio::spawn(async move {
         while let Some(accepted) = receiver.recv().await {
-            complete_acknowledgement(&runtime, accepted.acknowledgement).await;
-            let _ = accepted.completed.send(());
+            let acknowledged = complete_acknowledgement(&runtime, accepted.acknowledgement).await;
+            let _ = accepted.completed.send(acknowledged);
         }
     });
     (sender, task)
@@ -273,7 +289,7 @@ fn start_rsvp_drain(
 struct ReceivedDispatch {
     event: Event,
     observed_at: String,
-    completion: Option<tokio::sync::oneshot::Receiver<()>>,
+    completion: Option<tokio::sync::oneshot::Receiver<bool>>,
 }
 #[cfg(test)]
 impl ReceivedDispatch {
@@ -371,7 +387,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
     // Tickets run beside reception and are cancelled/joined before return.
     let tickets = runtime.as_ref().and_then(|runtime| runtime.start_tickets());
     let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let worker_stopped = Arc::clone(&stopped);
+    // Fatal worker invalidation only: a cooperative shutdown must still drain
+    // queued accepted work through the writer instead of discarding it.
+    let worker_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let error = Arc::new(std::sync::Mutex::new(None));
     let worker_error = Arc::clone(&error);
     let (failed, failure) = tokio::sync::watch::channel(false);
@@ -491,6 +509,18 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                 }
                             }
                         }
+                        // The ordered runtime is a separate instance from the
+                        // command runtime's own copy: READY identity must reach
+                        // it directly, or its application fence stays disarmed
+                        // and bot-user checks stay lazy.
+                        if let (Some(interactions), Some(dispatch)) =
+                            (interactions.as_ref(), dispatch.as_ref())
+                        {
+                            if let Event::Ready(ready) = &dispatch.event {
+                                interactions.set_bot_user_id(ready.user.id.get());
+                                interactions.set_application_id(ready.application.id.get());
+                            }
+                        }
                         if let (Some(runtime), Some(sender), Some(dispatch)) = (interactions.as_ref(), rsvp_sender.as_ref(), dispatch.as_mut()) {
                             if let Event::InteractionCreate(interaction) = &dispatch.event {
                                 let interaction = interaction.0.clone();
@@ -585,8 +615,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
         crate::dispatch::DISPATCH_BACKLOG,
         move |work| {
             // Already-running work may finish; queued funnel effects are not
-            // admitted after shutdown/error. Accepted RSVP has its own drain.
-            if worker_stopped.load(Ordering::Acquire) {
+            // admitted after a fatal worker error. A cooperative shutdown still
+            // drains queued accepted work. Accepted RSVP has its own drain.
+            if worker_failed.load(Ordering::Acquire) {
                 return;
             }
             let operation =
@@ -692,11 +723,18 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                 panic!("gateway leveling dispatch failed; checkpoint unchanged")
                             });
                             }
-                            if let Some(completion) = dispatch.completion {
-                                handle.block_on(completion).unwrap_or_else(|_| {
+                            // A Blocked receipt-callback exhaustion leaves the command
+                            // never-acknowledged: hold the cursor instead of
+                            // silently passing it. The error path below releases
+                            // a cold-resume wait and records the fence.
+                            let acknowledgement_held = if let Some(completion) = dispatch.completion
+                            {
+                                !handle.block_on(completion).unwrap_or_else(|_| {
                                     panic!("interaction drain failed; checkpoint unchanged")
-                                });
-                            }
+                                })
+                            } else {
+                                false
+                            };
                         }
                         let durable_job = onboarding_job
                             .as_ref()
@@ -708,16 +746,22 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             })
                             .transpose()
                             .unwrap_or_else(|_| panic!("invalid onboarding job"));
-                        let checkpoint_result = handle.block_on(checkpoint_io(
-                            &worker_state,
-                            &generation,
-                            deadline,
-                            store.commit_dispatch_with_job(
-                                &checkpoint,
-                                pipeline.handlers().store().take_batch(),
-                                durable_job,
-                            ),
-                        ));
+                        let checkpoint_result = if acknowledgement_held {
+                            Err(sqlx::Error::InvalidArgument(
+                                "interaction acknowledgement failed; checkpoint unchanged".into(),
+                            ))
+                        } else {
+                            handle.block_on(checkpoint_io(
+                                &worker_state,
+                                &generation,
+                                deadline,
+                                store.commit_dispatch_with_job(
+                                    &checkpoint,
+                                    pipeline.handlers().store().take_batch(),
+                                    durable_job,
+                                ),
+                            ))
+                        };
                         // A failed checkpoint is recorded on `operation` (the
                         // worker stops and accepted RSVP drains) instead of
                         // panicking away accepted commands.
@@ -775,7 +819,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                 // Retain the original error without panicking away accepted
                 // commands or allowing a later checkpoint to leap past failure.
                 *worker_error.lock().expect("gateway error lock") = Some(error);
-                worker_stopped.store(true, Ordering::Release);
+                worker_failed.store(true, Ordering::Release);
                 failed.send_replace(true);
             }
         },
