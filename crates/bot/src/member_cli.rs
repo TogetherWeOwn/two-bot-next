@@ -196,7 +196,7 @@ fn now_iso() -> String {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis()
-            .min(u128::from(i64::MAX)) as i64,
+            .min(i64::MAX as u128) as i64,
     )
 }
 
@@ -391,18 +391,18 @@ async fn run(
 /// Dry-run by default: name the exact resolution, write nothing. With
 /// `--execute`, run the attempt-fenced write once; a generation/claim
 /// mismatch resolves nothing and reports failure without guessing.
-async fn resolve<F, Fut>(
-    store: &PgMemberModerationStore,
+async fn resolve<'a, F, Fut>(
+    store: &'a PgMemberModerationStore,
     guild: &str,
     execute: bool,
     intent: &str,
     write: F,
 ) -> i32
 where
-    F: FnOnce(&PgMemberModerationStore, &str) -> Fut,
+    F: FnOnce(&'a PgMemberModerationStore, &'a str) -> Fut + Send,
     Fut: std::future::Future<Output = Result<(), two_bot_core::member_moderation::StoreError>>
-        + Send,
-    F: Send,
+        + Send
+        + 'a,
 {
     let _ = guild;
     if !execute {
@@ -426,7 +426,7 @@ mod tests {
     use super::*;
 
     fn args(values: &[&str]) -> Vec<String> {
-        values.iter().map(str::to_string).collect()
+        values.iter().map(|value| value.to_string()).collect()
     }
 
     #[test]

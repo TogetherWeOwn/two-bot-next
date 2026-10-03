@@ -164,7 +164,7 @@ fn now_millis_i64() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
-        .min(u128::from(i64::MAX)) as i64
+        .min(i64::MAX as u128) as i64
 }
 
 /// Role positions plus the guild owner, read live per command.
@@ -394,18 +394,16 @@ async fn execute(
     let target = match target {
         Some(target) => {
             let target_id = target.get().to_string();
-            let (roles, is_bot) = match resolved_target_roles(interaction, target) {
+            let resolved_or_fetched = match resolved_target_roles(interaction, target) {
                 Some(resolved) => Some(resolved),
                 None => fetched_target(executor, &guild_id, &target_id)
                     .await
                     .map_err(|_| FAILURE_REPLY.to_owned())?,
             };
-            let Some((roles, is_bot)) = roles else {
-                if action == ModerationAction::Ban {
-                    (vec![guild_id.clone()], false)
-                } else {
-                    return Err(NO_MEMBER_REPLY.to_owned());
-                }
+            let (roles, is_bot) = match resolved_or_fetched {
+                Some(pair) => pair,
+                None if action == ModerationAction::Ban => (vec![guild_id.clone()], false),
+                None => return Err(NO_MEMBER_REPLY.to_owned()),
             };
             Some(ModerationTarget {
                 user_id: target_id.clone(),
