@@ -40,7 +40,7 @@ and force-pushes. They require two status checks: `pr-lint` (ruleset
 100-character limit, the trailing period and a non-empty body. On a push to
 `main` it also checks every commit subject. `check` and `worker check` run on
 every PR too, and a PR merges only when they are green on the exact head commit,
-even though the rulesets do not enforce them. Never bypass or weaken a check.
+even though the rulesets do not enforce them. `check`, `worker check`, `gitleaks` and `pr-lint` are required checks on `main` and must be green on the exact head commit before merge. Never bypass or weaken a check.
 
 ### Issues
 
