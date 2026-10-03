@@ -773,22 +773,40 @@ pub fn reconcile_watch_window(
             ));
         }
     }
-    let live_override_keys: BTreeSet<OverrideKey> = live
+    let live_overrides: BTreeMap<OverrideKey, &PermissionOverride> = live
         .overrides
         .iter()
         .filter(|row| !row.synced)
-        .map(override_key)
+        .map(|row| (override_key(row), row))
         .collect();
     for row in report.target_overrides.clone() {
+        if !row.allow {
+            continue;
+        }
         let key = override_key(&row);
-        if row.allow && !live_override_keys.contains(&key) {
-            // Staged allows what live revoked: carry the revocation.
-            report
-                .target_overrides
-                .retain(|existing| override_key(existing) != key);
-            report
-                .carried_revocations
-                .push(format!("{}:{}", row.command_name, row.resource_id));
+        match live_overrides.get(&key) {
+            // Staged allows what live revoked outright: carry the revocation.
+            None => {
+                report
+                    .target_overrides
+                    .retain(|existing| override_key(existing) != key);
+                report
+                    .carried_revocations
+                    .push(format!("{}:{}", row.command_name, row.resource_id));
+            }
+            // Staged allows what live flipped to deny: the live deny replaces
+            // the staged allow so the window's revocation is not reintroduced.
+            Some(live_row) if !live_row.allow => {
+                for existing in report.target_overrides.iter_mut() {
+                    if override_key(existing) == key {
+                        *existing = PermissionOverride::clone(live_row);
+                    }
+                }
+                report
+                    .carried_revocations
+                    .push(format!("{}:{}", row.command_name, row.resource_id));
+            }
+            Some(_) => {}
         }
     }
     // Live explicit rows missing from the target (added or flipped during the
@@ -1406,6 +1424,43 @@ mod tests {
         assert!(report.is_go());
         assert_eq!(report.carried_revocations, vec!["ban:99".to_owned()]);
         assert!(report.target_overrides.is_empty());
+    }
+
+    #[test]
+    fn reconciler_carries_allow_to_deny_flip_instead_of_keeping_staged_allow() {
+        let mut baseline = scoped(vec![gated("ban", 4)]);
+        baseline.overrides.push(PermissionOverride::explicit(
+            "ban",
+            "99",
+            OverrideTarget::Role,
+            true,
+        ));
+        let staged = baseline.clone();
+        let (live, lineage) = simulate_watch_window(
+            &baseline,
+            &[DriftEvent::ChangedOverride {
+                row: PermissionOverride::explicit("ban", "99", OverrideTarget::Role, false),
+            }],
+        );
+        let mock = MockDiscord::from_baseline(std::slice::from_ref(&baseline));
+        let report = reconcile_watch_window(
+            &baseline,
+            &staged,
+            &live,
+            &lineage,
+            &mock.live_ids_for_scope(&baseline.scope),
+        );
+        assert!(report.is_go());
+        assert_eq!(report.carried_revocations, vec!["ban:99".to_owned()]);
+        assert_eq!(
+            report.target_overrides,
+            vec![PermissionOverride::explicit(
+                "ban",
+                "99",
+                OverrideTarget::Role,
+                false
+            )]
+        );
     }
 
     #[test]
