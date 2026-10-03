@@ -23,11 +23,17 @@ never DELETE/TRUNCATE; reader and PUBLIC receive no lane access. The verifier
 requires these three privileges and rejects extra erase privileges.
 
 Two tables are migrator-only (`migrator` kind): `member_erasure_audit`
-(operator accountability written by the operator-only erasure path, never the
-gateway) and `invite_campaigns` (redirect store with no gateway reader/writer).
-The plan transfers them to the migrator and grants the migrator ALL with no
-runtime or reader grant; the verifier requires migrator ownership/privileges
-and rejects any runtime/reader access, including TOAST-storage ownership drift.
+(operator accountability written by the operator-only erasure path) and
+`invite_campaigns` (go.two.gg redirect store). They still have readers outside
+these three groups, so neither group receives a grant: `two-bot backup` reads
+both through `DUMP_TABLES` (`crates/core/src/backup/dump_file.rs`, via
+`dump.rs`; a runtime-group login cannot read them, so the nightly dump would
+abort), and the go.two.gg `REDIRECT_DB` connector reads `invite_campaigns`
+(`wrangler/src/redirect-store.ts`, unbound today with a snapshot fallback).
+Each of those readers needs its own reviewed identity. The plan transfers both
+tables to the migrator and grants the migrator ALL with no runtime or reader
+grant; the verifier requires migrator ownership/privileges and rejects any
+runtime/reader access, including TOAST-storage ownership drift.
 
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's

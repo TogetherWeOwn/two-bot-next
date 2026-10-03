@@ -1043,16 +1043,14 @@ async fn transactional_drift(
 /// Staging ledger before the first bootstrap: the 29 migration versions the
 /// pending set is computed against. Pending versions are derived as every
 /// other source version, so later migrations join the pending set unlisted.
-/// Three pending versions create tables with no object-matrix row yet (0370
-/// containment claims, 0410 member erasure audit, 0411 invite campaigns);
-/// they stay out of this rehearsal until the matrix backfill lands, and the
-/// backfill removes this exclusion. A new migration that creates an
+/// Every pending version now has an object-matrix row (the matrix backfill
+/// covers 0370 containment claims, 0410 member erasure audit and 0411 invite
+/// campaigns), so no version is excluded. A new migration that creates an
 /// unmatrixed table fails this test at the final verify, by design.
 const STAGING_LEDGER29: [i64; 29] = [
     1, 2, 120, 121, 122, 123, 140, 141, 150, 160, 170, 180, 190, 200, 210, 300, 310, 311, 320, 330,
     331, 332, 333, 334, 340, 350, 351, 360, 390,
 ];
-const PENDING_EXCLUDED_WITHOUT_MATRIX_ROW: [i64; 3] = [370, 410, 411];
 
 /// The ephemeral self-grant must be gone after the plan commits: the
 /// executing identity cannot SET the migrator group anymore. Runs inside a
@@ -1203,12 +1201,9 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         .await
         .unwrap();
     // Apply every pending migration as a SET ROLE member, then record them.
-    // Versions without a matrix row are excluded until the backfill lands.
     let mut pending = Vec::new();
     for (version, migration) in &all {
-        if !STAGING_LEDGER29.contains(version)
-            && !PENDING_EXCLUDED_WITHOUT_MATRIX_ROW.contains(version)
-        {
+        if !STAGING_LEDGER29.contains(version) {
             sqlx::raw_sql(sqlx::AssertSqlSafe(migration.clone()))
                 .execute(&migrator_pool)
                 .await
