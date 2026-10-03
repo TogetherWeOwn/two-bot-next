@@ -142,21 +142,24 @@ fn bodies(mock: &MockRest) -> Vec<Value> {
 /// A valid bulk-overwrite receipt: every element parses as a Discord command
 /// and the array length must match the published set exactly, so callers pass
 /// the live router count rather than hard-coding it.
-fn registry_receipt(count: usize, first_id: u64) -> Value {
-    Value::Array(
-        (0..count)
-            .map(|i| {
-                json!({
-                    "id": (first_id + i as u64).to_string(),
-                    "application_id": "1111",
-                    "version": "1",
-                    "default_member_permissions": null,
-                    "type": 1,
-                    "name": format!("receipt-{i}"),
-                    "description": "registry receipt",
+fn registry_receipt(count: usize, first_id: u64) -> ScriptedResponse {
+    ScriptedResponse::json(
+        200,
+        Value::Array(
+            (0..count)
+                .map(|i| {
+                    json!({
+                        "id": (first_id + i as u64).to_string(),
+                        "application_id": "1111",
+                        "version": "1",
+                        "default_member_permissions": null,
+                        "type": 1,
+                        "name": format!("receipt-{i}"),
+                        "description": "registry receipt",
+                    })
                 })
-            })
-            .collect(),
+                .collect(),
+        ),
     )
 }
 
