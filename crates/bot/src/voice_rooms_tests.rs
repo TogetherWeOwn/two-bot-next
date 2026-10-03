@@ -1432,6 +1432,11 @@ fn voice_command_set_is_gated_on_two_voice() {
             "logging",
             "export",
             "import",
+            "position",
+            "group",
+            "inheritpermissions",
+            "defaultlimit",
+            "alwaysprivate",
             "kick"
         ]
     );
