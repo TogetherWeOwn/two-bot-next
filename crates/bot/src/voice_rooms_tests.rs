@@ -1601,6 +1601,30 @@ fn decide_text_channels_refuses_bad_input() {
 }
 
 #[test]
+fn command_names_key_the_role_restrictions() {
+    let commands = [
+        VoiceCommand::Create {
+            name: String::new(),
+        },
+        VoiceCommand::Setup,
+        VoiceCommand::Ping,
+        VoiceCommand::Invite,
+        VoiceCommand::TextChannels {
+            channel_id: CREATOR,
+            request: request(None, None, None),
+        },
+    ];
+    for command in &commands {
+        assert!(
+            two_bot_core::voice_access::VOICE_COMMANDS.contains(&command.name()),
+            "{} is not a restrictable voice command",
+            command.name()
+        );
+    }
+    assert_eq!(commands[4].name(), "textchannels");
+}
+
+#[test]
 fn text_channels_summary_reports_the_stored_settings() {
     let mut creator = CreatorChannel::new(GUILD, CREATOR);
     assert!(text_channels_summary(&creator).contains("off"));

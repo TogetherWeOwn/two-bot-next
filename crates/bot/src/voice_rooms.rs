@@ -2585,6 +2585,7 @@ impl VoiceCommand {
             Self::Setup => "setup",
             Self::Ping => "ping",
             Self::Invite => "invite",
+            Self::TextChannels { .. } => "textchannels",
         }
     }
 }
