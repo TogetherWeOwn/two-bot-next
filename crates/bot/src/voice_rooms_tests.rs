@@ -76,8 +76,10 @@ struct Store {
     trace: Trace,
     creators: Mutex<Vec<CreatorChannel>>,
     rooms: Mutex<HashMap<u64, VoiceRoom>>,
+    companions: Mutex<HashMap<(u64, u64), TextCompanion>>,
     persist_error: Option<StoreError>,
     forget_errors: Mutex<VecDeque<StoreError>>,
+    companion_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
     after_persist: Option<Hook>,
 }
@@ -88,8 +90,10 @@ impl Store {
             trace,
             creators: Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)]),
             rooms: Mutex::new(HashMap::new()),
+            companions: Mutex::new(HashMap::new()),
             persist_error: None,
             forget_errors: Mutex::new(VecDeque::new()),
+            companion_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
             after_persist: None,
         }
@@ -139,6 +143,38 @@ impl RoomPersistence for Store {
         self.rooms.lock().unwrap().remove(&channel);
         Ok(())
     }
+    async fn companions(&self, _: u64) -> Result<Vec<TextCompanion>, StoreError> {
+        Ok(self.companions.lock().unwrap().values().cloned().collect())
+    }
+    async fn add_companion(&self, companion: &TextCompanion) -> Result<bool, StoreError> {
+        self.trace.lock().unwrap().push(format!(
+            "add_companion:{}:{}",
+            companion.room_channel_id, companion.text_channel_id
+        ));
+        if let Some(error) = self.companion_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        Ok(self
+            .companions
+            .lock()
+            .unwrap()
+            .insert(
+                (companion.guild_id, companion.room_channel_id),
+                companion.clone(),
+            )
+            .is_none())
+    }
+    async fn remove_companion(
+        &self,
+        guild: u64,
+        room: u64,
+    ) -> Result<Option<TextCompanion>, StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("remove_companion:{room}"));
+        Ok(self.companions.lock().unwrap().remove(&(guild, room)))
+    }
 }
 
 struct Http {
@@ -148,6 +184,8 @@ struct Http {
     move_errors: Mutex<VecDeque<RoomHttpError>>,
     delete_errors: Mutex<VecDeque<RoomHttpError>>,
     rename_errors: Mutex<VecDeque<RoomHttpError>>,
+    companion_errors: Mutex<VecDeque<RoomHttpError>>,
+    view_errors: Mutex<VecDeque<RoomHttpError>>,
     created_attributes: Mutex<Vec<RoomChannelAttributes>>,
     after_create: Option<Hook>,
     before_move: Option<Hook>,
@@ -163,6 +201,8 @@ impl Http {
             move_errors: Mutex::new(VecDeque::new()),
             delete_errors: Mutex::new(VecDeque::new()),
             rename_errors: Mutex::new(VecDeque::new()),
+            companion_errors: Mutex::new(VecDeque::new()),
+            view_errors: Mutex::new(VecDeque::new()),
             created_attributes: Mutex::new(Vec::new()),
             after_create: None,
             before_move: None,
@@ -244,6 +284,67 @@ impl RoomWrites for Http {
             .unwrap()
             .push(format!("rename:{channel}:{name}"));
         match self.rename_errors.lock().unwrap().pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    async fn create_companion(
+        &self,
+        plan: &TextChannelPlan,
+        bot_id: Snowflake,
+        guard: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace.lock().unwrap().push(format!(
+            "create_companion:{}:{}:{bot_id}",
+            plan.room_id, plan.name
+        ));
+        if let Some(error) = self.companion_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        let id = {
+            let mut id = self.next_id.lock().unwrap();
+            let next = *id;
+            *id += 1;
+            next
+        };
+        // Text channel: kind 0, parented to the room's category.
+        Ok(channel(id, 0, Some(plan.category_id)))
+    }
+    async fn grant_companion_view(
+        &self,
+        text_channel: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("grant:{text_channel}:{member}"));
+        match self.view_errors.lock().unwrap().pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    async fn revoke_companion_view(
+        &self,
+        text_channel: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("revoke:{text_channel}:{member}"));
+        match self.view_errors.lock().unwrap().pop_front() {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -1474,4 +1575,228 @@ async fn disabled_gateway_responder_does_not_acknowledge() {
     );
     tokio::task::yield_now().await;
     assert!(trace.lock().unwrap().is_empty());
+}
+
+// --- V9c companion lifecycle --------------------------------------------------
+
+fn text_creator() -> CreatorChannel {
+    let mut creator = CreatorChannel::new(GUILD, CREATOR);
+    creator.text_channels = true;
+    creator
+}
+
+fn companion_fixture() -> (LiveGuild, Store, Http, Trace) {
+    let trace = Trace::default();
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(&[], vec![]));
+    let mut store = Store::new(trace.clone());
+    store.creators.lock().unwrap()[0] = text_creator();
+    (live, store, Http::new(trace.clone()), trace)
+}
+
+/// Drive one full join through room create, companion create and move.
+async fn join_with_companion(
+    worker: &mut GuildRoomWorker<Store, Http>,
+    member: u64,
+    now: &mut u64,
+) -> u64 {
+    join(worker, member);
+    // Room create.
+    dispatch(worker, *now).await;
+    *now += 1;
+    // Companion create.
+    dispatch(worker, *now).await;
+    *now += 1;
+    // Move.
+    dispatch(worker, *now).await;
+    *now += 1;
+    // Simulate Discord's voice-state echo: the member is now in the room.
+    worker.live.voice_update(member, Some(500), Some(false));
+    worker.reconcile();
+    500
+}
+
+#[tokio::test]
+async fn companion_created_with_room_when_toggle_on() {
+    let (live, store, http, trace) = companion_fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    join_with_companion(&mut worker, MEMBER, &mut now).await;
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        calls.contains(&"create".to_owned()),
+        "room created: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("create_companion:500:voice-chat:999")),
+        "companion POST carries room id, default name and bot id: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("add_companion:500:")),
+        "companion record persisted: {calls:?}"
+    );
+    assert_eq!(worker.companions.len(), 1);
+    let companion = &worker.companions[&500];
+    assert_eq!(companion.guild_id, GUILD);
+    assert!(companion.settings.enabled);
+}
+
+#[tokio::test]
+async fn no_companion_when_toggle_off() {
+    let (live, store, http, trace) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    worker.reconcile();
+    assert!(!worker.dispatch_one(2).await);
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        !calls.iter().any(|call| call.contains("companion")),
+        "{calls:?}"
+    );
+    assert!(worker.companions.is_empty());
+}
+
+#[tokio::test]
+async fn join_grants_view_and_leave_revokes_without_deny() {
+    let (live, store, http, trace) = companion_fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    join_with_companion(&mut worker, MEMBER, &mut now).await;
+    let text_id = worker.companions[&500].text_channel_id;
+    // Second occupant joins the room: reconcile enqueues exactly one grant.
+    worker.live.voice_update(MEMBER + 1, Some(500), Some(false));
+    worker.reconcile();
+    dispatch(&mut worker, now).await;
+    now += 1;
+    // Occupant leaves: reconcile enqueues exactly one revoke (delete of the
+    // overwrite, never a deny).
+    worker.live.voice_update(MEMBER + 1, None, Some(false));
+    worker.reconcile();
+    dispatch(&mut worker, now).await;
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        calls.contains(&format!("grant:{text_id}:{}", MEMBER + 1)),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&format!("revoke:{text_id}:{}", MEMBER + 1)),
+        "{calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn companion_deleted_with_its_room_and_delete_is_idempotent() {
+    let (live, store, http, trace) = companion_fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    join_with_companion(&mut worker, MEMBER, &mut now).await;
+    let text_id = worker.companions[&500].text_channel_id;
+    // Everyone leaves: reconcile queues the room delete, which deletes the
+    // companion first.
+    worker.live.voice_update(MEMBER, None, Some(false));
+    worker.reconcile();
+    dispatch(&mut worker, now).await;
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        calls.contains(&format!("delete:{text_id}")),
+        "companion deleted: {calls:?}"
+    );
+    assert!(calls.contains(&"delete:500".to_owned()), "{calls:?}");
+    assert!(
+        calls.contains(&"remove_companion:500".to_owned()),
+        "companion row removed: {calls:?}"
+    );
+    assert!(worker.companions.is_empty());
+    // Re-dispatching the room delete (or a duplicate) is a no-op.
+    worker.reconcile();
+    assert!(!worker.dispatch_one(now + 1).await);
+    let after = trace.lock().unwrap().clone();
+    assert_eq!(
+        after
+            .iter()
+            .filter(|call| *call == &format!("delete:{text_id}"))
+            .count(),
+        1,
+        "no duplicate companion delete: {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn companion_create_is_idempotent_when_record_already_exists() {
+    let (live, store, http, trace) = companion_fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, now).await;
+    now += 1;
+    // A racing dispatch persisted the companion first: the queued create is
+    // success without another POST.
+    worker.companions.insert(
+        500,
+        TextCompanion {
+            guild_id: GUILD,
+            room_channel_id: 500,
+            text_channel_id: 700,
+            settings: two_bot_core::voice_text_channel::TextChannelSettings {
+                enabled: true,
+                configured_name: None,
+                viewer_role_id: None,
+            },
+            created_at: NOW.to_owned(),
+        },
+    );
+    dispatch(&mut worker, now).await;
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.starts_with("create_companion")),
+        "no duplicate POST: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn unknown_companion_outcome_adopts_visible_channel_without_repost() {
+    let (live, store, mut http, trace) = companion_fixture();
+    http.companion_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::UnknownOutcome);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut now = 0;
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, now).await;
+    now += 1;
+    // The POST outcome is unknown, but the live snapshot already shows the
+    // channel the POST created (name + category match): adopt it.
+    worker.live.upsert_channel(channel(600, 0, Some(CATEGORY)));
+    {
+        let mut live = worker.live.inner.write().unwrap();
+        if let Some(created) = live.channels.get_mut(&600) {
+            created.name = Some("voice-chat".to_owned());
+        }
+    }
+    dispatch(&mut worker, now).await;
+    let calls = trace.lock().unwrap().clone();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("create_companion"))
+            .count(),
+        1,
+        "exactly one POST: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("add_companion:500:600")),
+        "adopted channel persisted: {calls:?}"
+    );
+    assert_eq!(worker.companions[&500].text_channel_id, 600);
 }

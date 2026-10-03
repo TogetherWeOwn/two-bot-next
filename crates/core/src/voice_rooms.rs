@@ -702,6 +702,30 @@ pub enum RoomAction {
         name: String,
         seed: u64,
     },
+    /// Create the V9 companion text channel for an already-created room.
+    /// The full [`TextChannelPlan`] (name, category, creation-time overwrites
+    /// plus settings snapshot) rides the action so a later `/textchannels`
+    /// change cannot alter this channel; overwrites are never patched after
+    /// the POST. `channel_id()` is `None` (like `CreateRoom`): the companion
+    /// is keyed by its room, and room-scoped suspend/drop must not cancel a
+    /// creation whose outcome is unknown — the dispatch rechecks the store.
+    CreateCompanion {
+        room_channel_id: Snowflake,
+        plan: TextChannelPlan,
+    },
+    /// Grant one occupant View on the companion (V9 join). Never a deny.
+    GrantCompanionView {
+        room_channel_id: Snowflake,
+        text_channel_id: Snowflake,
+        member_id: Snowflake,
+    },
+    /// Delete one occupant's overwrite on the companion (V9 leave). The
+    /// overwrite is deleted, never replaced with a deny.
+    RevokeCompanionView {
+        room_channel_id: Snowflake,
+        text_channel_id: Snowflake,
+        member_id: Snowflake,
+    },
     MoveMember {
         member_id: Snowflake,
         channel_id: Snowflake,
@@ -731,13 +755,24 @@ impl RoomAction {
     }
 
     /// The room channel this action touches, if any (suspend/drop scope).
+    /// Companion view edits scope to their room: once the room is gone its
+    /// companion is deleted, so pending grants/revokes for it are dropped
+    /// with it. `CreateCompanion` scopes to no channel (like `CreateRoom`).
     #[must_use]
     pub fn channel_id(&self) -> Option<Snowflake> {
         match self {
-            Self::CreateRoom { .. } => None,
+            Self::CreateRoom { .. } | Self::CreateCompanion { .. } => None,
             Self::MoveMember { channel_id, .. }
             | Self::DeleteRoom { channel_id }
-            | Self::RenameRoom { channel_id, .. } => Some(*channel_id),
+            | Self::RenameRoom { channel_id, .. }
+            | Self::GrantCompanionView {
+                room_channel_id: channel_id,
+                ..
+            }
+            | Self::RevokeCompanionView {
+                room_channel_id: channel_id,
+                ..
+            } => Some(*channel_id),
         }
     }
 }

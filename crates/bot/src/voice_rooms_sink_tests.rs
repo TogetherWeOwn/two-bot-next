@@ -19,6 +19,19 @@ impl RoomPersistence for Arc<Store> {
     async fn forget(&self, guild: u64, channel: u64) -> Result<(), StoreError> {
         self.as_ref().forget(guild, channel).await
     }
+    async fn companions(&self, guild: u64) -> Result<Vec<TextCompanion>, StoreError> {
+        self.as_ref().companions(guild).await
+    }
+    async fn add_companion(&self, companion: &TextCompanion) -> Result<bool, StoreError> {
+        self.as_ref().add_companion(companion).await
+    }
+    async fn remove_companion(
+        &self,
+        guild: u64,
+        room: u64,
+    ) -> Result<Option<TextCompanion>, StoreError> {
+        self.as_ref().remove_companion(guild, room).await
+    }
 }
 
 #[derive(Clone, Default)]
@@ -77,6 +90,34 @@ impl RoomWrites for GatedHttp {
     }
     async fn rename(&self, channel: u64, name: &str) -> Result<(), RoomHttpError> {
         self.http.rename(channel, name).await
+    }
+    async fn create_companion(
+        &self,
+        plan: &TextChannelPlan,
+        bot_id: Snowflake,
+        guard: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        self.http.create_companion(plan, bot_id, guard).await
+    }
+    async fn grant_companion_view(
+        &self,
+        text_channel_id: Snowflake,
+        member_id: Snowflake,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.http
+            .grant_companion_view(text_channel_id, member_id, guard)
+            .await
+    }
+    async fn revoke_companion_view(
+        &self,
+        text_channel_id: Snowflake,
+        member_id: Snowflake,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.http
+            .revoke_companion_view(text_channel_id, member_id, guard)
+            .await
     }
 }
 

@@ -147,6 +147,18 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     );
     assert_eq!(store.companion_for(101, 500).await?, None);
     assert_eq!(store.companion_for(100, 501).await?, None);
+    // V9c worker load: guild-scoped companion listing for startup
+    // reconciliation, ordered by room.
+    let mut second = companion.clone();
+    second.room_channel_id = 501;
+    second.text_channel_id = 601;
+    assert!(store.add_companion(&second).await?);
+    assert_eq!(
+        store.companions_in_guild(100).await?,
+        vec![companion.clone(), second.clone()]
+    );
+    assert!(store.companions_in_guild(101).await?.is_empty());
+    assert_eq!(store.remove_companion(100, 501).await?, Some(second));
     assert_eq!(
         store.remove_companion(101, 500).await?,
         None,

@@ -40,6 +40,30 @@ impl RoomWrites for DeleteOnly {
     async fn rename(&self, _: u64, _: &str) -> Result<(), RoomHttpError> {
         panic!("reconciliation must not rename a room");
     }
+    async fn create_companion(
+        &self,
+        _: &TextChannelPlan,
+        _: Snowflake,
+        _: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        panic!("reconciliation must not create a companion");
+    }
+    async fn grant_companion_view(
+        &self,
+        _: Snowflake,
+        _: Snowflake,
+        _: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        panic!("reconciliation must not grant companion view");
+    }
+    async fn revoke_companion_view(
+        &self,
+        _: Snowflake,
+        _: Snowflake,
+        _: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        panic!("reconciliation must not revoke companion view");
+    }
 }
 
 struct RecordingVoice {
