@@ -30,8 +30,12 @@ pub mod internal_events;
 #[cfg(feature = "db")]
 pub mod leveling_runtime;
 mod message_safety;
+pub mod onboarding_config;
+pub mod onboarding_messages;
+pub mod onboarding_permissions;
 pub mod pipeline;
 pub mod ratelimit_guard;
+pub mod voice_rooms;
 
 #[cfg(feature = "db")]
 pub use leveling_runtime::{LevelingRuntime, OrderedLevelingPipeline};

@@ -67,6 +67,14 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "automod_violations", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "community_facts", measure: TableMeasure::Columns(&["recorded_at"]) },
     TableSpec { table: "community_scorecard_alerts", measure: TableMeasure::Columns(&["created_at"]) },
+    // Retry reservation (TOG-11145): next_attempt_at is a BIGINT epoch-ms
+    // backoff deadline, not a write time, and has no timestamptz cast.
+    TableSpec {
+        table: "community_scorecard_attempts",
+        measure: TableMeasure::Unmeasurable(
+            "no timestamp column; next_attempt_at is an epoch-ms retry deadline, and a completed week is visible via community_scorecard_runs.generated_at",
+        ),
+    },
     TableSpec { table: "community_scorecard_runs", measure: TableMeasure::Columns(&["generated_at"]) },
     TableSpec { table: "community_stream_heartbeats", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "containment_events", measure: TableMeasure::Columns(&["created_at"]) },
@@ -78,6 +86,12 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
     TableSpec { table: "feed_relays", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "gateway_boot_directives", measure: TableMeasure::Columns(&["armed_at", "consumed_at"]) },
+    TableSpec {
+        table: "gateway_onboarding_jobs",
+        measure: TableMeasure::Unmeasurable(
+            "transient restart-recovery queue with no timestamp column (occurred_at_ms is a gateway event time); rows hold no durable member state",
+        ),
+    },
     TableSpec { table: "gateway_sessions", measure: TableMeasure::Columns(&["updated_at"]) },
     // Collector read-times ride the same row write, so their maximum is the
     // row's last write.
@@ -97,6 +111,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "internal_discord_events", measure: TableMeasure::Columns(&["claimed_at"]) },
     TableSpec { table: "internal_idempotency", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "internal_nonces", measure: TableMeasure::Columns(&["burned_at"]) },
+    // Retirements rewrite disabled_at without touching created_at, so the
+    // maximum across both is the row's last write (same shape as tickets).
+    TableSpec { table: "invite_campaigns", measure: TableMeasure::Columns(&["created_at", "disabled_at"]) },
     TableSpec { table: "invite_snapshots", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "join_risk_flags", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "level_import_runs", measure: TableMeasure::Columns(&["imported_at"]) },
@@ -156,6 +173,18 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "scheduled_events", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "scheduled_messages", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "self_role_audit", measure: TableMeasure::Columns(&["created_at"]) },
+    TableSpec {
+        table: "self_role_exchange_baselines",
+        measure: TableMeasure::Unmeasurable(
+            "no timestamp column; the baseline row is written with its event's exchange lifecycle (measured via self_role_exchanges.created_at)",
+        ),
+    },
+    // Ticket creation, settlement and retirement each rewrite a different
+    // column without touching the others, so the maximum is the row's last write.
+    TableSpec {
+        table: "self_role_exchanges",
+        measure: TableMeasure::Columns(&["created_at", "completed_at", "retired_at"]),
+    },
     TableSpec { table: "self_role_panel_claims", measure: TableMeasure::Columns(&["processing_expires_at"]) },
     TableSpec { table: "sticky_messages", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "ticket_transcripts", measure: TableMeasure::Columns(&["created_at"]) },
@@ -164,6 +193,24 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec {
         table: "tickets",
         measure: TableMeasure::Columns(&["created_at", "closing_started_at", "closed_at"]),
+    },
+    TableSpec {
+        table: "voice_creators",
+        measure: TableMeasure::Unmeasurable(
+            "no timestamp column; creator configuration is upserted in place (see PgRoomStore::add_creator)",
+        ),
+    },
+    // Insert-once rows (PgRoomStore::add_room never overwrites). An ownership
+    // transfer that updates owner_id must add its own timestamp column.
+    TableSpec { table: "voice_rooms", measure: TableMeasure::Columns(&["created_at"]) },
+    // Same insert-once shape as voice_rooms (PgRoomStore::add_companion never
+    // overwrites the creation snapshot).
+    TableSpec { table: "voice_text_companions", measure: TableMeasure::Columns(&["created_at"]) },
+    TableSpec {
+        table: "voice_access_controls",
+        measure: TableMeasure::Unmeasurable(
+            "mutable per-guild settings row with no timestamp column; no member IDs",
+        ),
     },
     TableSpec {
         table: "web_contract_meta",
