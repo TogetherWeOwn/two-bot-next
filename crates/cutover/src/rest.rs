@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use twilight_http::error::Error as TwilightError;
-use twilight_http::request::{Request, TryIntoRequest};
+use twilight_http::request::{AuditLogReason, Request, TryIntoRequest};
 use twilight_http::Client;
 use twilight_model::channel::message::Message;
 use twilight_model::channel::Channel;
@@ -331,15 +331,17 @@ impl RestClient {
         .map(ListPage::into_option)
     }
 
-    /// Delete one channel (ghost-cleanup execute path). Same governed retry
-    /// semantics as the readers, minus body decode (DELETE answers 204 with
-    /// no body): 2xx is deleted, 404 is already-gone success (a duplicate
-    /// delete is success), 429 backs off on the response's own retry-after,
-    /// 5xx retries with backoff. A 403 is a hard failure — never proof of
-    /// deletion, so the row stays tracked for the next run.
+    /// Delete one channel (ghost-cleanup execute path), carrying the
+    /// operator's `reason` in the Discord audit-log header. Same governed
+    /// retry semantics as the readers, minus body decode (DELETE answers
+    /// 204 with no body): 2xx is deleted, 404 is already-gone success (a
+    /// duplicate delete is success), 429 backs off on the response's own
+    /// retry-after, 5xx retries with backoff. A 403 is a hard failure —
+    /// never proof of deletion, so the row stays tracked for the next run.
     pub async fn delete_channel(
         &self,
         channel_id: Id<ChannelMarker>,
+        reason: &str,
     ) -> Result<DeleteOutcome, RestError> {
         let transport = self
             .inner
@@ -352,6 +354,7 @@ impl RestClient {
                 .inner
                 .client
                 .delete_channel(channel_id)
+                .reason(reason)
                 .try_into_request()?;
             self.inner.requests.fetch_add(1, Ordering::Relaxed);
             let (res, _) =

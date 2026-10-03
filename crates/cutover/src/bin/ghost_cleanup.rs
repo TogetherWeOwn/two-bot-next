@@ -105,12 +105,14 @@ async fn run(args: Args) -> Result<i32, String> {
     let tracked = store.rooms_in_guild(guild_id).await.map_err(|_| {
         "tracked-room query failed; check authorized database/schema (no migrations are applied)"
     })?;
-    db.close().await;
 
     let plan = plan_ghost_cleanup(&tracked, &seen);
     validate_execute_count(mode, expected, plan.action_count()).map_err(|e| e.to_owned())?;
 
     if mode == RemovalMode::DryRun {
+        // The store holds a clone of this pool, so it stays open until the
+        // last write lands; dry run writes nothing, so it can close here.
+        db.close().await;
         let report = render_report(
             &guild,
             mode,
@@ -143,8 +145,10 @@ async fn run(args: Args) -> Result<i32, String> {
         .map_err(|_| "cleanup client unavailable; check admission authority")?;
 
     let (forgot, mut failures) = apply_forgets(&store, guild_id, &plan.forget).await;
-    let (deleted, delete_failures) = apply_deletes(&client, &store, guild_id, &plan.delete).await;
+    let (deleted, delete_failures) =
+        apply_deletes(&client, &store, guild_id, &plan.delete, reason).await;
     failures.extend(delete_failures);
+    db.close().await;
     let outcome = GhostApplyOutcome {
         forgot,
         deleted,

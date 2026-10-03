@@ -173,15 +173,17 @@ pub async fn apply_forgets(
     (forgot, failed)
 }
 
-/// Delete empty tracked channels, then forget their rows. A failed delete
-/// keeps the row (a 403 is never proof of deletion); a failed row drop
-/// after a successful delete is reported — the channel is already gone, so
-/// the next run forgets it.
+/// Delete empty tracked channels, then forget their rows. `reason` travels
+/// in the Discord audit-log header of every delete. A failed delete keeps
+/// the row (a 403 is never proof of deletion); a failed row drop after a
+/// successful delete is reported — the channel is already gone, so the next
+/// run forgets it.
 pub async fn apply_deletes(
     client: &RestClient,
     store: &PgRoomStore,
     guild_id: Snowflake,
     rooms: &[VoiceRoom],
+    reason: &str,
 ) -> (Vec<String>, Vec<GhostFailure>) {
     use twilight_model::id::{marker::ChannelMarker, Id};
 
@@ -189,7 +191,7 @@ pub async fn apply_deletes(
     let mut failed = Vec::new();
     for room in rooms {
         match client
-            .delete_channel(Id::<ChannelMarker>::new(room.channel_id))
+            .delete_channel(Id::<ChannelMarker>::new(room.channel_id), reason)
             .await
         {
             Ok(DeleteOutcome::Deleted | DeleteOutcome::AlreadyGone) => {
