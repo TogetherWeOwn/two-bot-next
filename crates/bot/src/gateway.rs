@@ -308,6 +308,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
     voice: Option<Arc<dyn VoiceEventSink>>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), sqlx::Error> {
+    let _dispatch_guard = runtime.as_ref().map(|runtime| runtime.dispatch_guard());
     let _voice_connection = VoiceConnectionGuard(voice.clone());
     let generation = Arc::new(AtomicU64::new(0));
     let saved = checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, store.load()).await?;

@@ -1,19 +1,36 @@
-//! Real SQLx interoperability proof for the staging migration runner (TOG-11572).
+//! Real SQLx interoperability proof for the staging migration runner.
 //! Only agent-testdb or the ephemeral CI service, never an application URL.
 //! Controller: python3 scripts/cargo_cache.py run -- test -p two-bot-cutover
 //! --test staging_migrate_db -- --ignored
+//!
+//! Shape: seed the exact 29-version staging ledger through a filtered SQLx
+//! migrator as a non-superuser member login under SET ROLE, then run the real
+//! `staging-migrate apply` with the reviewed `expected_pending` list through
+//! the full migrator. The seeded max is 390 while most pending versions sort
+//! below it, so a full ledger afterwards proves SQLx applies every unapplied
+//! version regardless of the ledger max.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde_json::Value;
 use sqlx::{
-    postgres::{PgConnectOptions, PgSslMode},
-    Connection, PgConnection,
+    migrate::Migrator,
+    postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
+    Connection, Executor, PgConnection,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// Exact staging ledger versions at the base SHA (29 rows, max 390).
+const SEED_VERSIONS: [i64; 29] = [
+    1, 2, 120, 121, 122, 123, 140, 141, 150, 160, 170, 180, 190, 200, 210, 300, 310, 311, 320, 330,
+    331, 332, 333, 334, 340, 350, 351, 360, 390,
+];
 
 fn url_allowed(url: &str, github_actions: bool) -> bool {
     url == "postgres://agent_test@agent-testdb:5432/agent_test"
@@ -35,6 +52,7 @@ struct Fixture {
     host: String,
     database: String,
     outsider: String,
+    mlogin: String,
 }
 
 impl Fixture {
@@ -49,8 +67,10 @@ impl Fixture {
         };
         let mut admin = PgConnection::connect_with(&admin_options(host, "agent_test")).await?;
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let database = format!("two_bot_staging_fx_{}_{nonce}", std::process::id());
-        let outsider = format!("stg_fx_outsider_{}_{nonce}", std::process::id());
+        let pid = std::process::id();
+        let database = format!("two_bot_staging_fx_{pid}_{nonce}");
+        let outsider = format!("stg_fx_outsider_{pid}_{nonce}");
+        let mlogin = format!("stg_fx_mlogin_{pid}_{nonce}");
         // Cluster-level group shared with other suites: tolerate a concurrent create.
         sqlx::query(
             "DO $$ BEGIN CREATE ROLE two_bot_migrator NOLOGIN; \
@@ -61,11 +81,24 @@ impl Fixture {
         for sql in [
             format!("CREATE DATABASE {database}"),
             format!("CREATE ROLE {outsider} LOGIN"),
+            // Non-superuser member login: proves SET ROLE works by membership,
+            // not by superuser powers.
+            format!("CREATE ROLE {mlogin} LOGIN"),
         ] {
             sqlx::query(sqlx::AssertSqlSafe(sql))
                 .execute(&mut admin)
                 .await?;
         }
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "GRANT CONNECT ON DATABASE {database} TO two_bot_migrator"
+        )))
+        .execute(&mut admin)
+        .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "GRANT two_bot_migrator TO {mlogin}"
+        )))
+        .execute(&mut admin)
+        .await?;
         let mut scratch = PgConnection::connect_with(&admin_options(host, &database)).await?;
         sqlx::query("ALTER SCHEMA public OWNER TO two_bot_migrator")
             .execute(&mut scratch)
@@ -76,6 +109,7 @@ impl Fixture {
             host: host.to_owned(),
             database,
             outsider,
+            mlogin,
         })
     }
 
@@ -92,6 +126,7 @@ impl Fixture {
         url: Option<String>,
         host: &str,
         db: &str,
+        expected_pending: Option<&str>,
     ) -> (i32, String, String) {
         let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_staging-migrate"));
         cmd.args([
@@ -106,8 +141,11 @@ impl Fixture {
             "TOG-fixture#recovery",
             "--acl-plan-ref",
             "TOG-fixture#acl",
-        ])
-        .env_remove("TWO_BOT_STAGING_MIGRATOR_DATABASE_URL");
+        ]);
+        if let Some(list) = expected_pending {
+            cmd.args(["--expected-pending", list]);
+        }
+        cmd.env_remove("TWO_BOT_STAGING_MIGRATOR_DATABASE_URL");
         for key in ["PGOPTIONS", "PGPASSFILE", "PGSERVICE"] {
             cmd.env_remove(key);
         }
@@ -133,9 +171,11 @@ impl Fixture {
         )))
         .execute(&mut self.admin)
         .await?;
-        sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE {}", self.outsider)))
-            .execute(&mut self.admin)
-            .await?;
+        for role in [&self.outsider, &self.mlogin] {
+            sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE {role}")))
+                .execute(&mut self.admin)
+                .await?;
+        }
         self.admin.close().await?;
         Ok(())
     }
@@ -145,16 +185,76 @@ fn manifest(stdout: &str) -> Value {
     serde_json::from_str(stdout).expect("manifest json")
 }
 
+fn pending_list(value: &Value) -> Vec<i64> {
+    value
+        .as_array()
+        .expect("pending list")
+        .iter()
+        .map(|v| v.as_i64().expect("version"))
+        .collect()
+}
+
+/// Seed the 29-version staging state through a filtered SQLx migrator, as the
+/// non-superuser member login with SET ROLE on the single pooled connection.
+async fn seed_staging_state(fx: &Fixture) -> TestResult {
+    let options = PgConnectOptions::new_without_pgpass()
+        .host(&fx.host)
+        .port(5432)
+        .username(&fx.mlogin)
+        .password("")
+        .database(&fx.database)
+        .ssl_mode(PgSslMode::Disable);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|conn: &mut PgConnection, _meta| {
+            Box::pin(async move {
+                conn.execute("SET ROLE two_bot_migrator").await?;
+                Ok::<_, sqlx::Error>(())
+            })
+        })
+        .connect_with(options)
+        .await?;
+    let seed: Vec<_> = two_bot_cutover::staging_migrate::MIGRATOR
+        .iter()
+        .filter(|m| SEED_VERSIONS.contains(&m.version))
+        .cloned()
+        .collect();
+    assert_eq!(
+        seed.len(),
+        SEED_VERSIONS.len(),
+        "seed must cover 29 versions"
+    );
+    Migrator::with_migrations(seed).run(&pool).await?;
+    pool.close().await;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires agent-testdb or the CI service"]
 async fn real_sqlx_runner_cases() -> TestResult {
     let fx = Fixture::new().await?;
     let migrator = fx.url("agent_test", &fx.database);
+    let member = fx.url(&fx.mlogin, &fx.database);
     let (host, db) = (fx.host.clone(), fx.database.clone());
     let total = two_bot_cutover::staging_migrate::MIGRATOR.iter().count() as u64;
 
+    // The member login is a plain non-superuser that holds the migrator group
+    // by membership only.
+    let mut c = fx.scratch().await?;
+    let superuser: bool = sqlx::query_scalar("SELECT rolsuper FROM pg_roles WHERE rolname = $1")
+        .bind(&fx.mlogin)
+        .fetch_one(&mut c)
+        .await?;
+    assert!(!superuser, "member login must not be a superuser");
+    let is_member: bool =
+        sqlx::query_scalar("SELECT pg_has_role($1, 'two_bot_migrator', 'MEMBER')")
+            .bind(&fx.mlogin)
+            .fetch_one(&mut c)
+            .await?;
+    assert!(is_member, "member login must hold the migrator group");
+
     // Missing binding and wrong target refuse before any DDL.
-    let (code, _, err) = fx.run("--apply", None, &host, &db).await;
+    let (code, _, err) = fx.run("--apply", None, &host, &db, Some("")).await;
     assert_eq!(code, 2, "{err}");
     let (code, _, _) = fx
         .run(
@@ -162,11 +262,18 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(migrator.clone()),
             &host,
             "two_bot_staging_other",
+            Some(""),
         )
         .await;
     assert_eq!(code, 2);
     let (code, _, _) = fx
-        .run("--apply", Some(migrator.clone()), "other-host", &db)
+        .run(
+            "--apply",
+            Some(migrator.clone()),
+            "other-host",
+            &db,
+            Some(""),
+        )
         .await;
     assert_eq!(code, 2);
     // Production-like and empty pins refuse before any DDL.
@@ -176,42 +283,137 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(migrator.clone()),
             "ep-prod-fixture.us-east-2.aws.neon.tech",
             &db,
+            Some(""),
         )
         .await;
     assert_eq!(code, 2, "{err}");
-    let (code, _, _) = fx.run("--apply", Some(migrator.clone()), "", &db).await;
+    // Pooler endpoints refuse before any DDL.
+    let (code, _, err) = fx
+        .run(
+            "--apply",
+            Some(migrator.clone()),
+            "ep-test-pooler.us-east-2.aws.neon.tech",
+            &db,
+            Some(""),
+        )
+        .await;
+    assert_eq!(code, 2, "{err}");
+    let (code, _, _) = fx
+        .run("--apply", Some(migrator.clone()), "", &db, Some(""))
+        .await;
     assert_eq!(code, 2);
-    let (code, _, _) = fx.run("--apply", Some(migrator.clone()), &host, "").await;
+    let (code, _, _) = fx
+        .run("--apply", Some(migrator.clone()), &host, "", Some(""))
+        .await;
     assert_eq!(code, 2);
+    // Apply without the reviewed pending list refuses before any DDL.
+    let (code, _, err) = fx
+        .run("--apply", Some(migrator.clone()), &host, &db, None)
+        .await;
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("expected_pending"));
     // A login that cannot SET ROLE two_bot_migrator is refused.
     let outsider = fx.url(&fx.outsider, &fx.database);
-    let (code, _, err) = fx.run("--apply", Some(outsider), &host, &db).await;
+    let (code, _, err) = fx
+        .run("--apply", Some(outsider), &host, &db, Some(""))
+        .await;
     assert_eq!(code, 2, "{err}");
-    let mut c = fx.scratch().await?;
     let ledger: bool =
         sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations') IS NOT NULL")
             .fetch_one(&mut c)
             .await?;
     assert!(!ledger, "refusals must not create the ledger");
 
-    // Plan is read-only.
-    let (code, out, err) = fx.run("--plan", Some(migrator.clone()), &host, &db).await;
-    assert_eq!(code, 0, "{err}");
-    assert_eq!(manifest(&out)["applied_count"], 0);
-    let ledger: bool =
-        sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations') IS NOT NULL")
-            .fetch_one(&mut c)
-            .await?;
-    assert!(!ledger, "plan must not create the ledger");
+    // Seed the exact 29-version staging state as the member login.
+    seed_staging_state(&fx).await?;
+    let (rows, max, failed): (i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*), coalesce(max(version), 0), \
+         count(*) FILTER (WHERE NOT success) FROM public._sqlx_migrations",
+    )
+    .fetch_one(&mut c)
+    .await?;
+    assert_eq!((rows, max, failed), (29, 390, 0));
+    let owner: String = sqlx::query_scalar(
+        "SELECT pg_get_userbyid(relowner)::text FROM pg_class \
+         WHERE oid = to_regclass('public._sqlx_migrations')",
+    )
+    .fetch_one(&mut c)
+    .await?;
+    assert_eq!(owner, "two_bot_migrator");
 
-    // Initial apply.
-    let (code, out, err) = fx.run("--apply", Some(migrator.clone()), &host, &db).await;
+    // Plan is read-only and prints the computed pending list.
+    let (code, out, err) = fx
+        .run("--plan", Some(member.clone()), &host, &db, None)
+        .await;
     assert_eq!(code, 0, "{err}");
     let m = manifest(&out);
-    assert_eq!(m["applied_count"], total);
+    assert_eq!(m["applied_count"], 0);
+    let seed_set: HashSet<i64> = SEED_VERSIONS.into_iter().collect();
+    let expected: Vec<i64> = two_bot_cutover::staging_migrate::MIGRATOR
+        .iter()
+        .filter(|mm| !seed_set.contains(&mm.version))
+        .map(|mm| mm.version)
+        .collect();
+    assert_eq!(pending_list(&m["pending_before"]), expected);
+    assert_eq!(m["ledger_before"].as_array().unwrap().len(), 29);
+    // Pending spans both sides of the ledger max: versions below 390 were
+    // never applied, yet SQLx must still pick them up.
+    assert!(expected.contains(&201), "below-max gap must be pending");
+    assert!(expected.contains(&410), "above-max version must be pending");
+    let expected_csv = expected
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let ledger: i64 = sqlx::query_scalar("SELECT count(*) FROM public._sqlx_migrations")
+        .fetch_one(&mut c)
+        .await?;
+    assert_eq!(ledger, 29, "plan must not change the ledger");
+
+    // A wrong pending list refuses before any DDL.
+    let (code, _, err) = fx
+        .run("--apply", Some(member.clone()), &host, &db, Some("201"))
+        .await;
+    assert_eq!(code, 2, "{err}");
+    let ledger: i64 = sqlx::query_scalar("SELECT count(*) FROM public._sqlx_migrations")
+        .fetch_one(&mut c)
+        .await?;
+    assert_eq!(ledger, 29, "plan-bound refusal must not change the ledger");
+
+    // Apply the reviewed list as the member login.
+    let (code, out, err) = fx
+        .run(
+            "--apply",
+            Some(member.clone()),
+            &host,
+            &db,
+            Some(&expected_csv),
+        )
+        .await;
+    assert_eq!(code, 0, "{err}");
+    let m = manifest(&out);
+    assert_eq!(m["applied_count"], expected.len() as u64);
     assert!(m["role_verified_connections"].as_u64().unwrap() >= 1);
     assert_eq!(m["ledger_after"].as_array().unwrap().len() as u64, total);
     assert!(!out.contains("postgres://"), "manifest must not echo URLs");
+    let (rows, failed): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE NOT success) \
+         FROM public._sqlx_migrations",
+    )
+    .fetch_one(&mut c)
+    .await?;
+    assert_eq!((rows, failed), (total as i64, 0));
+    // Below-max gaps are filled alongside above-max versions: the ledger max
+    // never limited what SQLx applied.
+    for version in [201, 228, 312, 321, 352, 370, 410, 411] {
+        let present: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM public._sqlx_migrations WHERE version = $1 AND success)",
+        )
+        .bind(version)
+        .fetch_one(&mut c)
+        .await?;
+        assert!(present, "version {version} must be applied");
+    }
     let owner: String = sqlx::query_scalar(
         "SELECT pg_get_userbyid(relowner)::text FROM pg_class \
          WHERE oid = to_regclass('public._sqlx_migrations')",
@@ -228,8 +430,21 @@ async fn real_sqlx_runner_cases() -> TestResult {
     .await?;
     assert_eq!(foreign, 0, "every DDL connection ran as the migrator");
 
-    // Repeat is a no-op.
-    let (code, out, err) = fx.run("--apply", Some(migrator.clone()), &host, &db).await;
+    // The reviewed list is now stale, so it refuses; an empty expectation
+    // applies nothing.
+    let (code, _, _) = fx
+        .run(
+            "--apply",
+            Some(member.clone()),
+            &host,
+            &db,
+            Some(&expected_csv),
+        )
+        .await;
+    assert_eq!(code, 2);
+    let (code, out, err) = fx
+        .run("--apply", Some(member.clone()), &host, &db, Some(""))
+        .await;
     assert_eq!(code, 0, "{err}");
     assert_eq!(manifest(&out)["applied_count"], 0);
 
@@ -237,11 +452,15 @@ async fn real_sqlx_runner_cases() -> TestResult {
     sqlx::query("UPDATE public._sqlx_migrations SET checksum = decode(repeat('00', 48), 'hex') WHERE version = (SELECT min(version) FROM public._sqlx_migrations)")
         .execute(&mut c)
         .await?;
-    let (code, _, err) = fx.run("--apply", Some(migrator.clone()), &host, &db).await;
+    let (code, _, err) = fx
+        .run("--apply", Some(member.clone()), &host, &db, Some(""))
+        .await;
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("drift"));
     // Restore the checksum from the source, then an incomplete row refuses.
-    let (code, _, _) = fx.run("--plan", Some(migrator.clone()), &host, &db).await;
+    let (code, _, _) = fx
+        .run("--plan", Some(member.clone()), &host, &db, None)
+        .await;
     assert_eq!(code, 2);
     sqlx::query("DELETE FROM public._sqlx_migrations WHERE version = (SELECT max(version) FROM public._sqlx_migrations)")
         .execute(&mut c)
@@ -258,7 +477,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             .execute(&mut c)
             .await?;
     }
-    let (code, _, err) = fx.run("--apply", Some(migrator), &host, &db).await;
+    let (code, _, err) = fx.run("--apply", Some(member), &host, &db, Some("")).await;
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("incomplete"));
 

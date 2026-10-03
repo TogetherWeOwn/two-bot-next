@@ -349,6 +349,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         $cas$;"#,
     )
     .await?;
+    // Channel runtime exclusion is DML-only and stays private to the bot.
+    as_role(pool, &roles[1], "INSERT INTO public.moderation_idempotency (guild_id, idempotency_key, action, request_hash, state, claimed_at) VALUES ('channel-role-probe', 'key', 'slowmode', 'hash', 'in_flight', now()); INSERT INTO public.moderation_channel_executions (guild_id, channel_id, idempotency_key, claim_token) SELECT guild_id, 'channel', idempotency_key, claim_token FROM public.moderation_idempotency WHERE guild_id = 'channel-role-probe'; SELECT * FROM public.moderation_channel_executions; UPDATE public.moderation_channel_executions SET channel_id = 'other' WHERE guild_id = 'channel-role-probe'; DELETE FROM public.moderation_channel_executions WHERE guild_id = 'channel-role-probe'").await?;
     as_role(pool, &roles[1], "SELECT * FROM public.gateway_onboarding_jobs; INSERT INTO public.gateway_onboarding_jobs (guild_id, shard_id, session_id, seq, occurred_at_ms) VALUES ('roles', 0, 'roles', 1, 0); UPDATE public.gateway_onboarding_jobs SET state = 'running', attempts = attempts + 1 WHERE guild_id = 'roles'; DELETE FROM public.gateway_onboarding_jobs WHERE guild_id = 'roles'").await?;
     // Migration 0200 relations are runtime-operated: event claims and panel
     // lane leases must work under the least-privilege login.
@@ -406,6 +408,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "INSERT INTO public.members (member_id) VALUES ('test')",
         "SELECT * FROM public.self_role_audit",
         "SELECT * FROM public.self_role_panel_claims",
+        "SELECT * FROM public.moderation_channel_executions",
         "SELECT * FROM public.self_role_exchanges",
         "SELECT * FROM public.self_role_exchange_baselines",
         "SELECT * FROM public.scheduled_messages",
