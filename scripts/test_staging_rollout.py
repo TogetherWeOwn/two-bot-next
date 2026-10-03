@@ -84,7 +84,10 @@ def date(offset=0):
 
 def receipts():
     return [
-        {"type": "wrangler-session", "version": 1, "wrangler_version": "4.143.1"},
+        {
+            "type": "wrangler-session", "version": 1, "wrangler_version": "4.143.1",
+            "command_line_args": ["deploy", "--config", "staging-deploy.json", "--env", "staging"],
+        },
         {
             "type": "deploy", "version": 1,
             "worker_name": "two-bot-next-staging",
@@ -176,6 +179,7 @@ class FakeClient:
         self.api_routes = copy.deepcopy(api_routes or {})
         self.request_routes = copy.deepcopy(request_routes or {})
         self.deadline = deadline
+        self.observation = None
         self.calls = []
 
     def respond(self, routes, key):
@@ -258,12 +262,34 @@ class DeployReceiptTests(OfflineTestCase):
                 self.assert_gate("deploy_receipt_missing_or_ambiguous",
                                  rollout.deploy_version, records, STARTED)
 
+    def test_wrangler_action_version_probe_is_accepted_beside_the_deploy_session(self):
+        # wrangler-action runs `wrangler --version` first; Wrangler records that too.
+        for flag in ("--version", "-v"):
+            with self.subTest(flag=flag):
+                probe = {"type": "wrangler-session", "version": 1,
+                         "wrangler_version": "4.143.1", "command_line_args": [flag]}
+                self.assertEqual(rollout.deploy_version([probe] + receipts(), STARTED), VERSION)
+                self.assertEqual(rollout.deploy_version(receipts() + [probe], STARTED), VERSION)
+
     def test_missing_ambiguous_or_wrong_wrangler_session(self):
         wrong = receipts()
         wrong[0]["wrangler_version"] = "4.142.0"
         schema = receipts()
         schema[0]["version"] = 2
-        for records in [receipts()[1:], receipts() + [receipts()[0]], wrong, schema]:
+        no_args = receipts()
+        del no_args[0]["command_line_args"]
+        bad_args = receipts()
+        bad_args[0]["command_line_args"] = ["deploy", 1]
+        probe = {"type": "wrangler-session", "version": 1,
+                 "wrangler_version": "4.143.1", "command_line_args": ["--version"]}
+        wrong_probe = dict(probe, wrangler_version="4.142.0")
+        schema_probe = dict(probe, version=2)
+        other_command = dict(probe, command_line_args=["secret", "put", "X"])
+        no_args_probe = {key: value for key, value in probe.items() if key != "command_line_args"}
+        for records in [receipts()[1:], receipts() + [receipts()[0]], wrong, schema, no_args,
+                        bad_args, receipts()[1:] + [probe],
+                        [wrong_probe] + receipts(), [schema_probe] + receipts(),
+                        [other_command] + receipts(), [no_args_probe] + receipts()]:
             with self.subTest(records=records):
                 self.assert_gate("wrong_wrangler_receipt", rollout.deploy_version, records, STARTED)
 
@@ -933,6 +959,83 @@ class OrchestrationTests(OfflineTestCase):
                 client.request_routes[URL + "/readyz"] = [(status, headers, body)]
                 self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
                 self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_timeout_records_which_stage_was_stuck_without_echoing_service_output(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        _, headers, _ = ready_response()
+        stuck = {"build_revision": REVISION, "build_id": BUILD_ID,
+                 "components": [["process", "ready"], ["gateway", "starting"],
+                                ["token_invalid", "ready"], ["Bad\nname", "ready"],
+                                ["gateway", SENTINEL], ["x"], "junk"]}
+        for status, body, expected in [
+            (503, json.dumps(stuck).encode(),
+             "rollout=converged readyz=503 components=process:ready,gateway:starting,token_invalid:ready "
+             "identity=match"),
+            (503, json.dumps({**stuck, "build_id": "other"}).encode(),
+             "rollout=converged readyz=503 components=process:ready,gateway:starting,token_invalid:ready "
+             "identity=mismatch"),
+            (503, SENTINEL.encode(), "rollout=converged readyz=503 body=unreadable"),
+            (0, b"", "rollout=converged readyz=0 body=unreadable"),
+        ]:
+            with self.subTest(status=status, expected=expected):
+                self.clock.now = 100
+                client = verify_client()
+                client.request_routes[URL + "/readyz"] = [(status, headers, body)]
+                self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+                self.assertEqual(client.observation, expected)
+                self.assertNotIn(SENTINEL, client.observation)
+        self.assert_no_secret_saved_or_printed()
+
+    def test_timeout_observation_for_missing_and_unconverged_rollouts(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.api_routes[ROWS_PATH] = [[old_row()]]
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertEqual(client.observation, "no_new_rollout")
+        self.clock.now = 100
+        pending = completed_row()
+        pending["status"] = "progressing"
+        pending["health"] = {"instances": {"active": 1, "healthy": 0, "failed": 0, "starting": 1,
+                                           "scheduling": SENTINEL}}
+        client = verify_client()
+        client.api_routes[DETAIL_PATH] = [pending]
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertEqual(client.observation,
+                         "rollout=progressing instances=active:1,healthy:0,failed:0,starting:1")
+        self.assert_no_secret_saved_or_printed()
+
+    def test_main_prints_last_observation_only_for_rollout_timeout(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        argv = ["staging_rollout.py", "verify", "--receipt", self.args.receipt,
+                "--output", self.args.output, "--evidence", self.args.evidence]
+        _, headers, _ = ready_response()
+        body = json.dumps({"build_revision": REVISION, "build_id": BUILD_ID,
+                           "components": [["process", "ready"], ["gateway", "down"]]}).encode()
+        client = verify_client()
+        client.request_routes[URL + "/readyz"] = [(503, headers, body)]
+        self.stdout.seek(0)
+        self.stdout.truncate()
+        with patch.object(sys, "argv", argv), patch.object(rollout, "Client", return_value=client):
+            self.assertEqual(rollout.main(), 1)
+        self.assertEqual(self.stdout.getvalue().splitlines(), [
+            "staging rollout gate failed: rollout_timeout",
+            "last observation before timeout: rollout=converged readyz=503 "
+            "components=process:ready,gateway:down identity=match"])
+        self.stdout.seek(0)
+        self.stdout.truncate()
+        self.clock.now = 100
+        client = verify_client()
+        changed = app()
+        changed["id"] = "different_application"
+        client.api_routes[APP_PATH] = [[changed]]
+        with patch.object(sys, "argv", argv), patch.object(rollout, "Client", return_value=client):
+            self.assertEqual(rollout.main(), 1)
+        self.assertEqual(self.stdout.getvalue().splitlines(),
+                         ["staging rollout gate failed: application_identity_drift"])
         self.assert_no_secret_saved_or_printed()
 
     def test_health_status_or_serving_worker_mismatch_never_succeeds(self):

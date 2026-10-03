@@ -1080,6 +1080,68 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         CommandDefinition::new("ping", "Show the bot's response latency"),
         CommandDefinition::new("invite", "Show this server's invite link"),
         CommandDefinition::new(
+            "access",
+            "Set who can create voice rooms and use room commands",
+        )
+        .permissions(PERM_MANAGE_CHANNELS)
+        .options(vec![
+            CommandOption::new(
+                "show",
+                "Show the current voice-room access settings",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "creation",
+                "Turn temporary room creation on or off",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "enabled",
+                "On allows new rooms, off stops them (existing rooms keep working)",
+                CommandOptionType::Boolean,
+            )
+            .required()]),
+            CommandOption::new(
+                "role",
+                "Set or clear the role required to use room commands",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "role",
+                "Required role; leave empty to clear it",
+                CommandOptionType::Role,
+            )]),
+            CommandOption::new(
+                "restrict",
+                "Limit a room command to specific roles (no role = admins only)",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![
+                CommandOption::new(
+                    "command",
+                    "The command name without the slash, e.g. kick",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(32),
+                CommandOption::new("role", "Allowed role", CommandOptionType::Role),
+                CommandOption::new("role2", "Another allowed role", CommandOptionType::Role),
+                CommandOption::new("role3", "Another allowed role", CommandOptionType::Role),
+            ]),
+            CommandOption::new(
+                "unrestrict",
+                "Lift a room command's role restriction",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "command",
+                "The command name without the slash, e.g. kick",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(32)]),
+        ]),
+        CommandDefinition::new(
             "reclaim",
             "Take back ownership of your temporary voice room",
         ),
@@ -1783,7 +1845,7 @@ mod tests {
         let defs = voice_commands();
         assert_eq!(
             defs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-            ["create", "setup", "ping", "invite", "reclaim", "transfer"]
+            ["create", "setup", "ping", "invite", "access", "reclaim", "transfer"]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
         assert_eq!(
@@ -1801,14 +1863,38 @@ mod tests {
             assert_eq!(def.default_member_permissions, None);
             assert!(def.options.is_empty());
         }
+        // `/access` is admin-gated and is all sub-commands, each with its
+        // required options listed before the optional ones.
+        let access = &defs[4];
+        assert_eq!(
+            access.default_member_permissions,
+            Some(PERM_MANAGE_CHANNELS.to_string())
+        );
+        assert_eq!(
+            access
+                .options
+                .iter()
+                .map(|o| o.name.as_str())
+                .collect::<Vec<_>>(),
+            ["show", "creation", "role", "restrict", "unrestrict"]
+        );
+        for sub in &access.options {
+            assert_eq!(sub.kind, CommandOptionType::SubCommand.as_u8());
+            let required_first = sub
+                .options
+                .iter()
+                .skip_while(|o| o.required == Some(true))
+                .all(|o| o.required != Some(true));
+            assert!(required_first, "{} lists a required option late", sub.name);
+        }
         // `/reclaim` takes no options; `/transfer` names its recipient.
-        assert_eq!(defs[4].default_member_permissions, None);
-        assert!(defs[4].options.is_empty());
         assert_eq!(defs[5].default_member_permissions, None);
-        assert_eq!(defs[5].options.len(), 1);
-        assert_eq!(defs[5].options[0].name, "member");
-        assert_eq!(defs[5].options[0].kind, CommandOptionType::User as u8);
-        assert!(defs[5].options[0].required == Some(true));
+        assert!(defs[5].options.is_empty());
+        assert_eq!(defs[6].default_member_permissions, None);
+        assert_eq!(defs[6].options.len(), 1);
+        assert_eq!(defs[6].options[0].name, "member");
+        assert_eq!(defs[6].options[0].kind, CommandOptionType::User as u8);
+        assert!(defs[6].options[0].required == Some(true));
         // Merges cleanly alongside the other slices, first-wins.
         let merged = merge_commands(
             &[feature_commands(), moderation_commands(), voice_commands()],

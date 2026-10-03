@@ -10,6 +10,16 @@ impl RoomPersistence for Arc<Store> {
     async fn rooms(&self, guild: u64) -> Result<Vec<VoiceRoom>, StoreError> {
         self.as_ref().rooms(guild).await
     }
+    async fn access_controls(&self, guild: u64) -> Result<AccessControls, StoreError> {
+        self.as_ref().access_controls(guild).await
+    }
+    async fn save_access_controls(
+        &self,
+        guild: u64,
+        controls: &AccessControls,
+    ) -> Result<(), StoreError> {
+        self.as_ref().save_access_controls(guild, controls).await
+    }
     async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), StoreError> {
         self.as_ref().add_creator(creator).await
     }
@@ -71,6 +81,22 @@ impl RoomWrites for GatedHttp {
         guard: WriteGuard,
     ) -> Result<(), RoomHttpError> {
         self.http.move_member(guild, member, channel, guard).await
+    }
+    async fn disconnect(
+        &self,
+        guild: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.http.disconnect(guild, member, guard).await
+    }
+    async fn deny_connect(
+        &self,
+        channel: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.http.deny_connect(channel, member, guard).await
     }
     async fn delete(&self, channel: u64, guard: WriteGuard) -> Result<(), RoomHttpError> {
         if let Some(gate) = &self.delete {
