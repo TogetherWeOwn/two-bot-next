@@ -90,11 +90,14 @@ pub struct CreatorChannel {
     /// First room number; the numbering engine (V5) assigns the lowest free
     /// number at or above this.
     pub first_room_number: i64,
+    /// V8 `/group`: shared numbering and contiguous block per category.
+    /// Stored by the V11 import; honored by the room planner.
+    pub group_by_category: bool,
 }
 
 impl CreatorChannel {
     /// Spec defaults: creator-source permissions and limit, public, no text
-    /// channel, rooms above, numbering from 1.
+    /// channel, rooms above, numbering from 1, ungrouped.
     #[must_use]
     pub fn new(guild_id: Snowflake, channel_id: Snowflake) -> Self {
         Self {
@@ -110,6 +113,7 @@ impl CreatorChannel {
             text_viewer_role_id: None,
             position: RoomPosition::Above,
             first_room_number: 1,
+            group_by_category: false,
         }
     }
 
