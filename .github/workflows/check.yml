@@ -579,6 +579,7 @@ jobs:
         run: cargo test -p two-bot --locked command_runtime_tests -- --ignored --test-threads=1
 
       - name: Managed feed poller acceptance (CI service and REST doubles only)
+        if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked feed_jobs -- --ignored --test-threads=1
