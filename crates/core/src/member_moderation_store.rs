@@ -11,7 +11,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::member_moderation::{
     AuditRow, BanAttempt, ClaimState, HistoricalBanAcceptance, MemberModerationStore, MemberQueues,
-    StoreError, UnbanJob, UnbanResolution,
+    StoreError, UnbanJob, UnbanResolution, UncertainKind, UncertainRow,
 };
 
 #[derive(Clone)]
@@ -766,7 +766,6 @@ impl MemberModerationStore for PgMemberModerationStore {
     }
 
     async fn surface_uncertain(&self, guild_id: &str) -> Result<Vec<UncertainRow>, StoreError> {
-        use crate::member_moderation::{UncertainKind, UncertainRow};
         self.ensure_guild(guild_id)?;
         // Identifiers only: claim tokens never leave the ledger. Every fenced
         // state surfaces — prepared intents, running dispatches, and all
