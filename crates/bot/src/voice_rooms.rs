@@ -1646,6 +1646,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// honours retry-after; other failures back off with the queue budget
     /// (dead-lettered after [`two_bot_core::voice_rooms::QUEUE_MAX_ATTEMPTS`],
     /// surfaced via `/setup`).
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_companion_view(
         &mut self,
         action: &QueuedAction,
