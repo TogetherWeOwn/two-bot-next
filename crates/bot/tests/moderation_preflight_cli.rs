@@ -211,7 +211,13 @@ async fn boot_refuses_with_disabled_moderation_while_unban_owed() {
     )
     .await;
     assert_eq!(output.status.code(), Some(1));
-    let logs = String::from_utf8_lossy(&output.stderr);
+    // The runtime subscriber writes tracing records to stdout, so both
+    // streams count as the boot log here.
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(logs.contains("moderation_disable_refused"), "{logs}");
     assert!(
         logs.contains("req-cli-owed"),
@@ -254,7 +260,11 @@ async fn boot_proceeds_past_guard_when_nothing_owed() {
         .wait_with_output()
         .await
         .expect("reaps the booted bot");
-    let logs = String::from_utf8_lossy(&output.stderr);
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         !logs.contains("moderation_disable_refused"),
         "boot must not refuse with nothing owed: {logs}"
