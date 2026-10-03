@@ -2065,3 +2065,144 @@ async fn disabled_gateway_responder_does_not_acknowledge() {
     tokio::task::yield_now().await;
     assert!(trace.lock().unwrap().is_empty());
 }
+
+fn channel_with_overwrites(
+    id: u64,
+    kind: u8,
+    parent: Option<u64>,
+    overwrites: serde_json::Value,
+) -> Channel {
+    let mut channel = channel(id, kind, parent);
+    channel.permission_overwrites = Some(serde_json::from_value(overwrites).unwrap());
+    channel
+}
+
+fn health_guild(
+    base: Permissions,
+    category: Vec<serde_json::Value>,
+    creator: Vec<serde_json::Value>,
+) -> LiveGuild {
+    let live = LiveGuild::new(GUILD);
+    live.publish(GuildSnapshot {
+        channels: vec![
+            channel_with_overwrites(CREATOR, 2, Some(CATEGORY), json!(creator)),
+            channel_with_overwrites(CATEGORY, 4, None, json!(category)),
+        ],
+        members: vec![],
+        bot: BotAccess {
+            member_id: 999,
+            guild_owner_id: 998,
+            member_roles: vec![],
+            roles: vec![role(base)],
+        },
+    });
+    live
+}
+
+fn everyone_overwrite(deny: Permissions) -> serde_json::Value {
+    json!({ "id": GUILD.to_string(), "type": 0, "allow": "0", "deny": deny.bits().to_string() })
+}
+
+#[test]
+fn health_check_is_clean_when_every_level_grants_the_four_permissions() {
+    let live = health_guild(permissions(), vec![], vec![]);
+    assert!(live.permission_findings(&[CREATOR]).is_empty());
+}
+
+#[test]
+fn health_check_names_a_missing_guild_level_permission() {
+    let live = health_guild(permissions() - Permissions::MOVE_MEMBERS, vec![], vec![]);
+    assert_eq!(
+        live.permission_findings(&[CREATOR]),
+        vec![PermissionFinding {
+            permission: VoicePermission::MoveMembers,
+            scope: VoicePermissionScope::Guild,
+            category_id: None,
+            channel_id: None,
+        }]
+    );
+}
+
+#[test]
+fn health_check_names_the_category_override_that_causes_it() {
+    let live = health_guild(
+        permissions(),
+        vec![everyone_overwrite(Permissions::MANAGE_CHANNELS)],
+        vec![],
+    );
+    let findings = live.permission_findings(&[CREATOR]);
+    assert_eq!(
+        findings,
+        vec![PermissionFinding {
+            permission: VoicePermission::ManageChannels,
+            scope: VoicePermissionScope::Category,
+            category_id: Some(CATEGORY),
+            channel_id: None,
+        }]
+    );
+    assert_eq!(
+        health_line(&findings[0]),
+        "health: the permission override on category <#400> removes Manage Channels from the bot"
+    );
+}
+
+#[test]
+fn health_check_names_a_creator_channel_override() {
+    let live = health_guild(
+        permissions(),
+        vec![],
+        vec![everyone_overwrite(Permissions::VIEW_CHANNEL)],
+    );
+    let findings = live.permission_findings(&[CREATOR]);
+    assert_eq!(
+        findings,
+        vec![PermissionFinding {
+            permission: VoicePermission::ViewChannel,
+            scope: VoicePermissionScope::Channel,
+            category_id: None,
+            channel_id: Some(CREATOR),
+        }]
+    );
+    assert_eq!(
+        health_line(&findings[0]),
+        "health: the permission override on <#200> removes View Channel from the bot"
+    );
+}
+
+#[test]
+fn health_check_reports_nothing_for_incomplete_data_or_unknown_channels() {
+    let never_published = LiveGuild::new(GUILD);
+    assert!(never_published.permission_findings(&[CREATOR]).is_empty());
+    let live = health_guild(permissions() - Permissions::MANAGE_ROLES, vec![], vec![]);
+    assert!(live.permission_findings(&[12345]).is_empty());
+    assert!(live.permission_findings(&[]).is_empty());
+    assert_eq!(
+        health_line(&live.permission_findings(&[CREATOR])[0]),
+        "health: the bot lacks Manage Roles for the whole server"
+    );
+}
+
+#[test]
+fn health_check_dedups_a_shared_category_override() {
+    let live = LiveGuild::new(GUILD);
+    live.publish(GuildSnapshot {
+        channels: vec![
+            channel(CREATOR, 2, Some(CATEGORY)),
+            channel(201, 2, Some(CATEGORY)),
+            channel_with_overwrites(
+                CATEGORY,
+                4,
+                None,
+                json!([everyone_overwrite(Permissions::MOVE_MEMBERS)]),
+            ),
+        ],
+        members: vec![],
+        bot: BotAccess {
+            member_id: 999,
+            guild_owner_id: 998,
+            member_roles: vec![],
+            roles: vec![role(permissions())],
+        },
+    });
+    assert_eq!(live.permission_findings(&[CREATOR, 201]).len(), 1);
+}

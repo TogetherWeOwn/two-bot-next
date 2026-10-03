@@ -97,6 +97,26 @@ def receipts():
     ]
 
 
+def real_shape_receipts():
+    """Record shapes written by Wrangler 4.143.1 when `wrangler-action` drives a deploy.
+
+    Field names follow workers-sdk `packages/wrangler/src/index.ts` (the `wrangler-session`
+    entry, written for EVERY invocation) and its deploy output entry; values are
+    synthetic. The first session is the action's `wrangler --version` probe.
+    """
+    log = "/home/runner/.config/.wrangler/logs/wrangler-2026-10-03_01-22-59_123.log"
+    return [
+        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.143.1",
+         "command_line_args": ["--version"], "log_file_path": log, "timestamp": date()},
+        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.143.1",
+         "command_line_args": ["deploy", "--config", "/tmp/staging-deploy.json", "--env", "staging"],
+         "log_file_path": log, "timestamp": date()},
+        {"version": 1, "type": "deploy", "worker_name": "two-bot-next-staging",
+         "worker_tag": "tag123", "version_id": VERSION, "targets": [URL],
+         "worker_name_overridden": False, "wrangler_environment": "staging", "timestamp": date()},
+    ]
+
+
 def baseline():
     return {
         "started": STARTED, "application_id": APPLICATION_ID,
@@ -292,6 +312,51 @@ class DeployReceiptTests(OfflineTestCase):
                         [other_command] + receipts(), [no_args_probe] + receipts()]:
             with self.subTest(records=records):
                 self.assert_gate("wrong_wrangler_receipt", rollout.deploy_version, records, STARTED)
+
+    def test_failure_diagnostic_is_allowlisted_counts_and_versions_only(self):
+        records = real_shape_receipts()
+        records[0]["wrangler_version"] = "4.142.0"
+        records[1]["wrangler_version"] = SENTINEL
+        records.append({"type": SENTINEL, "command_line_args": [SENTINEL]})
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.deploy_version(records, STARTED)
+        self.assertEqual(str(caught.exception), "wrong_wrangler_receipt")
+        self.assertEqual(caught.exception.detail,
+                         "records deploy=1,other=1,wrangler-session=2; "
+                         "sessions deploy=1,probe=1,other=0; "
+                         "v1/wrangler-4.142.0 v1/wrangler-invalid")
+        for private in [SENTINEL, "command_line_args", "log_file_path", "/home/runner", "timestamp"]:
+            self.assertNotIn(private, caught.exception.detail)
+
+    def test_diagnostic_names_session_class_counts(self):
+        # An unrecognized session (e.g. another Wrangler command at the pinned
+        # version) must show up as `other` so the failing sub-check is named.
+        records = real_shape_receipts()
+        records[1]["command_line_args"] = ["secret", "put", "X"]
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.deploy_version(records, STARTED)
+        self.assertEqual(str(caught.exception), "wrong_wrangler_receipt")
+        self.assertIn("sessions deploy=0,probe=1,other=1", caught.exception.detail)
+        self.assertNotIn("secret", caught.exception.detail)
+
+    def test_diagnostic_does_not_print_non_integer_or_bool_versions(self):
+        records = [{"type": "wrangler-session", "version": True, "wrangler_version": 4.1},
+                   {"type": "wrangler-session", "version": 10 ** 6, "wrangler_version": None}]
+        self.assertEqual(rollout.receipt_shape(records),
+                         "records wrangler-session=2; sessions deploy=0,probe=0,other=2; "
+                         "vinvalid/wrangler-invalid vinvalid/wrangler-invalid")
+        self.assertEqual(rollout.receipt_shape([]),
+                         "records none; sessions deploy=0,probe=0,other=0; none")
+
+    def test_deploy_field_diagnostic_names_failed_checks_only(self):
+        records = receipts()
+        records[1]["wrangler_environment"] = SENTINEL
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.deploy_version(records, STARTED)
+        self.assertEqual(str(caught.exception), "wrong_deploy_receipt")
+        self.assertTrue(caught.exception.detail.endswith(
+            "deploy version=ok worker=ok environment=bad not_overridden=ok"))
+        self.assertNotIn(SENTINEL, caught.exception.detail)
 
     def test_missing_deploy_fields_fail_closed(self):
         for key in ["worker_name", "wrangler_environment", "worker_name_overridden", "version"]:
@@ -709,8 +774,23 @@ class DeploymentWiringTests(unittest.TestCase):
         steps = re.split(r"(?m)^      - ", source)[1:]
         prepare = [step for step in steps if "python3 ../scripts/staging_rollout.py prepare" in step]
         deploy = [step for step in steps if "command: deploy --config" in step]
+        receipt = [step for step in steps if "python3 ../scripts/staging_rollout.py receipt" in step]
+        takeover = [step for step in steps if "ownership-control.mjs deployment-takeover" in step]
         verify = [step for step in steps if "python3 ../scripts/staging_rollout.py verify" in step]
-        self.assertEqual((len(prepare), len(deploy), len(verify)), (1, 1, 1))
+        self.assertEqual((len(prepare), len(deploy), len(receipt), len(takeover), len(verify)),
+                         (1, 1, 1, 1, 1))
+        # The local Wrangler receipt is accepted after the deploy and before ownership moves.
+        self.assertLess(steps.index(deploy[0]), steps.index(receipt[0]))
+        self.assertLess(steps.index(receipt[0]), steps.index(takeover[0]))
+        self.assertLess(steps.index(takeover[0]), steps.index(verify[0]))
+        self.assertNotRegex(receipt[0], r"(?m)^\s*(?:if|continue-on-error):")
+        self.assertIn("set -euo pipefail", receipt[0])
+        self.assertIn('--receipt "$ROLLOUT_DIR/baseline.json"', receipt[0])
+        self.assertIn('--output "$WRANGLER_OUTPUT_FILE_PATH"', receipt[0])
+        # Network-free: no Cloudflare credentials or staging URL in this step.
+        self.assertNotIn("secrets.", receipt[0])
+        self.assertNotIn("STAGING_URL", receipt[0])
+        self.assertNotIn("|| true", receipt[0])
         # GitHub rejects the whole workflow if job-level env uses the runner context.
         job_header = source.split("    steps:\n", 1)[0]
         self.assertNotIn("runner.", job_header)
@@ -1171,6 +1251,55 @@ class OrchestrationTests(OfflineTestCase):
         self.assert_gate("api_http_failure", rollout.verify, self.args, client)
         self.assert_no_evidence()
         self.assert_no_secret_saved_or_printed()
+
+    def test_receipt_mode_accepts_real_shape_without_cloudflare_credentials_or_network(self):
+        self.prepare_baseline()
+        self.write_deploy_output(real_shape_receipts())
+        argv = ["staging_rollout.py", "receipt", "--receipt", self.args.receipt,
+                "--output", self.args.output, "--evidence", self.args.evidence]
+        with patch.dict(os.environ, {}, clear=True), patch.object(sys, "argv", argv), \
+                patch.object(rollout, "Client", side_effect=AssertionError("receipt must be network-free")):
+            self.assertEqual(rollout.main(), 0)
+        self.assertEqual(json.loads(Path(self.args.evidence).read_text()), {"worker_version": VERSION})
+        self.assertIn("wrangler deploy receipt accepted", self.stdout.getvalue())
+        self.docker.assert_not_called()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_receipt_mode_rejections_stop_before_ownership_moves(self):
+        self.prepare_baseline()
+        stale = real_shape_receipts()
+        stale[2]["timestamp"] = date(-1)
+        wrong = real_shape_receipts()
+        wrong[0]["wrangler_version"] = "4.142.0"
+        for records, code in [(stale, "stale_deploy_receipt"),
+                              (wrong, "wrong_wrangler_receipt"),
+                              (real_shape_receipts()[:2], "deploy_receipt_missing_or_ambiguous")]:
+            with self.subTest(code=code):
+                self.write_deploy_output(records)
+                self.assert_gate(code, rollout.receipt, self.args)
+                self.assert_no_evidence()
+
+    def test_main_prints_allowlisted_diagnostic_after_gate_code(self):
+        self.prepare_baseline()
+        records = real_shape_receipts()
+        records[0]["wrangler_version"] = "4.142.0"
+        records[0]["command_line_args"] = [SENTINEL]
+        self.write_deploy_output(records)
+        argv = ["staging_rollout.py", "verify", "--receipt", self.args.receipt,
+                "--output", self.args.output, "--evidence", self.args.evidence]
+        with patch.object(sys, "argv", argv), patch.object(rollout, "Client", return_value=verify_client()):
+            self.assertEqual(rollout.main(), 1)
+        self.assertEqual(self.stdout.getvalue().splitlines()[1:], [
+            "staging rollout gate failed: wrong_wrangler_receipt",
+            "staging rollout diagnostic: records deploy=1,wrangler-session=2; "
+            "sessions deploy=1,probe=0,other=1; v1/wrangler-4.142.0 v1/wrangler-4.143.1",
+        ])
+        self.assert_no_evidence()
+        # The caller-owned NDJSON input legitimately holds the sentinel; only
+        # printed output and generated files are checked.
+        self.assertNotIn(SENTINEL, self.stdout.getvalue() + self.stderr.getvalue())
+        for path in [self.args.receipt, self.args.deploy_config]:
+            self.assertNotIn(SENTINEL, Path(path).read_text())
 
     def test_main_hides_raw_unexpected_exception_and_returns_failure(self):
         self.prepare_baseline()
