@@ -105,6 +105,12 @@ impl World {
             &self.bot.roles,
             creator.permission_overwrites.as_deref().unwrap_or_default(),
         );
+        let grouped = self.settings.group_by_category;
+        let group_room_ids = if grouped {
+            category_room_ids(creator, &self.channels, &self.rooms)
+        } else {
+            Vec::new()
+        };
         plan_room(&RoomPlanInput {
             guild_id: GUILD,
             owner_id: OWNER,
@@ -115,7 +121,27 @@ impl World {
             rooms: &self.rooms,
             bot: &self.bot,
             bot_permissions,
+            grouped,
+            group_room_ids: &group_room_ids,
         })
+    }
+
+    /// Track one room already in the creator's category.
+    fn add_room(&mut self, id: u64, position: i32) {
+        self.channels
+            .insert(id, channel(id, 2, Some(CATEGORY), position, &[]));
+        self.rooms.insert(
+            id,
+            VoiceRoom {
+                guild_id: GUILD,
+                channel_id: id,
+                creator_channel_id: CREATOR,
+                owner_id: 301,
+                original_creator_id: 301,
+                name_seed: 1,
+                created_at: "2026-10-02T00:00:00.000000+00:00".to_owned(),
+            },
+        );
     }
 }
 
@@ -285,4 +311,72 @@ fn rooms_and_other_categories_do_not_change_the_creators_slot() {
     // Existing rooms are never moved: the new room sits directly below the
     // creator and pushes room 510 (position 3) down.
     assert_eq!(world.plan().unwrap().position, Some(3));
+}
+
+#[test]
+fn grouped_rooms_keep_a_contiguous_block_at_the_block_edge() {
+    let mut world = World::new(full());
+    world.settings.group_by_category = true;
+    world.add_room(510, 3);
+    world.add_room(511, 4);
+    // Below: after the last group room, taking channel 500's slot (5) and
+    // leaving [creator, 510, 511, new] contiguous.
+    world.settings.position = RoomPosition::Below;
+    assert_eq!(world.plan().unwrap().position, Some(5));
+    // Above: before the first group room, taking room 510's slot (3).
+    world.settings.position = RoomPosition::Above;
+    assert_eq!(world.plan().unwrap().position, Some(3));
+}
+
+#[test]
+fn grouped_without_rooms_starts_the_block_next_to_the_creator() {
+    let mut world = World::new(full());
+    world.settings.group_by_category = true;
+    assert_eq!(world.plan().unwrap().position, Some(2));
+    world.settings.position = RoomPosition::Below;
+    assert_eq!(world.plan().unwrap().position, Some(5));
+}
+
+#[test]
+fn the_group_set_covers_only_live_rooms_in_the_category() {
+    let mut world = World::new(full());
+    world.settings.group_by_category = true;
+    world.add_room(510, 3);
+    // Another category: not in the group.
+    world
+        .channels
+        .insert(900, channel(900, 2, Some(901), 0, &[]));
+    world.rooms.insert(
+        900,
+        VoiceRoom {
+            guild_id: GUILD,
+            channel_id: 900,
+            creator_channel_id: CREATOR,
+            owner_id: 301,
+            original_creator_id: 301,
+            name_seed: 1,
+            created_at: "2026-10-02T00:00:00.000000+00:00".to_owned(),
+        },
+    );
+    // Tracked but hand-deleted (no live channel): not in the group.
+    world.rooms.insert(
+        911,
+        VoiceRoom {
+            guild_id: GUILD,
+            channel_id: 911,
+            creator_channel_id: CREATOR,
+            owner_id: 301,
+            original_creator_id: 301,
+            name_seed: 1,
+            created_at: "2026-10-02T00:00:00.000000+00:00".to_owned(),
+        },
+    );
+    let creator = world.channels[&CREATOR].clone();
+    assert_eq!(
+        category_room_ids(&creator, &world.channels, &world.rooms),
+        vec![510]
+    );
+    // ... so planning still lands at the block edge, not past the strangers.
+    world.settings.position = RoomPosition::Below;
+    assert_eq!(world.plan().unwrap().position, Some(5));
 }

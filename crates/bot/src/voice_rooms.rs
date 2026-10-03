@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::voice_room_plan::{plan_room, RoomPlanInput};
+use crate::voice_room_plan::{category_room_ids, plan_room, RoomPlanInput};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use twilight_cache_inmemory::DefaultInMemoryCache;
@@ -1931,6 +1931,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             }
         }
         let bot = live.bot.as_ref().ok_or(RoomHttpError::AccessDenied)?;
+        let grouped = settings.group_by_category;
+        let group_room_ids = if grouped {
+            category_room_ids(channel, &live.channels, &self.rooms)
+        } else {
+            Vec::new()
+        };
         plan_room(&RoomPlanInput {
             guild_id: self.live.guild_id,
             owner_id: ticket.member_id,
@@ -1941,6 +1947,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             rooms: &self.rooms,
             bot,
             bot_permissions: permissions,
+            grouped,
+            group_room_ids: &group_room_ids,
         })
     }
 
