@@ -112,7 +112,10 @@ Look for these literal messages:
   loaded its durable state; not yet proof of a successful RESUMED event.
 - `gateway shard loop started` / `gateway reconnect failed; Twilight will retry`.
 - `durable gateway failed; checkpoint unchanged, readiness unavailable` — fatal
-  initialization failure; underlying SQL error deliberately not logged.
+  initialization failure; underlying SQL error deliberately not logged. Its
+  `error_class` is also on `/readyz` as `gateway_failure` for 15 s before exit
+  and in Workers Logs as `container_gateway_failure` (see
+  [startup-diagnostics.md](startup-diagnostics.md)).
 - `container service failed` / `SIGTERM received; draining`.
 - Worker: `two-bot container started|stopped`, `two-bot /readyz unhealthy`,
   `two-bot keepalive probe failed`, `two-bot container error`.
