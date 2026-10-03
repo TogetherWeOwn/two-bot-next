@@ -330,7 +330,8 @@ the secrets: create both before dispatch, or the jobs fail instead of running.
 Prerequisites the legitimate principal must verify **before dispatch** (the
 runner cannot, and this change does not claim them): the real staging Neon
 identity; that the dedicated migrator binding already exists; the
-`staging-migrate` environment protections above; and a complete
+`staging-migrate-plan` / `staging-migrate-apply` environment protections
+above; and a complete
 recovery set covering the Next schema, `_sqlx_migrations` ledger, object
 ownership, ACLs and logins. The generic legacy backup omits Next tables and the
 SQLx history, and unverified Neon PITR is not a working recovery. Apply the
