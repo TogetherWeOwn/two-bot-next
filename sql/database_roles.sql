@@ -124,11 +124,6 @@ BEGIN
                     EXECUTE format('GRANT SELECT, INSERT, UPDATE ON TABLE %s TO two_bot_runtime', target);
                 ELSIF obj.kind = 'view' THEN
                     EXECUTE format('GRANT SELECT ON TABLE %s TO two_web_reader', target);
-                ELSIF obj.kind = 'migrator-only' THEN
-                    -- Owner/migrator ALL only (granted above); no runtime or
-                    -- reader grant. Tables of this kind must have no runtime
-                    -- or reader path; cite the code otherwise.
-                    NULL;
                 END IF;
                 -- SERIAL/IDENTITY sequences follow only allowlisted bot tables.
                 FOR seq IN (
