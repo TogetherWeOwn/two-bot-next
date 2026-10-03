@@ -169,9 +169,7 @@ async fn only_200_is_accepted_and_status_errors_never_retry_or_leak_bodies() {
             // accepted 200) is unavailable, never a retry with the body.
             let expected = match status {
                 429 => DiscordError::RateLimited,
-                201 | 204 | 503 => {
-                    DiscordError::Unavailable(format!("Discord returned {status}"))
-                }
+                201 | 204 | 503 => DiscordError::Unavailable(format!("Discord returned {status}")),
                 _ => DiscordError::Rejected(format!("Discord refused the request with {status}")),
             };
             assert_eq!(
