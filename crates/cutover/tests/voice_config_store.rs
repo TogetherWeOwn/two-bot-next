@@ -7,7 +7,7 @@ use sqlx::{postgres::PgConnectOptions, postgres::PgPoolOptions, PgPool, Postgres
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use two_bot_core::voice_config::{
-    export_configuration, import_configuration, ChannelKind, ChannelReference,
+    export_configuration, import_configuration, ChannelKind, ChannelReference, ChannelTemplates,
     CreatorConfiguration, GuildInventory, PermissionSource, RoomPosition, VoiceConfiguration,
 };
 use two_bot_core::voice_rooms::{CreatorChannel, TextCompanion, VoiceRoom};
