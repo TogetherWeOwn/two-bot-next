@@ -437,7 +437,7 @@ jobs:
 
       - name: onboarding prompt store regressions (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo test -p two-bot-core --features db --test onboarding_store --locked -- --ignored
+        run: cargo test -p two-bot-store --features db --test onboarding_store --locked -- --ignored
 
       - name: onboarding shared runtime acceptance (mock Discord and CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
@@ -526,12 +526,12 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
-        run: cargo test -p two-bot-core --features db --locked channel_moderation -- --include-ignored
+        run: cargo test -p two-bot-discord --features db --locked --test internal_channel_moderation -- --include-ignored
 
       - name: channel moderation shared-router REST acceptance (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
         run: >-
           env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS cargo test -p two-bot-discord
           --features db --locked --test channel_moderation_runtime -- --include-ignored
@@ -539,7 +539,7 @@ jobs:
       - name: Internal channel moderation executor (mock REST and CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-discord --features db --locked --test internal_channel_moderation -- --include-ignored
 
       - name: Internal-member durable store regressions (CI service only)
@@ -548,11 +548,11 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test internal_member_store -- --ignored
 
-      - name: Internal member moderation executor (mock REST and CI service only)
+      - name: Internal member moderation executor (mock Discord and CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot-discord --features db --locked --test internal_member_moderation -- --include-ignored
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-discord --features db --locked --test internal_member_moderation -- --ignored
 
       - name: Internal event executor mirror acceptance (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
@@ -597,10 +597,8 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         run: timeout 60s cargo test -p two-bot --locked --test alive -- --ignored --nocapture
 
-      - name: Consecutive retained restore drills (actual CLI, CI service only)
+      - name: Consecutive retained restore drills (actual CLI, dedicated CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked --test restore_drill -- --ignored --nocapture
 
       # NOTE: cargo-deny runs earlier in this job (TOG-12134 disk hygiene);
@@ -697,9 +695,7 @@ jobs:
           POSTGRES_HOST_AUTH_METHOD: trust
         options: >-
           --health-cmd "pg_isready -U agent_test -d agent_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
+          --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -823,7 +819,7 @@ jobs:
     env:
       IMAGE: two-bot-next:smoke-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -986,16 +982,14 @@ jobs:
           POSTGRES_HOST_AUTH_METHOD: trust
         options: >-
           --health-cmd "pg_isready -U agent_test -d agent_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
+          --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       TICKET_TEST_DB_HOST: agent-testdb
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+      - uses: dtolnay/rust-toolchain@11d5960a326750d5838078e36cf38b85af677262 # placeholder - replaced below
         with:
           toolchain: stable
       # TOG-11810: dependency build cache, as in the `check` job. The key
@@ -1057,7 +1051,7 @@ jobs:
       - name: Verify staging rollout provenance (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollout.py -v
       - name: Verify staging redirect smoke (offline fixtures)
-        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_redirect_smoke.py -v
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_automation_read_smoke.py -v
       - name: Verify staging automation read smoke (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_automation_read_smoke.py -v
       - name: Verify runner routing for every workflow job
@@ -1069,3 +1063,90 @@ jobs:
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release.cjs
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release-publication.cjs
+
+  # Always-run aggregator for the path-filtered matrix. GitHub counts a
+  # skipped job as passing for required checks, and leaves a required context
+  # pending forever when its workflow never starts (a `paths:`/`branches:`
+  # filter on the trigger). Every selector-gated job reports through this
+  # job: it runs on every PR (no selector `if:`, only `always()`), and fails
+  # when any needed conclusion is failure or cancelled, or when the selector
+  # itself did not succeed (fail-closed, so a broken selector cannot turn
+  # skipped jobs into a false green). `skipped` is accepted only when the
+  # selector explicitly deselected that job. The container image smoke is
+  # intentionally not in `needs:`: it is not a correctness gate and builds up
+  # to 30 minutes; it stays independently visible. Ruleset enforcement still
+  # points at `check` and `worker check` in this slice; the operator flips the
+  # required context to `required checks` separately.
+  required-checks:
+    name: required checks
+    permissions: {}
+    needs: [job-inputs, supply-chain, check, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db]
+    # A skipped or cancelled dependency must not read as green.
+    if: ${{ always() }}
+    # Runner routing: see the note on the first job above.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'required-checks') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    steps:
+      - name: Aggregate required conclusions
+        env:
+          JOB_INPUTS_RESULT: ${{ needs.job-inputs.result }}
+          RUST_SELECTED: ${{ needs.job-inputs.outputs.rust }}
+          WORKER_SELECTED: ${{ needs.job-inputs.outputs.worker }}
+          PARITY_SELECTED: ${{ needs.job-inputs.outputs.parity }}
+          SUPPLY_CHAIN_RESULT: ${{ needs.supply-chain.result }}
+          CHECK_RESULT: ${{ needs.check.result }}
+          WORKER_RESULT: ${{ needs.worker.result }}
+          PARITY_DOCS_RESULT: ${{ needs.parity-docs.result }}
+          SELF_ROLE_RESULT: ${{ needs.self-role-store.result }}
+          COMMUNITY_DB_RESULT: ${{ needs.community-db.result }}
+          FEEDS_DB_RESULT: ${{ needs.feeds-db.result }}
+          TICKETS_RESULT: ${{ needs.tickets-postgres.result }}
+          MODERATION_DB_RESULT: ${{ needs.moderation-db.result }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+
+          failures = []
+
+          def selected(name):
+              # The selector shell defaults undecidable diffs to true and the
+              # outputs fall back to true, so a missing output with a
+              # successful selector is treated as selected (fail-closed).
+              return os.environ.get(name, "") != "false"
+
+          if os.environ.get("JOB_INPUTS_RESULT") != "success":
+              failures.append(
+                  "job-inputs did not succeed "
+                  f"(result={os.environ.get('JOB_INPUTS_RESULT')!r}); "
+                  "refusing to trust skips")
+          else:
+              gated = [
+                  ("worker", "WORKER_RESULT", "WORKER_SELECTED"),
+                  ("parity-docs", "PARITY_DOCS_RESULT", "PARITY_SELECTED"),
+                  ("self-role-store", "SELF_ROLE_RESULT", "RUST_SELECTED"),
+                  ("community-db", "COMMUNITY_DB_RESULT", "RUST_SELECTED"),
+                  ("feeds-db", "FEEDS_DB_RESULT", "RUST_SELECTED"),
+                  ("tickets-postgres", "TICKETS_RESULT", "RUST_SELECTED"),
+                  ("moderation-db", "MODERATION_DB_RESULT", "RUST_SELECTED"),
+              ]
+              for job, result_var, sel_var in gated:
+                  result = os.environ.get(result_var, "")
+                  if result == "success":
+                      continue
+                  if result == "skipped" and not selected(sel_var):
+                      continue
+                  failures.append(f"{job}: result={result!r} selected={selected(sel_var)}")
+              for job, var in (("supply-chain", "SUPPLY_CHAIN_RESULT"),
+                               ("check", "CHECK_RESULT")):
+                  result = os.environ.get(var, "")
+                  if result != "success":
+                      failures.append(f"{job}: result={result!r} (always-run gate)")
+
+          if failures:
+              print("required checks FAILED:")
+              for failure in failures:
+                  print(f"  - {failure}")
+              sys.exit(1)
+          print("required checks passed")
+          PY
