@@ -149,8 +149,10 @@ pub(crate) fn id_list(vars: &HashMap<String, String>, key: &str) -> HashSet<Stri
         .unwrap_or_default()
 }
 
-/// Where the live [`ContainmentSettings`] come from.
-pub(crate) trait SettingsSource: Send + 'static {
+/// Where the live [`ContainmentSettings`] come from. `Sync` is required: the
+/// worker is shared by reference across awaits (`contain`, `plan`) and the
+/// spawned [`run`](ContainmentWorker::run) future must stay `Send`.
+pub(crate) trait SettingsSource: Send + Sync + 'static {
     fn current(&mut self) -> impl Future<Output = ContainmentSettings> + Send;
 }
 
