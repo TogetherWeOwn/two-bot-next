@@ -3,10 +3,8 @@
 mod common;
 
 use common::{MockRest, ScriptedResponse};
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
+use tokio::time::Instant;
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
 use two_bot_discord::{
     ratelimit_guard::{GuardConfig, GuardError, RateLimitGuard},
