@@ -295,6 +295,8 @@ Invocation (secret-free; the URL comes only from the existing
 staging-migrate --plan --source-sha <40hex> --staging-host <host> \
   --staging-database <db> --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
   [--expected-pending <ascending,comma-separated versions>]
+staging-migrate --apply <same flags> --expected-pending <list> \
+  --plan-manifest-sha256 <64hex> --plan-run-id <run id>
 ```
 
 Reconcile is set-based: pending is every source version absent from the
@@ -302,24 +304,37 @@ ledger, in source order, so a ledger may lag the source by any subset. `--plan`
 prints that list in the manifest (`pending_before`) and changes nothing.
 `--apply` requires `--expected-pending` (the workflow input of the same name)
 and refuses before any DDL unless it equals the computed pending list exactly,
-so apply can only run the pending set a reviewed plan already showed.
+so apply can only run the pending set a reviewed plan already showed. `--apply`
+additionally requires `--plan-manifest-sha256` and `--plan-run-id`: the SHA-256
+of the reviewed plan run's uploaded `staging-migrate-manifest.json` and the run
+that produced it. The runner recomputes the hash over its own source SHA,
+pending list and full source migration table (so same-pending-different-SQL
+replays refuse) and refuses on any mismatch, binding apply to the exact
+manifest the reviewed plan produced on the same `source_sha`. `--plan` prints
+its own hash (`plan_manifest_sha256`) in the manifest and ignores the binding
+flags.
 
 It refuses (exit 2, before any DDL) when the binding is absent, the target does
 not equal the pinned staging host/database inputs, either pin is empty or looks
 like production, either host pin or the binding host is a pooler endpoint
 (session `SET ROLE` and the migrator lock need the direct endpoint), the login
 cannot assume `two_bot_migrator`, a reference is missing, `--apply` has no
-`--expected-pending` or it mismatches, or the ledger has a failed/incomplete
+`--expected-pending` or it mismatches, `--apply` has no `plan_manifest_sha256`/
+`plan_run_id` or the hash does not match the recomputed manifest, or the ledger has a failed/incomplete
 row, a SHA-384 mismatch or a version unknown to the source. The database name needs no `staging`
 substring (the verified shared-Neon staging database is `two_bot`); the pinned
 host plus the binding-match check is the staging identity. It never resets,
 reverts, restores, creates roles or grants. The sanitized JSON manifest (source
-SHA, per-migration SHA-384, ledger before/after, applied count) is the evidence;
+SHA, per-migration SHA-384, ledger before/after, applied count, plus its own
+`plan_manifest_sha256` and the bound `plan_run_id`) is the evidence;
 on failure the ledger-after is preserved, not repaired.
 
 The workflow runs only when dispatched from `main` and splits into two jobs.
 The `plan` job always runs and reads the binding from the `staging-migrate-plan`
 GitHub environment, which carries no reviewer because planning changes nothing;
+it uploads `staging-migrate-manifest.json` as the `staging-migrate-manifest`
+run artifact (14-day retention), which is where the reviewer reads
+`plan_manifest_sha256`/`plan_run_id` for the apply dispatch.
 the `apply` job runs only for `mode: apply`, after a green plan, and reads the
 binding from the `staging-migrate-apply` environment, which must have a
 required reviewer and a main-only deployment-branch rule. Both bindings must be

@@ -25,7 +25,9 @@ mod database_roles_cli;
 mod discord_test_common;
 mod dispatch;
 mod erasure_cli;
+mod feed_jobs;
 mod gateway;
+mod gateway_commands;
 mod gateway_failure;
 mod gateway_metrics;
 #[cfg(test)]
@@ -57,6 +59,8 @@ mod self_role_handlers;
 #[allow(dead_code)]
 mod self_role_runtime;
 mod shutdown;
+#[cfg(test)]
+mod smoke_error_contract_tests;
 mod ticket_runtime;
 #[cfg(test)]
 #[path = "../../core/tests/support/tracing_capture.rs"]
@@ -362,6 +366,21 @@ async fn main() {
                         self_roles,
                         gates,
                     );
+                    if let Some(runtime) = &runtime {
+                        let config = gateway_commands::GatewayCommandConfig::from_map(
+                            guild_id,
+                            &std::env::vars().collect(),
+                        )
+                        .map_err(|error| {
+                            step_failure(FailureClass::CustomCommandsInitFailed, error)
+                        })?;
+                        runtime
+                            .initialize_custom_commands(config)
+                            .await
+                            .map_err(|error| {
+                                step_failure(FailureClass::CustomCommandsInitFailed, error)
+                            })?;
+                    }
                     // Onboarding renders through that same executor: one shared
                     // admission lane and pacing, never a private Discord client.
                     // Its identity probe honors the mock REST seam through the

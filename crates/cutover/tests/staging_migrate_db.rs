@@ -127,6 +127,7 @@ impl Fixture {
         host: &str,
         db: &str,
         expected_pending: Option<&str>,
+        plan_binding: Option<(&str, &str)>,
     ) -> (i32, String, String) {
         let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_staging-migrate"));
         cmd.args([
@@ -144,6 +145,9 @@ impl Fixture {
         ]);
         if let Some(list) = expected_pending {
             cmd.args(["--expected-pending", list]);
+        }
+        if let Some((hash, run_id)) = plan_binding {
+            cmd.args(["--plan-manifest-sha256", hash, "--plan-run-id", run_id]);
         }
         cmd.env_remove("TWO_BOT_STAGING_MIGRATOR_DATABASE_URL");
         for key in ["PGOPTIONS", "PGPASSFILE", "PGSERVICE"] {
@@ -254,7 +258,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
     assert!(is_member, "member login must hold the migrator group");
 
     // Missing binding and wrong target refuse before any DDL.
-    let (code, _, err) = fx.run("--apply", None, &host, &db, Some("")).await;
+    let (code, _, err) = fx.run("--apply", None, &host, &db, Some(""), None).await;
     assert_eq!(code, 2, "{err}");
     let (code, _, _) = fx
         .run(
@@ -263,6 +267,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             "two_bot_staging_other",
             Some(""),
+            None,
         )
         .await;
     assert_eq!(code, 2);
@@ -273,6 +278,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             "other-host",
             &db,
             Some(""),
+            None,
         )
         .await;
     assert_eq!(code, 2);
@@ -284,6 +290,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             "ep-prod-fixture.us-east-2.aws.neon.tech",
             &db,
             Some(""),
+            None,
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -295,27 +302,41 @@ async fn real_sqlx_runner_cases() -> TestResult {
             "ep-test-pooler.us-east-2.aws.neon.tech",
             &db,
             Some(""),
+            None,
         )
         .await;
     assert_eq!(code, 2, "{err}");
     let (code, _, _) = fx
-        .run("--apply", Some(migrator.clone()), "", &db, Some(""))
+        .run("--apply", Some(migrator.clone()), "", &db, Some(""), None)
         .await;
     assert_eq!(code, 2);
     let (code, _, _) = fx
-        .run("--apply", Some(migrator.clone()), &host, "", Some(""))
+        .run("--apply", Some(migrator.clone()), &host, "", Some(""), None)
         .await;
     assert_eq!(code, 2);
     // Apply without the reviewed pending list refuses before any DDL.
     let (code, _, err) = fx
-        .run("--apply", Some(migrator.clone()), &host, &db, None)
+        .run("--apply", Some(migrator.clone()), &host, &db, None, None)
         .await;
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("expected_pending"));
+    // Apply without the plan-bound hash and run id refuses before any DDL.
+    let (code, _, err) = fx
+        .run(
+            "--apply",
+            Some(migrator.clone()),
+            &host,
+            &db,
+            Some(""),
+            None,
+        )
+        .await;
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("plan_manifest_sha256"));
     // A login that cannot SET ROLE two_bot_migrator is refused.
     let outsider = fx.url(&fx.outsider, &fx.database);
     let (code, _, err) = fx
-        .run("--apply", Some(outsider), &host, &db, Some(""))
+        .run("--apply", Some(outsider), &host, &db, Some(""), None)
         .await;
     assert_eq!(code, 2, "{err}");
     let ledger: bool =
@@ -341,13 +362,22 @@ async fn real_sqlx_runner_cases() -> TestResult {
     .await?;
     assert_eq!(owner, "two_bot_migrator");
 
-    // Plan is read-only and prints the computed pending list.
+    // Plan is read-only and prints the computed pending list with its hash.
     let (code, out, err) = fx
-        .run("--plan", Some(member.clone()), &host, &db, None)
+        .run("--plan", Some(member.clone()), &host, &db, None, None)
         .await;
     assert_eq!(code, 0, "{err}");
     let m = manifest(&out);
     assert_eq!(m["applied_count"], 0);
+    let plan_hash = m["plan_manifest_sha256"]
+        .as_str()
+        .expect("plan hash")
+        .to_owned();
+    assert_eq!(
+        plan_hash.len(),
+        64,
+        "plan hash must be a SHA-256 hex digest"
+    );
     let seed_set: HashSet<i64> = SEED_VERSIONS.into_iter().collect();
     let expected: Vec<i64> = two_bot_cutover::staging_migrate::MIGRATOR
         .iter()
@@ -372,7 +402,14 @@ async fn real_sqlx_runner_cases() -> TestResult {
 
     // A wrong pending list refuses before any DDL.
     let (code, _, err) = fx
-        .run("--apply", Some(member.clone()), &host, &db, Some("201"))
+        .run(
+            "--apply",
+            Some(member.clone()),
+            &host,
+            &db,
+            Some("201"),
+            None,
+        )
         .await;
     assert_eq!(code, 2, "{err}");
     let ledger: i64 = sqlx::query_scalar("SELECT count(*) FROM public._sqlx_migrations")
@@ -380,7 +417,27 @@ async fn real_sqlx_runner_cases() -> TestResult {
         .await?;
     assert_eq!(ledger, 29, "plan-bound refusal must not change the ledger");
 
-    // Apply the reviewed list as the member login.
+    // A mismatched plan hash refuses before any DDL, even with the right list.
+    let mut bad_hash = plan_hash.clone();
+    bad_hash.replace_range(..2, if &plan_hash[..2] == "00" { "ff" } else { "00" });
+    let (code, _, err) = fx
+        .run(
+            "--apply",
+            Some(member.clone()),
+            &host,
+            &db,
+            Some(&expected_csv),
+            Some((&bad_hash, "424242")),
+        )
+        .await;
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("plan_manifest_sha256"));
+    let ledger: i64 = sqlx::query_scalar("SELECT count(*) FROM public._sqlx_migrations")
+        .fetch_one(&mut c)
+        .await?;
+    assert_eq!(ledger, 29, "hash refusal must not change the ledger");
+
+    // Apply the reviewed list as the member login, bound to the plan hash.
     let (code, out, err) = fx
         .run(
             "--apply",
@@ -388,6 +445,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(&expected_csv),
+            Some((&plan_hash, "424242")),
         )
         .await;
     assert_eq!(code, 0, "{err}");
@@ -431,7 +489,8 @@ async fn real_sqlx_runner_cases() -> TestResult {
     assert_eq!(foreign, 0, "every DDL connection ran as the migrator");
 
     // The reviewed list is now stale, so it refuses; an empty expectation
-    // applies nothing.
+    // applies nothing. The no-op apply still needs a fresh plan hash, so
+    // re-plan first and bind to the new empty manifest.
     let (code, _, _) = fx
         .run(
             "--apply",
@@ -439,27 +498,52 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(&expected_csv),
+            Some((&plan_hash, "424242")),
         )
         .await;
     assert_eq!(code, 2);
     let (code, out, err) = fx
-        .run("--apply", Some(member.clone()), &host, &db, Some(""))
+        .run("--plan", Some(member.clone()), &host, &db, None, None)
+        .await;
+    assert_eq!(code, 0, "{err}");
+    let empty_hash = manifest(&out)["plan_manifest_sha256"]
+        .as_str()
+        .expect("empty plan hash")
+        .to_owned();
+    let (code, out, err) = fx
+        .run(
+            "--apply",
+            Some(member.clone()),
+            &host,
+            &db,
+            Some(""),
+            Some((&empty_hash, "424243")),
+        )
         .await;
     assert_eq!(code, 0, "{err}");
     assert_eq!(manifest(&out)["applied_count"], 0);
 
-    // SHA-384 drift refuses.
+    // SHA-384 drift refuses. The binding inputs must be valid-format so the
+    // run reaches reconcile (which fails on drift) instead of refusing on the
+    // missing binding first.
     sqlx::query("UPDATE public._sqlx_migrations SET checksum = decode(repeat('00', 48), 'hex') WHERE version = (SELECT min(version) FROM public._sqlx_migrations)")
         .execute(&mut c)
         .await?;
     let (code, _, err) = fx
-        .run("--apply", Some(member.clone()), &host, &db, Some(""))
+        .run(
+            "--apply",
+            Some(member.clone()),
+            &host,
+            &db,
+            Some(""),
+            Some((&empty_hash, "424244")),
+        )
         .await;
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("drift"));
     // Restore the checksum from the source, then an incomplete row refuses.
     let (code, _, _) = fx
-        .run("--plan", Some(member.clone()), &host, &db, None)
+        .run("--plan", Some(member.clone()), &host, &db, None, None)
         .await;
     assert_eq!(code, 2);
     sqlx::query("DELETE FROM public._sqlx_migrations WHERE version = (SELECT max(version) FROM public._sqlx_migrations)")
@@ -477,7 +561,18 @@ async fn real_sqlx_runner_cases() -> TestResult {
             .execute(&mut c)
             .await?;
     }
-    let (code, _, err) = fx.run("--apply", Some(member), &host, &db, Some("")).await;
+    // Same valid-format binding here: the run must reach reconcile (which
+    // fails on the incomplete row) instead of refusing on the binding first.
+    let (code, _, err) = fx
+        .run(
+            "--apply",
+            Some(member),
+            &host,
+            &db,
+            Some(""),
+            Some((&empty_hash, "424245")),
+        )
+        .await;
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("incomplete"));
 

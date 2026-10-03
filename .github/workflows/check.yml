@@ -65,6 +65,7 @@ jobs:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
       CARGO_TERM_COLOR: always
+      TWO_CUSTOM_COMMAND_TEST_CI: "1"
       # Disk hygiene for hosted overflow runners (TOG-12134): the integration
       # link step (`cargo test --workspace --test '*'`) links ~70 test
       # binaries and exhausted the job-container overlay (98 MB left, rust-lld
@@ -135,9 +136,10 @@ jobs:
           printf 'job-inputs: rust=%s worker=%s parity=%s\n' \
             "$SEL_RUST" "$SEL_WORKER" "$SEL_PARITY"
 
-      # `worker check` and the database jobs are skipped when `job inputs
-      # changed` fails, and GitHub counts a skipped required check as passing.
-      # Failing here keeps a broken selector from turning those into false greens.
+      # The database jobs skip when `job inputs changed` fails (they are not
+      # required checks); `worker check` always runs and fails closed on a
+      # broken selector via its own guard step. Failing here keeps a broken
+      # selector from turning skips into false greens.
       - name: require job inputs selection to pass
         if: needs.job-inputs.result != 'success'
         run: exit 1
@@ -563,6 +565,14 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
 
+      - name: custom-command Postgres proof
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-core --features db --locked --test custom_command_store -- --ignored
+
+      - name: custom-command routed runtime proof (mock Discord and CI Postgres only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-discord --features db --locked --test custom_command_runtime -- --include-ignored
+
       - name: Durable Discord send admission (isolated DBs and mock HTTP only)
         if: needs.job-inputs.outputs.rust != 'false'
         env:
@@ -577,6 +587,12 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked command_runtime_tests -- --ignored --test-threads=1
+
+      - name: Managed feed poller acceptance (CI service and REST doubles only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot --locked feed_jobs -- --ignored --test-threads=1
 
       - name: Real binary lifecycle acceptance (CI service only, under 60 s)
         if: needs.job-inputs.outputs.rust != 'false'
@@ -1001,9 +1017,11 @@ jobs:
     permissions:
       contents: read
     needs: [job-inputs]
-    # Required check. Skipped when the selector sees no worker inputs, which
-    # GitHub counts as passing; `check` fails if the selector itself fails.
-    if: needs.job-inputs.outputs.worker != 'false'
+    # Required check: always runs so the merge gate never goes missing.
+    # Docs/asset-only PRs fast-pass below (no `paths:` filter: that would
+    # skip the whole workflow including this required check). A failed or
+    # missing selector fails closed via the guard step, never a false green.
+    if: ${{ always() }}
     # Runner routing: see the note on the first job above.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'worker') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 10
@@ -1015,37 +1033,61 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+      - name: Docs/asset-only fast pass (no worker inputs changed)
+        if: needs.job-inputs.outputs.worker == 'false'
+        run: echo "No worker inputs changed per the job-inputs selector; required check passes without the npm suite."
+      # A skipped or failed selector must not make this required check green.
+      - name: require job inputs selection to pass
+        if: needs.job-inputs.result != 'success'
+        run: exit 1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: needs.job-inputs.outputs.worker != 'false'
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: wrangler/package-lock.json
       - run: npm ci
+        if: needs.job-inputs.outputs.worker != 'false'
       - run: npm run typecheck
+        if: needs.job-inputs.outputs.worker != 'false'
       - run: npm test
+        if: needs.job-inputs.outputs.worker != 'false'
       # TOG-9907: named envs do not inherit bindings; fail if any [env.*]
       # omits the Container/DO/exports/vars wiring (staging HTTP 1101).
       - name: check env bindings are explicit
+        if: needs.job-inputs.outputs.worker != 'false'
         run: |
           python3 scripts/check-env-bindings.py wrangler.toml
           python3 scripts/test-env-bindings.py
       - name: Verify frozen legacy registry export preconditions
+        if: needs.job-inputs.outputs.worker != 'false'
         run: node --test ../scripts/test-export-legacy-registry.mjs
       - name: Verify PR lint event and dispatch paths
+        if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-pr-lint.py
       - name: Verify secret-scan trigger and concurrency surface
+        if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-secret-scan.py
       - name: Verify production deploy guards
+        if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-deploy-production.py
       - name: Verify release reconciliation retries
+        if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-release-retry.py
+      # Always runs, even on docs/asset-only fast-pass: the offline suite
+      # pins this step with no `if:` (test_required_worker_ci_runs_this_offline_suite).
       - name: Verify staging rollout provenance (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollout.py -v
       - name: Verify staging redirect smoke (offline fixtures)
+        if: needs.job-inputs.outputs.worker != 'false'
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_redirect_smoke.py -v
+      - name: Verify staging automation read smoke (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_automation_read_smoke.py -v
       - name: Verify runner routing for every workflow job
+        if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-runner-routing.py
       - name: Verify offline release lifecycle
+        if: needs.job-inputs.outputs.worker != 'false'
         # Match the library bundled by the pinned release action, in an isolated
         # API-double fixture with lifecycle scripts disabled and no write token.
         run: | # zizmor: ignore[adhoc-packages] pinned offline release fixture only

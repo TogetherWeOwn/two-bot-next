@@ -4,6 +4,7 @@
 
 ### Added
 
+- Register an immediate-first, non-overlapping feed poll job with the existing owned job supervisor, pinned HTTPS connector, shared REST executor and fenced SQLx ledger. Preserve exact string nonces (including decimal-looking values), recover pending deliveries even after items leave the feed, rotate the bounded recovery queue without starving XML-present items, and surface bounded-history misses or uncertain send/completion receipts as recovery-required rather than reposting. Announcements remain off by default; no deployment or activation is included.
 - Add self-role reads and singular role operations to the shared REST executor:
   authoritative member/bot/role/channel policy snapshots, fetched reaction-message
   identity, paced single-attempt operations with pre/post ownership checks and
@@ -111,6 +112,25 @@
   runs in CI and gates the required `check` job.
   Runtime router/REST wiring remains deferred; this does not enable Discord
   role mutations.
+- Framework-free custom-command validation, template rendering, feature-gate
+  decisions, accepted-message text trigger selection, command-list formatting,
+  registry merge outcomes and automation audit facts.
+- Postgres custom-command and shared audit persistence, migration `0130`,
+  transaction-compatible capacity locking, and a credential-free database
+  regression test against agent-testdb or a CI service container.
+- Shared-router custom-command execution adapter with transactional management,
+  deferred mention-safe replies, dynamic slash execution auditing, and serialized
+  full-registry publication. Add mock REST + isolated testdb runtime fixtures;
+  gateway execution is wired with bounded dispatch/checkpoint ordering.
+- Explicit moderation-acceptance contract and prefix execution through the shared
+  REST executor, with immutable pre-send audit reservations preventing replay of
+  unknown deliveries. Preserve uncertain transport/timeout/5xx/429 outcomes as
+  unresolved rather than auditing a definite failure. Add prefix failure/restart
+  fixtures, dual-gated Message Content intent, and unchanged Worker forwarding of
+  custom-command and automod flags. Add shared bootstrap metadata reads, cold-RESUME
+  context and gateway dispatch under the existing heartbeat-safe checkpoint budget.
+  Prefixes require explicit automod-disabled configuration until the ordinary
+  moderation-result producer is integrated; unknown acceptance stays fail-closed.
 - Wire `/feed-add`, `/feed-remove` and `/feed-list` through the same command runtime, router and REST executor as sticky commands. Defer ephemerally before guild-scoped CRUD and audit writes, preserve the invoking channel, and publish the complete gated command registry on Ready. Isolated Postgres and mock REST acceptance cover feed commands and sticky coexistence; announcements remain off by default, with no fetching, polling or relay posts.
 - Wire `/sticky` and `/sticky-remove` through the shared interaction router and drive accepted-message re-posts through the shared REST executor. The runtime claims one re-post window atomically per burst, validates and records the replacement id before retiring the previous sticky (best-effort), releases the claim and audits `post_failed` on REST failure, and deletes an orphaned replacement when the claim moved on. Commands defer ephemerally before I/O and edit the original reply; refusals are limited to owned sticky commands. `TWO_AUTOMATIONS` gates both surfaces; ManageGuild is required, and `/sticky` validates a 1–2000 UTF-16 body with a 1–300 s debounce (default 5 s). Covered by isolated Postgres and mock REST acceptance tests.
 - Add the audit mirror delivery service over the shared REST executor: record-before-deliver, private guild-fenced destinations, enforced nonce/mention suppression, kill-switch enforcement, crash-safe marker reconciliation and quarantine. Revalidate prepared ownership after shared transport pacing, preserve interrupted dedup adoption evidence, treat malformed history as uncertain, and run service fault-injection regressions in CI. Runtime wiring and activation remain deferred.
@@ -135,6 +155,7 @@
 
 ### Fixed
 
+- Support the exact authenticated-user REST read used by feed history reconciliation, and preserve the uncompressed runtime-image budget when Docker's containerd store also accounts for compressed blobs.
 - Retain unsent onboarding welcome/goodbye payloads when successful REST responses contain inconsistent role snapshots or unusable channel evidence, while preserving proven-denial skips. Resolve only submitted session destinations so an unavailable unselected room cannot block valid routing. Add mock restart and selected/unselected regressions; current-head execution and independent review remain pending.
 - Synchronize the interrupted onboarding callback restart fixture on its first durable claim, not early HTTP arrival. Keep token-free receipts, exact attempt counts, replay fencing and fresh-reselection assertions unchanged.
 - Reconcile onboarding with the shared sticky/feed command runtime and outbound message safety. Component posts accept only typed no-mention/one-member welcome policies, neutralize mass mentions and validate effective payloads; original-response edits retain shared scalar-safe truncation and clearing semantics. Preserve independent gateway/feature pools, bounded ingress and worker admission. Add focused mock-wire regressions; preceding ingress repair passed required CI, while the complete reconciliation and independent review remain pending.

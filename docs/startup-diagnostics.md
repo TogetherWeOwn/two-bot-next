@@ -28,6 +28,7 @@ Rust logs fixed `startup_phase` / `error_class` fields before fatal exits:
 | Durable gateway checkpoint read | `checkpoint_load_failed` |
 | Onboarding gate parsing | `onboarding_gates_invalid` |
 | Onboarding runtime initialization | `onboarding_init_failed` |
+| Custom-command registry bootstrap | `custom_commands_init_failed` |
 | Milestone read | `milestones_load_failed` |
 | Automod configuration rejected | `automod_config_invalid` |
 | Automod REST executor build | `automod_executor_failed` |
