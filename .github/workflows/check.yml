@@ -197,6 +197,10 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v
 
+      - name: soak evidence parser (offline, fixtures only)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_evidence.py' -v
+
       - name: Validate voice template fixtures (hermetic, no renderer)
         run: |
           python3 tests/voice_templates/validate.py
