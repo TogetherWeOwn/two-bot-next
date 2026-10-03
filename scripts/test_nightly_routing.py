@@ -52,17 +52,27 @@ class NightlyRoutingTests(unittest.TestCase):
     def test_response_classification_fixture_does_not_shorten_default_deadline(self):
         source = (ROOT / "crates/discord/src/internal_actions/tests.rs").read_text()
         fixture = source.split("    fn executor(", 1)[1].split("\n    fn ", 1)[0]
-        self.assertNotIn("executor.timeout =", fixture)
+        # Frozen-clock contract (#151): the fixture executor pins the short
+        # 100ms deadline by default so timeout tests never use production timing.
+        self.assertIn("executor.timeout = Duration::from_millis(100)", fixture)
+        self.assertIn("executor.response_received =", fixture)
 
     def test_short_deadlines_remain_explicit_in_timeout_coverage(self):
         source = (ROOT / "crates/discord/src/internal_actions/tests.rs").read_text()
-        self.assertTrue("    fn deadline_executor(" in source, "deadline fixtures must be explicit")
+        # Frozen-clock contract (#151): slowness is modeled with stall_* flags
+        # plus controlled advance(), not wall-clock delay/body_delay fields.
+        self.assertNotIn("    fn deadline_executor(", source)
+        self.assertNotIn("body_delay", source)
         for name in [
             "timeout_and_lost_response_are_unknown_and_not_retried",
             "deadline_covers_success_body_and_truncated_body_is_unknown",
         ]:
             body = source.split(f"async fn {name}()", 1)[1].split("#[tokio::test]", 1)[0]
-            self.assertIn("mock.deadline_executor(keys())", body)
+            self.assertIn("run_until_timeout(&mock, &executor,", body)
+            self.assertTrue(
+                "stall_response = true" in body or "stall_body = true" in body,
+                f"{name} must model slowness with a stall_* flag",
+            )
             self.assertIn("UnknownReason::Timeout", body)
             self.assertIn("assert_eq!(mock.count(), 1)", body)
 
