@@ -85,7 +85,8 @@ fn slash(sequence: u64, id: u64) -> Value {
         "guild_id": GUILD, "channel": {"id": "4444", "type": 0, "name": "commands"},
         "authorizing_integration_owners": {"0": GUILD}, "entitlements": [],
         "member": {
-            "permissions": "0", "roles": [], "deaf": false, "mute": false,
+            "permissions": "0", "roles": [], "joined_at": null,
+            "deaf": false, "mute": false, "flags": 0,
             "user": {"id": "3333", "username": "tester", "discriminator": "0000", "avatar": null}
         },
         "data": {"id": "5555", "name": "faq", "type": 1, "options": []}
@@ -96,7 +97,7 @@ fn prefix(sequence: u64, id: u64) -> Value {
     json!({"op": 0, "s": sequence, "t": "MESSAGE_CREATE", "d": {
         "id": id.to_string(), "guild_id": GUILD, "channel_id": "4444", "type": 0,
         "author": {"id": "3333", "username": "tester", "discriminator": "0000", "avatar": null},
-        "content": "!FaQ ignored arguments", "timestamp": "2026-09-30T12:00:00Z", "edited_timestamp": null,
+        "content": "!FaQ ignored arguments", "timestamp": "2026-09-30T12:00:00.000000+00:00", "edited_timestamp": null,
         "tts": false, "mention_everyone": false, "mentions": [], "mention_roles": [],
         "attachments": [], "embeds": [], "pinned": false
     }})

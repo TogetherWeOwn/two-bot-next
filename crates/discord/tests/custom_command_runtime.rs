@@ -56,7 +56,8 @@ fn slash(id: u64, name: &str, permissions: u64, options: &[(&str, &str)]) -> Int
         "guild_id": "2222", "channel": {"id": "4444", "type": 0, "name": "commands"},
         "authorizing_integration_owners": {"0": "2222"}, "entitlements": [],
         "member": {
-            "permissions": permissions.to_string(), "roles": [], "deaf": false, "mute": false,
+            "permissions": permissions.to_string(), "roles": [], "joined_at": null,
+            "deaf": false, "mute": false, "flags": 0,
             "user": {"id": "3333", "username": "tester", "discriminator": "0000", "avatar": null}
         },
         "data": {"id": "5555", "name": name, "type": 1,
@@ -68,7 +69,7 @@ fn message(id: u64, content: &str) -> Message {
     serde_json::from_value(json!({
         "id": id.to_string(), "guild_id": "2222", "channel_id": "4444", "type": 0,
         "author": {"id": "3333", "username": "tester", "discriminator": "0000", "avatar": null},
-        "content": content, "timestamp": "2026-09-30T12:00:00Z", "edited_timestamp": null,
+        "content": content, "timestamp": "2026-09-30T12:00:00.000000+00:00", "edited_timestamp": null,
         "tts": false, "mention_everyone": false, "mentions": [], "mention_roles": [],
         "attachments": [], "embeds": [], "pinned": false
     }))
