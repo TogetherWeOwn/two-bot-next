@@ -713,7 +713,7 @@ impl<
                     observer.observe_audit_entry(AuditLogObservation {
                         guild_id: guild_id.get(),
                         entry_id: created.id.get(),
-                        action: created.action_type.clone(),
+                        action: created.action_type,
                         executor_id: created.user_id.map(|id| id.get()),
                         target_id: created.target_id.map(|id| id.get()),
                     });
