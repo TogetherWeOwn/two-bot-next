@@ -153,7 +153,7 @@ async fn discord(fixture: Fixture) -> MockRest {
             ("GET", "/users/@me") => {
                 ScriptedResponse::json(200, json!({"id":"999","bot":true,"username":"bot"}))
             }
-            ("GET", "/oauth2/applications/@me") => {
+            ("GET", "/applications/@me") => {
                 ScriptedResponse::json(200, json!({"id": STAGING_BOT_APPLICATION_ID}))
             }
             ("GET", "/guilds/22") => {
@@ -404,7 +404,7 @@ async fn discord_identity_only(wrong_app: bool) -> MockRest {
             ("GET", "/users/@me") => {
                 ScriptedResponse::json(200, json!({"id":"999","bot":true,"username":"bot"}))
             }
-            ("GET", "/oauth2/applications/@me") => {
+            ("GET", "/applications/@me") => {
                 let id = if wrong_app {
                     "1"
                 } else {
@@ -430,7 +430,7 @@ async fn discord_partial() -> MockRest {
             ("GET", "/users/@me") => {
                 ScriptedResponse::json(200, json!({"id":"999","bot":true,"username":"bot"}))
             }
-            ("GET", "/oauth2/applications/@me") => {
+            ("GET", "/applications/@me") => {
                 ScriptedResponse::json(200, json!({"id": STAGING_BOT_APPLICATION_ID}))
             }
             ("GET", "/guilds/22") => {
@@ -479,7 +479,7 @@ async fn discord_managed() -> MockRest {
             ("GET", "/users/@me") => {
                 ScriptedResponse::json(200, json!({"id":"999","bot":true,"username":"bot"}))
             }
-            ("GET", "/oauth2/applications/@me") => {
+            ("GET", "/applications/@me") => {
                 ScriptedResponse::json(200, json!({"id": STAGING_BOT_APPLICATION_ID}))
             }
             ("GET", "/guilds/22") => {
@@ -637,7 +637,7 @@ async fn containment_worker_wrong_application_id_claims_nothing() {
         assert_eq!(request.method, "GET", "no REST beyond the identity reads");
         assert!(
             request.path == "/api/v10/users/@me"
-                || request.path == "/api/v10/oauth2/applications/@me",
+                || request.path == "/api/v10/applications/@me",
             "identity read only: {}",
             request.path
         );
