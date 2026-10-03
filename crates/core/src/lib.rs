@@ -118,6 +118,7 @@ pub mod voice_config;
 pub mod voice_config_diff;
 pub mod voice_create_admission;
 pub mod voice_custom_id;
+pub mod voice_ghost_cleanup;
 pub mod voice_logging;
 pub mod voice_name_filter;
 pub mod voice_naming;
@@ -375,6 +376,7 @@ pub use voice_access::{
     is_voice_command, may_create_room, may_use_command, validate_access_controls, AccessControls,
     AccessDecision, AccessDenyReason, AccessError, AccessMember, RoleId, VOICE_COMMANDS,
 };
+pub use voice_ghost_cleanup::{plan_ghost_cleanup, GhostCleanupPlan};
 pub use voice_permission_health::{
     evaluate_permissions, notice_target, resolve_effective_permissions, NoticeCandidates,
     NoticeTarget, NoticeThrottle, OverwriteMasks, OverwriteTarget, PermissionFinding,
