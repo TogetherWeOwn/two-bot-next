@@ -23,6 +23,7 @@ pub mod internal_events;
 pub mod leveling_runtime;
 #[cfg(feature = "db")]
 pub mod lfg_interactions;
+pub mod member_moderation;
 mod message_safety;
 pub mod onboarding_config;
 pub mod onboarding_messages;
