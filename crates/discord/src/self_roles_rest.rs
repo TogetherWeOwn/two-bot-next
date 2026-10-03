@@ -169,7 +169,7 @@ impl ActionExecutor {
             .try_into_request()
             .map_err(|_| SelfRoleRestError::InvalidId)?;
         let mut lane = self.paced_lane(false).await.map_err(guard_error)?;
-        *lane = std::time::Instant::now();
+        self.stamp_paced_lane(&mut lane, false);
         // `send_admitted` skips lane locking: the reservation above is the
         // pacing. It still collects the bounded body, so a truncated member
         // document stays `Ambiguous`, never a parsed partial snapshot.
@@ -376,7 +376,7 @@ impl ActionExecutor {
         if let Err(error) = self.inner.transport.guard.check_now(false) {
             return Err(guard_error(error));
         }
-        *lane = std::time::Instant::now();
+        self.stamp_paced_lane(&mut lane, false);
         let (result, response_status) = match tokio::time::timeout(
             Duration::from_millis(MODERATION_TIMEOUT_MS),
             self.send_status(&request),
