@@ -49,6 +49,7 @@ os.execv(sys.argv[1], [sys.argv[1], 'backup'])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("TWO_DATABASE_URL", url)
+        .env("TWO_DATABASE_TLS", "local-only")
         .env("TWO_BACKUP_DIR", dir)
         .env("TWO_BACKUP_KEEP", "2")
         // A local marker, not a bucket/network command. The CLI appends the
