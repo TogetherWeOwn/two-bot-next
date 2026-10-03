@@ -30,11 +30,12 @@ Rules the rehearsal verified in source:
   above, numbering from 1). If the database write fails after the channel is
   created, the handler deletes the channel again (compensation); if that
   delete also fails it names the channel so an admin can remove it by hand.
-- Per-creator tuning after creation runs through the V11 import (the whole
-  configuration document), because the individual settings commands
-  (`/position`, `/group`, `/inheritpermissions`, `/defaultlimit`,
-  `/alwaysprivate`) are not wired as slash commands. There is no partial
-  per-creator edit path: change the value in the exported JSON and re-import.
+- Per-creator tuning after creation runs through the single-setting
+  commands (`/position`, `/group`, `/inheritpermissions`, `/defaultlimit`,
+  `/alwaysprivate`), each an admin-gated write of one field with the same
+  bounds the import validates. The V11 import remains for bulk edits
+  (templates, aliases, lists, logging): change the value in the exported
+  JSON and re-import.
 - `group_by_category` (shared numbering and contiguous block per category)
   is stored by the V11 import and shown in the diff, but the room planner
   hardcodes ungrouped placement. Do not promise shared numbering at cutover
@@ -142,6 +143,31 @@ What was rehearsed and passed (offline, from merged source):
 - Reconcile forgets hand-deleted rooms and never touches untracked
   channels.
 
+### Ghost-count staging verification (2026-10-03, read-only)
+
+Head `87d98060`. Staging guild only: one `voice_rooms` SELECT attempt,
+read-only legacy temp-voice counts, one channel-listing GET. No writes,
+no cleanup actions, no live guild queries.
+
+- The `voice_rooms` table is absent on the staging database (zero
+  `voice_*` tables; migrations pending), so the tracked-rows SELECT the
+  live `report voice-ghosts` count needs fails with `UndefinedTable`.
+  The diff is unverifiable until staging migrates.
+- Legacy temp-voice rows for staging: `temp_voice_channels` 0 (no legacy
+  ghosts), `temp_voice_creates` 1 (dated 2026-09-29), `temp_voice_audit`
+  24 with the latest a 2026-09-29 boot-reconcile delete. No post-cleanup
+  run is recorded.
+- The live listing shows 3 voice channels (`Lobby`, `Squad`, `Voice 1`).
+  With zero tracked rows the arithmetic gives `tracked_gone=[]`,
+  `untracked_present=[3]`, `clean=false`.
+- Candidate residual baseline: the 3 live voice channels read as
+  permanent staging voice, but no baseline documents them as residual
+  yet, so the count cannot certify "back to baseline".
+- Verdict: NEEDS WORK — the count is not at baseline (expected
+  `clean=true` or a documented residual). Needs staging migrated and
+  healthy plus a written residual baseline naming the permanent
+  channels.
+
 ## 6. Gaps
 
 Each gap below is filed as its own card and linked from the rehearsal
@@ -156,8 +182,10 @@ staging returning to healthy; it is not listed here as a code gap.
    (tracked-present, tracked-gone, untracked-present plus a `clean` flag),
    covered by unit and CLI integration tests. Still open: live staging
    polling of the count across a rehearsal swap (§4 live run).
-3. The per-creator settings commands (`/position`,
-   `/inheritpermissions`, `/defaultlimit`, `/alwaysprivate`) are not wired,
-   so mid-cutover tuning requires a full-document export/edit/import
-   cycle. Usable, but slower and easier to mistype under time pressure
-   than single-setting commands.
+3. ~~The per-creator settings commands are not wired, so mid-cutover
+   tuning requires a full-document export/edit/import cycle~~ Wired: the
+   per-creator settings commands (`/position`, `/group`,
+   `/inheritpermissions`, `/defaultlimit`, `/alwaysprivate`) are
+   admin-gated slash commands with single-field writes, covered by unit
+   tests. Still open: live staging practice of each command on the
+   staging guild once staging is healthy (§4 live run).
