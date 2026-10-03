@@ -501,6 +501,22 @@ impl LiveGuild {
             state.ready && state.channels.contains_key(&channel)
         })
     }
+
+    /// Guard for a passed vote's disconnect. A disconnect drops the member from
+    /// whatever voice channel they are in when it lands, so it is only allowed
+    /// while the member is still in the vote's room, evaluated at send time. A
+    /// target that moved on is skipped, never disconnected from another channel.
+    fn member_in_room_guard(&self, channel: Snowflake, member: Snowflake) -> WriteGuard {
+        let live = self.clone();
+        Arc::new(move || {
+            let state = live.inner.read().expect("live voice lock");
+            state.ready
+                && state
+                    .members
+                    .get(&member)
+                    .is_some_and(|current| current.channel_id == Some(channel))
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -856,7 +872,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let mut finished = Vec::new();
         for reference in self.active_votes.clone() {
             let (owner_id, original_creator_id, occupants) =
-                self.kick_facts(reference.room_id).unwrap_or_default();
+                match self.kick_facts(reference.room_id) {
+                    Ok(facts) => facts,
+                    // Evidence went stale mid-pass: leave the vote untouched.
+                    Err(KickRefusal::Unavailable) => continue,
+                    // A room that is gone has no occupants.
+                    Err(KickRefusal::NotARoom | KickRefusal::Vote(_)) => Default::default(),
+                };
             let facts = VoteRoomFacts {
                 guild_id: self.live.guild_id,
                 room_id: reference.room_id,
@@ -1238,24 +1260,38 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     .read()
                     .expect("live voice lock")
                     .permissions(self.live.guild_id, channel_id);
-                let result = if !self.rooms.contains_key(&channel_id) {
-                    // The room is gone and its overwrites went with it.
+                let result = if self.rooms.get(&channel_id).is_none_or(|room| {
+                    member_id == room.owner_id || member_id == room.original_creator_id
+                }) {
+                    // Either the room is gone and its overwrites went with it, or
+                    // ownership changed after the vote passed and the target is now
+                    // the owner or original creator: write nothing.
                     Ok(())
                 } else if !can_enforce_kick(permissions) {
                     Err(RoomHttpError::AccessDenied)
                 } else {
-                    let guard = self.live.room_guard(channel_id);
                     // Deny first so the target cannot rejoin between the writes.
+                    // The deny is room-scoped, so the target having left does not
+                    // skip it; the disconnect is not, so it re-checks presence.
                     match self
                         .http
-                        .deny_connect(channel_id, member_id, guard.clone())
+                        .deny_connect(channel_id, member_id, self.live.room_guard(channel_id))
                         .await
                     {
-                        Ok(()) => {
-                            self.http
-                                .disconnect(self.live.guild_id, member_id, guard)
-                                .await
-                        }
+                        Ok(()) => match self
+                            .http
+                            .disconnect(
+                                self.live.guild_id,
+                                member_id,
+                                self.live.member_in_room_guard(channel_id, member_id),
+                            )
+                            .await
+                        {
+                            // The target left or moved on since the deny landed:
+                            // nothing to disconnect.
+                            Err(RoomHttpError::Cancelled) => Ok(()),
+                            other => other,
+                        },
                         Err(error) => Err(error),
                     }
                 };

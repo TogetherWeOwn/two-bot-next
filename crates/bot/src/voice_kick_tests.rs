@@ -274,6 +274,62 @@ async fn bots_are_not_occupants_for_voting() {
     );
 }
 
+/// Start a vote on `TARGET` and pass it with three Yes ballots.
+fn pass_vote(worker: &mut GuildRoomWorker<Store, Http>) {
+    start(worker, VOTER_A, TARGET).unwrap();
+    for voter in [VOTER_A, VOTER_B] {
+        worker.kick_cast(VOTE, voter, VoteBallot::Yes, 1).unwrap();
+    }
+    let passed = worker.kick_cast(VOTE, VOTER_C, VoteBallot::Yes, 2).unwrap();
+    assert_eq!(passed.status, VoteKickStatus::Passed);
+}
+
+#[tokio::test]
+async fn target_moved_to_another_channel_is_denied_but_not_disconnected() {
+    let (mut worker, trace) = setup().await;
+    pass_vote(&mut worker);
+    // Between the pass and the dispatch the target joins a channel nobody voted in.
+    worker
+        .live
+        .voice_update(TARGET, Some(ROOM + 1), Some(false));
+    dispatch(&mut worker, 3).await;
+    assert_eq!(*trace.lock().unwrap(), [format!("deny:{ROOM}:{TARGET}")]);
+    assert!(
+        worker.failures().is_empty(),
+        "a skipped disconnect is not a failure"
+    );
+}
+
+#[tokio::test]
+async fn target_who_left_voice_is_denied_but_not_disconnected() {
+    let (mut worker, trace) = setup().await;
+    pass_vote(&mut worker);
+    worker.live.voice_update(TARGET, None, Some(false));
+    dispatch(&mut worker, 3).await;
+    assert_eq!(*trace.lock().unwrap(), [format!("deny:{ROOM}:{TARGET}")]);
+    assert!(worker.failures().is_empty());
+}
+
+#[tokio::test]
+async fn target_who_became_owner_after_the_vote_passed_is_not_touched() {
+    let (mut worker, trace) = setup().await;
+    pass_vote(&mut worker);
+    worker.rooms.get_mut(&ROOM).unwrap().owner_id = TARGET;
+    dispatch(&mut worker, 3).await;
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.failures().is_empty());
+}
+
+#[tokio::test]
+async fn target_who_is_the_original_creator_after_the_vote_passed_is_not_touched() {
+    let (mut worker, trace) = setup().await;
+    pass_vote(&mut worker);
+    worker.rooms.get_mut(&ROOM).unwrap().original_creator_id = TARGET;
+    dispatch(&mut worker, 3).await;
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.failures().is_empty());
+}
+
 #[tokio::test]
 async fn missing_manage_roles_records_a_failure_and_writes_nothing() {
     let mut snap = snapshot(&[ROOM], roster());
