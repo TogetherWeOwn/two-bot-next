@@ -95,7 +95,7 @@ impl GatewayCommands {
         let runtime = crate::command_runtime::CommandRuntime::new(
             pool,
             executor,
-            crate::command_runtime::CommandRuntime::build_router(config.gates),
+            crate::command_runtime::router_with_commands(config.gates),
             config.gates.configured_guild.ok_or_else(config_error)?,
             config.gates.automations,
         );
