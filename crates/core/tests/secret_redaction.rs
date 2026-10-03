@@ -475,6 +475,65 @@ fn channel_store_rejects_unknown_query_secrets_without_sqlx_warning() {
     assert!(!text.contains("ignoring unrecognized connect parameter"));
 }
 
+#[cfg(feature = "db")]
+#[test]
+fn channel_store_tls_refusals_never_echo_urls_or_reach_logs() {
+    use two_bot_core::database_tls::TlsPolicy;
+    let cases = [
+        (
+            "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=disable",
+            TlsPolicy::Required,
+            "database sslmode does not require TLS",
+        ),
+        (
+            "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db",
+            TlsPolicy::Required,
+            "database URL must set sslmode under the required TLS policy",
+        ),
+        (
+            "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=prefer",
+            TlsPolicy::LocalOnly,
+            "remote database host is refused under the local-only TLS policy",
+        ),
+        (
+            "postgres://fixture-user:fixture-db-password@fixture-host/fixture-db?sslmode=verify-full",
+            TlsPolicy::Required,
+            "local database host is refused under the required TLS policy",
+        ),
+        (
+            "postgres://fixture-user:fixture-db-password@fixture-host/fixture-db?sslmode=fixture-mode",
+            TlsPolicy::LocalOnly,
+            "unsupported database sslmode",
+        ),
+    ];
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for (url, policy, expected) in cases {
+                let error = two_bot_core::ChannelModerationStore::connect_with_tls(url, 1, policy)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.to_string(), expected);
+                let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+                while let Some(error) = current {
+                    for shown in [format!("{error}"), format!("{error:?}")] {
+                        assert!(!shown.contains("fixture"), "TLS refusal echoed the URL");
+                    }
+                    current = error.source();
+                }
+            }
+            tracing::warn!("capture remains active");
+        });
+    });
+    let text = capture.text();
+    assert!(text.contains("capture remains active"));
+    assert!(!text.contains("fixture"), "TLS refusal reached logs");
+}
+
 #[test]
 fn guild_config_wrapper_rerender_keeps_webhook_userinfo_and_query_redacted() {
     // `GuildConfigApiError::Http` re-renders the wrapped error through
