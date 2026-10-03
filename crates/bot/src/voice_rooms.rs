@@ -19,6 +19,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::voice_room_plan::{plan_room, RoomPlanInput};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use twilight_cache_inmemory::DefaultInMemoryCache;
@@ -27,7 +28,7 @@ use twilight_model::{
     application::interaction::{
         application_command::CommandOptionValue, Interaction, InteractionData, InteractionType,
     },
-    channel::{message::MessageFlags, permission_overwrite::PermissionOverwrite, Channel},
+    channel::{message::MessageFlags, Channel},
     guild::{Permissions, Role},
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
     id::{marker::RoleMarker, Id},
@@ -36,9 +37,8 @@ use two_bot_core::{
     now_iso,
     voice_rooms::{
         category_full_message, voice_commands, ActionQueue, CreatorChannel, NewRoomSpec,
-        PermissionSource, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, RoomPosition,
-        VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN,
-        RENAME_MIN_INTERVAL_MS,
+        ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, RoomPosition, VoiceGates,
+        VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN, RENAME_MIN_INTERVAL_MS,
     },
     CommandDefinition, Snowflake,
 };
@@ -674,42 +674,18 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 });
             }
         }
-        let source = if permissions.is_some_and(|p| p.contains(Permissions::MANAGE_ROLES)) {
-            match settings.permission_source {
-                PermissionSource::Creator => Some(ticket.creator_id),
-                PermissionSource::Category => channel.parent_id.map(Id::get),
-                PermissionSource::Channel(id) => Some(id),
-            }
-        } else {
-            channel.parent_id.map(Id::get)
-        };
-        let mut overwrites: Vec<PermissionOverwrite> = match source {
-            Some(id) => live
-                .channels
-                .get(&id)
-                .ok_or(RoomHttpError::AccessDenied)?
-                .permission_overwrites
-                .clone()
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
-        // Privacy/default owner permissions are applied by V8. Never silently
-        // create a public room if a later slice has enabled an unsupported default.
-        if settings.private_default || settings.text_channels {
-            return Err(RoomHttpError::InvalidRequest);
-        }
         let bot = live.bot.as_ref().ok_or(RoomHttpError::AccessDenied)?;
-        if !can_manage_room(effective_permissions(
-            self.live.guild_id,
-            bot.guild_owner_id,
-            bot.member_id,
-            &bot.member_roles,
-            &bot.roles,
-            &overwrites,
-        )) {
-            return Err(RoomHttpError::AccessDenied);
-        }
-        RoomChannelAttributes::from_creator(settings, channel, std::mem::take(&mut overwrites))
+        plan_room(&RoomPlanInput {
+            guild_id: self.live.guild_id,
+            owner_id: ticket.member_id,
+            settings,
+            creator: channel,
+            channels: &live.channels,
+            creators: &self.creators,
+            rooms: &self.rooms,
+            bot,
+            bot_permissions: permissions,
+        })
     }
 
     /// Executes at most one write, releasing the guild lane on every outcome.
@@ -1778,6 +1754,7 @@ async fn execute_create<S: RoomPersistence, H: RoomWrites>(
         video_quality_mode: None,
         nsfw: false,
         user_limit: 0,
+        position: None,
         overwrites: Vec::new(),
     };
     let always: WriteGuard = Arc::new(|| true);

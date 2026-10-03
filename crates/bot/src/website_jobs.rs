@@ -122,6 +122,7 @@ pub async fn serve(
     gateway: server::SharedState,
     shutdown: watch::Sender<bool>,
     self_roles: Option<Arc<SelfRoleService>>,
+    automod: crate::automod_gateway::Slot,
 ) -> std::io::Result<()> {
     let mut registered = Vec::new();
     let mut parked = Vec::new();
@@ -181,6 +182,10 @@ pub async fn serve(
                 let registration = community_jobs::register(context.clone());
                 registered.extend(registration.jobs);
                 parked = registration.parked;
+                // Repeat-history expiry rides the shared supervisor.
+                if crate::automod_gateway::enabled() {
+                    registered.push(crate::automod_gateway::expiry_job(automod));
+                }
                 match audit_runtime::register(context, shutdown.subscribe()) {
                     Some(job) => registered.push(job),
                     None => parked.extend(audit_runtime::NAMES),
@@ -200,12 +205,15 @@ pub async fn serve(
 }
 
 async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::SharedStatus {
-    let names: Vec<&'static str> = NAMES
+    let mut names: Vec<&'static str> = NAMES
         .into_iter()
         .chain(community_jobs::NAMES)
         .chain(audit_runtime::NAMES)
         .chain([RECOVERY_JOB_NAME])
         .collect();
+    if crate::automod_gateway::enabled() {
+        names.push(crate::automod_gateway::JOB_NAME);
+    }
     // Start everything parked; the loop below unparks exactly the registered
     // jobs. Recovery alone must not make unavailable website/community jobs
     // look active, and an absent recovery job must not report live.

@@ -436,6 +436,7 @@ async fn spawn_runner_until_shutdown(
         db.store.clone(),
         None,
         None,
+        None,
         shutdown,
     ));
     (task, state)
