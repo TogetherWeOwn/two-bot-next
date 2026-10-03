@@ -77,10 +77,9 @@ header fields (previous version ID kept for the whole watch).
   returns a scrape, and container plus Worker logs are readable for the
   window. Polls are read-only on a short cadence; only findings are
   recorded.
-- [ ] Each query in the [watch signal query pack](watch-signal-queries.md)
-  (§§ 1–5, read-only rules on every query) returns an answer from
+- [ ] Each of the five watch queries below returns a read-only answer from
   existing sources, with no SQL, probe or restore against staging or
-  production databases. The five queries, with their sources:
+  production databases:
   gateway session starts (`two_bot_gateway_events_total{event="READY"}`,
   `two_bot_gateway_reconnects_total`, `two_bot_gateway_resumes_total`,
   cross-checked against `gateway shard loop started` log lines);
@@ -98,14 +97,17 @@ header fields (previous version ID kept for the whole watch).
   GO, EXTEND or ROLLBACK at each checkpoint; a ROLLBACK row repeats the
   previous Worker version ID from the header.
 
-Source: [watch signal query pack](watch-signal-queries.md) §§ 1–5 and its
-read-only rules; [production-deploy.md](production-deploy.md) 48-hour
+Source: [production-deploy.md](production-deploy.md) 48-hour
 watch log (header fields, checkpoint rows, `readyz` and revision,
 gateway, error-class and rollback-decision rows);
 [cutover.md § 48-hour watch](cutover.md#48-hour-watch) (real configured
 monitor, finding-only reporting, named coverage);
-[metrics.md](metrics.md) series contract and
-[runbook § Metrics alerts](runbook.md#metrics-alerts) for the scrape path.
+[metrics.md](metrics.md) series contract (gateway event counters, REST
+route/result labels, handler-latency buckets, job streaks) and
+[runbook § Metrics alerts](runbook.md#metrics-alerts) for the
+off-container scrape path. Every table query above runs only against an
+authorized test-container copy or a backup artifact, never against
+staging or production.
 
 ## 5. GO / NO-GO record
 
