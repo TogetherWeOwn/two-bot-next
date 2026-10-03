@@ -58,3 +58,18 @@ The acceptance fixture covers fallback order, mention handling, zero-ID
 handling, unknown-level refusal with echo bound, detail gating, and repeats
 stopping after the bound with reset. No network, Discord, database, or
 staging identity is used.
+
+## `/logging` (admin) and persistence
+
+`/logging` (Manage Channels, the spec's "admin") sets the guild's logging
+choices: `show`, `level level:<off|brief|full>`, `channel [channel]` and
+`mention [role]` (no channel or role clears it). Each change is a
+read-modify-write under the runtime's admin lock, saved whole to
+`voice_logging_settings` (migration 0228; no row means brief notices through
+the fallback chain with no mention). Unknown level text is refused
+fail-closed through `parse_detail_level`, and a failed read or write changes
+nothing and says so. Only a mention *role* is stored, so the table holds no
+member IDs.
+
+Sending notices (health check, error routing, repeat ledger) reads these
+settings in the next V10 slice; this slice only stores and edits them.

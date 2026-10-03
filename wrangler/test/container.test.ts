@@ -441,6 +441,97 @@ test("cold keepalive passes env through the SDK's string-URL fetch path", async 
   assert.ok(h.logs.includes("two-bot /readyz unhealthy: 503"));
 });
 
+// TOG-13044: the bot reports why its gateway task failed on /readyz; the
+// Worker passes it through and logs the fixed phase/class once per keepalive.
+function readyzWith(gatewayFailure: unknown, extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    components: [["process", "ready"], ["gateway", "starting"]],
+    ...(gatewayFailure === undefined ? {} : { gateway_failure: gatewayFailure }),
+    ...extra,
+  });
+}
+
+async function keepaliveSeeing(t: TestContext, body: string) {
+  const h = await harness(t);
+  h.setProbeResponse((status) => new Response(body, {
+    status, headers: { "content-type": "application/json" },
+  }));
+  await tickKeepalive(h.bot);
+  return h;
+}
+
+const gatewayFailureLogs = (logs: string[]) =>
+  logs.filter((line) => line.includes("container_gateway_failure"));
+
+test("keepalive logs the gateway failure phase and class once, as strict tokens", async (t) => {
+  const failure = { phase: "durable_gateway", class: "checkpoint_load_failed" };
+  const h = await keepaliveSeeing(t, readyzWith(failure));
+  assert.deepEqual(gatewayFailureLogs(h.logs), [JSON.stringify({
+    event: "container_gateway_failure", phase: "durable_gateway", class: "checkpoint_load_failed",
+  })]);
+});
+
+test("public /readyz forwards the gateway failure unchanged", async (t) => {
+  const body = readyzWith({ phase: "durable_gateway", class: "automod_config_invalid" });
+  const h = await harness(t);
+  h.setProbeResponse((status) => new Response(body, {
+    status, headers: { "content-type": "application/json" },
+  }));
+  const response = await worker.fetch(new Request("https://worker.invalid/readyz"), {
+    CF_VERSION_METADATA: { id: ID },
+    TWO_BOT: { getByName: () => h.bot },
+  } as unknown as Env, {} as ExecutionContext);
+  assert.equal(response.status, 503);
+  assert.equal(await response.text(), body);
+  assert.deepEqual(gatewayFailureLogs(h.logs), [], "only the keepalive path logs the class");
+});
+
+test("keepalive without a gateway failure logs no failure event", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith(undefined));
+  assert.deepEqual(gatewayFailureLogs(h.logs), []);
+});
+
+const HOSTILE_FAILURES: [string, unknown][] = [
+  ["url as class", { phase: "durable_gateway", class: "postgres://user:hunter2@db.internal/app" }],
+  ["uppercase class", { phase: "durable_gateway", class: "Checkpoint_Load_Failed" }],
+  ["over-long class", { phase: "durable_gateway", class: "a".repeat(33) }],
+  ["empty phase", { phase: "", class: "checkpoint_load_failed" }],
+  ["spaced phase", { phase: "durable gateway", class: "checkpoint_load_failed" }],
+  ["numeric class", { phase: "durable_gateway", class: 7 }],
+  ["missing class", { phase: "durable_gateway" }],
+  ["string instead of object", "durable_gateway:checkpoint_load_failed"],
+  ["null", null],
+  ["array", ["durable_gateway", "checkpoint_load_failed"]],
+];
+for (const [name, hostile] of HOSTILE_FAILURES) {
+  test(`keepalive drops a hostile gateway failure (${name})`, async (t) => {
+    const h = await keepaliveSeeing(t, readyzWith(hostile));
+    assert.deepEqual(gatewayFailureLogs(h.logs), []);
+    assert.ok(h.logs.every((line) => !line.includes("hunter2") && !line.includes("db.internal")));
+  });
+}
+
+test("keepalive logs only phase and class even when the failure object carries more", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith({
+    phase: "durable_gateway", class: "gateway_runtime_failed", error: "postgres://user:hunter2@db.internal/app",
+  }));
+  const [line] = gatewayFailureLogs(h.logs);
+  assert.equal(line, JSON.stringify({
+    event: "container_gateway_failure", phase: "durable_gateway", class: "gateway_runtime_failed",
+  }));
+  assert.ok(h.logs.every((entry) => !entry.includes("hunter2")));
+});
+
+test("keepalive ignores a gateway failure in a non-bot (text) probe answer", async (t) => {
+  const h = await harness(t);
+  h.setProbeResponse((status) => new Response(
+    readyzWith({ phase: "durable_gateway", class: "checkpoint_load_failed" }),
+    { status, headers: { "content-type": "text/plain" } },
+  ));
+  await tickKeepalive(h.bot);
+  assert.deepEqual(gatewayFailureLogs(h.logs), []);
+});
+
 for (const path of ["/health", "/readyz", "keepalive", "start", "startAndWaitForPorts"]) {
   test(`${path} startup forwards only allowlisted publication settings`, async (t) => {
     const h = await harness(t, PUBLICATION_WORKER_ENV);

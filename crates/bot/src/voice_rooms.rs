@@ -26,22 +26,29 @@ use twilight_cache_inmemory::DefaultInMemoryCache;
 use twilight_gateway::Event;
 use twilight_model::{
     application::interaction::{
-        application_command::CommandOptionValue, Interaction, InteractionData, InteractionType,
+        application_command::{CommandDataOption, CommandOptionValue},
+        Interaction, InteractionData, InteractionType,
     },
-    channel::{message::MessageFlags, Channel},
+    channel::{message::MessageFlags, permission_overwrite::PermissionOverwriteType, Channel},
     guild::{Permissions, Role},
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
     id::{marker::RoleMarker, Id},
 };
 use two_bot_core::{
-    now_iso,
+    evaluate_permissions as evaluate_health, now_iso,
+    voice_access::{
+        is_voice_command, may_create_room, may_use_command, validate_access_controls,
+        AccessControls, AccessDecision, AccessDenyReason, AccessMember,
+    },
+    voice_logging::{parse_detail_level, DetailLevel, LoggingSettings},
     voice_rooms::{
         category_full_message, voice_commands, ActionQueue, CreatorChannel, NewRoomSpec,
         ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, RoomPosition, VoiceGates,
         VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN, RENAME_MIN_INTERVAL_MS,
     },
     voice_utilities::{invite_render, ping_render},
-    CommandDefinition, Snowflake,
+    CommandDefinition, OverwriteTarget, PermissionFinding, PermissionOverwrite as HealthOverwrite,
+    Snowflake, VoicePermission, VoicePermissionScope,
 };
 use two_bot_cutover::voice_rooms::PgRoomStore;
 use two_bot_discord::voice_rooms::{
@@ -72,6 +79,28 @@ pub trait RoomPersistence: Send + Sync {
         creator: &CreatorChannel,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
     fn persist(&self, room: &VoiceRoom) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// The guild's V10b controls; an unconfigured guild reads as the defaults.
+    fn access_controls(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<AccessControls, StoreError>> + Send;
+    /// Replace the guild's controls (validated before the write).
+    fn save_access_controls(
+        &self,
+        guild: Snowflake,
+        controls: &AccessControls,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// The guild's V10a logging settings; an unconfigured guild reads as the defaults.
+    fn logging_settings(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<LoggingSettings, StoreError>> + Send;
+    /// Replace the guild's logging settings.
+    fn save_logging_settings(
+        &self,
+        guild: Snowflake,
+        settings: &LoggingSettings,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
     fn forget(
         &self,
         guild: Snowflake,
@@ -105,6 +134,34 @@ impl RoomPersistence for PgRoomStore {
             return Err(StoreError::Conflict);
         }
         Ok(())
+    }
+
+    async fn access_controls(&self, guild: Snowflake) -> Result<AccessControls, StoreError> {
+        self.access_controls(guild).await.map_err(store_error)
+    }
+
+    async fn save_access_controls(
+        &self,
+        guild: Snowflake,
+        controls: &AccessControls,
+    ) -> Result<(), StoreError> {
+        self.save_access_controls(guild, controls)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn logging_settings(&self, guild: Snowflake) -> Result<LoggingSettings, StoreError> {
+        self.logging_settings(guild).await.map_err(store_error)
+    }
+
+    async fn save_logging_settings(
+        &self,
+        guild: Snowflake,
+        settings: &LoggingSettings,
+    ) -> Result<(), StoreError> {
+        self.save_logging_settings(guild, settings)
+            .await
+            .map_err(store_error)
     }
 
     async fn forget(&self, guild: Snowflake, channel: Snowflake) -> Result<(), StoreError> {
@@ -144,6 +201,22 @@ pub trait RoomWrites: Send + Sync {
         channel: Snowflake,
         guard: WriteGuard,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// V4 vote-kick enforcement: disconnect the member from voice
+    /// (`channel_id: null`); 404 (already left) is success.
+    fn disconnect(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// V4 vote-kick enforcement: deny Connect to the member on one room
+    /// channel only (member-scoped overwrite, not a guild kick or ban).
+    fn deny_connect(
+        &self,
+        channel: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
     fn delete(
         &self,
         channel: Snowflake,
@@ -176,6 +249,25 @@ impl RoomWrites for RoomHttp {
         guard: WriteGuard,
     ) -> Result<(), RoomHttpError> {
         self.move_member(guild, member, channel, move || guard())
+            .await
+    }
+
+    async fn disconnect(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.disconnect_member(guild, member, move || guard()).await
+    }
+
+    async fn deny_connect(
+        &self,
+        channel: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.deny_member_connect(channel, member, move || guard())
             .await
     }
 
@@ -326,6 +418,68 @@ impl LiveGuild {
         live.generation += 1;
     }
 
+    /// V10 health check: the bot's missing Manage Channels, Move Members,
+    /// Manage Roles and View Channel permissions across the given creator
+    /// channels and their categories, attributed to the outermost level that
+    /// removes each one. Incomplete cache data (no bot snapshot, a missing
+    /// @everyone or bot role) reports nothing rather than a false failure, and
+    /// the guild owner and Administrator roles never have findings.
+    #[must_use]
+    pub fn permission_findings(&self, creators: &[Snowflake]) -> Vec<PermissionFinding> {
+        let live = self.inner.read().expect("live voice lock");
+        let Some(bot) = live.bot.as_ref() else {
+            return Vec::new();
+        };
+        if bot.member_id == bot.guild_owner_id {
+            return Vec::new();
+        }
+        let Some(everyone) = bot.roles.iter().find(|role| role.id.get() == self.guild_id) else {
+            return Vec::new();
+        };
+        let mut base = everyone.permissions.bits();
+        for role_id in &bot.member_roles {
+            let Some(role) = bot.roles.iter().find(|role| role.id == *role_id) else {
+                return Vec::new();
+            };
+            base |= role.permissions.bits();
+        }
+        let bot_roles: Vec<Snowflake> = bot.member_roles.iter().map(|id| id.get()).collect();
+        let mut findings = Vec::new();
+        for creator_id in creators {
+            let Some(channel) = live.channels.get(creator_id) else {
+                continue;
+            };
+            let category = channel
+                .parent_id
+                .and_then(|parent| live.channels.get(&parent.get()));
+            // A creator outside a category, or whose category is not cached,
+            // has no category-level evidence: only guild and channel scopes.
+            let (category_id, category_overwrites) = category.map_or_else(
+                || (0, Vec::new()),
+                |category| {
+                    (
+                        category.id.get(),
+                        health_overwrites(self.guild_id, category),
+                    )
+                },
+            );
+            for finding in evaluate_health(
+                base,
+                category_id,
+                &category_overwrites,
+                *creator_id,
+                &health_overwrites(self.guild_id, channel),
+                bot.member_id,
+                &bot_roles,
+            ) {
+                if !findings.contains(&finding) {
+                    findings.push(finding);
+                }
+            }
+        }
+        findings
+    }
+
     /// Refresh the bot access snapshot after role changes. Generation is
     /// unchanged: role edits do not invalidate in-flight tickets, they only
     /// affect the next guard evaluation.
@@ -410,6 +564,53 @@ impl LiveGuild {
     }
 }
 
+/// Role and member overwrites of one cached channel, in the health core's
+/// shape. @everyone is the role whose id is the guild id.
+fn health_overwrites(guild_id: Snowflake, channel: &Channel) -> Vec<HealthOverwrite> {
+    channel
+        .permission_overwrites
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|overwrite| {
+            let target = match overwrite.kind {
+                PermissionOverwriteType::Role if overwrite.id.get() == guild_id => {
+                    OverwriteTarget::Everyone
+                }
+                PermissionOverwriteType::Role => OverwriteTarget::Role(overwrite.id.get()),
+                PermissionOverwriteType::Member => OverwriteTarget::Member(overwrite.id.get()),
+                _ => return None,
+            };
+            Some(HealthOverwrite {
+                target,
+                allow: overwrite.allow.bits(),
+                deny: overwrite.deny.bits(),
+            })
+        })
+        .collect()
+}
+
+/// One `/setup` line for a missing permission. Ids only: the category or
+/// channel is mentioned, never named.
+#[must_use]
+pub fn health_line(finding: &PermissionFinding) -> String {
+    let permission = match finding.permission {
+        VoicePermission::ManageChannels => "Manage Channels",
+        VoicePermission::MoveMembers => "Move Members",
+        VoicePermission::ManageRoles => "Manage Roles",
+        VoicePermission::ViewChannel => "View Channel",
+    };
+    match (finding.scope, finding.category_id, finding.channel_id) {
+        (VoicePermissionScope::Category, Some(category), _) => format!(
+            "health: the permission override on category <#{category}> removes {permission} from the bot"
+        ),
+        (VoicePermissionScope::Channel, _, Some(channel)) => format!(
+            "health: the permission override on <#{channel}> removes {permission} from the bot"
+        ),
+        _ => format!("health: the bot lacks {permission} for the whole server"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleFailure {
     CategoryFull {
@@ -440,6 +641,7 @@ pub struct GuildRoomWorker<S, H> {
     store: S,
     http: H,
     creators: HashMap<Snowflake, CreatorChannel>,
+    access: AccessControls,
     rooms: HashMap<Snowflake, VoiceRoom>,
     queue: ActionQueue,
     renames: RenameCoalescer,
@@ -463,6 +665,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .into_iter()
             .map(|c| (c.channel_id, c))
             .collect();
+        let access = store.access_controls(live.guild_id).await?;
         let rooms = store
             .rooms(live.guild_id)
             .await?
@@ -474,6 +677,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             store,
             http,
             creators,
+            access,
             rooms,
             queue: ActionQueue::new(),
             renames: RenameCoalescer::new(),
@@ -498,6 +702,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         created_at: String,
     ) -> bool {
         if self.halted
+            || !may_create_room(&self.access)
             || !self.creators.contains_key(&ticket.creator_id)
             || !self
                 .live
@@ -1079,6 +1284,8 @@ enum ActorCommand {
         created_at: String,
     },
     CreatorAdded(CreatorChannel),
+    /// The guild's saved access controls changed (`/access`).
+    AccessChanged(AccessControls),
     /// One-shot worker snapshot for `/setup` (room count, failures, halt).
     Status(oneshot::Sender<WorkerStatus>),
 }
@@ -1092,6 +1299,9 @@ pub struct VoiceRuntime<S, H> {
     enabled: bool,
     seeds: AtomicU64,
     actors: Mutex<HashMap<Snowflake, GuildActor>>,
+    /// Serializes `/access` read-modify-write cycles so two admins cannot
+    /// overwrite each other's change (rare, admin-only, so one lock is enough).
+    access_lock: tokio::sync::Mutex<()>,
 }
 
 impl<S, H> VoiceRuntime<S, H>
@@ -1113,6 +1323,7 @@ where
             enabled,
             seeds: AtomicU64::new(initial_seed()),
             actors: Mutex::new(HashMap::new()),
+            access_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1231,6 +1442,14 @@ where
         if let Some(actor) = self.live_actor(guild) {
             update(&actor.live);
             let _ = actor.tx.send(ActorCommand::Reconcile);
+        }
+    }
+
+    /// Push freshly saved access controls to the live actor, so a creation
+    /// switch takes effect without a restart.
+    fn access_changed(&self, guild: Snowflake, controls: AccessControls) {
+        if let Some(actor) = self.live_actor(guild) {
+            let _ = actor.tx.send(ActorCommand::AccessChanged(controls));
         }
     }
 
@@ -1402,8 +1621,17 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             worker.creators.insert(creator.channel_id, creator);
             worker.reconcile();
         }
+        ActorCommand::AccessChanged(controls) => worker.access = controls,
         ActorCommand::Status(reply) => {
+            let mut creator_ids: Vec<Snowflake> = worker.creators.keys().copied().collect();
+            creator_ids.sort_unstable();
             let _ = reply.send(WorkerStatus {
+                health: worker
+                    .live
+                    .permission_findings(&creator_ids)
+                    .iter()
+                    .map(health_line)
+                    .collect(),
                 tracked_rooms: worker.tracked().len(),
                 failures: worker.failures().iter().map(failure_line).collect(),
                 halted: worker.halted(),
@@ -1653,6 +1881,34 @@ pub enum VoiceCommand {
     Setup,
     Ping,
     Invite,
+    Access(AccessAction),
+    Logging(LoggingAction),
+}
+
+/// One `/logging` sub-command. `Invalid` is a malformed or unknown shape; it
+/// is answered, never silently ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoggingAction {
+    Show,
+    Level(String),
+    Channel(Option<Snowflake>),
+    Mention(Option<Snowflake>),
+    Invalid,
+}
+
+/// One `/access` sub-command. `Invalid` is a malformed or unknown shape; it
+/// is answered, never silently ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessAction {
+    Show,
+    Creation(bool),
+    RequiredRole(Option<Snowflake>),
+    Restrict {
+        command: String,
+        roles: Vec<Snowflake>,
+    },
+    Unrestrict(String),
+    Invalid,
 }
 
 /// Guild the interaction was invoked in. `PartialMember` carries no guild, so
@@ -1689,7 +1945,86 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
         "setup" => Some(VoiceCommand::Setup),
         "ping" => Some(VoiceCommand::Ping),
         "invite" => Some(VoiceCommand::Invite),
+        "access" => Some(VoiceCommand::Access(parse_access_action(&command.options))),
+        "logging" => Some(VoiceCommand::Logging(parse_logging_action(
+            &command.options,
+        ))),
         _ => None,
+    }
+}
+
+fn parse_logging_action(options: &[CommandDataOption]) -> LoggingAction {
+    let Some(sub) = options.first() else {
+        return LoggingAction::Invalid;
+    };
+    let CommandOptionValue::SubCommand(args) = &sub.value else {
+        return LoggingAction::Invalid;
+    };
+    let arg = |name: &str| args.iter().find(|option| option.name == name);
+    match sub.name.as_str() {
+        "show" => LoggingAction::Show,
+        "level" => arg("level")
+            .and_then(|option| match &option.value {
+                CommandOptionValue::String(value) => Some(LoggingAction::Level(value.clone())),
+                _ => None,
+            })
+            .unwrap_or(LoggingAction::Invalid),
+        "channel" => LoggingAction::Channel(arg("channel").and_then(|option| match option.value {
+            CommandOptionValue::Channel(channel) => Some(channel.get()),
+            _ => None,
+        })),
+        "mention" => LoggingAction::Mention(arg("role").and_then(|option| match option.value {
+            CommandOptionValue::Role(role) => Some(role.get()),
+            _ => None,
+        })),
+        _ => LoggingAction::Invalid,
+    }
+}
+
+fn parse_access_action(options: &[CommandDataOption]) -> AccessAction {
+    let Some(sub) = options.first() else {
+        return AccessAction::Invalid;
+    };
+    let CommandOptionValue::SubCommand(args) = &sub.value else {
+        return AccessAction::Invalid;
+    };
+    let roles: Vec<Snowflake> = ["role", "role2", "role3"]
+        .iter()
+        .filter_map(|name| args.iter().find(|option| option.name == *name))
+        .filter_map(|option| match option.value {
+            CommandOptionValue::Role(role) => Some(role.get()),
+            _ => None,
+        })
+        .fold(Vec::new(), |mut roles, role| {
+            if !roles.contains(&role) {
+                roles.push(role);
+            }
+            roles
+        });
+    let command = args
+        .iter()
+        .find(|option| option.name == "command")
+        .and_then(|option| match &option.value {
+            CommandOptionValue::String(value) => Some(value.trim().to_ascii_lowercase()),
+            _ => None,
+        });
+    match sub.name.as_str() {
+        "show" => AccessAction::Show,
+        "creation" => args
+            .iter()
+            .find(|option| option.name == "enabled")
+            .and_then(|option| match option.value {
+                CommandOptionValue::Boolean(enabled) => Some(AccessAction::Creation(enabled)),
+                _ => None,
+            })
+            .unwrap_or(AccessAction::Invalid),
+        "role" => AccessAction::RequiredRole(roles.first().copied()),
+        "restrict" => command.map_or(AccessAction::Invalid, |command| AccessAction::Restrict {
+            command,
+            roles,
+        }),
+        "unrestrict" => command.map_or(AccessAction::Invalid, AccessAction::Unrestrict),
+        _ => AccessAction::Invalid,
     }
 }
 
@@ -1697,9 +2032,51 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
 /// view-open, so this gate applies to `/create` only. Fail closed on
 /// missing permissions.
 fn may_create(permissions: Option<Permissions>) -> bool {
+    is_voice_admin(permissions)
+}
+
+/// The spec's "admin": Manage Channels (Administrator implies it). Fail
+/// closed on missing permissions.
+fn is_voice_admin(permissions: Option<Permissions>) -> bool {
     permissions.is_some_and(|permissions| {
         permissions.intersects(Permissions::ADMINISTRATOR | Permissions::MANAGE_CHANNELS)
     })
+}
+
+impl VoiceCommand {
+    /// The slash-command name per-command role restrictions are keyed on.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Create { .. } => "create",
+            Self::Setup => "setup",
+            Self::Ping => "ping",
+            Self::Invite => "invite",
+            Self::Access(_) => "access",
+            Self::Logging(_) => "logging",
+        }
+    }
+}
+
+/// The invoking member's access facts: effective admin flag and role IDs.
+fn access_member(interaction: &Interaction) -> AccessMember {
+    let member = interaction.member.as_ref();
+    AccessMember {
+        is_admin: is_voice_admin(member.and_then(|member| member.permissions)),
+        roles: member.map_or_else(Vec::new, |member| {
+            member.roles.iter().map(|role| role.get()).collect()
+        }),
+    }
+}
+
+fn access_denied_text(reason: AccessDenyReason) -> &'static str {
+    match reason {
+        AccessDenyReason::RequiredRole => {
+            "You need the server's required role to use voice-room commands."
+        }
+        AccessDenyReason::CommandRestricted => {
+            "You do not have a role that may use this command here."
+        }
+    }
 }
 
 /// Discord snowflake epoch (2015-01-01T00:00:00Z) in Unix milliseconds.
@@ -1739,6 +2116,8 @@ pub fn ephemeral_response(content: &str) -> InteractionResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerStatus {
     pub tracked_rooms: usize,
+    /// Current permission-health findings, rendered for `/setup`.
+    pub health: Vec<String>,
     pub failures: Vec<String>,
     pub halted: bool,
 }
@@ -1809,6 +2188,136 @@ async fn execute_create<S: RoomPersistence, H: RoomWrites>(
     }
 }
 
+/// Render the controls for `/access show` and as the confirmation after a change.
+fn access_summary(controls: &AccessControls) -> String {
+    let mut lines = vec![
+        format!(
+            "Room creation: {}",
+            if controls.room_creation_enabled {
+                "on"
+            } else {
+                "off (existing rooms and commands keep working)"
+            }
+        ),
+        match controls.required_role {
+            Some(role) => format!("Required role: <@&{role}>"),
+            None => "Required role: none".to_owned(),
+        },
+    ];
+    if controls.command_roles.is_empty() {
+        lines.push("Restricted commands: none".to_owned());
+    } else {
+        lines.push("Restricted commands:".to_owned());
+        for (command, roles) in &controls.command_roles {
+            let who = if roles.is_empty() {
+                "admins only".to_owned()
+            } else {
+                roles
+                    .iter()
+                    .map(|role| format!("<@&{role}>"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            lines.push(format!("- /{command}: {who}"));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Apply one `/access` action: read, change, validate, save, then hand the
+/// saved controls to `on_saved` (the live actor). A failed read or write
+/// changes nothing and says so.
+async fn execute_access<S: RoomPersistence>(
+    store: &S,
+    guild_id: Snowflake,
+    action: AccessAction,
+    on_saved: impl FnOnce(AccessControls),
+) -> String {
+    let Ok(mut controls) = store.access_controls(guild_id).await else {
+        return "Could not read the voice-room settings. Nothing was changed; try again."
+            .to_owned();
+    };
+    match action {
+        AccessAction::Show => return access_summary(&controls),
+        AccessAction::Invalid => {
+            return "Unknown /access option. Use show, creation, role, restrict or unrestrict."
+                .to_owned()
+        }
+        AccessAction::Creation(enabled) => controls.room_creation_enabled = enabled,
+        AccessAction::RequiredRole(role) => controls.required_role = role,
+        AccessAction::Restrict { command, roles } => {
+            if !is_voice_command(&command) {
+                return format!("/{command} is not a voice-room command, so nothing was changed.");
+            }
+            controls.command_roles.insert(command, roles);
+        }
+        AccessAction::Unrestrict(command) => {
+            if controls.command_roles.remove(&command).is_none() {
+                return format!("/{command} has no role restriction, so nothing was changed.");
+            }
+        }
+    }
+    if validate_access_controls(&controls).is_err() {
+        return "Those settings are not valid, so nothing was changed.".to_owned();
+    }
+    match store.save_access_controls(guild_id, &controls).await {
+        Ok(()) => {
+            let summary = access_summary(&controls);
+            on_saved(controls);
+            format!("Saved.\n{summary}")
+        }
+        Err(_) => {
+            "Could not save the voice-room settings. Nothing was changed; try again.".to_owned()
+        }
+    }
+}
+
+/// Render the settings for `/logging show` and as the confirmation after a change.
+fn logging_summary(settings: &LoggingSettings) -> String {
+    let level = match settings.level {
+        DetailLevel::Off => "off (no notices are sent)",
+        DetailLevel::Brief => "brief",
+        DetailLevel::Full => "full",
+    };
+    let channel = match settings.channel_id {
+        Some(channel) => format!("<#{channel}>"),
+        None => "not set (falls back to the server's system channel, then a DM, then the creator channel's chat)".to_owned(),
+    };
+    let mention = match settings.mention_role_id {
+        Some(role) => format!("<@&{role}>"),
+        None => "none".to_owned(),
+    };
+    format!("Log level: {level}\nLog channel: {channel}\nMentioned on errors: {mention}")
+}
+
+/// Apply one `/logging` action: read, change, save. A failed read or write
+/// changes nothing and says so.
+async fn execute_logging<S: RoomPersistence>(
+    store: &S,
+    guild_id: Snowflake,
+    action: LoggingAction,
+) -> String {
+    let Ok(mut settings) = store.logging_settings(guild_id).await else {
+        return "Could not read the logging settings. Nothing was changed; try again.".to_owned();
+    };
+    match action {
+        LoggingAction::Show => return logging_summary(&settings),
+        LoggingAction::Invalid => {
+            return "Unknown /logging option. Use show, level, channel or mention.".to_owned()
+        }
+        LoggingAction::Level(raw) => match parse_detail_level(&raw) {
+            Ok(level) => settings.level = level,
+            Err(error) => return format!("{error} Nothing was changed."),
+        },
+        LoggingAction::Channel(channel) => settings.channel_id = channel,
+        LoggingAction::Mention(role) => settings.mention_role_id = role,
+    }
+    match store.save_logging_settings(guild_id, &settings).await {
+        Ok(()) => format!("Saved.\n{}", logging_summary(&settings)),
+        Err(_) => "Could not save the logging settings. Nothing was changed; try again.".to_owned(),
+    }
+}
+
 fn create_error_text(error: RoomHttpError) -> String {
     match error {
         RoomHttpError::Unauthorized => "Voice rooms are paused: Discord refused the bot credential. Tell an admin to fix the token, then restart the bot.".to_owned(),
@@ -1857,6 +2366,28 @@ where
     let Some(guild_id) = interaction_guild(interaction) else {
         return false;
     };
+    // Guild-level role gate first. Settings that cannot be read fail closed for
+    // members: only an admin proceeds without them.
+    let member = access_member(interaction);
+    let (gate_store, _) = runtime.make_pair();
+    match gate_store.access_controls(guild_id).await {
+        Ok(controls) => {
+            if let AccessDecision::Deny(reason) =
+                may_use_command(&controls, &member, command.name())
+            {
+                reply(ephemeral_response(access_denied_text(reason))).await;
+                return true;
+            }
+        }
+        Err(_) if !member.is_admin => {
+            reply(ephemeral_response(
+                "Voice-room settings are unavailable right now. Try again shortly.",
+            ))
+            .await;
+            return true;
+        }
+        Err(_) => {}
+    }
     match command {
         VoiceCommand::Ping => {
             let latency = interaction_latency_ms(interaction.id.get(), unix_now_ms());
@@ -1865,6 +2396,38 @@ where
         }
         VoiceCommand::Invite => {
             reply(ephemeral_response(&invite_render(invite_code))).await;
+            true
+        }
+        VoiceCommand::Access(action) => {
+            if !member.is_admin {
+                reply(ephemeral_response(
+                    "You need Manage Channels to use /access.",
+                ))
+                .await;
+                return true;
+            }
+            let _serialized = runtime.access_lock.lock().await;
+            let (store, _) = runtime.make_pair();
+            let text = execute_access(&store, guild_id, action, |controls| {
+                runtime.access_changed(guild_id, controls);
+            })
+            .await;
+            reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::Logging(action) => {
+            if !member.is_admin {
+                reply(ephemeral_response(
+                    "You need Manage Channels to use /logging.",
+                ))
+                .await;
+                return true;
+            }
+            // Same lock as `/access`: admin-only and rare, so one lock is enough.
+            let _serialized = runtime.access_lock.lock().await;
+            let (store, _) = runtime.make_pair();
+            let text = execute_logging(&store, guild_id, action).await;
+            reply(ephemeral_response(&text)).await;
             true
         }
         VoiceCommand::Setup => {
@@ -1878,9 +2441,15 @@ where
                 guild_id,
                 creators,
                 tracked_rooms: status.as_ref().map_or(0, |status| status.tracked_rooms),
-                failures: status
-                    .as_ref()
-                    .map_or_else(Vec::new, |status| status.failures.clone()),
+                // Current health findings first: they are live, failures are history.
+                failures: status.as_ref().map_or_else(Vec::new, |status| {
+                    status
+                        .health
+                        .iter()
+                        .chain(status.failures.iter())
+                        .cloned()
+                        .collect()
+                }),
                 halted: status.as_ref().is_some_and(|status| status.halted),
                 store_error,
             });
