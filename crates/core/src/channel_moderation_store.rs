@@ -25,7 +25,8 @@ pub struct ChannelAuditRow {
     pub idempotency_key: String,
     /// Bounded numbers only (count/seconds/affected), serialised as JSON.
     pub metadata_json: String,
-    /// ISO-8601 UTC millis, bound with an explicit shared-ledger timestamptz cast.
+    /// ISO-8601 UTC millis, bound with an explicit shared-ledger timestamptz cast;
+    /// migration 0112 types the shared ledger as timestamptz.
     pub created_at: String,
 }
 
@@ -1298,6 +1299,78 @@ mod tests {
                 .expect("claims"),
             ChannelClaim::Mismatch
         );
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn shared_timestamp_schema_preserves_channel_claim_and_audit_instants() {
+        let store = test_store().await;
+        let typed_columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = current_schema() AND data_type = 'timestamp with time zone'
+               AND ((table_name = 'moderation_idempotency'
+                     AND column_name IN ('claimed_at', 'completed_at'))
+                    OR (table_name = 'moderation_audit' AND column_name = 'created_at'))",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("reads shared timestamp types");
+        assert_eq!(typed_columns, 3);
+        let time = "2026-09-30T02:00:00.123+02:00";
+        let ticket = winning_ticket(
+            store
+                .claim(
+                    "g-timestamps",
+                    "key-timestamps",
+                    "moderation.purge",
+                    "hash",
+                    time,
+                )
+                .await
+                .expect("claims against the member-upgraded schema"),
+        );
+        assert!(store
+            .complete(&ticket, "purged", "{}", time)
+            .await
+            .expect("completes"));
+        let instant_preserved: bool = sqlx::query_scalar(
+            "SELECT claimed_at = '2026-09-30T00:00:00.123Z'::timestamptz
+                    AND completed_at = claimed_at
+             FROM moderation_idempotency
+             WHERE guild_id = 'g-timestamps' AND idempotency_key = 'key-timestamps'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("reads persisted claim instants");
+        assert!(instant_preserved);
+        assert!(matches!(
+            store
+                .claim(
+                    "g-timestamps",
+                    "key-timestamps",
+                    "moderation.purge",
+                    "hash",
+                    time
+                )
+                .await
+                .expect("replays"),
+            ChannelClaim::Replayed { .. }
+        ));
+        let mut row = audit_row("timestamps", "moderation.purge", "purged");
+        row.created_at = time.to_owned();
+        store
+            .record_audit(&row)
+            .await
+            .expect("audits against the shared schema");
+        let audit_instant_preserved: bool = sqlx::query_scalar(
+            "SELECT created_at = '2026-09-30T00:00:00.123Z'::timestamptz
+             FROM moderation_audit WHERE request_id = 'req-timestamps'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("reads persisted audit instant");
+        assert!(audit_instant_preserved);
         store.cleanup().await;
     }
 

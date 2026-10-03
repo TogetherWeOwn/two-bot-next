@@ -8,7 +8,7 @@
 //! room's configured templates under the six canonical preview states, and
 //! answers the owner-or-admin inspection gate. It performs no I/O, holds no
 //! Discord, store, clock or database types, and never leaks member names,
-//! presence details or IDs beyond what [`render`](crate::voice_naming::render)
+//! presence details or IDs beyond what [`render`]
 //! already exposes: callers pass aggregated room facts (the resolved owner
 //! display name, the resolved game title, headcounts), never rosters.
 //!
@@ -177,7 +177,7 @@ impl VariableMap {
 
 /// One "Preview in other states" row: the state, which configured template
 /// was rendered, and the rendered name. Rendering reuses
-/// [`render`](crate::voice_naming::render), so the V5 fallback contract
+/// [`render`], so the V5 fallback contract
 /// holds: previews are never empty and never over 100 characters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatePreview {
