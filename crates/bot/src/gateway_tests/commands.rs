@@ -81,7 +81,7 @@ async fn seed(db: &TestDb) {
 fn slash(sequence: u64, id: u64) -> Value {
     json!({"op": 0, "s": sequence, "t": "INTERACTION_CREATE", "d": {
         "id": id.to_string(), "application_id": "1111", "type": 2,
-        "token": "custom-command-fixture", "version": 1,
+        "token": "***REDACTED***", "version": 1,
         "guild_id": GUILD, "channel": {"id": "4444", "type": 0, "name": "commands"},
         "authorizing_integration_owners": {"0": GUILD}, "entitlements": [],
         "member": {
@@ -196,6 +196,46 @@ async fn wait_requests(rest: &MockRest, count: usize) {
     .expect("REST request deadline");
 }
 
+/// Detached command work commits its audit rows after the checkpoint the test
+/// already waited on, so poll for them instead of asserting immediately.
+async fn wait_audit_ok(pool: &PgPool, expected: i64) {
+    tokio::time::timeout(BOUND, async {
+        loop {
+            let ok: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM automation_audit_log WHERE action = 'command.run' AND outcome = 'ok'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if ok >= expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("command audit deadline");
+}
+
+async fn wait_audit_result(pool: &PgPool, id: &str) -> (String, String) {
+    tokio::time::timeout(BOUND, async {
+        loop {
+            if let Ok(fact) = sqlx::query_as(
+                "SELECT outcome, reason FROM automation_audit_log WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            {
+                return fact;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("command audit deadline")
+}
+
 fn assert_registry(rest: &MockRest) {
     let requests = rest.requests();
     let sets = requests
@@ -269,37 +309,28 @@ async fn ready_routes_custom_slash_and_accepted_prefix_before_checkpoint() {
     assert_eq!(gateway.authentication().await["op"], 2);
     gateway.send(ready(&gateway.url, "command-session")).await;
     wait_sequence(&db.store, 1).await;
+    // Registry publication rides a detached spawn lane, so wait for the PUT
+    // instead of assuming it lands with the checkpoint.
+    wait_requests(&rest, 3).await;
     wait_connected(&state).await;
     assert_registry(&rest);
     gateway.send(slash(2, 20)).await;
     wait_sequence(&db.store, 2).await;
     gateway.send(prefix(3, 51)).await;
     wait_sequence(&db.store, 3).await;
+    wait_requests(&rest, 6).await;
     wait_connected(&state).await;
     assert_rendered_replies(&rest, 51);
     assert_eq!(db.count().await, 1, "ordinary message capture still runs");
-    let ok: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM automation_audit_log WHERE action = 'command.run' AND outcome = 'ok'",
-    )
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        ok, 2,
-        "slash and prefix results persisted before checkpoint"
-    );
+    wait_audit_ok(&db.pool, 2);
 
     // A terminal runtime failure is not a shard failure and does not block
     // capture/checkpoint; its already-committed reservation still fences replay.
     gateway.send(prefix(4, 52)).await;
     wait_sequence(&db.store, 4).await;
+    wait_requests(&rest, 7).await;
     wait_connected(&state).await;
-    let fact: (String, String) = sqlx::query_as(
-        "SELECT outcome, reason FROM automation_audit_log WHERE id = 'custom:text:result:52'",
-    )
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
+    let fact = wait_audit_result(&db.pool, "custom:text:result:52").await;
     assert_eq!(fact, ("failed".into(), "delivery_failed".into()));
     assert_eq!(rest.requests().len(), 7);
     runner.abort();
@@ -387,6 +418,9 @@ async fn cold_resume_publishes_complete_registry_and_uses_bootstrap_guild_name()
     seed(&db).await;
     let mut script = bootstrap_responses();
     script.extend([
+        // RESUMED carries no application id: the registry sync resolves it
+        // through the shared executor before the bulk overwrite.
+        ScriptedResponse::json(200, json!({"id": "1111"})),
         ScriptedResponse::json(200, json!({})),
         ScriptedResponse::status(204),
         ScriptedResponse::json(200, json!({})),
@@ -410,14 +444,17 @@ async fn cold_resume_publishes_complete_registry_and_uses_bootstrap_guild_name()
     // No READY or GUILD_CREATE: the new pipeline's guild cache is empty.
     gateway.send(resumed(43)).await;
     wait_sequence(&db.store, 43).await;
+    wait_requests(&rest, 4).await;
     wait_connected(&state).await;
     assert_registry(&rest);
     gateway.send(slash(44, 21)).await;
     wait_sequence(&db.store, 44).await;
     gateway.send(prefix(45, 53)).await;
     wait_sequence(&db.store, 45).await;
+    wait_requests(&rest, 7).await;
     assert_rendered_replies(&rest, 53);
     assert_eq!(db.count().await, 1);
+    wait_audit_ok(&db.pool, 2);
     runner.abort();
     let _ = runner.await;
     gateway.stop().await;
@@ -475,7 +512,7 @@ async fn unavailable_automod_or_disabled_command_gates_capture_without_prefix_po
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn slow_prefix_rest_stops_shard_without_checkpoint_and_reservation_fences_resume() {
+async fn slow_prefix_rest_commits_checkpoint_and_reservation_fences_resume() {
     let db = TestDb::new().await;
     seed(&db).await;
     let mut script = bootstrap_responses();
@@ -485,34 +522,25 @@ async fn slow_prefix_rest_stops_shard_without_checkpoint_and_reservation_fences_
     ]);
     let rest = MockRest::start(script, ScriptedResponse::status(500)).await;
     let commands = bootstrap(&db, &rest, &vars(Some("0"))).await;
-    let mut gateway = CommandGateway::start(2000).await; // total dispatch budget: 500ms
+    let mut gateway = CommandGateway::start(45000).await;
     let (runner, state) = spawn_runner_with_commands(&db, &gateway.url, Some(commands)).await;
     assert_eq!(gateway.authentication().await["op"], 2);
     gateway.send(ready(&gateway.url, "slow-session")).await;
     wait_sequence(&db.store, 1).await;
+    wait_requests(&rest, 3).await;
     wait_connected(&state).await;
+    assert_registry(&rest);
     gateway.send(prefix(2, 60)).await;
     wait_requests(&rest, 4).await;
+    // Detached command work never blocks the serial checkpoint writer: the
+    // capture commits while the prefix POST is still in flight.
+    wait_sequence(&db.store, 2).await;
     assert_eq!(
         *state.read().await,
-        GatewayState::Armed,
-        "not ready during REST I/O"
+        GatewayState::Connected,
+        "checkpoint commits during slow detached REST"
     );
-    let result = tokio::time::timeout(Duration::from_millis(1500), runner)
-        .await
-        .expect("total deadline must stop shard before heartbeat")
-        .expect("runner join");
-    assert_eq!(
-        result.unwrap_err().to_string(),
-        "gateway checkpoint deadline exceeded"
-    );
-    assert_eq!(*state.read().await, GatewayState::Armed);
-    assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
-    assert_eq!(
-        db.count().await,
-        0,
-        "pending funnel batch was not committed"
-    );
+    assert_eq!(db.count().await, 1, "capture committed with REST pending");
     let attempt: String = sqlx::query_scalar(
         "SELECT outcome FROM automation_audit_log WHERE id = 'custom:text:attempt:60'",
     )
@@ -520,6 +548,11 @@ async fn slow_prefix_rest_stops_shard_without_checkpoint_and_reservation_fences_
     .await
     .unwrap();
     assert_eq!(attempt, "unknown");
+    // Abandon the shard mid-send: the dispatch guard cancels the in-flight
+    // POST, so the attempt stays unresolved instead of recording a guess.
+    runner.abort();
+    let _ = runner.await;
+    gateway.stop().await;
     let result: Option<String> = sqlx::query_scalar(
         "SELECT outcome FROM automation_audit_log WHERE id = 'custom:text:result:60'",
     )
@@ -537,12 +570,14 @@ async fn slow_prefix_rest_stops_shard_without_checkpoint_and_reservation_fences_
             .count(),
         1
     );
-    gateway.stop().await;
 
     // New runtime and empty pipeline, same DB checkpoint. Replay arrives before
     // RESUMED, so only the durable attempt can prevent another message POST.
     let mut script = bootstrap_responses();
-    script.push(ScriptedResponse::json(200, json!({})));
+    script.extend([
+        ScriptedResponse::json(200, json!({"id": "1111"})),
+        ScriptedResponse::json(200, json!({})),
+    ]);
     let restarted_rest = MockRest::start(script, ScriptedResponse::status(500)).await;
     let commands = bootstrap(&db, &restarted_rest, &vars(Some("0"))).await;
     let mut gateway = CommandGateway::start(45000).await;
@@ -554,19 +589,20 @@ async fn slow_prefix_rest_stops_shard_without_checkpoint_and_reservation_fences_
     let (runner, state) = spawn_runner_with_commands(&db, "ws://127.0.0.1:1", Some(commands)).await;
     let auth = gateway.authentication().await;
     assert_eq!(auth["op"], 6);
-    assert_eq!(auth["d"]["seq"], 1);
-    gateway.send(prefix(2, 60)).await;
-    wait_sequence(&db.store, 2).await;
+    assert_eq!(auth["d"]["seq"], 2);
+    gateway.send(prefix(3, 60)).await;
+    wait_sequence(&db.store, 3).await;
     assert_eq!(
         db.count().await,
         1,
         "replayed capture committed exactly once"
     );
-    gateway.send(resumed(3)).await;
-    wait_sequence(&db.store, 3).await;
+    gateway.send(resumed(4)).await;
+    wait_sequence(&db.store, 4).await;
     wait_connected(&state).await;
+    wait_requests(&restarted_rest, 4).await;
     assert_registry(&restarted_rest);
-    assert_eq!(restarted_rest.requests().len(), 3);
+    assert_eq!(restarted_rest.requests().len(), 4);
     assert!(restarted_rest
         .requests()
         .iter()
@@ -581,12 +617,15 @@ async fn slow_prefix_rest_stops_shard_without_checkpoint_and_reservation_fences_
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn ready_registry_failure_or_application_mismatch_never_checkpoint_or_report_ready() {
+async fn ready_registry_failure_or_application_mismatch_warns_and_remains_retryable() {
     for mismatch in [false, true] {
         let db = TestDb::new().await;
         let rest = MockRest::start(bootstrap_responses(), ScriptedResponse::status(403)).await;
         let commands = bootstrap(&db, &rest, &vars(Some("0"))).await;
         let mut gateway = CommandGateway::start(45000).await;
+        // Keep a handle: the retryability probe below runs against the same
+        // runtime the runner owns.
+        let probe = Arc::clone(&commands);
         let (runner, state) = spawn_runner_with_commands(&db, &gateway.url, Some(commands)).await;
         assert_eq!(gateway.authentication().await["op"], 2);
         let mut packet = ready(&gateway.url, "failed-session");
@@ -594,22 +633,40 @@ async fn ready_registry_failure_or_application_mismatch_never_checkpoint_or_repo
             packet["d"]["application"]["id"] = json!("7777");
         }
         gateway.send(packet).await;
-        let error = tokio::time::timeout(BOUND, runner)
-            .await
-            .expect("failure deadline")
-            .expect("runner join")
-            .expect_err("bootstrap dispatch fails closed");
-        assert_eq!(
-            error.to_string(),
-            if mismatch {
-                "gateway application context mismatch"
-            } else {
-                "gateway registry synchronization failed"
-            }
-        );
-        assert_eq!(*state.read().await, GatewayState::Armed);
-        assert!(db.store.load().await.unwrap().is_none());
-        assert_eq!(rest.requests().len(), if mismatch { 2 } else { 3 });
+        // Detached publication warns instead of failing the runner: the
+        // gateway still checkpoints and reports ready, nothing publishes, and
+        // the failed sync stays eligible for a later connection event.
+        wait_sequence(&db.store, 1).await;
+        wait_connected(&state).await;
+        if mismatch {
+            // The context check fails before any REST write.
+            assert_eq!(rest.requests().len(), 2);
+            assert!(rest.requests().iter().all(|request| request.method != "PUT"));
+            let error = probe
+                .publish_registry_checked(Some(7777))
+                .await
+                .expect_err("mismatched application stays unpublished");
+            assert_eq!(error, crate::command_runtime::RegistrySyncError::Publish);
+        } else {
+            wait_requests(&rest, 3).await;
+            assert_eq!(rest.requests().len(), 3);
+            assert_eq!(
+                rest.requests()
+                    .iter()
+                    .filter(|request| request.method == "PUT")
+                    .count(),
+                1,
+                "one failed registry write, then warn"
+            );
+            let error = probe
+                .publish_registry_checked(Some(1111))
+                .await
+                .expect_err("refused registry write stays retryable");
+            assert_eq!(error, crate::command_runtime::RegistrySyncError::Publish);
+        }
+        assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
+        runner.abort();
+        let _ = runner.await;
         gateway.stop().await;
         rest.shutdown().await;
         db.close().await;
