@@ -27,6 +27,8 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_db_pool_connections` | Current pool size |
 | `two_bot_db_pool_idle_connections` | Current idle connections |
 | `two_bot_db_pool_max_connections` | Configured maximum |
+| `two_bot_db_errors_total{op}` | Storage-layer failures; `op` is `admission` (send-admission SQL) or `other` (every other store until its op joins the allowlist) |
+| `two_bot_send_admissions_total{outcome}` | Send-admission `admit()` decisions; `outcome` is `admitted`, `blocked`, `storage_error` (also counted in `two_bot_db_errors_total{op="admission"}`) or `other` |
 | `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
 | `two_bot_job_last_success_timestamp_seconds{job}` | Last successful completion time in Unix seconds; zero means no success recorded |
 | `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
@@ -135,6 +137,14 @@ as dynamic labels.
   `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued`.
 - `two_bot_voice_dead_letters_total{action}` — `action` is `create`, `move`,
   `delete`, `companion`, `ownership`, `kick`, `rename` or `other`.
+- `two_bot_db_errors_total{op}` — `op` is `admission` or `other`. Recorded
+  by `Metrics::db_error`; currently only send-admission SQL
+  (admit/extend/complete storage failures) reports, so `other` stays zero
+  until another store's op joins the allowlist.
+- `two_bot_send_admissions_total{outcome}` — `outcome` is `admitted`,
+  `blocked`, `storage_error` or `other`. Recorded once per `admit()`
+  decision by the Postgres admission gate; failed `complete()`/`extend()`
+  storage writes count only in `two_bot_db_errors_total`.
 - Log fields (coordinated with blocked structured-log work, which owns JSON
   formatting): `voice_event="voice_operation"` with `op`/`outcome`,
   `voice_event="voice_reconcile"` with plan counts,
@@ -224,6 +234,8 @@ server, no new infrastructure.
 | `job_consecutive_failures:<job>` | `two_bot_job_consecutive_failures` >= 3 | [job failures](runbook.md#alert-job-failures) |
 | `rest_429_rate` | 429s > 10% of REST requests between samples, >= 10 requests | [REST 429](runbook.md#alert-rest-429) |
 | `db_pool_saturated` | pool at max, 0 idle, 3 consecutive samples | [DB pool](runbook.md#alert-db-pool) |
+| `db_errors` | 3+ storage failures between samples (restarts skip the window) | [DB errors](runbook.md#alert-db-errors) |
+| `send_admission_blocked` | new admission refusals in 3 consecutive samples | [send admission blocked](runbook.md#alert-send-admission-blocked) |
 
 `job_stale` uses `JOB_INTERVAL_SECONDS`, which must equal each scheduled job's
 Rust `*_INTERVAL_MS / 1000`. `invite_snapshot`, `session_checkpoint` and `other`
@@ -237,10 +249,13 @@ used on both sides of the B2 soak evidence seam. The Rust canonical list is
 is named `evidence-{ruleId}-{window}.json` (soak-ledger packets stamp the
 `soak_expected_committed` ledger identity), so the QA evidence table can
 attribute packets when several rules fire in one window. Both sides pin all
-four spellings with tests; the payload shape is unchanged.
+six spellings with tests; the payload shape is unchanged.
 
-Known gaps: there is no DB error counter (the pool rule is a proxy) and no
-send-admission series, so neither is alerted. Add the series first, then a rule.
+Known gaps: the DB error counter currently records only send-admission SQL,
+so non-admission stores still surface only through the pool proxy and the
+job-failure rules; adopt `Metrics::db_error` per store incrementally. A
+slow trickle of DB errors below the burst threshold likewise surfaces only
+through `job_consecutive_failures`.
 A forced job failure on staging (three failures) raises
 `job_consecutive_failures:<job>` within about one keepalive tick. Counter resets
 (process restart) skip the 429 window. Alert state is persisted in DO storage
