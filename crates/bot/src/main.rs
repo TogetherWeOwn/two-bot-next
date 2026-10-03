@@ -59,7 +59,6 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 use tracing::info;
-use two_bot::voice_rooms::VoiceEventSink;
 use two_bot_core::{ComponentStatus, Config, VoiceGates};
 
 use futures_util::FutureExt as _;

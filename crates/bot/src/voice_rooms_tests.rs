@@ -2630,7 +2630,7 @@ fn component_interaction(custom_id: &str, with_guild: bool) -> Interaction {
     let mut interaction = voice_interaction(None, None, with_guild);
     interaction.kind = InteractionType::MessageComponent;
     interaction.data = Some(InteractionData::MessageComponent(Box::new(
-        twilight_model::application::interaction::MessageComponentInteractionData {
+        twilight_model::application::interaction::message_component::MessageComponentInteractionData {
             custom_id: custom_id.to_owned(),
             component_type: twilight_model::channel::message::component::ComponentType::Button,
             resolved: None,
