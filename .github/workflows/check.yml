@@ -397,6 +397,11 @@ jobs:
         run: >-
           cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
 
+      - name: LFG actual-router and mock-Discord regressions
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: >-
+          cargo test -p two-bot-discord --features db --locked --test lfg_interactions -- --ignored --test-threads=1
+
       - name: leveling gateway and interaction integration (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
         env:
