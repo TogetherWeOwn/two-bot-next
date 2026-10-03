@@ -944,6 +944,26 @@ mod tests {
     }
 
     #[test]
+    fn bad_words_reject_punctuation_separators() {
+        // Legacy only allows whitespace and zero-width characters between
+        // word letters (`is_word_gap`): punctuation breaks the word, so these
+        // must not match even though the spaced variant above does.
+        let policy = policy();
+        for content in [
+            "s.p.a.m.w.o.r.d",
+            "s-p-a-m-w-o-r-d",
+            "s/p/a/m/w/o/r/d",
+            "buy s,p,a,m,w,o,r,d now",
+        ] {
+            assert_eq!(check(content, &policy), None, "{content:?}");
+        }
+        // Non-ASCII letters are word characters too (`is_word_char` is
+        // Unicode-aware), so they close the boundary on either side.
+        assert_eq!(check("éspamword", &policy), None);
+        assert_eq!(check("spamwordé", &policy), None);
+    }
+
+    #[test]
     fn filter_order_bad_words_first() {
         // A message that is both an invite and a bad word reports bad_words.
         let policy = policy();
