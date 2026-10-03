@@ -156,7 +156,7 @@ async fn persisted(
         JoinRiskClaim::Persisted {
             evidence,
             join_count,
-        } => Ok((join_count, evidence)),
+        } => Ok((join_count, *evidence)),
         JoinRiskClaim::Duplicate => Err("unexpected duplicate".into()),
     }
 }

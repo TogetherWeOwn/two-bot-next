@@ -38,7 +38,9 @@ pub enum JoinRiskClaim {
     /// This call inserted the observation and persisted its evidence.
     /// Pass `persisted = true` to [`JoinRiskEvidence::staff_message`].
     Persisted {
-        evidence: JoinRiskEvidence,
+        // Boxed: the evidence (~240 B) would dwarf `Duplicate`;
+        // `clippy::large-enum-variant` denies the build under `-D warnings`.
+        evidence: Box<JoinRiskEvidence>,
         /// Prior claimed rows in the window plus this join (legacy `joinCount`).
         join_count: u64,
     },
@@ -134,7 +136,7 @@ impl JoinRiskStore {
         tx.commit().await?;
         Ok(JoinRiskClaim::Persisted {
             join_count: evidence.join_count,
-            evidence,
+            evidence: Box::new(evidence),
         })
     }
 }
