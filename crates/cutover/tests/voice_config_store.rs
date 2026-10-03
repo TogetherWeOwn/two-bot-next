@@ -7,8 +7,8 @@ use sqlx::{postgres::PgConnectOptions, postgres::PgPoolOptions, PgPool, Postgres
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use two_bot_core::voice_config::{
-    export_configuration, import_configuration, ChannelKind, ChannelReference, GuildInventory,
-    VoiceConfiguration,
+    export_configuration, import_configuration, ChannelKind, ChannelReference,
+    CreatorConfiguration, GuildInventory, PermissionSource, RoomPosition, VoiceConfiguration,
 };
 use two_bot_core::voice_rooms::{CreatorChannel, TextCompanion, VoiceRoom};
 use two_bot_core::voice_text_channel::TextChannelSettings;
@@ -339,5 +339,213 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     assert_eq!(snapshot.creators[0].default_limit, 0);
     store.apply(77, &snapshot).await?;
     assert_eq!(rooms.creator_for(77, 7).await?, Some(creator));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb:5432 with agent_test and an empty password"]
+async fn voice_config_per_creator_limit_inherit_edges() -> TestResult {
+    let options = PgConnectOptions::new()
+        .host("agent-testdb")
+        .port(5432)
+        .username("agent_test")
+        .password("")
+        .database("postgres");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect_with(options)
+        .await?;
+    // Only locally generated ASCII letters/digits/underscores become identifiers.
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let schema = format!("voice_config_inherit_{}_{}", std::process::id(), nonce);
+    QueryBuilder::<Postgres>::new("CREATE SCHEMA ")
+        .push(&schema)
+        .build()
+        .execute(&pool)
+        .await?;
+    let result = verify_inherit_edges(&pool, &schema).await;
+    let cleanup = QueryBuilder::<Postgres>::new("DROP SCHEMA ")
+        .push(&schema)
+        .push(" CASCADE")
+        .build()
+        .execute(&pool)
+        .await;
+    pool.close().await;
+    result?;
+    cleanup?;
+    Ok(())
+}
+
+/// Stored `voice_creators.default_limit`: `None` is a missing row, `Some(None)`
+/// is inherit-the-live-limit, `Some(Some(n))` is an explicit override.
+async fn raw_default_limit(
+    pool: &PgPool,
+    guild: &str,
+    channel: &str,
+) -> Result<Option<Option<i32>>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<i32>>(
+        "SELECT default_limit FROM voice_creators WHERE guild_id = $1 AND channel_id = $2",
+    )
+    .bind(guild)
+    .bind(channel)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Per-creator `default_limit` inherit edges (0225): NULL means "inherit the
+/// live creator's limit" and has no codec value, so the snapshot reports it as
+/// 0 and an apply of 0 over an existing NULL keeps the NULL. Explicit 0 is
+/// unlimited and behaves like any other override.
+async fn verify_inherit_edges(pool: &PgPool, schema: &str) -> TestResult {
+    sqlx::query("SELECT set_config('search_path', $1, false)")
+        .bind(schema)
+        .execute(pool)
+        .await?;
+    sqlx::migrate!("./migrations").run(pool).await?;
+    let store = PgVoiceConfigStore::new(pool.clone());
+    let rooms = PgRoomStore::new(pool.clone());
+
+    // Three live creators: inherit (NULL), explicit unlimited (0), cap (4).
+    let mut inherit = CreatorChannel::new(78, 7);
+    inherit.name_template = "Inherit @@owner@@ ##".to_owned();
+    inherit.text_channels = true;
+    inherit.text_channel_name = Some("Squad chat".to_owned());
+    inherit.text_viewer_role_id = Some(9);
+    let mut unlimited = CreatorChannel::new(78, 8);
+    unlimited.name_template = "Open @@owner@@ ##".to_owned();
+    unlimited.default_limit = Some(0);
+    unlimited.private_default = true;
+    unlimited.position = two_bot_core::voice_rooms::RoomPosition::Below;
+    unlimited.first_room_number = 3;
+    let mut capped = CreatorChannel::new(78, 9);
+    capped.name_template = "Capped @@owner@@ ##".to_owned();
+    capped.default_limit = Some(4);
+    capped.permission_source = two_bot_core::voice_rooms::PermissionSource::Category;
+    capped.first_room_number = 5;
+    rooms.add_creator(&inherit).await?;
+    rooms.add_creator(&unlimited).await?;
+    rooms.add_creator(&capped).await?;
+    assert_eq!(raw_default_limit(pool, "78", "7").await?, Some(None));
+    assert_eq!(raw_default_limit(pool, "78", "8").await?, Some(Some(0)));
+    assert_eq!(raw_default_limit(pool, "78", "9").await?, Some(Some(4)));
+
+    // The snapshot cannot tell inherit from unlimited: both report 0.
+    let snapshot = store.snapshot(78).await?;
+    assert_eq!(snapshot.creators.len(), 3);
+    assert_eq!(snapshot.creators[0].channel_id, "7");
+    assert_eq!(snapshot.creators[1].channel_id, "8");
+    assert_eq!(snapshot.creators[2].channel_id, "9");
+    assert_eq!(snapshot.creators[0].default_limit, 0);
+    assert_eq!(snapshot.creators[1].default_limit, 0);
+    assert_eq!(snapshot.creators[2].default_limit, 4);
+
+    // A plain round trip keeps the NULL: inherit never becomes unlimited.
+    store.apply(78, &snapshot).await?;
+    assert_eq!(raw_default_limit(pool, "78", "7").await?, Some(None));
+    assert_eq!(raw_default_limit(pool, "78", "8").await?, Some(Some(0)));
+    assert_eq!(raw_default_limit(pool, "78", "9").await?, Some(Some(4)));
+    assert_eq!(rooms.creator_for(78, 7).await?, Some(inherit.clone()));
+
+    // Editing a creator's other settings through the configuration never flips
+    // inherit to unlimited, and the V9b columns the configuration does not
+    // carry survive the upsert.
+    let mut edited = snapshot.clone();
+    let first = &mut edited.creators[0];
+    first.name_template = "Renamed @@owner@@ ##".to_owned();
+    first.status_template = Some("Live @@game_name@@".to_owned());
+    first.always_private = true;
+    first.text_channels = false;
+    first.position = RoomPosition::Below;
+    first.first_number = 9;
+    first.group_by_category = true;
+    first.permission_source = PermissionSource::Category {};
+    store.apply(78, &edited).await?;
+    assert_eq!(
+        raw_default_limit(pool, "78", "7").await?,
+        Some(None),
+        "settings edit keeps inherit"
+    );
+    let stored = store.snapshot(78).await?;
+    assert_eq!(stored.creators[0], edited.creators[0]);
+    let live = rooms.creator_for(78, 7).await?.expect("creator survives");
+    assert_eq!(live.text_channel_name, Some("Squad chat".to_owned()));
+    assert_eq!(live.text_viewer_role_id, Some(9));
+    assert!(!live.text_channels);
+
+    // An explicit limit over an inherit row clears the inherit ...
+    let mut recapped = stored.clone();
+    recapped.creators[0].default_limit = 4;
+    store.apply(78, &recapped).await?;
+    assert_eq!(raw_default_limit(pool, "78", "7").await?, Some(Some(4)));
+    // ... and an explicit 0 over a cap stores unlimited, never NULL.
+    let mut cleared = store.snapshot(78).await?;
+    cleared.creators[0].default_limit = 0;
+    store.apply(78, &cleared).await?;
+    assert_eq!(raw_default_limit(pool, "78", "7").await?, Some(Some(0)));
+    // The second snapshot/apply cycle is stable once the row is explicit.
+    let stable = store.snapshot(78).await?;
+    store.apply(78, &stable).await?;
+    assert_eq!(raw_default_limit(pool, "78", "7").await?, Some(Some(0)));
+    assert_eq!(store.snapshot(78).await?, stable);
+
+    // Fresh rows inserted through the configuration are explicit: a 0 limit on
+    // a guild that never had the creator stores 0, not NULL, and the 99
+    // boundary round-trips alongside per-creator privacy/position/numbering.
+    let mut fresh = store.snapshot(79).await?;
+    assert!(fresh.creators.is_empty());
+    fresh.creators.push(CreatorConfiguration {
+        channel_id: "81".to_owned(),
+        name_template: "Fresh @@owner@@ ##".to_owned(),
+        status_template: None,
+        default_limit: 0,
+        always_private: false,
+        text_channels: false,
+        position: RoomPosition::Above,
+        first_number: 1,
+        group_by_category: false,
+        permission_source: PermissionSource::Creator {},
+    });
+    fresh.creators.push(CreatorConfiguration {
+        channel_id: "82".to_owned(),
+        name_template: "Full @@owner@@ ##".to_owned(),
+        status_template: Some("On a quest".to_owned()),
+        default_limit: 99,
+        always_private: true,
+        text_channels: true,
+        position: RoomPosition::Below,
+        first_number: 2,
+        group_by_category: true,
+        permission_source: PermissionSource::Category {},
+    });
+    store.apply(79, &fresh).await?;
+    assert_eq!(raw_default_limit(pool, "79", "81").await?, Some(Some(0)));
+    assert_eq!(raw_default_limit(pool, "79", "82").await?, Some(Some(99)));
+    assert_eq!(store.snapshot(79).await?, fresh);
+
+    // snapshot -> export -> import -> apply is the identity for the fresh guild
+    // too, pinning per-creator separation through the wire format.
+    let inventory = GuildInventory {
+        guild_id: "79".to_owned(),
+        channels: [("81", ChannelKind::Voice), ("82", ChannelKind::Voice)]
+            .into_iter()
+            .map(|(id, kind)| {
+                (
+                    id.to_owned(),
+                    ChannelReference {
+                        guild_id: "79".to_owned(),
+                        kind,
+                    },
+                )
+            })
+            .collect(),
+        roles: BTreeMap::new(),
+        members: BTreeMap::new(),
+    };
+    let exported = export_configuration(&fresh, &inventory)?;
+    let imported = import_configuration(&exported, &inventory)?;
+    assert_eq!(imported, fresh);
+    store.apply(79, &imported).await?;
+    assert_eq!(store.snapshot(79).await?, fresh);
     Ok(())
 }
