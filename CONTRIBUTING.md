@@ -38,9 +38,9 @@ and force-pushes. They require two status checks: `pr-lint` (ruleset
 `pr-conventions`) and `gitleaks` (ruleset `protect-main`). Both run from
 `.github/workflows/supply-chain.yml`. `pr-lint` checks the title format, the
 100-character limit, the trailing period and a non-empty body. On a push to
-`main` it also checks every commit subject. `check` and `worker check` run on
-every PR too, and a PR merges only when they are green on the exact head commit,
-even though the rulesets do not enforce them. Never bypass or weaken a check.
+`main` it also checks every commit subject.
+`check`, `worker check`, `gitleaks` and `pr-lint` are required checks on `main`: the rulesets enforce `gitleaks` and `pr-lint`, and a PR also merges only when `check` and `worker check` are green on the exact head commit.
+Never bypass or weaken a check.
 
 ### Issues
 
