@@ -81,7 +81,7 @@ async fn seed(db: &TestDb) {
 fn slash(sequence: u64, id: u64) -> Value {
     json!({"op": 0, "s": sequence, "t": "INTERACTION_CREATE", "d": {
         "id": id.to_string(), "application_id": "1111", "type": 2,
-        "token": "***REDACTED***", "version": 1,
+        "token": "custom-command-fixture", "version": 1,
         "guild_id": GUILD, "channel": {"id": "4444", "type": 0, "name": "commands"},
         "authorizing_integration_owners": {"0": GUILD}, "entitlements": [],
         "member": {
