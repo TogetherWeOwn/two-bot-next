@@ -64,6 +64,17 @@ pub struct AccessControls {
     pub command_roles: BTreeMap<String, Vec<RoleId>>,
 }
 
+impl Default for AccessControls {
+    /// An unconfigured guild: creation on, nothing restricted.
+    fn default() -> Self {
+        Self {
+            room_creation_enabled: true,
+            required_role: None,
+            command_roles: BTreeMap::new(),
+        }
+    }
+}
+
 /// The invoking member. `is_admin` is the caller's effective Manage Channels
 /// result for this context; `roles` carries the member's role IDs.
 /// Duplicates are harmless.
