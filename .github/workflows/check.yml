@@ -37,3 +37,11 @@ jobs:
     uses: ./.github/workflows/sbom.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
     with:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+  check:
+    name: check
+    permissions:
+      contents: read
+    needs: [self-role-store, supply-chain, parity-docs, job-inputs]
+    # Failed, skipped or cancelled dependencies must not make check appear green.
+    if: ${{ always() }}
