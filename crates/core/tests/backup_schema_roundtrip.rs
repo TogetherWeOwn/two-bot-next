@@ -1626,6 +1626,7 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("TWO_DATABASE_URL", fixture_url(&db))
+            .env("TWO_DATABASE_TLS", "local-only")
             .env("TWO_BACKUP_DIR", &directory.0)
             .env("TWO_BACKUP_KEEP", "14"),
         "two-bot backup",
@@ -1676,6 +1677,7 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
                 .args(["-o", "pipefail", "-c", script.as_str()])
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin")
+                .env("TWO_DATABASE_TLS", "local-only")
                 .env("TWO_RESTORE_URL", &target_url),
             &format!("restore drill, month {month}"),
         );
