@@ -223,6 +223,7 @@ pub fn parse_import_document(
     let overwrite = match body {
         serde_json::Value::Object(map) => parse_overwrite(map)?,
         serde_json::Value::Array(_) => false,
+        _ => false,
     };
     let is_own_format =
         matches!(body, serde_json::Value::Object(map) if map.contains_key("version"));
