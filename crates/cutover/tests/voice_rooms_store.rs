@@ -281,7 +281,7 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     verify_logging_settings(&store, pool).await
 }
 
-/// V3 privacy persistence (0414): the private flag, the Join channel and the
+/// V3 privacy persistence (0416): the private flag, the Join channel and the
 /// per-room block list round-trip, survive privacy toggles, are bounded by the
 /// schema, and go with the room row.
 async fn verify_privacy(store: &PgRoomStore, pool: &PgPool) -> TestResult {

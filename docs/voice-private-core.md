@@ -92,7 +92,10 @@ later slice.
   `RoomAction::SetEveryoneConnect`. The private flag, the Join-channel plan and
   the stored record change only after that write lands, so a refused write
   leaves the room as it was. A repeated `/private` on a private room whose
-  @everyone overwrite no longer denies Connect re-asserts it.
+  @everyone overwrite no longer denies Connect re-asserts it. `/public` on a
+  room whose stored flag is public but whose @everyone overwrite still denies
+  Connect (a room an `/alwaysprivate` creator made) lifts that deny; with no
+  deny it changes nothing.
 - **The overwrite.** Only the Connect bit moves; every other @everyone bit (View
   Channel included) is carried over unchanged, because the write replaces the
   whole entry. Manage Roles is never emitted as an allow, on any overwrite
@@ -104,8 +107,13 @@ later slice.
   room, with no overwrites (it syncs to the category). A retry after an unknown
   outcome adopts the channel the live snapshot shows instead of creating a second
   one. It is deleted on `/public`, and with its room (ahead of the row, so a
-  failed delete retries the whole room delete instead of leaking it). The worker
-  only deletes Join channel ids it created or loaded from its own store.
+  failed delete retries the whole room delete instead of leaking it). On
+  `/public` the delete runs inside the same retried action, after the Connect
+  write and before the flag flips and the record is saved, so the stored Join id
+  outlives a restart until the channel is gone and `/public` can run again to
+  finish the job. The Join channel's name carries the owner's display name only
+  after it is sanitized like a `/create` name and passes the name filter. The
+  worker only deletes Join channel ids it created or loaded from its own store.
 - **Persistence** (`0416_voice_room_privacy`). `voice_rooms.private` and
   `join_channel_id`, plus `voice_room_blocks` rows that cascade with the room.
   `PrivacyRecord` is the durable subset of `PrivateRoom`; a corrupt record is

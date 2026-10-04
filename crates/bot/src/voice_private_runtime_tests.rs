@@ -97,6 +97,28 @@ fn record(private: bool, join: Option<u64>, blocked: &[u64]) -> PrivacyRecord {
     }
 }
 
+/// The room's overwrites as Discord holds them once the bot has written its
+/// Connect grant: @everyone is denied Connect while the room is `closed`.
+fn bot_and_everyone_overwrites(closed: bool) -> Vec<PermissionOverwrite> {
+    vec![
+        role_overwrite(
+            GUILD,
+            Permissions::empty(),
+            if closed {
+                Permissions::CONNECT
+            } else {
+                Permissions::empty()
+            },
+        ),
+        PermissionOverwrite {
+            allow: Permissions::CONNECT,
+            deny: Permissions::empty(),
+            id: Id::new(BOT),
+            kind: PermissionOverwriteType::Member,
+        },
+    ]
+}
+
 #[tokio::test]
 async fn private_denies_connect_keeps_view_and_creates_one_join_channel() {
     let (mut worker, trace) = worker().await;
@@ -158,6 +180,34 @@ async fn a_filtered_owner_name_is_left_out_of_the_join_channel_name() {
 }
 
 #[tokio::test]
+async fn an_owner_name_is_sanitized_before_it_reaches_the_join_channel() {
+    let (mut worker, trace) = worker().await;
+    // A mention, backticks and a control character, as a display name may carry.
+    worker.apply_privacy(OWNER, false, "A@na `x`\u{7}y", PrivacyCommand::Private);
+    drain(&mut worker).await;
+    let name = "⇩ Join Ana x y";
+    assert!(calls(&trace).contains(&format!("create_join:{name}:Some({CATEGORY}):None")));
+    assert!(!calls(&trace)
+        .iter()
+        .any(|c| c.contains('@') || c.contains('`') || c.contains('\u{7}')));
+    assert_eq!(
+        join_of(&worker),
+        Some(JoinChannel::Created {
+            id: ChannelId(JOIN),
+            name: name.to_owned()
+        })
+    );
+}
+
+#[tokio::test]
+async fn an_owner_name_that_sanitizes_to_nothing_leaves_the_bare_prefix() {
+    let (mut worker, trace) = worker().await;
+    worker.apply_privacy(OWNER, false, "@`@", PrivacyCommand::Private);
+    drain(&mut worker).await;
+    assert!(calls(&trace).contains(&format!("create_join:⇩ Join:Some({CATEGORY}):None")));
+}
+
+#[tokio::test]
 async fn private_again_is_a_noop() {
     let (mut worker, trace) = worker().await;
     private_cmd(&mut worker, OWNER);
@@ -211,8 +261,9 @@ async fn public_restores_connect_deletes_the_join_channel_and_keeps_blocks() {
         calls(&trace),
         [
             format!("overwrite:{ROOM}:{GUILD}:Role"),
-            format!("save_privacy:{ROOM}:false:None:1"),
+            // The Join channel goes before the record stops naming it.
             format!("delete:{JOIN}"),
+            format!("save_privacy:{ROOM}:false:None:1"),
         ]
     );
     let writes = written(&worker);
@@ -745,4 +796,193 @@ async fn handle_public_on_a_public_room_replies_and_writes_nothing() {
     let text = response_text(response.as_ref().expect("reply"));
     assert!(text.contains("already public"), "{text}");
     assert!(!calls(&trace).iter().any(|c| c.starts_with("overwrite")));
+}
+
+#[tokio::test]
+async fn public_opens_a_room_a_creator_made_private_without_a_join_channel() {
+    let (live, store, http, trace) = parts();
+    // `/alwaysprivate` rooms are created with @everyone Connect already denied,
+    // while their stored flag still reads public and no Join channel exists.
+    set_room_overwrites(&live, bot_and_everyone_overwrites(true));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert!(!worker.privacy.contains_key(&ROOM));
+    let reply = public_cmd(&mut worker, OWNER);
+    assert!(reply.contains("Opening it to everyone"), "{reply}");
+    assert!(!reply.contains("already public"), "{reply}");
+    drain(&mut worker).await;
+    assert_eq!(
+        calls(&trace),
+        [
+            format!("overwrite:{ROOM}:{GUILD}:Role"),
+            format!("save_privacy:{ROOM}:false:None:0"),
+        ]
+    );
+    let writes = written(&worker);
+    let (channel_id, everyone) = writes.last().unwrap();
+    assert_eq!(*channel_id, ROOM);
+    assert!(everyone.deny.is_empty());
+    assert_eq!(stored(&worker), Some(record(false, None, &[])));
+    // The write is recorded, so a repeat is the plain no-op.
+    let again = public_cmd(&mut worker, OWNER);
+    assert!(again.contains("already public"), "{again}");
+    assert!(!worker.dispatch_one(99_000_000).await);
+}
+
+#[tokio::test]
+async fn public_on_a_room_that_is_open_on_discord_writes_nothing() {
+    let (live, store, http, trace) = parts();
+    set_room_overwrites(&live, bot_and_everyone_overwrites(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let reply = public_cmd(&mut worker, OWNER);
+    assert!(reply.contains("already public"), "{reply}");
+    assert!(!worker.dispatch_one(0).await);
+    assert!(calls(&trace).is_empty());
+}
+
+#[tokio::test]
+async fn a_stop_between_the_connect_write_and_the_join_delete_keeps_the_join_id() {
+    let (mut worker, trace) = worker().await;
+    private_cmd(&mut worker, OWNER);
+    drain(&mut worker).await;
+    trace.lock().unwrap().clear();
+    worker
+        .http
+        .delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::UnknownOutcome);
+    public_cmd(&mut worker, OWNER);
+    // The Connect write lands, then the Join delete's outcome is unknown; the
+    // process stops here, as a crash would.
+    assert!(worker.dispatch_one(0).await);
+    assert_eq!(
+        calls(&trace),
+        [
+            format!("overwrite:{ROOM}:{GUILD}:Role"),
+            format!("delete:{JOIN}")
+        ]
+    );
+    // Nothing was persisted: the record still names the Join channel.
+    let persisted = stored(&worker).expect("the record from `/private`");
+    assert_eq!(persisted, record(true, Some(JOIN), &[]));
+    assert!(worker.privacy[&ROOM].private);
+    drop(worker);
+
+    // Restart: Discord already holds the open @everyone entry and still has
+    // the Join channel.
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(ROOM, room(ROOM));
+    store.privacy.lock().unwrap().insert(ROOM, persisted);
+    live.publish(snapshot(
+        &[ROOM, JOIN],
+        vec![VoiceMember {
+            member_id: OWNER,
+            channel_id: ROOM,
+            bot: Some(false),
+        }],
+    ));
+    set_room_overwrites(&live, bot_and_everyone_overwrites(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert!(worker.join_deletable.contains(&JOIN));
+    worker.reconcile();
+    assert_eq!(
+        join_of(&worker),
+        Some(JoinChannel::Created {
+            id: ChannelId(JOIN),
+            name: String::new()
+        })
+    );
+    // The flag still says private, so `/public` runs in full and deletes it.
+    let reply = public_cmd(&mut worker, OWNER);
+    assert!(reply.contains("public again"), "{reply}");
+    drain(&mut worker).await;
+    assert_eq!(
+        calls(&trace),
+        [
+            format!("overwrite:{ROOM}:{GUILD}:Role"),
+            format!("delete:{JOIN}"),
+            format!("save_privacy:{ROOM}:false:None:0"),
+        ]
+    );
+    assert_eq!(stored(&worker), Some(record(false, None, &[])));
+    assert!(worker.join_deletable.is_empty());
+}
+
+#[tokio::test]
+async fn a_join_delete_that_fails_retries_the_whole_public_action() {
+    let (mut worker, trace) = worker().await;
+    private_cmd(&mut worker, OWNER);
+    drain(&mut worker).await;
+    trace.lock().unwrap().clear();
+    worker
+        .http
+        .delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::UnknownOutcome);
+    public_cmd(&mut worker, OWNER);
+    drain(&mut worker).await;
+    assert_eq!(
+        calls(&trace),
+        [
+            format!("overwrite:{ROOM}:{GUILD}:Role"),
+            format!("delete:{JOIN}"),
+            // The retry repeats the idempotent write, then deletes for real.
+            format!("overwrite:{ROOM}:{GUILD}:Role"),
+            format!("delete:{JOIN}"),
+            format!("save_privacy:{ROOM}:false:None:0"),
+        ]
+    );
+    assert_eq!(stored(&worker), Some(record(false, None, &[])));
+}
+
+#[tokio::test]
+async fn a_refused_join_delete_keeps_the_record_and_public_can_be_run_again() {
+    let (mut worker, trace) = worker().await;
+    private_cmd(&mut worker, OWNER);
+    drain(&mut worker).await;
+    trace.lock().unwrap().clear();
+    worker
+        .http
+        .delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    public_cmd(&mut worker, OWNER);
+    drain(&mut worker).await;
+    // Discord is open, but the record keeps naming the Join channel it could
+    // not delete, and the refusal is recorded.
+    assert_eq!(stored(&worker), Some(record(true, Some(JOIN), &[])));
+    assert!(worker.privacy[&ROOM].private);
+    assert!(worker.join_deletable.contains(&JOIN));
+    assert!(worker.failures().contains(&LifecycleFailure::Discord {
+        channel_id: ROOM,
+        error: RoomHttpError::AccessDenied,
+    }));
+    // Running `/public` again finishes the job.
+    let reply = public_cmd(&mut worker, OWNER);
+    assert!(reply.contains("public again"), "{reply}");
+    drain(&mut worker).await;
+    assert_eq!(stored(&worker), Some(record(false, None, &[])));
+    assert!(worker.join_deletable.is_empty());
+}
+
+#[tokio::test]
+async fn handle_public_on_a_room_a_creator_made_private_opens_it() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    // Discord holds a Connect deny the stored flag knows nothing about.
+    runtime.update_live(GUILD, |live| {
+        set_room_overwrites(live, bot_and_everyone_overwrites(true));
+    });
+    let interaction = voice_interaction_as(Some(command_data("public", Vec::new())), None, OWNER);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(text.contains("Opening it to everyone"), "{text}");
+    wait_trace(&trace, &format!("overwrite:500:{GUILD}:Role")).await;
+    wait_trace(&trace, "save_privacy:500:false:None:0").await;
+    assert!(!calls(&trace)
+        .iter()
+        .any(|c| c.starts_with("delete") || c.starts_with("create_join")));
 }

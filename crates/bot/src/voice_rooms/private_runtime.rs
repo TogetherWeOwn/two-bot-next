@@ -11,12 +11,15 @@
 //! Join channel plan) changes only after that write lands, so a refused write
 //! leaves the room exactly as it was and the stored flag never claims more than
 //! Discord enforces. The flag and Join channel id are then persisted before the
-//! next write is queued; a store failure retries through the same action.
+//! next write is queued; a store failure retries through the same action. On
+//! `/public` the Join channel is deleted first, inside that action, so its id
+//! stays in the stored record until the channel is gone.
 //!
 //! Every overwrite written here keeps View Channel untouched and never carries
 //! Manage Roles as an allow.
 
 use two_bot_core::{
+    voice_name_filter::sanitize_channel_name,
     voice_ownership::require_room_owner,
     voice_private::{
         join_channel_name, ChannelId, JoinChannel, MemberId, PrivacyEffect, PrivacyError,
@@ -243,17 +246,20 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     }
 
     /// The owner's display name as it may appear in the Join channel's name:
-    /// the full channel name goes through the same name filter as a generated
-    /// room name, and a name that fails it is left out (the channel is then
-    /// just "⇩ Join"), never sent.
+    /// sanitized like a `/create` name (no `@`, backtick or control character),
+    /// and the full channel name then goes through the same name filter as a
+    /// generated room name. A name that fails the filter is left out (the
+    /// channel is then just "⇩ Join"). Only the sanitized name is ever kept,
+    /// so what the filter vetted is what Discord receives.
     fn joinable_display(&self, room: &VoiceRoom, display: &str) -> String {
         let context = NameFilterContext {
             guild_id: self.live.guild_id.to_string(),
             channel_id: room.channel_id.to_string(),
             user_id: room.owner_id.to_string(),
         };
-        match filter_channel_name(&join_channel_name(display), &self.name_policy, &context) {
-            Ok(_) => display.to_owned(),
+        let clean = sanitize_channel_name(display);
+        match filter_channel_name(&join_channel_name(&clean), &self.name_policy, &context) {
+            Ok(_) => clean,
             Err(_) => String::new(),
         }
     }
@@ -390,8 +396,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         bot_permissions: Option<Permissions>,
     ) -> String {
         if !state.private {
+            // A room an `/alwaysprivate` creator made already denies Connect to
+            // @everyone while its stored flag still reads public, so the flag
+            // alone cannot say the room is open: check what Discord holds.
+            if !self.live_everyone_denies_connect(channel) {
+                self.privacy.insert(channel, state);
+                return "This room is already public.".to_owned();
+            }
+            if !can_edit_overwrites(bot_permissions) {
+                return NEEDS_MANAGE_ROLES.to_owned();
+            }
             self.privacy.insert(channel, state);
-            return "This room is already public.".to_owned();
+            self.enqueue_everyone_connect(channel, false);
+            return "This room wasn't marked private, but it was closed to new members. \
+                    Opening it to everyone."
+                .to_owned();
         }
         if !can_edit_overwrites(bot_permissions) {
             return NEEDS_MANAGE_ROLES.to_owned();
@@ -546,7 +565,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return;
         };
         let result = match planned {
-            Ok((bot_grant, everyone)) => self.write_overwrites(room, bot_grant, &everyone).await,
+            Ok((bot_grant, everyone)) => {
+                match self.write_overwrites(room, bot_grant, &everyone).await {
+                    // The Join channel goes before the flag flips and the record is
+                    // written: its id stays stored until the channel is gone, so a
+                    // restart between the two steps can still delete it (`/public`
+                    // again retries the delete), and a failure retries this action.
+                    Ok(()) if !deny => self.delete_join_of(room).await,
+                    written => written,
+                }
+            }
             Err(error) => Err(error),
         };
         match result {
@@ -575,7 +603,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 );
             }
             Err(RoomHttpError::UnknownOutcome) => {
-                // Both writes replace a whole entry, so a retry is safe.
+                // Both writes replace a whole entry and the Join delete treats
+                // a missing channel as done, so a retry is safe.
                 self.mark_failed_observed(
                     action,
                     "Discord privacy write outcome unknown".to_owned(),
@@ -659,8 +688,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         self.enqueue_join_creates(room, &plan.effects);
     }
 
-    /// `/public` landed: flip the flag, revoke nothing (grants are runtime-only
-    /// until the join-request slice) and delete the Join channel.
+    /// `/public` landed and the Join channel is already deleted: flip the
+    /// flag. Nothing is revoked (grants are runtime-only until the join-request
+    /// slice).
     fn finish_public(&mut self, room: Snowflake) {
         let Some(state) = self.privacy.get(&room).cloned() else {
             return;
@@ -668,19 +698,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let Ok(plan) = state.make_public() else {
             return;
         };
-        self.privacy.insert(room, plan.room.clone());
-        for effect in plan.effects {
-            if let PrivacyEffect::DeleteJoinChannel { channel_id } = effect {
-                self.join_deletable.insert(channel_id.0);
-                self.queue.enqueue(
-                    self.live.guild_id,
-                    RoomAction::DeleteJoinChannel {
-                        room_channel_id: room,
-                        channel_id: channel_id.0,
-                    },
-                );
-            }
-        }
+        self.privacy.insert(room, plan.room);
     }
 
     /// Create the Join channel next to a private room, once.
@@ -817,20 +835,31 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         started: Instant,
     ) {
         self.join_deletable.insert(channel_id);
+        let mut unwanted = Vec::new();
         if let Some(state) = self.privacy.get(&room).cloned() {
             if let Ok(plan) = state.join_channel_created(ChannelId(channel_id), name) {
                 self.privacy.insert(room, plan.room);
                 for effect in plan.effects {
                     if let PrivacyEffect::DeleteJoinChannel { channel_id } = effect {
-                        self.queue.enqueue(
-                            self.live.guild_id,
-                            RoomAction::DeleteJoinChannel {
-                                room_channel_id: room,
-                                channel_id: channel_id.0,
-                            },
-                        );
+                        unwanted.push(channel_id.0);
                     }
                 }
+            }
+        }
+        // A channel the room no longer wants (it went public while this was
+        // being created) is deleted before the record is written, so no
+        // untracked Join channel outlives a restart. The record cannot hold its
+        // id (a public room has none), so a delete that fails here falls back
+        // to the queue.
+        for id in unwanted {
+            if self.delete_join_channel(id).await.is_err() {
+                self.queue.enqueue(
+                    self.live.guild_id,
+                    RoomAction::DeleteJoinChannel {
+                        room_channel_id: room,
+                        channel_id: id,
+                    },
+                );
             }
         }
         self.privacy_dirty.insert(room);
@@ -855,27 +884,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         now_ms: u64,
         started: Instant,
     ) {
-        let present = self
-            .live
-            .inner
-            .read()
-            .expect("live voice lock")
-            .channels
-            .contains_key(&channel_id);
-        if !self.join_deletable.contains(&channel_id) || !present {
-            self.join_deletable.remove(&channel_id);
+        if !self.join_deletable.contains(&channel_id) {
             self.queue.mark_succeeded(&action);
             return;
         }
-        let live = self.live.clone();
-        let guard: WriteGuard = Arc::new(move || {
-            let state = live.inner.read().expect("live voice lock");
-            state.ready && state.channels.contains_key(&channel_id)
-        });
-        match self.http.delete(channel_id, guard).await {
-            Ok(()) | Err(RoomHttpError::NotFound) => {
-                self.live.remove_channel(channel_id);
-                self.join_deletable.remove(&channel_id);
+        match self.delete_join_channel(channel_id).await {
+            Ok(()) => {
                 self.queue.mark_succeeded(&action);
             }
             Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
@@ -901,9 +915,20 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// retries the whole room delete (every step is idempotent), so the Join
     /// channel is never leaked behind a forgotten room.
     pub(super) async fn delete_join_for(&mut self, room: Snowflake) -> bool {
-        let Some(channel_id) = self.join_channel_of(room) else {
-            return true;
-        };
+        self.delete_join_of(room).await.is_ok()
+    }
+
+    /// Delete the room's recorded Join channel, if it has one.
+    async fn delete_join_of(&mut self, room: Snowflake) -> Result<(), RoomHttpError> {
+        match self.join_channel_of(room) {
+            Some(channel_id) => self.delete_join_channel(channel_id).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Delete one Join channel. A channel the snapshot no longer shows, or one
+    /// Discord reports gone, counts as deleted.
+    async fn delete_join_channel(&mut self, channel_id: Snowflake) -> Result<(), RoomHttpError> {
         let present = self
             .live
             .inner
@@ -913,7 +938,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .contains_key(&channel_id);
         if !present {
             self.join_deletable.remove(&channel_id);
-            return true;
+            return Ok(());
         }
         let live = self.live.clone();
         let guard: WriteGuard = Arc::new(move || {
@@ -924,9 +949,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             Ok(()) | Err(RoomHttpError::NotFound) => {
                 self.live.remove_channel(channel_id);
                 self.join_deletable.remove(&channel_id);
-                true
+                Ok(())
             }
-            Err(_) => false,
+            Err(error) => Err(error),
         }
     }
 
