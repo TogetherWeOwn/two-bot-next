@@ -60,12 +60,15 @@ impl RoomPersistence for Arc<Store> {
             .claim_create(guild, user, config, now_secs)
             .await
     }
-    async fn settle_create(
+    async fn persist_create(
         &self,
         reservation_id: &str,
-        channel: Option<u64>,
-    ) -> Result<bool, StoreError> {
-        self.as_ref().settle_create(reservation_id, channel).await
+        room: &VoiceRoom,
+    ) -> Result<(), StoreError> {
+        self.as_ref().persist_create(reservation_id, room).await
+    }
+    async fn settle_create(&self, reservation_id: &str) -> Result<bool, StoreError> {
+        self.as_ref().settle_create(reservation_id).await
     }
     async fn config_snapshot(&self, guild: u64) -> Result<VoiceConfiguration, StoreError> {
         self.as_ref().config_snapshot(guild).await

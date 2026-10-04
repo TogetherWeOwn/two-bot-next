@@ -105,6 +105,7 @@ struct Store {
     /// `(reservation, bound channel)`.
     claims: Mutex<Vec<(u64, i64)>>,
     settled: Mutex<Vec<(String, Option<u64>)>>,
+    settle_errors: Mutex<VecDeque<StoreError>>,
     /// Also push `claim` / `settle` markers onto the shared trace, for tests
     /// that pin ordering against the Discord and persist calls.
     trace_claims: bool,
@@ -134,6 +135,7 @@ impl Store {
             claim_script: Mutex::new(VecDeque::new()),
             claims: Mutex::new(Vec::new()),
             settled: Mutex::new(Vec::new()),
+            settle_errors: Mutex::new(VecDeque::new()),
             trace_claims: false,
         }
     }
@@ -264,18 +266,40 @@ impl RoomPersistence for Store {
             }),
         }
     }
-    async fn settle_create(
+    async fn persist_create(
         &self,
         reservation_id: &str,
-        channel: Option<u64>,
-    ) -> Result<bool, StoreError> {
+        room: &VoiceRoom,
+    ) -> Result<(), StoreError> {
+        // Model a transaction: even an UPDATE-only refusal publishes no room.
+        if let Some(error) = self.settle_errors.lock().unwrap().pop_front() {
+            self.trace
+                .lock()
+                .unwrap()
+                .push(format!("persist:{}", room.channel_id));
+            return Err(error);
+        }
+        self.persist(room).await?;
         if self.trace_claims {
             self.trace.lock().unwrap().push("settle".to_owned());
         }
         self.settled
             .lock()
             .unwrap()
-            .push((reservation_id.to_owned(), channel));
+            .push((reservation_id.to_owned(), Some(room.channel_id)));
+        Ok(())
+    }
+    async fn settle_create(&self, reservation_id: &str) -> Result<bool, StoreError> {
+        if self.trace_claims {
+            self.trace.lock().unwrap().push("settle".to_owned());
+        }
+        if let Some(error) = self.settle_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        self.settled
+            .lock()
+            .unwrap()
+            .push((reservation_id.to_owned(), None));
         Ok(true)
     }
     async fn config_snapshot(&self, _: u64) -> Result<VoiceConfiguration, StoreError> {
@@ -1355,9 +1379,8 @@ async fn a_429_requeue_keeps_one_claim_and_settles_it_once() {
 }
 
 #[tokio::test]
-async fn a_create_that_ends_without_a_room_rolls_its_reservation_back() {
-    // Unknown Discord outcome.
-    let (live, store, http, _) = fixture();
+async fn unknown_create_outcome_keeps_capacity_and_never_reposts() {
+    let (live, store, http, trace) = fixture();
     http.create_errors
         .lock()
         .unwrap()
@@ -1365,23 +1388,176 @@ async fn a_create_that_ends_without_a_room_rolls_its_reservation_back() {
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
-    assert_eq!(
-        *worker.store.settled.lock().unwrap(),
-        [("r1".to_owned(), None)]
-    );
+    assert!(worker.store.settled.lock().unwrap().is_empty());
+    assert!(!worker.dispatch_one(86_400_000).await);
+    assert_eq!(*trace.lock().unwrap(), ["create"]);
+    assert_eq!(worker.store.claims.lock().unwrap().len(), 1);
+}
 
-    // The room was created but could not be persisted: compensation deletes it.
-    let (live, mut store, http, _) = fixture();
+#[tokio::test]
+async fn delayed_compensation_keeps_capacity_until_the_delete_succeeds() {
+    let (live, mut store, http, trace) = fixture();
     store.persist_error = Some(StoreError::Unavailable);
+    http.delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::RateLimited {
+            retry_after_ms: 600_000,
+            global: false,
+        });
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
+    assert!(worker.store.settled.lock().unwrap().is_empty());
+    assert_eq!(
+        worker
+            .compensation_reservations
+            .get(&500)
+            .map(String::as_str),
+        Some("r1")
+    );
+    dispatch(&mut worker, 1).await;
+    assert!(worker.store.settled.lock().unwrap().is_empty());
+    assert!(!worker.dispatch_one(300_001).await);
+    dispatch(&mut worker, 600_001).await;
     assert_eq!(
         *worker.store.settled.lock().unwrap(),
         [("r1".to_owned(), None)]
     );
+    assert!(worker.compensation_reservations.is_empty());
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            "create",
+            "persist:500",
+            "delete:500",
+            "delete:500",
+            "forget:500"
+        ]
+    );
+}
 
-    // A 429 requeue whose join went stale before the retry releases its claim.
+#[tokio::test]
+async fn denied_or_occupied_compensation_never_refunds_capacity() {
+    for occupied in [false, true] {
+        let (live, mut store, http, _) = fixture();
+        store.persist_error = Some(StoreError::Unavailable);
+        if !occupied {
+            http.delete_errors
+                .lock()
+                .unwrap()
+                .push_back(RoomHttpError::AccessDenied);
+        }
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        join(&mut worker, MEMBER);
+        dispatch(&mut worker, 0).await;
+        if occupied {
+            worker.live.voice_update(MEMBER + 1, Some(500), Some(false));
+        }
+        dispatch(&mut worker, 1).await;
+        assert!(worker.store.settled.lock().unwrap().is_empty());
+        assert_eq!(
+            worker
+                .compensation_reservations
+                .get(&500)
+                .map(String::as_str),
+            Some("r1")
+        );
+    }
+}
+
+#[tokio::test]
+async fn compensation_settlement_errors_are_reported_and_credentials_halt() {
+    for error in [StoreError::Unavailable, StoreError::CredentialRefused] {
+        let (live, mut store, http, trace) = fixture();
+        store.persist_error = Some(StoreError::Unavailable);
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        join(&mut worker, MEMBER);
+        dispatch(&mut worker, 0).await;
+        worker.store.settle_errors.lock().unwrap().push_back(error);
+        dispatch(&mut worker, 1).await;
+        assert!(worker.store.settled.lock().unwrap().is_empty());
+        assert_eq!(
+            worker.failures().back(),
+            Some(&LifecycleFailure::Persistence {
+                channel_id: Some(500),
+                error,
+            })
+        );
+        assert_eq!(worker.halted(), error == StoreError::CredentialRefused);
+        let before = trace.lock().unwrap().clone();
+        if worker.halted() {
+            join(&mut worker, MEMBER + 1);
+            worker.reconcile();
+            assert!(!worker.dispatch_one(600_000).await);
+            assert_eq!(*trace.lock().unwrap(), before);
+        } else {
+            dispatch(&mut worker, 3000).await;
+            assert_eq!(
+                *worker.store.settled.lock().unwrap(),
+                [("r1".to_owned(), None)]
+            );
+            assert_eq!(
+                *trace.lock().unwrap(),
+                ["create", "persist:500", "delete:500", "forget:500"]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn atomic_create_settlement_refusal_halts_without_publishing_a_partial_room() {
+    let (live, store, http, trace) = fixture();
+    store
+        .settle_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::CredentialRefused);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    join(&mut worker, MEMBER + 1);
+    dispatch(&mut worker, 0).await;
+    assert!(worker.halted());
+    assert!(worker.store.rooms.lock().unwrap().is_empty());
+    assert!(worker.store.settled.lock().unwrap().is_empty());
+    assert_eq!(
+        worker.failures().back(),
+        Some(&LifecycleFailure::Persistence {
+            channel_id: Some(500),
+            error: StoreError::CredentialRefused,
+        })
+    );
+    assert!(!worker.dispatch_one(600_000).await);
+    assert_eq!(*trace.lock().unwrap(), ["create", "persist:500"]);
+}
+
+#[tokio::test]
+async fn long_repeated_429s_reuse_one_durable_capacity_hold() {
+    let (live, store, http, _) = fixture();
+    for _ in 0..2 {
+        http.create_errors
+            .lock()
+            .unwrap()
+            .push_back(RoomHttpError::RateLimited {
+                retry_after_ms: 350_000,
+                global: false,
+            });
+    }
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 350_000).await;
+    assert!(worker.store.settled.lock().unwrap().is_empty());
+    dispatch(&mut worker, 700_000).await;
+    assert_eq!(worker.store.claims.lock().unwrap().len(), 1);
+    assert_eq!(
+        *worker.store.settled.lock().unwrap(),
+        [("r1".to_owned(), Some(500))]
+    );
+}
+
+#[tokio::test]
+async fn a_429_requeue_with_a_stale_join_releases_its_confirmed_absent_claim() {
     let (live, store, http, trace) = fixture();
     http.create_errors
         .lock()
@@ -1401,6 +1577,37 @@ async fn a_create_that_ends_without_a_room_rolls_its_reservation_back() {
         [("r1".to_owned(), None)]
     );
     assert_eq!(worker.store.claims.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn cancelled_create_settlement_refusal_is_reported_and_halts_on_credentials() {
+    for error in [StoreError::Unavailable, StoreError::CredentialRefused] {
+        let (live, store, http, trace) = fixture();
+        http.create_errors
+            .lock()
+            .unwrap()
+            .push_back(RoomHttpError::RateLimited {
+                retry_after_ms: 1500,
+                global: false,
+            });
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        join(&mut worker, MEMBER);
+        dispatch(&mut worker, 0).await;
+        worker.live.voice_update(MEMBER, None, Some(false));
+        worker.store.settle_errors.lock().unwrap().push_back(error);
+        dispatch(&mut worker, 1500).await;
+        assert_eq!(
+            worker.failures().back(),
+            Some(&LifecycleFailure::Persistence {
+                channel_id: None,
+                error
+            })
+        );
+        assert_eq!(worker.halted(), error == StoreError::CredentialRefused);
+        assert!(worker.store.settled.lock().unwrap().is_empty());
+        assert_eq!(*trace.lock().unwrap(), ["create"]);
+        assert!(!worker.dispatch_one(600_000).await);
+    }
 }
 
 #[tokio::test]

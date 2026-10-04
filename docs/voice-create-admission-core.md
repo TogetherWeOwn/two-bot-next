@@ -75,21 +75,32 @@ The pure core is now called by the runtime with persisted history:
   burst history, calls `decide_admission` and, only when allowed, inserts the
   reservation. Two concurrent joins (in one process or two) therefore cannot
   both pass the guild cap. A refusal writes nothing. Cap counts are live rooms
-  (`voice_rooms`) plus in-flight reservations (`settled_at IS NULL`, younger
-  than `IN_FLIGHT_RESERVATION_TTL_SECS`, 300 s, so a reservation abandoned by a
-  crash stops holding a slot). The caller supplies `now_secs`.
-- **Settle.** `PgRoomStore::settle_create` binds the reservation to the created
-  room or rolls the create back. Either way the row stays for burst and
-  cooldown history.
+  (`voice_rooms`) plus **all** unsettled reservations (`settled_at IS NULL`).
+  The caller supplies `now_secs` for history, not capacity expiry. Age cannot
+  distinguish a crashed process, a slow live 429 waiter or an unknown POST
+  outcome, so no TTL refunds capacity (superseding the initial migration's
+  expiry commentary).
+- **Transfer/settle.** `PgRoomStore::persist_create` inserts the room and binds
+  its reservation in one transaction under the same guild lock as claimers.
+  No missing or double-counted capacity is visible between those writes; an
+  insert/UPDATE failure rolls both back. Exact replay is idempotent while the
+  room exists, but cannot recreate a deleted room. `settle_create` only releases
+  an unbound claim after known no-side-effect failure, confirmed channel absence
+  or successful compensation. Either way the row stays for burst/cooldown history.
 - **Worker.** `GuildRoomWorker::dispatch_one` claims after its cheap checks and
   before the only Discord create call. A refusal records
   `LifecycleFailure::CreateRefused` (stable `RefusalReason::code`, legacy
   `user_message`) and never calls Discord; a claim-time store error records a
-  persistence failure, also without calling Discord. A 429 requeue keeps its
-  one claim; a create that ends without a room (Discord error, failed persist,
-  a join that went stale before the retry) rolls its reservation back. A refusal
-  is a policy outcome, not a lifecycle failure, so it adds no
-  `two_bot_voice_operations_total` outcome.
+  persistence failure, also without calling Discord. A long/repeated 429 requeue
+  keeps its one non-expiring claim without counting a second burst attempt.
+  Unknown creates never retry the POST or refund their hold. Failed room
+  persistence retains the hold through delayed, denied or occupied-channel
+  compensation, and releases it only when the delete/absence is confirmed.
+  A join cancelled before a retry is a confirmed no-effect outcome. Settlement
+  errors reach the bounded setup failure report; a credential refusal halts all
+  subsequent writes. A transient compensation settlement error retries only SQL
+  after the channel is known gone. A refusal is a policy outcome, not a lifecycle
+  failure, so it adds no `two_bot_voice_operations_total` outcome.
 
 ## Residual parent work
 
@@ -99,8 +110,15 @@ Caps and cooldown use the legacy defaults (1 room per member, 40 per guild,
 settings into `GuildRoomWorker::set_admission_config` is not part of this slice.
 A refusal reaches the operator as a `/setup` failure line and a notice; there
 is no per-member reply on a gateway voice join. No retention job prunes
-`voice_create_reservations`. Naming, permissions, ownership and room lifecycle
-are separate slices, and unit and database tests establish behaviour only, not
+`voice_create_reservations`. Unknown-outcome and crash-orphan holds are
+conservative capacity debt across restarts, not automatically expired leases.
+They require evidence-led reconciliation before release; this slice adds no
+operator release API or automatic reconciliation for unknown POSTs. A crash
+before local compensation loses its in-memory channel association but **not**
+the durable hold. Transient settlement errors on cancelled/no-effect creates
+also retain the hold for reconciliation. This trades availability for the cap
+invariant; do not clear holds based solely on age. Naming, permissions, ownership
+and room lifecycle are separate slices, and unit and database tests establish behaviour only, not
 staging readiness (staging proof stays on the voice acceptance card).
 
 ## Hermetic verification

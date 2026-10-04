@@ -190,13 +190,20 @@ pub trait RoomPersistence: Send + Sync {
         config: &CreateAdmissionConfig,
         now_secs: i64,
     ) -> impl Future<Output = Result<CreateClaim, StoreError>> + Send;
-    /// Settle an admitted claim: bind it to the created room (`Some`) or roll
-    /// the create back (`None`). The reservation row stays either way, so the
-    /// burst window and cooldown keep counting it.
+    /// Persist the successful create and transfer its capacity hold atomically
+    /// under the claim's guild lock. Failure retains the unbound hold; replay
+    /// never POSTs again. No intermediate double occupancy is visible.
+    fn persist_create(
+        &self,
+        reservation_id: &str,
+        room: &VoiceRoom,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// Release a claim only after known no-side-effect failure, confirmed
+    /// absence or successful compensation. Never release an unknown outcome.
+    /// The history row remains for burst and cooldown accounting.
     fn settle_create(
         &self,
         reservation_id: &str,
-        channel: Option<Snowflake>,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
     /// Every companion tracked in the guild, for worker load and startup
     /// reconciliation. Each row carries its creation-time settings snapshot.
@@ -312,12 +319,18 @@ impl RoomPersistence for PgRoomStore {
             .map_err(store_error)
     }
 
-    async fn settle_create(
+    async fn persist_create(
         &self,
         reservation_id: &str,
-        channel: Option<Snowflake>,
-    ) -> Result<bool, StoreError> {
-        self.settle_create(reservation_id, channel)
+        room: &VoiceRoom,
+    ) -> Result<(), StoreError> {
+        self.persist_create(reservation_id, room)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn settle_create(&self, reservation_id: &str) -> Result<bool, StoreError> {
+        self.settle_create(reservation_id)
             .await
             .map_err(store_error)
     }
@@ -1151,6 +1164,9 @@ pub struct GuildRoomWorker<S, H> {
     uncertain_moves: HashMap<Snowflake, JoinTicket>,
     deletes: HashSet<Snowflake>,
     compensation: HashSet<Snowflake>,
+    /// A failed atomic room persist leaves this durable cap hold unsettled.
+    /// Release it only after the compensation delete/absence is confirmed.
+    compensation_reservations: HashMap<Snowflake, String>,
     denied: HashMap<Snowflake, (u64, Option<Permissions>)>,
     failures: VecDeque<LifecycleFailure>,
     notices: Vec<NoticeState>,
@@ -1241,6 +1257,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             uncertain_moves: HashMap::new(),
             deletes: HashSet::new(),
             compensation: HashSet::new(),
+            compensation_reservations: HashMap::new(),
             denied: HashMap::new(),
             failures: VecDeque::new(),
             notices: Vec::new(),
@@ -2082,17 +2099,27 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         released
     }
 
-    /// Settle a create's admission reservation: bound to its room, or rolled
-    /// back. Best effort: a failed settle only keeps the cap slot held until
-    /// the reservation's in-flight TTL, so it never blocks the lifecycle. The
-    /// reservation row stays either way, so burst and cooldown history hold.
-    async fn settle_reservation(&self, reservation: &str, channel: Option<Snowflake>) {
-        if let Err(error) = self.store.settle_create(reservation, channel).await {
-            warn!(
-                guild = self.live.guild_id,
-                ?error,
-                "voice create reservation settle failed"
-            );
+    /// Release only a confirmed absent create. Errors retain the durable hold
+    /// and reach the bounded setup failure report; credential refusals stop ALL
+    /// subsequent writes just like claim/persist failures.
+    async fn settle_reservation(&mut self, reservation: &str, channel: Option<Snowflake>) -> bool {
+        match self.store.settle_create(reservation).await {
+            Ok(_) => true,
+            Err(error) => {
+                warn!(
+                    guild = self.live.guild_id,
+                    ?error,
+                    "voice create reservation settle failed"
+                );
+                self.record(LifecycleFailure::Persistence {
+                    channel_id: channel,
+                    error,
+                });
+                if error == StoreError::CredentialRefused {
+                    self.halted = true;
+                }
+                false
+            }
         }
     }
 
@@ -2269,10 +2296,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         let room = VoiceRoom::from_spec(creation.spec, channel_id);
                         self.live.upsert_channel(channel);
                         self.rooms.insert(channel_id, room.clone());
-                        let persisted = self.store.persist(&room).await;
-                        let bound = persisted.is_ok().then_some(channel_id);
-                        self.settle_reservation(&reservation, bound).await;
-                        match persisted {
+                        // The room and its reservation transfer commit together.
+                        // On failure, keep the hold through compensation; neither
+                        // a SQL error nor elapsed time proves channel absence.
+                        match self.store.persist_create(&reservation, &room).await {
                             Ok(()) => {
                                 // V9c: companion first (same ordered lane), then
                                 // the move. The plan's settings snapshot is the
@@ -2310,6 +2337,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 if error == StoreError::CredentialRefused {
                                     self.halted = true;
                                 }
+                                self.compensation_reservations
+                                    .insert(channel_id, reservation);
                                 self.queue_delete(channel_id, true);
                                 self.observe_voice_state();
                             }
@@ -2324,9 +2353,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         );
                     }
                     Err(error) => {
-                        // Unknown create outcomes must never produce another POST.
+                        // Unknown outcomes must never produce another POST or
+                        // refund capacity: Discord may have created the room.
                         self.creations.remove(&action.id);
-                        self.settle_reservation(&reservation, None).await;
+                        if error != RoomHttpError::UnknownOutcome {
+                            self.settle_reservation(&reservation, None).await;
+                        }
                         if error != RoomHttpError::Cancelled {
                             observe_voice_operation("create", voice_outcome_from_http(&error));
                         }
@@ -2449,6 +2481,24 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 elapsed_ms(now_ms, started),
                             );
                             return true;
+                        }
+                        if let Some(held) = self.compensation_reservations.get(&channel_id).cloned()
+                        {
+                            if !self.settle_reservation(&held, Some(channel_id)).await {
+                                if self.halted {
+                                    self.queue.mark_succeeded(&action);
+                                } else {
+                                    // The channel is known gone; retry only SQL,
+                                    // keeping the hold and never creating again.
+                                    self.mark_failed_observed(
+                                        action,
+                                        "voice create reservation unavailable".to_owned(),
+                                        elapsed_ms(now_ms, started),
+                                    );
+                                }
+                                return true;
+                            }
+                            self.compensation_reservations.remove(&channel_id);
                         }
                         match self.store.forget(self.live.guild_id, channel_id).await {
                             Ok(()) => {

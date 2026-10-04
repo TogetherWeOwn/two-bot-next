@@ -7,7 +7,7 @@
 
 use two_bot_core::voice_create_admission::{CreateAdmissionConfig, RefusalReason};
 use two_bot_core::voice_rooms::{NewRoomSpec, VoiceRoom};
-use two_bot_cutover::voice_rooms::{CreateClaim, PgRoomStore, IN_FLIGHT_RESERVATION_TTL_SECS};
+use two_bot_cutover::voice_rooms::{CreateClaim, PgRoomStore};
 use two_bot_testsupport::TestDatabase;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -80,8 +80,7 @@ async fn create_then_delete(
     now: i64,
 ) -> TestResult {
     let id = admitted(store, user, config, now).await?;
-    assert!(store.add_room(&room(user, channel)).await?);
-    assert!(store.settle_create(&id, Some(channel)).await?);
+    store.persist_create(&id, &room(user, channel)).await?;
     assert!(store.remove_room(GUILD, channel).await?.is_some());
     Ok(())
 }
@@ -190,18 +189,18 @@ async fn caps_count_live_and_in_flight_rooms_and_cooldown_counts_rollbacks() -> 
     );
     // Binding one to a tracked room hands its slot to `voice_rooms` without
     // counting it twice: a settled reservation plus its room is one slot.
-    assert!(store.add_room(&room(300, 510)).await?);
-    assert!(store.settle_create(&in_flight, Some(510)).await?);
+    store.persist_create(&in_flight, &room(300, 510)).await?;
+    store.persist_create(&in_flight, &room(300, 510)).await?;
     assert!(
-        !store.settle_create(&in_flight, Some(510)).await?,
-        "settling twice is a no-op"
+        !store.settle_create(&in_flight).await?,
+        "a bound live room cannot be rolled back"
     );
     assert_eq!(
         refused(&store, 300, &two, T0 + 61).await?,
         RefusalReason::UserCap
     );
     // Rolling the other create back frees its slot, but not its cooldown.
-    assert!(store.settle_create(&second, None).await?);
+    assert!(store.settle_create(&second).await?);
     let three = config(3, 40, 30);
     assert_eq!(
         refused(&store, 300, &three, T0 + 40).await?,
@@ -219,27 +218,181 @@ async fn caps_count_live_and_in_flight_rooms_and_cooldown_counts_rollbacks() -> 
         RefusalReason::GuildCap
     );
 
-    // A reservation abandoned by a crash stops holding a slot after the
-    // in-flight TTL (it still counts toward burst and cooldown history).
+    // Age never proves absence: a crash, unknown POST or live 429 waiter
+    // retains its slot even after the former 300 s expiry and after a day.
     let lone = config(1, 40, 0);
     admitted(&store, 800, &lone, T0 + 1000).await?;
+    for age in [299, 300, 86_400] {
+        assert_eq!(
+            refused(&store, 800, &lone, T0 + 1000 + age).await?,
+            RefusalReason::UserCap
+        );
+    }
+    db.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TWO_TEST_DATABASE_URL on agent-testdb"]
+async fn aged_claim_blocks_competing_store_and_resumes_without_new_history() -> TestResult {
+    let db = database().await;
+    let original = PgRoomStore::new(db.pool().clone());
+    let restarted = PgRoomStore::new(db.independent_pool().await?);
+    let cap = config(10, 1, 0);
+    let held = admitted(&original, 300, &cap, T0).await?;
+    for age in [299, 300, 3600, 86_400] {
+        assert_eq!(
+            refused(&restarted, 301, &cap, T0 + age).await?,
+            RefusalReason::GuildCap
+        );
+    }
+    // The slow old worker resumes. Its original slot never went to another
+    // worker, and transferring it does not count a second burst attempt.
+    original.persist_create(&held, &room(300, 500)).await?;
+    assert_eq!(
+        refused(&restarted, 301, &cap, T0 + 86_400).await?,
+        RefusalReason::GuildCap
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM voice_create_reservations")
+        .fetch_one(db.pool())
+        .await?;
+    assert_eq!(count, 1);
+    original.remove_room(GUILD, 500).await?;
+    assert!(
+        original
+            .persist_create(&held, &room(300, 500))
+            .await
+            .is_err(),
+        "replay cannot resurrect a deleted room"
+    );
+    admitted(&restarted, 301, &cap, T0 + 86_400).await?;
+    db.close().await?;
+    Ok(())
+}
+
+async fn wait_for_blocked_query(pool: &sqlx::PgPool, pattern: &str) -> TestResult {
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+                 WHERE NOT l.granted AND a.datname = current_database() AND a.query LIKE $1)",
+            )
+            .bind(pattern)
+            .fetch_one(pool)
+            .await?;
+            if blocked {
+                return Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TWO_TEST_DATABASE_URL on agent-testdb"]
+async fn room_persist_and_settlement_are_not_separately_observable_to_claimers() -> TestResult {
+    let db = database().await;
+    let store = PgRoomStore::new(db.pool().clone());
+    let peer = PgRoomStore::new(db.independent_pool().await?);
+    let cap = config(10, 2, 0);
+    let held = admitted(&store, 300, &cap, T0).await?;
+    // Hold an INSERT after it has written the row, before reservation UPDATE.
+    // The barrier is database-scoped and transaction-owned: no fixed global
+    // test lock, sleeps-as-evidence or session lock returned to a pool.
+    sqlx::raw_sql(
+        "CREATE FUNCTION pause_room_transfer() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           PERFORM pg_advisory_xact_lock(hashtextextended(current_database() || ':room_transfer_fixture', 0));
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER pause_room_transfer AFTER INSERT ON voice_rooms
+         FOR EACH ROW EXECUTE FUNCTION pause_room_transfer();",
+    ).execute(db.pool()).await?;
+    let mut barrier = db.pool().begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(current_database() || ':room_transfer_fixture', 0))")
+        .execute(&mut *barrier).await?;
+    let transfer = tokio::spawn(async move { store.persist_create(&held, &room(300, 500)).await });
+    wait_for_blocked_query(db.pool(), "INSERT INTO voice_rooms%").await?;
+    let claimant = tokio::spawn(async move { peer.claim_create(GUILD, 301, &cap, T0 + 60).await });
+    wait_for_blocked_query(db.pool(), "SELECT pg_advisory_xact_lock%").await?;
+    assert!(!transfer.is_finished());
+    assert!(
+        !claimant.is_finished(),
+        "claimer must wait for the complete transfer"
+    );
+    let rooms: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM voice_rooms")
+        .fetch_one(db.pool())
+        .await?;
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM voice_create_reservations WHERE settled_at IS NULL",
+    )
+    .fetch_one(db.pool())
+    .await?;
+    assert_eq!(
+        (rooms, pending),
+        (0, 1),
+        "outside readers see only the old capacity"
+    );
+    barrier.commit().await?;
+    transfer.await??;
+    assert!(
+        matches!(claimant.await??, CreateClaim::Admitted { .. }),
+        "one live room plus the next claim is two slots, not three"
+    );
     assert_eq!(
         refused(
-            &store,
-            800,
-            &lone,
-            T0 + 1000 + IN_FLIGHT_RESERVATION_TTL_SECS - 1
+            &PgRoomStore::new(db.pool().clone()),
+            302,
+            &config(10, 2, 0),
+            T0 + 60
         )
         .await?,
-        RefusalReason::UserCap
+        RefusalReason::GuildCap
     );
-    admitted(
-        &store,
-        800,
-        &lone,
-        T0 + 1000 + IN_FLIGHT_RESERVATION_TTL_SECS,
+    db.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TWO_TEST_DATABASE_URL on agent-testdb"]
+async fn failed_settlement_rolls_back_the_room_insert_and_retains_capacity() -> TestResult {
+    let db = database().await;
+    let store = PgRoomStore::new(db.pool().clone());
+    let cap = config(10, 1, 0);
+    let held = admitted(&store, 300, &cap, T0).await?;
+    // Synthetic UPDATE-only refusal; never revoke real credentials/grants.
+    sqlx::raw_sql(
+        "CREATE FUNCTION refuse_create_settlement() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'fixture settlement refusal' USING ERRCODE = '42501'; END $$;
+         CREATE TRIGGER refuse_create_settlement BEFORE UPDATE ON voice_create_reservations
+         FOR EACH ROW EXECUTE FUNCTION refuse_create_settlement();",
     )
+    .execute(db.pool())
     .await?;
+    let error = store
+        .persist_create(&held, &room(300, 500))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("42501")
+    );
+    assert!(
+        store.rooms_in_guild(GUILD).await?.is_empty(),
+        "no partial room insert"
+    );
+    assert_eq!(
+        refused(&store, 301, &cap, T0 + 86_400).await?,
+        RefusalReason::GuildCap
+    );
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM voice_create_reservations WHERE settled_at IS NULL",
+    )
+    .fetch_one(db.pool())
+    .await?;
+    assert_eq!(pending, 1);
     db.close().await?;
     Ok(())
 }

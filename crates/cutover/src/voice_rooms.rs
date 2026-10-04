@@ -23,12 +23,6 @@ use two_bot_core::{format_iso_millis, parse_iso_millis, Snowflake};
 
 use super::voice_config_store::PgVoiceConfigStore;
 
-/// How long an unsettled create reservation holds a cap slot. A reservation
-/// older than this was abandoned (a crash between the claim and the settle)
-/// and no longer counts toward the user or guild cap; it still counts toward
-/// the burst window and cooldown, which only read `created_at`.
-pub const IN_FLIGHT_RESERVATION_TTL_SECS: i64 = 300;
-
 /// The verdict of [`PgRoomStore::claim_create`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateClaim {
@@ -41,6 +35,34 @@ pub enum CreateClaim {
 #[derive(Debug, Clone)]
 pub struct PgRoomStore {
     pool: PgPool,
+}
+
+async fn insert_room(
+    connection: &mut sqlx::PgConnection,
+    room: &VoiceRoom,
+) -> Result<bool, sqlx::Error> {
+    let millis = parse_iso_millis(&room.created_at)
+        .ok_or_else(|| invalid_argument("invalid room creation timestamp"))?;
+    let timestamp = OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000)
+        .map_err(invalid_argument)?;
+    Ok(sqlx::query(
+        "INSERT INTO voice_rooms
+         (guild_id, channel_id, creator_channel_id, owner_id,
+          original_creator_id, name_seed, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT (guild_id, channel_id) DO NOTHING",
+    )
+    .bind(room.guild_id.to_string())
+    .bind(room.channel_id.to_string())
+    .bind(room.creator_channel_id.to_string())
+    .bind(room.owner_id.to_string())
+    .bind(room.original_creator_id.to_string())
+    .bind(room.name_seed.to_string())
+    .bind(timestamp)
+    .execute(connection)
+    .await?
+    .rows_affected()
+        != 0)
 }
 
 impl PgRoomStore {
@@ -150,28 +172,67 @@ impl PgRoomStore {
     /// Insert once: replay must never overwrite ownership, the seed or timestamp.
     /// Returns false when this exact channel is already tracked.
     pub async fn add_room(&self, room: &VoiceRoom) -> Result<bool, sqlx::Error> {
-        let millis = parse_iso_millis(&room.created_at)
-            .ok_or_else(|| invalid_argument("invalid room creation timestamp"))?;
-        let timestamp = OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000)
-            .map_err(invalid_argument)?;
-        Ok(sqlx::query(
-            "INSERT INTO voice_rooms
-             (guild_id, channel_id, creator_channel_id, owner_id,
-              original_creator_id, name_seed, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7)
-             ON CONFLICT (guild_id, channel_id) DO NOTHING",
+        let mut connection = self.pool.acquire().await?;
+        insert_room(&mut connection, room).await
+    }
+
+    /// Atomically transfer a claim's cap slot to its live room. Claimants use
+    /// the same guild lock, so neither a missing slot nor double occupancy is
+    /// visible. Any insert/settlement error rolls the whole transaction back,
+    /// keeping the reservation held until confirmed compensation. Exact replay
+    /// is idempotent; a mismatched or previously rolled-back claim refuses.
+    pub async fn persist_create(
+        &self,
+        reservation_id: &str,
+        room: &VoiceRoom,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("voice_create:{}", room.guild_id))
+            .execute(&mut *tx)
+            .await?;
+        let claim = sqlx::query(
+            "SELECT channel_id, settled_at IS NOT NULL AS settled
+             FROM voice_create_reservations
+             WHERE id = $1 AND guild_id = $2 AND user_id = $3 FOR UPDATE",
         )
+        .bind(reservation_id)
         .bind(room.guild_id.to_string())
-        .bind(room.channel_id.to_string())
-        .bind(room.creator_channel_id.to_string())
-        .bind(room.owner_id.to_string())
         .bind(room.original_creator_id.to_string())
-        .bind(room.name_seed.to_string())
-        .bind(timestamp)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?
-        .rows_affected()
-            != 0)
+        .ok_or_else(|| invalid_argument("create reservation does not match room"))?;
+        if claim.try_get::<bool, _>("settled")?
+            && claim.try_get::<Option<String>, _>("channel_id")?
+                != Some(room.channel_id.to_string())
+        {
+            return Err(invalid_argument("create reservation is already settled"));
+        }
+        if claim.try_get::<bool, _>("settled")? || !insert_room(&mut tx, room).await? {
+            let stored =
+                sqlx::query("SELECT * FROM voice_rooms WHERE guild_id = $1 AND channel_id = $2")
+                    .bind(room.guild_id.to_string())
+                    .bind(room.channel_id.to_string())
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let mut expected = room.clone();
+            expected.created_at = format_iso_millis(
+                parse_iso_millis(&room.created_at)
+                    .ok_or_else(|| invalid_argument("invalid room creation timestamp"))?,
+            );
+            if decode_room(&stored)? != expected {
+                return Err(invalid_argument("created room conflicts with tracked room"));
+            }
+        }
+        sqlx::query(
+            "UPDATE voice_create_reservations SET channel_id = $2, settled_at = now()
+             WHERE id = $1 AND settled_at IS NULL",
+        )
+        .bind(reservation_id)
+        .bind(room.channel_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await
     }
 
     /// Persist a V2 ownership handoff on an already-tracked room. Only the
@@ -263,11 +324,12 @@ impl PgRoomStore {
     /// The per-guild advisory lock makes concurrent claims (two joins, two
     /// processes) see each other's reservation, so they cannot both pass the
     /// guild cap. `now_secs` is the caller's Unix-seconds clock; it stamps the
-    /// reservation and anchors the window, cooldown and in-flight TTL, so the
-    /// decision never depends on the database clock.
+    /// reservation and anchors the window and cooldown, so the decision never
+    /// depends on the database clock.
     ///
-    /// Cap counts are live rooms (`voice_rooms`) plus in-flight reservations
-    /// (not yet settled, younger than [`IN_FLIGHT_RESERVATION_TTL_SECS`]).
+    /// Cap counts are live rooms (`voice_rooms`) plus all unsettled reservations.
+    /// Age alone never proves absence: slow/repeated 429s, unknown POST outcomes
+    /// and crashes retain capacity until evidence permits settlement.
     /// Burst and cooldown history comes from every reservation ever accepted,
     /// including rooms since deleted and rolled-back creates, so neither a
     /// deletion nor a restart frees a slot.
@@ -292,19 +354,16 @@ impl PgRoomStore {
             "SELECT
                (SELECT COUNT(*) FROM voice_rooms WHERE guild_id = $1)
                  + (SELECT COUNT(*) FROM voice_create_reservations
-                     WHERE guild_id = $1 AND settled_at IS NULL
-                       AND created_at > to_timestamp($3::double precision)) AS rooms_in_guild,
+                     WHERE guild_id = $1 AND settled_at IS NULL) AS rooms_in_guild,
                (SELECT COUNT(*) FROM voice_rooms WHERE guild_id = $1 AND owner_id = $2)
                  + (SELECT COUNT(*) FROM voice_create_reservations
-                     WHERE guild_id = $1 AND user_id = $2 AND settled_at IS NULL
-                       AND created_at > to_timestamp($3::double precision)) AS owned_by_user,
+                     WHERE guild_id = $1 AND user_id = $2 AND settled_at IS NULL) AS owned_by_user,
                (SELECT floor(extract(epoch FROM max(created_at)))::bigint
                   FROM voice_create_reservations
                  WHERE guild_id = $1 AND user_id = $2) AS last_created_secs",
         )
         .bind(&guild)
         .bind(&user)
-        .bind(now_secs.saturating_sub(IN_FLIGHT_RESERVATION_TTL_SECS))
         .fetch_one(&mut *tx)
         .await?;
         let history = sqlx::query(
@@ -353,23 +412,18 @@ impl PgRoomStore {
         }
     }
 
-    /// Settle an in-flight reservation: bind it to the created room
-    /// (`Some(channel)`) or roll the create back (`None`). Either way the row
-    /// stays, so the burst window and cooldown keep counting it; only its cap
-    /// slot is released to `voice_rooms` (bound) or freed (rolled back).
-    /// Returns false when the reservation was already settled.
-    pub async fn settle_create(
-        &self,
-        reservation_id: &str,
-        channel_id: Option<Snowflake>,
-    ) -> Result<bool, sqlx::Error> {
+    /// Release an unbound claim ONLY after confirmed no-side-effect failure,
+    /// channel absence or successful compensation. Unknown outcomes stay held.
+    /// The row stays for burst/cooldown history. Live-room transfers must use
+    /// [`Self::persist_create`], not a separate room insert and settlement.
+    /// Returns false when already settled (including a bound live room).
+    pub async fn settle_create(&self, reservation_id: &str) -> Result<bool, sqlx::Error> {
         Ok(sqlx::query(
             "UPDATE voice_create_reservations
-             SET channel_id = $2, settled_at = now()
-             WHERE id = $1 AND settled_at IS NULL",
+             SET settled_at = now()
+             WHERE id = $1 AND settled_at IS NULL AND channel_id IS NULL",
         )
         .bind(reservation_id)
-        .bind(channel_id.map(|id| id.to_string()))
         .execute(&self.pool)
         .await?
         .rows_affected()
