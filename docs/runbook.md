@@ -255,6 +255,36 @@ identified, when they coincide with 429 or DB-error alerts, or when sends
 stay refused with no cooldown in the logs — the lane may be stuck and the
 fix belongs to the on-call engineer, not another redeploy.
 
+#### Alert: voice failures
+
+Voice room lifecycle failures between two keepalive samples
+(`two_bot_voice_operations_total`, `two_bot_voice_dead_letters_total`,
+`two_bot_voice_orphans_total`). Fires when failed operations exceed 5% of
+room operations with at least 10 operations in the window (the T3 room
+create/move/delete budget in
+[voice-cutover-rollback-triggers.md](voice-cutover-rollback-triggers.md)),
+or when any new dead-letter (a queue write that exhausted 10 attempts) or
+orphan (an untracked creator-channel orphan needing manual deletion)
+appears — so a low-volume stranded-member failure still pages. Any outcome
+other than `success` (`category_full`, `discord`, `persistence`,
+`cancelled`) counts as a failure: the join did not place a room, or the
+move/delete did not complete. A counter reset (process restart) skips the
+window rather than firing, and a slow trickle below threshold stays silent.
+
+First response: scope the failing operation from the `op`/`outcome` labels
+on `two_bot_voice_operations_total` via the authorized `/ops/metrics`
+scrape; confirm no deploy is in progress; then read the container logs for
+the matching `voice_event="voice_operation"` warn lines (see the lifecycle
+signal inventory in
+[voice-lifecycle-alert-drill.md](voice-lifecycle-alert-drill.md)). Do not
+retry uncertain room writes, replay member moves, or delete untracked
+channels by hand — untracked-channel deletion by the bot is never allowed.
+
+Escalate when failures persist across windows after the suspect deploy is
+identified, when a dead-letter or orphan names a stranded member, or when
+failures coincide with 429, DB-error or pool alerts — the fix then belongs
+to the on-call engineer, not another redeploy.
+
 ## Persisted ownership control
 
 The Worker/DO fence is implemented, not implicitly released by deployment.
