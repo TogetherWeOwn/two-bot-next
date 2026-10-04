@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import worker, { type Env } from "../src/index.ts";
 import {
-  EMPTY_STATE, RULES, evaluateMetrics, parseExposition, transitionMessages,
+  EMPTY_STATE, RULES, RUNBOOK_BASE_URL, evaluateMetrics, packetFilename, parseExposition, ruleFor, runbookUrl, transitionMessages,
 } from "../src/alert-rules.ts";
 
 const NOW = 1_000_000;
@@ -11,6 +11,13 @@ function body(extra: string[]): string {
   return ["# HELP x y", "# TYPE x gauge", ...extra, ""].join("\n");
 }
 const ev = (lines: string[], prev = EMPTY_STATE) => evaluateMetrics(parseExposition(body(lines)), prev, NOW);
+
+/** Heading-slug index for one checked-in doc (single definition reused below). */
+function docAnchors(doc: string): Set<string> {
+  const text = readFileSync(new URL(`../../docs/${doc}`, import.meta.url), "utf8");
+  return new Set([...text.matchAll(/^#+ (.+)$/gm)].map((m) =>
+    m[1]!.toLowerCase().replace(/[^a-z0-9 -]/g, "").replace(/ /g, "-")));
+}
 
 test("job stale fires only past two intervals and ignores never-succeeded", () => {
   assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="rank"} ${NOW - 1200}`]).firing, []);
@@ -50,19 +57,109 @@ test("transitions notify once on fire and once on resolve", () => {
   assert.match(transitionMessages(["job_stale:rank"], [])[0]!, /RESOLVED/);
 });
 
+test("db errors fire on a burst, ignore trickles and restarts", () => {
+  const base = ev([`two_bot_db_errors_total{op="admission"} 0`, `two_bot_db_errors_total{op="other"} 0`]);
+  assert.deepEqual(base.firing, []);
+  const trickle = ev([`two_bot_db_errors_total{op="admission"} 2`, `two_bot_db_errors_total{op="other"} 0`], base.state);
+  assert.deepEqual(trickle.firing, []);
+  const burst = ev([`two_bot_db_errors_total{op="admission"} 5`, `two_bot_db_errors_total{op="other"} 0`], base.state);
+  assert.deepEqual(burst.firing, ["db_errors"]);
+  const restart = ev([`two_bot_db_errors_total{op="admission"} 1`], burst.state);
+  assert.deepEqual(restart.firing, []);
+});
+
+test("send admission blocked needs three consecutive windows with new refusals", () => {
+  const lines = (n: number) => [`two_bot_send_admissions_total{outcome="blocked"} ${n}`];
+  let state = EMPTY_STATE;
+  for (const expected of [[], [], ["send_admission_blocked"]]) {
+    const r = ev(lines(state.sendBlocked + 1), state);
+    assert.deepEqual(r.firing, expected);
+    state = r.state;
+  }
+  // A quiet window clears the streak; a counter reset (restart) resets it.
+  assert.equal(ev(lines(state.sendBlocked), state).state.sendBlockedStreak, 0);
+  assert.equal(ev([`two_bot_send_admissions_total{outcome="blocked"} 0`], state).state.sendBlockedStreak, 0);
+});
+
+test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
+  const window = "2026-10-09T20-11-06Z";
+  // Single shared spelling with the Rust canonical list (ALERT_RULE_IDS in
+  // crates/core/src/evidence.rs); both sides pin all six here and there.
+  assert.deepEqual(RULES.map((r) => r.id), [
+    "job_stale",
+    "job_consecutive_failures",
+    "rest_429_rate",
+    "db_pool_saturated",
+    "db_errors",
+    "send_admission_blocked",
+  ]);
+  assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
+  assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
+  assert.equal(packetFilename("rest_429_rate", window), `evidence-rest_429_rate-${window}.json`);
+  assert.equal(packetFilename("db_pool_saturated", window), `evidence-db_pool_saturated-${window}.json`);
+  assert.equal(packetFilename("db_errors", window), `evidence-db_errors-${window}.json`);
+  assert.equal(packetFilename("send_admission_blocked", window), `evidence-send_admission_blocked-${window}.json`);
+  // Unknown keys get no filename rather than a misleading one; hostile
+  // window stamps stay filename-safe.
+  assert.equal(packetFilename("no_such_rule", window), undefined);
+  assert.equal(packetFilename("rest_429_rate", "2026-10-09T20:11:06Z"), "evidence-rest_429_rate-2026-10-09T20-11-06Z.json");
+});
+
 test("every rule links to an existing runbook heading", () => {
-  const runbook = readFileSync(new URL("../../docs/runbook.md", import.meta.url), "utf8");
-  const slugs = new Set([...runbook.matchAll(/^#+ (.+)$/gm)].map((m) =>
-    m[1]!.toLowerCase().replace(/[^a-z0-9 -]/g, "").replace(/ /g, "-")));
+  const slugs = docAnchors("runbook.md");
   for (const rule of RULES) {
     const anchor = rule.runbook.split("#")[1]!;
     assert.ok(slugs.has(anchor), `${rule.id}: missing runbook heading for #${anchor}`);
   }
 });
 
+test("every fired packet carries a runbook deep link that resolves in checked-in docs", () => {
+  const slugs = docAnchors("runbook.md");
+  // Fire one of each rule kind so every RULES entry is covered.
+  const firing = [
+    ...ev([`two_bot_job_last_success_timestamp_seconds{job="rank"} ${NOW - 1201}`]).firing,
+    ...ev([`two_bot_job_consecutive_failures{job="counter"} 3`]).firing,
+    ...ev(
+      [`two_bot_rest_requests_total{route="other",result="2xx"} 180`, `two_bot_rest_requests_total{route="other",result="429"} 20`],
+      ev([`two_bot_rest_requests_total{route="other",result="2xx"} 100`, `two_bot_rest_requests_total{route="other",result="429"} 0`]).state,
+    ).firing,
+  ];
+  const poolLines = ["two_bot_db_pool_configured 1", "two_bot_db_pool_connections 5", "two_bot_db_pool_max_connections 5", "two_bot_db_pool_idle_connections 0"];
+  let pool = EMPTY_STATE;
+  for (let i = 0; i < 3; i++) pool = ev(poolLines, pool).state;
+  firing.push(...pool.firing);
+  firing.push(
+    ...ev(
+      [`two_bot_db_errors_total{op="admission"} 5`, `two_bot_db_errors_total{op="other"} 0`],
+      ev([`two_bot_db_errors_total{op="admission"} 0`, `two_bot_db_errors_total{op="other"} 0`]).state,
+    ).firing,
+  );
+  let blocked = EMPTY_STATE;
+  for (let i = 1; i <= 3; i++) {
+    blocked = ev([`two_bot_send_admissions_total{outcome="blocked"} ${i}`], blocked).state;
+  }
+  firing.push(...blocked.firing);
+  assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
+  const packets = transitionMessages([], firing);
+  assert.equal(packets.length, RULES.length);
+  for (const rule of RULES) {
+    const packet = packets.find((p) => p.includes(`: ${rule.summary}. Runbook: `));
+    assert.ok(packet, `${rule.id}: no fired packet carries its summary`);
+    assert.ok(packet!.includes(runbookUrl(rule)), `${rule.id}: packet lacks full deep link ${runbookUrl(rule)}`);
+    const url = packet!.slice(packet!.indexOf("Runbook: ") + "Runbook: ".length);
+    assert.ok(url.startsWith(RUNBOOK_BASE_URL), `${rule.id}: runbook is not a full docs URL: ${url}`);
+    const anchor = url.slice(`${RUNBOOK_BASE_URL}runbook.md#`.length);
+    assert.ok(slugs.has(anchor), `${rule.id}: packet URL anchor #${anchor} missing from docs/runbook.md`);
+    assert.equal(ruleFor(firing.find((k) => k.startsWith(rule.id))!)?.id, rule.id);
+  }
+});
+
 test("/ops/metrics: 404 without a configured token, 401 without/with a wrong bearer, proxied with the right one", async () => {
   const calls: Request[] = [];
   const env = (token?: string) => ({
+    // The fence stamps the deployment header on every DO forward, so the
+    // fixture must carry the version-metadata binding like production.
+    CF_VERSION_METADATA: { id: "synthetic-metrics-deployment" },
     METRICS_SCRAPE_TOKEN: token,
     REDIRECT_MAPPINGS_JSON: "[]",
     TWO_BOT: { getByName: () => ({ fetch: async (r: Request) => { calls.push(r); return new Response("ok"); } }) },

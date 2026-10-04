@@ -237,6 +237,22 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex_of(&Sha256::digest(data))
 }
 
+/// Hash an archive without allocating its whole compressed contents.
+pub fn sha256_reader_hex(mut reader: impl std::io::Read) -> std::io::Result<String> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 32 * 1024];
+    loop {
+        let len = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(len) => len,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        digest.update(&buffer[..len]);
+    }
+    Ok(hex_of(&digest.finalize()))
+}
+
 fn hex_of(digest: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(digest.len() * 2);
@@ -438,6 +454,50 @@ mod tests {
             secret_access_key: Secret::new(worked_example_secret()),
             prefix: Some("two-bot".to_owned()),
         }
+    }
+
+    #[test]
+    fn streamed_hash_bounds_reads_and_handles_short_or_interrupted_input() {
+        struct ShortReader {
+            bytes: std::io::Cursor<Vec<u8>>,
+            interrupt: bool,
+        }
+        impl std::io::Read for ShortReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                assert!(buffer.len() <= 32 * 1024, "bounded hashing buffer");
+                if std::mem::take(&mut self.interrupt) {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let len = buffer.len().min(17);
+                std::io::Read::read(&mut self.bytes, &mut buffer[..len])
+            }
+        }
+        let data = vec![b'x'; 65_537];
+        let expected = sha256_hex(&data);
+        let reader = ShortReader {
+            bytes: std::io::Cursor::new(data),
+            interrupt: true,
+        };
+        assert_eq!(sha256_reader_hex(reader).unwrap(), expected);
+        assert_eq!(
+            sha256_reader_hex(&b""[..]).unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn streamed_hash_never_returns_a_digest_after_read_failure() {
+        struct FailingReader;
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected read failure"))
+            }
+        }
+        let reader = std::io::Read::chain(&b"partial input"[..], FailingReader);
+        assert_eq!(
+            sha256_reader_hex(reader).unwrap_err().kind(),
+            std::io::ErrorKind::Other
+        );
     }
 
     #[test]

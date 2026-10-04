@@ -39,13 +39,31 @@ export const REST_429_RATIO = 0.1;
 export const REST_429_MIN_REQUESTS = 10;
 /** Pool at max with zero idle for this many consecutive samples. */
 export const POOL_SATURATED_SAMPLES = 3;
+/** DB errors must reach this many between two samples... */
+export const DB_ERROR_MIN_ERRORS = 3;
+/** ...and send-admission refusals must appear in this many consecutive samples. */
+export const SEND_BLOCKED_SAMPLES = 3;
 
 export const RULES: readonly RuleDef[] = [
   { id: "job_stale", summary: `scheduled job has no success for more than ${STALE_INTERVALS} intervals`, runbook: "runbook.md#alert-job-stale" },
   { id: "job_consecutive_failures", summary: `scheduled job failed ${FAILURE_THRESHOLD}+ times in a row`, runbook: "runbook.md#alert-job-failures" },
   { id: "rest_429_rate", summary: `Discord REST 429s exceed ${REST_429_RATIO * 100}% of requests`, runbook: "runbook.md#alert-rest-429" },
   { id: "db_pool_saturated", summary: `database pool exhausted for ${POOL_SATURATED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-db-pool" },
+  { id: "db_errors", summary: `database errors reached ${DB_ERROR_MIN_ERRORS}+ between samples`, runbook: "runbook.md#alert-db-errors" },
+  { id: "send_admission_blocked", summary: `Discord sends refused admission for ${SEND_BLOCKED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-send-admission-blocked" },
 ];
+
+/**
+ * Public docs base for fired-packet runbook deep links. The packet carries the
+ * full URL (not the relative `docs/...` path) so the soak operator can jump
+ * straight from the webhook message to the matching runbook section.
+ */
+export const RUNBOOK_BASE_URL = "https://github.com/TogetherWeOwn/two-bot-next/blob/main/docs/";
+
+/** Full deep link for a rule's runbook anchor. */
+export function runbookUrl(rule: RuleDef): string {
+  return `${RUNBOOK_BASE_URL}${rule.runbook}`;
+}
 
 export interface MetricsAlertState {
   /** Rule ids (with subject) currently firing, e.g. `job_stale:rank`. */
@@ -53,9 +71,12 @@ export interface MetricsAlertState {
   rest429: number;
   restTotal: number;
   poolStreak: number;
+  dbErrors: number;
+  sendBlocked: number;
+  sendBlockedStreak: number;
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], rest429: 0, restTotal: 0, poolStreak: 0 };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0 };
 
 export function parseExposition(text: string): Sample[] {
   const samples: Sample[] = [];
@@ -114,7 +135,26 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   const poolStreak = saturated ? prev.poolStreak + 1 : 0;
   if (poolStreak >= POOL_SATURATED_SAMPLES) firing.push("db_pool_saturated");
 
-  return { firing, state: { firing, rest429, restTotal, poolStreak } };
+  let dbErrors = 0;
+  for (const s of gauge("two_bot_db_errors_total")) dbErrors += s.value;
+  // A counter that went backwards means the process restarted: no window.
+  // `?? 0` covers DO storage written before these fields existed.
+  const prevDbErrors = prev.dbErrors ?? 0;
+  const dbReset = dbErrors < prevDbErrors;
+  if (!dbReset && dbErrors - prevDbErrors >= DB_ERROR_MIN_ERRORS) firing.push("db_errors");
+
+  let sendBlocked = 0;
+  for (const s of gauge("two_bot_send_admissions_total")) {
+    if (s.labels["outcome"] === "blocked") sendBlocked += s.value;
+  }
+  const prevSendBlocked = prev.sendBlocked ?? 0;
+  const sendReset = sendBlocked < prevSendBlocked;
+  // Sustained refusal, not one busy tick: only windows with new refusals
+  // extend the streak, so idle or self-clearing contention never pages.
+  const sendBlockedStreak = sendReset || sendBlocked === prevSendBlocked ? 0 : (prev.sendBlockedStreak ?? 0) + 1;
+  if (sendBlockedStreak >= SEND_BLOCKED_SAMPLES) firing.push("send_admission_blocked");
+
+  return { firing, state: { firing, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {
@@ -122,12 +162,28 @@ export function ruleFor(key: string): RuleDef | undefined {
   return RULES.find((r) => r.id === id);
 }
 
+/**
+ * Fired-packet filename carrying the producer identity (TOG-12100):
+ * `evidence-{ruleId}-{window}.json`. The rule id is the single shared
+ * spelling also pinned in Rust (`ALERT_RULE_IDS` in
+ * `crates/core/src/evidence.rs`) and documented in `docs/metrics.md`, so the
+ * QA evidence table can attribute packets when several rules fire in one soak
+ * window. Returns `undefined` for unknown keys rather than a misleading name.
+ */
+export function packetFilename(key: string, window: string): string | undefined {
+  const rule = ruleFor(key);
+  if (!rule) return undefined;
+  const safe = (part: string) => part.replace(/[^A-Za-z0-9._-]/g, "-");
+  return `evidence-${safe(rule.id)}-${safe(window)}.json`;
+}
+
 /** Alert-message lines for transitions; no mentions, no secrets. */
 export function transitionMessages(before: string[], after: string[]): string[] {
   const out: string[] = [];
   for (const key of after.filter((k) => !before.includes(k))) {
     const rule = ruleFor(key);
-    out.push(`two-bot-next ALERT ${key}: ${rule?.summary ?? key}. Runbook: docs/${rule?.runbook ?? "runbook.md"}`);
+    const runbook = rule ? runbookUrl(rule) : `${RUNBOOK_BASE_URL}runbook.md`;
+    out.push(`two-bot-next ALERT ${key}: ${rule?.summary ?? key}. Runbook: ${runbook}`);
   }
   for (const key of before.filter((k) => !after.includes(k))) {
     out.push(`two-bot-next RESOLVED ${key}.`);

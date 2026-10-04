@@ -551,7 +551,7 @@ fn disabled_and_ungated_wire_interactions_take_the_refusal_path() {
 }
 
 #[test]
-fn custom_rows_and_unknown_names_follow_legacy_fallthrough() {
+fn custom_rows_and_unknown_names_get_explicit_outcomes() {
     let router = InteractionRouter::new(all_on());
     let custom = slash("faq", Some(0));
     // Enabled row: everyone, no permission gate.
@@ -564,28 +564,18 @@ fn custom_rows_and_unknown_names_follow_legacy_fallthrough() {
             },
         }
     );
-    // Disabled row / no row: silence — another app's command.
-    assert_eq!(
-        route_interaction(&router, &custom, Some(false)),
-        RoutedInteraction::Slash {
-            name: "faq".to_owned(),
-            outcome: SlashOutcome::Ignore,
-        }
-    );
-    assert_eq!(
-        route_interaction(&router, &custom, None),
-        RoutedInteraction::Slash {
-            name: "faq".to_owned(),
-            outcome: SlashOutcome::Ignore,
-        }
-    );
-    // Unknown builtins (incl. the dropped rota command): silence.
-    for name in ["rota-acknowledge", "definitely-not-a-command"] {
+    // Disabled/missing rows and unknown names get the uniform private reply.
+    for row in [Some(false), None] {
         assert_eq!(
-            slash_outcome(&router, name),
-            SlashOutcome::Ignore,
-            "/{name} is not ours"
+            route_interaction(&router, &custom, row),
+            RoutedInteraction::Slash {
+                name: "faq".to_owned(),
+                outcome: SlashOutcome::Unknown,
+            }
         );
+    }
+    for name in ["rota-acknowledge", "definitely-not-a-command"] {
+        assert_eq!(slash_outcome(&router, name), SlashOutcome::Unknown);
     }
 }
 
@@ -625,11 +615,11 @@ fn component_ids_and_prefixes_route() {
             "{id} routes by prefix",
         );
     }
-    // Unknown ids and disabled surfaces: silence.
+    // Unknown ids reply; disabled surfaces remain fenced.
     assert!(matches!(
         route_interaction(&router, &component("two:unknown:thing", Vec::new()), None),
         RoutedInteraction::Component {
-            outcome: ComponentOutcome::Ignore,
+            outcome: ComponentOutcome::Unknown,
             ..
         }
     ));
@@ -664,7 +654,7 @@ fn component_ids_and_prefixes_route() {
 #[test]
 fn modal_submits_share_the_component_table() {
     let router = InteractionRouter::new(all_on());
-    // Legacy has no modals; known ids route for future slices, unknown stay silent.
+    // Legacy has no modals; they share the explicit component outcomes.
     assert_eq!(
         route_interaction(&router, &modal(&format!("{LFG_PREFIX}abc123")), None),
         RoutedInteraction::Modal {
@@ -677,7 +667,7 @@ fn modal_submits_share_the_component_table() {
     assert!(matches!(
         route_interaction(&router, &modal("two:unknown:thing"), None),
         RoutedInteraction::Modal {
-            outcome: ComponentOutcome::Ignore,
+            outcome: ComponentOutcome::Unknown,
             ..
         }
     ));
@@ -743,6 +733,289 @@ fn twilight_publish_shape_matches_the_registry_wire_shape() {
     assert_eq!(json["default_member_permissions"], "4");
     assert_eq!(json["options"][0]["type"], 6);
     assert_eq!(json["options"][1]["max_length"], 512);
+}
+
+#[tokio::test]
+async fn slow_dispatch_sends_defer_then_original_edit_on_the_wire() {
+    use common::{MockRest, ScriptedResponse};
+    use std::time::Duration;
+    use two_bot_core::router::replies::{InteractionReply, ReplyPolicy};
+    use two_bot_discord::{
+        dispatch_interaction, ActionExecutor, DispatchOptions, InteractionReplyTransport,
+    };
+    for ephemeral in [true, false] {
+        let mock = MockRest::start(Vec::new(), ScriptedResponse::status(204)).await;
+        let executor =
+            ActionExecutor::with_proxy("reply-test-token".into(), Some(mock.origin())).unwrap();
+        let interaction = slash("rank", Some(0));
+        let transport = InteractionReplyTransport::new(&executor, &interaction);
+        let options = DispatchOptions {
+            ephemeral,
+            reply_policy: ReplyPolicy::new(Duration::from_millis(10)).unwrap(),
+            ..Default::default()
+        };
+        dispatch_interaction(
+            &InteractionRouter::new(all_on()),
+            &interaction,
+            &transport,
+            options,
+            |_, _| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok::<_, &str>(InteractionReply::new("@everyone completed", ephemeral))
+            },
+        )
+        .await
+        .unwrap();
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(
+            requests[0].path,
+            "/api/v10/interactions/7/routing-test-token/callback"
+        );
+        let ack: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(ack["type"], 5);
+        assert_eq!(ack["data"]["flags"], if ephemeral { 64 } else { 0 });
+        assert!(ack["data"].get("content").is_none());
+        assert_eq!(requests[1].method, "PATCH");
+        assert_eq!(
+            requests[1].path.replace("%40", "@"),
+            "/api/v10/webhooks/1111/routing-test-token/messages/@original"
+        );
+        let edit: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(edit["content"], "@everyone completed");
+        assert_eq!(edit["allowed_mentions"]["parse"], serde_json::json!([]));
+        assert!(
+            edit.get("flags").is_none(),
+            "visibility cannot change on an edit"
+        );
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn unknown_ids_names_and_refusals_reply_without_invoking_a_handler() {
+    use common::{MockRest, ScriptedResponse};
+    use two_bot_core::router::replies::{
+        InteractionReply, EXPIRED_COMPONENT_REPLY, UNKNOWN_COMMAND_REPLY,
+    };
+    use two_bot_discord::{
+        dispatch_interaction, ActionExecutor, DispatchOptions, InteractionReplyTransport,
+    };
+    let mock = MockRest::start(Vec::new(), ScriptedResponse::status(204)).await;
+    let executor =
+        ActionExecutor::with_proxy("reply-test-token".into(), Some(mock.origin())).unwrap();
+    let router = InteractionRouter::new(all_on());
+    for interaction in [
+        slash("missing", Some(0)),
+        component("two:unknown", Vec::new()),
+        modal("two:unknown"),
+        slash("command", Some(0)),
+    ] {
+        let transport = InteractionReplyTransport::new(&executor, &interaction);
+        assert!(dispatch_interaction(
+            &router,
+            &interaction,
+            &transport,
+            DispatchOptions::default(),
+            |_, _| async {
+                panic!("unknown/refused interactions must not execute a handler");
+                #[allow(unreachable_code)]
+                Ok::<InteractionReply, &str>(InteractionReply::new("wrong", false))
+            }
+        )
+        .await
+        .unwrap());
+    }
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 4);
+    for (i, request) in requests.iter().enumerate() {
+        assert_eq!(request.method, "POST");
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["type"], 4);
+        assert_eq!(body["data"]["flags"], 64);
+        // Unknown slash names get the re-pick wording; stale
+        // components/modals get the expired-control wording.
+        let expected = match i {
+            0 => UNKNOWN_COMMAND_REPLY,
+            1 | 2 => EXPIRED_COMPONENT_REPLY,
+            _ => MANAGE_SERVER_REQUIRED,
+        };
+        assert_eq!(body["data"]["content"], expected);
+    }
+    let mut foreign = component("two:unknown", Vec::new());
+    foreign.guild_id = Some(Id::new(9999));
+    let transport = InteractionReplyTransport::new(&executor, &foreign);
+    assert!(!dispatch_interaction(
+        &router,
+        &foreign,
+        &transport,
+        DispatchOptions::default(),
+        |_, _| async {
+            panic!("foreign guild must not execute a handler");
+            #[allow(unreachable_code)]
+            Ok::<InteractionReply, &str>(InteractionReply::new("wrong", false))
+        }
+    )
+    .await
+    .unwrap());
+    assert_eq!(mock.requests().len(), 4);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_deferred_error_is_deleted_then_sent_as_private_followup() {
+    use common::{MockRest, ScriptedResponse};
+    use std::time::Duration;
+    use two_bot_core::router::replies::{InteractionReply, ReplyPolicy};
+    use two_bot_discord::{
+        dispatch_interaction, ActionExecutor, DispatchOptions, InteractionReplyTransport,
+    };
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204), ScriptedResponse::status(204)],
+        ScriptedResponse::json(200, serde_json::json!({"id": "42"})),
+    )
+    .await;
+    let executor =
+        ActionExecutor::with_proxy("reply-test-token".into(), Some(mock.origin())).unwrap();
+    let interaction = slash("rank", Some(0));
+    let transport = InteractionReplyTransport::new(&executor, &interaction);
+    dispatch_interaction(
+        &InteractionRouter::new(all_on()),
+        &interaction,
+        &transport,
+        DispatchOptions {
+            reply_policy: ReplyPolicy::new(Duration::from_millis(10)).unwrap(),
+            ..Default::default()
+        },
+        |_, _| async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Err::<InteractionReply, _>("internal database error")
+        },
+    )
+    .await
+    .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].method, "DELETE");
+    assert!(requests[1]
+        .path
+        .replace("%40", "@")
+        .ends_with("/messages/@original"));
+    assert_eq!(requests[2].method, "POST");
+    assert_eq!(
+        requests[2].path,
+        "/api/v10/webhooks/1111/routing-test-token?with_components=false"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+    assert_eq!(body["flags"], 64);
+    assert!(body["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("Something went wrong (ref "));
+    assert!(!body.to_string().contains("database"));
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn private_progress_and_completion_edit_the_created_followup_on_the_wire() {
+    use common::{MockRest, ScriptedResponse};
+    use two_bot_core::router::replies::{InteractionReply, ReplyError};
+    use two_bot_discord::{
+        dispatch_interaction, ActionExecutor, DispatchOptions, InteractionReplyTransport,
+    };
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, serde_json::json!({"id": "424242"})),
+        ],
+        ScriptedResponse::status(200),
+    )
+    .await;
+    let executor =
+        ActionExecutor::with_proxy("reply-test-token".into(), Some(mock.origin())).unwrap();
+    let interaction = slash("rank", Some(0));
+    let transport = InteractionReplyTransport::new(&executor, &interaction);
+    dispatch_interaction(
+        &InteractionRouter::new(all_on()),
+        &interaction,
+        &transport,
+        DispatchOptions::default(),
+        |_, session| async move {
+            session.defer(false).await?;
+            session
+                .respond(InteractionReply::new("private progress", true))
+                .await?;
+            session
+                .respond(InteractionReply::new("more private progress", true))
+                .await?;
+            Ok::<_, ReplyError<two_bot_discord::DiscordError>>(InteractionReply::new(
+                "@everyone final result",
+                true,
+            ))
+        },
+    )
+    .await
+    .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(requests[1].method, "DELETE");
+    assert!(requests[1]
+        .path
+        .replace("%40", "@")
+        .ends_with("/messages/@original"));
+    assert_eq!(requests[2].method, "POST");
+    let followup: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+    assert_eq!(followup["flags"], 64);
+    for (request, content) in requests[3..]
+        .iter()
+        .zip(["more private progress", "@everyone final result"])
+    {
+        assert_eq!(request.method, "PATCH");
+        assert_eq!(
+            request.path,
+            "/api/v10/webhooks/1111/routing-test-token/messages/424242"
+        );
+        let edit: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(edit["content"], content);
+        assert_eq!(edit["allowed_mentions"]["parse"], serde_json::json!([]));
+        assert!(edit.get("flags").is_none());
+    }
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn followup_requires_a_valid_message_identity_without_retrying() {
+    use common::{MockRest, ScriptedResponse};
+    use two_bot_core::router::replies::ReplyOperation;
+    use two_bot_discord::ActionExecutor;
+    for response in [
+        ScriptedResponse::status(204),
+        ScriptedResponse::json(200, serde_json::json!({"id": "0"})),
+        ScriptedResponse::json(200, serde_json::json!({"id": "not-a-snowflake"})),
+    ] {
+        let mock = MockRest::start(Vec::new(), response).await;
+        let executor =
+            ActionExecutor::with_proxy("reply-test-token".into(), Some(mock.origin())).unwrap();
+        let result = executor
+            .execute_reply_operation(
+                1111,
+                7,
+                "routing-test-token",
+                ReplyOperation::Followup(two_bot_core::router::replies::InteractionReply::new(
+                    "private", true,
+                )),
+            )
+            .await;
+        assert!(result.is_err(), "must not invent a followup edit target");
+        assert_eq!(
+            mock.requests().len(),
+            1,
+            "uncertain creation is not retried"
+        );
+        mock.shutdown().await;
+    }
 }
 
 #[tokio::test]

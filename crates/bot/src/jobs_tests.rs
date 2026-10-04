@@ -346,6 +346,8 @@ async fn every_registered_job_reports_success_in_seconds() {
     let names: Vec<_> = crate::website_jobs::NAMES
         .into_iter()
         .chain(crate::community_jobs::NAMES)
+        .chain(crate::audit_runtime::NAMES)
+        .chain(crate::scheduled_jobs::NAMES)
         .collect();
     let status = statuses(&names, false);
     let metrics = Arc::new(Metrics::default());

@@ -25,6 +25,13 @@ EXTRA_REQUIRED_VARS = {"TWO_GUILD_NAME"}
 OPTIONAL_SECRET_BINDINGS = {"OPS_ALERT_WEBHOOK_URL", "METRICS_SCRAPE_TOKEN"}
 # Absent tuning uses the code default; a named env may opt in independently.
 OPTIONAL_VARS = {"UNREADY_ALERT_FAILURES"}
+# TOG-12980 (CISO TOG-12979 C1/C10): the default-dark POST /internal/actions
+# ingress exists in staging only. A top-level var would be required in every
+# environment, so it is denied there too; production must never carry it.
+INGRESS_VAR = "INTERNAL_ACTIONS_INGRESS"
+INGRESS_ENVS = {"staging"}
+# Private-receiver config is Operator-set Worker secrets, never wrangler.toml.
+RECEIVER_CONFIG_PREFIX = "TWO_INTERNAL_"
 
 
 def check(path: Path) -> list[str]:
@@ -44,6 +51,16 @@ def check(path: Path) -> list[str]:
         variables = section.get("vars", {})
         for key in sorted(OPTIONAL_SECRET_BINDINGS & set(variables)):
             errors.append(f"{prefix}: {key} must be an optional Worker secret, never a plain var")
+        env_name = prefix[len("[env."):-len(".vars]")] if prefix.startswith("[env.") else None
+        if INGRESS_VAR in variables and env_name not in INGRESS_ENVS:
+            errors.append(
+                f"{prefix}: {INGRESS_VAR} is staging-only "
+                "(top-level vars are required in every env; production must never set it)"
+            )
+        if variables.get(INGRESS_VAR, "1") != "1":
+            errors.append(f'{prefix}: {INGRESS_VAR} must be exactly "1" or absent')
+        for key in sorted(k for k in variables if k.startswith(RECEIVER_CONFIG_PREFIX)):
+            errors.append(f"{prefix}: {key} is an Operator-set Worker secret, never a wrangler.toml var")
         threshold = variables.get("UNREADY_ALERT_FAILURES")
         if threshold is not None and (
             not isinstance(threshold, str)
@@ -74,6 +91,8 @@ def check(path: Path) -> list[str]:
                 f"{prefix}: missing [exports.{REQUIRED_CONTAINERS_CLASS}] "
                 "DO class export (exports are not inherited from the top level)"
             )
+        if env.get("version_metadata", {}).get("binding") != "CF_VERSION_METADATA":
+            errors.append(f"{prefix}: missing version_metadata binding 'CF_VERSION_METADATA'")
         missing_vars = required_vars - set(env.get("vars", {}))
         if missing_vars:
             errors.append(

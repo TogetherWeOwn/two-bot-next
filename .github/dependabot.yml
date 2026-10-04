@@ -1,28 +1,60 @@
+# Dependabot policy for two-bot-next.
+#
+# Why grouped weekly: CI runner capacity is the bottleneck, and one grouped
+# PR per ecosystem per week replaces up to N single-bump PRs. Security
+# updates are NOT grouped (applies-to: version-updates on every group), so
+# they keep arriving as separate, prioritized PRs.
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
     schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
     commit-message: { prefix: "chore(deps)" }
-    groups:
-      minor-patch:
-        patterns: ["*"]
-        update-types: [minor, patch]
+    labels: ["dependencies"]
     open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+      cargo-major:
+        applies-to: version-updates
+        update-types: [major]
+  - package-ecosystem: docker
+    directory: /
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+    commit-message: { prefix: "build(deps)" }
+    labels: ["dependencies"]
+    open-pull-requests-limit: 5
+    groups:
+      docker-minor-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+      docker-major:
+        applies-to: version-updates
+        update-types: [major]
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
     commit-message: { prefix: "ci(deps)" }
+    labels: ["dependencies"]
+    open-pull-requests-limit: 5
     groups:
-      minor-patch:
-        patterns: ["*"]
+      actions-minor-patch:
+        applies-to: version-updates
         update-types: [minor, patch]
+      actions-major:
+        applies-to: version-updates
+        update-types: [major]
   - package-ecosystem: npm
     directory: /wrangler
     schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
     commit-message: { prefix: "chore(deps)" }
-    groups:
-      minor-patch:
-        patterns: ["*"]
-        update-types: [minor, patch]
+    labels: ["dependencies"]
     open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+      npm-major:
+        applies-to: version-updates
+        update-types: [major]

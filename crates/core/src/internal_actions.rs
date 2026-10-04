@@ -1,12 +1,11 @@
-//! Website-to-bot internal actions: pure-domain half of `POST /internal/actions`.
+//! Website-to-bot internal actions: authentication and domain checks.
 //!
 //! Ports `src/internal/*` from legacy two-bot (frozen `main`, card acceptance
-//! criteria) as framework-free data plus pure functions. The axum route, the
-//! twilight Discord calls land in later slices in the bot crate. The durable
-//! guards live in `internal_action_store` behind the `db` feature; this
-//! module owns the order of the checks and every refusal the caller can see, so
-//! the whole pipeline below is unit-testable without Discord, Postgres, or a
-//! socket.
+//! criteria) as framework-free data plus pure functions. The Axum listener and
+//! Discord executor are separate concerns. Durable guards live in
+//! `internal_action_store` behind `db`; [`AuthenticatedRequest`] bridges its
+//! async nonce commit to the shared post-replay checks. The in-memory
+//! [`authorize`] path remains unit-testable without Discord, Postgres or sockets.
 //!
 //! Legacy map (`src/internal/*.ts`):
 //! - `signing.ts` — HMAC-SHA256 `sha256=` over
@@ -50,6 +49,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 
+use super::clock_guard::ClockGuard;
 use super::moderation::{require_moderation_reason, ModerationAction, ReasonError};
 
 /// Route path the canonical string signs (legacy `ACTIONS_PATH`).
@@ -63,8 +63,9 @@ pub const SKEW_SECONDS: u64 = 120;
 /// fresh up to a second past its nominal skew distance, and a nonce burned at
 /// delivery must still be live then. 241 s is the smallest TTL that covers
 /// every accepted instant for the default skew while the clocks advance together
-/// without rollback. Expiry followed by wall-clock rollback can reopen freshness;
-/// the receiver needs an explicit clock policy (see `docs/threat-model.md`, F8).
+/// without rollback. Expiry followed by wall-clock rollback used to reopen
+/// freshness; the pipeline now evaluates against a [`ClockGuard`] high-water
+/// mark and refuses regressed clocks fail-closed (see `docs/threat-model.md`, F8).
 pub const NONCE_TTL_SECONDS: u64 = 241;
 /// Diagnostic cutoff for `in_flight` idempotency claims (legacy
 /// `CLAIM_STALE_SECONDS`). Durable stale claims require reconciliation, never
@@ -169,14 +170,23 @@ impl std::fmt::Debug for SigningKey {
 pub enum KeySpecError {
     #[error("TWO_INTERNAL_KEYS entries must be \"key-id:secret\"")]
     MalformedEntry,
-    #[error("TWO_INTERNAL_KEYS: secret for \"{0}\" is shorter than 32 characters")]
+    #[error("TWO_INTERNAL_KEYS: secret for \"{0}\" is shorter than 32 bytes")]
     SecretTooShort(String),
     #[error("TWO_INTERNAL_ACTIONS=1 but no signing keys are configured")]
     NoKeys,
+    /// The ring is a map: a repeated id would silently keep one secret and
+    /// present as intermittent 401s for whichever signer holds the other.
+    #[error("TWO_INTERNAL_KEYS: key id \"{0}\" appears more than once")]
+    DuplicateKeyId(String),
+    /// Two ids sharing one secret are aliases, not separate callers: either id
+    /// verifies a capture signed for the other, and per-key buckets double.
+    #[error("TWO_INTERNAL_KEYS: key ids \"{first}\" and \"{second}\" share one secret")]
+    ReusedSecret { first: String, second: String },
 }
 
 /// Parse a `TWO_INTERNAL_KEYS` spec. Error messages name the key id, never the
-/// secret.
+/// secret. Ids must be unique and no two ids may share a secret (threat model
+/// F3); both compare exactly, after the trim the parser already applies.
 pub fn parse_keys(spec: &str) -> Result<Vec<SigningKey>, KeySpecError> {
     let mut out = Vec::new();
     for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -189,6 +199,18 @@ pub fn parse_keys(spec: &str) -> Result<Vec<SigningKey>, KeySpecError> {
         }
         if secret.len() < MIN_KEY_SECRET_LEN {
             return Err(KeySpecError::SecretTooShort(id.to_owned()));
+        }
+        if out.iter().any(|key: &SigningKey| key.id == id) {
+            return Err(KeySpecError::DuplicateKeyId(id.to_owned()));
+        }
+        if let Some(alias) = out
+            .iter()
+            .find(|key| bool::from(key.secret.expose().as_slice().ct_eq(secret.as_bytes())))
+        {
+            return Err(KeySpecError::ReusedSecret {
+                first: alias.id.clone(),
+                second: id.to_owned(),
+            });
         }
         out.push(SigningKey {
             id: id.to_owned(),
@@ -227,6 +249,8 @@ impl std::fmt::Debug for KeyRing {
 }
 
 impl KeyRing {
+    /// Build from [`parse_keys`] output. The ring is a map, so a repeated id
+    /// here keeps only the last secret; `parse_keys` refuses that spec first.
     #[must_use]
     pub fn new(keys: Vec<SigningKey>) -> Self {
         Self {
@@ -322,8 +346,10 @@ pub fn valid_nonce_format(nonce: &str) -> bool {
 /// keeping them consistent: a nonce is live while `now - seen <= ttl`.
 /// This coverage assumes expiry and freshness clocks advance together without
 /// rollback. Saturating subtraction protects retained entries, not entries already
-/// swept; wall-clock rollback can make an expired capture fresh again. The receiver
-/// must supply a clock policy rather than treating TTL coverage as unconditional.
+/// swept; wall-clock rollback used to make an expired capture fresh again. The
+/// pipeline now evaluates `now_ms` against a caller-supplied [`ClockGuard`]
+/// before burning (see [`authorize`]), so a sweep can never reopen a signed
+/// window the high-water mark has already passed.
 #[derive(Debug, Clone)]
 pub struct NonceCache {
     seen: HashMap<String, u64>,
@@ -1516,17 +1542,170 @@ impl std::fmt::Debug for AuthDecision {
     }
 }
 
+/// A signature-verified, fresh request, before replay protection or JSON parsing.
+/// The raw bytes and authenticated headers stay bound together across an async
+/// database wait. No `Clone` or `Debug`: this is a one-use capability, not a log.
+pub struct AuthenticatedRequest<'a> {
+    key_id: &'a str,
+    #[cfg(feature = "db")]
+    timestamp: &'a str,
+    #[cfg(feature = "db")]
+    skew_seconds: u64,
+    nonce: &'a str,
+    raw: &'a [u8],
+    guarded_ms: u64,
+}
+
+/// A request whose nonce has been committed. Only this type can perform the
+/// post-replay checks. Neither type exposes a public constructor.
+///
+/// ```compile_fail
+/// use two_bot_core::internal_actions::{AuthenticatedRequest, NonceBurnedRequest};
+/// fn skip_commit(request: AuthenticatedRequest<'_>) {
+///     let _ = NonceBurnedRequest(request);
+/// }
+/// ```
+pub struct NonceBurnedRequest<'a>(AuthenticatedRequest<'a>);
+
+impl<'a> AuthenticatedRequest<'a> {
+    /// Authenticate headers and exact bytes without parsing JSON or touching
+    /// replay/rate-limit state. Malformed authenticated bodies must reach the
+    /// nonce burn; unverified requests must never reach it.
+    pub fn verify(
+        headers: &AuthHeaders<'a>,
+        raw: &'a [u8],
+        keys: &KeyRing,
+        skew_seconds: u64,
+        now_ms: u64,
+        clock: &mut ClockGuard,
+    ) -> Result<Self, ActionError> {
+        if headers.key_id.is_empty()
+            || headers.timestamp.is_empty()
+            || headers.nonce.is_empty()
+            || headers.signature.is_empty()
+        {
+            return Err(auth_failure("missing_auth_headers"));
+        }
+        if !valid_nonce_format(headers.nonce) {
+            return Err(auth_failure("bad_nonce_format"));
+        }
+        if !keys.verify(
+            headers.key_id,
+            headers.signature,
+            headers.timestamp,
+            headers.nonce,
+            raw,
+        ) {
+            return Err(auth_failure("bad_signature"));
+        }
+        // Authenticate before touching the guard: a forged request cannot move
+        // the high-water mark and lock legitimate callers out.
+        let guarded_ms = clock.evaluate(now_ms).map_err(|rollback| {
+            ActionError::new(
+                ErrorCode::StaleRequest,
+                format!("Timestamp is outside the ±{skew_seconds}s window"),
+                format!(
+                    "clock_rollback: observed {roll}ms against high-water {mark}ms",
+                    roll = rollback.observed_ms,
+                    mark = rollback.high_water_ms
+                ),
+            )
+        })?;
+        if !within_skew(headers.timestamp, skew_seconds, guarded_ms / 1000) {
+            return Err(ActionError::new(
+                ErrorCode::StaleRequest,
+                format!("Timestamp is outside the ±{skew_seconds}s window"),
+                "stale_timestamp",
+            ));
+        }
+        Ok(Self {
+            key_id: headers.key_id,
+            #[cfg(feature = "db")]
+            timestamp: headers.timestamp,
+            #[cfg(feature = "db")]
+            skew_seconds,
+            nonce: headers.nonce,
+            raw,
+            guarded_ms,
+        })
+    }
+
+    /// Re-check freshness against database time and commit the nonce before any
+    /// JSON, bucket or action check. Only a successful new burn grants the next
+    /// stage. Cancellation/DB failure never grants a volatile fallback.
+    #[cfg(feature = "db")]
+    pub async fn burn_durably(
+        self,
+        store: &crate::internal_action_store::InternalActionStore,
+    ) -> Result<NonceBurnedRequest<'a>, ActionError> {
+        use crate::internal_action_store::InternalStoreError;
+
+        // The store's commit-time clock and retention use this fixed window.
+        // Do not silently widen a caller's narrower window during a DB wait.
+        if self.skew_seconds != SKEW_SECONDS {
+            return Err(ActionError::new(
+                ErrorCode::Internal,
+                "Server misconfigured: durable nonce skew mismatch",
+                "nonce_skew_mismatch",
+            ));
+        }
+        match store.burn_nonce(self.nonce, self.timestamp).await {
+            Ok(true) => Ok(NonceBurnedRequest(self)),
+            Ok(false) => Err(replayed_nonce()),
+            Err(InternalStoreError::InvalidInput) => Err(ActionError::new(
+                ErrorCode::StaleRequest,
+                "Request expired before nonce commit",
+                "stale_timestamp",
+            )),
+            Err(_) => Err(ActionError::new(
+                ErrorCode::Internal,
+                "Internal action storage unavailable",
+                "nonce_store_unavailable",
+            )),
+        }
+    }
+}
+
+impl NonceBurnedRequest<'_> {
+    /// Continue only after the nonce burn. Uses the same signed bytes, never a
+    /// separately supplied/re-serialized payload. Idempotency and per-verb
+    /// validation still belong before execution, not inside authentication.
+    pub fn authorize(
+        self,
+        flags: &InternalFlags,
+        has_store: bool,
+        has_settings: bool,
+        buckets: &mut TokenBuckets,
+    ) -> Result<AuthDecision, ActionError> {
+        authorize_burned(self.0, flags, has_store, has_settings, buckets)
+    }
+}
+
+fn replayed_nonce() -> ActionError {
+    ActionError::new(
+        ErrorCode::Replayed,
+        "This nonce has already been used",
+        "replayed_nonce",
+    )
+}
+
 /// Authorise one request against the load-bearing check order:
 ///
 /// 1. headers present → 2. signature (unknown id and bad signature are one
 ///    refusal) → 3. freshness → 4. replay (nonce burns before the body is
 ///    read, so a replay can never reach Discord) → 5. per-key bucket → 6. body
-///    parses as a JSON object → 7. action allowlisted and enabled, store and
+///    parses as one JSON object with no repeated key at any depth → 7. action
+///    allowlisted and enabled, store and
 ///    settings present where required → 8. `guild.add_member`'s tighter bucket.
 ///
 /// Buckets 5 and 8 run after verification on purpose: rate-limiting an
 /// unverified key id would let anyone lock out a legitimate caller by spamming
 /// its id.
+///
+/// The `clock` guard closes the F8 rollback gap: `now_ms` is evaluated against
+/// the caller's [`ClockGuard`] high-water mark before the nonce burns, and the
+/// mark (not a regressed reading) decides freshness. The receiver owns one
+/// guard per clock domain and persists its mark across restart/failover.
 #[allow(clippy::too_many_arguments)]
 pub fn authorize(
     headers: &AuthHeaders<'_>,
@@ -1536,37 +1715,12 @@ pub fn authorize(
     has_store: bool,
     has_settings: bool,
     skew_seconds: u64,
-    now_unix_secs: u64,
     now_ms: u64,
     nonces: &mut NonceCache,
     buckets: &mut TokenBuckets,
+    clock: &mut ClockGuard,
 ) -> Result<AuthDecision, ActionError> {
-    if headers.key_id.is_empty()
-        || headers.timestamp.is_empty()
-        || headers.nonce.is_empty()
-        || headers.signature.is_empty()
-    {
-        return Err(auth_failure("missing_auth_headers"));
-    }
-    if !valid_nonce_format(headers.nonce) {
-        return Err(auth_failure("bad_nonce_format"));
-    }
-    if !keys.verify(
-        headers.key_id,
-        headers.signature,
-        headers.timestamp,
-        headers.nonce,
-        raw,
-    ) {
-        return Err(auth_failure("bad_signature"));
-    }
-    if !within_skew(headers.timestamp, skew_seconds, now_unix_secs) {
-        return Err(ActionError::new(
-            ErrorCode::StaleRequest,
-            format!("Timestamp is outside the ±{skew_seconds}s window"),
-            "stale_timestamp",
-        ));
-    }
+    let verified = AuthenticatedRequest::verify(headers, raw, keys, skew_seconds, now_ms, clock)?;
     // The skew is configurable independently of the cache TTL, so enforce the
     // coverage relation on the live pair: a nonce must still be live at every
     // instant its signed timestamp is fresh. A skew-180/TTL-240 wiring would
@@ -1585,14 +1739,24 @@ pub fn authorize(
             "nonce_ttl_too_short",
         ));
     }
-    if !nonces.offer(headers.nonce, now_ms) {
-        return Err(ActionError::new(
-            ErrorCode::Replayed,
-            "This nonce has already been used",
-            "replayed_nonce",
-        ));
+    if !nonces.offer(verified.nonce, verified.guarded_ms) {
+        return Err(replayed_nonce());
     }
-    let per_key = buckets.take(&format!("key:{}", headers.key_id), DEFAULT_BUCKET, now_ms);
+    NonceBurnedRequest(verified).authorize(flags, has_store, has_settings, buckets)
+}
+
+fn authorize_burned(
+    verified: AuthenticatedRequest<'_>,
+    flags: &InternalFlags,
+    has_store: bool,
+    has_settings: bool,
+    buckets: &mut TokenBuckets,
+) -> Result<AuthDecision, ActionError> {
+    let per_key = buckets.take(
+        &format!("key:{}", verified.key_id),
+        DEFAULT_BUCKET,
+        verified.guarded_ms,
+    );
     if !per_key.allowed {
         return Err(ActionError::new(
             ErrorCode::RateLimited,
@@ -1602,7 +1766,7 @@ pub fn authorize(
         .with_retry_after(per_key.retry_after_secs));
     }
 
-    let body = parse_body_object(raw)?;
+    let body = parse_body_object(verified.raw)?;
     let action = match body.get("action").and_then(Value::as_str) {
         Some(a) if !a.is_empty() => a.to_owned(),
         _ => {
@@ -1617,9 +1781,9 @@ pub fn authorize(
 
     if action == "guild.add_member" {
         let per_action = buckets.take(
-            &format!("key:{}:add_member", headers.key_id),
+            &format!("key:{}:add_member", verified.key_id),
             ADD_MEMBER_BUCKET,
-            now_ms,
+            verified.guarded_ms,
         );
         if !per_action.allowed {
             return Err(ActionError::new(
@@ -1632,16 +1796,25 @@ pub fn authorize(
     }
 
     Ok(AuthDecision {
-        key_id: headers.key_id.to_owned(),
+        key_id: verified.key_id.to_owned(),
         action,
         body,
     })
 }
 
-/// Body parses as JSON and must be an object. The content-type refusal lives
-/// with the route (it needs the headers); JSON shape lives here so the order
-/// — after verify, skew, replay, and the key bucket — is pinned in one place.
-fn parse_body_object(raw: &[u8]) -> Result<Map<String, Value>, ActionError> {
+/// Body parses as JSON, repeats no object key at any depth, and is an object.
+/// The content-type refusal lives with the route (it needs the headers); JSON
+/// shape lives here so the order — after verify, skew, replay, and the key
+/// bucket — is pinned in one place. Executors that re-read the authenticated
+/// bytes call this too, so every reader of one signed body sees one document.
+///
+/// Duplicate keys are refused, not resolved (threat model F3): `serde_json`
+/// and `JSON.parse` keep the last value while other parsers keep the first or
+/// refuse, so a signed body with `"action"` twice could mean one verb to the
+/// website's audit and another here. Keys compare after unescaping, so `"a"`
+/// and `"\u0061"` collide. The refusal is one scalar class that never names
+/// the key: a body may carry an OAuth token.
+pub fn parse_body_object(raw: &[u8]) -> Result<Map<String, Value>, ActionError> {
     if raw.len() > MAX_BODY_BYTES {
         return Err(ActionError::new(
             ErrorCode::Malformed,
@@ -1652,6 +1825,15 @@ fn parse_body_object(raw: &[u8]) -> Result<Map<String, Value>, ActionError> {
     let parsed: Value = serde_json::from_slice(raw).map_err(|_| {
         ActionError::new(ErrorCode::Malformed, "Body is not valid JSON", "bad_json")
     })?;
+    // Second pass over bytes that already parsed: syntax and nesting depth
+    // are proven, so the only refusal left is a repeated key.
+    if serde_json::from_slice::<UniqueKeys>(raw).is_err() {
+        return Err(ActionError::new(
+            ErrorCode::Malformed,
+            "Body repeats a JSON object key",
+            "duplicate_json_key",
+        ));
+    }
     match parsed {
         Value::Object(map) => Ok(map),
         _ => Err(ActionError::new(
@@ -1659,6 +1841,64 @@ fn parse_body_object(raw: &[u8]) -> Result<Map<String, Value>, ActionError> {
             "Body must be a JSON object",
             "body_not_object",
         )),
+    }
+}
+
+/// Walks one JSON value without building it and fails on the first object
+/// that repeats a key. The error text is fixed and never reaches a caller.
+struct UniqueKeys;
+
+impl<'de> serde::Deserialize<'de> for UniqueKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(UniqueKeys)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for UniqueKeys {
+    type Value = Self;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self, A::Error> {
+        while seq.next_element::<UniqueKeys>()?.is_some() {}
+        Ok(self)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self, A::Error> {
+        let mut seen = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key) {
+                return Err(serde::de::Error::custom("duplicate object key"));
+            }
+            map.next_value::<UniqueKeys>()?;
+        }
+        Ok(self)
     }
 }
 
@@ -1726,7 +1966,7 @@ mod tests {
 
         #[test]
         fn property_valid_key_specs_round_trip_and_enforce_the_minimum(
-            entries in proptest::collection::vec(("[a-z0-9_-]{1,16}", "[a-zA-Z0-9:]{32,80}"), 1..=8),
+            entries in unique_key_entries(),
             length in 0usize..=64,
         ) {
             let wire = entries.iter().map(|(id, secret)| format!(" {id} : {secret} "))
@@ -1739,6 +1979,76 @@ mod tests {
                 let spec = format!("fixture:{}", "a".repeat(n));
                 prop_assert_eq!(parse_keys(&spec).is_ok(), n >= 32);
             }
+        }
+
+        #[test]
+        fn property_duplicate_key_ids_and_reused_secrets_refuse_naming_ids_only(
+            entries in unique_key_entries(),
+            pick in any::<proptest::sample::Index>(),
+            insert_at in any::<proptest::sample::Index>(),
+            fresh in "[a-zA-Z0-9]{32,40}",
+        ) {
+            let (id, secret) = pick.get(&entries).clone();
+            let at = insert_at.index(entries.len() + 1);
+            let refused = |extra: (String, String)| {
+                let mut spec = entries.clone();
+                spec.insert(at, extra);
+                let wire = spec.iter().map(|(id, secret)| format!("{id}:{secret}"))
+                    .collect::<Vec<_>>().join(",");
+                parse_keys(&wire).expect_err("ambiguous spec must refuse")
+            };
+            // Generated ids are lowercase and every generated secret ends in
+            // two digits, so `ALIAS` and a `--`-suffixed secret are new.
+            let fresh = format!("{fresh}--");
+            let alias = "ALIAS".to_owned();
+            // Whichever copy parses second is the one refused.
+            let duplicate = refused((id.clone(), fresh.clone()));
+            prop_assert_eq!(&duplicate, &KeySpecError::DuplicateKeyId(id.clone()));
+            let reused = refused((alias.clone(), secret.clone()));
+            let pick_first = entries.iter().position(|(other, _)| *other == id).unwrap() < at;
+            let (first, second) = if pick_first { (id.clone(), alias) } else { (alias, id.clone()) };
+            prop_assert_eq!(&reused, &KeySpecError::ReusedSecret { first, second });
+            for err in [duplicate, reused] {
+                let text = format!("{err} {err:?}");
+                prop_assert!(!text.contains(&fresh));
+                for (_, secret) in &entries {
+                    prop_assert!(!text.contains(secret.as_str()));
+                }
+            }
+        }
+
+        #[test]
+        fn property_duplicate_json_keys_refuse_at_any_depth(
+            path in proptest::collection::vec(("[a-z]{1,6}", any::<bool>()), 0..6),
+            key in "[a-z]{1,8}",
+            escaped in any::<bool>(),
+            first in any::<i64>(),
+            second in any::<i64>(),
+        ) {
+            // Nest `inner` under each segment: an object member, or the second
+            // element of an array inside one.
+            let wrap = |inner: String| path.iter().rev().fold(inner, |acc, (name, in_array)| {
+                if *in_array {
+                    format!("{{\"{name}\":[null,{acc}]}}")
+                } else {
+                    format!("{{\"{name}\":{acc}}}")
+                }
+            });
+            let alias = if escaped {
+                format!("\\u{:04x}{}", key.as_bytes()[0], &key[1..])
+            } else {
+                key.clone()
+            };
+            let distinct = wrap(format!("{{\"{key}\":{first},\"{key}_\":{second}}}"));
+            let repeated = wrap(format!("{{\"{key}\":{first},\"{alias}\":{second}}}"));
+            let accepted = parse_body_object(distinct.as_bytes()).expect("distinct keys parse");
+            prop_assert_eq!(Value::Object(accepted), serde_json::from_str::<Value>(&distinct).unwrap());
+            // `serde_json` alone accepts the repeat and keeps one value.
+            prop_assert!(serde_json::from_str::<Value>(&repeated).is_ok());
+            let err = parse_body_object(repeated.as_bytes()).expect_err("repeated key refuses");
+            prop_assert_eq!(err.code, ErrorCode::Malformed);
+            prop_assert_eq!(err.log_reason.as_str(), "duplicate_json_key");
+            prop_assert_eq!(err.message.as_str(), "Body repeats a JSON object key");
         }
 
         #[test]
@@ -1764,6 +2074,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 1–8 entries with unique ids and unique secrets: ids come from a set and
+    /// each secret ends in its own two-digit index.
+    fn unique_key_entries() -> impl Strategy<Value = Vec<(String, String)>> {
+        proptest::collection::btree_set("[a-z0-9_-]{1,16}", 1..=8).prop_flat_map(|ids| {
+            let n = ids.len();
+            (
+                Just(ids),
+                proptest::collection::vec("[a-zA-Z0-9:]{30,78}", n),
+            )
+                .prop_map(|(ids, secrets)| {
+                    ids.into_iter()
+                        .zip(secrets)
+                        .enumerate()
+                        .map(|(i, (id, secret))| (id, format!("{secret}{i:02}")))
+                        .collect::<Vec<_>>()
+                })
+        })
     }
 
     use crate::settings::{classify_key, SETTING_CLASSES};
@@ -2016,6 +2345,46 @@ mod tests {
         // The error names the id, never the secret.
         let err = parse_keys("web:short").expect_err("must fail");
         assert!(!format!("{err}").contains("short") || format!("{err}").contains("web"));
+    }
+
+    #[test]
+    fn parse_keys_refuses_duplicate_ids_and_reused_secrets() {
+        let (s1, s2) = (vec1().secret.as_str(), vec2().secret.as_str());
+        let duplicate = KeySpecError::DuplicateKeyId("web".to_owned());
+        assert_eq!(
+            parse_keys(&format!("web:{s1},web:{s2}")),
+            Err(duplicate.clone())
+        );
+        // Repeating the identical entry is still refused: a spec that lists
+        // one caller twice was not written the way the operator thinks.
+        assert_eq!(
+            parse_keys(&format!("web:{s1}, web : {s1} ")),
+            Err(duplicate.clone())
+        );
+        let reused = KeySpecError::ReusedSecret {
+            first: "web".to_owned(),
+            second: "web2".to_owned(),
+        };
+        // Secrets compare after the parser's own trim.
+        assert_eq!(
+            parse_keys(&format!("web:{s1},web2: {s1} ")),
+            Err(reused.clone())
+        );
+        assert_eq!(
+            parse_keys(&format!("other:{s2},web:{s1},web2:{s1}")),
+            Err(reused.clone())
+        );
+        // Ids and secrets compare exactly: case-distinct ids are separate keys.
+        assert_eq!(
+            parse_keys(&format!("web:{s1},WEB:{s2}")).map(|keys| keys.len()),
+            Ok(2)
+        );
+        for err in [duplicate, reused] {
+            for text in [format!("{err}"), format!("{err:?}")] {
+                assert!(text.contains("web"), "{text}");
+                assert!(!text.contains(s1) && !text.contains(s2), "{text}");
+            }
+        }
     }
 
     #[test]
@@ -2332,12 +2701,14 @@ mod tests {
 
     #[test]
     fn catalog_counts_match_legacy_census() {
-        // Shared legacy census: hot 41 / cold 28 / env_only 48. Count the
-        // actual entries, not just representatives of each class.
+        // Shared legacy census: hot 41 / cold 28 / env_only 48, plus the
+        // receiver's combined bind and caller mapping (both env-only),
+        // plus the two template-assistant endpoint keys (both env-only).
+        // Count actual entries, not just representatives of each class.
         for (class, expected) in [
             (SettingClass::Hot, 41),
             (SettingClass::Cold, 28),
-            (SettingClass::EnvOnly, 48),
+            (SettingClass::EnvOnly, 52),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),
@@ -2852,6 +3223,7 @@ mod tests {
         now_ms: u64,
         nonces: &mut NonceCache,
         buckets: &mut TokenBuckets,
+        clock: &mut ClockGuard,
     ) -> Result<AuthDecision, ActionError> {
         authorize(
             headers,
@@ -2861,11 +3233,77 @@ mod tests {
             true,
             true,
             SKEW_SECONDS,
-            now_ms / 1000,
             now_ms,
             nonces,
             buckets,
+            clock,
         )
+    }
+
+    #[test]
+    fn staged_verification_authenticates_before_advancing_clock() {
+        let vector = vec1();
+        let headers = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
+        let now = vector.timestamp.parse::<u64>().unwrap() * 1000;
+        let keys = ring();
+        let mut clock = ClockGuard::new();
+        let changed_body = format!("{}\n", vector.body);
+        let error = AuthenticatedRequest::verify(
+            &headers,
+            changed_body.as_bytes(),
+            &keys,
+            SKEW_SECONDS,
+            now + 300_000,
+            &mut clock,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, ErrorCode::Unauthorized);
+        assert_eq!(clock.high_water_ms(), None);
+        assert!(AuthenticatedRequest::verify(
+            &headers,
+            vector.body.as_bytes(),
+            &keys,
+            SKEW_SECONDS,
+            now,
+            &mut clock,
+        )
+        .is_ok());
+        assert_eq!(clock.high_water_ms(), Some(now));
+    }
+
+    #[test]
+    fn staged_verification_clamps_small_rollbacks_and_refuses_large_ones() {
+        use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
+
+        let vector = vec1();
+        let headers = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
+        let now = vector.timestamp.parse::<u64>().unwrap() * 1000;
+        let keys = ring();
+        let mut clock = ClockGuard::restore(now);
+        let verified = AuthenticatedRequest::verify(
+            &headers,
+            vector.body.as_bytes(),
+            &keys,
+            SKEW_SECONDS,
+            now - CLOCK_SKEW_TOLERANCE_MS,
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(verified.guarded_ms, now);
+        let error = AuthenticatedRequest::verify(
+            &headers,
+            vector.body.as_bytes(),
+            &keys,
+            SKEW_SECONDS,
+            now - CLOCK_SKEW_TOLERANCE_MS - 1,
+            &mut clock,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, ErrorCode::StaleRequest);
+        assert!(error.log_reason.starts_with("clock_rollback:"));
+        assert_eq!(clock.high_water_ms(), Some(now));
     }
 
     #[test]
@@ -2940,6 +3378,7 @@ mod tests {
         ] {
             let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
             let mut buckets = TokenBuckets::new();
+            let mut clock = ClockGuard::new();
             let nonce = test_nonce();
             let sig = sign(
                 vector.secret.as_bytes(),
@@ -2954,6 +3393,7 @@ mod tests {
                 now_ms,
                 &mut nonces,
                 &mut buckets,
+                &mut clock,
             );
             if accepted {
                 assert!(result.is_ok(), "{timestamp}");
@@ -2968,21 +3408,26 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_clock_rollback_after_nonce_expiry_reopens_capture() {
-        // Characterize the clock-policy gap, not a deployed replay guarantee:
-        // once swept, a nonce cannot guard a capture made fresh by wall rollback.
+    fn pipeline_clock_rollback_after_nonce_expiry_refuses_capture() {
+        // F8 fail-closed: accept a capture, expire and sweep its nonce, then
+        // roll time back into its signed window. The high-water guard refuses
+        // the rolled-back capture on both sweep paths — explicit sweep and a
+        // sweep via another fresh request's offer — even though the nonce is
+        // forgotten. A retained nonce still refuses rollback as a replay.
         let vector = vec1();
         let seen_ms = 1_720_000_000_000;
         let headers = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
         for explicit_sweep in [true, false] {
             let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
             let mut buckets = TokenBuckets::new();
+            let mut clock = ClockGuard::new();
             authorize_for_test(
                 &headers,
                 vector.body.as_bytes(),
                 seen_ms,
                 &mut nonces,
                 &mut buckets,
+                &mut clock,
             )
             .expect("first delivery accepted");
             let err = authorize_for_test(
@@ -2991,6 +3436,7 @@ mod tests {
                 seen_ms - 1_000,
                 &mut nonces,
                 &mut buckets,
+                &mut clock,
             )
             .expect_err("rollback cannot bypass an entry still in memory");
             assert_eq!(err.code, ErrorCode::Replayed);
@@ -3002,6 +3448,7 @@ mod tests {
                 expired_ms,
                 &mut nonces,
                 &mut buckets,
+                &mut clock,
             )
             .expect_err("old capture is stale before rollback");
             assert_eq!(err.code, ErrorCode::StaleRequest);
@@ -3023,19 +3470,124 @@ mod tests {
                     expired_ms,
                     &mut nonces,
                     &mut buckets,
+                    &mut clock,
                 )
                 .expect("another fresh request sweeps expired entries via offer");
             }
             assert!(!nonces.seen.contains_key(&vector.nonce));
-            authorize_for_test(
+            let err = authorize_for_test(
                 &headers,
                 vector.body.as_bytes(),
                 seen_ms,
                 &mut nonces,
                 &mut buckets,
+                &mut clock,
             )
-            .expect("known gap: expiry then rollback makes the capture acceptable again");
+            .expect_err("expiry then rollback must refuse, not reopen the capture");
+            assert_eq!(err.code, ErrorCode::StaleRequest);
+            assert_eq!(
+                err.log_reason.lines().next().unwrap_or(""),
+                "clock_rollback: observed 1720000000000ms against high-water 1720000241001ms"
+            );
         }
+    }
+
+    #[test]
+    fn pipeline_clock_within_tolerance_decides_at_high_water() {
+        // A freshness sample within tolerance of the mark evaluates against
+        // the mark: delivery 1 s behind the high-water mark still authorizes
+        // (it is not rollback), while the mark itself does not regress.
+        let vector = vec1();
+        let seen_ms = 1_720_000_000_000;
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
+        let headers = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
+        authorize_for_test(
+            &headers,
+            vector.body.as_bytes(),
+            seen_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect("first delivery accepted");
+        assert_eq!(clock.high_water_ms(), Some(seen_ms));
+        // A second nonce delivered 1 s behind the mark is still fresh at the
+        // mark and authorizes; the mark does not move backwards.
+        let nonce = test_nonce();
+        let sig = sign(
+            vector.secret.as_bytes(),
+            &vector.timestamp,
+            &nonce,
+            vector.body.as_bytes(),
+        );
+        let lagging = signed_headers("web", &vector.timestamp, &nonce, &sig);
+        authorize_for_test(
+            &lagging,
+            vector.body.as_bytes(),
+            seen_ms - 1_000,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect("within-tolerance delivery authorizes at the high-water mark");
+        assert_eq!(clock.high_water_ms(), Some(seen_ms));
+    }
+
+    #[test]
+    fn pipeline_clock_forward_jump_behaves_as_before() {
+        // Forward jumps keep prior behavior: the mark advances, fresh requests
+        // authorize, and stale captures refuse as stale — not as rollback.
+        let vector = vec1();
+        let seen_ms = 1_720_000_000_000;
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
+        let headers = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
+        authorize_for_test(
+            &headers,
+            vector.body.as_bytes(),
+            seen_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect("first delivery accepted");
+        // The jump must clear the ±120 s skew window: at +60 s the old
+        // capture is still fresh and its still-live nonce (TTL 241 s)
+        // correctly refuses as replay, not stale. +180 s makes it stale.
+        let jumped_ms = seen_ms + 180_000;
+        let nonce = test_nonce();
+        let timestamp = (jumped_ms / 1000).to_string();
+        let sig = sign(
+            vector.secret.as_bytes(),
+            &timestamp,
+            &nonce,
+            vector.body.as_bytes(),
+        );
+        let fresh = signed_headers("web", &timestamp, &nonce, &sig);
+        authorize_for_test(
+            &fresh,
+            vector.body.as_bytes(),
+            jumped_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect("forward jump authorizes fresh captures");
+        assert_eq!(clock.high_water_ms(), Some(jumped_ms));
+        // The old capture is stale at the jumped clock — same as before.
+        let err = authorize_for_test(
+            &headers,
+            vector.body.as_bytes(),
+            jumped_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect_err("old capture is stale after forward jump");
+        assert_eq!(err.code, ErrorCode::StaleRequest);
     }
 
     #[test]
@@ -3046,21 +3598,44 @@ mod tests {
         raw.resize(MAX_BODY_BYTES, b' ');
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let nonce = test_nonce();
         let sig = sign(vector.secret.as_bytes(), &vector.timestamp, &nonce, &raw);
         let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
-        assert!(authorize_for_test(&headers, &raw, now_ms, &mut nonces, &mut buckets).is_ok());
+        assert!(authorize_for_test(
+            &headers,
+            &raw,
+            now_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock
+        )
+        .is_ok());
 
         raw.push(b' ');
         let nonce = test_nonce();
         let sig = sign(vector.secret.as_bytes(), &vector.timestamp, &nonce, &raw);
         let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
-        let err = authorize_for_test(&headers, &raw, now_ms, &mut nonces, &mut buckets)
-            .expect_err("one byte over cap");
+        let err = authorize_for_test(
+            &headers,
+            &raw,
+            now_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect_err("one byte over cap");
         assert_eq!(err.code, ErrorCode::Malformed);
         assert_eq!(err.log_reason, "body_too_large");
-        let err = authorize_for_test(&headers, &raw, now_ms, &mut nonces, &mut buckets)
-            .expect_err("oversized request already burned its nonce");
+        let err = authorize_for_test(
+            &headers,
+            &raw,
+            now_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect_err("oversized request already burned its nonce");
         assert_eq!(err.code, ErrorCode::Replayed);
         assert_eq!(nonces.len(), 2);
     }
@@ -3071,6 +3646,7 @@ mod tests {
         let now_ms = 1_720_000_000_000;
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let wrong = signed_headers("web", &vector.timestamp, &vector.nonce, &vec2().signature);
         let unknown = signed_headers(
             "unknown",
@@ -3085,6 +3661,7 @@ mod tests {
                 now_ms,
                 &mut nonces,
                 &mut buckets,
+                &mut clock,
             )
             .expect_err("wrong signature");
             let unknown_err = authorize_for_test(
@@ -3093,6 +3670,7 @@ mod tests {
                 now_ms,
                 &mut nonces,
                 &mut buckets,
+                &mut clock,
             )
             .expect_err("unknown caller");
             assert_eq!(wrong_err, unknown_err);
@@ -3107,6 +3685,7 @@ mod tests {
             now_ms,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .is_ok());
     }
@@ -3117,6 +3696,7 @@ mod tests {
         let now_ms = 1_720_000_000_000;
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let marker = "synthetic-oauth-body-marker";
         let raw = format!("{{\"access_token\":\"{marker}\",\"action\":");
         let nonce = test_nonce();
@@ -3127,15 +3707,90 @@ mod tests {
             raw.as_bytes(),
         );
         let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
-        let err = authorize_for_test(&headers, raw.as_bytes(), now_ms, &mut nonces, &mut buckets)
-            .expect_err("malformed JSON");
+        let err = authorize_for_test(
+            &headers,
+            raw.as_bytes(),
+            now_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect_err("malformed JSON");
         assert_eq!(err.code, ErrorCode::Malformed);
         assert_eq!(err.log_reason, "bad_json");
         assert!(!format!("{err:?}").contains(marker));
         assert!(!format!("{err}").contains(marker));
-        let err = authorize_for_test(&headers, raw.as_bytes(), now_ms, &mut nonces, &mut buckets)
-            .expect_err("rejected JSON still burned its nonce");
+        let err = authorize_for_test(
+            &headers,
+            raw.as_bytes(),
+            now_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect_err("rejected JSON still burned its nonce");
         assert_eq!(err.code, ErrorCode::Replayed);
+    }
+
+    #[test]
+    fn pipeline_duplicate_json_keys_refuse_after_burning_the_nonce() {
+        let vector = vec1();
+        let now_ms = 1_720_000_000_000;
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
+        let marker = "synthetic-oauth-body-marker";
+        for raw in [
+            // Which verb runs would depend on which parser reads the body.
+            r#"{"action":"settings.get","action":"role.assign","discord_id":"123456789012345678","role_key":"member"}"#.to_owned(),
+            // An escaped spelling of the same key is the same key.
+            r#"{"action":"role.assign","\u0061ction":"guild.add_member"}"#.to_owned(),
+            // Nested, beside a token that must never be echoed.
+            format!(
+                r#"{{"action":"guild.add_member","access_token":"{marker}","meta":[{{"k":1,"k":2}}]}}"#
+            ),
+        ] {
+            let nonce = test_nonce();
+            let sig = sign(
+                vector.secret.as_bytes(),
+                &vector.timestamp,
+                &nonce,
+                raw.as_bytes(),
+            );
+            let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
+            let err = authorize_for_test(
+                &headers,
+                raw.as_bytes(),
+                now_ms,
+                &mut nonces,
+                &mut buckets,
+                &mut clock,
+            )
+            .expect_err("repeated key");
+            assert_eq!(err.code, ErrorCode::Malformed);
+            assert_eq!(err.log_reason, "duplicate_json_key");
+            for text in [format!("{err}"), format!("{err:?}")] {
+                assert!(!text.contains(marker), "{text}");
+                assert!(!text.contains("guild.add_member"), "{text}");
+            }
+            let err = authorize_for_test(
+                &headers,
+                raw.as_bytes(),
+                now_ms,
+                &mut nonces,
+                &mut buckets,
+                &mut clock,
+            )
+            .expect_err("refused body still burned its nonce");
+            assert_eq!(err.code, ErrorCode::Replayed);
+        }
+        // The frozen legacy vectors repeat no key and still parse unchanged.
+        for vector in vectors() {
+            assert_eq!(
+                Value::Object(parse_body_object(vector.body.as_bytes()).expect("vector body")),
+                serde_json::from_str::<Value>(&vector.body).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -3144,6 +3799,7 @@ mod tests {
         let now_ms = 1_720_000_000_000;
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let headers = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
         authorize_for_test(
             &headers,
@@ -3151,6 +3807,7 @@ mod tests {
             now_ms,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect("old key accepted during overlap");
         let rotated = KeyRing::new(vec![SigningKey {
@@ -3179,10 +3836,10 @@ mod tests {
             true,
             true,
             SKEW_SECONDS,
-            now_ms / 1000,
             now_ms,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("rotation must not reset global replay memory");
         assert_eq!(err.code, ErrorCode::Replayed);
@@ -3226,6 +3883,7 @@ mod tests {
         let flags = InternalFlags::from_map(&HashMap::new());
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let headers = signed_headers(
             "web",
             vec1().timestamp.as_str(),
@@ -3240,10 +3898,10 @@ mod tests {
             false,
             false,
             SKEW_SECONDS,
-            1_720_000_000,
             1_720_000_000_000,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect("valid request authorizes");
         assert_eq!(decision.action, "role.assign");
@@ -3263,10 +3921,10 @@ mod tests {
             false,
             false,
             SKEW_SECONDS,
-            1_720_000_000,
             1_720_000_000_001,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("replay");
         assert_eq!(err.code, ErrorCode::Replayed);
@@ -3282,6 +3940,7 @@ mod tests {
         let flags = InternalFlags::from_map(&HashMap::new());
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let raw = br#"{"action":"role.assign"}"#;
         let nonce = test_nonce();
         let sig = sign(vec1().secret.as_bytes(), "1000120", &nonce, raw);
@@ -3294,14 +3953,15 @@ mod tests {
             false,
             false,
             SKEW_SECONDS,
-            1_000_000,
             1_000_000_000,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect("boundary-fresh request authorizes");
         // Same request at its last fresh instant, buckets refilled.
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let headers = signed_headers("web", "1000120", &nonce, &sig);
         let err = authorize(
             &headers,
@@ -3311,10 +3971,10 @@ mod tests {
             false,
             false,
             SKEW_SECONDS,
-            1_000_240,
             1_000_240_000,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("boundary replay");
         assert_eq!(err.code, ErrorCode::Replayed);
@@ -3325,6 +3985,7 @@ mod tests {
         // is 240001 ms old, past a 240 s TTL. With the coverage TTL it is
         // still live, so this is a replay, not a second acceptance.
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let headers = signed_headers("web", "1000120", &nonce, &sig);
         let err = authorize(
             &headers,
@@ -3334,10 +3995,10 @@ mod tests {
             false,
             false,
             SKEW_SECONDS,
-            1_000_240,
             1_000_240_001,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("fractional-ms replay");
         assert_eq!(err.code, ErrorCode::Replayed);
@@ -3353,6 +4014,7 @@ mod tests {
         let flags = InternalFlags::from_map(&HashMap::new());
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let raw = br#"{"action":"role.assign"}"#;
         let nonce = test_nonce();
         let sig = sign(vec1().secret.as_bytes(), "1000180", &nonce, raw);
@@ -3365,10 +4027,10 @@ mod tests {
             false,
             false,
             180,
-            1_000_000,
             1_000_000_000,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("wide skew refused");
         assert_eq!(err.code, ErrorCode::Internal);
@@ -3382,6 +4044,7 @@ mod tests {
         let flags = InternalFlags::from_map(&HashMap::new());
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         // Stale timestamp AND bad signature: the signature refusal wins,
         // because everything after it trusts the key id.
         let headers = signed_headers("web", "1000000000", vec1().nonce.as_str(), "sha256=nope");
@@ -3393,10 +4056,10 @@ mod tests {
             false,
             false,
             SKEW_SECONDS,
-            1_720_000_000,
             1_720_000_000_000,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("bad signature");
         assert_eq!(err.code, ErrorCode::Unauthorized);
@@ -3409,6 +4072,7 @@ mod tests {
         let flags = InternalFlags::from_map(&HashMap::new());
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         // Stale but correctly signed → stale_request.
         let sig = sign(
             vec1().secret.as_bytes(),
@@ -3425,10 +4089,10 @@ mod tests {
             false,
             false,
             SKEW_SECONDS,
-            1_720_000_000,
             1_720_000_000_000,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("stale");
         assert_eq!(err.code, ErrorCode::StaleRequest);
@@ -3450,10 +4114,10 @@ mod tests {
             true,
             true,
             SKEW_SECONDS,
-            1_720_000_000,
             1_720_000_000_001,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("unknown action");
         assert_eq!(err.code, ErrorCode::ActionNotAllowed);
@@ -3466,6 +4130,7 @@ mod tests {
         let flags = InternalFlags::from_map(&HashMap::new());
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         // Exhaust the 20-burst key bucket with distinct valid nonces.
         for i in 0..20 {
             let nonce = format!("{i:032x}");
@@ -3484,10 +4149,10 @@ mod tests {
                 false,
                 false,
                 SKEW_SECONDS,
-                1_720_000_000,
                 1_720_000_000_000,
                 &mut nonces,
                 &mut buckets,
+                &mut clock,
             )
             .expect("burst allows 20");
         }
@@ -3507,10 +4172,10 @@ mod tests {
             false,
             false,
             SKEW_SECONDS,
-            1_720_000_000,
             1_720_000_000_000,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("21st is limited");
         assert_eq!(err.code, ErrorCode::RateLimited);
@@ -3523,10 +4188,12 @@ mod tests {
         let flags = InternalFlags::from_map(&HashMap::new());
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let attempt = |raw: &[u8],
                        nonce: &str,
                        nonces: &mut NonceCache,
-                       buckets: &mut TokenBuckets|
+                       buckets: &mut TokenBuckets,
+                       clock: &mut ClockGuard|
          -> ActionError {
             let sig = sign(
                 vec1().secret.as_bytes(),
@@ -3543,19 +4210,33 @@ mod tests {
                 true,
                 true,
                 SKEW_SECONDS,
-                1_720_000_000,
                 1_720_000_000_000,
                 nonces,
                 buckets,
+                clock,
             )
             .expect_err("malformed")
         };
         assert_eq!(
-            attempt(b"not json", &test_nonce(), &mut nonces, &mut buckets).code,
+            attempt(
+                b"not json",
+                &test_nonce(),
+                &mut nonces,
+                &mut buckets,
+                &mut clock
+            )
+            .code,
             ErrorCode::Malformed
         );
         assert_eq!(
-            attempt(b"[1,2]", &test_nonce(), &mut nonces, &mut buckets).code,
+            attempt(
+                b"[1,2]",
+                &test_nonce(),
+                &mut nonces,
+                &mut buckets,
+                &mut clock
+            )
+            .code,
             ErrorCode::Malformed
         );
         assert_eq!(
@@ -3563,7 +4244,8 @@ mod tests {
                 br#"{"no_action":1}"#,
                 &test_nonce(),
                 &mut nonces,
-                &mut buckets
+                &mut buckets,
+                &mut clock
             )
             .code,
             ErrorCode::Malformed
