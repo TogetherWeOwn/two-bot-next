@@ -4,13 +4,14 @@ name: staging-migrate
 # automatically and has no production path. Refuses before any DDL unless the
 # operator names an independently reviewed source SHA that is already on main,
 # the verified non-secret staging identity, and the recovery/ACL references.
-# The migrator binding TWO_BOT_STAGING_MIGRATOR_DATABASE_URL must already
-# exist; this workflow never creates or changes credentials.
-# Two jobs share one dispatch: `plan` reads the pending set through the
+# The per-mode bindings must already exist; this workflow never creates or
+# changes credentials. `plan` reads only TWO_BOT_STAGING_PLAN_DATABASE_URL (a
+# login holding only two_bot_migrator_ro, physically read-only) from the
 # no-reviewer `staging-migrate-plan` environment and always runs; `apply`
-# runs only for mode=apply, after a green plan, through the reviewed
-# `staging-migrate-apply` environment. Both environments must exist before
-# dispatch; a missing environment fails the job instead of leaking a binding.
+# reads only TWO_BOT_STAGING_MIGRATOR_DATABASE_URL from the reviewed
+# `staging-migrate-apply` environment and runs only for mode=apply, after a
+# green plan. Both environments must exist before dispatch; a missing
+# environment fails the job instead of leaking a binding.
 on:
   workflow_dispatch:
     inputs:
@@ -90,7 +91,8 @@ jobs:
       - name: Run
         env:
           # Must already exist as a staging-migrate-plan environment secret; absent means refusal.
-          TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: ${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}
+          # Read-only login (two_bot_migrator_ro): the runner refuses at validate when absent.
+          TWO_BOT_STAGING_PLAN_DATABASE_URL: ${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}
           SOURCE_SHA: ${{ inputs.source_sha }}
           STAGING_HOST: ${{ inputs.staging_host }}
           STAGING_DATABASE: ${{ inputs.staging_database }}
