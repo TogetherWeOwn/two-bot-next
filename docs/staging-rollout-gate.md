@@ -87,7 +87,11 @@ not production authorization or a migration tool.
    all components ready and the exact compiled revision/build ID, `/health` 200
    with the exact Worker version, and a lag-tolerant control-plane recheck. Any
    non-passing poll resets the streak. The success evidence records
-   `"active_lag": true` on this path.
+   `"active_lag": true` on this path. The application listing is read separately
+   from the rollout record and can briefly trail it, so a completed rollout whose
+   target digest the listing does not yet show is not accepted and not failed
+   immediately: `verify` keeps polling (last observation `application_image=stale`)
+   for up to twelve polls, then fails closed as `application_image_drift`.
 7. Require the intended Worker version at 100% traffic, `/readyz` **200** with all
    components ready and the exact compiled revision/build ID, and `/health` 200.
    Both responses carry `x-two-worker-version`, overwritten by the outer Worker

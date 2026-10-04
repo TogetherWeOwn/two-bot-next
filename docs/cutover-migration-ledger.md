@@ -34,7 +34,7 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0403_gate_cleared | up | members | re-runnable | Drop column `gate_cleared_at` and its index; NULLs carry no meaning. |
 | 0404_members_third_message_at | up | members | re-runnable | Drop column `third_message_at`; the funnel log can re-derive it. |
 | 0405_timestamptz_and_boolean | up | events, members | backout-script | Type rewrite: backout is `is_bot USING is_bot::smallint` plus restoring the old defaults; `recorded_at` default must be set back explicitly. |
-| 0406_rollback_journal | up | rollback_journal, rollback_watermarks | re-runnable | Drop both tables; journal rows are cutover evidence, re-capturable. |
+| 0406_rollback_journal | up | rollback_journal, rollback_watermarks | re-runnable | Drop both tables; journal rows are cutover evidence, re-capturable. Both tables and the store chain's `_two_bot_migrations` ledger are excluded from backups (`EXCLUDED_TABLES`): journal rows are re-capturable watch-window evidence, and restoring old watermarks could mark post-backup writes as journaled. |
 | 0407_invite_campaigns | up | invite_campaigns | re-runnable | Drop the table; no other migration reads it. |
 
 ## Cutover chain (`crates/cutover/migrations/`)
@@ -103,10 +103,12 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0410_member_erasure_audit | up | member_erasure_audit | backout-script | Unguarded `CREATE TABLE` fails on re-apply; backout drops the table (erasure evidence, export before dropping). |
 | 0411_invite_campaigns | up | invite_campaigns | re-runnable | Drop the table; campaigns are re-creatable. |
 | 0412_voice_rooms_ownership_touched | up | voice_rooms | re-runnable | Drop column `owner_touched_at`; ownership handoffs lose their timestamp. |
+| 0414_voice_rooms_custom_name | up | voice_rooms | re-runnable | Drop columns `custom_name` and `name_touched_at`; rooms fall back to their template name. |
+| 0415_internal_event_keys | up | internal_event_keys | backout-script | Unguarded `CREATE TABLE` fails on re-apply; backout drops the table (event.read loses its key map until upsert re-registers keys). |
 
 ## Notes
 
-- Voice rows (0224-0229, 0412) are listed here for completeness; their runtime
+- Voice rows (0224-0229, 0412, 0414) are listed here for completeness; their runtime
   rollback disposition belongs to the voice rollback card, not this ledger.
 - Unguarded DDL (`CREATE TABLE` / `ADD COLUMN` without `IF NOT EXISTS`) is
   classed `backout-script` even when the change is additive, because a

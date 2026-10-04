@@ -8,7 +8,7 @@ const path = require('node:path');
 const {Manifest, setLogger} = require('release-please');
 const library = path.dirname(require.resolve('release-please/package.json'));
 const {PullRequestBody} = require(path.join(library, 'build/src/util/pull-request-body'));
-const {migrateReleaseNotes} = require('./migrate-release-notes.cjs');
+const {migrateReleaseNotes, parseOverflowLink, resolveNotesBody, buildOverflowBody, NATIVE_NOTES_BRANCH} = require('./migrate-release-notes.cjs');
 const root = path.resolve(__dirname, '..');
 const read = file => fs.readFileSync(path.join(root, file), 'utf8');
 const config = JSON.parse(read('release-please-config.json'));
@@ -22,10 +22,29 @@ assert.equal(fixtureHeader, header);
 const expectedNotes = notes.trim();
 assert.match(expectedNotes, /^## \[0\.2\.0\]\(https:\/\/github\.com\/TogetherWeOwn\/two-bot-next\/releases\/tag\/v0\.2\.0\)/);
 assert.equal(footer.trim(), 'Refs: TOG-9865');
-for (const section of ['Summary', 'Changes', 'Testing']) {
-  assert(header.includes(`## ${section}\n`));
+const SECTIONS = ['Thinking Path', 'Linked Issues or Issue Description', 'What Changed', 'Verification', 'Risks', 'Model Used', 'Checklist'];
+assert.equal(SECTIONS.length, 7);
+for (const section of SECTIONS) {
+  assert.equal(header.split(`## ${section}\n`).length - 1, 1, `Header must carry exactly one ## ${section}`);
   assert(!expectedNotes.includes(`## ${section}\n`), 'Template must not enter published notes');
 }
+// Overflow canonical form: native stores this same full body in release-notes.md
+// and leaves a single-line link visible. The stored body must carry the same
+// seven sections before its first delimiter and parse to the same payload.
+const overflowVisible = buildOverflowBody('TogetherWeOwn/two-bot-next', NATIVE_NOTES_BRANCH);
+assert(!overflowVisible.includes('\n'), 'Overflow visible body is a single line');
+assert.deepEqual(parseOverflowLink(overflowVisible).branchName, NATIVE_NOTES_BRANCH);
+const overflowStored = body;
+const overflowResolved = resolveNotesBody(overflowVisible, () => overflowStored);
+assert.equal(overflowResolved, overflowStored);
+for (const section of SECTIONS) {
+  assert.equal(overflowResolved.split(`## ${section}\n`).length - 1, 1, `Stored overflow body must carry ## ${section}`);
+}
+assert.deepEqual(
+  PullRequestBody.parse(overflowResolved, logger).releaseData.map(data => data.version.toString()),
+  PullRequestBody.parse(body, logger).releaseData.map(data => data.version.toString()),
+  'Overflow stored body must parse to the same release payload',
+);
 for (const section of ['Added', 'Fixed', 'Notes']) assert(expectedNotes.includes(`### ${section}\n`));
 const historicalNotes = read('scripts/fixtures/bootstrap-changelog.md').split('\n').filter(line => line.startsWith('- '));
 for (const note of historicalNotes) assert(expectedNotes.includes(note));

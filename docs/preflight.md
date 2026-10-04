@@ -80,9 +80,11 @@ export is required. The report names this coverage gate explicitly.
 4. Every supplied level reward and every `TWO_SELF_ROLE_PANELS[].options[].roleId`
    must exist, be unmanaged, not be `@everyone`, and be strictly below the bot's
    highest role. Equal-position roles use Twilight's Discord snowflake ordering.
-   Administrator **does not bypass hierarchy**. The self-role parser extracts
-   `channelId` and `options[].roleId` from the legacy JSON array; this is not a
-   replacement for the full runtime self-role safety/configuration validator.
+   Administrator **does not bypass hierarchy**. The self-role catalogue is
+   parsed with the same strict parser as gateway boot
+   (`parse_self_role_panels`), so Discord bounds (20 reactions, 100-unit
+   button custom ids, 80-unit button labels) fail preflight before any REST.
+   Live role/channel safety beyond the catalogue still validates at runtime.
 5. For production's built-in onboarding catalogue, game **and platform** role IDs
    and primary/fallback channel IDs are checked when the game picker is enabled.
    Production catalogue IDs are never applied to another guild, and `session` or

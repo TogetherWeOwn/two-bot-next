@@ -15,8 +15,20 @@ uses `HandlerId::Moderation`; no second router, registry or HTTP client exists.
 The shared router adjudicates the configured guild, feature gate and runtime
 permissions. The invoking channel is authoritative. The channel domain validates
 required reasons, purge 1–100 and slowmode 0–21600. Lockdown changes only the
-@everyone SendMessages bit; unlock requires the recorded recovery seed and
-restores exact original masks or deletes an originally absent overwrite.
+@everyone lockdown bits: SendMessages, SendMessagesInThreads, CreatePublicThreads,
+CreatePrivateThreads and AddReactions. A role- or member-specific overwrite that
+allows sending still wins; lockdown does not edit it. Unlock requires the
+recorded recovery seed and restores exact original masks or deletes an
+originally absent overwrite.
+
+Purge lists the newest `count` messages, then bulk-deletes those under 14 days
+old and deletes older ones one by one, because Discord rejects the whole bulk
+call when any message is older. It never deletes pinned messages or this bot's
+own posts (ticket, sticky and LFG panels), so it can delete fewer than `count`;
+the reply reports the number actually deleted. A message that vanished after
+the listing is skipped. If a later delete is refused or rate limited after some
+messages are gone, the purge stops and reports the count so far. An ambiguous
+failure (5xx, timeout) keeps the claim and lane for reconciliation.
 
 READY publishes the router's complete gated registry, including the other
 builtin slices. RESUMED-only startup resolves the application through the same
@@ -51,6 +63,15 @@ confirmed unlock recovery cleanup and lane release. False means no finalization
 occurred and must never trigger another effect. SQL failure retains the claim,
 lane and recovery seed; retry only persistence with the same ticket/result.
 The older `complete` method alone does not release a runtime lane.
+
+A failure releases the lane (via `finish` with a `refused` reply) only when it
+proves no mutation was accepted: a local guard or build refusal, a confirmed
+400/401/403/404/405 rejection, a 429 (Discord documents it as not processed),
+or any failure of `/purge`'s history read. `/purge` runs the read and the delete
+as separate phases, so a 5xx, timeout or unreadable body on the read cannot
+strand the lane; the website executor already splits them the same way. A failed
+delete, overwrite write or slowmode PATCH with an ambiguous result (5xx, timeout,
+unexpected status) still keeps the claim and lane.
 
 The first lockdown seed is persisted before PUT and repeated locks preserve it.
 A proven rejected first lock can retire its new seed because the original state
