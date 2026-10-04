@@ -4,49 +4,54 @@
 
 > - two-bot-next is the Together We Own Discord bot, written in Rust, running as one always-on container.
 > - Its workspace ships as one synchronized release with one root changelog and tag.
-> - Version 0.3.0 must carry the generated changes and the preserved bootstrap notes.
-> - The release description also needs the repository's seven completed PR sections without changing native note parsing.
-> - This pull request updates release metadata; it does not authorize production cutover.
+> - Version 0.3.0 must carry generated changes and all preserved bootstrap notes.
+> - Local consumers outside the root workspace also need compatible version requirements.
+> - This pull request repairs release synchronization and canonical PR metadata without authorizing production cutover.
 
 ## Linked Issues or Issue Description
 
-- Publish the synchronized 0.3.0 workspace release, replacing 0.2.0 metadata and preserving all release and bootstrap notes. Repair the missing PR-template sections in the canonical overflow document without replacing its native link.
+- Publish the synchronized 0.3.0 workspace release and preserve every release/bootstrap note. Address the independent review's excluded-fuzz-consumer and copyable-testsupport-example findings on this same PR.
 
 ## What Changed
 
 - Update the root release manifest, seven package versions and local dependency pins, Cargo.lock, and CHANGELOG.md through release-please.
-- Complete the seven PR sections before the first native notes delimiter. Keep the generated release-note region and overflow link unchanged.
-- Credit release-please automation and the repository contributors whose changes appear in the notes below.
+- Synchronize both excluded fuzz path requirements and the testsupport dependency example to 0.3.0. Register native generic extra-file updates so later releases synchronize them too.
+- Extend the offline native lifecycle fixture with both excluded consumers, three drift controls, all six fuzz targets, and unchanged external fuzz dependencies. Update the release documentation.
+- Keep all seven PR sections before the native notes delimiter. Preserve the generated notes region and native overflow link.
+- Credit release-please automation and the repository contributors whose changes appear below.
 
 ## Verification
 
-- `node scripts/test-release-publication.cjs` with release-please 17.6.0: passed the offline native publication and misplaced-template negative control.
-- `node verify-release-metadata.cjs` with release-please 17.6.0: verified byte-identical notes, one v0.3.0 native payload, and unchanged publication through the overflow representation.
-- Strict local PR-standards validation passed all seven sections without the generated-branch exemption.
-- Regenerated head `b80d30f928cd1a4e4d894440e0191790a299f98b`: [check dispatch](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/37196605796) is still running; [supply-chain dispatch](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/37196607309) passed. The reviewer must verify all required exact-head PR-event gates before approval. Older green heads do not satisfy this gate. This repair changes only notes-branch metadata.
-- No local Rust suite, staging E2E, or production tests ran in this metadata-only repair. Independent review and publication verification remain pending.
+- `node scripts/test-release.cjs` with release-please 17.6.0: PASS, 22 bootstrap plus 22 generated post-release native lifecycles and three excluded-consumer drift controls. The new regression failed before the repair, including on the next generated release after current pins alone were fixed.
+- `node scripts/test-release-publication.cjs`: PASS, native publication, retry and misplaced-template negative control.
+- `python3 scripts/test-release-retry.py`: PASS, 28 tests. `python3 scripts/test-pr-lint.py`: PASS, 27 tests.
+- `python3 scripts/test-docker-deps.py`: PASS, seven package targets; Cargo compilation was not run. `git diff --check`: PASS.
+- Compilation-free offline Cargo resolver fixtures using the actual local dependency names, versions and requirements: all three failed before the fix (exit 101), compatible controls passed, and all three pass after the fix. The fuzz consumer fixtures retain six targets.
+- Repair head `13bc96ba5af9b2557d7e1b2f7dd37d45a07283e0` supersedes the reviewed head. New exact-head CI and independent approval are pending; older approvals or green heads do not satisfy the merge gate.
+- No local Rust compilation, full fuzz campaign, staging E2E, production tests or deployment ran. Canonical-note preservation is verified separately against the previous stored body; publication remains unverified until merge.
 
 ## Risks
 
 - Pre-1.0 release publication is not production deployment or cutover approval.
-- Changing native delimiter placement could empty the release payload; the offline parser and publication comparison protect against that regression.
-- Keep the native overflow link and all stored notes. A later regeneration must repeat the seven-section validation before review.
+- Native delimiter placement controls published notes; the pinned publication fixture protects that boundary.
+- The generic updater changes only annotated version lines; the lifecycle checks preserve the unpublished fuzz package version, external dependencies and target definitions.
+- Keep the freeze until publication is verified. A regeneration requires preserving this metadata repair and repeating exact-head CI and review.
 
 ## Model Used
 
-- OpenAI `gpt-6.1-sol` repaired the release description and checked its preservation. release-please 17.6.0 generated the versions and release notes; the historical implementation remains credited to its contributors.
+- OpenAI `gpt-6.1-sol` authored the synchronization repair and verification. release-please 17.6.0 generated the versions and release notes. A routed assertion draft returned an error and contributed no code; historical work remains credited to its contributors.
 
 ## Checklist
 
 - [x] I wrote a thinking path that runs from the project to this change
 - [x] I named the model used, with its version
 - [ ] I searched for duplicate or related PRs and linked them above (not required for this generated chore release)
-- [x] I ran the relevant offline metadata and publication tests locally and they pass (no local Rust suite)
-- [ ] I added or updated repository tests where applicable (this repair changes canonical metadata only)
-- [x] I updated the release description this change touches
+- [x] I ran the relevant offline release and resolver tests locally and they pass
+- [x] I added regression coverage for the excluded consumers and next-release synchronization
+- [x] I updated the documentation this change touches
 - [x] No secret, token or credential is in the diff, the title, the body or the branch name
 - [x] No internal ticket id, instance link or private host is in the title, body, commits or branch name
-- [ ] CI is green on the regenerated exact head before approval (full check is pending; review handoff is conditional)
+- [ ] CI is green on the repaired exact head before independent approval (pending)
 ---
 
 
