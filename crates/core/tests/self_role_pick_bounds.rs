@@ -172,10 +172,11 @@ fn unknown_picks_refuse_with_documented_reason() {
 #[test]
 fn select_delta_emits_canonical_order_and_null_option_fallback() {
     let panel = button_panel();
-    // Submitted [B, A], but mutations follow catalogue order [A, B].
+    // Submitted [B, A], but mutations follow catalogue order [A, B]. A pure
+    // grant on a non-exclusive panel is an add, not a replace.
     let desired = vec![ROLE_B.to_owned(), ROLE_A.to_owned()];
     let plan = plan_select_delta(&panel, &held(&[]), &desired).expect("plans");
-    assert_eq!(plan.operation, RoleOperation::Replace);
+    assert_eq!(plan.operation, RoleOperation::Add);
     assert_eq!(plan.add_role_ids, [ROLE_A, ROLE_B]);
     assert!(plan.remove_role_ids.is_empty());
     assert_eq!(plan.outcome, SettledOutcome::Assigned);
