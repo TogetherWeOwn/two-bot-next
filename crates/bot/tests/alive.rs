@@ -505,7 +505,7 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
                 3,
                 "registry sync on each boot: two identities plus one publication"
             );
-            &fresh[..]
+            fresh
         } else {
             assert!(
                 fresh.len() >= 3,
