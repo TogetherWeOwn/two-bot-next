@@ -874,6 +874,31 @@ async fn refused_interaction_is_answered_ephemerally_via_executor() {
 }
 
 #[tokio::test]
+async fn unconfirmed_help_does_not_invent_a_live_registry() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    assert!(runtime.published_commands().is_none());
+    runtime
+        .on_interaction(&slash("help", Some(CHANNEL), Vec::new()))
+        .await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1);
+    let reply: serde_json::Value = serde_json::from_slice(&callbacks[0].body).unwrap();
+    assert_eq!(reply["type"], 4);
+    assert_eq!(reply["data"]["flags"], 64);
+    assert_eq!(
+        reply["data"]["content"],
+        "The command list is still refreshing. Try /help again shortly."
+    );
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "no publication or store work from help"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn help_answers_immediately_from_the_live_publish_set() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     // All feature gates on: the reply must equal the rendered live set.

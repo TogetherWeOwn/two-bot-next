@@ -539,7 +539,12 @@ async fn management_republishes_whole_registry_and_dynamic_execution_audits_deli
     )
     .await;
     let runtime = runtime(pool.clone(), &mock, true);
+    let observer = runtime.clone();
+    assert!(observer.published_commands().is_none());
     runtime.sync_registry().await.unwrap();
+    let initial = observer.published_commands().expect("confirmed READY set");
+    assert_eq!(initial.len(), base);
+    assert!(!initial.iter().any(|command| command.name == "faq"));
     let options = [
         ("name", "faq"),
         ("template", "Hi {user} {username} in {server} {channel}"),
@@ -554,6 +559,13 @@ async fn management_republishes_whole_registry_and_dynamic_execution_audits_deli
         .unwrap()
         .unwrap();
     assert_eq!(row.text_trigger.as_deref(), Some("!faq"));
+    let added = observer.published_commands().expect("confirmed addition");
+    assert_eq!(added.len(), base + 1);
+    assert!(added.iter().any(|command| command.name == "faq"));
+    assert!(
+        !initial.iter().any(|command| command.name == "faq"),
+        "old readers keep an immutable snapshot"
+    );
     assert!(runtime
         .handle_interaction(&slash(21, "faq", 0, &[]), Some("Test guild"))
         .await
@@ -570,6 +582,10 @@ async fn management_republishes_whole_registry_and_dynamic_execution_audits_deli
         .handle_interaction(&slash(24, "command-remove", 32, &[("name", "faq")]), None)
         .await
         .unwrap());
+    let removed = observer.published_commands().expect("confirmed removal");
+    assert_eq!(removed.len(), base);
+    assert!(!removed.iter().any(|command| command.name == "faq"));
+    assert!(added.iter().any(|command| command.name == "faq"));
     let requests = mock.requests();
     let published = requests
         .iter()
@@ -681,6 +697,88 @@ async fn collision_and_audit_failure_do_not_mutate_and_publish_failure_is_honest
         .as_str()
         .unwrap()
         .contains("Registry publication failed"));
+    mock.shutdown().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn confirmed_discovery_snapshot_survives_committed_refresh_failures() {
+    let pool = test_pool().await;
+    let base = InteractionRouter::new(gates(true))
+        .publish_set(&[])
+        .unwrap()
+        .len();
+    let mock = MockRest::start(
+        vec![
+            registry_receipt(base, 6100),
+            ScriptedResponse::status(204),
+            registry_receipt(base + 1, 6200),
+            ScriptedResponse::json(200, json!({"id": "9001"})),
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(403),
+            ScriptedResponse::json(200, json!({"id": "9001"})),
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(403),
+            ScriptedResponse::json(200, json!({"id": "9001"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    runtime.sync_registry().await.unwrap();
+    runtime
+        .handle_interaction(
+            &slash(
+                101,
+                "command",
+                32,
+                &[("name", "alpha"), ("template", "Alpha")],
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    let confirmed = runtime.published_commands().unwrap();
+    assert!(confirmed.iter().any(|command| command.name == "alpha"));
+    runtime
+        .handle_interaction(
+            &slash(
+                102,
+                "command",
+                32,
+                &[("name", "beta"), ("template", "Beta")],
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(store::get_command(&pool, "2222", "beta")
+        .await
+        .unwrap()
+        .is_some());
+    let after_failed_add = runtime.published_commands().unwrap();
+    assert!(std::sync::Arc::ptr_eq(&confirmed, &after_failed_add));
+    assert!(!after_failed_add
+        .iter()
+        .any(|command| command.name == "beta"));
+    runtime
+        .handle_interaction(
+            &slash(103, "command-remove", 32, &[("name", "alpha")]),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(store::get_command(&pool, "2222", "alpha")
+        .await
+        .unwrap()
+        .is_none());
+    let after_failed_remove = runtime.published_commands().unwrap();
+    assert!(std::sync::Arc::ptr_eq(&confirmed, &after_failed_remove));
+    assert!(after_failed_remove
+        .iter()
+        .any(|command| command.name == "alpha"));
+    assert_eq!(mock.requests().len(), 10, "no hidden reads or retry PUTs");
     mock.shutdown().await;
     pool.close().await;
 }
