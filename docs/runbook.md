@@ -371,10 +371,16 @@ previously healthy version from your deployment record; never silently choose
 path) runs `staging-migrate --plan|--apply` from `crates/cutover/src/bin/staging_migrate.rs`.
 It embeds this crate's migrations through the SQLx **0.9.0 library** (no
 `sqlx-cli`; the pin is asserted against `Cargo.lock`), keeps the ledger in
-`public._sqlx_migrations`, and runs `SET ROLE two_bot_migrator` in SQLx's
-per-connection `after_connect`, verifying `current_user` on every connection.
-Invocation (secret-free; the URL comes only from the existing
-`TWO_BOT_STAGING_MIGRATOR_DATABASE_URL` binding):
+`public._sqlx_migrations`, and runs `SET ROLE` in SQLx's per-connection
+`after_connect`, verifying `current_user` on every connection. The two modes
+use two credentials and two groups, so the plan is physically read-only:
+`--plan` reads only `TWO_BOT_STAGING_PLAN_DATABASE_URL` (a login holding only
+`two_bot_migrator_ro`, the `staging-migrate-plan` environment secret) and runs
+as `two_bot_migrator_ro`; `--apply` reads only
+`TWO_BOT_STAGING_MIGRATOR_DATABASE_URL` (the reviewed `staging-migrate-apply`
+environment secret) and runs as `two_bot_migrator`. A mode never reads the
+other mode's binding, and an absent binding refuses before any connection.
+Invocation (secret-free; each URL comes only from its existing binding):
 
 ```text
 staging-migrate --plan --source-sha <40hex> --staging-host <host> \
