@@ -128,7 +128,10 @@ fn unlock_restores_recorded_seed() {
     ] {
         let rec = recorded(allow, deny, true);
         assert_eq!(
-            plan_unlock(Some(&rec)),
+            plan_unlock(
+                Some(&rec),
+                Some(&plan_lockdown(Some(&overwrite(allow, deny))).unwrap().write),
+            ),
             Ok(UnlockPlan::Restore {
                 allow: allow.to_owned(),
                 deny: deny.to_owned(),
@@ -140,14 +143,74 @@ fn unlock_restores_recorded_seed() {
 #[test]
 fn unlock_without_prior_overwrite_deletes_it() {
     assert_eq!(
-        plan_unlock(Some(&recorded("0", "0", false))),
+        plan_unlock(
+            Some(&recorded("0", "0", false)),
+            Some(&overwrite("0", "2048"))
+        ),
         Ok(UnlockPlan::DeleteOverwrite)
     );
 }
 
 #[test]
 fn unlock_refuses_unknown_or_absent_record() {
-    assert_eq!(plan_unlock(None), Err(UnlockError::NotLocked));
+    assert_eq!(plan_unlock(None, None), Err(UnlockError::NotLocked));
+}
+
+#[test]
+fn unlock_preserves_live_access_edits_and_only_restores_the_send_bits() {
+    for prior_exists in [false, true] {
+        for (prior_allow, prior_deny) in [(0_u64, 0_u64), (2048, 0), (0, 2048)] {
+            if !prior_exists && (prior_allow != 0 || prior_deny != 0) {
+                continue;
+            }
+            let rec = recorded(
+                &prior_allow.to_string(),
+                &prior_deny.to_string(),
+                prior_exists,
+            );
+            // VIEW_CHANNEL was denied after lockdown; a new unrelated allow
+            // and a high permission bit were added too. None may be reverted.
+            let live_allow = 8192_u64 | (1 << 48);
+            let live_deny = 1024_u64 | 2048;
+            let plan = plan_unlock(
+                Some(&rec),
+                Some(&overwrite(&live_allow.to_string(), &live_deny.to_string())),
+            );
+            assert_eq!(
+                plan,
+                Ok(UnlockPlan::Restore {
+                    allow: (live_allow | prior_allow).to_string(),
+                    deny: (1024 | prior_deny).to_string(),
+                })
+            );
+        }
+    }
+}
+
+#[test]
+fn unlock_refuses_missing_overwrite_and_send_bit_drift() {
+    let rec = recorded("2048", "0", true);
+    assert_eq!(plan_unlock(Some(&rec), None), Err(UnlockError::Drift));
+    for (allow, deny) in [("0", "1024"), ("2048", "3072"), ("2048", "0")] {
+        assert_eq!(
+            plan_unlock(Some(&rec), Some(&overwrite(allow, deny))),
+            Err(UnlockError::Drift)
+        );
+    }
+    assert!(UnlockError::Drift
+        .to_string()
+        .contains("no mutation attempted"));
+}
+
+#[test]
+fn unlock_refuses_corrupt_live_masks() {
+    let rec = recorded("0", "0", false);
+    for (allow, deny) in [("bad", "2048"), ("0", "bad"), ("0", "18446744073709551616")] {
+        assert!(matches!(
+            plan_unlock(Some(&rec), Some(&overwrite(allow, deny))),
+            Err(UnlockError::InvalidMask(_))
+        ));
+    }
 }
 
 #[test]

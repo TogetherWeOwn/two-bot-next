@@ -137,11 +137,11 @@ impl ChannelModerationStore {
         &self.pool
     }
 
-    /// Remember exactly what the `@everyone` overwrite was before Owen denied
-    /// `SendMessages`. Insert-only: a repeated lockdown refreshes the reason
-    /// but can never replace the original pre-lock masks (or the original
-    /// recovery generation) with the already-locked masks (legacy
-    /// `recordLockdown`, TOG-1659 High 1).
+    /// Remember the live `@everyone` overwrite before Owen denies `SendMessages`.
+    /// While the live send deny remains set, preserve the first masks/generation.
+    /// If it was cleared externally, refresh the seed and mint a new generation
+    /// atomically, so a later unlock never uses the stale cycle's send bits.
+    /// Callers must serialize channel mutations and supply a freshly read seed.
     pub async fn record_lockdown(
         &self,
         channel_id: &str,
@@ -150,12 +150,20 @@ impl ChannelModerationStore {
         reason: &str,
         locked_at: &str,
     ) -> Result<LockdownRecord, sqlx::Error> {
+        let live_deny = seed.prior_deny.parse::<u64>().map_err(|_| {
+            sqlx::Error::InvalidArgument("invalid lockdown permission mask".to_owned())
+        })?;
+        let refresh = live_deny & super::channel_moderation::SEND_MESSAGES_BIT == 0;
         let row = sqlx::query(
             "INSERT INTO moderation_lockdowns
                (channel_id, guild_id, prior_allow, prior_deny, prior_exists, reason, locked_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (channel_id) DO UPDATE
-               SET reason = excluded.reason,
+               SET prior_allow = CASE WHEN $8 THEN excluded.prior_allow ELSE moderation_lockdowns.prior_allow END,
+                   prior_deny = CASE WHEN $8 THEN excluded.prior_deny ELSE moderation_lockdowns.prior_deny END,
+                   prior_exists = CASE WHEN $8 THEN excluded.prior_exists ELSE moderation_lockdowns.prior_exists END,
+                   recovery_generation = CASE WHEN $8 THEN excluded.recovery_generation ELSE moderation_lockdowns.recovery_generation END,
+                   reason = excluded.reason,
                    locked_at = excluded.locked_at
              RETURNING channel_id, guild_id, prior_allow, prior_deny, prior_exists, reason,
                        recovery_generation",
@@ -167,6 +175,7 @@ impl ChannelModerationStore {
         .bind(seed.prior_exists)
         .bind(reason)
         .bind(locked_at)
+        .bind(refresh)
         .fetch_one(&self.pool)
         .await?;
         Ok(LockdownRecord {
@@ -1005,7 +1014,13 @@ mod tests {
         let got = store.get_lockdown(channel).await.expect("reads");
         assert_eq!(got, Some(rec.clone()));
         assert_eq!(
-            crate::channel_moderation::plan_unlock(got.as_ref()),
+            crate::channel_moderation::plan_unlock(
+                got.as_ref(),
+                Some(&crate::channel_moderation::EveryoneOverwrite {
+                    allow: "1024".to_owned(),
+                    deny: "10240".to_owned(),
+                }),
+            ),
             Ok(crate::channel_moderation::UnlockPlan::Restore {
                 allow: "1024".to_owned(),
                 deny: "8192".to_owned(),
@@ -1018,7 +1033,7 @@ mod tests {
             .expect("clears"));
         assert_eq!(store.get_lockdown(channel).await.expect("reads"), None);
         assert_eq!(
-            crate::channel_moderation::plan_unlock(None),
+            crate::channel_moderation::plan_unlock(None, None),
             Err(crate::channel_moderation::UnlockError::NotLocked)
         );
         store.cleanup().await;
@@ -1027,7 +1042,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires agent-testdb or the CI Postgres service"]
     async fn repeated_lockdown_preserves_first_masks() {
-        // Legacy `recordLockdown` is insert-only: a repeated lockdown refreshes
+        // While the live send deny remains set, a repeated lockdown refreshes
         // the reason but never replaces the original pre-lock masks with the
         // already-locked masks.
         let store = test_store().await;
@@ -1071,6 +1086,57 @@ mod tests {
             .clear_lockdown(channel, &second.recovery_generation)
             .await
             .expect("clears"));
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn live_unlock_refreshes_the_next_lockdown_seed_and_generation() {
+        let store = test_store().await;
+        let channel = "t-lock-refresh";
+        let first = store
+            .record_lockdown(
+                channel,
+                "g1",
+                &super::super::channel_moderation::LockdownSeed {
+                    prior_allow: "3072".to_owned(),
+                    prior_deny: "8192".to_owned(),
+                    prior_exists: true,
+                },
+                "first",
+                "2026-09-30T00:00:00.000Z",
+            )
+            .await
+            .unwrap();
+        // An external edit removed the send deny and the entire overwrite.
+        let next = store
+            .record_lockdown(
+                channel,
+                "g1",
+                &super::super::channel_moderation::LockdownSeed {
+                    prior_allow: "0".to_owned(),
+                    prior_deny: "0".to_owned(),
+                    prior_exists: false,
+                },
+                "next",
+                "2026-09-30T00:01:00.000Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                &next.prior_allow[..],
+                &next.prior_deny[..],
+                next.prior_exists
+            ),
+            ("0", "0", false)
+        );
+        assert_ne!(next.recovery_generation, first.recovery_generation);
+        assert!(!store
+            .clear_lockdown(channel, &first.recovery_generation)
+            .await
+            .unwrap());
+        assert_eq!(store.get_lockdown(channel).await.unwrap(), Some(next));
         store.cleanup().await;
     }
 
@@ -1126,9 +1192,13 @@ mod tests {
         assert_eq!(stale_a, first);
         assert_eq!(stale_b, first);
         // The first unlock restores its own generation and clears it.
+        let current = crate::channel_moderation::EveryoneOverwrite {
+            allow: "1024".to_owned(),
+            deny: "10240".to_owned(),
+        };
         assert_eq!(
-            crate::channel_moderation::plan_unlock(Some(&stale_a)),
-            crate::channel_moderation::plan_unlock(Some(&stale_b))
+            crate::channel_moderation::plan_unlock(Some(&stale_a), Some(&current)),
+            crate::channel_moderation::plan_unlock(Some(&stale_b), Some(&current))
         );
         assert!(store
             .clear_lockdown(channel, &stale_a.recovery_generation)
@@ -1163,7 +1233,14 @@ mod tests {
             Some(second.clone())
         );
         assert!(
-            crate::channel_moderation::plan_unlock(Some(&second)).is_ok(),
+            crate::channel_moderation::plan_unlock(
+                Some(&second),
+                Some(&crate::channel_moderation::EveryoneOverwrite {
+                    allow: "4096".to_owned(),
+                    deny: "18432".to_owned(),
+                }),
+            )
+            .is_ok(),
             "the new cycle still unlocks"
         );
         assert!(store

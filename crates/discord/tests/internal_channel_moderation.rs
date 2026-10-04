@@ -259,6 +259,80 @@ async fn rejected_repeated_lockdown_preserves_original_seed_and_unlock_failure_k
 
 #[tokio::test]
 #[ignore = "requires agent-testdb or CI service container"]
+async fn unlock_preserves_live_privacy_changes_instead_of_restoring_a_snapshot() {
+    for prior in [None, Some("3072")] {
+        let db = TestDb::new().await;
+        seed_lockdown(&db, prior).await;
+        let mock = MockRest::start(
+            vec![
+                channel(Some("16384"), "3072"),
+                ScriptedResponse::status(204),
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let exec = executor(db.pool.clone(), &mock);
+        let result = exec
+            .execute(
+                &request("moderation.unlock", json!({})),
+                &actor(),
+                "privacy-unlock",
+                "privacy-unlock-key",
+                TIME,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, "unlocked");
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[1].method, "PUT");
+        let body: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            body["allow"],
+            if prior.is_some() { "18432" } else { "16384" }
+        );
+        assert_eq!(body["deny"], "1024");
+        assert!(db.store().get_lockdown(CHANNEL).await.unwrap().is_none());
+        mock.shutdown().await;
+        db.cleanup().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn unlock_send_bit_drift_aborts_without_consuming_the_recovery_seed() {
+    let db = TestDb::new().await;
+    let seed = seed_lockdown(&db, Some("3072")).await;
+    let mock = MockRest::start(
+        vec![channel(Some("0"), "1024")],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let exec = executor(db.pool.clone(), &mock);
+    let failure = exec
+        .execute(
+            &request("moderation.unlock", json!({})),
+            &actor(),
+            "drift-unlock",
+            "drift-unlock-key",
+            TIME,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failure.code, ErrorCode::ActionNotAllowed);
+    assert!(failure.message.contains("no mutation attempted"));
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(mock.requests()[0].method, "GET");
+    assert_eq!(db.store().get_lockdown(CHANNEL).await.unwrap(), Some(seed));
+    assert_reservations(&db, 0).await;
+    assert_audit(&db, "moderation.unlock", "refused", "cleanup", None).await;
+    mock.shutdown().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
 async fn stale_channel_ticket_and_recovery_generation_cannot_finish_current_owner() {
     use two_bot_core::channel_moderation_store::{ChannelAuditRow, ChannelClaim};
     let db = TestDb::new().await;
@@ -352,7 +426,18 @@ async fn ambiguous_permission_responses_retain_request_channel_and_recovery_fenc
             };
             let mock = MockRest::start(
                 vec![
-                    channel(prior_allow, "8192"),
+                    if action == "moderation.unlock" {
+                        channel(
+                            Some(if prior_allow.is_some() { "1024" } else { "0" }),
+                            if prior_allow.is_some() {
+                                "10240"
+                            } else {
+                                "2048"
+                            },
+                        )
+                    } else {
+                        channel(prior_allow, "8192")
+                    },
                     ScriptedResponse::status(status),
                 ],
                 ScriptedResponse::status(500),
@@ -446,8 +531,16 @@ async fn recovery_read_failures_release_both_fences_and_preserve_original_seed()
             .unwrap();
         let mock = MockRest::start(
             vec![
-                channel(Some("3072"), "8192"),
-                channel(Some("3072"), "8192"),
+                if has_seed {
+                    channel(Some("1024"), "10240")
+                } else {
+                    channel(Some("3072"), "8192")
+                },
+                if has_seed {
+                    channel(Some("1024"), "10240")
+                } else {
+                    channel(Some("3072"), "8192")
+                },
                 ScriptedResponse::status(204),
                 channel(Some("3072"), "8192"),
                 ScriptedResponse::json(200, json!({"id": CHANNEL})),
@@ -515,7 +608,11 @@ async fn rejected_channel_reservations_release_request_claim_and_allow_same_key_
         .unwrap();
         let mock = MockRest::start(
             vec![
-                channel(Some("3072"), "8192"),
+                if repeated {
+                    channel(Some("1024"), "10240")
+                } else {
+                    channel(Some("3072"), "8192")
+                },
                 ScriptedResponse::status(204),
                 channel(None, "0"),
                 ScriptedResponse::json(200, json!({"id": CHANNEL})),
@@ -663,8 +760,16 @@ async fn rejected_recovery_writes_release_reservations_without_discord_mutation(
         .unwrap();
         let mock = MockRest::start(
             vec![
-                channel(Some("3072"), "8192"),
-                channel(Some("3072"), "8192"),
+                if repeated {
+                    channel(Some("1024"), "10240")
+                } else {
+                    channel(Some("3072"), "8192")
+                },
+                if repeated {
+                    channel(Some("1024"), "10240")
+                } else {
+                    channel(Some("3072"), "8192")
+                },
                 ScriptedResponse::status(204),
                 channel(None, "0"),
                 ScriptedResponse::json(200, json!({"id": CHANNEL})),
@@ -902,7 +1007,7 @@ async fn seed_lockdown(db: &TestDb, prior_allow: Option<&str>) -> two_bot_core::
             GUILD,
             &two_bot_core::LockdownSeed {
                 prior_allow: prior_allow.unwrap_or("0").to_owned(),
-                prior_deny: "8192".to_owned(),
+                prior_deny: if prior_allow.is_some() { "8192" } else { "0" }.to_owned(),
                 prior_exists: prior_allow.is_some(),
             },
             "cleanup",
