@@ -429,7 +429,8 @@ It refuses (exit 2, before any DDL) when the binding is absent, the target does
 not equal the pinned staging host/database inputs, either pin is empty or looks
 like production, either host pin or the binding host is a pooler endpoint
 (session `SET ROLE` and the migrator lock need the direct endpoint), the login
-cannot assume `two_bot_migrator`, a reference is missing, `--apply` has no
+cannot assume `two_bot_migrator` (apply) or `two_bot_migrator_ro` (plan), the
+plan login also holds `two_bot_migrator`, a reference is missing, `--apply` has no
 `--expected-pending` or it mismatches, `--apply` has no `plan_manifest_sha256`/
 `plan_run_id` or the hash does not match the recomputed manifest, `--apply`
 has no producing-run manifest or that manifest does not carry the bound hash,
@@ -442,14 +443,24 @@ SHA, per-migration SHA-384, ledger before/after, applied count, plus its own
 `plan_manifest_sha256` and the bound `plan_run_id`) is the evidence;
 on failure the ledger-after is preserved, not repaired.
 
-The workflow runs only when dispatched from `main` and splits into two jobs.
+The workflow runs only when dispatched from `main` and splits into three jobs.
 The `plan` job always runs and reads the binding from the `staging-migrate-plan`
 GitHub environment, which carries no reviewer because planning changes nothing;
 it uploads `staging-migrate-manifest.json` as the `staging-migrate-manifest`
 run artifact (14-day retention), which is where the reviewer reads
-`plan_manifest_sha256`/`plan_run_id` for the apply dispatch.
-the `apply` job runs only for `mode: apply`, after a green plan, and reads the
-binding from the `staging-migrate-apply` environment, which must have a
+`plan_manifest_sha256`/`plan_run_id` for the apply dispatch. The digest is the
+embedded source/pending/migration projection, **not** SHA-256 of the JSON or ZIP.
+For `mode: apply`, the unprotected `claim` job validates this dispatch's read-only
+plan against the request and uploads `staging-migrate-apply-claim.json` as the
+`staging-migrate-apply-claim` artifact, before apply waits for environment approval.
+It has no database secrets or environment; a step inside the waiting apply job
+cannot publish evidence before approval. Both artifact uploads disable compression
+for the bounded stored-ZIP reader. The [claim contract](staging-migrate-claim.md)
+defines the exact versioned fields, serialization vector and consumer requirements.
+The claim is a request, not proof of producer provenance or CEO GO; the independent
+protection-rule consumer must authenticate both runs and the prior plan artifact.
+The `apply` job runs only for `mode: apply`, after a green plan **and claim**, and
+reads the binding from the `staging-migrate-apply` environment, which must have a
 required reviewer and a main-only deployment-branch rule. Both bindings must be
 environment secrets, not repository secrets; otherwise a workflow edited on
 another branch could read them. This change does not create the environments or
@@ -457,7 +468,11 @@ the secrets: create both before dispatch, or the jobs fail instead of running.
 
 Prerequisites the legitimate principal must verify **before dispatch** (the
 runner cannot, and this change does not claim them): the real staging Neon
-identity; that the dedicated migrator binding already exists; the
+identity; that both dedicated bindings already exist, each in its own
+environment: `TWO_BOT_STAGING_PLAN_DATABASE_URL` (a login holding only
+`two_bot_migrator_ro`) in `staging-migrate-plan` for the `plan` job, and
+`TWO_BOT_STAGING_MIGRATOR_DATABASE_URL` in `staging-migrate-apply` for the
+`apply` job, since the two jobs never share a credential; the
 `staging-migrate-plan` / `staging-migrate-apply` environment protections
 above; and a complete
 recovery set covering the Next schema, `_sqlx_migrations` ledger, object
@@ -466,6 +481,17 @@ SQLx history, and unverified Neon PITR is not a working recovery. Apply the
 reviewed ACL sequence in `docs/database-roles.md` so other shared-database
 services keep their access. Real SQLx proof runs only against disposable CI
 services (`crates/cutover/tests/staging_migrate_db.rs`).
+
+The plan login must hold only `two_bot_migrator_ro`: `--plan` refuses, before it
+reads the ledger, when the login is a member of `two_bot_migrator` (directly,
+by inheritance, or as a superuser), and the refusal names the role and never
+the login or the URL. The `source_sha` input picks the commit whose runner is
+built, while the plan/apply split itself comes from the workflow on `main`. A
+plan dispatched with a `source_sha` older than `3d1e2ddd` therefore builds the
+pre-split runner, which looks for `TWO_BOT_STAGING_MIGRATOR_DATABASE_URL`; the
+`plan` job never exports that binding, so the old runner refuses before any
+connection (fail closed). Dispatch plan and apply with a `source_sha` at or
+after the split.
 
 ### Redeploy the approved revision
 

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "kind": "staging-migrate-apply-claim",
+  "repository": "TogetherWeOwn/two-bot-next",
+  "workflow_path": ".github/workflows/staging-migrate.yml",
+  "environment_name": "staging-migrate-apply",
+  "apply_run_id": "37110947191",
+  "apply_run_attempt": "2",
+  "workflow_head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "plan_run_id": "37110947190",
+  "plan_manifest_sha256": "e4a3136346ca546df4f1f4f654322c278ff7df1d5902ec5685cd43036b41beea",
+  "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "target": {
+    "host": "staging.invalid",
+    "database": "two_bot"
+  },
+  "expected_pending": [
+    "1",
+    "9007199254740993"
+  ],
+  "recovery_evidence_ref": "recovery-review#decision",
+  "acl_plan_ref": "acl-review#decision"
+}
