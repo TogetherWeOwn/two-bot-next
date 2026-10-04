@@ -206,7 +206,7 @@ pub async fn import(
         };
         // `created_by`/`created_at` only matter for fresh rows; the upsert
         // preserves them on conflict.
-        store::put_command(&mut *tx, &row, actor, at, actor, at).await?;
+        store::put_command(&mut *tx, &row, actor, actor, at, at).await?;
         enabled.insert(name, live);
         let created = !seen.contains(name) && !preexisting.contains(name);
         seen.insert(name);

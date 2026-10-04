@@ -66,6 +66,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       TWO_CUSTOM_COMMAND_TEST_CI: "1"
+      TWO_AUTOMATION_TRANSFER_TEST_CI: "1"
       # Disk hygiene for hosted overflow runners (TOG-12134): the integration
       # link step (`cargo test --workspace --test '*'`) links ~70 test
       # binaries and exhausted the job-container overlay (98 MB left, rust-lld

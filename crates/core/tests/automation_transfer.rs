@@ -127,7 +127,7 @@ async fn import_applies_mee6_payload_and_refuses_live_collisions() {
         text_trigger: Some("!live".to_owned()),
         enabled: true,
     };
-    store::put_command(&pool, &live, ACTOR, AT, ACTOR, AT)
+    store::put_command(&pool, &live, ACTOR, ACTOR, AT, AT)
         .await
         .expect("seed live");
     let changed = parse(&json!({
