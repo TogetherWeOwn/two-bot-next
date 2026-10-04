@@ -236,7 +236,7 @@ pub fn classify_leave_gaps(
         }
         // Compare instants, retain the source spelling in reports and fills.
         let mut times = times;
-        times.sort_by(|a, b| a.0.cmp(&b.0));
+        times.sort_by_key(|a| a.0);
         let last_join_ms = times.last().map(|(ms, _)| *ms).unwrap_or(0);
         let last_join = times.last().map(|(_, s)| s.clone()).unwrap_or_default();
         let spellings: Vec<String> = times.into_iter().map(|(_, s)| s).collect();
