@@ -2606,10 +2606,10 @@
         ]
       },
       "owner": [
-        "TOG-11149"
+        "TOG-15277"
       ],
       "status": "waived",
-      "action": "Replay interleaved same-member voice frames across two channels through TOG-11149’s contract suite.",
+      "action": "Replay a same-tick burst of same-member voice frames across two channels through the fixture added by TOG-15277.",
       "expected": "Frames apply serially per member and idempotency keys are channel-scoped: one session per channel, no cross-channel dedupe.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
@@ -2624,19 +2624,18 @@
           "[7da2c15](https://github.com/TogetherWeOwn/two-bot/commit/7da2c15d41447a3a1b0a8033039db0fddd9633e0)",
           "`src/discord/`",
           "TOG-6123: drop open voice sessions on fresh session (ShardReady) as well as resume",
-          "gap"
+          "ported"
         ]
       },
       "owner": [
         "TOG-11149"
       ],
-      "status": "waived",
-      "action": "In TOG-11149’s contract suite, open voice sessions and then deliver a fresh ShardReady and a resume.",
-      "expected": "Open sessions are dropped on both fresh session and resume.",
-      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "automated",
+      "action": "Run the READY and RESUMED reconnect-drop fixtures in `crates/discord/tests/funnel_replay.rs`.",
+      "expected": "Open voice sessions are dropped on both a fresh session (READY) and a resume; a first READY with nothing open writes nothing and the next leave ends unknown-start.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test funnel_replay -- pipeline_fresh_session_ready_drops_open_voice_sessions pipeline_voice_boundaries_and_reconnect_drop",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
     },
     {
       "id": "s13-448cf1d",
@@ -2646,19 +2645,18 @@
           "[448cf1d](https://github.com/TogetherWeOwn/two-bot/commit/448cf1d99f8a060d1d8fbc587c5b00bec7cee9ab)",
           "`src/core/`, `src/discord/`, `src/staging/`",
           "TOG-6122: close open voice session on server-leave (end to open channel, duration to leave time)",
-          "gap"
+          "ported"
         ]
       },
       "owner": [
         "TOG-11149"
       ],
-      "status": "waived",
-      "action": "In TOG-11149’s contract suite, have a member in voice leave the server.",
-      "expected": "The open session closes on its open channel with duration ending at the leave time.",
-      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "automated",
+      "action": "Run the server-leave-mid-voice fixtures in `crates/discord/tests/funnel_replay.rs`, `crates/core/src/handlers.rs` and `crates/core/src/voice.rs`.",
+      "expected": "The open session closes on its open channel with duration ending at the leave time; the tracker is emptied and a repeated leave writes no second end row.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test funnel_replay -- pipeline_leave_closes_voice_first pipeline_voice_move_and_server_leave_share_receipt_boundaries && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib -- handlers::tests::leave_closes_open_session_then_records voice::tests::resolve_measured_and_unknown",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
     },
     {
       "id": "s13-6928f11",
@@ -2903,12 +2901,11 @@
         ]
       },
       "owner": [
-        "TOG-10869",
-        "TOG-10078"
+        "TOG-15281"
       ],
       "status": "waived",
-      "action": "Run TOG-10869’s shutdown-preflight fixture with pending rows exactly at and above the report limit.",
-      "expected": "Truncated is reported only when rows were actually cut.",
+      "action": "Run the disable-guard report fixture with owed ids exactly at and just above the 10-id naming limit (TOG-15281).",
+      "expected": "`+N more` appears only when ids were actually left unnamed; counts stay exact.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
       "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
       "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
@@ -2967,11 +2964,11 @@
         ]
       },
       "owner": [
-        "TOG-11149"
+        "TOG-15277"
       ],
       "status": "waived",
-      "action": "Deliver a voice leave with a malformed timestamp through TOG-11149’s contract suite.",
-      "expected": "The session is treated as unknown-start, not a fabricated duration.",
+      "action": "Deliver a voice leave with a malformed timestamp, with and without an open session, through the fixture added by TOG-15277.",
+      "expected": "The session is treated as unknown-start, not a fabricated duration, and no leveling XP is awarded.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
       "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
@@ -3031,12 +3028,11 @@
         ]
       },
       "owner": [
-        "TOG-10869",
-        "TOG-10078"
+        "TOG-15281"
       ],
       "status": "waived",
-      "action": "Run TOG-10869’s shutdown-preflight fixture with a running unban claim left by a stopped worker.",
-      "expected": "The preflight names each stranded claim with hand-release steps; the executor itself stays TOG-10078.",
+      "action": "Run the disable-guard fixture with a running unban claim left by a stopped worker (TOG-15281).",
+      "expected": "The refusal tags each running claim and gives the supported release steps.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
       "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
       "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
@@ -3459,16 +3455,17 @@
           "[8b5d1e1](https://github.com/TogetherWeOwn/two-bot/commit/8b5d1e18b1e14bd7a7a1ad63c5b7a8dde642057f)",
           "`src/announcements/`",
           "fix(lfg): reject reserved leave-action role keys (#414)",
-          "gap"
+          "ported"
         ]
       },
       "owner": [
         "TOG-10260"
       ],
-      "status": "manual",
-      "action": "Attempt to configure an LFG role key equal to the reserved leave action through the normal config path.",
-      "expected": "The key is refused; the leave action keeps working.",
-      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+      "status": "automated",
+      "action": "Run the reserved leave-action role-key refusals in `crates/core/tests/lfg_acceptance.rs` and `crates/core/src/lfg.rs`.",
+      "expected": "The reserved `__leave__` key is refused wherever it appears in a role spec and the leave action keeps routing.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test lfg_acceptance && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib -- lfg::tests::role_spec_refuses_reserved_leave_key lfg::tests::select_parsing_routes_signup_and_leave"
     },
     {
       "id": "s13-218e469",
@@ -3545,11 +3542,10 @@
         ]
       },
       "owner": [
-        "TOG-10260",
-        "TOG-11022"
+        "TOG-10293"
       ],
       "status": "manual",
-      "action": "Invoke the announcement and LFG commands in the staging guild; take a slow-service leg from a local mock.",
+      "action": "Invoke the LFG commands and select in the staging guild with a slow-service leg from a local mock; invoke /rsvp once TOG-10293 wires it.",
       "expected": "Each interaction is deferred before service I/O, so no interaction-failed reply appears.",
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },
@@ -3662,18 +3658,17 @@
           "[bffccf3](https://github.com/TogetherWeOwn/two-bot/commit/bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3)",
           "`src/core/`, `src/discord/`, `src/store/`",
           "fix(events): keep membership projections chronological (#387)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
         "TOG-11149"
       ],
-      "status": "waived",
-      "action": "Deliver out-of-order and same-time join/leave events and a replay through TOG-11149’s contract suite.",
-      "expected": "Membership projections follow event chronology and tie rules, not arrival order; replay is idempotent.",
-      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "automated",
+      "action": "Run the membership chronology contract in `crates/core/tests/membership_contract.rs` (out-of-order and same-time join/leave events, replay).",
+      "expected": "Membership projections follow event chronology and tie rules, not arrival order; replay is idempotent. Store contract only; the Postgres run is the `--ignored` step in the check workflow.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test membership_contract"
     }
   ]
 }
