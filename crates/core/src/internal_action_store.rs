@@ -7,8 +7,9 @@ use sqlx::{PgPool, Row};
 
 use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
 use crate::internal_actions::{
-    body_hash, is_implemented, is_snowflake, valid_idempotency_key, valid_nonce_format,
-    within_skew, CLAIM_STALE_SECONDS, MAX_BODY_BYTES, NONCE_TTL_SECONDS, SKEW_SECONDS,
+    body_hash, is_implemented, is_snowflake, valid_event_key, valid_idempotency_key,
+    valid_nonce_format, within_skew, CLAIM_STALE_SECONDS, MAX_BODY_BYTES, NONCE_TTL_SECONDS,
+    SKEW_SECONDS,
 };
 
 /// Clock domain for the durable nonce high-water mark. One guard per clock
