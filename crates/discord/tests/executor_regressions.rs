@@ -653,11 +653,12 @@ async fn purge_accepts_a_valid_empty_history_without_deletion() {
     mock.shutdown().await;
 }
 
-fn history(ids: &[&str]) -> ScriptedResponse {
-    ScriptedResponse::json(
-        200,
-        serde_json::Value::Array(ids.iter().map(|id| serde_json::json!({"id": id})).collect()),
-    )
+fn history<S: AsRef<str>>(ids: &[S]) -> ScriptedResponse {
+    let rows = ids
+        .iter()
+        .map(|id| serde_json::json!({"id": id.as_ref()}))
+        .collect();
+    ScriptedResponse::json(200, serde_json::Value::Array(rows))
 }
 
 fn wire_calls(mock: &MockRest) -> Vec<(String, String)> {
