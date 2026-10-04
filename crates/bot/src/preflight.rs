@@ -127,7 +127,7 @@ impl Report {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ChannelTarget {
     post: bool,
     moderate: bool,
@@ -137,6 +137,7 @@ struct ChannelTarget {
     category: bool,
 }
 
+#[derive(Debug)]
 struct Targets {
     guild_id: u64,
     channels: BTreeMap<u64, ChannelTarget>,

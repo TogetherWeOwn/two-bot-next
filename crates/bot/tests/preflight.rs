@@ -455,7 +455,7 @@ fn self_role_panels() -> String {
 }
 
 fn self_role_script(target_position: u64, managed: bool) -> Vec<ScriptedResponse> {
-    let mut bodies = vec![
+    let bodies = vec![
         user(),
         json!({"id": BOT.to_string(), "name": TOKEN, "description": "", "bot_public": true,
             "bot_require_code_grant": false, "verify_key": "fixture", "flags": 1 << 15}),
