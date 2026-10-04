@@ -369,9 +369,15 @@ async fn a_refused_connect_write_changes_nothing_and_is_recorded() {
 #[tokio::test]
 async fn an_unknown_connect_outcome_dead_letters_without_flipping_the_room() {
     let (mut worker, _) = worker().await;
-    worker.http.overwrite_errors.lock().unwrap().extend(
-        std::iter::repeat_with(|| RoomHttpError::UnknownOutcome).take(QUEUE_MAX_ATTEMPTS as usize),
-    );
+    worker
+        .http
+        .overwrite_errors
+        .lock()
+        .unwrap()
+        .extend(std::iter::repeat_n(
+            RoomHttpError::UnknownOutcome,
+            QUEUE_MAX_ATTEMPTS as usize,
+        ));
     private_cmd(&mut worker, OWNER);
     for step in 0..u64::from(QUEUE_MAX_ATTEMPTS) {
         assert!(worker.dispatch_one(step * 1_000_000).await);
@@ -551,14 +557,20 @@ async fn restart_adopts_a_join_channel_that_still_exists_and_deletes_it_on_publi
             bot: Some(false),
         }],
     ));
-    // The room already denies Connect, as Discord holds it after `/private`.
+    // The room already denies Connect to @everyone and carries the bot's own
+    // Connect allow, as Discord holds it after `/private`: without that allow
+    // the bot could not manage the room and its writes would be suspended.
     set_room_overwrites(
         &live,
-        vec![role_overwrite(
-            GUILD,
-            Permissions::empty(),
-            Permissions::CONNECT,
-        )],
+        vec![
+            role_overwrite(GUILD, Permissions::empty(), Permissions::CONNECT),
+            PermissionOverwrite {
+                allow: Permissions::CONNECT,
+                deny: Permissions::empty(),
+                id: Id::new(BOT),
+                kind: PermissionOverwriteType::Member,
+            },
+        ],
     );
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     assert!(worker.privacy[&ROOM].private);

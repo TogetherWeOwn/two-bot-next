@@ -112,7 +112,7 @@ pub(super) fn with_overwrite(
         .filter(|entry| !(entry.kind == overwrite.kind && entry.id == overwrite.id))
         .cloned()
         .collect();
-    next.push(overwrite.clone());
+    next.push(*overwrite);
     next
 }
 
@@ -636,12 +636,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     ) -> Result<(), RoomHttpError> {
         if let Some(grant) = bot_grant {
             self.http
-                .put_overwrite(room, grant.clone(), self.live.room_guard(room))
+                .put_overwrite(room, grant, self.live.room_guard(room))
                 .await?;
             self.note_overwrite(room, &grant);
         }
         self.http
-            .put_overwrite(room, everyone.clone(), self.live.room_guard(room))
+            .put_overwrite(room, *everyone, self.live.room_guard(room))
             .await?;
         self.note_overwrite(room, everyone);
         Ok(())
