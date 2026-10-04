@@ -104,6 +104,7 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0411_invite_campaigns | up | invite_campaigns | re-runnable | Drop the table; campaigns are re-creatable. |
 | 0412_voice_rooms_ownership_touched | up | voice_rooms | re-runnable | Drop column `owner_touched_at`; ownership handoffs lose their timestamp. |
 | 0414_voice_rooms_custom_name | up | voice_rooms | re-runnable | Drop columns `custom_name` and `name_touched_at`; rooms fall back to their template name. |
+| 0415_internal_event_keys | up | internal_event_keys | backout-script | Unguarded `CREATE TABLE` fails on re-apply; backout drops the table (event.read loses its key map until upsert re-registers keys). |
 
 ## Notes
 
