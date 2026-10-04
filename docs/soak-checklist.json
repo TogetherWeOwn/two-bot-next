@@ -2538,19 +2538,18 @@
           "[720419b](https://github.com/TogetherWeOwn/two-bot/commit/720419b9789120cdd77b5481ade916de88d863f1)",
           "`src/core/`",
           "TOG-5683: voice blind-window reconcile report (count startKnown:false per gap)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
         "TOG-11152"
       ],
-      "status": "waived",
-      "action": "Run TOG-11152’s voice reconcile report on a test-container fixture with startKnown:false sessions across a blind window.",
-      "expected": "Per-gap startKnown:false counts match the fixture; the report writes nothing.",
-      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "automated",
+      "action": "Run the voice blind-window unit fixtures and the DB-backed `report_cli` scenario (events-write gaps with startKnown:false ends across two blind windows).",
+      "expected": "Per-gap startKnown:false counts match the fixture (2 and 1, one end unattributed); known-start sessions are not counted; the report writes nothing and no `_sqlx_migrations` table appears.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
     },
     {
       "id": "s13-40e266e",
@@ -2560,18 +2559,17 @@
           "[40e266e](https://github.com/TogetherWeOwn/two-bot/commit/40e266eff752d9851ffb5f5f0948ce957d7b4ad1)",
           "`src/core/`",
           "TOG-5683: reconcile heartbeat from events write series, not the contained probe table",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
         "TOG-11152"
       ],
-      "status": "waived",
-      "action": "Seed a test-container fixture with an events-write gap and a healthy probe table; run the reconcile report.",
-      "expected": "The heartbeat comes from the events write series, so the gap is reported despite healthy probes.",
-      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "automated",
+      "action": "Run the DB-backed `report_cli` scenario: an events-write gap with a healthy probe table seeded through it.",
+      "expected": "The heartbeat comes from `events.recorded_at`, so the gap is reported despite healthy probes; a backfilled row (old `occurred_at`) does not close it.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only"
     },
     {
       "id": "s13-edaf2dd",
@@ -2581,18 +2579,17 @@
           "[edaf2dd](https://github.com/TogetherWeOwn/two-bot/commit/edaf2dd930c7bcb22b4f02e5f9f112b5ab420577)",
           "`src/analytics/`, `src/core/`",
           "TOG-5684: enforce startKnown:false exclusion from duration averages",
-          "gap"
+          "ported"
         ]
       },
       "owner": [
-        "TOG-15338"
+        "TOG-11152"
       ],
-      "status": "manual",
-      "action": "Run the offline core duration fixtures in crates/core/src/voice.rs; keep the full-row report-consumer verification manual until [TOG-15338](/TOG/issues/TOG-15338) supplies its integration receipt, not proven by these fixtures.",
-      "expected": "Known 60 / unknown 600 averages to 60 (removing the start-known filter yields 330). Mixed numeric/numeric-string metadata averages to 60 with measured=2 and excluded_unknown_starts=4. Invalid-only metadata yields no average and measured=0, not fabricated zeroes. Finite decimal numeric strings are supported; legacy JavaScript coercions of empty strings, booleans, containers and radix-prefixed strings are explicitly rejected.",
-      "evidence": "Attach exact-head CI/local results for averages_filter_on_flag_not_null, metadata_average_excludes_unknown_numbers_and_numeric_strings, metadata_numbers_and_numeric_strings_enter_known_average and metadata_invalid_durations_never_become_measured_zeroes. Independent review must accept the documented strict parsing boundary. Core-only evidence does not promote this gap while its report consumer is absent from main; no staging/production access or acceptance claim.",
-      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib voice::tests::",
-      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — preserve the separate exact-SHA voice receipt gate; offline duration fixtures are not staging acceptance."
+      "status": "automated",
+      "action": "Run the duration summary fixtures, the core metadata-parsing fixtures in `crates/core/src/voice.rs` and the DB-backed `report_cli` scenario mixing known and startKnown:false sessions.",
+      "expected": "`durations` averages known-start sessions only (the unknown start carrying a number is excluded) and counts the excluded unknown starts. Known 60 / unknown 600 averages to 60 (removing the start-known filter yields 330); mixed numeric/numeric-string metadata averages to 60 with measured=2 and excluded_unknown_starts=4; invalid-only metadata yields no average, not fabricated zeroes. Finite decimal numeric strings are measured; legacy JavaScript coercions of empty strings, booleans, containers and radix-prefixed strings are deliberately rejected.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Include the core `voice::tests` results (`averages_filter_on_flag_not_null`, `metadata_average_excludes_unknown_numbers_and_numeric_strings`, `metadata_numbers_and_numeric_strings_enter_known_average`, `metadata_invalid_durations_never_become_measured_zeroes`). Fixture proof only, not a deployed-network soak receipt; the separate voice receipt gate is unchanged.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib voice::tests::"
     },
     {
       "id": "s13-59965d0",
@@ -2834,7 +2831,7 @@
           "[8371181](https://github.com/TogetherWeOwn/two-bot/commit/83711812364c451926eafe4ba0859db279eb7e7c)",
           "`src/announcements/`",
           "feat(feeds): follow same-host redirects, refuse cross-host distinctly (#299)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -2855,7 +2852,7 @@
           "[b5038fb](https://github.com/TogetherWeOwn/two-bot/commit/b5038fbc6b265978accfea0df448e518cd1449f5)",
           "`src/announcements/`",
           "fix(feeds): bound each pollFeeds read with a timeout (#298)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -2876,7 +2873,7 @@
           "[a50e747](https://github.com/TogetherWeOwn/two-bot/commit/a50e7474fb4e5493d1a412dab24eeb14748d9860)",
           "`src/announcements/`",
           "fix(feeds): isolate per-item failures in pollFeeds batch (#302)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -2918,7 +2915,7 @@
           "[df990c9](https://github.com/TogetherWeOwn/two-bot/commit/df990c96db0615ef7e6db5f4736395b7eb89ec31)",
           "`src/announcements/`",
           "fix(announcements): prefer alternate link for multi-link Atom entries (#306)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -2982,7 +2979,7 @@
           "[c99fec7](https://github.com/TogetherWeOwn/two-bot/commit/c99fec78c4b211c9421cd0785e6fdc0aac8c5e73)",
           "`src/announcements/`",
           "fix(announcements): reclaim crashed feed-delivery claims after 60s lease (#312)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3045,7 +3042,7 @@
           "[db84b22](https://github.com/TogetherWeOwn/two-bot/commit/db84b22cb55d8eb2a446ac23fdd3362cefcabed6)",
           "`src/announcements/`",
           "fix(feeds): advance poll window past 20-post cap across polls (#318)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3128,7 +3125,7 @@
           "[4931aec](https://github.com/TogetherWeOwn/two-bot/commit/4931aec4754e374e8c4dbfb8f8be85e1b7ee8285)",
           "`src/redirect/`",
           "fix(redirect): cache campaign misses at short negative TTL (#339)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3230,7 +3227,7 @@
           "[f5e62b7](https://github.com/TogetherWeOwn/two-bot/commit/f5e62b701038d45cc26cce29cd4684186f2540b2)",
           "`src/core/`, `src/redirect/`",
           "fix(redirect): resolve throttle bucket through trusted-proxy chain (#342)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3517,7 +3514,7 @@
           "[287a181](https://github.com/TogetherWeOwn/two-bot/commit/287a181c53ffa7884c345c9e1377f743f61f67cd)",
           "`src/jobs/`",
           "fix(snapshots): discard pending collector cycles after stop (#421)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3596,7 +3593,7 @@
           "[3f3f969](https://github.com/TogetherWeOwn/two-bot/commit/3f3f96906c577026bf6eea52061b73c79e7b651f)",
           "`src/jobs/`",
           "fix(events): reject malformed scheduled-event response elements (#436)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3617,7 +3614,7 @@
           "[881d21d](https://github.com/TogetherWeOwn/two-bot/commit/881d21d5f4bde7038060e3fb866175ee6891a2bd)",
           "`src/jobs/`",
           "fix(events): reject malformed optional snapshot fields (#432)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [

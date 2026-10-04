@@ -1277,34 +1277,31 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-720419b: 720419b — TOG-5683: voice blind-window reconcile report (count startKnown:false per gap)
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Run TOG-11152’s voice reconcile report on a test-container fixture with startKnown:false sessions across a blind window.
-- **Expected:** Per-gap startKnown:false counts match the fixture; the report writes nothing.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the voice blind-window unit fixtures and the DB-backed `report_cli` scenario (events-write gaps with startKnown:false ends across two blind windows).
+- **Expected:** Per-gap startKnown:false counts match the fixture (2 and 1, one end unattributed); known-start sessions are not counted; the report writes nothing and no `_sqlx_migrations` table appears.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-40e266e: 40e266e — TOG-5683: reconcile heartbeat from events write series, not the contained probe table
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Seed a test-container fixture with an events-write gap and a healthy probe table; run the reconcile report.
-- **Expected:** The heartbeat comes from the events write series, so the gap is reported despite healthy probes.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the DB-backed `report_cli` scenario: an events-write gap with a healthy probe table seeded through it.
+- **Expected:** The heartbeat comes from `events.recorded_at`, so the gap is reported despite healthy probes; a backfilled row (old `occurred_at`) does not close it.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only
 
 ### s13-edaf2dd: edaf2dd — TOG-5684: enforce startKnown:false exclusion from duration averages
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Run the offline core duration fixtures in crates/core/src/voice.rs; keep the full-row report-consumer verification manual until [TOG-15338](/TOG/issues/TOG-15338) supplies its integration receipt, not proven by these fixtures.
-- **Expected:** Known 60 / unknown 600 averages to 60 (removing the start-known filter yields 330). Mixed numeric/numeric-string metadata averages to 60 with measured=2 and excluded_unknown_starts=4. Invalid-only metadata yields no average and measured=0, not fabricated zeroes. Finite decimal numeric strings are supported; legacy JavaScript coercions of empty strings, booleans, containers and radix-prefixed strings are explicitly rejected.
-- **Evidence:** Attach exact-head CI/local results for averages_filter_on_flag_not_null, metadata_average_excludes_unknown_numbers_and_numeric_strings, metadata_numbers_and_numeric_strings_enter_known_average and metadata_invalid_durations_never_become_measured_zeroes. Independent review must accept the documented strict parsing boundary. Core-only evidence does not promote this gap while its report consumer is absent from main; no staging/production access or acceptance claim.
-- **Owner:** [TOG-15338](/TOG/issues/TOG-15338)
-- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib voice::tests::
-- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — preserve the separate exact-SHA voice receipt gate; offline duration fixtures are not staging acceptance.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the duration summary fixtures, the core metadata-parsing fixtures in `crates/core/src/voice.rs` and the DB-backed `report_cli` scenario mixing known and startKnown:false sessions.
+- **Expected:** `durations` averages known-start sessions only (the unknown start carrying a number is excluded) and counts the excluded unknown starts. Known 60 / unknown 600 averages to 60 (removing the start-known filter yields 330); mixed numeric/numeric-string metadata averages to 60 with measured=2 and excluded_unknown_starts=4; invalid-only metadata yields no average, not fabricated zeroes. Finite decimal numeric strings are measured; legacy JavaScript coercions of empty strings, booleans, containers and radix-prefixed strings are deliberately rejected.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Include the core `voice::tests` results (`averages_filter_on_flag_not_null`, `metadata_average_excludes_unknown_numbers_and_numeric_strings`, `metadata_numbers_and_numeric_strings_enter_known_average`, `metadata_invalid_durations_never_become_measured_zeroes`). Fixture proof only, not a deployed-network soak receipt; the separate voice receipt gate is unchanged.
+- **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib voice::tests::
 
 ### s13-59965d0: 59965d0 — TOG-5981: serialize same-member voice frames, scope voice idempotency keys by channel
 
