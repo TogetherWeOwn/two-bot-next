@@ -416,9 +416,11 @@ async fn mixed_rsvp_custom_command_survives_brief_lane_contention() {
         serde_json::from_slice::<Value>(&edits[0].body).unwrap()["content"],
         "Hi <@3333> tester in Bootstrap guild <#4444>"
     );
+    // The seed above commits its own `command.create` audit row, so scope
+    // the run assertion to the invocation record: exactly one `command.run`.
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM automation_audit_log WHERE target_key = 'faq'",
+            "SELECT count(*) FROM automation_audit_log WHERE target_key = 'faq' AND action = 'command.run'",
         )
         .fetch_one(&db.pool)
         .await
