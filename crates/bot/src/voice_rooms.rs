@@ -3775,7 +3775,7 @@ where
     /// it must never authorize guild-wide configuration or owner overrides.
     /// Use the member's role IDs with our complete guild-role snapshot instead.
     /// Missing/disconnected snapshots fail closed, including for admin claims.
-    /// Source: https://docs.discord.com/developers/resources/guild#guild-member-object
+    /// Source: <https://docs.discord.com/developers/resources/guild#guild-member-object>
     fn guild_permissions(&self, interaction: &Interaction) -> Option<Permissions> {
         let guild = interaction_guild(interaction)?;
         let member = interaction.member.as_ref()?;

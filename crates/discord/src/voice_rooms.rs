@@ -806,7 +806,7 @@ impl RoomHttp {
     }
 
     /// Atomic room-scoped overwrite replacement for an owner handoff.
-    /// Source: https://docs.discord.com/developers/resources/channel#modify-channel
+    /// Source: <https://docs.discord.com/developers/resources/channel#modify-channel>
     pub async fn update_room_overwrites(
         &self,
         channel_id: Snowflake,
