@@ -1538,7 +1538,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Action:** Run TOG-10081’s scheduler fixture with the scheduled-message scheduler disabled and due jobs present.
 - **Expected:** Zero jobs fire.
 - **Evidence:** Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
-- **Owner:** [TOG-10081](/TOG/issues/TOG-10081)
+- **Owner:** [TOG-15758](/TOG/issues/TOG-15758)
 - **Reason:** Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 

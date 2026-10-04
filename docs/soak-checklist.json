@@ -2688,7 +2688,7 @@
           "[37afd80](https://github.com/TogetherWeOwn/two-bot/commit/37afd809f940d1cf36f1df3e87d7a14873ccd099)",
           "`src/discord/`, `src/jobs/`",
           "feat(presence): cap probe scan cost and window trend reads (#236)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3085,11 +3085,11 @@
           "[2f386e8](https://github.com/TogetherWeOwn/two-bot/commit/2f386e81096385c37abcd4045221a570470d096b)",
           "`src/automations/`",
           "test(scheduler): prove disabled scheduler fires zero jobs (#335)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
-        "TOG-10081"
+        "TOG-15758"
       ],
       "status": "waived",
       "action": "Run TOG-10081’s scheduler fixture with the scheduled-message scheduler disabled and due jobs present.",
@@ -3106,7 +3106,7 @@
           "[298f3a4](https://github.com/TogetherWeOwn/two-bot/commit/298f3a4f234b8b8520eebd091b789de89f6666bb)",
           "`src/selfRoles/`",
           "fix(selfrole): reject reaction panels over Discord's 20-reaction cap (#336)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3187,7 +3187,7 @@
           "[b3d8d97](https://github.com/TogetherWeOwn/two-bot/commit/b3d8d9757a413c295081eaf9e92c6a34cae00293)",
           "`src/selfRoles/`",
           "fix(selfrole): reject button custom_ids over Discord's 100-char limit (#338)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3350,7 +3350,7 @@
           "[7df2a95](https://github.com/TogetherWeOwn/two-bot/commit/7df2a95106feb48cb032c31a4cd3de52a24bf9e6)",
           "`src/leveling/`",
           "fix(leveling): honor configured command guild fence (#394)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3413,7 +3413,7 @@
           "[1e64035](https://github.com/TogetherWeOwn/two-bot/commit/1e640352aff1996348306543cf9d2cc4de37ff82)",
           "`src/jobs/`",
           "fix(presence): bound repeated truncated roster scans (#400)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3496,7 +3496,7 @@
           "[1d64196](https://github.com/TogetherWeOwn/two-bot/commit/1d6419662573084a83bcd195807747c2f83ed1e1)",
           "`src/jobs/`",
           "fix(scorecard): retry failed weekly runs within bounded schedule (#413)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3557,7 +3557,7 @@
           "[f5edc70](https://github.com/TogetherWeOwn/two-bot/commit/f5edc70d6920d2981e1275f62281923f109444fb)",
           "`src/leveling/`",
           "fix(leveling): show absent members as unranked (#429)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3638,7 +3638,7 @@
           "[3676c1d](https://github.com/TogetherWeOwn/two-bot/commit/3676c1d15f94bf6fd17c909f6ddea5d030bb4326)",
           "`src/selfRoles/`",
           "fix(self-role): reject button labels over Discord's 80-char limit (#337)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
