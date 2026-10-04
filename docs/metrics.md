@@ -127,10 +127,12 @@ as dynamic labels.
   `two_bot_job_last_success_timestamp_seconds{job}` and
   `two_bot_job_consecutive_failures{job}` — `job` is one of
   `invite_snapshot`, `session_checkpoint`, `counter`, `rank`,
-  `scheduled_events`, `presence_probe`, `community_scorecard`, `inactivity`,
-  `audit_retry`, `scheduled_messages`, `other`; `outcome` is `success` or `failure`.
+  `scheduled_events`, `settings`, `presence_probe`, `community_scorecard`,
+  `inactivity`, `audit_retry`, `scheduled_messages`, `other`; `outcome` is
+  `success` or `failure`.
   `session_checkpoint` records successful durable gateway commits; zero means
   never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
+  `settings` is the DB-only 15 s `guild_settings` version poll.
 - `two_bot_voice_operations_total{op,outcome}` — `op` is `create`, `move`
   or `delete`; `outcome` is `success`, `category_full`, `discord`,
   `persistence` or `cancelled`. `Rejected` status/code values never become

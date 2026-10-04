@@ -465,13 +465,16 @@ impl ContainmentSignal {
 /// Staff-alert proposal, not permission to post. Mirrors legacy
 /// `formatContainmentAlert` (`src/discord/containmentAlert.ts`, blob
 /// `b3a0e19e6a4230748459b962ae6efd5829005c78`): the head, executor/action/
-/// target line, removed-role line (capped at [`CONTAINMENT_ALERT_MAX_IDS`]),
-/// restore line, and flag-only footer. Only snowflake IDs, the legacy wire
-/// action name, heat/threshold counters and the outcome label appear here —
-/// never tokens, options, or user text.
+/// target line, incident/audit-entry line, removed-role line (capped at
+/// [`CONTAINMENT_ALERT_MAX_IDS`]), restore line, and flag-only footer. Only
+/// snowflake IDs, the legacy wire action name, heat/threshold counters and the
+/// outcome label appear here — never tokens, options, or user text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainmentAlert {
     pub guild_id: String,
+    /// Triggering audit-entry ID; equals the [`ContainmentIncident`] `id` so
+    /// staff can correlate the alert to the guild audit-log entry.
+    pub incident_id: String,
     pub executor_id: Option<String>,
     pub action: DestructiveAction,
     pub target_id: Option<String>,
@@ -495,6 +498,7 @@ impl ContainmentAlert {
     ) -> Self {
         Self {
             guild_id: trigger.guild_id.clone(),
+            incident_id: trigger.audit_entry_id.clone(),
             executor_id: trigger.executor_id.clone(),
             action: trigger.action,
             target_id: trigger.target_id.clone(),
@@ -547,6 +551,7 @@ impl ContainmentAlert {
                 "Executor: `{executor}` · action: `{}` · target: `{target}`.",
                 self.action.as_str()
             ),
+            format!("Incident/audit entry: `{}`.", self.incident_id),
             removed,
             "Restore check: unavailable.".to_owned(),
             String::new(),
@@ -1165,6 +1170,28 @@ mod tests {
                 Err(QuarantineFailure::Unavailable)
             );
         }
+    }
+
+    #[test]
+    fn staff_message_carries_incident_audit_entry_id() {
+        let trigger = event("123456789012345678", DestructiveAction::MemberKick, NOW);
+        let alert = ContainmentAlert::from_trigger(
+            &trigger,
+            5,
+            5,
+            ContainmentIncidentState::Contained,
+            ids(&["danger-a"]),
+        );
+        assert_eq!(alert.incident_id, "123456789012345678");
+        let message = alert.staff_message();
+        assert_eq!(message.mentions, crate::onboarding::MentionPolicy::None);
+        assert!(
+            message
+                .content
+                .contains("Incident/audit entry: `123456789012345678`"),
+            "staff text must carry the incident/audit-entry ID, got: {}",
+            message.content
+        );
     }
 
     #[test]
