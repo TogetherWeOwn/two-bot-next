@@ -27,6 +27,11 @@ predicates in memory:
 
 Each ticker pass claims at most `TICKER_BATCH_LIMIT` (10) rows.
 
+The supervised ticker exists only while `TWO_AUTOMATIONS=1`
+(`scheduled_jobs::register` in `crates/bot`). With the gate off no job is
+built, so no row is claimed, posted or audited; the `/readyz` status map lists
+`scheduled_messages` as parked.
+
 ## Acceptance
 
 1. **List order.** `/schedule-list` rows come back in ascending `next_run_at`

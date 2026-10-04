@@ -108,6 +108,7 @@ impl PromptGuard {
                 &self.member_id,
                 &[channel_id.to_owned()],
                 0,
+                &[],
                 occurred_at,
             );
             insert_row(&mut self.transaction, &routed).await?;
@@ -188,6 +189,7 @@ pub async fn record_channel_routed(
             member_id,
             &selection.channel_ids,
             selection.degraded_count,
+            &selection.unavailable_keys(),
             occurred_at,
         ),
     )
@@ -219,6 +221,7 @@ pub async fn record_game_selection_in_transaction(
                 member_id,
                 &selection.channel_ids,
                 selection.degraded_count,
+                &selection.unavailable_keys(),
                 occurred_at,
             ),
         )

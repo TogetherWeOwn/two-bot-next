@@ -60,6 +60,12 @@ panel with template expansion and the unique-names check, `/private`,
 published to a guild). No live channel update is performed or verified by this
 component's tests.
 
+`/name` is wired: see [`voice-name-panel.md`](voice-name-panel.md). `/private`
+and `/public` are wired with the Join channel: see
+[`voice-private-core.md`](voice-private-core.md#runtime-wiring-private-and-public).
+`/limit`, `/unlimit`, the join-request buttons and the bitrate preference are
+not.
+
 ## Hermetic verification
 
 ```sh

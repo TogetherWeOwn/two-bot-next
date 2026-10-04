@@ -23,9 +23,11 @@ WRANGLER = "4.147.0"
 VERSION_PROBES = (["--version"], ["-v"])
 LIMIT = 100
 MAX_BODY = 2 * 1024 * 1024
+# Cloudflare rejects the default "Python-urllib/x.y" agent at the edge with 403 (error 1010),
+# so an explicit agent is required for the gate to see the Worker at all.
+USER_AGENT = "two-bot-next-staging-rollout/1.0"
 # Consecutive fully-passing verify passes required before a completed rollout
-# whose only deviation is the control-plane `active` counter still reading 0
-# (with `healthy` at 1) is accepted. Each pass re-checks every identity and
+# whose only deviation is a `LAG_COUNTS` instance-counter shape is accepted. Each pass re-checks every identity and
 # runtime probe; any non-passing poll resets the streak.
 ACTIVE_LAG_CONFIRMATIONS = 2
 # Polls (5s apart) tolerated while a completed rollout's target image is not
@@ -105,7 +107,7 @@ class Client:
     def request(self, url, authenticated=False):
         timeout = 10 if self.deadline is None else min(10, self.deadline - time.monotonic())
         require(timeout > 0, "rollout_timeout")
-        headers = {"Cache-Control": "no-cache"}
+        headers = {"Cache-Control": "no-cache", "User-Agent": USER_AGENT}
         if authenticated:
             headers["Authorization"] = f"Bearer {self.token}"
         try:
@@ -346,18 +348,27 @@ def converged(row, image, target_version):
             and progress_ok)
 
 
+# Control-plane counter shapes that differ from `converged` only in how Cloudflare
+# reports one serving instance: `active` still reading 0 right after the rollout,
+# or, under durable_object scheduling, the in-use instance counted `active` but
+# not `healthy` (observed steady state while the exact build served ready).
+LAG_COUNTS = (
+    {"active": 0, "healthy": 1, "failed": 0, "starting": 0, "scheduling": 0},
+    {"active": 1, "healthy": 0, "failed": 0, "starting": 0, "scheduling": 0},
+)
+
+
 def active_lag(row, image, target_version):
-    """A completed rollout identical to `converged` except the control-plane
-    `active` counter still reads 0 while `healthy` reads 1. Only `verify`
-    consults this, and only as a provisional pass that still needs consecutive
-    fully-passing exact-version runtime probes before acceptance.
+    """A completed rollout identical to `converged` except for one of the
+    `LAG_COUNTS` counter shapes. Only `verify` consults this, and only as a
+    provisional pass that still needs consecutive fully-passing exact-version
+    runtime probes before acceptance.
     """
     shape = _rollout_shape(row, image, target_version)
     if shape is None:
         return False
     counts, progress_ok = shape
-    return (counts == {"active": 0, "healthy": 1, "failed": 0, "starting": 0, "scheduling": 0}
-            and progress_ok)
+    return counts in LAG_COUNTS and progress_ok
 
 
 def worker_namespace(client, version):
@@ -561,12 +572,13 @@ def verify(args, client):
                         active_worker(client, version)
                         final = client.api(f"/containers/applications/{app['id']}/rollouts/{pinned['id']}")
                         require(mapping(final).get("id") == pinned["id"], "rollout_identity_drift")
-                        if complete:
-                            require(converged(final, image, pinned["target_version"]),
-                                    "rollout_not_converged")
-                        else:
-                            require(active_lag(final, image, pinned["target_version"]),
-                                    "rollout_not_converged")
+                        # The instance counters can wobble between the `converged`
+                        # and lag shapes while the exact build keeps serving, so
+                        # either completed shape passes the re-read; identity,
+                        # steps and failed/starting/scheduling stay exact.
+                        require(converged(final, image, pinned["target_version"])
+                                or active_lag(final, image, pinned["target_version"]),
+                                "rollout_not_converged")
                         final_app = application(client)
                         require(final_app["id"] == app["id"]
                                 and final_app["durable_objects"]["namespace_id"] == baseline["namespace_id"]

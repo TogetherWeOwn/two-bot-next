@@ -35,12 +35,15 @@ pub mod internal_member_moderation;
 pub mod leveling_runtime;
 #[cfg(feature = "db")]
 pub mod lfg_interactions;
+pub mod member_moderation;
 mod message_safety;
 pub mod onboarding_config;
 pub mod onboarding_messages;
 pub mod onboarding_permissions;
 pub mod pipeline;
 pub mod ratelimit_guard;
+#[cfg(any(test, feature = "test-support"))]
+pub mod staging_slash_smoke;
 #[cfg(test)]
 mod test_clock;
 pub mod voice_rooms;

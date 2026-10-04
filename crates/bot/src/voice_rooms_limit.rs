@@ -406,12 +406,14 @@ where
 }
 
 /// Handle one `/limit` or `/unlimit` interaction: identify the caller, run it
-/// on the worker and reply once, ephemerally. Always `true`: the command is
+/// on the worker and reply once, ephemerally. `is_admin` is the invoker's
+/// guild-level authority from the access check. Always `true`: the command is
 /// ours even when it is refused.
 pub(super) async fn handle_limit<S, H, F>(
     runtime: &VoiceRuntime<S, H>,
     interaction: &Interaction,
     guild_id: Snowflake,
+    is_admin: bool,
     command: LimitCommand,
     reply: impl FnOnce(InteractionResponse) -> F + Send,
 ) -> bool
@@ -420,7 +422,7 @@ where
     H: RoomWrites + Send + 'static,
     F: Future<Output = ()> + Send,
 {
-    let Some((actor_id, is_admin)) = interaction_actor(interaction) else {
+    let Some(actor_id) = invoker_member_id(interaction) else {
         reply(ephemeral_response(&format!(
             "I couldn't tell who invoked /{} — try again.",
             command.name()

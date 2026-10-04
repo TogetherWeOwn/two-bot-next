@@ -35,6 +35,42 @@ fn reject(raw: &str, policy: &AutomodPolicy) -> NameError {
 }
 
 #[test]
+fn create_path_policy_preserves_content_rules_with_invalid_chat_config() {
+    let vars: std::collections::HashMap<String, String> = [
+        ("TWO_AUTOMOD_BAD_WORDS", " ＢＬＯＲＰ "),
+        ("TWO_AUTOMOD_ALLOWED_DOMAINS", "Trusted.GG"),
+        ("TWO_AUTOMOD_REPEAT_COUNT", "21"),
+        ("TWO_AUTOMOD_BYPASS_ROLE_IDS", "invalid"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+    .collect();
+    assert!(two_bot_core::AutomodConfig::from_map(&vars).is_err());
+    let policy = AutomodPolicy::name_policy_from_map(&vars);
+    for word in ["Blorp", "b l o r p", "bl\u{200B}orp"] {
+        assert_eq!(
+            reject(word, &policy),
+            NameError::Blocked {
+                filter: AutomodFilter::BadWords
+            }
+        );
+    }
+    assert_eq!(
+        reject("discord.gg/abc123", &policy),
+        NameError::Blocked {
+            filter: AutomodFilter::InviteLink
+        }
+    );
+    assert_eq!(
+        reject("https://unlisted.example/news", &policy),
+        NameError::Blocked {
+            filter: AutomodFilter::ExternalLink
+        }
+    );
+    assert!(filter_channel_name("https://sub.trusted.gg/news", &policy, &context()).is_ok());
+}
+
+#[test]
 fn sanitize_table() {
     for (raw, expected) in [
         // NFKC first: full-width folds (then `@` strips), ligatures expand.

@@ -7,8 +7,9 @@ use sqlx::{PgPool, Row};
 
 use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
 use crate::internal_actions::{
-    body_hash, is_implemented, valid_idempotency_key, valid_nonce_format, within_skew,
-    CLAIM_STALE_SECONDS, MAX_BODY_BYTES, NONCE_TTL_SECONDS, SKEW_SECONDS,
+    body_hash, is_implemented, is_snowflake, valid_event_key, valid_idempotency_key,
+    valid_nonce_format, within_skew, CLAIM_STALE_SECONDS, MAX_BODY_BYTES, NONCE_TTL_SECONDS,
+    SKEW_SECONDS,
 };
 
 /// Clock domain for the durable nonce high-water mark. One guard per clock
@@ -673,6 +674,62 @@ impl InternalActionStore {
         .fetch_optional(&self.pool)
         .await?
         .is_some())
+    }
+
+    /// Guild-fenced website event-key to Discord scheduled-event ID map
+    /// (legacy `discordEventId`). The website never names a snowflake: the
+    /// signed `event.read` verifier resolves its `event_key` in the request
+    /// guild through this table, and `event.upsert` registers the key after
+    /// Discord confirms a create. A key is an address only inside its guild.
+    fn check_event_key_shape(guild_id: &str, event_key: &str) -> Result<(), InternalStoreError> {
+        if !is_snowflake(guild_id) || !valid_event_key(event_key) {
+            return Err(InternalStoreError::InvalidInput);
+        }
+        Ok(())
+    }
+
+    /// Register (or re-point) one key in one guild. `event.upsert` calls this
+    /// only after Discord confirms the create/update the mapping names.
+    pub async fn put_event_key(
+        &self,
+        guild_id: &str,
+        event_key: &str,
+        event_id: &str,
+    ) -> Result<(), InternalStoreError> {
+        Self::check_event_key_shape(guild_id, event_key)?;
+        if !is_snowflake(event_id) {
+            return Err(InternalStoreError::InvalidInput);
+        }
+        sqlx::query(
+            "INSERT INTO internal_event_keys (guild_id, event_key, event_id) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (guild_id, event_key) DO UPDATE \
+             SET event_id = EXCLUDED.event_id, updated_at = clock_timestamp()",
+        )
+        .bind(guild_id)
+        .bind(event_key)
+        .bind(event_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Resolve one key inside one guild. `Ok(None)` is an unmapped key: the
+    /// caller refuses `action_not_allowed` before any Discord call, exactly
+    /// like legacy's mapped-event verifier.
+    pub async fn event_id_for_key(
+        &self,
+        guild_id: &str,
+        event_key: &str,
+    ) -> Result<Option<String>, InternalStoreError> {
+        Self::check_event_key_shape(guild_id, event_key)?;
+        Ok(sqlx::query_scalar(
+            "SELECT event_id FROM internal_event_keys WHERE guild_id = $1 AND event_key = $2",
+        )
+        .bind(guild_id)
+        .bind(event_key)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 }
 
