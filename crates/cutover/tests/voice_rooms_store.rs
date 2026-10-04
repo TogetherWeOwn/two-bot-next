@@ -157,6 +157,50 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     );
     assert!(!store.update_ownership(100, 599, 301, 300).await?);
 
+    // V3 `/name` override: stored as typed (tokens and SQL-looking text are
+    // data), stamps `name_touched_at`, leaves the tracked room row alone, and
+    // clears back to the template name. Out-of-range text and a missing row
+    // never write.
+    assert!(store.custom_names(100).await?.is_empty());
+    let named_stamp = "SELECT name_touched_at::text FROM voice_rooms WHERE guild_id = '100' AND channel_id = '500'";
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(named_stamp)
+            .fetch_one(pool)
+            .await?,
+        None,
+        "a room never renamed has no name stamp"
+    );
+    let typed = "@@owner@@'s [[den/crew]]; SELECT 'not SQL'";
+    assert!(store.set_custom_name(100, 500, Some(typed)).await?);
+    assert_eq!(
+        store.custom_names(100).await?,
+        vec![(500, typed.to_owned())]
+    );
+    assert!(store.custom_names(101).await?.is_empty());
+    assert_eq!(store.room_for(100, 500).await?, Some(handed.clone()));
+    assert!(sqlx::query_scalar::<_, Option<String>>(named_stamp)
+        .fetch_one(pool)
+        .await?
+        .is_some());
+    let hundred = "é".repeat(100);
+    assert!(store.set_custom_name(100, 501, Some(&hundred)).await?);
+    assert!(store
+        .set_custom_name(100, 501, Some(&"x".repeat(101)))
+        .await
+        .is_err());
+    assert!(store.set_custom_name(100, 501, Some("")).await.is_err());
+    assert_eq!(
+        store.custom_names(100).await?,
+        vec![(500, typed.to_owned()), (501, hundred.clone())]
+    );
+    assert!(store.set_custom_name(100, 500, None).await?);
+    assert_eq!(store.custom_names(100).await?, vec![(501, hundred)]);
+    assert!(sqlx::query_scalar::<_, Option<String>>(named_stamp)
+        .fetch_one(pool)
+        .await?
+        .is_some());
+    assert!(!store.set_custom_name(100, 599, Some("missing")).await?);
+
     // V9b companion records: creation snapshot round-trips, insert-once, and
     // get/delete per room. The snapshot decodes back into the pure settings.
     let companion = TextCompanion {

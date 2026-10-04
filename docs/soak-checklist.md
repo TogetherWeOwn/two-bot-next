@@ -1235,19 +1235,21 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-0495e7d: 0495e7d — TOG-3186: one live-activation allowlist replacing five divergent staging fences
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** From the staging boot log, capture the live-activation allowlist decision for the bot identity, guild and capabilities.
-- **Expected:** One allowlist decides activation; capabilities outside it stay inert; no legacy staging fence is inherited.
-- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the activation matrix and boot fixtures: identity x capability decisions, runtime composition for the staging, live, mixed and third-party pairs, and the env-driven boot child processes.
+- **Expected:** One allowlist decides activation: the staging pair permits every capability, the live pair only the cleared list, and every other identity, a missing token and a mixed pair are refused; a refused capability publishes no command, handler or privileged intent and does not abort boot.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11140](/TOG/issues/TOG-11140)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib activation::tests && python3 scripts/cargo_cache.py run -- test -p two-bot activation_
 
 ### s13-a7f16b9: a7f16b9 — TOG-3314: hot-wire goodbye channels so a stored value reaches the live handler
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Set the goodbye channel through the normal config path, then have a disposable fixture member leave without a restart.
-- **Expected:** The goodbye message posts in the newly configured channel without restart; restore the disposable configuration afterwards.
-- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the runtime goodbye hot-setting fixture and the gateway configured-empty goodbye fixture on a disposable test database with local mock Discord.
+- **Expected:** A stored goodbye channel list reaches a runtime built before the write with no restart; deleting it restores the deployment value; a stored empty list posts nothing even though the deployment names a channel.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; the `#[ignore]` DB scenarios need the disposable agent-testdb URL and run in the `onboarding_` and `gateway_tests` steps of `check.yml`. Fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-10278](/TOG/issues/TOG-10278)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot onboarding_runtime_goodbye_hot_setting_reaches_live_handler -- --include-ignored && python3 scripts/cargo_cache.py run -- test -p two-bot onboarding_gateway_configured_empty_destinations_are_terminal_noops -- --ignored --test-threads=1
 
 ### s13-78e7c2d: 78e7c2d — TOG-3471: renumber temp-voice migrations to 0036/0037; filter create-path names through automod
 
@@ -1261,50 +1263,49 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-e2a3f37: e2a3f37 — TOG-5356: clear self_roles in LIVE_CLEARED_CAPABILITIES
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Use a self-role panel in the staging guild while `self_roles` is not in the activation allowlist.
-- **Expected:** The capability is cleared at boot and the interaction has no role effect; it activates only when explicitly allowlisted.
-- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the clearance pin and the boot composition fixture for the live pair with a self-role component and every other capability.
+- **Expected:** The live pair routes self-role components and refuses every other capability; other identity pairs route no self-role component.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11140](/TOG/issues/TOG-11140)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib activation_shipped_clearance_is_self_roles_only && python3 scripts/cargo_cache.py run -- test -p two-bot activation_boot_publishes_only_permitted_capabilities
 
 ### s13-e2082e4: e2082e4 — TOG-5357: gate MessageContent intent on automod/tickets
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** From the staging gateway identify log, record requested intents with automod/tickets enabled and disabled per the approved config.
-- **Expected:** MessageContent is requested only when automod or tickets is enabled.
-- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the intent bitfield pins, the permission matrix and the env-driven boot and preflight fixtures with automod and tickets enabled and disabled.
+- **Expected:** MessageContent is requested only when automod or tickets is enabled and permitted; the gated set is 1735 and the full set 34503; a refused identity requests no privileged intent.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11140](/TOG/issues/TOG-11140)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-discord --lib intents::tests && python3 scripts/cargo_cache.py run -- test -p two-bot activation_intents_refuse_uncleared_automod_and_tickets && python3 scripts/cargo_cache.py run -- test -p two-bot activation_boot_from_env_isolates_denied_moderation_validation && python3 scripts/cargo_cache.py run -- test -p two-bot --test preflight refused_activation_requests_no_privileged_message_content_intent
 
 ### s13-720419b: 720419b — TOG-5683: voice blind-window reconcile report (count startKnown:false per gap)
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Run TOG-11152’s voice reconcile report on a test-container fixture with startKnown:false sessions across a blind window.
-- **Expected:** Per-gap startKnown:false counts match the fixture; the report writes nothing.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the voice blind-window unit fixtures and the DB-backed `report_cli` scenario (events-write gaps with startKnown:false ends across two blind windows).
+- **Expected:** Per-gap startKnown:false counts match the fixture (2 and 1, one end unattributed); known-start sessions are not counted; the report writes nothing and no `_sqlx_migrations` table appears.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-40e266e: 40e266e — TOG-5683: reconcile heartbeat from events write series, not the contained probe table
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Seed a test-container fixture with an events-write gap and a healthy probe table; run the reconcile report.
-- **Expected:** The heartbeat comes from the events write series, so the gap is reported despite healthy probes.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the DB-backed `report_cli` scenario: an events-write gap with a healthy probe table seeded through it.
+- **Expected:** The heartbeat comes from `events.recorded_at`, so the gap is reported despite healthy probes; a backfilled row (old `occurred_at`) does not close it.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only
 
 ### s13-edaf2dd: edaf2dd — TOG-5684: enforce startKnown:false exclusion from duration averages
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Run the duration averages in TOG-11152’s report on a fixture mixing known and startKnown:false sessions.
-- **Expected:** Averages exclude startKnown:false sessions; those sessions are still counted as unknown.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the duration summary fixtures and the DB-backed `report_cli` scenario mixing known and startKnown:false sessions.
+- **Expected:** `durations` averages known-start sessions only (the unknown start carrying a number is excluded) and counts the excluded unknown starts.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests
 
 ### s13-59965d0: 59965d0 — TOG-5981: serialize same-member voice frames, scope voice idempotency keys by channel
 
@@ -1369,11 +1370,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-b948b89: b948b89 — fix(onboarding): dedupe repeated keys in legacy planSelection (#269)
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Complete onboarding session selection with a disposable member; send repeated-key payloads Discord cannot produce through the onboarding_effects fixture.
-- **Expected:** Repeated keys are deduped and each valid pick routes once.
-- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Submit repeated and unknown game keys through the pure planner and the runtime picker fixture.
+- **Expected:** Repeated keys are deduped (first occurrence wins) for known and unknown keys alike; each valid pick grants and records once.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; the `#[ignore]` DB scenarios need the disposable agent-testdb URL and run in the `onboarding_` and `gateway_tests` steps of `check.yml`. Fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11180](/TOG/issues/TOG-11180), [TOG-10278](/TOG/issues/TOG-10278)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib game_plan_dedupes_known_and_unknown_keys_in_first_submission_order && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test onboarding_effects game_finalization_keeps_reply_plan_and_recording_in_sync_when_visibility_changes && python3 scripts/cargo_cache.py run -- test -p two-bot onboarding_runtime_game_picker_withholds_invisible_destinations_and_dedupes_keys -- --include-ignored
 
 ### s13-7f90492: 7f90492 — feat(events): add gated event.read mapped-event verifier (#266)
 
@@ -1408,11 +1410,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-b3747a8: b3747a8 — fix(session): route valid picks alongside stale keys (#290)
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Select valid onboarding picks after removing one catalog option from the disposable configuration, so a stale key remains.
-- **Expected:** Valid picks still route; only the stale key is ignored. Restore the configuration afterwards.
-- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Submit a session selection holding one valid and one stale key through the pure planner and the runtime picker fixture.
+- **Expected:** The valid pick still routes and the ack carries a retry note for the stale key; a wholly unknown selection routes nowhere and records nothing.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; the `#[ignore]` DB scenarios need the disposable agent-testdb URL and run in the `onboarding_` and `gateway_tests` steps of `check.yml`. Fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11180](/TOG/issues/TOG-11180), [TOG-10278](/TOG/issues/TOG-10278)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib session_valid_picks_survive_stale_keys_and_offer_a_partial_retry && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib session_entirely_unknown_or_empty_submissions_route_nothing && python3 scripts/cargo_cache.py run -- test -p two-bot onboarding_runtime_roleless_session_reselection_stale_menu_and_goodbye_mentions -- --include-ignored
 
 ### s13-8371181: 8371181 — feat(feeds): follow same-host redirects, refuse cross-host distinctly (#299)
 
@@ -1636,11 +1639,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-a40d4a5: a40d4a5 — fix(onboarding): plan session picks in catalog order (#258)
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Select onboarding picks in reverse catalog order with a disposable member.
-- **Expected:** Picks are planned and routed in catalog order.
-- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Submit session picks in reverse catalog order, with a repeat, through the pure planner and the runtime picker fixture.
+- **Expected:** Picks are planned and routed in catalog order, deduped, and the ack links follow that order.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; the `#[ignore]` DB scenarios need the disposable agent-testdb URL and run in the `onboarding_` and `gateway_tests` steps of `check.yml`. Fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11180](/TOG/issues/TOG-11180), [TOG-10278](/TOG/issues/TOG-10278)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib session_reordered_duplicate_submissions_follow_the_supplied_catalog && python3 scripts/cargo_cache.py run -- test -p two-bot onboarding_runtime_session_picks_route_in_catalog_order -- --include-ignored
 
 ### s13-90ab4b7: 90ab4b7 — fix(backup): publish dumps only after completed output (#386)
 
@@ -1672,11 +1676,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-d3d9afe: d3d9afe — fix(onboarding): withhold invisible fallback destinations (#398)
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Configure a disposable onboarding fallback channel the member cannot view, then complete selection.
-- **Expected:** The invisible fallback destination is withheld. Restore the configuration afterwards.
-- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Deny a disposable member the dedicated rooms and the hub, then submit game picks; repeat with only the hub denied.
+- **Expected:** The roles are kept, no link to a room the member cannot open is shown, and no `channel_routed` row is written when nothing is reachable; a mixed submission links the reachable room and records the other pick as unavailable.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; the `#[ignore]` DB scenarios need the disposable agent-testdb URL and run in the `onboarding_` and `gateway_tests` steps of `check.yml`. Fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11180](/TOG/issues/TOG-11180), [TOG-10278](/TOG/issues/TOG-10278)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib invisible_primary_and_fallback_retain_roles_without_a_route && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib routed_row_names_unavailable_picks_only_when_a_pick_has_no_route && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test onboarding_effects && python3 scripts/cargo_cache.py run -- test -p two-bot onboarding_runtime_game_picker_withholds_invisible_destinations_and_dedupes_keys -- --include-ignored && python3 scripts/cargo_cache.py run -- test -p two-bot onboarding_runtime_game_role_match_post_grant_routing_clear_and_dry_run -- --include-ignored
 
 ### s13-1e64035: 1e64035 — fix(presence): bound repeated truncated roster scans (#400)
 
