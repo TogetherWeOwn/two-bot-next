@@ -232,11 +232,61 @@ test("incident playbooks cite emitted metrics and selected literal log messages"
     ["crates/bot/src/command_runtime.rs", "sticky claim failed; skipping activity"],
     ["wrangler/src/index.ts", "two-bot container stopped"],
     ["crates/bot/src/server.rs", "SIGTERM received; draining"],
+    ["crates/discord/src/ratelimit_guard.rs", "Discord refused the bot token; REST disabled until restart"],
   ];
   for (const [path, message] of logs) {
     assert.ok(incidents.includes(message), `missing incident signal: ${message}`);
     assert.ok(read(path).includes(`"${message}"`), `log no longer emitted in ${path}: ${message}`);
   }
+});
+
+// Documentation regression guards, not proof of runtime behavior, a deployed
+// control or recovery. Fixtures also reject stale claims beside corrected prose.
+const incidentContracts: [string, string, string, string][] = [
+  ["persistent containment", "persistent ownership fence", "no authenticated HTTP stop route or persistent incident-pause control", "wrangler/src/ownership.ts"],
+  ["activated writers", "Moderation and automod are implemented and gated", "these moderation action slices and Worker flag forwarding are absent", "wrangler/src/container-env.ts"],
+  ["conditional live redirects", "With `REDIRECT_DB`, the Worker supplies `connectPostgres`", "the Worker constructs its RedirectStore with an undefined connector", "wrangler/src/redirect-store.ts"],
+  ["DML-only jobs", "lazy jobs also use `skip_migrations=true`", "the lazy jobs connection currently requests migrations and the web contract DDL", "crates/bot/src/website_jobs.rs"],
+  ["durable send admission", "token-wide durable `PgSendAdmission`", "Current send admission is per executor, not shared per token", "crates/core/src/send_admission/postgres.rs"],
+  ["shared process guard", "process-wide `process_guard`", "There is no wired token-wide cooldown/queue/breaker", "crates/discord/src/ratelimit_guard.rs"],
+  ["database readiness", "`database` component performs a bounded live ping", "There is no DB-ready component or DB-error metric", "crates/bot/src/server.rs"],
+  ["authorized metrics proxy", "authenticated `GET /ops/metrics`", "the Worker and DO do not proxy it", "wrangler/src/index.ts"],
+  ["job success coverage", "Every supervised job success updates", "the six periodic jobs do not populate that success metric", "crates/bot/src/jobs.rs"],
+  ["current archive coverage", "current writer is v4", "does not include gateway_sessions or website tables", "crates/core/src/backup/dump_file.rs"],
+  ["durable scorecard retries", "three durable attempt slots, five minutes apart", "the scorecard consumes its weekly attempt before DB work", "crates/bot/src/community_scorecard_retry.rs"],
+  ["default-dark action ingress", "`POST /internal/actions` is implemented but staging-only and default-dark", "Internal-action endpoints and /voice/ownership/health are not wired bot endpoints", "wrangler/src/index.ts"],
+];
+
+function guidanceText(markdown: string): string {
+  return markdown.replace(/[`*]/g, "").replace(/\s+/g, " ").toLowerCase();
+}
+
+function checkIncidentContract(markdown: string, contract: (typeof incidentContracts)[number]): void {
+  const [name, claim, stale, source] = contract;
+  const text = guidanceText(markdown);
+  assert.ok(text.includes(guidanceText(claim)), `missing current incident contract: ${name}`);
+  assert.ok(!text.includes(guidanceText(stale)), `stale incident claim: ${name}`);
+  assert.ok(markdown.includes(source), `missing source reference: ${source}`);
+}
+
+for (const contract of incidentContracts) {
+  const [name, claim, stale] = contract;
+  test(`incident guidance preserves ${name} rather than historical absence claims`, () => {
+    checkIncidentContract(runbook, contract);
+    // Replacing all wrapped/repeated corrective prose must fail, and adding
+    // the old claim beside the correction must not silently pass either.
+    assert.throws(() => checkIncidentContract(runbook.replace(/\s+/g, " ").replaceAll(claim, stale), contract),
+      /missing current incident contract/);
+    assert.throws(() => checkIncidentContract(`${runbook}\n${stale}`, contract), /stale incident claim/);
+  });
+}
+
+test("historical tabletop cannot substitute for current wiring or staging acceptance", () => {
+  const history = read("docs/incident-tabletop-2026-10-01.md");
+  assert.match(history, /historical findings at the October-1 source baseline/);
+  assert.match(history, /not current\s+wiring guidance/);
+  assert.match(history, /Local source walkthrough completed; staging walkthrough blocked/);
+  assert.match(history, /successful source tests do not fill this gate/);
 });
 
 test("ownership runbook examples use only the covered staging control client", () => {

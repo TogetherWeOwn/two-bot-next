@@ -37,6 +37,13 @@ current deployment. No current Worker version/image was verified in this run.
 
 The inputs below are **hypothetical source-contract cases**, not staging logs or
 metric samples. They exercise the decision sequence without provider calls.
+These are historical findings at the October-1 source baseline, **not current
+wiring guidance**: later source implements conditional live Hyperdrive redirects,
+a database readiness component and a persistent ownership fence. The preserved
+negative claims below must not guide a current incident; use the updated
+[incident playbooks](runbook.md#incident-playbooks), confirm the deployed revision,
+and record a fresh staging walkthrough before cutover. No later source correction
+changes the observations or completes the missing staging acceptance.
 
 | Scenario input | First five minutes / containment decision | Recovery evidence required, not observed here |
 |---|---|---|
