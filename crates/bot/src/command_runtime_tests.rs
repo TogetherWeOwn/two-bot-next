@@ -660,7 +660,7 @@ async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
                 .collect();
             assert_eq!(
                 names,
-                vec!["rank", "leaderboard"],
+                vec!["rank", "leaderboard", "help"],
                 "unrelated core commands remain; uncleared surfaces are replaced"
             );
         }
@@ -772,7 +772,7 @@ async fn activation_boot_from_env_fixture() {
     let defs = runtime.router().publish_set(&[]).unwrap();
     let names: Vec<_> = defs.iter().map(|def| def.name.as_str()).collect();
     if expected == "narrowed" {
-        assert_eq!(names, ["rank", "leaderboard"]);
+        assert_eq!(names, ["rank", "leaderboard", "help"]);
         assert!(!runtime.router().gates().moderation);
         assert!(!runtime.router().gates().automations);
         assert!(!runtime.router().gates().announcements);
@@ -883,6 +883,9 @@ async fn help_answers_immediately_from_the_live_publish_set() {
         ..gates(true, true)
     };
     let runtime = runtime_without_db(router_gates, true, origin);
+    assert!(runtime.published_commands().is_none());
+    runtime.publish_registry_checked(Some(1111)).await.unwrap();
+    assert!(runtime.published_commands().is_some());
     runtime
         .on_interaction(&slash("help", Some(CHANNEL), Vec::new()))
         .await;
