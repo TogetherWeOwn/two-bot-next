@@ -585,6 +585,12 @@ pub async fn run_shard<I: InviteSource + 'static>(
                     };
                     Some(handle.block_on(crate::automod_gateway::process(automod, delivery, &at)))
                 });
+                // Staff audit rows: translated pre-update (member deltas and
+                // voice boundaries need the rows the funnel is about to
+                // mutate), stored before the checkpoint commits. The store
+                // write is idempotent, so a crash between the two replays
+                // safely; a failed write never stalls this worker.
+                let mut audit_events = Vec::new();
                 if let Some(dispatch) = dispatch {
                     // A cold voice RESUME is followed by IDENTIFY; READY connects.
                     connected = matches!(dispatch.event, Event::Ready(_) | Event::Resumed)
@@ -593,6 +599,12 @@ pub async fn run_shard<I: InviteSource + 'static>(
                     onboarding_job = writer_onboarding
                         .as_ref()
                         .and_then(|runtime| runtime.capture(&dispatch.event, &pipeline));
+                    audit_events = crate::audit_gateway::translate(
+                        &dispatch.event,
+                        pipeline.cache(),
+                        &dispatch.observed_at,
+                        checkpoint.sequence,
+                    );
                     // Exactly one funnel call per dispatch, then drain deferred
                     // XP awards through the leveling runtime under the
                     // checkpoint deadline before the cursor commits. Without a
@@ -648,6 +660,10 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                 panic!("gateway leveling dispatch failed; checkpoint unchanged")
                             });
                     }
+                }
+                if !audit_events.is_empty() {
+                    let pending = std::mem::take(&mut audit_events);
+                    handle.block_on(crate::audit_gateway::record_all(&pending));
                 }
                 let durable_job = onboarding_job
                     .as_ref()

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store", "crates/testsupport"]
+exclude = ["fuzz"]
 default-members = [".", "crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store"]
 
 # One native Rust release strategy versions the whole workspace. The root
@@ -37,7 +38,7 @@ axum = { version = "0.8", default-features = false, features = [
     "tokio",
     "tracing",
 ] }
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 hex = "0.4"

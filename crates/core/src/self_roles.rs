@@ -994,6 +994,11 @@ fn parse_panel(
             "{at} has more than Discord's 25-option select limit"
         )));
     }
+    if mode == PanelMode::Reaction && options_items.len() > 20 {
+        return Err(SelfRoleConfigError::new(format!(
+            "{at} has more than Discord's 20-reaction limit"
+        )));
+    }
     let mut option_keys = HashSet::new();
     let mut role_ids = HashSet::new();
     let mut emojis = HashSet::new();

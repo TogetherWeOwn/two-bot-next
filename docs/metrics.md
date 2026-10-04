@@ -127,10 +127,12 @@ as dynamic labels.
   `two_bot_job_last_success_timestamp_seconds{job}` and
   `two_bot_job_consecutive_failures{job}` — `job` is one of
   `invite_snapshot`, `session_checkpoint`, `counter`, `rank`,
-  `scheduled_events`, `presence_probe`, `community_scorecard`, `inactivity`,
-  `audit_retry`, `scheduled_messages`, `other`; `outcome` is `success` or `failure`.
+  `scheduled_events`, `settings`, `presence_probe`, `community_scorecard`,
+  `inactivity`, `audit_retry`, `scheduled_messages`, `other`; `outcome` is
+  `success` or `failure`.
   `session_checkpoint` records successful durable gateway commits; zero means
   never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
+  `settings` is the DB-only 15 s `guild_settings` version poll.
 - `two_bot_voice_operations_total{op,outcome}` — `op` is `create`, `move`
   or `delete`; `outcome` is `success`, `category_full`, `discord`,
   `persistence` or `cancelled`. `Rejected` status/code values never become
@@ -250,6 +252,7 @@ server, no new infrastructure.
 | `db_pool_saturated` | pool at max, 0 idle, 3 consecutive samples | [DB pool](runbook.md#alert-db-pool) |
 | `db_errors` | 3+ storage failures between samples (restarts skip the window) | [DB errors](runbook.md#alert-db-errors) |
 | `send_admission_blocked` | new admission refusals in 3 consecutive samples | [send admission blocked](runbook.md#alert-send-admission-blocked) |
+| `voice_failures` | room-op failures > 5% of >= 10 ops between samples, or any new dead-letter/orphan (restarts skip the window) | [voice failures](runbook.md#alert-voice-failures) |
 
 `job_stale` uses `JOB_INTERVAL_SECONDS`, which must equal each scheduled job's
 Rust `*_INTERVAL_MS / 1000`. `invite_snapshot`, `session_checkpoint` and `other`
@@ -263,7 +266,7 @@ used on both sides of the B2 soak evidence seam. The Rust canonical list is
 is named `evidence-{ruleId}-{window}.json` (soak-ledger packets stamp the
 `soak_expected_committed` ledger identity), so the QA evidence table can
 attribute packets when several rules fire in one window. Both sides pin all
-six spellings with tests; the payload shape is unchanged.
+seven spellings with tests; the payload shape is unchanged.
 
 Known gaps: the DB error counter currently records only send-admission SQL,
 so non-admission stores still surface only through the pool proxy and the

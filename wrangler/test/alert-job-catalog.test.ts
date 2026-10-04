@@ -24,6 +24,7 @@ const STALE_EXEMPT = new Map<string, string>([
   ["other", "catch-all for unknown job names; unrelated jobs share it, so no single cadence exists"],
   ["audit_retry", "supervisor sweep with its own 30 s loop and parked/halt reporting in audit_runtime.rs; not registered through the website/community schedulers this catalog parses"],
   ["scheduled_messages", "15 s ticker registered in scheduled_jobs.rs, not the website/community schedulers this catalog parses; at STALE_INTERVALS=2 a staleness rule would be noisy and needs its own threshold"],
+  ["settings", "DB-only 15 s version poll registered in settings_jobs.rs, not the website/community schedulers this catalog parses; parked without DATABASE_URL, so at STALE_INTERVALS=2 a staleness rule would be noisy and needs its own threshold"],
 ]);
 
 function parseJobs(source: string): string[] {
@@ -127,7 +128,7 @@ const real: Catalog = { jobs: JOBS, rust: RUST, worker: JOB_INTERVAL_SECONDS, ex
 test("parses the full Rust job allowlist and every registered cadence", () => {
   assert.deepEqual(JOBS, [
     "invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events",
-    "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "other",
+    "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "other",
   ]);
   // Rust *_INTERVAL_MS / 1000: community_snapshots.rs:45,47, scheduled_events.rs:26,
   // presence.rs:36, community.rs:61, inactivity.rs:27.

@@ -8,7 +8,10 @@
 //! `staging-migrate apply` with the reviewed `expected_pending` list through
 //! the full migrator. The seeded max is 390 while most pending versions sort
 //! below it, so a full ledger afterwards proves SQLx applies every unapplied
-//! version regardless of the ledger max.
+//! version regardless of the ledger max. Plan runs as a separate read-only
+//! login through its own `TWO_BOT_STAGING_PLAN_DATABASE_URL` binding and
+//! `SET ROLE two_bot_migrator_ro`, proving the plan path cannot DDL even
+//! when pointed at the same database.
 
 use std::{
     collections::HashSet,
@@ -53,6 +56,7 @@ struct Fixture {
     database: String,
     outsider: String,
     mlogin: String,
+    rologin: String,
 }
 
 impl Fixture {
@@ -71,9 +75,16 @@ impl Fixture {
         let database = format!("two_bot_staging_fx_{pid}_{nonce}");
         let outsider = format!("stg_fx_outsider_{pid}_{nonce}");
         let mlogin = format!("stg_fx_mlogin_{pid}_{nonce}");
-        // Cluster-level group shared with other suites: tolerate a concurrent create.
+        let rologin = format!("stg_fx_rologin_{pid}_{nonce}");
+        // Cluster-level groups shared with other suites: tolerate concurrent creates.
         sqlx::query(
             "DO $$ BEGIN CREATE ROLE two_bot_migrator NOLOGIN; \
+             EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
+        )
+        .execute(&mut admin)
+        .await?;
+        sqlx::query(
+            "DO $$ BEGIN CREATE ROLE two_bot_migrator_ro NOLOGIN; \
              EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
         )
         .execute(&mut admin)
@@ -84,13 +95,15 @@ impl Fixture {
             // Non-superuser member login: proves SET ROLE works by membership,
             // not by superuser powers.
             format!("CREATE ROLE {mlogin} LOGIN"),
+            // Read-only plan login: holds only the RO group, never the migrator.
+            format!("CREATE ROLE {rologin} LOGIN"),
         ] {
             sqlx::query(sqlx::AssertSqlSafe(sql))
                 .execute(&mut admin)
                 .await?;
         }
         sqlx::query(sqlx::AssertSqlSafe(format!(
-            "GRANT CONNECT ON DATABASE {database} TO two_bot_migrator"
+            "GRANT CONNECT ON DATABASE {database} TO two_bot_migrator, two_bot_migrator_ro"
         )))
         .execute(&mut admin)
         .await?;
@@ -99,8 +112,24 @@ impl Fixture {
         )))
         .execute(&mut admin)
         .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "GRANT two_bot_migrator_ro TO {rologin}"
+        )))
+        .execute(&mut admin)
+        .await?;
         let mut scratch = PgConnection::connect_with(&admin_options(host, &database)).await?;
         sqlx::query("ALTER SCHEMA public OWNER TO two_bot_migrator")
+            .execute(&mut scratch)
+            .await?;
+        // The plan path reads only the ledger and schema presence, so the
+        // fixture RO login gets exactly that: schema USAGE plus ledger SELECT.
+        // (Production grants the full SELECT matrix from `sql/database_roles.sql`.)
+        // Mirror the production render: PUBLIC holds no CREATE on `public` (the
+        // default on PostgreSQL before 15), so only the schema owner can DDL.
+        sqlx::query("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
+            .execute(&mut scratch)
+            .await?;
+        sqlx::query("GRANT USAGE ON SCHEMA public TO two_bot_migrator_ro")
             .execute(&mut scratch)
             .await?;
         scratch.close().await?;
@@ -110,6 +139,7 @@ impl Fixture {
             database,
             outsider,
             mlogin,
+            rologin,
         })
     }
 
@@ -127,7 +157,24 @@ impl Fixture {
         host: &str,
         db: &str,
         expected_pending: Option<&str>,
-        plan_binding: Option<(&str, &str)>,
+        plan_binding: Option<(&str, &str, &str)>,
+    ) -> (i32, String, String) {
+        self.run_with_stray(mode, url, None, host, db, expected_pending, plan_binding)
+            .await
+    }
+
+    /// Like [`Self::run`], but also sets `stray` as the OTHER mode's binding:
+    /// proves a mode never borrows the credential reserved for the other one.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_with_stray(
+        &self,
+        mode: &str,
+        url: Option<String>,
+        stray: Option<String>,
+        host: &str,
+        db: &str,
+        expected_pending: Option<&str>,
+        plan_binding: Option<(&str, &str, &str)>,
     ) -> (i32, String, String) {
         let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_staging-migrate"));
         cmd.args([
@@ -146,15 +193,43 @@ impl Fixture {
         if let Some(list) = expected_pending {
             cmd.args(["--expected-pending", list]);
         }
-        if let Some((hash, run_id)) = plan_binding {
-            cmd.args(["--plan-manifest-sha256", hash, "--plan-run-id", run_id]);
+        if let Some((hash, run_id, manifest_path)) = plan_binding {
+            cmd.args([
+                "--plan-manifest-sha256",
+                hash,
+                "--plan-run-id",
+                run_id,
+                "--plan-manifest-path",
+                manifest_path,
+            ]);
         }
-        cmd.env_remove("TWO_BOT_STAGING_MIGRATOR_DATABASE_URL");
-        for key in ["PGOPTIONS", "PGPASSFILE", "PGSERVICE"] {
+        // Each mode reads only its own binding: the runner refuses when the
+        // mode's binding is absent, even when the other mode's URL is set.
+        let (binding, other) = if mode == "--plan" {
+            (
+                "TWO_BOT_STAGING_PLAN_DATABASE_URL",
+                "TWO_BOT_STAGING_MIGRATOR_DATABASE_URL",
+            )
+        } else {
+            (
+                "TWO_BOT_STAGING_MIGRATOR_DATABASE_URL",
+                "TWO_BOT_STAGING_PLAN_DATABASE_URL",
+            )
+        };
+        for key in [
+            "TWO_BOT_STAGING_PLAN_DATABASE_URL",
+            "TWO_BOT_STAGING_MIGRATOR_DATABASE_URL",
+            "PGOPTIONS",
+            "PGPASSFILE",
+            "PGSERVICE",
+        ] {
             cmd.env_remove(key);
         }
         if let Some(url) = url {
-            cmd.env("TWO_BOT_STAGING_MIGRATOR_DATABASE_URL", url);
+            cmd.env(binding, url);
+        }
+        if let Some(stray) = stray {
+            cmd.env(other, stray);
         }
         let out = cmd.output().await.expect("spawn staging-migrate");
         (
@@ -168,6 +243,21 @@ impl Fixture {
         PgConnection::connect_with(&admin_options(&self.host, &self.database)).await
     }
 
+    /// A session as the read-only plan login with its group assumed, exactly
+    /// as the runner's `after_connect` does for `--plan`.
+    async fn ro_session(&self) -> Result<PgConnection, sqlx::Error> {
+        let options = PgConnectOptions::new_without_pgpass()
+            .host(&self.host)
+            .port(5432)
+            .username(&self.rologin)
+            .password("")
+            .database(&self.database)
+            .ssl_mode(PgSslMode::Disable);
+        let mut conn = PgConnection::connect_with(&options).await?;
+        conn.execute("SET ROLE two_bot_migrator_ro").await?;
+        Ok(conn)
+    }
+
     async fn finish(mut self) -> TestResult {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP DATABASE {} WITH (FORCE)",
@@ -175,7 +265,7 @@ impl Fixture {
         )))
         .execute(&mut self.admin)
         .await?;
-        for role in [&self.outsider, &self.mlogin] {
+        for role in [&self.outsider, &self.mlogin, &self.rologin] {
             sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE {role}")))
                 .execute(&mut self.admin)
                 .await?;
@@ -187,6 +277,23 @@ impl Fixture {
 
 fn manifest(stdout: &str) -> Value {
     serde_json::from_str(stdout).expect("manifest json")
+}
+
+/// Snapshot a plan run's stdout to a temp file, mirroring the workflow's
+/// `staging-migrate-manifest.json` artifact. The caller passes the path as
+/// `--plan-manifest-path` so apply proves the bound hash against the
+/// producing plan's manifest. Returns the path; the OS reclaims temp files.
+fn snapshot_plan_manifest(stdout: &str) -> String {
+    let path = std::env::temp_dir().join(format!(
+        "staging-migrate-db-plan-{}-{}.json",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::write(&path, stdout).expect("plan snapshot must be writable");
+    path.to_string_lossy().into_owned()
 }
 
 fn pending_list(value: &Value) -> Vec<i64> {
@@ -239,6 +346,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
     let fx = Fixture::new().await?;
     let migrator = fx.url("agent_test", &fx.database);
     let member = fx.url(&fx.mlogin, &fx.database);
+    let ro = fx.url(&fx.rologin, &fx.database);
     let (host, db) = (fx.host.clone(), fx.database.clone());
     let total = two_bot_cutover::staging_migrate::MIGRATOR.iter().count() as u64;
 
@@ -362,12 +470,96 @@ async fn real_sqlx_runner_cases() -> TestResult {
     .await?;
     assert_eq!(owner, "two_bot_migrator");
 
+    // The plan path reads only the ledger, so the fixture RO group gets exactly
+    // that (production grants the full SELECT matrix from `sql/database_roles.sql`).
+    sqlx::query("GRANT SELECT ON public._sqlx_migrations TO two_bot_migrator_ro")
+        .execute(&mut c)
+        .await?;
+
+    // The RO login is physically incapable of DDL or ledger writes: this is
+    // the database-enforced boundary, not a runner convention.
+    let mut ro_conn = fx.ro_session().await?;
+    let readable: i64 = sqlx::query_scalar("SELECT count(*) FROM public._sqlx_migrations")
+        .fetch_one(&mut ro_conn)
+        .await?;
+    assert_eq!(readable, 29, "RO group must read the ledger");
+    for denied in [
+        "CREATE TABLE public.ro_probe (id int)",
+        "ALTER TABLE public._sqlx_migrations ADD COLUMN ro_probe int",
+        "DROP TABLE public._sqlx_migrations",
+        "DELETE FROM public._sqlx_migrations",
+        "INSERT INTO public._sqlx_migrations \
+         (version, description, success, checksum, execution_time) \
+         VALUES (999999, 'ro probe', true, '\\x00', 0)",
+    ] {
+        assert!(
+            sqlx::query(denied).execute(&mut ro_conn).await.is_err(),
+            "RO role must be refused: {denied}"
+        );
+    }
+    ro_conn.close().await?;
+    let ledger: i64 = sqlx::query_scalar("SELECT count(*) FROM public._sqlx_migrations")
+        .fetch_one(&mut c)
+        .await?;
+    assert_eq!(ledger, 29, "RO probes must not change the ledger");
+
+    // Each mode reads only its own binding. A plan run with only the migrator
+    // binding set refuses on the absent RO binding, before connecting.
+    let (code, out, err) = fx
+        .run_with_stray(
+            "--plan",
+            None,
+            Some(migrator.clone()),
+            &host,
+            &db,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("TWO_BOT_STAGING_PLAN_DATABASE_URL"), "{err}");
+    assert!(out.is_empty(), "refusal must not emit a manifest");
+    // The migrator-group login cannot be used as the plan credential either:
+    // it does not hold the RO group, so SET ROLE two_bot_migrator_ro refuses.
+    let (code, _, err) = fx
+        .run("--plan", Some(member.clone()), &host, &db, None, None)
+        .await;
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("SET ROLE two_bot_migrator_ro"), "{err}");
+    // And the RO login cannot be used for apply: SET ROLE two_bot_migrator
+    // refuses before any DDL, even with a well-formed plan binding.
+    let (code, _, err) = fx
+        .run(
+            "--apply",
+            Some(ro.clone()),
+            &host,
+            &db,
+            Some(""),
+            Some((
+                &"a".repeat(64),
+                "424240",
+                "producing-plan/staging-migrate-manifest.json",
+            )),
+        )
+        .await;
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("SET ROLE two_bot_migrator"), "{err}");
+    let ledger: i64 = sqlx::query_scalar("SELECT count(*) FROM public._sqlx_migrations")
+        .fetch_one(&mut c)
+        .await?;
+    assert_eq!(
+        ledger, 29,
+        "cross-credential refusals must not change the ledger"
+    );
+
     // Plan is read-only and prints the computed pending list with its hash.
     let (code, out, err) = fx
-        .run("--plan", Some(member.clone()), &host, &db, None, None)
+        .run("--plan", Some(ro.clone()), &host, &db, None, None)
         .await;
     assert_eq!(code, 0, "{err}");
     let m = manifest(&out);
+    assert_eq!(m["role"], "two_bot_migrator_ro");
+    assert!(m["role_verified_connections"].as_u64().unwrap() >= 1);
     assert_eq!(m["applied_count"], 0);
     let plan_hash = m["plan_manifest_sha256"]
         .as_str()
@@ -378,6 +570,9 @@ async fn real_sqlx_runner_cases() -> TestResult {
         64,
         "plan hash must be a SHA-256 hex digest"
     );
+    // Snapshot the plan stdout as the producing run's artifact: every apply
+    // below proves its bound hash against this manifest.
+    let plan_artifact = snapshot_plan_manifest(&out);
     let seed_set: HashSet<i64> = SEED_VERSIONS.into_iter().collect();
     let expected: Vec<i64> = two_bot_cutover::staging_migrate::MIGRATOR
         .iter()
@@ -427,7 +622,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(&expected_csv),
-            Some((&bad_hash, "424242")),
+            Some((&bad_hash, "424242", &plan_artifact)),
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -437,6 +632,30 @@ async fn real_sqlx_runner_cases() -> TestResult {
         .await?;
     assert_eq!(ledger, 29, "hash refusal must not change the ledger");
 
+    // The right hash with no producing manifest refuses before any DDL: the
+    // hash is exact but its provenance against the named plan run is
+    // unprovable.
+    let (code, _, err) = fx
+        .run(
+            "--apply",
+            Some(member.clone()),
+            &host,
+            &db,
+            Some(&expected_csv),
+            Some((
+                &plan_hash,
+                "424242",
+                "/tmp/staging-migrate-db-no-such-manifest.json",
+            )),
+        )
+        .await;
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("plan_run_id"), "{err}");
+    let ledger: i64 = sqlx::query_scalar("SELECT count(*) FROM public._sqlx_migrations")
+        .fetch_one(&mut c)
+        .await?;
+    assert_eq!(ledger, 29, "provenance refusal must not change the ledger");
+
     // Apply the reviewed list as the member login, bound to the plan hash.
     let (code, out, err) = fx
         .run(
@@ -445,12 +664,14 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(&expected_csv),
-            Some((&plan_hash, "424242")),
+            Some((&plan_hash, "424242", &plan_artifact)),
         )
         .await;
     assert_eq!(code, 0, "{err}");
     let m = manifest(&out);
     assert_eq!(m["applied_count"], expected.len() as u64);
+    assert_eq!(m["role"], "two_bot_migrator", "apply path is unchanged");
+    assert_eq!(m["plan_provenance_verified"], true);
     assert!(m["role_verified_connections"].as_u64().unwrap() >= 1);
     assert_eq!(m["ledger_after"].as_array().unwrap().len() as u64, total);
     assert!(!out.contains("postgres://"), "manifest must not echo URLs");
@@ -498,18 +719,19 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(&expected_csv),
-            Some((&plan_hash, "424242")),
+            Some((&plan_hash, "424242", &plan_artifact)),
         )
         .await;
     assert_eq!(code, 2);
     let (code, out, err) = fx
-        .run("--plan", Some(member.clone()), &host, &db, None, None)
+        .run("--plan", Some(ro.clone()), &host, &db, None, None)
         .await;
     assert_eq!(code, 0, "{err}");
     let empty_hash = manifest(&out)["plan_manifest_sha256"]
         .as_str()
         .expect("empty plan hash")
         .to_owned();
+    let empty_artifact = snapshot_plan_manifest(&out);
     let (code, out, err) = fx
         .run(
             "--apply",
@@ -517,7 +739,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(""),
-            Some((&empty_hash, "424243")),
+            Some((&empty_hash, "424243", &empty_artifact)),
         )
         .await;
     assert_eq!(code, 0, "{err}");
@@ -525,7 +747,8 @@ async fn real_sqlx_runner_cases() -> TestResult {
 
     // SHA-384 drift refuses. The binding inputs must be valid-format so the
     // run reaches reconcile (which fails on drift) instead of refusing on the
-    // missing binding first.
+    // missing binding first. The provenance anchor must verify too, so the
+    // empty plan's artifact travels with the binding.
     sqlx::query("UPDATE public._sqlx_migrations SET checksum = decode(repeat('00', 48), 'hex') WHERE version = (SELECT min(version) FROM public._sqlx_migrations)")
         .execute(&mut c)
         .await?;
@@ -536,14 +759,14 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(""),
-            Some((&empty_hash, "424244")),
+            Some((&empty_hash, "424244", &empty_artifact)),
         )
         .await;
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("drift"));
     // Restore the checksum from the source, then an incomplete row refuses.
     let (code, _, _) = fx
-        .run("--plan", Some(member.clone()), &host, &db, None, None)
+        .run("--plan", Some(ro.clone()), &host, &db, None, None)
         .await;
     assert_eq!(code, 2);
     sqlx::query("DELETE FROM public._sqlx_migrations WHERE version = (SELECT max(version) FROM public._sqlx_migrations)")
@@ -570,7 +793,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(""),
-            Some((&empty_hash, "424245")),
+            Some((&empty_hash, "424245", &empty_artifact)),
         )
         .await;
     assert_eq!(code, 2, "{err}");
