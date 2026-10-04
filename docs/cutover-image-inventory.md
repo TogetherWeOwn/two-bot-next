@@ -1,10 +1,15 @@
 # Cutover container image inventory (offline, read-only)
 
 Read-only record of the cutover runtime image. No registry push, no deploy,
-no secret access. All values below come from static files at the inventory
-commit; no image was built or pulled for this note.
+no secret access. Values come from static files at the baseline inventory
+commit, except for the separately sourced builder-row refresh below. No image
+was built or pulled for this note; the refresh adds no measured evidence.
 
-- Inventory commit: `7797b1e166d2aa7b28725cdddc1b8f0c097a5ed5` (2026-10-03)
+- Baseline inventory commit: `7797b1e166d2aa7b28725cdddc1b8f0c097a5ed5` (2026-10-03)
+- Builder-row refresh (2026-10-04): [`Dockerfile:10` at `723663df9c74fd24734170a981cf59908aadd33a`](https://github.com/TogetherWeOwn/two-bot-next/blob/723663df9c74fd24734170a981cf59908aadd33a/Dockerfile#L10).
+  The baseline used `rust:1.94-trixie`; only the builder row now records the
+  Rust 1.98 tag and digest. Runtime, layer, SBOM and size notes remain the
+  baseline record, with unmeasured values still TBD.
 - Source files: `Dockerfile`, `.github/workflows/sbom.yml`,
   `docs/supply-chain.md`, `scripts/container-smoke.py`, `.trivyignore.yaml`
 - Method: read the files above only. Byte sizes are TBD until the CI-built
@@ -83,13 +88,17 @@ downloaded for this offline inventory, so there is no SBOM pointer to a
 specific run yet. The cutover evidence manifest should name the
 candidate's run ID and attach or link its two `.cdx.json` files.
 
-## Stale-vs-main notes
+## Baseline stale-vs-main notes
 
-- `Dockerfile` in this worktree is identical to `origin/main` (empty
-  `git diff origin/main -- Dockerfile` at the inventory commit). Nothing stale.
-- Branch-vs-main file diff touches bot/voice/watch/docs code, not the image:
-  no Dockerfile, base digest, release profile, or SBOM workflow change rides
-  with this branch.
+These comparisons describe the 2026-10-03 baseline, not the builder refresh
+or the current PR diff.
+
+- At the baseline inventory commit, `Dockerfile` was identical to the then-current
+  `origin/main` (empty `git diff origin/main -- Dockerfile`). Nothing was stale.
+- That baseline branch-vs-main diff touched bot/voice/watch/docs code, not the
+  image: no Dockerfile, base digest, release profile, or SBOM workflow change
+  rode with that branch. The separately sourced builder refresh changes the
+  builder tag and digest, not the runtime image or its measurement status.
 - `Dockerfile.distroless` is a local-trial-only variant, never built by CI
   and never the cutover image. It omits the provenance `ARG`/`LABEL` block
   the CI `Dockerfile` carries, so do not substitute one for the other when
