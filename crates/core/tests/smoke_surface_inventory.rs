@@ -63,8 +63,8 @@ fn inventory_matches_registry_output_in_publish_order() {
             row["description"].as_str().expect("row description"),
             "/{name} description"
         );
-        assert_eq!(
-            definition.dm_permission, false,
+        assert!(
+            !definition.dm_permission,
             "/{name} is guild-only (DMs false)"
         );
         assert_eq!(row["dm_permission"], false, "/{name} fixture DMs false");
