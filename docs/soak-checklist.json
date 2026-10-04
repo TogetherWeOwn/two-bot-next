@@ -2377,18 +2377,19 @@
           "[a891063](https://github.com/TogetherWeOwn/two-bot/commit/a8910636e2de4b6bd518a78645acb5bec0422604)",
           "`src/core/`, `src/tempVoice/`",
           "TOG-3471: reconcile settings, command registry, and source citations",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
         "TOG-10093",
         "TOG-10119"
       ],
-      "status": "manual",
-      "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. List the deployed `/voice` subcommands and temp-voice settings in the staging guild.",
-      "expected": "Registry and settings match TOG-10091’s config/registry golden; no orphan or missing subcommand.",
-      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
-      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+      "status": "automated",
+      "action": "Run the voice publish pins: the router merge and yield tests in `crates/core/src/router.rs`, the staging manifest drift tests in `crates/core/tests/staging_publish_manifest.rs`, and the generated command reference check in `crates/core/tests/reference_docs.rs`.",
+      "expected": "With `TWO_VOICE=1` the merged publish set carries the 27 builtins then the 16 voice names (voice `kick` loses first-wins to moderation `/kick`), `/templateassistant` only with the assistant gate too, names and default permissions equal the manifest, and none publish with the gate off.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result; fixture proof only. Deployed `/voice` registry read-back and the temp-voice staging scenario stay on [TOG-10119](/TOG/issues/TOG-10119) and are not covered by this row.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::voice && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::templateassistant && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test staging_publish_manifest && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs committed_references_match_compiled_metadata",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — deployed registry read-back and temp-voice scenario evidence; the offline publish pins above are this row's automated proof."
     },
     {
       "id": "s13-50c3e9f",

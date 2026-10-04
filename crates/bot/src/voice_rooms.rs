@@ -4261,8 +4261,9 @@ pub fn setup_panel(summary: &SetupSummary) -> SetupPanel {
 }
 
 /// Voice definitions for the guild command merge, gated on `TWO_VOICE=1`.
-/// Registration merges these first-wins via [`merge_commands`](two_bot_core::merge_commands);
-/// the S4 slice owns the REST call.
+/// Production publication runs through `InteractionRouter::publish_set`
+/// (`RouterGates::voice`), which merges `voice_commands()` first-wins after
+/// moderation; this helper pins the same gate for the voice module's own tests.
 #[must_use]
 pub fn voice_command_set(gates: &VoiceGates) -> Vec<CommandDefinition> {
     if gates.enabled {
