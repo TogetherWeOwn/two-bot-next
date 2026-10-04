@@ -1154,6 +1154,7 @@ mod tests {
             expected_pending: None,
             plan_manifest_sha256: None,
             plan_run_id: None,
+            plan_manifest_path: None,
         };
         assert_eq!(binding_env(&plan), PLAN_URL_ENV);
         assert_eq!(expected_role(&plan), READ_ONLY_ROLE);
@@ -1178,6 +1179,7 @@ mod tests {
             expected_pending: None,
             plan_manifest_sha256: None,
             plan_run_id: None,
+            plan_manifest_path: None,
         };
         // Plan refuses on the absent RO binding by name: the migrator URL is a
         // different binding and can never satisfy the plan path.
