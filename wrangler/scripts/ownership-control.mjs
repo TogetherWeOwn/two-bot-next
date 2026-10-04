@@ -3,7 +3,21 @@
 // Production handoff remains B4's separately authorized execution sheet.
 class ControlError extends Error {}
 
-export async function control({ action, url, token, actor, expectedEpoch, releaseFence = false }, send = fetch) {
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// A takeover POST fired within a second of `wrangler deploy` can land on a
+// still-propagating older Worker version, whose deployment id no longer
+// matches the stamped header; the singleton answers 503 (deployment_mismatch
+// and friends all map to 503 server-side). Retry only that transient 5xx for
+// the push-path deployment-takeover. Never retry the deliberate fence refusal,
+// auth/validation failures, or explicit operator actions; the verify gate
+// still adjudicates exactness of whatever owner wins.
+function retryableTakeoverFailure(error) {
+  return error instanceof ControlError &&
+    /^Ownership control failed \(HTTP 5\d\d\)/.test(error.message);
+}
+
+export async function control({ action, url, token, actor, expectedEpoch, releaseFence = false, takeoverAttempts = 5, takeoverRetryDelayMs = 10000 }, send = fetch, wait = sleep) {
   const origin = new URL(url);
   if (origin.protocol !== "https:" || origin.port || origin.username || origin.password ||
       !/^two-bot-next-staging\.[a-z0-9-]+\.workers\.dev$/.test(origin.hostname) ||
@@ -25,26 +39,40 @@ export async function control({ action, url, token, actor, expectedEpoch, releas
     }
     return state;
   };
-  const current = await read({ method: "GET" });
-  if (action === "status") return current;
-  if (!actor || !/^[a-zA-Z0-9_.:@/-]{1,128}$/.test(actor)) throw new ControlError("Explicit audit actor is required");
-  if (action === "deployment-takeover") {
-    // Routine deployments may hand off an active owner. A parked or pristine
-    // singleton needs an explicit workflow-dispatch release, never push/default.
-    if (current.owner?.phase !== "active" && !releaseFence) {
-      throw new ControlError("Singleton is intentionally fenced or uninitialized; explicit staging release required");
+  const once = async () => {
+    const current = await read({ method: "GET" });
+    if (action === "status") return current;
+    if (!actor || !/^[a-zA-Z0-9_.:@/-]{1,128}$/.test(actor)) throw new ControlError("Explicit audit actor is required");
+    if (action === "deployment-takeover") {
+      // Routine deployments may hand off an active owner. A parked or pristine
+      // singleton needs an explicit workflow-dispatch release, never push/default.
+      if (current.owner?.phase !== "active" && !releaseFence) {
+        throw new ControlError("Singleton is intentionally fenced or uninitialized; explicit staging release required");
+      }
+      expectedEpoch = current.owner?.epoch ?? 0;
     }
-    expectedEpoch = current.owner?.epoch ?? 0;
+    if (!Number.isSafeInteger(expectedEpoch) || expectedEpoch < 0) throw new ControlError("Explicit expected epoch is required");
+    const targetAction = action === "deployment-takeover" ? "takeover" : action;
+    const result = await read({ method: "POST", body: JSON.stringify({ action: targetAction, actor, expectedEpoch }) });
+    if (result.running || result.owner?.epoch !== expectedEpoch + 1 ||
+        (targetAction === "takeover" && (result.owner.phase !== "active" || result.owner.deploymentId !== result.deploymentId)) ||
+        (targetAction === "fence" && (result.owner.phase !== "fenced" || result.owner.deploymentId !== null))) {
+      throw new ControlError("Ownership transition not confirmed; preserve maintenance");
+    }
+    return result;
+  };
+  if (action !== "deployment-takeover") return once();
+  let failure;
+  for (let attempt = 1; attempt <= takeoverAttempts; attempt++) {
+    try {
+      return await once();
+    } catch (error) {
+      failure = error;
+      if (!retryableTakeoverFailure(error) || attempt >= takeoverAttempts) throw error;
+      await wait(takeoverRetryDelayMs);
+    }
   }
-  if (!Number.isSafeInteger(expectedEpoch) || expectedEpoch < 0) throw new ControlError("Explicit expected epoch is required");
-  const targetAction = action === "deployment-takeover" ? "takeover" : action;
-  const result = await read({ method: "POST", body: JSON.stringify({ action: targetAction, actor, expectedEpoch }) });
-  if (result.running || result.owner?.epoch !== expectedEpoch + 1 ||
-      (targetAction === "takeover" && (result.owner.phase !== "active" || result.owner.deploymentId !== result.deploymentId)) ||
-      (targetAction === "fence" && (result.owner.phase !== "fenced" || result.owner.deploymentId !== null))) {
-    throw new ControlError("Ownership transition not confirmed; preserve maintenance");
-  }
-  return result;
+  throw failure;
 }
 
 if (process.argv[1] === new URL(import.meta.url).pathname) {

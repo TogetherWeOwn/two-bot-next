@@ -20,6 +20,8 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_gateway_latency_seconds` | Last heartbeat round-trip from Twilight's completed ACK sample |
 | `two_bot_gateway_reconnects_total` | New HELLOs after the first HELLO in the running loop (successful transport reconnections, not failed dial attempts) |
 | `two_bot_gateway_resumes_total` | Received RESUMED dispatches |
+| `two_bot_gateway_disconnects_total` | Observed transport losses funnelled through the shard supervisor (reconnect failures, close frames, invalid sessions, cold-resume IDENTIFY). Every disconnect must pair with a later RESUME or fresh READY in the same window; an unpaired disconnect means the gateway never came back |
+| `two_bot_gateway_missed_events_total` | Dispatches Discord assigned but this process never received (sequence gaps inside one session). Any nonzero increase over the watch window fails the zero-missed-events acceptance |
 | `two_bot_gateway_events_total{event}` | Received dispatches, including replays/duplicates, plus heartbeat ACKs and closes; fixed type allowlist, remainder `other` |
 | `two_bot_handler_duration_seconds` | Cumulative histogram over nonduplicate dispatch parse/pipeline/durable commit, including failures; seconds |
 | `two_bot_rest_requests_total{route,result}` | Executor HTTP sends, including retries; result `2xx`, `3xx`, `4xx`, `429`, `5xx` at response headers or `transport` (failure/cancellation/timeout before headers); later body failures do not hide 429/5xx |
@@ -248,6 +250,7 @@ server, no new infrastructure.
 | `db_pool_saturated` | pool at max, 0 idle, 3 consecutive samples | [DB pool](runbook.md#alert-db-pool) |
 | `db_errors` | 3+ storage failures between samples (restarts skip the window) | [DB errors](runbook.md#alert-db-errors) |
 | `send_admission_blocked` | new admission refusals in 3 consecutive samples | [send admission blocked](runbook.md#alert-send-admission-blocked) |
+| `voice_failures` | room-op failures > 5% of >= 10 ops between samples, or any new dead-letter/orphan (restarts skip the window) | [voice failures](runbook.md#alert-voice-failures) |
 
 `job_stale` uses `JOB_INTERVAL_SECONDS`, which must equal each scheduled job's
 Rust `*_INTERVAL_MS / 1000`. `invite_snapshot`, `session_checkpoint` and `other`
@@ -261,7 +264,7 @@ used on both sides of the B2 soak evidence seam. The Rust canonical list is
 is named `evidence-{ruleId}-{window}.json` (soak-ledger packets stamp the
 `soak_expected_committed` ledger identity), so the QA evidence table can
 attribute packets when several rules fire in one window. Both sides pin all
-six spellings with tests; the payload shape is unchanged.
+seven spellings with tests; the payload shape is unchanged.
 
 Known gaps: the DB error counter currently records only send-admission SQL,
 so non-admission stores still surface only through the pool proxy and the

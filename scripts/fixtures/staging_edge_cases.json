@@ -1,0 +1,47 @@
+{
+  "_comment": "Offline edge-case fixture pack for the staging smoke commands (no network, no tokens, no guild touch). Each case is one observable smoke outcome with the exact surface text the harness must classify. Sources are pinned in scripts/staging_edge_cases.py; this file carries shapes only.",
+  "version": 1,
+  "pack": "staging-smoke edge cases: permission-denied, interaction-timeout, empty-rank",
+  "cases": [
+    {
+      "name": "permission_denied",
+      "command": "feed-add",
+      "observation": {
+        "reply": "You need the Manage Server permission to use this command. Ask a server admin to grant it.",
+        "reason": "harness identity lacks the Discord permission; the bot itself is healthy"
+      },
+      "expected_outcome": "permission_denied",
+      "meaning": "Stop and fix the harness identity or grants; never a bot bug, never a watch-log error. Never retry with another credential."
+    },
+    {
+      "name": "interaction_timeout",
+      "command": "rank",
+      "observation": {
+        "reply": null,
+        "reason": "interactions endpoint did not respond (TimeoutError)"
+      },
+      "expected_outcome": "interaction_timeout",
+      "meaning": "Transport gave no answer: check container health and readiness, then rerun once. One hit then green is a flake; a persistent stall is a bug or infra outage."
+    },
+    {
+      "name": "empty_rank",
+      "command": "rank",
+      "observation": {
+        "reply": "**Quiet Newcomer**\nLevel **1** · Rank **Unranked** (no XP recorded)\nXP **0** · 0/100 this level · **100** to level 2",
+        "reason": "member has no XP row yet; a valid empty result, not a failure"
+      },
+      "expected_outcome": "empty_rank",
+      "meaning": "Healthy empty shape: the command answered and the member simply has no XP. Must surface as an answered-empty outcome, never as an error or a missing-registration failure."
+    },
+    {
+      "name": "generic_failure_contrast",
+      "command": "rank",
+      "observation": {
+        "reply": "Something went wrong (ref 1a2b3c4d). Please try again — if it keeps happening, share this reference with a server admin.",
+        "reason": "handler error with a correlation reference; the only text that ever carries a failure outward"
+      },
+      "expected_outcome": "generic_failure",
+      "meaning": "Contrast case: the one shape that IS a bot-side failure. None of the three edge cases above may classify here, or a red smoke line becomes untriagable by shape."
+    }
+  ]
+}
