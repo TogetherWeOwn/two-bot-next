@@ -1008,21 +1008,20 @@ async fn reclaim_hands_room_back_to_returned_creator_and_persists() {
     let tracked = worker.tracked().get(&500).expect("tracked room");
     assert_eq!(tracked.owner_id, MEMBER);
     assert_eq!(tracked.original_creator_id, MEMBER);
+    // The succession handoff is still queued, so the reclaim coalesces into
+    // it: one grant rewrite converges on the latest owner, never the stale
+    // caretaker.
     dispatch(&mut worker, 0).await;
-    dispatch(&mut worker, 1).await;
-    assert!(
+    assert!(!worker.dispatch_one(1).await);
+    assert_eq!(
         trace
             .lock()
             .unwrap()
             .iter()
             .filter(|call| call.starts_with("update_ownership"))
-            .count()
-            >= 1
+            .collect::<Vec<_>>(),
+        [&format!("update_ownership:500:{MEMBER}")]
     );
-    assert!(trace
-        .lock()
-        .unwrap()
-        .contains(&format!("update_ownership:500:{MEMBER}")));
 }
 
 #[tokio::test]
