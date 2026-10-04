@@ -648,6 +648,169 @@ async fn persistence_failure_compensates_the_exact_new_channel_and_never_moves()
     assert_eq!(worker.failures().len(), 1);
 }
 
+/// Worker-level pin for the legacy "only creator channels create rooms" rule
+/// (the core `decide_room_join` test does not exercise `GuildRoomWorker`).
+/// Mutation: drop the `creators.contains_key` gate from `accept_join`.
+#[tokio::test]
+async fn joining_a_channel_that_is_not_a_creator_never_creates_a_room() {
+    const LOBBY: u64 = 777;
+    let (live, store, http, trace) = fixture();
+    live.publish(snapshot(&[LOBBY], vec![]));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // The gateway still hands out a ticket for any voice channel; the worker
+    // is what refuses it.
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(LOBBY), Some(false))
+        .expect("ticket for a joined channel");
+    assert_eq!(ticket.creator_id, LOBBY);
+    assert!(!worker.accept_join(ticket, "lobby room".to_owned(), 7, NOW.to_owned()));
+    assert!(!worker.dispatch_one(0).await);
+    assert!(worker.creations.is_empty());
+    assert!(worker.tracked().is_empty());
+    assert!(worker.failures().is_empty());
+    assert!(trace.lock().unwrap().is_empty());
+    // The configured creator still works for the same member afterwards.
+    worker.live.voice_update(MEMBER, None, Some(false));
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 1).await;
+    assert_eq!(*trace.lock().unwrap(), ["create", "persist:500"]);
+}
+
+/// A guild with no creator row configured creates nothing, even when a member
+/// sits in a voice channel. Mutation: as above.
+#[tokio::test]
+async fn a_guild_without_creator_channels_never_creates_a_room() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap().clear();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .expect("ticket for a joined channel");
+    assert!(!worker.accept_join(ticket, "new room".to_owned(), 7, NOW.to_owned()));
+    assert!(!worker.dispatch_one(0).await);
+    assert!(worker.tracked().is_empty());
+    assert!(worker.failures().is_empty());
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+/// The overwrite/permission preflight (`prepare`) must refuse before the
+/// channel POST, at worker level. Mutation: run `prepare()` after `create`
+/// (the trace then contains `create` for the refused plan).
+#[tokio::test]
+async fn refused_creation_plan_records_a_failure_before_any_channel_is_created() {
+    // Bot lacks Manage Channels on the creator channel.
+    let (live, store, http, trace) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .inner
+        .write()
+        .unwrap()
+        .bot
+        .as_mut()
+        .unwrap()
+        .roles = vec![role(permissions() & !Permissions::MANAGE_CHANNELS)];
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        worker.failures().back(),
+        Some(&LifecycleFailure::Discord {
+            channel_id: CREATOR,
+            error: RoomHttpError::AccessDenied,
+        })
+    );
+    assert!(worker.creations.is_empty());
+    assert!(worker.tracked().is_empty());
+    assert!(!worker.dispatch_one(1).await);
+    assert!(trace.lock().unwrap().is_empty());
+
+    // A private-by-default creator without Manage Roles: `plan_room` refuses
+    // instead of silently making a public room.
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].private_default = true;
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .inner
+        .write()
+        .unwrap()
+        .bot
+        .as_mut()
+        .unwrap()
+        .roles = vec![role(permissions() & !Permissions::MANAGE_ROLES)];
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        worker.failures().back(),
+        Some(&LifecycleFailure::Discord {
+            channel_id: CREATOR,
+            error: RoomHttpError::AccessDenied,
+        })
+    );
+    assert!(worker.creations.is_empty());
+    assert!(worker.tracked().is_empty());
+    assert!(!worker.dispatch_one(1).await);
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.http.created_attributes.lock().unwrap().is_empty());
+}
+
+/// A failed compensation delete must keep the room (and its provenance)
+/// tracked so a later sweep can remove it, never strand an untracked orphan.
+/// Mutation: drop the room from `rooms` after the refused compensation delete.
+#[tokio::test]
+async fn failed_rollback_keeps_the_room_tracked_until_a_later_sweep_removes_it() {
+    let (live, mut store, http, trace) = fixture();
+    store.persist_error = Some(StoreError::Unavailable);
+    http.delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "delete:500"]
+    );
+    // Retained with its creation provenance and flagged for compensation.
+    let kept = worker.tracked().get(&500).expect("room stays tracked");
+    assert_eq!(kept.owner_id, MEMBER);
+    assert_eq!(kept.original_creator_id, MEMBER);
+    assert_eq!(kept.creator_channel_id, CREATOR);
+    assert!(worker.compensation.contains(&500));
+    assert!(worker.deletes.contains(&500));
+    // The refused delete is not retried against unchanged permissions.
+    for time in [3000, 6000, 10000] {
+        worker.reconcile();
+        assert!(!worker.dispatch_one(time).await);
+    }
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "delete:500"]
+    );
+    assert!(worker.tracked().contains_key(&500));
+    // A permission refresh lets the next sweep retry the delete and forget it.
+    worker.live.publish(snapshot(&[500], vec![]));
+    worker.reconcile();
+    dispatch(&mut worker, 10000).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            "create",
+            "persist:500",
+            "delete:500",
+            "delete:500",
+            "forget:500"
+        ]
+    );
+    assert!(worker.tracked().is_empty());
+    assert!(!worker.compensation.contains(&500));
+    assert!(!worker.deletes.contains(&500));
+}
+
 #[tokio::test]
 async fn voice_change_during_persistence_compensates_instead_of_moving() {
     let (live, mut store, http, trace) = fixture();
