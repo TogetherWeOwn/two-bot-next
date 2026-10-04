@@ -101,7 +101,9 @@ pub enum DiscordError {
     /// treatment as [`DiscordError::Timeout`].
     #[error("discord was unreachable: {0}")]
     Unavailable(String),
-    /// Rate limited (legacy `rate_limited`): uncertain, paced per §6.
+    /// Rate limited (legacy `rate_limited`): paced per §6. Discord did not
+    /// process the request ([`DiscordError::proves_no_effect`]), but the
+    /// member and website fences still classify it as uncertain.
     #[error("discord rate-limited this request")]
     RateLimited,
     /// Refused locally before any wire attempt; safe to release a claim.
@@ -115,6 +117,16 @@ impl DiscordError {
     #[must_use]
     pub fn is_safe_pre_mutation(&self) -> bool {
         matches!(self, Self::Rejected(_) | Self::Guard(_))
+    }
+
+    /// True when the failure proves the request had no effect: everything
+    /// [`Self::is_safe_pre_mutation`] covers, plus a 429. Discord documents a
+    /// rate-limited request as not processed, and the send-admission layer
+    /// already releases on it (`docs/discord-send-admission.md`). Callers that
+    /// fence a single request may release that fence and retry.
+    #[must_use]
+    pub fn proves_no_effect(&self) -> bool {
+        self.is_safe_pre_mutation() || matches!(self, Self::RateLimited)
     }
 }
 
@@ -3528,6 +3540,15 @@ mod tests {
         assert!(DiscordError::Rejected("build: invalid request".to_owned()).is_safe_pre_mutation());
         assert!(!DiscordError::Timeout.is_safe_pre_mutation());
         assert!(!DiscordError::RateLimited.is_safe_pre_mutation());
+    }
+
+    #[test]
+    fn proves_no_effect_adds_only_rate_limits_to_safe_pre_mutation() {
+        assert!(DiscordError::RateLimited.proves_no_effect());
+        assert!(DiscordError::Rejected("refused".to_owned()).proves_no_effect());
+        assert!(DiscordError::Guard(GuardError::AdmissionTimeout).proves_no_effect());
+        assert!(!DiscordError::Timeout.proves_no_effect());
+        assert!(!DiscordError::Unavailable("503".to_owned()).proves_no_effect());
     }
 
     #[test]

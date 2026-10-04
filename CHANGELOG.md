@@ -156,6 +156,7 @@
 
 ### Fixed
 
+- Stop a failed or rate-limited `/purge` history read from wedging the channel: the slash runtime now runs the read and the delete as separate phases, finishes the request as refused and releases the channel lane when the read fails (a timeout there proves no delete was sent), and treats a 429 on any channel mutation as not applied. `/unlock` and `/lockdown` stay reachable; a delete or overwrite write that may have applied still keeps the lane for reconciliation.
 - Support the exact authenticated-user REST read used by feed history reconciliation, and preserve the uncompressed runtime-image budget when Docker's containerd store also accounts for compressed blobs.
 - Retain unsent onboarding welcome/goodbye payloads when successful REST responses contain inconsistent role snapshots or unusable channel evidence, while preserving proven-denial skips. Resolve only submitted session destinations so an unavailable unselected room cannot block valid routing. Add mock restart and selected/unselected regressions; current-head execution and independent review remain pending.
 - Synchronize the interrupted onboarding callback restart fixture on its first durable claim, not early HTTP arrival. Keep token-free receipts, exact attempt counts, replay fencing and fresh-reselection assertions unchanged.

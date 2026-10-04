@@ -52,6 +52,15 @@ occurred and must never trigger another effect. SQL failure retains the claim,
 lane and recovery seed; retry only persistence with the same ticket/result.
 The older `complete` method alone does not release a runtime lane.
 
+A failure releases the lane (via `finish` with a `refused` reply) only when it
+proves no mutation was accepted: a local guard or build refusal, a confirmed
+400/401/403/404/405 rejection, a 429 (Discord documents it as not processed),
+or any failure of `/purge`'s history read. `/purge` runs the read and the delete
+as separate phases, so a 5xx, timeout or unreadable body on the read cannot
+strand the lane; the website executor already splits them the same way. A failed
+delete, overwrite write or slowmode PATCH with an ambiguous result (5xx, timeout,
+unexpected status) still keeps the claim and lane.
+
 The first lockdown seed is persisted before PUT and repeated locks preserve it.
 A proven rejected first lock can retire its new seed because the original state
 was not changed; a rejected repeated lock keeps the original recovery seed.
