@@ -379,3 +379,56 @@ async fn actor_plumbing_refuses_unknown_rooms_and_votes() {
         KickRefusal::Vote(VoteKickError::UnknownVote)
     );
 }
+
+#[tokio::test]
+async fn kick_room_of_resolves_tracked_rooms_only() {
+    let (worker, _trace) = setup().await;
+    assert_eq!(worker.kick_room_of(TARGET), Some(ROOM));
+    assert_eq!(worker.kick_room_of(VOTER_A), Some(ROOM));
+    // Unknown member: no room, so the router keeps the interaction.
+    assert_eq!(worker.kick_room_of(999_999), None);
+}
+
+#[tokio::test]
+async fn kick_room_of_ignores_untracked_channels() {
+    const LOBBY: u64 = 501;
+    const BYSTANDER: u64 = 305;
+    let mut members = roster();
+    members.push(VoiceMember {
+        member_id: BYSTANDER,
+        channel_id: LOBBY,
+        bot: Some(false),
+    });
+    // LOBBY is a live voice channel but not a tracked temporary room.
+    let (worker, _trace) = setup_with(snapshot(&[ROOM, LOBBY], members)).await;
+    assert_eq!(worker.kick_room_of(BYSTANDER), None);
+    assert_eq!(worker.kick_room_of(TARGET), Some(ROOM));
+}
+
+#[tokio::test]
+async fn kick_room_of_is_none_while_evidence_is_stale() {
+    let trace = Trace::default();
+    let live = LiveGuild::new(GUILD);
+    // No snapshot published: evidence is not authoritative.
+    let store = Store::new(trace.clone());
+    store.rooms.lock().unwrap().insert(ROOM, room(ROOM));
+    let worker = GuildRoomWorker::load(live, store, Http::new(trace.clone()))
+        .await
+        .unwrap();
+    assert_eq!(worker.kick_room_of(TARGET), None);
+}
+
+#[tokio::test]
+async fn actor_kick_room_of_answers_through_the_inbox() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace);
+    assert!(runtime.publish_snapshot(GUILD, snapshot(&[ROOM], roster())));
+    // The fake store tracks no rooms, so even a live-occupant target is
+    // unclaimed; the inbox round-trip answers instead of hanging.
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), runtime.kick_room_of(GUILD, TARGET),)
+            .await
+            .expect("claim reply"),
+        None
+    );
+}

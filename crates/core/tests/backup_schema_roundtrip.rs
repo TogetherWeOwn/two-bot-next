@@ -1402,37 +1402,42 @@ async fn v3_prefix_restores_into_migrated_schema_without_retaining_newer_target_
 
     // Missing legacy subsystems may be omitted only when their archive is empty.
     // Refuse nonempty data BEFORE touching current tables or guard modes.
-    let absent_name = OPTIONAL_LEGACY_TABLES[0];
-    let mut incompatible = copy_contents(&legacy);
-    let absent = incompatible
-        .manifest
-        .tables
-        .iter_mut()
-        .find(|table| table.name == absent_name)
-        .unwrap();
-    absent.columns = vec!["flagged".to_owned()];
-    absent.count = 1;
-    incompatible.buffers.insert(
-        absent_name.to_owned(),
-        vec![serde_json::Map::from_iter([(
-            "flagged".to_owned(),
-            json!(true),
-        )])],
-    );
-    incompatible.rows += 1;
-    let incompatible_path = directory.path("nonempty-absent-legacy.ndjson.gz");
-    write_archive(&incompatible_path, &incompatible);
+    // No optional-legacy table exists in this tree (every covered table is
+    // migrated), so there is no live absent table to poison: the refusal
+    // below runs only while the coverage list names one. Forgetting moderation
+    // history stays unconditional: the v3 restore below requires it.
     forget_moderation_history(pool).await;
-    let all_tables = actual_tables(pool).await;
-    let unchanged = snapshot(pool, &all_tables).await;
-    let sequences = sequence_snapshot(pool).await;
-    let error = restore(pool, &incompatible_path).await.unwrap_err();
-    assert!(error
-        .to_string()
-        .contains(&format!("{absent_name} is absent from target")));
-    assert_eq!(snapshot(pool, &all_tables).await, unchanged);
-    assert_eq!(triggers(pool).await, guards);
-    assert_eq!(sequence_snapshot(pool).await, sequences);
+    if let Some(absent_name) = OPTIONAL_LEGACY_TABLES.first() {
+        let mut incompatible = copy_contents(&legacy);
+        let absent = incompatible
+            .manifest
+            .tables
+            .iter_mut()
+            .find(|table| table.name == *absent_name)
+            .unwrap();
+        absent.columns = vec!["flagged".to_owned()];
+        absent.count = 1;
+        incompatible.buffers.insert(
+            absent_name.to_string(),
+            vec![serde_json::Map::from_iter([(
+                "flagged".to_owned(),
+                json!(true),
+            )])],
+        );
+        incompatible.rows += 1;
+        let incompatible_path = directory.path("nonempty-absent-legacy.ndjson.gz");
+        write_archive(&incompatible_path, &incompatible);
+        let all_tables = actual_tables(pool).await;
+        let unchanged = snapshot(pool, &all_tables).await;
+        let sequences = sequence_snapshot(pool).await;
+        let error = restore(pool, &incompatible_path).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(&format!("{absent_name} is absent from target")));
+        assert_eq!(snapshot(pool, &all_tables).await, unchanged);
+        assert_eq!(triggers(pool).await, guards);
+        assert_eq!(sequence_snapshot(pool).await, sequences);
+    }
 
     let report = restore(pool, &legacy_path).await.unwrap();
     assert!(report.ok, "v3's revision baseline is explicitly counted");

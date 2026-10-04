@@ -796,7 +796,9 @@ async fn slow_dispatch_sends_defer_then_original_edit_on_the_wire() {
 #[tokio::test]
 async fn unknown_ids_names_and_refusals_reply_without_invoking_a_handler() {
     use common::{MockRest, ScriptedResponse};
-    use two_bot_core::router::replies::{InteractionReply, UNKNOWN_INTERACTION_REPLY};
+    use two_bot_core::router::replies::{
+        InteractionReply, EXPIRED_COMPONENT_REPLY, UNKNOWN_COMMAND_REPLY,
+    };
     use two_bot_discord::{
         dispatch_interaction, ActionExecutor, DispatchOptions, InteractionReplyTransport,
     };
@@ -832,14 +834,14 @@ async fn unknown_ids_names_and_refusals_reply_without_invoking_a_handler() {
         let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["type"], 4);
         assert_eq!(body["data"]["flags"], 64);
-        assert_eq!(
-            body["data"]["content"],
-            if i == 3 {
-                MANAGE_SERVER_REQUIRED
-            } else {
-                UNKNOWN_INTERACTION_REPLY
-            }
-        );
+        // Unknown slash names get the re-pick wording; stale
+        // components/modals get the expired-control wording.
+        let expected = match i {
+            0 => UNKNOWN_COMMAND_REPLY,
+            1 | 2 => EXPIRED_COMPONENT_REPLY,
+            _ => MANAGE_SERVER_REQUIRED,
+        };
+        assert_eq!(body["data"]["content"], expected);
     }
     let mut foreign = component("two:unknown", Vec::new());
     foreign.guild_id = Some(Id::new(9999));

@@ -20,6 +20,8 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_gateway_latency_seconds` | Last heartbeat round-trip from Twilight's completed ACK sample |
 | `two_bot_gateway_reconnects_total` | New HELLOs after the first HELLO in the running loop (successful transport reconnections, not failed dial attempts) |
 | `two_bot_gateway_resumes_total` | Received RESUMED dispatches |
+| `two_bot_gateway_disconnects_total` | Observed transport losses funnelled through the shard supervisor (reconnect failures, close frames, invalid sessions, cold-resume IDENTIFY). Every disconnect must pair with a later RESUME or fresh READY in the same window; an unpaired disconnect means the gateway never came back |
+| `two_bot_gateway_missed_events_total` | Dispatches Discord assigned but this process never received (sequence gaps inside one session). Any nonzero increase over the watch window fails the zero-missed-events acceptance |
 | `two_bot_gateway_events_total{event}` | Received dispatches, including replays/duplicates, plus heartbeat ACKs and closes; fixed type allowlist, remainder `other` |
 | `two_bot_handler_duration_seconds` | Cumulative histogram over nonduplicate dispatch parse/pipeline/durable commit, including failures; seconds |
 | `two_bot_rest_requests_total{route,result}` | Executor HTTP sends, including retries; result `2xx`, `3xx`, `4xx`, `429`, `5xx` at response headers or `transport` (failure/cancellation/timeout before headers); later body failures do not hide 429/5xx |
@@ -27,9 +29,17 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_db_pool_connections` | Current pool size |
 | `two_bot_db_pool_idle_connections` | Current idle connections |
 | `two_bot_db_pool_max_connections` | Configured maximum |
+| `two_bot_db_errors_total{op}` | Storage-layer failures; `op` is `admission` (send-admission SQL) or `other` (every other store until its op joins the allowlist) |
+| `two_bot_send_admissions_total{outcome}` | Send-admission `admit()` decisions; `outcome` is `admitted`, `blocked`, `storage_error` (also counted in `two_bot_db_errors_total{op="admission"}`) or `other` |
 | `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
 | `two_bot_job_last_success_timestamp_seconds{job}` | Last successful completion time in Unix seconds; zero means no success recorded |
 | `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
+| `two_bot_voice_operations_total{op,outcome}` | Finished room create/move/delete outcomes; `op` is `create`, `move` or `delete`, `outcome` is `success`, `category_full`, `discord`, `persistence` or `cancelled`; retries and 429 backoffs are not outcomes |
+| `two_bot_voice_reconcile_actions_total{action}` | Reconcile plan sizes; `action` is `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued` |
+| `two_bot_voice_dead_letters_total{action}` | Queue writes that exhausted `QUEUE_MAX_ATTEMPTS` (10); `action` is `create`, `move`, `delete`, `companion`, `ownership`, `kick`, `rename` or `other` |
+| `two_bot_voice_tracked_rooms` | Rooms tracked in memory; compare with live Discord channels for ghosts |
+| `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
+| `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
 
 ## Job coverage and outcomes
 
@@ -121,6 +131,40 @@ as dynamic labels.
   `audit_retry`, `scheduled_messages`, `other`; `outcome` is `success` or `failure`.
   `session_checkpoint` records successful durable gateway commits; zero means
   never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
+- `two_bot_voice_operations_total{op,outcome}` — `op` is `create`, `move`
+  or `delete`; `outcome` is `success`, `category_full`, `discord`,
+  `persistence` or `cancelled`. `Rejected` status/code values never become
+  labels; all store variants share `persistence`.
+- `two_bot_voice_reconcile_actions_total{action}` — `action` is
+  `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued`.
+- `two_bot_voice_dead_letters_total{action}` — `action` is `create`, `move`,
+  `delete`, `companion`, `ownership`, `kick`, `rename` or `other`.
+- `two_bot_db_errors_total{op}` — `op` is `admission` or `other`. Recorded
+  by `Metrics::db_error`; currently only send-admission SQL
+  (admit/extend/complete storage failures) reports, so `other` stays zero
+  until another store's op joins the allowlist.
+- `two_bot_send_admissions_total{outcome}` — `outcome` is `admitted`,
+  `blocked`, `storage_error` or `other`. Recorded once per `admit()`
+  decision by the Postgres admission gate; failed `complete()`/`extend()`
+  storage writes count only in `two_bot_db_errors_total`.
+- Log fields (coordinated with blocked structured-log work, which owns JSON
+  formatting): `voice_event="voice_operation"` with `op`/`outcome`,
+  `voice_event="voice_reconcile"` with plan counts,
+  `voice_event="voice_dead_letter"` with `action`/`attempts`, and
+  `voice_event="voice_creator_orphan"`. No channel, member, token, body or
+  ID leaves the process in any label or field.
+- Worker log fields (Workers Logs only, never a metric):
+  `event="container_gateway_failure"` with `phase`/`class`, emitted by the
+  Container DO keepalive in `wrangler/src/index.ts` once per tick while the
+  gateway task is failing. `phase` is `durable_gateway`; `class` is one of
+  `store_unavailable`, `gateway_pool_connect_failed`, `checkpoint_load_failed`,
+  `onboarding_gates_invalid`, `onboarding_init_failed`,
+  `custom_commands_init_failed`, `milestones_load_failed`,
+  `automod_config_invalid`, `automod_executor_failed`, `raid_executor_failed`,
+  `gateway_runtime_failed` or `gateway_task_panicked` (every `FailureClass`
+  variant in `crates/bot/src/gateway_failure.rs`). Only `[a-z0-9_]{1,32}`
+  tokens are ever logged; anything else is dropped. See
+  [startup diagnostics](startup-diagnostics.md#self-diagnosing-gateway-failures-readyz-gatewayfailure).
 - `two_bot_handler_duration_seconds` histogram buckets (`le`, seconds):
   `0.001`, `0.005`, `0.01`, `0.05`, `0.1`, `0.5`, `1`, `5`, `+Inf`, plus
   `_sum` and `_count`.
@@ -204,6 +248,9 @@ server, no new infrastructure.
 | `job_consecutive_failures:<job>` | `two_bot_job_consecutive_failures` >= 3 | [job failures](runbook.md#alert-job-failures) |
 | `rest_429_rate` | 429s > 10% of REST requests between samples, >= 10 requests | [REST 429](runbook.md#alert-rest-429) |
 | `db_pool_saturated` | pool at max, 0 idle, 3 consecutive samples | [DB pool](runbook.md#alert-db-pool) |
+| `db_errors` | 3+ storage failures between samples (restarts skip the window) | [DB errors](runbook.md#alert-db-errors) |
+| `send_admission_blocked` | new admission refusals in 3 consecutive samples | [send admission blocked](runbook.md#alert-send-admission-blocked) |
+| `voice_failures` | room-op failures > 5% of >= 10 ops between samples, or any new dead-letter/orphan (restarts skip the window) | [voice failures](runbook.md#alert-voice-failures) |
 
 `job_stale` uses `JOB_INTERVAL_SECONDS`, which must equal each scheduled job's
 Rust `*_INTERVAL_MS / 1000`. `invite_snapshot`, `session_checkpoint` and `other`
@@ -217,10 +264,13 @@ used on both sides of the B2 soak evidence seam. The Rust canonical list is
 is named `evidence-{ruleId}-{window}.json` (soak-ledger packets stamp the
 `soak_expected_committed` ledger identity), so the QA evidence table can
 attribute packets when several rules fire in one window. Both sides pin all
-four spellings with tests; the payload shape is unchanged.
+seven spellings with tests; the payload shape is unchanged.
 
-Known gaps: there is no DB error counter (the pool rule is a proxy) and no
-send-admission series, so neither is alerted. Add the series first, then a rule.
+Known gaps: the DB error counter currently records only send-admission SQL,
+so non-admission stores still surface only through the pool proxy and the
+job-failure rules; adopt `Metrics::db_error` per store incrementally. A
+slow trickle of DB errors below the burst threshold likewise surfaces only
+through `job_consecutive_failures`.
 A forced job failure on staging (three failures) raises
 `job_consecutive_failures:<job>` within about one keepalive tick. Counter resets
 (process restart) skip the 429 window. Alert state is persisted in DO storage

@@ -78,6 +78,20 @@ pub const fn invalidates_session(resumable: bool) -> bool {
     !resumable
 }
 
+/// Dispatches Discord assigned but this process never received in one session:
+/// the gap between the last received checkpoint and a new sequence. Zero for
+/// a new session, for duplicates, and for the next expected sequence. A
+/// nonzero gap means transport loss inside a resumable session; the watch
+/// counts it toward the zero-missed-events acceptance.
+pub fn missed_gap(prev: Option<&GatewaySession>, session_id: &str, sequence: u64) -> u64 {
+    match prev {
+        Some(saved) if saved.session_id == session_id => {
+            sequence.saturating_sub(saved.sequence.saturating_add(1))
+        }
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +198,22 @@ mod tests {
             );
         }
         assert_eq!(BootDirective::default(), BootDirective::None);
+    }
+
+    #[test]
+    fn sequence_gaps_count_missed_dispatches_only_in_the_same_session() {
+        let session = saved();
+        assert_eq!(missed_gap(Some(&session), "mock-session", 43), 0);
+        assert_eq!(missed_gap(Some(&session), "mock-session", 42), 0);
+        assert_eq!(missed_gap(Some(&session), "mock-session", 41), 0);
+        assert_eq!(missed_gap(Some(&session), "mock-session", 45), 2);
+        assert_eq!(missed_gap(Some(&session), "new-session", 1), 0);
+        assert_eq!(missed_gap(None, "mock-session", 7), 0);
+        let saturated = GatewaySession {
+            sequence: u64::MAX,
+            ..saved()
+        };
+        assert_eq!(missed_gap(Some(&saturated), "mock-session", u64::MAX), 0);
     }
 
     #[test]
