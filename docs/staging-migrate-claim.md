@@ -53,6 +53,17 @@ its projection and requires embedded == computed == requested digest. This does
 not authenticate the separately referenced prior plan run. That is mandatory
 consumer work, not a promise inferred from the artifact name or a numeric ID.
 
+Pending input follows the runner's trimming and integer parsing: surrounding
+whitespace is ignored, whitespace-only input means no pending migrations, and
+leading zeros or a leading `+` normalize to canonical positive i64 strings.
+Duplicates, descending values, empty entries, overflow and manifest mismatches
+still refuse. Database pins accept letters, digits, `_`, `-` and `.` within the
+63-byte bound (for example `two-bot-staging`); production-like and URL-like names
+still refuse. Evidence references use the runner's bare-reference rules: at most
+200 UTF-8 bytes, no whitespace, `@` or `://`. Punctuation such as
+`acl-review#decision(v2)` is preserved, not normalized; exact manifest/request
+reference and target equality remain mandatory.
+
 ## Rust digest serialization
 
 `crates/cutover/src/staging_migrate.rs::manifest_hash` hashes these UTF-8 bytes,

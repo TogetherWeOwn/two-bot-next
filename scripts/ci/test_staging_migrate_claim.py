@@ -86,8 +86,12 @@ class ClaimTests(unittest.TestCase):
                          ("PLAN_MANIFEST_SHA256", "c" * 64), ("SOURCE_SHA", "c" * 40),
                          ("STAGING_HOST", "elsewhere.invalid"), ("STAGING_DATABASE", "other_db"),
                          ("RECOVERY_REF", "other-review"), ("ACL_REF", "other-review"),
-                         ("EXPECTED_PENDING", "1"), ("EXPECTED_PENDING", "01,9007199254740993"),
-                         ("EXPECTED_PENDING", "1,9007199254740992")):
+                         ("EXPECTED_PENDING", "1"), ("EXPECTED_PENDING", "1,9007199254740992"),
+                         ("EXPECTED_PENDING", "1,"), ("EXPECTED_PENDING", "1,,9007199254740993"),
+                         ("EXPECTED_PENDING", "1,1"), ("EXPECTED_PENDING", "9007199254740993,1"),
+                         ("EXPECTED_PENDING", "0,9007199254740993"), ("EXPECTED_PENDING", "-1,9007199254740993"),
+                         ("EXPECTED_PENDING", "1,9223372036854775808"),
+                         ("EXPECTED_PENDING", "1,9_007_199_254_740_993")):
             with self.subTest(key=key, bad=bad):
                 with self.assertRaises(Refused):
                     build_claim(self.plan, {**ENV, key: bad})
@@ -135,15 +139,71 @@ class ClaimTests(unittest.TestCase):
                     self.assertFalse(output.exists())
                     self.assertNotIn("sentinel", result.stderr)
 
+    def test_pending_input_normalizes_like_the_runner(self):
+        for raw in (" 1, 9007199254740993 ", "\t1,\n9007199254740993\t",
+                    "01,+09007199254740993"):
+            with self.subTest(raw=raw):
+                claim = build_claim(self.plan, {**ENV, "EXPECTED_PENDING": raw})
+                self.assertEqual(claim["expected_pending"], ["1", "9007199254740993"])
+
+    def test_bare_references_keep_runner_accepted_punctuation(self):
+        for key, env_key in (("acl_plan_ref", "ACL_REF"), ("recovery_evidence_ref", "RECOVERY_REF")):
+            for value in ("acl-review#decision(v2)", "review?revision=2&approved=true", "révision#2"):
+                with self.subTest(key=key, value=value):
+                    plan = {**self.plan, key: value}
+                    claim = build_claim(plan, {**ENV, env_key: value})
+                    self.assertEqual(claim[key], value)
+            for value in ("", "a" * 201, "é" * 101, "review\tref", "review\nref", "a@b"):
+                with self.subTest(key=key, value=value):
+                    with self.assertRaises(Refused):
+                        build_claim({**self.plan, key: value}, {**ENV, env_key: value})
+
+    def test_bare_database_pins_accept_hyphens_and_dots(self):
+        for database in ("two-bot-staging", "two.bot_staging"):
+            with self.subTest(database=database):
+                plan = deepcopy(self.plan)
+                plan["target"]["database"] = database
+                claim = build_claim(plan, {**ENV, "STAGING_DATABASE": database})
+                self.assertEqual(claim["target"], plan["target"])
+                with self.assertRaises(Refused):
+                    build_claim(plan, ENV)
+        for database in ("two-bot-prod", "user@database", "db/other", "db?secret", "db%2Fother",
+                         "two words", "a" * 64):
+            with self.subTest(database=database):
+                plan = deepcopy(self.plan)
+                plan["target"]["database"] = database
+                with self.assertRaises(Refused):
+                    build_claim(plan, {**ENV, "STAGING_DATABASE": database})
+
+    def test_reviewer_examples_publish_through_the_actual_cli(self):
+        plan = deepcopy(self.plan)
+        plan["target"]["database"] = "two-bot-staging"
+        plan["acl_plan_ref"] = "acl-review#decision(v2)"
+        env = {**ENV, "STAGING_DATABASE": "two-bot-staging", "ACL_REF": plan["acl_plan_ref"],
+               "EXPECTED_PENDING": " 1, 9007199254740993 "}
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as directory:
+            manifest, output = Path(directory) / "plan.json", Path(directory) / "claim.json"
+            manifest.write_text(json.dumps(plan))
+            result = subprocess.run(["python3", str(ROOT / "scripts/ci/staging_migrate_claim.py"),
+                                     "--manifest", str(manifest), "--output", str(output)],
+                                    env={**os.environ, **env}, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            claim = json.loads(output.read_text())
+            self.assertEqual(claim["expected_pending"], ["1", "9007199254740993"])
+            self.assertEqual(claim["acl_plan_ref"], plan["acl_plan_ref"])
+            self.assertEqual(claim["target"], plan["target"])
+
     def test_empty_pending_and_full_length_decimal_identity(self):
         plan = deepcopy(self.plan)
         plan["pending_before"] = []
         plan["plan_manifest_sha256"] = projection_hash(plan)
-        env = {**ENV, "EXPECTED_PENDING": "", "PLAN_MANIFEST_SHA256": plan["plan_manifest_sha256"],
+        env = {**ENV, "PLAN_MANIFEST_SHA256": plan["plan_manifest_sha256"],
                "PLAN_RUN_ID": "18446744073709551615"}
-        claim = build_claim(plan, env)
-        self.assertEqual(claim["expected_pending"], [])
-        self.assertEqual(claim["plan_run_id"], env["PLAN_RUN_ID"])
+        for raw in ("", "  ", "\t\n"):
+            with self.subTest(raw=raw):
+                claim = build_claim(plan, {**env, "EXPECTED_PENDING": raw})
+                self.assertEqual(claim["expected_pending"], [])
+                self.assertEqual(claim["plan_run_id"], env["PLAN_RUN_ID"])
 
     def test_producer_files_roundtrip_as_stored_zip_entries(self):
         for path in (PLAN, CLAIM):

@@ -105,23 +105,30 @@ def build_claim(manifest, env):
     require(isinstance(target.get("host"), str)
             and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}", target["host"])
             and isinstance(target.get("database"), str)
-            and re.fullmatch(r"[a-zA-Z0-9_]{1,63}", target["database"])
+            and re.fullmatch(r"[a-zA-Z0-9_.-]{1,63}", target["database"])
             and all("prod" not in value.lower() for value in target.values()),
             "target is not a bare staging identity")
     require(target == {"host": env.get("STAGING_HOST"), "database": env.get("STAGING_DATABASE")},
             "plan target does not match the request")
     for key, env_key in (("recovery_evidence_ref", "RECOVERY_REF"), ("acl_plan_ref", "ACL_REF")):
         value = env.get(env_key, "")
-        require(isinstance(value, str) and 0 < len(value) <= 200
-                and all(c.isascii() and (c.isalnum() or c in "-_.:#/") for c in value)
-                and "://" not in value, "approval reference is not a bare reference")
+        # Match the runner's is_ref contract; punctuation is not a URL or credential.
+        require(isinstance(value, str) and 0 < len(value.encode("utf-8")) <= 200
+                and not any(c.isspace() for c in value)
+                and "@" not in value and "://" not in value,
+                "approval reference is not a bare reference")
         require(manifest.get(key) == value, "approval reference does not match the request")
-    raw = env.get("EXPECTED_PENDING", "")
-    pending = [] if raw == "" else raw.split(",")
-    require(all(DECIMAL.fullmatch(v) and int(v) <= I64_MAX for v in pending),
+    raw = env.get("EXPECTED_PENDING", "").strip()
+    parts = [] if not raw else [part.strip() for part in raw.split(",")]
+    require(all(re.fullmatch(r"[+]?[0-9]+", part) for part in parts),
             "requested pending versions are invalid")
-    require(pending == [str(v) for v in versions(manifest.get("pending_before"))],
+    try:
+        requested = versions([int(part) for part in parts])
+    except ValueError:
+        raise Refused("requested pending versions are invalid") from None
+    require(requested == versions(manifest.get("pending_before")),
             "pending versions do not match the request")
+    pending = [str(version) for version in requested]
     return {
         "schema_version": 1,
         "kind": CLAIM_KIND,
