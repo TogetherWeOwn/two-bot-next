@@ -602,6 +602,52 @@ class ConvergenceTests(OfflineTestCase):
                 self.assert_gate("invalid_api_schema", rollout.converged, row, IMAGE, 8)
 
 
+def lag_row():
+    row = completed_row()
+    row["health"]["instances"]["active"] = 0
+    return row
+
+
+class ActiveLagTests(OfflineTestCase):
+    def test_completed_zero_active_with_healthy_singleton_is_lag_not_converged(self):
+        self.assertFalse(rollout.converged(lag_row(), IMAGE, 8))
+        self.assertTrue(rollout.active_lag(lag_row(), IMAGE, 8))
+
+    def test_pending_and_progressing_are_never_lag(self):
+        for status in ["pending", "progressing"]:
+            with self.subTest(status=status):
+                row = lag_row()
+                row["status"] = status
+                self.assertFalse(rollout.active_lag(row, IMAGE, 8))
+
+    def test_any_other_counter_deviation_is_not_lag(self):
+        for key, value in [("active", 1), ("healthy", 0), ("failed", 1),
+                           ("starting", 1), ("scheduling", 1)]:
+            with self.subTest(key=key, value=value):
+                row = lag_row()
+                row["health"]["instances"][key] = value
+                self.assertFalse(rollout.active_lag(row, IMAGE, 8))
+
+    def test_lag_shares_converged_identity_and_schema_checks(self):
+        row = lag_row()
+        row["target_version"] = 9
+        self.assert_gate("rollout_identity_drift", rollout.active_lag, row, IMAGE, 8)
+        row = lag_row()
+        row["status"] = "replaced"
+        self.assert_gate("rollout_replaced_or_reverted", rollout.active_lag, row, IMAGE, 8)
+        row = lag_row()
+        del row["health"]["instances"]["active"]
+        self.assert_gate("invalid_api_schema", rollout.active_lag, row, IMAGE, 8)
+
+    def test_lag_needs_completed_steps_and_instance_progress(self):
+        row = lag_row()
+        row["steps"][0]["status"] = "pending"
+        self.assert_gate("rollout_steps_incomplete", rollout.active_lag, row, IMAGE, 8)
+        row = lag_row()
+        row["progress"].update(total_instances=1, updated_instances=0)
+        self.assertFalse(rollout.active_lag(row, IMAGE, 8))
+
+
 class RuntimeTests(OfflineTestCase):
     def test_all_components_ready_for_exact_worker_sha_and_build(self):
         self.assertTrue(rollout.runtime_ready(*ready_response(), VERSION, REVISION, BUILD_ID))
@@ -1002,6 +1048,59 @@ class OrchestrationTests(OfflineTestCase):
             ("api", APP_PATH),
         ])
         self.assertEqual(self.clock.sleeps, [])
+        self.assert_no_secret_saved_or_printed()
+
+    def lag_client(self, readyz_routes):
+        lagged = lag_row()
+        client = verify_client()
+        client.api_routes[ROWS_PATH] = [[old_row(), lagged]]
+        client.api_routes[DETAIL_PATH] = [lagged]
+        client.request_routes[URL + "/readyz"] = readyz_routes
+        return client
+
+    def test_active_lag_accepts_after_two_consecutive_full_passes(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = self.lag_client([ready_response()])
+        rollout.verify(self.args, client)
+        self.assertEqual(json.loads(Path(self.args.evidence).read_text()), {
+            "worker_version": VERSION, "application_id": APPLICATION_ID,
+            "rollout_id": NEW_ROLLOUT, "target_version": 8, "image": IMAGE,
+            "revision": REVISION, "build_id": BUILD_ID, "readyz": 200, "health": 200,
+            "active_lag": True,
+        })
+        self.assertEqual(self.clock.sleeps, [5])
+        self.assert_no_secret_saved_or_printed()
+
+    def test_active_lag_streak_resets_on_any_non_passing_poll(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        _, headers, body = ready_response()
+        flapping = [ready_response(), (503, headers, body), ready_response(), ready_response()]
+        client = self.lag_client(flapping)
+        client.deadline = 120
+        rollout.verify(self.args, client)
+        self.assertTrue(json.loads(Path(self.args.evidence).read_text())["active_lag"])
+        self.assertEqual(self.clock.sleeps, [5, 5, 5])
+        self.assert_no_secret_saved_or_printed()
+
+    def test_single_lag_pass_without_confirmation_times_out(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        _, headers, body = ready_response()
+        client = self.lag_client([ready_response(), (503, headers, body)])
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertTrue(client.observation.startswith("rollout=active_lag "))
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_lag_without_exact_runtime_never_succeeds(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        _, headers, body = ready_response()
+        client = self.lag_client([(503, headers, body)])
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assert_no_evidence()
         self.assert_no_secret_saved_or_printed()
 
     def test_verify_ndjson_rejections_happen_before_image_or_api_probes(self):
