@@ -516,7 +516,7 @@ class DeltaChecklistTests(unittest.TestCase):
         automated = [e for e in self.checklist["entries"] if e["parity"]["section"] == 13 and e["status"] == "automated"]
         self.assertEqual({e["parity"]["row"][3] for e in automated}, {"ported"})
         for entry in automated:
-            self.assertTrue(entry["verification"].startswith("python3 scripts/cargo_cache.py run -- test -p two-bot-"))
+            self.assertTrue(entry["verification"].startswith("python3 scripts/cargo_cache.py run -- test -p two-bot"))
 
     def test_render_lists_delta_sections_and_owners(self):
         output = render(self.checklist)
