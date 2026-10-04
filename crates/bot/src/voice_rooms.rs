@@ -20,7 +20,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::voice_room_plan::{category_room_ids, plan_room, RoomPlanInput};
+use crate::voice_room_plan::{
+    category_room_ids, plan_room_diagnosed, RoomPlanError, RoomPlanInput, BOT_ROOM_ACCESS,
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 use twilight_cache_inmemory::DefaultInMemoryCache;
@@ -35,7 +37,7 @@ use twilight_model::{
             component::{ActionRow, Button, ButtonStyle, Component},
             AllowedMentions, MessageFlags,
         },
-        permission_overwrite::PermissionOverwriteType,
+        permission_overwrite::{PermissionOverwrite, PermissionOverwriteType},
         Channel, ChannelType,
     },
     guild::{Permissions, Role},
@@ -55,8 +57,9 @@ use two_bot_core::{
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
     },
     voice_config::{
-        export_configuration, validate_configuration, ChannelKind, ChannelReference,
-        GuildInventory, VoiceConfiguration, MAX_IMPORT_BYTES, VOICE_CONFIG_VERSION,
+        decode_configuration, export_configuration, validate_configuration, ChannelKind,
+        ChannelReference, GuildInventory, VoiceConfigError, VoiceConfiguration, MAX_IMPORT_BYTES,
+        VOICE_CONFIG_VERSION,
     },
     voice_config_diff::{
         diff_configuration, diff_content_hash, render_preview, skip_unknown_channels,
@@ -70,10 +73,15 @@ use two_bot_core::{
         parse_detail_level, resolve_log_target, should_log, DetailLevel, LogTarget,
         LoggingCandidates, LoggingSettings, RepeatLedger,
     },
+    voice_name_filter::{
+        filter_channel_name, resolve_create_name, BlockedRoomName, NameError, NameFilterContext,
+        ResolvedRoomName, NAME_BLOCKED_AUDIT_REASON,
+    },
     voice_ownership::{
         decide_ownership, OwnershipDecision, OwnershipError, OwnershipRequest, RoomActor,
         RoomMember, RoomOwnership,
     },
+    voice_permissions::OWNER_ALLOW_BITS,
     voice_rooms::{
         category_full_message, is_usable_channel_name, voice_commands, ActionQueue, CreatorChannel,
         NewRoomSpec, PermissionSource, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction,
@@ -90,22 +98,49 @@ use two_bot_core::{
         VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError, VoteKickRef,
         VoteKickStatus, VoteKickUpdate, VoteRoomFacts,
     },
-    CommandDefinition, OverwriteTarget, PermissionFinding, PermissionOverwrite as HealthOverwrite,
-    Snowflake, VoicePermission, VoicePermissionScope,
+    AutomodPolicy, CommandDefinition, OverwriteTarget, PermissionFinding,
+    PermissionOverwrite as HealthOverwrite, Snowflake, VoicePermission, VoicePermissionScope,
 };
-use two_bot_cutover::voice_rooms::PgRoomStore;
+use two_bot_cutover::voice_rooms::{OwnerGrantIntent, PgRoomStore};
 use two_bot_discord::voice_rooms::{
     can_enforce_kick, can_manage_room, effective_permissions, RoomChannelAttributes, RoomHttp,
     RoomHttpError,
 };
 
+#[path = "voice_name_panel.rs"]
+mod name_panel;
+pub use name_panel::NameDirectory;
+use name_panel::{
+    handle_name_interaction, name_component_action, name_directory_from_cache, NameCommand,
+    NameInteraction, NameReply,
+};
+
 pub type WriteGuard = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Keep a permission refusal observed at send time distinct from a stale
+/// ticket cancellation, without changing the adapter's boolean guard contract.
+struct GuardedWrite {
+    check: WriteGuard,
+    permission_failure: Arc<Mutex<Option<LifecycleFailure>>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreError {
     Unavailable,
     CredentialRefused,
     Conflict,
+}
+
+impl std::fmt::Display for StoreError {
+    /// Plain words for an admin-facing reply; never the variant name or any
+    /// driver detail.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unavailable => "the store is unavailable",
+            Self::CredentialRefused => "the store refused the bot credential",
+            Self::Conflict => "the store reported a conflict",
+        })
+    }
 }
 
 /// No synchronous database work is allowed on the gateway event loop.
@@ -131,12 +166,37 @@ pub trait RoomPersistence: Send + Sync {
         channel: Snowflake,
     ) -> impl Future<Output = Result<Option<CreatorChannel>, StoreError>> + Send;
     fn persist(&self, room: &VoiceRoom) -> impl Future<Output = Result<(), StoreError>> + Send;
-    /// Persist a V2 caretaker/command handoff on an already-tracked room.
-    /// Returns `Ok(true)` when the row existed, `Ok(false)` when the tracked
-    /// row has no database counterpart (deleted out-of-band).
+    fn pending_owner_grants(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<Vec<Snowflake>, StoreError>> + Send;
+    /// Persist every possible grant recipient before writing Discord overwrites.
+    fn prepare_owner_grants(
+        &self,
+        room: &VoiceRoom,
+        previous_owner_id: Snowflake,
+    ) -> impl Future<Output = Result<OwnerGrantIntent, StoreError>> + Send;
+    /// Atomically persist ownership and acknowledge exactly this cleanup intent.
+    /// A missing row or superseded revision returns false without clearing work.
     fn update_ownership(
         &self,
         room: &VoiceRoom,
+        revision: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+    /// Every V3 `/name` custom-name override in the guild, for worker load.
+    /// Rooms on their template name have no entry.
+    fn custom_names(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<Vec<(Snowflake, String)>, StoreError>> + Send;
+    /// Persist a V3 `/name` override on a tracked room, or clear it with
+    /// `None` (restore). Returns `Ok(true)` when the row existed, `Ok(false)`
+    /// when the tracked row has no database counterpart (deleted out-of-band).
+    fn save_custom_name(
+        &self,
+        guild: Snowflake,
+        channel: Snowflake,
+        custom_name: Option<&str>,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
     /// The guild's V10b controls; an unconfigured guild reads as the defaults.
     fn access_controls(
@@ -168,10 +228,15 @@ pub trait RoomPersistence: Send + Sync {
     ) -> impl Future<Output = Result<VoiceConfiguration, StoreError>> + Send;
     /// Replace the guild's V11 voice configuration in one transaction
     /// (`/import` Confirm only; never touches live rooms or companions).
+    /// Compare-and-swap on `expected` (the snapshot the preview was rendered
+    /// from): a concurrent change is `Conflict`, never a silent overwrite.
+    /// The preview hash already binds (`current`, `candidate`); this closes
+    /// the re-read-to-write window under the store's per-guild lock.
     fn config_apply(
         &self,
         guild: Snowflake,
         config: &VoiceConfiguration,
+        expected: &VoiceConfiguration,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
     fn forget(
         &self,
@@ -234,15 +299,40 @@ impl RoomPersistence for PgRoomStore {
         Ok(())
     }
 
-    async fn update_ownership(&self, room: &VoiceRoom) -> Result<bool, StoreError> {
-        self.update_ownership(
-            room.guild_id,
-            room.channel_id,
-            room.owner_id,
-            room.original_creator_id,
-        )
-        .await
-        .map_err(store_error)
+    async fn pending_owner_grants(&self, guild: Snowflake) -> Result<Vec<Snowflake>, StoreError> {
+        self.pending_owner_grants(guild).await.map_err(store_error)
+    }
+
+    async fn prepare_owner_grants(
+        &self,
+        room: &VoiceRoom,
+        previous_owner_id: Snowflake,
+    ) -> Result<OwnerGrantIntent, StoreError> {
+        self.prepare_owner_grants(room, previous_owner_id)
+            .await
+            .map_err(store_error)?
+            .ok_or(StoreError::Conflict)
+    }
+
+    async fn update_ownership(&self, room: &VoiceRoom, revision: &str) -> Result<bool, StoreError> {
+        self.complete_owner_grants(room, revision)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn custom_names(&self, guild: Snowflake) -> Result<Vec<(Snowflake, String)>, StoreError> {
+        self.custom_names(guild).await.map_err(store_error)
+    }
+
+    async fn save_custom_name(
+        &self,
+        guild: Snowflake,
+        channel: Snowflake,
+        custom_name: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        self.set_custom_name(guild, channel, custom_name)
+            .await
+            .map_err(store_error)
     }
 
     async fn access_controls(&self, guild: Snowflake) -> Result<AccessControls, StoreError> {
@@ -291,11 +381,15 @@ impl RoomPersistence for PgRoomStore {
         &self,
         guild: Snowflake,
         config: &VoiceConfiguration,
+        expected: &VoiceConfiguration,
     ) -> Result<(), StoreError> {
-        self.voice_configs()
-            .apply(guild, config)
-            .await
-            .map_err(store_error)
+        match self.voice_configs().apply(guild, config, expected).await {
+            Ok(()) => Ok(()),
+            // The store's compare-and-swap sentinel: the guild changed
+            // between the Confirm re-read and the locked write.
+            Err(sqlx::Error::RowNotFound) => Err(StoreError::Conflict),
+            Err(error) => Err(store_error(error)),
+        }
     }
 
     async fn companions(&self, guild: Snowflake) -> Result<Vec<TextCompanion>, StoreError> {
@@ -359,7 +453,9 @@ fn voice_dead_action(action: &RoomAction) -> &'static str {
         | RoomAction::RevokeCompanionView { .. } => "companion",
         RoomAction::UpdateOwnership { .. } => "ownership",
         RoomAction::KickMember { .. } => "kick",
-        RoomAction::RenameRoom { .. } => "rename",
+        // The override write belongs to the rename family: same feature,
+        // and the bounded `action` label set stays as documented.
+        RoomAction::RenameRoom { .. } | RoomAction::SetCustomName { .. } => "rename",
     }
 }
 
@@ -426,6 +522,16 @@ pub trait RoomWrites: Send + Sync {
         member: Snowflake,
         guard: WriteGuard,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// Replace one tracked room's overwrites after an ownership handoff.
+    fn update_overwrites(
+        &self,
+        channel: Snowflake,
+        overwrites: &[PermissionOverwrite],
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<Channel, RoomHttpError>> + Send {
+        let _ = (channel, overwrites, guard);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
     fn delete(
         &self,
         channel: Snowflake,
@@ -523,6 +629,16 @@ impl RoomWrites for RoomHttp {
         guard: WriteGuard,
     ) -> Result<(), RoomHttpError> {
         self.deny_member_connect(channel, member, move || guard())
+            .await
+    }
+
+    async fn update_overwrites(
+        &self,
+        channel: Snowflake,
+        overwrites: &[PermissionOverwrite],
+        guard: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        self.update_room_overwrites(channel, overwrites, move || guard())
             .await
     }
 
@@ -647,7 +763,9 @@ struct LiveState {
     ready: bool,
     generation: u64,
     next_transition: u64,
+    next_channel_revision: u64,
     channels: HashMap<Snowflake, Channel>,
+    channel_revisions: HashMap<Snowflake, u64>,
     members: HashMap<Snowflake, MemberState>,
     bot: Option<BotAccess>,
 }
@@ -728,6 +846,42 @@ impl LiveState {
     }
 }
 
+/// Findings from the same snapshot and surface as the create/move gate.
+/// The caller already owns the read lock; do not reacquire it here.
+fn write_permission_findings(
+    state: &LiveState,
+    guild_id: Snowflake,
+    channel_id: Snowflake,
+) -> Vec<PermissionFinding> {
+    let (Some(bot), Some(channel)) = (state.bot.as_ref(), state.channels.get(&channel_id)) else {
+        return Vec::new();
+    };
+    let Some(base) = effective_permissions(
+        guild_id,
+        bot.guild_owner_id,
+        bot.member_id,
+        &bot.member_roles,
+        &bot.roles,
+        &[],
+    ) else {
+        return Vec::new();
+    };
+    let Some(effective) = state.permissions(guild_id, channel_id) else {
+        return Vec::new();
+    };
+    two_bot_core::voice_permission_health::evaluate_write_permissions(
+        base.bits(),
+        effective.bits(),
+        BOT_ROOM_ACCESS,
+        if channel.kind == ChannelType::GuildCategory {
+            VoicePermissionScope::Category
+        } else {
+            VoicePermissionScope::Channel
+        },
+        channel_id,
+    )
+}
+
 /// Shared with the gateway, not locked across network/database awaits.
 #[derive(Debug, Clone)]
 pub struct LiveGuild {
@@ -759,6 +913,7 @@ impl LiveGuild {
             .into_iter()
             .map(|channel| (channel.id.get(), channel))
             .collect();
+        live.channel_revisions = live.channels.keys().map(|id| (*id, 0)).collect();
         // One shared stamp: bootstrap order is unknown, so tenure ties
         // break by member id until transitions establish real seniority.
         // A snapshot rebuild resets tenure — tenure is continuous tracked
@@ -917,43 +1072,84 @@ impl LiveGuild {
 
     pub fn upsert_channel(&self, channel: Channel) {
         if channel.guild_id.map(Id::get) == Some(self.guild_id) {
-            self.inner
-                .write()
-                .expect("live voice lock")
-                .channels
-                .insert(channel.id.get(), channel);
+            let mut live = self.inner.write().expect("live voice lock");
+            live.next_channel_revision += 1;
+            let revision = live.next_channel_revision;
+            live.channel_revisions.insert(channel.id.get(), revision);
+            live.channels.insert(channel.id.get(), channel);
         }
     }
 
     pub fn remove_channel(&self, channel: Snowflake) {
-        self.inner
-            .write()
-            .expect("live voice lock")
-            .channels
-            .remove(&channel);
+        let mut live = self.inner.write().expect("live voice lock");
+        live.channel_revisions.remove(&channel);
+        live.channels.remove(&channel);
     }
 
-    fn join_guard(&self, ticket: JoinTicket) -> WriteGuard {
+    /// REST completion must never roll back gateway evidence or resurrect a
+    /// deleted channel, even after an identical-looking reconnect snapshot.
+    fn publish_owner_overwrites(&self, channel: Channel, generation: u64, revision: u64) -> bool {
+        let mut live = self.inner.write().expect("live voice lock");
+        let id = channel.id.get();
+        if !live.ready
+            || live.generation != generation
+            || live.channel_revisions.get(&id) != Some(&revision)
+        {
+            return false;
+        }
+        let Some(current) = live.channels.get_mut(&id) else {
+            return false;
+        };
+        current.permission_overwrites = channel.permission_overwrites;
+        live.next_channel_revision += 1;
+        let revision = live.next_channel_revision;
+        live.channel_revisions.insert(id, revision);
+        true
+    }
+
+    fn join_guard(&self, ticket: JoinTicket) -> GuardedWrite {
+        self.join_write_guard(ticket, RefusedWrite::Create, vec![ticket.creator_id])
+    }
+
+    fn move_guard(&self, ticket: JoinTicket, channel: Snowflake) -> GuardedWrite {
+        self.join_write_guard(ticket, RefusedWrite::Move, vec![ticket.creator_id, channel])
+    }
+
+    fn join_write_guard(
+        &self,
+        ticket: JoinTicket,
+        write: RefusedWrite,
+        channels: Vec<Snowflake>,
+    ) -> GuardedWrite {
         let live = self.clone();
-        Arc::new(move || {
+        let permission_failure = Arc::new(Mutex::new(None));
+        let observed = Arc::clone(&permission_failure);
+        let check = Arc::new(move || {
             let state = live.inner.read().expect("live voice lock");
-            state.ticket_valid(ticket)
-                && can_manage_room(state.permissions(live.guild_id, ticket.creator_id))
-        })
-    }
-
-    fn move_guard(&self, ticket: JoinTicket, channel: Snowflake) -> WriteGuard {
-        let live = self.clone();
-        let join = self.join_guard(ticket);
-        Arc::new(move || {
-            join()
-                && can_manage_room(
-                    live.inner
-                        .read()
-                        .expect("live voice lock")
-                        .permissions(live.guild_id, channel),
-                )
-        })
+            // Lost authority or a member who left is not a permission finding.
+            if !state.ticket_valid(ticket) {
+                return false;
+            }
+            for channel_id in &channels {
+                let Some(permissions) = state.permissions(live.guild_id, *channel_id) else {
+                    return false;
+                };
+                if !can_manage_room(Some(permissions)) {
+                    *observed.lock().expect("voice guard lock") =
+                        Some(LifecycleFailure::MissingPermission {
+                            write,
+                            channel_id: *channel_id,
+                            findings: write_permission_findings(&state, live.guild_id, *channel_id),
+                        });
+                    return false;
+                }
+            }
+            true
+        });
+        GuardedWrite {
+            check,
+            permission_failure,
+        }
     }
 
     /// Guard for a passed vote's writes: evidence must be authoritative and the
@@ -1010,25 +1206,37 @@ fn health_overwrites(guild_id: Snowflake, channel: &Channel) -> Vec<HealthOverwr
         .collect()
 }
 
-/// One `/setup` line for a missing permission. Ids only: the category or
-/// channel is mentioned, never named.
-#[must_use]
-pub fn health_line(finding: &PermissionFinding) -> String {
-    let permission = match finding.permission {
+fn permission_name(permission: VoicePermission) -> &'static str {
+    match permission {
         VoicePermission::ManageChannels => "Manage Channels",
         VoicePermission::MoveMembers => "Move Members",
         VoicePermission::ManageRoles => "Manage Roles",
         VoicePermission::ViewChannel => "View Channel",
-    };
+        VoicePermission::Connect => "Connect",
+    }
+}
+
+/// What removes one permission from the bot, naming the category or channel
+/// override responsible. Ids only: the category or channel is mentioned,
+/// never named.
+fn finding_clause(finding: &PermissionFinding) -> String {
+    let permission = permission_name(finding.permission);
     match (finding.scope, finding.category_id, finding.channel_id) {
         (VoicePermissionScope::Category, Some(category), _) => format!(
-            "health: the permission override on category <#{category}> removes {permission} from the bot"
+            "the permission override on category <#{category}> removes {permission} from the bot"
         ),
-        (VoicePermissionScope::Channel, _, Some(channel)) => format!(
-            "health: the permission override on <#{channel}> removes {permission} from the bot"
-        ),
-        _ => format!("health: the bot lacks {permission} for the whole server"),
+        (VoicePermissionScope::Channel, _, Some(channel)) => {
+            format!("the permission override on <#{channel}> removes {permission} from the bot")
+        }
+        _ => format!("the bot lacks {permission} for the whole server"),
     }
+}
+
+/// One `/setup` line for a missing permission. Ids only: the category or
+/// channel is mentioned, never named.
+#[must_use]
+pub fn health_line(finding: &PermissionFinding) -> String {
+    format!("health: {}", finding_clause(finding))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1045,6 +1253,31 @@ pub enum LifecycleFailure {
         channel_id: Option<Snowflake>,
         error: StoreError,
     },
+    /// Discord (or the live permission cache) refused a join-time write for a
+    /// missing permission. `findings` captures the refused operation's actual
+    /// permissions and causal surface; empty when a Discord refusal cannot be
+    /// explained by the cache (for example, stale roles).
+    MissingPermission {
+        write: RefusedWrite,
+        channel_id: Snowflake,
+        findings: Vec<PermissionFinding>,
+    },
+    /// The joiner's room name, and even the bare template, is blocked by the
+    /// automod name filter: no room was created. An operator misconfiguration
+    /// to fix, not a member to punish.
+    NameBlocked {
+        creator_id: Snowflake,
+        error: NameError,
+    },
+}
+
+/// The join-time Discord write that was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedWrite {
+    /// Creating the room channel (needs Manage Channels).
+    Create,
+    /// Moving the joiner into the new room (needs Move Members).
+    Move,
 }
 
 #[derive(Debug, Clone)]
@@ -1077,8 +1310,15 @@ pub struct GuildRoomWorker<S, H> {
     /// Compared against live occupancy via [`occupancy_diff`] on reconcile.
     companion_seen: HashMap<Snowflake, Vec<Snowflake>>,
     queue: ActionQueue,
+    /// Security cleanup survives the queue's finite retry cohorts. Only one
+    /// ownership action per room is queued; exhausted cohorts wait a minute.
+    ownership_repairs: HashMap<Snowflake, u64>,
+    ownership_queued: HashSet<Snowflake>,
     renames: RenameCoalescer,
     desired_names: HashMap<Snowflake, String>,
+    /// V3 `/name` overrides by room: the owner's text as typed, template
+    /// tokens intact. A room without an entry uses its template name.
+    custom_names: HashMap<Snowflake, String>,
     creations: HashMap<u64, Creation>,
     accepted: HashMap<Snowflake, (u64, u64)>,
     moves: HashMap<Snowflake, JoinTicket>,
@@ -1095,6 +1335,10 @@ pub struct GuildRoomWorker<S, H> {
     /// from the payload.
     vote_refs: HashMap<Snowflake, VoteKickRef>,
     active_votes: Vec<VoteKickRef>,
+    /// Automod policy the create-path name filter runs under. The default
+    /// policy still blocks invite and external links; the runtime installs the
+    /// configured word list through [`GuildRoomWorker::with_name_policy`].
+    name_policy: Arc<AutomodPolicy>,
 }
 
 /// Why `/kick` could not start or accept a ballot.
@@ -1123,6 +1367,8 @@ const NOTICE_REPEAT_INTERVAL_MS: u64 = 15 * 60 * 1000;
 
 /// Longest notice body; Discord's message limit is 2000 characters.
 const NOTICE_MAX_CHARS: usize = 1500;
+
+const OWNER_REPAIR_COOLDOWN_MS: u64 = 60_000;
 
 /// Repeat bookkeeping for one tracked failure. `last_attempt_ms` is the
 /// actor's monotonic clock, so a restart begins a fresh budget.
@@ -1154,6 +1400,17 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .into_iter()
             .map(|c| (c.room_channel_id, c))
             .collect();
+        let ownership_repairs = store
+            .pending_owner_grants(live.guild_id)
+            .await?
+            .into_iter()
+            .map(|channel| (channel, 0))
+            .collect();
+        let custom_names = store
+            .custom_names(live.guild_id)
+            .await?
+            .into_iter()
+            .collect();
         Ok(Self {
             live,
             store,
@@ -1166,8 +1423,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             unpersisted_companions: HashSet::new(),
             companion_seen: HashMap::new(),
             queue: ActionQueue::new(),
+            ownership_repairs,
+            ownership_queued: HashSet::new(),
             renames: RenameCoalescer::new(),
             desired_names: HashMap::new(),
+            custom_names,
             creations: HashMap::new(),
             accepted: HashMap::new(),
             moves: HashMap::new(),
@@ -1181,13 +1441,27 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             votes: VoteKickCore::new(),
             vote_refs: HashMap::new(),
             active_votes: Vec::new(),
+            name_policy: Arc::new(AutomodPolicy::default()),
         })
     }
 
+    /// Run the create-path name filter under `policy` from here on.
+    #[must_use]
+    pub fn with_name_policy(mut self, policy: Arc<AutomodPolicy>) -> Self {
+        self.name_policy = policy;
+        self
+    }
+
+    /// Accept one join-to-create ticket. `display` is the joiner's display
+    /// name: the room name is rendered from it and passed through the automod
+    /// name filter before anything is queued. A name containing a blocked term
+    /// is retried without the username; when even the bare template is
+    /// blocked, no create is queued and the refusal is recorded as
+    /// [`LifecycleFailure::NameBlocked`]. Returns whether a create was queued.
     pub fn accept_join(
         &mut self,
         ticket: JoinTicket,
-        name: String,
+        display: &str,
         seed: u64,
         created_at: String,
     ) -> bool {
@@ -1209,6 +1483,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
         self.accepted
             .insert(ticket.member_id, (ticket.generation, ticket.transition));
+        let context = NameFilterContext {
+            guild_id: self.live.guild_id.to_string(),
+            channel_id: ticket.creator_id.to_string(),
+            user_id: ticket.member_id.to_string(),
+        };
+        let name = match resolve_room_name(display, &self.name_policy, &context) {
+            Ok(resolved) => resolved.name,
+            Err(blocked) => {
+                self.record(LifecycleFailure::NameBlocked {
+                    creator_id: ticket.creator_id,
+                    error: blocked.error,
+                });
+                return false;
+            }
+        };
         let id = self.queue.enqueue(
             self.live.guild_id,
             RoomAction::CreateRoom {
@@ -1523,18 +1812,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 return false;
             }
         };
+        let previous_owner_id = room.owner_id;
         let mut updated = room;
         updated.owner_id = next.owner_id;
         updated.original_creator_id = next.original_creator_id;
         self.rooms.insert(channel, updated);
-        self.queue.enqueue(
-            self.live.guild_id,
-            RoomAction::UpdateOwnership {
-                channel_id: channel,
-                owner_id: next.owner_id,
-                original_creator_id: next.original_creator_id,
-            },
-        );
+        self.queue_owner_handoff(channel, previous_owner_id);
         true
     }
 
@@ -1633,6 +1916,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             }
             Err(error) => return ownership_refusal(error),
         };
+        let previous_owner_id = room.owner_id;
         let mut updated = room;
         updated.owner_id = next.owner_id;
         updated.original_creator_id = next.original_creator_id;
@@ -1641,14 +1925,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         // any lingering post-move uncertainty is stale — clear it so the next
         // reconcile (and the persisted handoff) stop skipping this channel.
         self.uncertain_moves.remove(&channel);
-        self.queue.enqueue(
-            self.live.guild_id,
-            RoomAction::UpdateOwnership {
-                channel_id: channel,
-                owner_id: next.owner_id,
-                original_creator_id: next.original_creator_id,
-            },
-        );
+        self.queue_owner_handoff(channel, previous_owner_id);
         match command {
             OwnershipCommand::Reclaim if was_creator => {
                 "You're the owner of this room again.".to_owned()
@@ -1658,6 +1935,181 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 format!("Transferred ownership of this room to <@{target_id}>.")
             }
         }
+    }
+
+    fn queue_owner_handoff(&mut self, channel_id: Snowflake, previous_owner_id: Snowflake) {
+        self.ownership_repairs.entry(channel_id).or_insert(0);
+        if self.ownership_queued.insert(channel_id) {
+            let room = &self.rooms[&channel_id];
+            self.queue.enqueue(
+                self.live.guild_id,
+                RoomAction::UpdateOwnership {
+                    channel_id,
+                    previous_owner_id,
+                    owner_id: room.owner_id,
+                    original_creator_id: room.original_creator_id,
+                },
+            );
+        }
+    }
+
+    /// Replay durable cleanup independently of caretaker succession. A present
+    /// owner does not prove Discord grants have converged to the ledger.
+    fn enqueue_owner_repairs(&mut self, now_ms: u64) {
+        self.ownership_repairs
+            .retain(|channel, _| self.rooms.contains_key(channel));
+        self.ownership_queued
+            .retain(|channel| self.rooms.contains_key(channel));
+        let due: Vec<_> = {
+            let live = self.live.inner.read().expect("live voice lock");
+            if !live.ready || self.halted {
+                return;
+            }
+            self.ownership_repairs
+                .iter()
+                .filter_map(|(channel, not_before)| {
+                    (*not_before <= now_ms
+                        && !self.ownership_queued.contains(channel)
+                        && live
+                            .permissions(self.live.guild_id, *channel)
+                            .is_some_and(|p| {
+                                p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES)
+                            }))
+                    .then_some(*channel)
+                })
+                .collect()
+        };
+        for channel in due {
+            self.queue_owner_handoff(channel, self.rooms[&channel].owner_id);
+        }
+    }
+
+    fn owner_action_failed(&mut self, action: QueuedAction, reason: &str, now_ms: u64) {
+        if action.attempts.saturating_add(1) >= QUEUE_MAX_ATTEMPTS {
+            let channel = action.action.channel_id().expect("ownership channel");
+            self.ownership_queued.remove(&channel);
+            self.ownership_repairs
+                .insert(channel, now_ms.saturating_add(OWNER_REPAIR_COOLDOWN_MS));
+        }
+        self.mark_failed_observed(action, reason.to_owned(), now_ms);
+    }
+
+    async fn rewrite_owner_grant(
+        &self,
+        channel_id: Snowflake,
+        issued_members: &[Snowflake],
+        owner_id: Snowflake,
+    ) -> Result<(), RoomHttpError> {
+        let (overwrites, changed, expected_overwrites, generation, revision) = {
+            let live = self.live.inner.read().expect("live voice lock");
+            if !live.ready {
+                return Err(RoomHttpError::Cancelled);
+            }
+            // A deleted channel drops its revision too, so test presence first:
+            // the cleanup caller must see NotFound, not a retryable Cancelled.
+            let channel = live
+                .channels
+                .get(&channel_id)
+                .ok_or(RoomHttpError::NotFound)?;
+            let revision = *live
+                .channel_revisions
+                .get(&channel_id)
+                .ok_or(RoomHttpError::Cancelled)?;
+            let current = channel
+                .permission_overwrites
+                .as_deref()
+                .ok_or(RoomHttpError::Cancelled)?;
+            let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+            let can_write = live
+                .permissions(self.live.guild_id, channel_id)
+                .is_some_and(|p| p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES));
+            if !can_write {
+                // Rooms created without Manage Roles are category-synced and
+                // have no bot-issued owner grant to move. Do not invent one.
+                if current.iter().any(|o| {
+                    o.kind == PermissionOverwriteType::Member
+                        && o.id.get() != owner_id
+                        && issued_members.contains(&o.id.get())
+                        && o.allow.intersects(owner_mask)
+                }) {
+                    return Err(RoomHttpError::AccessDenied);
+                }
+                return Ok(());
+            }
+            let mut overwrites = current.to_vec();
+            for old in &mut overwrites {
+                if old.kind == PermissionOverwriteType::Member
+                    && old.id.get() != owner_id
+                    && issued_members.contains(&old.id.get())
+                {
+                    old.allow &= !owner_mask;
+                }
+            }
+            overwrites.retain(|o| {
+                !(o.kind == PermissionOverwriteType::Member
+                    && o.id.get() != owner_id
+                    && issued_members.contains(&o.id.get())
+                    && o.allow.is_empty()
+                    && o.deny.is_empty())
+            });
+            let owner_bits = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+            if let Some(owner) = overwrites
+                .iter_mut()
+                .find(|o| o.kind == PermissionOverwriteType::Member && o.id.get() == owner_id)
+            {
+                // Preserve independent denies, like creation-time inheritance.
+                owner.allow = (owner.allow | owner_bits) & !owner.deny;
+            } else {
+                overwrites.push(PermissionOverwrite {
+                    id: Id::new(owner_id),
+                    kind: PermissionOverwriteType::Member,
+                    allow: owner_bits,
+                    deny: Permissions::empty(),
+                });
+            }
+            let changed = overwrites != current;
+            (
+                overwrites,
+                changed,
+                current.to_vec(),
+                live.generation,
+                revision,
+            )
+        };
+        if !changed {
+            return Ok(());
+        }
+        let live = self.live.clone();
+        let guard: WriteGuard = Arc::new(move || {
+            let state = live.inner.read().expect("live voice lock");
+            state.ready
+                && state.generation == generation
+                && state.channel_revisions.get(&channel_id) == Some(&revision)
+                && state.channels.get(&channel_id).is_some_and(|channel| {
+                    channel.permission_overwrites.as_deref() == Some(expected_overwrites.as_slice())
+                })
+                && state
+                    .permissions(live.guild_id, channel_id)
+                    .is_some_and(|p| {
+                        p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES)
+                    })
+        });
+        let channel = self
+            .http
+            .update_overwrites(channel_id, &overwrites, guard)
+            .await?;
+        if channel.id.get() != channel_id
+            || channel.guild_id.map(Id::get) != Some(self.live.guild_id)
+        {
+            return Err(RoomHttpError::UnknownOutcome);
+        }
+        if !self
+            .live
+            .publish_owner_overwrites(channel, generation, revision)
+        {
+            return Err(RoomHttpError::Cancelled);
+        }
+        Ok(())
     }
 
     pub fn propose_name(
@@ -2008,10 +2460,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         released
     }
 
-    fn prepare(&self, ticket: JoinTicket) -> Result<RoomChannelAttributes, RoomHttpError> {
+    fn prepare(&self, ticket: JoinTicket) -> Result<RoomChannelAttributes, RoomPlanError> {
         let live = self.live.inner.read().expect("live voice lock");
         if !live.ticket_valid(ticket) {
-            return Err(RoomHttpError::Cancelled);
+            return Err(RoomHttpError::Cancelled.into());
         }
         let settings = self
             .creators
@@ -2023,7 +2475,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .ok_or(RoomHttpError::NotFound)?;
         let permissions = live.permissions(self.live.guild_id, ticket.creator_id);
         if !can_manage_room(permissions) {
-            return Err(RoomHttpError::AccessDenied);
+            return Err(RoomPlanError {
+                error: RoomHttpError::AccessDenied,
+                source_id: Some(ticket.creator_id),
+                findings: write_permission_findings(&live, self.live.guild_id, ticket.creator_id),
+            });
         }
         if let Some(parent) = channel.parent_id {
             if live
@@ -2036,7 +2492,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 return Err(RoomHttpError::Rejected {
                     status: 400,
                     code: 50035,
-                });
+                }
+                .into());
             }
         }
         let bot = live.bot.as_ref().ok_or(RoomHttpError::AccessDenied)?;
@@ -2046,7 +2503,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         } else {
             Vec::new()
         };
-        plan_room(&RoomPlanInput {
+        plan_room_diagnosed(&RoomPlanInput {
             guild_id: self.live.guild_id,
             owner_id: ticket.member_id,
             settings,
@@ -2073,6 +2530,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 RoomAction::RenameRoom { channel_id, name },
             );
         }
+        self.enqueue_owner_repairs(now_ms);
         let Some(action) = self.queue.pop_due(self.live.guild_id, now_ms) else {
             return false;
         };
@@ -2089,7 +2547,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 };
                 let attributes = match self.prepare(creation.ticket) {
                     Ok(attributes) => attributes,
-                    Err(error) => {
+                    Err(failure) => {
+                        let error = failure.error;
                         if error
                             == (RoomHttpError::Rejected {
                                 status: 400,
@@ -2103,10 +2562,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             observe_voice_operation("create", "category_full");
                         } else if error != RoomHttpError::Cancelled {
                             let outcome = voice_outcome_from_http(&error);
-                            self.record(LifecycleFailure::Discord {
-                                channel_id: creator_channel_id,
-                                error,
-                            });
+                            if error == RoomHttpError::AccessDenied {
+                                self.record(LifecycleFailure::MissingPermission {
+                                    write: RefusedWrite::Create,
+                                    channel_id: failure
+                                        .source_id
+                                        .filter(|_| failure.findings.is_empty())
+                                        .unwrap_or(creator_channel_id),
+                                    findings: failure.findings,
+                                });
+                            } else {
+                                self.record(LifecycleFailure::Discord {
+                                    channel_id: failure.source_id.unwrap_or(creator_channel_id),
+                                    error,
+                                });
+                            }
                             observe_voice_operation("create", outcome);
                         }
                         self.creations.remove(&action.id);
@@ -2114,13 +2584,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         return true;
                     }
                 };
+                let guard = self.live.join_guard(creation.ticket);
                 match self
                     .http
                     .create(
                         self.live.guild_id,
                         &name,
                         &attributes,
-                        self.live.join_guard(creation.ticket),
+                        Arc::clone(&guard.check),
                     )
                     .await
                 {
@@ -2189,7 +2660,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         if error != RoomHttpError::Cancelled {
                             observe_voice_operation("create", voice_outcome_from_http(&error));
                         }
-                        self.complete_error(action, creator_channel_id, error);
+                        self.finish_join_error(
+                            action,
+                            creator_channel_id,
+                            error,
+                            RefusedWrite::Create,
+                            &guard,
+                        );
                     }
                 }
             }
@@ -2201,7 +2678,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     self.queue.mark_succeeded(&action);
                     return true;
                 };
-                let result = if !can_manage_room(
+                let guard = self.live.move_guard(ticket, channel_id);
+                let result = if !self
+                    .live
+                    .inner
+                    .read()
+                    .expect("live voice lock")
+                    .ticket_valid(ticket)
+                {
+                    Err(RoomHttpError::Cancelled)
+                } else if !can_manage_room(
                     self.live
                         .inner
                         .read()
@@ -2215,7 +2701,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             self.live.guild_id,
                             member_id,
                             channel_id,
-                            self.live.move_guard(ticket, channel_id),
+                            Arc::clone(&guard.check),
                         )
                         .await
                 };
@@ -2247,7 +2733,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         if error != RoomHttpError::Cancelled {
                             observe_voice_operation("move", voice_outcome_from_http(&error));
                         }
-                        self.complete_error(action, channel_id, error);
+                        self.finish_join_error(
+                            action,
+                            channel_id,
+                            error,
+                            RefusedWrite::Move,
+                            &guard,
+                        );
                         self.queue_delete(channel_id, true);
                         self.observe_voice_state();
                     }
@@ -2325,6 +2817,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 self.moves.remove(&channel_id);
                                 self.uncertain_moves.remove(&channel_id);
                                 self.desired_names.remove(&channel_id);
+                                self.custom_names.remove(&channel_id);
                                 observe_voice_operation("delete", "success");
                                 self.observe_voice_state();
                             }
@@ -2529,52 +3022,104 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             }
             RoomAction::UpdateOwnership {
                 channel_id,
-                owner_id,
-                original_creator_id,
+                previous_owner_id,
+                ..
             } => {
-                // No Discord write: the worker row already carries this
-                // handoff. A stale action (a newer succession moved the row,
-                // or the room was forgotten) persists nothing.
                 let Some(room) = self.rooms.get(&channel_id).cloned() else {
+                    self.ownership_queued.remove(&channel_id);
+                    self.ownership_repairs.remove(&channel_id);
                     self.queue.mark_succeeded(&action);
                     return true;
                 };
-                if room.owner_id != owner_id || room.original_creator_id != original_creator_id {
-                    self.queue.mark_succeeded(&action);
+                // A grant is never issued without durable recipient provenance.
+                // Retries/reloads retain every earlier possible recipient.
+                let intent = match self
+                    .store
+                    .prepare_owner_grants(&room, previous_owner_id)
+                    .await
+                {
+                    Ok(intent) => intent,
+                    Err(error) => {
+                        self.record(LifecycleFailure::Persistence {
+                            channel_id: Some(channel_id),
+                            error,
+                        });
+                        if error == StoreError::CredentialRefused {
+                            self.halted = true;
+                            self.queue.mark_succeeded(&action);
+                        } else {
+                            self.owner_action_failed(
+                                action,
+                                "owner grant preparation unavailable",
+                                elapsed_ms(now_ms, started),
+                            );
+                        }
+                        return true;
+                    }
+                };
+                // Always converge to the latest worker owner, never a stale
+                // queued recipient. After a restart that is the SQL owner.
+                if let Err(error) = self
+                    .rewrite_owner_grant(channel_id, &intent.members, room.owner_id)
+                    .await
+                {
+                    match error {
+                        RoomHttpError::RateLimited { retry_after_ms, .. } => {
+                            self.queue.mark_rate_limited(
+                                self.live.guild_id,
+                                retry_after_ms,
+                                elapsed_ms(now_ms, started),
+                                action,
+                            );
+                        }
+                        RoomHttpError::Unauthorized => {
+                            self.halted = true;
+                            self.record(LifecycleFailure::Discord { channel_id, error });
+                            self.queue.mark_succeeded(&action);
+                        }
+                        _ => {
+                            self.record(LifecycleFailure::Discord { channel_id, error });
+                            self.owner_action_failed(
+                                action,
+                                "owner overwrite update unavailable",
+                                elapsed_ms(now_ms, started),
+                            );
+                        }
+                    }
                     return true;
                 }
-                match self.store.update_ownership(&room).await {
+                match self.store.update_ownership(&room, &intent.revision).await {
                     Ok(true) => {
+                        self.ownership_queued.remove(&channel_id);
+                        self.ownership_repairs.remove(&channel_id);
                         self.queue.mark_succeeded(&action);
                     }
                     Ok(false) => {
-                        // Tracked but no database row (deleted out-of-band):
-                        // never retry a write that cannot land. The handoff
-                        // stays in the worker row and surfaces below.
                         self.record(LifecycleFailure::Persistence {
                             channel_id: Some(channel_id),
                             error: StoreError::Conflict,
                         });
-                        self.queue.mark_succeeded(&action);
-                    }
-                    Err(StoreError::CredentialRefused) => {
-                        self.record(LifecycleFailure::Persistence {
-                            channel_id: Some(channel_id),
-                            error: StoreError::CredentialRefused,
-                        });
-                        self.halted = true;
-                        self.queue.mark_succeeded(&action);
+                        self.owner_action_failed(
+                            action,
+                            "owner cleanup completion superseded",
+                            elapsed_ms(now_ms, started),
+                        );
                     }
                     Err(error) => {
                         self.record(LifecycleFailure::Persistence {
                             channel_id: Some(channel_id),
                             error,
                         });
-                        self.mark_failed_observed(
-                            action,
-                            "voice-room persistence unavailable".to_owned(),
-                            elapsed_ms(now_ms, started),
-                        );
+                        if error == StoreError::CredentialRefused {
+                            self.halted = true;
+                            self.queue.mark_succeeded(&action);
+                        } else {
+                            self.owner_action_failed(
+                                action,
+                                "voice-room persistence unavailable",
+                                elapsed_ms(now_ms, started),
+                            );
+                        }
                     }
                 }
             }
@@ -2645,6 +3190,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                     Err(error) => self.complete_error(action, channel_id, error),
                 }
+            }
+            RoomAction::SetCustomName {
+                channel_id,
+                custom_name,
+            } => {
+                self.dispatch_custom_name(action, channel_id, custom_name, now_ms, started)
+                    .await;
             }
             RoomAction::RenameRoom { channel_id, name } => {
                 let valid = {
@@ -2947,17 +3499,85 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
     }
 
+    fn finish_join_error(
+        &mut self,
+        action: QueuedAction,
+        channel_id: Snowflake,
+        error: RoomHttpError,
+        write: RefusedWrite,
+        guard: &GuardedWrite,
+    ) {
+        if error == RoomHttpError::Cancelled {
+            if let Some(failure) = guard
+                .permission_failure
+                .lock()
+                .expect("voice guard lock")
+                .take()
+            {
+                self.queue.mark_succeeded(&action);
+                observe_voice_operation(
+                    match write {
+                        RefusedWrite::Create => "create",
+                        RefusedWrite::Move => "move",
+                    },
+                    voice_outcome_from_http(&RoomHttpError::AccessDenied),
+                );
+                self.record(failure);
+                return;
+            }
+        }
+        self.finish_error(action, channel_id, error, Some(write));
+    }
+
     fn complete_error(
         &mut self,
         action: QueuedAction,
         channel_id: Snowflake,
         error: RoomHttpError,
     ) {
+        self.finish_error(action, channel_id, error, None);
+    }
+
+    /// Settle a failed write. A join-time create or move (`write` set) that
+    /// Discord or the permission cache refused for access names the missing
+    /// permission; every other failure keeps the plain Discord line.
+    fn finish_error(
+        &mut self,
+        action: QueuedAction,
+        channel_id: Snowflake,
+        error: RoomHttpError,
+        write: Option<RefusedWrite>,
+    ) {
         self.queue.mark_succeeded(&action);
         if error == RoomHttpError::Unauthorized {
             self.halted = true;
         }
-        if error != RoomHttpError::Cancelled {
+        if error == RoomHttpError::Cancelled {
+            return;
+        }
+        match write {
+            Some(write) => self.record_refusal(write, channel_id, error),
+            None => self.record(LifecycleFailure::Discord { channel_id, error }),
+        }
+    }
+
+    /// Record a refused join-time write. An access refusal becomes
+    /// [`LifecycleFailure::MissingPermission`], checking the write gate's
+    /// actual requirements (including Connect), not unrelated health gaps.
+    /// Planner and final-guard refusals use their already-captured findings.
+    fn record_refusal(&mut self, write: RefusedWrite, channel_id: Snowflake, error: RoomHttpError) {
+        if error == RoomHttpError::AccessDenied {
+            let findings = write_permission_findings(
+                &self.live.inner.read().expect("live voice lock"),
+                self.live.guild_id,
+                channel_id,
+            );
+            self.record(LifecycleFailure::MissingPermission {
+                write,
+                channel_id,
+                findings,
+            });
+        } else {
             self.record(LifecycleFailure::Discord { channel_id, error });
         }
     }
@@ -3007,7 +3627,9 @@ enum ActorCommand {
     Reconcile,
     Join {
         ticket: JoinTicket,
-        name: String,
+        /// The joiner's display name; the worker renders and filters the room
+        /// name from it.
+        display: String,
         seed: u64,
         created_at: String,
     },
@@ -3048,6 +3670,12 @@ enum ActorCommand {
     KickRoomOf {
         member: Snowflake,
         reply: oneshot::Sender<Option<Snowflake>>,
+    },
+    /// V3 `/name`: authorize against the room's current owner, then show the
+    /// panel, open the modal, or apply a custom name or a restore.
+    Name {
+        command: NameCommand,
+        reply: oneshot::Sender<NameReply>,
     },
 }
 
@@ -3097,6 +3725,8 @@ pub struct VoiceRuntime<S, H> {
     /// hash). Confirm consumes the entry, so a double click cannot apply
     /// twice; Cancel and expiry remove it with no write.
     pending_imports: Mutex<HashMap<(Snowflake, Snowflake, String), PendingImport>>,
+    /// Automod policy every room-name and `/create` name is filtered under.
+    name_policy: Arc<AutomodPolicy>,
 }
 
 impl<S, H> VoiceRuntime<S, H>
@@ -3120,7 +3750,16 @@ where
             actors: Mutex::new(HashMap::new()),
             access_lock: tokio::sync::Mutex::new(()),
             pending_imports: Mutex::new(HashMap::new()),
+            name_policy: Arc::new(AutomodPolicy::default()),
         }
+    }
+
+    /// Filter room names under the guild's configured automod policy. Without
+    /// this the default policy applies (links blocked, no word list).
+    #[must_use]
+    pub fn with_name_policy(mut self, policy: AutomodPolicy) -> Self {
+        self.name_policy = Arc::new(policy);
+        self
     }
 
     fn live_actor(&self, guild: Snowflake) -> Option<GuildActor> {
@@ -3130,6 +3769,31 @@ where
             .get(&guild)
             .filter(|actor| !actor.tx.is_closed())
             .cloned()
+    }
+
+    /// Interaction member.permissions includes source-channel overwrites, so
+    /// it must never authorize guild-wide configuration or owner overrides.
+    /// Use the member's role IDs with our complete guild-role snapshot instead.
+    /// Missing/disconnected snapshots fail closed, including for admin claims.
+    /// Source: <https://docs.discord.com/developers/resources/guild#guild-member-object>
+    fn guild_permissions(&self, interaction: &Interaction) -> Option<Permissions> {
+        let guild = interaction_guild(interaction)?;
+        let member = interaction.member.as_ref()?;
+        let member_id = member.user.as_ref()?.id.get();
+        let actor = self.live_actor(guild)?;
+        let live = actor.live.inner.read().expect("live voice lock");
+        if !live.ready {
+            return None;
+        }
+        let bot = live.bot.as_ref()?;
+        effective_permissions(
+            guild,
+            bot.guild_owner_id,
+            member_id,
+            &member.roles,
+            &bot.roles,
+            &[],
+        )
     }
 
     fn ensure_actor(&self, guild: Snowflake) -> Option<GuildActor> {
@@ -3152,11 +3816,13 @@ where
         let live = actor.live.clone();
         let make = Arc::clone(&self.make);
         let tick = self.tick;
+        let name_policy = Arc::clone(&self.name_policy);
         tokio::spawn(async move {
             let (store, http) = make();
-            let Ok(mut worker) = GuildRoomWorker::load(live, store, http).await else {
+            let Ok(worker) = GuildRoomWorker::load(live, store, http).await else {
                 return;
             };
+            let mut worker = worker.with_name_policy(name_policy);
             run_actor(&mut worker, rx, tick).await;
         });
         actors.insert(guild, actor.clone());
@@ -3190,7 +3856,7 @@ where
         member: Snowflake,
         channel: Option<Snowflake>,
         bot: Option<bool>,
-        name: String,
+        display: String,
     ) -> bool {
         let Some(actor) = self.live_actor(guild) else {
             return false;
@@ -3198,7 +3864,7 @@ where
         let command = match actor.live.voice_update(member, channel, bot) {
             Some(ticket) => ActorCommand::Join {
                 ticket,
-                name,
+                display,
                 seed: self.seeds.fetch_add(1, Ordering::Relaxed),
                 created_at: now_iso(),
             },
@@ -3336,6 +4002,24 @@ where
         }
     }
 
+    /// Pass an admin-supplied `/create` name through the same automod name
+    /// filter as generated room names. Returns the sanitized name to create
+    /// with, or the user-facing refusal; nothing is created for a refusal.
+    fn filter_creator_name(
+        &self,
+        guild_id: Snowflake,
+        channel_id: Snowflake,
+        user_id: Snowflake,
+        name: &str,
+    ) -> Result<String, String> {
+        let context = NameFilterContext {
+            guild_id: guild_id.to_string(),
+            channel_id: channel_id.to_string(),
+            user_id: user_id.to_string(),
+        };
+        filter_channel_name(name, &self.name_policy, &context).map_err(|error| error.to_string())
+    }
+
     fn creator_added(&self, creator: &CreatorChannel, channel: Channel) {
         if let Some(actor) = self.live_actor(creator.guild_id) {
             actor.live.upsert_channel(channel);
@@ -3441,13 +4125,12 @@ where
                 };
                 let member_id = update.user_id.get();
                 let bot = update.member.as_ref().map(|member| member.user.bot);
-                let name = room_name(&display_name(cache, guild_id, member_id));
                 self.voice_frame(
                     guild_id,
                     member_id,
                     update.channel_id.map(|id| id.get()),
                     bot,
-                    name,
+                    display_name(cache, guild_id, member_id),
                 );
             }
             Event::ChannelCreate(created) => {
@@ -3463,6 +4146,12 @@ where
             Event::ChannelDelete(deleted) => {
                 if let Some(guild_id) = deleted.guild_id.map(|id| id.get()) {
                     self.update_live(guild_id, |live| live.remove_channel(deleted.id.get()));
+                }
+            }
+            Event::GuildUpdate(updated) => {
+                let guild_id = updated.id.get();
+                if let Some(access) = bot_access_from_cache(cache, guild_id) {
+                    self.update_live(guild_id, |live| live.refresh_bot(access));
                 }
             }
             Event::RoleCreate(created) => {
@@ -3575,11 +4264,11 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         ActorCommand::Reconcile => worker.reconcile(),
         ActorCommand::Join {
             ticket,
-            name,
+            display,
             seed,
             created_at,
         } => {
-            worker.accept_join(ticket, name, seed, created_at);
+            worker.accept_join(ticket, &display, seed, created_at);
             worker.reconcile();
         }
         ActorCommand::CreatorAdded(creator) => {
@@ -3631,6 +4320,9 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         ActorCommand::KickRoomOf { member, reply } => {
             let _ = reply.send(worker.kick_room_of(member));
         }
+        ActorCommand::Name { command, reply } => {
+            let _ = reply.send(worker.apply_name(command, now_ms));
+        }
     }
 }
 
@@ -3638,16 +4330,20 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
 pub fn build_production_runtime(
     token: &str,
     pool: sqlx::PgPool,
+    name_policy: AutomodPolicy,
 ) -> Result<VoiceResponder<PgRoomStore, RoomHttp, RoomHttp>, RoomHttpError> {
     let replies = RoomHttp::new(token.to_owned())?;
     let http = replies.clone();
     let store = PgRoomStore::new(pool);
     Ok(VoiceResponder::new(
-        Arc::new(VoiceRuntime::new(
-            move || (store.clone(), http.clone()),
-            Duration::from_millis(250),
-            true,
-        )),
+        Arc::new(
+            VoiceRuntime::new(
+                move || (store.clone(), http.clone()),
+                Duration::from_millis(250),
+                true,
+            )
+            .with_name_policy(name_policy),
+        ),
         Arc::new(replies),
     ))
 }
@@ -3802,6 +4498,27 @@ fn room_name(display: &str) -> String {
     let keep = (MAX_CHANNEL_NAME_LEN as usize).saturating_sub(SUFFIX.chars().count());
     let head: String = display.chars().take(keep).collect();
     format!("{head}{SUFFIX}")
+}
+
+/// V1 room-name template until the V5 engine owns naming, in the legacy
+/// placeholder syntax the create-path filter renders.
+const ROOM_NAME_TEMPLATE: &str = "{username}'s room";
+/// Characters of the template's fixed text, which a long display name must
+/// leave room for inside the Discord 100-character ceiling.
+const ROOM_NAME_SUFFIX_CHARS: usize = "'s room".len();
+
+/// The V1 room name for a joiner, passed through the automod name filter: the
+/// joiner's display name plus the template suffix, truncated to the Discord
+/// ceiling by shortening the display name. A name containing a blocked term is
+/// retried without the username; only a blocked bare template is refused.
+fn resolve_room_name(
+    display: &str,
+    policy: &AutomodPolicy,
+    context: &NameFilterContext,
+) -> Result<ResolvedRoomName, BlockedRoomName> {
+    let keep = (MAX_CHANNEL_NAME_LEN as usize).saturating_sub(ROOM_NAME_SUFFIX_CHARS);
+    let username: String = display.chars().take(keep).collect();
+    resolve_create_name(ROOM_NAME_TEMPLATE, &username, 0, 0, policy, context)
 }
 
 // --- `/create` + `/setup` decisions (pure, no Discord) -------------------------
@@ -4206,12 +4923,35 @@ pub struct SetupSummary {
     pub store_error: Option<String>,
 }
 
-/// `/setup` panel text. Anyone may view it; the S4 handler gates the quick
-/// action and settings buttons on admin (spec V1).
+/// `/setup` panel text. The command stays open to every member, but only an
+/// admin gets [`setup_panel`], which names creator channels, store errors and
+/// the worker's failure lines. Everyone else gets [`setup_member_panel`]: a
+/// generic status with no ids, error classes or permission gaps. The S4
+/// handler also gates the quick action and settings buttons on admin (spec V1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupPanel {
     pub title: String,
     pub description: String,
+}
+
+/// The member (non-admin) `/setup` view: running or paused, and whether
+/// anything needs attention. Deliberately carries no channel ids, store or
+/// Discord error text, or permission gaps; those stay admin-only.
+#[must_use]
+pub fn setup_member_panel(halted: bool, needs_attention: bool) -> SetupPanel {
+    let status = if halted {
+        "Voice rooms are paused right now."
+    } else {
+        "Voice rooms are running."
+    };
+    let mut lines = vec![status.to_owned()];
+    if halted || needs_attention {
+        lines.push("Ask a server admin to check /setup for details.".to_owned());
+    }
+    SetupPanel {
+        title: "Voice rooms".to_owned(),
+        description: lines.join("\n"),
+    }
 }
 
 #[must_use]
@@ -4345,15 +5085,20 @@ pub fn plan_import_preview(
             ),
         };
     }
-    let incoming: VoiceConfiguration = match serde_json::from_slice(bytes) {
+    // The strict codec decode, never plain `serde_json`: the derived top-level
+    // decoder also takes the positional-array form the codec forbids.
+    let incoming = match decode_configuration(bytes) {
         Ok(config) => config,
-        Err(error) => {
+        Err(VoiceConfigError::Malformed { line, column }) => {
             return ImportDecision::Refuse {
                 message: format!(
-                    "Could not import that file: malformed configuration JSON at line {}, column {}. Nothing was changed.",
-                    error.line(),
-                    error.column(),
+                    "Could not import that file: malformed configuration JSON at line {line}, column {column}. Nothing was changed.",
                 ),
+            };
+        }
+        Err(error) => {
+            return ImportDecision::Refuse {
+                message: format!("Could not import that file: {error}. Nothing was changed."),
             };
         }
     };
@@ -4423,6 +5168,39 @@ pub fn plan_import_confirm(
     }
 }
 
+/// How many creator channels `candidate` adds over `current`.
+fn added_creator_count(current: &VoiceConfiguration, candidate: &VoiceConfiguration) -> usize {
+    candidate
+        .creators
+        .iter()
+        .filter(|creator| {
+            !current
+                .creators
+                .iter()
+                .any(|existing| existing.channel_id == creator.channel_id)
+        })
+        .count()
+}
+
+/// Manage Server alone may not turn an existing voice channel into a creator:
+/// `/create` needs Manage Channels, and an import is the same act without the
+/// channel being created. Returns the refusal text when `candidate` adds a
+/// creator row over `current` and the member lacks Manage Channels (admins
+/// pass). Removing or editing creators is not gated here.
+fn import_creator_gate(
+    current: &VoiceConfiguration,
+    candidate: &VoiceConfiguration,
+    permissions: Option<Permissions>,
+) -> Option<String> {
+    if added_creator_count(current, candidate) == 0 || is_voice_admin(permissions) {
+        return None;
+    }
+    Some(
+        "That file adds creator channels, which needs Manage Channels like /create. Ask a member with that permission to import it, or remove the new creator entries. Nothing was changed."
+            .to_owned(),
+    )
+}
+
 /// Confirm/Cancel buttons for a preview, bound to the uploading member and
 /// the diff's content hash via the voice custom-id codec.
 fn import_preview_components(member_id: Snowflake, hash: &str) -> Vec<Component> {
@@ -4468,7 +5246,9 @@ fn export_file_response(content: &str, filename: String, bytes: Vec<u8>) -> Inte
     }
 }
 
-/// Ephemeral `/import` preview reply with Confirm/Cancel buttons.
+/// Ephemeral `/import` preview reply with Confirm/Cancel buttons. Mentions
+/// are disabled: the preview quotes uploaded template text, which must never
+/// ping.
 fn import_preview_response(text: &str, member_id: Snowflake, hash: &str) -> InteractionResponse {
     InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
@@ -4476,6 +5256,12 @@ fn import_preview_response(text: &str, member_id: Snowflake, hash: &str) -> Inte
             content: Some(text.to_owned()),
             components: Some(import_preview_components(member_id, hash)),
             flags: Some(MessageFlags::EPHEMERAL),
+            allowed_mentions: Some(AllowedMentions {
+                parse: Vec::new(),
+                users: Vec::new(),
+                roles: Vec::new(),
+                replied_user: false,
+            }),
             ..Default::default()
         }),
     }
@@ -4602,6 +5388,9 @@ pub enum VoiceCommand {
         vote_id: Snowflake,
         ballot: VoteBallot,
     },
+    /// V3 `/name`: the owner's panel to set a custom name or restore the
+    /// template name.
+    Name,
 }
 
 /// One `/logging` sub-command. `Invalid` is a malformed or unknown shape; it
@@ -4843,6 +5632,7 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
             target,
             reason: parse_kick_reason(&command.options),
         }),
+        "name" => Some(VoiceCommand::Name),
         _ => None,
     }
 }
@@ -4869,25 +5659,6 @@ fn parse_kick_reason(options: &[CommandDataOption]) -> Option<String> {
             }
             _ => None,
         })
-}
-
-/// Invoking member id plus effective Manage Channels authority, from the
-/// interaction payload (guild `member.user`, else the top-level user).
-/// `None` when Discord sent no identifiable invoker — the handler refuses
-/// closed rather than acting as nobody.
-fn interaction_actor(interaction: &Interaction) -> Option<(Snowflake, bool)> {
-    let user = interaction
-        .member
-        .as_ref()
-        .and_then(|member| member.user.as_ref())
-        .or(interaction.user.as_ref())?;
-    let is_admin = is_voice_admin(
-        interaction
-            .member
-            .as_ref()
-            .and_then(|member| member.permissions),
-    );
-    Some((user.id.get(), is_admin))
 }
 
 fn parse_logging_action(options: &[CommandDataOption]) -> LoggingAction {
@@ -4966,8 +5737,9 @@ fn parse_access_action(options: &[CommandDataOption]) -> AccessAction {
 }
 
 /// `/create`, `/textchannels` and the V8 per-creator settings commands need
-/// Manage Channels; admins pass everywhere. `/setup` is view-open and
-/// `/access` checks the admin flag itself. Fail closed on missing permissions.
+/// Manage Channels; admins pass everywhere. `/setup` is open to everyone but
+/// shows detail to admins only, and `/access` checks the admin flag itself.
+/// Fail closed on missing permissions.
 fn may_create(permissions: Option<Permissions>) -> bool {
     is_voice_admin(permissions)
 }
@@ -5003,6 +5775,7 @@ impl VoiceCommand {
             // Ballots share the `kick` restriction surface: one role gate
             // covers starting votes and casting them.
             Self::Kick { .. } | Self::Ballot { .. } => "kick",
+            Self::Name => "name",
         }
     }
 }
@@ -5034,11 +5807,14 @@ fn vote_button_id(vote_id: Snowflake, ballot: VoteBallot) -> String {
     format!("{VOTE_BUTTON_PREFIX}{vote_id}:{vote}")
 }
 
-/// The invoking member's access facts: effective admin flag and role IDs.
-fn access_member(interaction: &Interaction) -> AccessMember {
+/// The invoking member's access facts: guild-level admin flag and role IDs.
+fn access_member(
+    interaction: &Interaction,
+    guild_permissions: Option<Permissions>,
+) -> AccessMember {
     let member = interaction.member.as_ref();
     AccessMember {
-        is_admin: is_voice_admin(member.and_then(|member| member.permissions)),
+        is_admin: is_voice_admin(guild_permissions),
         roles: member.map_or_else(Vec::new, |member| {
             member.roles.iter().map(|role| role.get()).collect()
         }),
@@ -5232,11 +6008,13 @@ pub struct WorkerStatus {
     pub halted: bool,
 }
 
-/// Notice body for one failure. `brief` points at `/setup`; `full` adds the
-/// failure itself. Never `off`: callers gate on [`should_log`] first.
+/// Notice body for one failure. `brief` includes actionable permission/name
+/// causes; `full` adds every failure. Callers gate `off` on [`should_log`] first.
 fn notice_text(failure: &LifecycleFailure, level: DetailLevel) -> String {
-    let mut text = match level {
-        DetailLevel::Full => format!(
+    let mut text = match (level, failure) {
+        (DetailLevel::Full, _)
+        | (DetailLevel::Brief, LifecycleFailure::MissingPermission { .. })
+        | (DetailLevel::Brief, LifecycleFailure::NameBlocked { .. }) => format!(
             "Voice rooms need attention: {}. Run /setup to see all current problems.",
             failure_line(failure)
         ),
@@ -5258,9 +6036,39 @@ fn failure_line(failure: &LifecycleFailure) -> String {
             format!("channel <#{channel_id}>: {error}")
         }
         LifecycleFailure::Persistence { channel_id, error } => match channel_id {
-            Some(channel) => format!("store <#{channel}>: {error:?}"),
-            None => format!("store: {error:?}"),
+            Some(channel) => format!("store <#{channel}>: {error}"),
+            None => format!("store: {error}"),
         },
+        LifecycleFailure::MissingPermission {
+            write,
+            channel_id,
+            findings,
+        } => {
+            let (verb, doing) = match write {
+                RefusedWrite::Create => ("create", "creating the room"),
+                RefusedWrite::Move => ("move", "moving the member into the room"),
+            };
+            if findings.is_empty() {
+                format!(
+                    "{verb} <#{channel_id}>: Discord refused {doing}; the bot needs Manage Channels, Move Members, View Channel and Connect on <#{channel_id}>, so check for a deny override"
+                )
+            } else {
+                let causes: Vec<String> = findings.iter().map(finding_clause).collect();
+                format!(
+                    "{verb} <#{channel_id}>: Discord refused {doing}; {}",
+                    causes.join("; ")
+                )
+            }
+        }
+        LifecycleFailure::NameBlocked { creator_id, error } => {
+            let why = error.filter().map_or_else(
+                || "invalid name".to_owned(),
+                |filter| filter.as_str().replace('_', " "),
+            );
+            format!(
+                "create <#{creator_id}>: {NAME_BLOCKED_AUDIT_REASON}, no room created (the room name template is blocked by the automod name filter: {why}); fix the template or the automod policy"
+            )
+        }
     }
 }
 
@@ -5529,6 +6337,33 @@ where
     H: RoomWrites + Send + 'static,
     F: Future<Output = ()> + Send,
 {
+    handle_voice_interaction_full(
+        runtime,
+        interaction,
+        invite_code,
+        inventory,
+        &NameDirectory::default(),
+        reply,
+    )
+    .await
+}
+
+/// [`handle_voice_interaction_with`] plus the display names `/name` renders
+/// `@@owner@@` from, which only the gateway cache knows. An empty directory
+/// renders every member as "member".
+pub async fn handle_voice_interaction_full<S, H, F>(
+    runtime: &VoiceRuntime<S, H>,
+    interaction: &Interaction,
+    invite_code: Option<&str>,
+    inventory: Option<&GuildInventory>,
+    names: &NameDirectory,
+    reply: impl FnOnce(InteractionResponse) -> F + Send,
+) -> bool
+where
+    S: RoomPersistence + Send + 'static,
+    H: RoomWrites + Send + 'static,
+    F: Future<Output = ()> + Send,
+{
     let Some(guild_id) = interaction_guild(interaction) else {
         return false;
     };
@@ -5536,12 +6371,16 @@ where
         return handle_import_component(runtime, interaction, guild_id, action, inventory, reply)
             .await;
     }
+    if let Some(action) = name_component_action(interaction) {
+        return handle_name_interaction(runtime, interaction, guild_id, names, action, true, reply)
+            .await;
+    }
     let Some(command) = parse_voice_command(interaction) else {
         return false;
     };
     // Guild-level role gate first. Settings that cannot be read fail closed for
     // members: only an admin proceeds without them.
-    let member = access_member(interaction);
+    let member = access_member(interaction, runtime.guild_permissions(interaction));
     let (gate_store, _) = runtime.make_pair();
     if let Some(denial) = command_gate(&gate_store, guild_id, &member, command.name()).await {
         reply(denial).await;
@@ -5650,28 +6489,40 @@ where
             true
         }
         VoiceCommand::Setup => {
-            let (store, _) = runtime.make_pair();
-            let (creators, store_error) = match store.creators(guild_id).await {
-                Ok(creators) => (creators, None),
-                Err(error) => (Vec::new(), Some(format!("{error:?}"))),
-            };
+            let permissions = runtime.guild_permissions(interaction);
             let status = runtime.worker_status(guild_id).await;
-            let panel = setup_panel(&SetupSummary {
-                guild_id,
-                creators,
-                tracked_rooms: status.as_ref().map_or(0, |status| status.tracked_rooms),
-                // Current health findings first: they are live, failures are history.
-                failures: status.as_ref().map_or_else(Vec::new, |status| {
-                    status
-                        .health
-                        .iter()
-                        .chain(status.failures.iter())
-                        .cloned()
-                        .collect()
-                }),
-                halted: status.as_ref().is_some_and(|status| status.halted),
-                store_error,
-            });
+            let panel = if is_voice_admin(permissions) {
+                let (store, _) = runtime.make_pair();
+                let (creators, store_error) = match store.creators(guild_id).await {
+                    Ok(creators) => (creators, None),
+                    Err(error) => (Vec::new(), Some(error.to_string())),
+                };
+                setup_panel(&SetupSummary {
+                    guild_id,
+                    creators,
+                    tracked_rooms: status.as_ref().map_or(0, |status| status.tracked_rooms),
+                    // Current health findings first: they are live, failures are history.
+                    failures: status.as_ref().map_or_else(Vec::new, |status| {
+                        status
+                            .health
+                            .iter()
+                            .chain(status.failures.iter())
+                            .cloned()
+                            .collect()
+                    }),
+                    halted: status.as_ref().is_some_and(|status| status.halted),
+                    store_error,
+                })
+            } else {
+                // No store read for a member: the generic view needs none, and
+                // an open command should not cost a query per invocation.
+                setup_member_panel(
+                    status.as_ref().is_some_and(|status| status.halted),
+                    status.as_ref().is_some_and(|status| {
+                        !status.health.is_empty() || !status.failures.is_empty()
+                    }),
+                )
+            };
             reply(ephemeral_response(&format!(
                 "**{}**\n{}",
                 panel.title, panel.description
@@ -5680,10 +6531,7 @@ where
             true
         }
         VoiceCommand::Create { name } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /create.",
@@ -5694,11 +6542,21 @@ where
             let text = match decide_create_channel(CreateChannelRequest { guild_id, name }) {
                 CreateChannelPlan::Refuse { message } => message,
                 CreateChannelPlan::Create { guild_id, name } => {
-                    let (store, http) = runtime.make_pair();
-                    execute_create(&store, &http, guild_id, &name, |creator, channel| {
-                        runtime.creator_added(creator, channel);
-                    })
-                    .await
+                    let channel_id = interaction
+                        .channel
+                        .as_ref()
+                        .map_or(0, |channel| channel.id.get());
+                    let user_id = interaction.author_id().map_or(0, |id| id.get());
+                    match runtime.filter_creator_name(guild_id, channel_id, user_id, &name) {
+                        Err(refusal) => refusal,
+                        Ok(name) => {
+                            let (store, http) = runtime.make_pair();
+                            execute_create(&store, &http, guild_id, &name, |creator, channel| {
+                                runtime.creator_added(creator, channel);
+                            })
+                            .await
+                        }
+                    }
                 }
             };
             reply(ephemeral_response(&text)).await;
@@ -5708,10 +6566,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /textchannels.",
@@ -5721,7 +6576,7 @@ where
             }
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
-                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_text_channels(creator, &request) {
                     TextChannelsPlan::Refuse { message } => message,
                     TextChannelsPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -5731,7 +6586,7 @@ where
                         }
                         Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
                         Err(error) => {
-                            format!("Could not save the companion settings ({error:?}). Try again.")
+                            format!("Could not save the companion settings ({error}). Try again.")
                         }
                     },
                 },
@@ -5743,10 +6598,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /position.",
@@ -5756,7 +6608,7 @@ where
             }
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
-                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_position(creator, &request) {
                     PositionPlan::Refuse { message } => message,
                     PositionPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -5766,7 +6618,7 @@ where
                         }
                         Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
                         Err(error) => {
-                            format!("Could not save the position settings ({error:?}). Try again.")
+                            format!("Could not save the position settings ({error}). Try again.")
                         }
                     },
                 },
@@ -5778,10 +6630,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /group.",
@@ -5791,7 +6640,7 @@ where
             }
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
-                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_group(creator, &request) {
                     GroupPlan::Refuse { message } => message,
                     GroupPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -5801,7 +6650,7 @@ where
                         }
                         Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
                         Err(error) => {
-                            format!("Could not save the grouping settings ({error:?}). Try again.")
+                            format!("Could not save the grouping settings ({error}). Try again.")
                         }
                     },
                 },
@@ -5813,10 +6662,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /inheritpermissions.",
@@ -5826,7 +6672,7 @@ where
             }
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
-                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_inherit_permissions(creator, &request) {
                     InheritPermissionsPlan::Refuse { message } => message,
                     InheritPermissionsPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -5836,7 +6682,7 @@ where
                         }
                         Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
                         Err(error) => {
-                            format!("Could not save the permission settings ({error:?}). Try again.")
+                            format!("Could not save the permission settings ({error}). Try again.")
                         }
                     },
                 },
@@ -5848,10 +6694,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /defaultlimit.",
@@ -5861,7 +6704,7 @@ where
             }
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
-                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_default_limit(creator, &request) {
                     DefaultLimitPlan::Refuse { message } => message,
                     DefaultLimitPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -5871,7 +6714,7 @@ where
                         }
                         Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
                         Err(error) => {
-                            format!("Could not save the limit settings ({error:?}). Try again.")
+                            format!("Could not save the limit settings ({error}). Try again.")
                         }
                     },
                 },
@@ -5883,10 +6726,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /alwaysprivate.",
@@ -5896,7 +6736,7 @@ where
             }
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
-                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_always_private(creator, &request) {
                     AlwaysPrivatePlan::Refuse { message } => message,
                     AlwaysPrivatePlan::Update(creator) => match store.add_creator(&creator).await {
@@ -5906,7 +6746,7 @@ where
                         }
                         Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
                         Err(error) => {
-                            format!("Could not save the privacy settings ({error:?}). Try again.")
+                            format!("Could not save the privacy settings ({error}). Try again.")
                         }
                     },
                 },
@@ -5915,7 +6755,7 @@ where
             true
         }
         VoiceCommand::Reclaim => {
-            let Some((actor_id, is_admin)) = interaction_actor(interaction) else {
+            let Some(actor_id) = invoker_member_id(interaction) else {
                 reply(ephemeral_response(
                     "I couldn't tell who invoked /reclaim — try again.",
                 ))
@@ -5923,7 +6763,12 @@ where
                 return true;
             };
             let text = runtime
-                .run_ownership(guild_id, actor_id, is_admin, OwnershipCommand::Reclaim)
+                .run_ownership(
+                    guild_id,
+                    actor_id,
+                    member.is_admin,
+                    OwnershipCommand::Reclaim,
+                )
                 .await
                 .unwrap_or_else(|| {
                     "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
@@ -5932,7 +6777,7 @@ where
             true
         }
         VoiceCommand::Transfer { target_id } => {
-            let Some((actor_id, is_admin)) = interaction_actor(interaction) else {
+            let Some(actor_id) = invoker_member_id(interaction) else {
                 reply(ephemeral_response(
                     "I couldn't tell who invoked /transfer — try again.",
                 ))
@@ -5952,7 +6797,7 @@ where
                 .run_ownership(
                     guild_id,
                     actor_id,
-                    is_admin,
+                    member.is_admin,
                     OwnershipCommand::Transfer { target_id },
                 )
                 .await
@@ -5962,6 +6807,18 @@ where
             reply(ephemeral_response(&text)).await;
             true
         }
+        VoiceCommand::Name => {
+            handle_name_interaction(
+                runtime,
+                interaction,
+                guild_id,
+                names,
+                NameInteraction::Panel,
+                false,
+                reply,
+            )
+            .await
+        }
         VoiceCommand::Export => {
             let Some(inventory) = inventory else {
                 reply(ephemeral_response(
@@ -5970,10 +6827,7 @@ where
                 .await;
                 return true;
             };
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_manage_server(permissions) {
                 reply(ephemeral_response("You need Manage Server to use /export.")).await;
                 return true;
@@ -6040,10 +6894,7 @@ where
         .await;
         return true;
     };
-    let permissions = interaction
-        .member
-        .as_ref()
-        .and_then(|member| member.permissions);
+    let permissions = runtime.guild_permissions(interaction);
     if !may_manage_server(permissions) {
         reply(ephemeral_response("You need Manage Server to use /import.")).await;
         return true;
@@ -6121,6 +6972,10 @@ where
             hash,
             text,
         } => {
+            if let Some(message) = import_creator_gate(&current, &candidate, permissions) {
+                reply(ephemeral_response(&message)).await;
+                return true;
+            }
             runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
             reply(import_preview_response(&text, member_id, &hash)).await;
         }
@@ -6168,10 +7023,7 @@ where
         .await;
         return true;
     }
-    let permissions = interaction
-        .member
-        .as_ref()
-        .and_then(|member| member.permissions);
+    let permissions = runtime.guild_permissions(interaction);
     if !may_manage_server(permissions) {
         reply(ephemeral_response(
             "You need Manage Server to confirm an import.",
@@ -6179,7 +7031,7 @@ where
         .await;
         return true;
     }
-    let member = access_member(interaction);
+    let member = access_member(interaction, runtime.guild_permissions(interaction));
     let (store, _) = runtime.make_pair();
     if let Some(denial) = command_gate(&store, guild_id, &member, "import").await {
         reply(denial).await;
@@ -6231,13 +7083,83 @@ where
             hash,
             text,
         } => {
+            if let Some(message) = import_creator_gate(&current, &candidate, permissions) {
+                reply(ephemeral_response(&message)).await;
+                return true;
+            }
             runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
             reply(import_preview_response(&text, member_id, &hash)).await;
         }
         ImportDecision::Apply { candidate, message } => {
-            match store.config_apply(guild_id, &candidate).await {
+            if let Some(refusal) = import_creator_gate(&current, &candidate, permissions) {
+                reply(ephemeral_response(&refusal)).await;
+                return true;
+            }
+            match store.config_apply(guild_id, &candidate, &current).await {
                 Ok(()) => {
                     reply(ephemeral_response(&message)).await;
+                }
+                Err(StoreError::Conflict) => {
+                    // Compare-and-swap lost under the lock: the guild changed
+                    // between the Confirm re-read and the locked write. The
+                    // preview hash already bound (`current`, `candidate`); that
+                    // binding stays, and the admin gets a fresh preview of the
+                    // new state instead of a silent overwrite.
+                    match store.config_snapshot(guild_id).await {
+                        Ok(fresh) => {
+                            match plan_import_confirm(&fresh, &candidate, inventory, &hash) {
+                                ImportDecision::Refuse { message } => {
+                                    reply(ephemeral_response(&message)).await;
+                                }
+                                ImportDecision::Notice { text } => {
+                                    reply(ephemeral_response(&text)).await;
+                                }
+                                ImportDecision::Preview {
+                                    candidate,
+                                    hash,
+                                    text,
+                                } => {
+                                    runtime.remember_pending_import(
+                                        guild_id, member_id, &hash, candidate,
+                                    );
+                                    reply(import_preview_response(&text, member_id, &hash)).await;
+                                }
+                                ImportDecision::Apply {
+                                    candidate: retry,
+                                    message: fresh_message,
+                                } => {
+                                    // The fresh state still matches the hash
+                                    // (the concurrent change reverted): retry
+                                    // once with the fresh snapshot as expected.
+                                    // The reply carries the fresh plan's
+                                    // message: its change count was computed
+                                    // against the fresh state, not the stale
+                                    // preview's.
+                                    match store.config_apply(guild_id, &retry, &fresh).await {
+                                        Ok(()) => {
+                                            reply(ephemeral_response(&fresh_message)).await;
+                                        }
+                                        Err(_) => {
+                                            runtime.remember_pending_import(
+                                                guild_id, member_id, &hash, retry,
+                                            );
+                                            reply(ephemeral_response(
+                                                "That preview is stale: the configuration changed underneath. Nothing was changed; try confirming again.",
+                                            ))
+                                            .await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
+                            reply(ephemeral_response(
+                                "That preview is stale: the configuration changed underneath. Nothing was changed; try confirming again.",
+                            ))
+                            .await;
+                        }
+                    }
                 }
                 Err(_) => {
                     runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
@@ -6361,12 +7283,34 @@ where
         Self { runtime, replies }
     }
 
+    /// [`Self::respond_named`] with no display-name directory: every member
+    /// renders as "member" in a `/name` template.
+    #[cfg(test)]
     async fn respond_with(
         runtime: &VoiceRuntime<S, H>,
         replies: &R,
         interaction: &Interaction,
         invite_code: Option<&str>,
         inventory: Option<GuildInventory>,
+    ) {
+        Self::respond_named(
+            runtime,
+            replies,
+            interaction,
+            invite_code,
+            inventory,
+            NameDirectory::default(),
+        )
+        .await;
+    }
+
+    async fn respond_named(
+        runtime: &VoiceRuntime<S, H>,
+        replies: &R,
+        interaction: &Interaction,
+        invite_code: Option<&str>,
+        inventory: Option<GuildInventory>,
+        names: NameDirectory,
     ) {
         // Vote-kick owns its transport. A non-room `/kick` belongs to the
         // moderation path, so return before any acknowledgement and let the
@@ -6424,16 +7368,45 @@ where
             }
             return;
         }
+        if matches!(
+            name_component_action(interaction),
+            Some(NameInteraction::OpenModal { .. })
+        ) {
+            // A modal must be the initial callback; a deferred
+            // acknowledgement cannot open one.
+            let answered: Arc<Mutex<Option<InteractionResponse>>> = Arc::new(Mutex::new(None));
+            let writer = Arc::clone(&answered);
+            handle_voice_interaction_full(
+                runtime,
+                interaction,
+                invite_code,
+                inventory.as_ref(),
+                &names,
+                move |response| async move {
+                    *writer.lock().unwrap() = Some(response);
+                },
+            )
+            .await;
+            let response = answered.lock().unwrap().take();
+            if let Some(response) = response {
+                if let Err(error) = replies.respond(interaction, response).await {
+                    warn!(interaction_id = interaction.id.get(), %error,
+                        "voice name modal response failed; not retried");
+                }
+            }
+            return;
+        }
         if let Err(error) = replies.defer(interaction).await {
             warn!(interaction_id = interaction.id.get(), %error,
                 "voice acknowledgement failed; command not executed");
             return;
         }
-        handle_voice_interaction_with(
+        handle_voice_interaction_full(
             runtime,
             interaction,
             invite_code,
             inventory.as_ref(),
+            &names,
             |response| async move {
                 if let Err(error) = replies.complete(interaction, response).await {
                     warn!(interaction_id = interaction.id.get(), %error,
@@ -6459,6 +7432,7 @@ where
         if let Event::InteractionCreate(created) = event {
             if parse_voice_command(&created.0).is_none()
                 && voice_import_action(&created.0).is_none()
+                && name_component_action(&created.0).is_none()
             {
                 return;
             }
@@ -6466,15 +7440,17 @@ where
             let invite_code = vanity_code_from_cache(cache, &interaction);
             let inventory = interaction_guild(&interaction)
                 .and_then(|guild_id| inventory_from_cache(cache, guild_id));
+            let names = name_directory_from_cache(cache, &interaction);
             let runtime = Arc::clone(&self.runtime);
             let replies = Arc::clone(&self.replies);
             tokio::spawn(async move {
-                Self::respond_with(
+                Self::respond_named(
                     &runtime,
                     &replies,
                     &interaction,
                     invite_code.as_deref(),
                     inventory,
+                    names,
                 )
                 .await;
             });

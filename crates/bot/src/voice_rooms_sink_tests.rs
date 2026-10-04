@@ -43,8 +43,33 @@ impl RoomPersistence for Arc<Store> {
     async fn persist(&self, room: &VoiceRoom) -> Result<(), StoreError> {
         self.as_ref().persist(room).await
     }
-    async fn update_ownership(&self, room: &VoiceRoom) -> Result<bool, StoreError> {
-        self.as_ref().update_ownership(room).await
+    async fn custom_names(&self, guild: u64) -> Result<Vec<(u64, String)>, StoreError> {
+        self.as_ref().custom_names(guild).await
+    }
+    async fn save_custom_name(
+        &self,
+        guild: u64,
+        channel: u64,
+        custom_name: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        self.as_ref()
+            .save_custom_name(guild, channel, custom_name)
+            .await
+    }
+    async fn pending_owner_grants(&self, guild: u64) -> Result<Vec<u64>, StoreError> {
+        self.as_ref().pending_owner_grants(guild).await
+    }
+    async fn prepare_owner_grants(
+        &self,
+        room: &VoiceRoom,
+        previous_owner_id: u64,
+    ) -> Result<OwnerGrantIntent, StoreError> {
+        self.as_ref()
+            .prepare_owner_grants(room, previous_owner_id)
+            .await
+    }
+    async fn update_ownership(&self, room: &VoiceRoom, revision: &str) -> Result<bool, StoreError> {
+        self.as_ref().update_ownership(room, revision).await
     }
     async fn forget(&self, guild: u64, channel: u64) -> Result<(), StoreError> {
         self.as_ref().forget(guild, channel).await
@@ -56,8 +81,9 @@ impl RoomPersistence for Arc<Store> {
         &self,
         guild: u64,
         config: &VoiceConfiguration,
+        expected: &VoiceConfiguration,
     ) -> Result<(), StoreError> {
-        self.as_ref().config_apply(guild, config).await
+        self.as_ref().config_apply(guild, config, expected).await
     }
 
     async fn companions(&self, guild: u64) -> Result<Vec<TextCompanion>, StoreError> {
@@ -401,13 +427,18 @@ async fn create_notifies_existing_actor_before_next_join() {
     let pipeline = MemPipeline::for_replay();
     bootstrap(&runtime, &pipeline, &[]);
     status(&runtime).await;
-    let interaction = voice_interaction(
-        Some(command_data(
-            "create",
-            vec![command_option("name", "new creator")],
-        )),
-        Some(Permissions::MANAGE_CHANNELS),
-        true,
+    // This guild grants Manage Channels through @everyone; the invoker has
+    // no additional role IDs, especially none missing from the guild cache.
+    let interaction = with_roles(
+        voice_interaction(
+            Some(command_data(
+                "create",
+                vec![command_option("name", "new creator")],
+            )),
+            Some(Permissions::MANAGE_CHANNELS),
+            true,
+        ),
+        &[],
     );
     let seen = Arc::new(Mutex::new(None));
     let writer = seen.clone();

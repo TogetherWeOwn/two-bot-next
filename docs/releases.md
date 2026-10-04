@@ -30,6 +30,11 @@ member versions, local dependency requirements, and root lockfile:
 There is no workspace plugin and no independently configured member release.
 This avoids duplicate flat tags and ensures that changes outside `crates/bot`
 (including shared domain code and the Worker) are eligible for release notes.
+The excluded `fuzz` workspace's local dependency requirements and the copyable
+`CONTRIBUTING.md` testsupport example use `extra-files` with inline
+`x-release-please-version` markers. The native lifecycle fixture checks them on
+every generated snapshot and its next release; the unpublished fuzz package
+keeps version `0.0.0`, and its external dependencies stay unchanged.
 
 The `0.1.0` manifest is only a seed: it does not assert a published release.
 Features and breaking changes advance the minor version while pre-1.0;
@@ -67,12 +72,15 @@ changelog and body are reconciled independently, so retries recover if only one
 side was updated. Once they agree the reconciliation is a no-op; unexpected
 layouts fail closed. The lifecycle fixture asserts each historical note in both
 outputs and the resulting release payload, with one title and no stranded notes.
-The configured PR header keeps Summary/Changes/Testing before the FIRST native
-`---` delimiter. Placing them inside the notes before the version heading makes
-17.6.0 parse zero releases and silently publish an empty notes payload. Worker CI
-runs `scripts/test-release-publication.cjs` against an immutable real first-PR
-body, asserting the full native publication payload and a misplaced-template
-negative control. Reconciliation also repairs the first-release comparison
+The configured PR header keeps the seven PR-template sections (Thinking Path,
+Linked Issues or Issue Description, What Changed, Verification, Risks, Model
+Used, Checklist) before the FIRST native `---` delimiter, so normal and
+overflow canonical bodies carry the same metadata. Placing them inside the notes
+before the version heading makes 17.6.0 parse zero releases and silently publish
+an empty notes payload. Worker CI runs `scripts/test-release-publication.cjs`
+against an immutable real first-PR body, asserting the full native publication
+payload, the seven-section header in both the normal body and the stored
+overflow representation, and a misplaced-template negative control. Reconciliation also repairs the first-release comparison
 against the unpublished 0.1.0 seed in both changelog and body; regeneration must
 not restore a link to a nonexistent tag.
 Cargo CI still validates compilation and the real release flow still validates

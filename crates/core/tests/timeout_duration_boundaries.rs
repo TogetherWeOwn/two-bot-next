@@ -49,7 +49,7 @@ fn validate_timeout(duration_seconds: Option<i64>) -> Result<u64, MemberError> {
         &policy(),
         &actor(),
         Some(&target()),
-        Some(100),
+        100,
         "spam",
         duration_seconds,
     )
@@ -187,7 +187,7 @@ fn timeout_bounds_do_not_leak_onto_other_verbs() {
         &policy(),
         &actor(),
         Some(&target()),
-        Some(100),
+        100,
         "spam",
         Some(MAX),
     )

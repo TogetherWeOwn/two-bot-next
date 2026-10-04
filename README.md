@@ -57,6 +57,8 @@ README. Staging deploys from `main`; production is a separate manual gate.
   failure handling and rollback.
 - [Staging soak acceptance](docs/staging-soak.md): the evidence required before
   cutover; deployment alone is not acceptance.
+- [Offline staging slash smoke](docs/staging-slash-smoke.md): fixture-only router/reply
+  checks, explicit staging fences and honest coverage gaps; not live E2E evidence.
 - [Backup/restore runbook](docs/backup.md) and [parity matrix](docs/parity.md).
 - [Channel lane reconciliation](docs/channel-lane-reconciliation.md): inspection-first
   operator release of an uncertain moderation lane, with explicit confirmation,
@@ -92,9 +94,10 @@ these tests in its existing integration-test step.
 Squash-merge only; PR titles follow Conventional Commits and the body follows the
 [PR template](.github/pull_request_template.md). This repo is public, so keep
 internal tracker IDs out of titles, bodies, commits and branch names. The rulesets
-require `gitleaks` and `pr-lint`; a PR also needs a green `check` (fmt, clippy
--D warnings, tests, cargo-deny) and `worker check` (including the runbook
-command-drift test) on the exact head commit. The approving non-author reviewer
+require `ci-ok`, `gitleaks` and `pr-lint` on the exact head commit. The single
+`ci-ok` aggregate gates both selectors, lint (`check`: fmt, clippy -D warnings,
+cargo-deny), all selected `rust tests` and `ignored db` lanes, and `worker check`
+(including the runbook command-drift test). The approving non-author reviewer
 squash-merges. See [Contributing](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). The
 workspace toolchain is pinned in `rust-toolchain.toml`.
 

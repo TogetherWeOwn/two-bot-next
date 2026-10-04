@@ -19,6 +19,14 @@ use two_bot_core::{format_iso_millis, parse_iso_millis, Snowflake};
 
 use super::voice_config_store::PgVoiceConfigStore;
 
+/// Durable recipients that may hold this room's bot-issued owner mask.
+/// Completion is fenced to this preparation; a newer intent must survive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerGrantIntent {
+    pub revision: String,
+    pub members: Vec<Snowflake>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PgRoomStore {
     pool: PgPool,
@@ -178,6 +186,210 @@ impl PgRoomStore {
         .await?
         .rows_affected()
             != 0)
+    }
+
+    /// Record every possible recipient before an owner overwrite is issued.
+    /// The persisted owner is included even when volatile handoffs ran ahead.
+    pub async fn prepare_owner_grants(
+        &self,
+        room: &VoiceRoom,
+        previous_owner_id: Snowflake,
+    ) -> Result<Option<OwnerGrantIntent>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let stored_owner: Option<String> = sqlx::query_scalar(
+            "SELECT owner_id FROM voice_rooms
+             WHERE guild_id = $1 AND channel_id = $2 FOR UPDATE",
+        )
+        .bind(room.guild_id.to_string())
+        .bind(room.channel_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(stored_owner) = stored_owner else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let revision: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE voice_owner_grants SET revision = $3, pending = TRUE, touched_at = now()
+             WHERE guild_id = $1 AND channel_id = $2",
+        )
+        .bind(room.guild_id.to_string())
+        .bind(room.channel_id.to_string())
+        .bind(&revision)
+        .execute(&mut *tx)
+        .await?;
+        for member in [
+            stored_owner,
+            previous_owner_id.to_string(),
+            room.owner_id.to_string(),
+        ] {
+            sqlx::query(
+                "INSERT INTO voice_owner_grants
+                 (guild_id, channel_id, member_id, revision, pending)
+                 VALUES ($1, $2, $3, $4, TRUE)
+                 ON CONFLICT (guild_id, channel_id, member_id) DO UPDATE
+                 SET revision = EXCLUDED.revision, pending = TRUE, touched_at = now()",
+            )
+            .bind(room.guild_id.to_string())
+            .bind(room.channel_id.to_string())
+            .bind(member)
+            .bind(&revision)
+            .execute(&mut *tx)
+            .await?;
+        }
+        // An intent-only mutation is also visible to rollback measurement.
+        sqlx::query(
+            "UPDATE voice_rooms SET owner_touched_at = now()
+             WHERE guild_id = $1 AND channel_id = $2",
+        )
+        .bind(room.guild_id.to_string())
+        .bind(room.channel_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        let rows = sqlx::query(
+            "SELECT member_id FROM voice_owner_grants
+             WHERE guild_id = $1 AND channel_id = $2 ORDER BY member_id",
+        )
+        .bind(room.guild_id.to_string())
+        .bind(room.channel_id.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        let members = rows
+            .iter()
+            .map(|row| decode_id(row, "member_id"))
+            .collect::<Result<_, _>>()?;
+        tx.commit().await?;
+        Ok(Some(OwnerGrantIntent { revision, members }))
+    }
+
+    pub async fn pending_owner_grants(
+        &self,
+        guild_id: Snowflake,
+    ) -> Result<Vec<Snowflake>, sqlx::Error> {
+        sqlx::query(
+            "SELECT DISTINCT channel_id FROM voice_owner_grants
+             WHERE guild_id = $1 AND pending ORDER BY channel_id",
+        )
+        .bind(guild_id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|row| decode_id(row, "channel_id"))
+        .collect()
+    }
+
+    /// After confirmed Discord cleanup, commit ownership and acknowledge exactly
+    /// this intent atomically. A failed/stale commit leaves pending work intact.
+    pub async fn complete_owner_grants(
+        &self,
+        room: &VoiceRoom,
+        revision: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let exists: Option<String> = sqlx::query_scalar(
+            "SELECT owner_id FROM voice_rooms
+             WHERE guild_id = $1 AND channel_id = $2 FOR UPDATE",
+        )
+        .bind(room.guild_id.to_string())
+        .bind(room.channel_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let valid: bool = sqlx::query_scalar(
+            "SELECT count(*) > 0 AND coalesce(bool_and(revision = $3 AND pending), FALSE)
+             AND coalesce(bool_or(member_id = $4), FALSE)
+             FROM voice_owner_grants WHERE guild_id = $1 AND channel_id = $2",
+        )
+        .bind(room.guild_id.to_string())
+        .bind(room.channel_id.to_string())
+        .bind(revision)
+        .bind(room.owner_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        if exists.is_none() || !valid {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE voice_rooms
+             SET owner_id = $3, original_creator_id = $4, owner_touched_at = now()
+             WHERE guild_id = $1 AND channel_id = $2",
+        )
+        .bind(room.guild_id.to_string())
+        .bind(room.channel_id.to_string())
+        .bind(room.owner_id.to_string())
+        .bind(room.original_creator_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM voice_owner_grants
+             WHERE guild_id = $1 AND channel_id = $2 AND member_id <> $3",
+        )
+        .bind(room.guild_id.to_string())
+        .bind(room.channel_id.to_string())
+        .bind(room.owner_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE voice_owner_grants SET pending = FALSE, touched_at = now()
+             WHERE guild_id = $1 AND channel_id = $2",
+        )
+        .bind(room.guild_id.to_string())
+        .bind(room.channel_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Persist a V3 `/name` custom-name override on an already-tracked room,
+    /// or clear it with `None` (restore). Only the name and its change stamp
+    /// move: ownership, seed and creation stamp stay as they are. The text
+    /// is stored as typed (template tokens intact); it must be 1-100
+    /// characters, the same bound as the column's `CHECK`. Returns false when
+    /// no row exists.
+    pub async fn set_custom_name(
+        &self,
+        guild_id: Snowflake,
+        channel_id: Snowflake,
+        custom_name: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        if custom_name.is_some_and(|name| !(1..=100).contains(&name.chars().count())) {
+            return Err(invalid_argument(
+                "custom room name must be 1-100 characters",
+            ));
+        }
+        Ok(sqlx::query(
+            "UPDATE voice_rooms
+             SET custom_name = $3, name_touched_at = now()
+             WHERE guild_id = $1 AND channel_id = $2",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(custom_name)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            != 0)
+    }
+
+    /// Every custom-name override in a guild, by channel id. Rooms using
+    /// their template name have no entry.
+    pub async fn custom_names(
+        &self,
+        guild_id: Snowflake,
+    ) -> Result<Vec<(Snowflake, String)>, sqlx::Error> {
+        sqlx::query(
+            "SELECT channel_id, custom_name FROM voice_rooms
+             WHERE guild_id = $1 AND custom_name IS NOT NULL ORDER BY channel_id",
+        )
+        .bind(guild_id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|row| Ok((decode_id(row, "channel_id")?, row.try_get("custom_name")?)))
+        .collect()
     }
 
     pub async fn room_for(

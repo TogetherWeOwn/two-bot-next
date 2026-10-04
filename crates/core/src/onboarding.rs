@@ -457,6 +457,19 @@ pub fn plan_game_selection(keys: &[&str], visible: &dyn Fn(&str) -> bool) -> Gam
     }
 }
 
+impl GameSelection {
+    /// Picks that keep their role but have no visible destination (legacy
+    /// `unavailable`): they never contribute a link or a successful route.
+    #[must_use]
+    pub fn unavailable_keys(&self) -> Vec<String> {
+        self.destinations
+            .iter()
+            .filter(|destination| destination.channel_id.is_none())
+            .map(|destination| destination.key.clone())
+            .collect()
+    }
+}
+
 /// Which game keys a member already holds, so the picker opens ticked with
 /// their current answers (legacy `currentGameKeys`). Platform roles are menu
 /// state, not game state — same as legacy, which scans `GAME_PICKS` only.
@@ -1295,15 +1308,22 @@ pub fn game_selected_row(
 /// Legacy game/anchor routed row (legacy `OnboardingRecorder::routed`,
 /// source `picker`). `degraded` is surfaced in the weekly numbers: non-zero
 /// means members are being sent to the hub because the real room is dark.
+/// `unavailable` names picks that kept their role but had no visible
+/// destination; the key is present only when at least one pick is unavailable,
+/// so fully routed rows stay byte-identical to legacy.
 #[must_use]
 pub fn channel_routed_row(
     guild_id: &str,
     member_id: &str,
     channel_ids: &[String],
     degraded_count: usize,
+    unavailable: &[String],
     occurred_at: &str,
 ) -> FunnelRow {
-    let metadata = serde_json::json!({ "channels": channel_ids, "degraded": degraded_count });
+    let mut metadata = serde_json::json!({ "channels": channel_ids, "degraded": degraded_count });
+    if !unavailable.is_empty() {
+        metadata["unavailable"] = serde_json::json!(unavailable);
+    }
     FunnelRow {
         guild_id: guild_id.to_owned(),
         member_id: member_id.to_owned(),
@@ -1646,6 +1666,80 @@ mod tests {
         let text = legacy_welcome_text(MEMBER);
         assert!(text.starts_with("<@900000000000007777> welcome to TWO."));
         assert!(text.contains(INTRO_CHANNEL_ID));
+    }
+
+    #[test]
+    fn welcome_copy_is_byte_identical_to_the_pure_renderers() {
+        // Goodbye already pins byte-identity; session/anchor/legacy welcome
+        // had substring tests only. Pin the exact bytes so a copy drift (or
+        // a wiring change that renders a different string) fails loudly.
+        let legacy = legacy_welcome_text(MEMBER);
+        assert_eq!(
+            legacy,
+            "<@900000000000007777> welcome to TWO.\n\nPick what you play below and I will open the right channels for you.\nYou can change this any time, and there is an intro thread in <#1087198966346690570> if you want one."
+        );
+        let session = session_welcome_text(MEMBER);
+        assert_eq!(
+            session,
+            "<@900000000000007777> you're in - that was the whole application.\n\nWhat do you want to do right now? Pick below and I will point you at the right room. You can change your mind any time - this picks a destination for tonight, not a label forever."
+        );
+        let far = anchor_welcome_text(MEMBER, BEFORE_RUN_1, SUNDAY_SQUAD);
+        assert_eq!(
+            far,
+            "Hey <@900000000000007777> — glad you're here.\n\nThe thing to know: **Sunday Squad**, every Sunday at 8pm Eastern in <#1175127344072118405>. We play Fall Guys for about an hour. Next one is <t:1787529600:R>.\n\nYou don't need to sign up or say anything first — just join the voice room and I'll get you into the party. Haven't got Fall Guys? Come anyway, there's something we can play right there in the room. If you can't make Sunday, hop in whenever and see who's about."
+        );
+        let near = anchor_welcome_text(MEMBER, RUN_1 - 1200, SUNDAY_SQUAD);
+        assert_eq!(
+            near,
+            "Hey <@900000000000007777> — glad you're here.\n\nThe thing to know: **Sunday Squad** is happening right now in <#1175127344072118405> — Fall Guys, for about another hour. Come say hi. You don't need it installed to join in.\n\nYou don't need to sign up or say anything first — just join the voice room and I'll get you into the party. Haven't got Fall Guys? Come anyway, there's something we can play right there in the room. If you can't make Sunday, hop in whenever and see who's about."
+        );
+    }
+
+    #[test]
+    fn welcome_effects_post_the_renderer_bytes_unchanged() {
+        // The adjudicated Post content is the renderer output verbatim —
+        // no wrapper, no footer, no truncation.
+        match adjudicate_welcome(
+            OnboardingMode::Legacy,
+            MEMBER,
+            Some("111"),
+            ANCHOR_CHANNEL_ID,
+            BEFORE_RUN_1,
+            SUNDAY_SQUAD,
+            false,
+        ) {
+            WelcomeEffect::Post { content, .. } => assert_eq!(content, legacy_welcome_text(MEMBER)),
+            WelcomeEffect::Skip { .. } => panic!("legacy with a channel posts"),
+        }
+        match adjudicate_welcome(
+            OnboardingMode::Session,
+            MEMBER,
+            Some("222"),
+            ANCHOR_CHANNEL_ID,
+            BEFORE_RUN_1,
+            SUNDAY_SQUAD,
+            false,
+        ) {
+            WelcomeEffect::Post { content, .. } => {
+                assert_eq!(content, session_welcome_text(MEMBER))
+            }
+            WelcomeEffect::Skip { .. } => panic!("session with a channel posts"),
+        }
+        match adjudicate_welcome(
+            OnboardingMode::Anchor,
+            MEMBER,
+            None,
+            ANCHOR_CHANNEL_ID,
+            BEFORE_RUN_1,
+            SUNDAY_SQUAD,
+            false,
+        ) {
+            WelcomeEffect::Post { content, .. } => assert_eq!(
+                content,
+                anchor_welcome_text(MEMBER, BEFORE_RUN_1, SUNDAY_SQUAD)
+            ),
+            WelcomeEffect::Skip { .. } => panic!("anchor always posts"),
+        }
     }
 
     // --- session picker -------------------------------------------------------------------
@@ -2102,6 +2196,7 @@ mod tests {
             "2",
             &[GAME_HUB_CHANNEL_ID.to_owned()],
             1,
+            &[],
             "2026-08-24T00:00:42.000Z",
         );
         let routed_meta: serde_json::Value =
@@ -2115,6 +2210,47 @@ mod tests {
             funnel_idempotency_key(&routed),
             "1:2:channel_routed:2026-08-24T00:00:42.000Z"
         );
+    }
+
+    #[test]
+    fn routed_row_names_unavailable_picks_only_when_a_pick_has_no_route() {
+        let shooters = pick_by_key("shooters").unwrap();
+        let primary = shooters.primary_channel_id.unwrap();
+        // Mixed: shooters keeps its room, the hub-only pick has none.
+        let mixed = plan_game_selection(&["shooters", "rocketleague"], &|id| id == primary);
+        assert_eq!(mixed.unavailable_keys(), vec!["rocketleague"]);
+        let row = channel_routed_row(
+            "1",
+            "2",
+            &mixed.channel_ids,
+            mixed.degraded_count,
+            &mixed.unavailable_keys(),
+            "2026-08-24T00:00:42.000Z",
+        );
+        let meta: serde_json::Value =
+            serde_json::from_str(row.metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            meta,
+            serde_json::json!({
+                "channels": [primary],
+                "degraded": 0,
+                "unavailable": ["rocketleague"],
+            })
+        );
+        // Fully routed rows keep the legacy two-key shape.
+        let routed = plan_game_selection(&["shooters", "rocketleague"], &see_everything());
+        assert!(routed.unavailable_keys().is_empty());
+        let row = channel_routed_row(
+            "1",
+            "2",
+            &routed.channel_ids,
+            routed.degraded_count,
+            &routed.unavailable_keys(),
+            "2026-08-24T00:00:42.000Z",
+        );
+        let meta: serde_json::Value =
+            serde_json::from_str(row.metadata.as_deref().unwrap()).unwrap();
+        assert!(meta.get("unavailable").is_none(), "{meta}");
     }
 
     #[test]

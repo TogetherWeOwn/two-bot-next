@@ -613,6 +613,21 @@ class ActiveLagTests(OfflineTestCase):
         self.assertFalse(rollout.converged(lag_row(), IMAGE, 8))
         self.assertTrue(rollout.active_lag(lag_row(), IMAGE, 8))
 
+    def test_in_use_singleton_counted_active_not_healthy_is_lag_not_converged(self):
+        # durable_object scheduling: the serving instance reads active=1, healthy=0.
+        row = completed_row()
+        row["health"]["instances"].update(active=1, healthy=0)
+        self.assertFalse(rollout.converged(row, IMAGE, 8))
+        self.assertTrue(rollout.active_lag(row, IMAGE, 8))
+        for key in ["failed", "starting", "scheduling"]:
+            with self.subTest(key=key):
+                bad = completed_row()
+                bad["health"]["instances"].update(active=1, healthy=0, **{key: 1})
+                self.assertFalse(rollout.active_lag(bad, IMAGE, 8))
+        idle = completed_row()
+        idle["health"]["instances"].update(active=0, healthy=0)
+        self.assertFalse(rollout.active_lag(idle, IMAGE, 8))
+
     def test_pending_and_progressing_are_never_lag(self):
         for status in ["pending", "progressing"]:
             with self.subTest(status=status):
@@ -1093,6 +1108,51 @@ class OrchestrationTests(OfflineTestCase):
         self.assertTrue(client.observation.startswith("rollout=active_lag "))
         self.assert_no_evidence()
         self.assert_no_secret_saved_or_printed()
+
+    def fresh_baseline(self):
+        # `prepare` refuses a stale deploy output, so loops reset the fixtures.
+        Path(self.args.output).unlink(missing_ok=True)
+        self.prepare_baseline()
+        self.write_deploy_output()
+
+    def test_final_reread_accepts_counters_that_wobble_between_completed_shapes(self):
+        # First read lag, final read converged (and the reverse): the exact
+        # build served ready both times, so a counter wobble must not fail.
+        for first, final, active_lag_expected in [
+            (lag_row(), completed_row(), True),
+            (completed_row(), lag_row(), False),
+        ]:
+            with self.subTest(first_is_lag=active_lag_expected):
+                self.fresh_baseline()
+                client = verify_client()
+                client.api_routes[ROWS_PATH] = [[old_row(), first]]
+                client.api_routes[DETAIL_PATH] = [first, final]
+                if active_lag_expected:
+                    client.api_routes[DETAIL_PATH] = [first, first, first, final]
+                    client.request_routes[URL + "/readyz"] = [ready_response()]
+                    client.deadline = 130
+                rollout.verify(self.args, client)
+                evidence = json.loads(Path(self.args.evidence).read_text())
+                self.assertEqual(evidence.get("active_lag", False), active_lag_expected)
+                Path(self.args.evidence).unlink()
+
+    def test_final_reread_still_rejects_failed_starting_or_idle_counters(self):
+        for key, value in [("failed", 1), ("starting", 1), ("scheduling", 1)]:
+            with self.subTest(key=key):
+                self.fresh_baseline()
+                client = verify_client()
+                bad = completed_row()
+                bad["health"]["instances"][key] = value
+                client.api_routes[DETAIL_PATH] = [completed_row(), bad]
+                self.assert_gate("rollout_not_converged", rollout.verify, self.args, client)
+                self.assert_no_evidence()
+        idle = completed_row()
+        idle["health"]["instances"].update(active=0, healthy=0)
+        self.fresh_baseline()
+        client = verify_client()
+        client.api_routes[DETAIL_PATH] = [completed_row(), idle]
+        self.assert_gate("rollout_not_converged", rollout.verify, self.args, client)
+        self.assert_no_evidence()
 
     def test_lag_without_exact_runtime_never_succeeds(self):
         self.prepare_baseline()
@@ -1643,6 +1703,32 @@ class OrchestrationTests(OfflineTestCase):
                 with patch.dict(os.environ, {"STAGING_URL": url}):
                     self.assert_gate("invalid_staging_url", rollout.verify, self.args, verify_client())
                 self.assert_no_evidence()
+
+
+class UserAgentTests(unittest.TestCase):
+    def test_requests_send_an_explicit_user_agent(self):
+        seen = []
+
+        class Response(io.BytesIO):
+            status = 200
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class Opener:
+            def open(self, request, timeout):
+                seen.append(request.get_header("User-agent"))
+                return Response(b"ok")
+
+        client = rollout.Client("0" * 32, "token")
+        client.opener = Opener()
+        client.request("https://example.invalid/readyz")
+        self.assertEqual(seen, [rollout.USER_AGENT])
+        self.assertFalse(seen[0].startswith("Python-urllib"))
 
 
 if __name__ == "__main__":

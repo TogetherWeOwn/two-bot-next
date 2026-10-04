@@ -19,7 +19,7 @@ use std::{sync::Arc, time::Duration};
 use sqlx::PgPool;
 use two_bot_core::{
     audit_scheduled, claim_due, clamp_retry_delay_ms, complete_run, format_iso_ms, lease_until_ms,
-    post_failure_retryable, retry_scheduled, OccurrenceOutcome, ScheduledAuditInput,
+    post_failure_retryable, retry_scheduled, FeatureGates, OccurrenceOutcome, ScheduledAuditInput,
     ScheduledMessageRow, ScheduledStoreError, SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
 };
 use two_bot_discord::executor::{ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordError};
@@ -38,14 +38,34 @@ const ORPHAN_REASON: &str = "Scheduled message run was not recorded";
 #[path = "scheduled_jobs_tests.rs"]
 mod tests;
 
-/// The supervised ticker for the configured guild.
-pub(crate) fn register(context: Arc<Context>) -> Job {
-    job(Arc::new(move || {
-        let context = context.clone();
-        Box::pin(
-            async move { tick(context.pool().await?, &context.rest, &context.guild, now_ms).await },
-        )
-    }))
+/// The supervised ticker for the configured guild, or `None` while
+/// `TWO_AUTOMATIONS` is off (legacy only started the scheduler when automations
+/// were enabled, and a disabled scheduler fired zero jobs). A disabled or
+/// misconfigured gate builds no job, so no row is claimed, posted or audited.
+pub(crate) fn register(context: Arc<Context>) -> Option<Job> {
+    let gates = match FeatureGates::from_env() {
+        Ok(gates) => gates,
+        Err(_) => {
+            tracing::warn!(
+                job = NAMES[0],
+                "scheduled messages parked: invalid feature configuration"
+            );
+            return None;
+        }
+    };
+    register_gated(
+        gates,
+        Arc::new(move || {
+            let context = context.clone();
+            Box::pin(async move {
+                tick(context.pool().await?, &context.rest, &context.guild, now_ms).await
+            })
+        }),
+    )
+}
+
+fn register_gated(gates: FeatureGates, action: JobAction) -> Option<Job> {
+    gates.automations.then(|| job(action))
 }
 
 /// Ten occurrences at the 5 s REST timeout, each with a possible orphan

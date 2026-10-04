@@ -30,6 +30,7 @@ pub fn print_server_usage() {
     print!("{}", crate::erasure_cli::USAGE);
     print!("{}", crate::moderation_cli::USAGE);
     print!("{}", crate::moderation_release_cli::USAGE);
+    print!("{}", crate::member_cli::USAGE);
 }
 
 fn env_var(name: &str) -> Option<String> {
@@ -259,6 +260,7 @@ pub async fn dispatch(args: &[String]) -> i32 {
     match args[0].as_str() {
         "db" => crate::database_roles_cli::dispatch(&args[1..]).await,
         "erase-member" => crate::erasure_cli::dispatch(&args[1..]).await,
+        "reconcile-member" => crate::member_cli::dispatch(&args[1..]).await,
         "backup" => cmd_backup().await,
         "restore" => cmd_restore(&args[1..]).await,
         "restore-drill" => crate::restore_drill::dispatch(&args[1..]).await,

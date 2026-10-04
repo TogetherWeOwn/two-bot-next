@@ -37,12 +37,32 @@ same channel, across independent pools/workers. Future slash-command wiring must
 use this reservation/settlement protocol too; the low-level REST executor's
 unrecorded unlock fallback is **not** a durable unlock path.
 
-Lockdown stores the original exact `@everyone` allow/deny masks before REST and
-changes only `SEND_MESSAGES`. Repeated lockdown preserves the first seed and its
-recovery generation. Unlock restores those masks, or deletes the overwrite if
-none originally existed. Settlement checks both request claim and recovery
-generation. Successful result/audit persistence, optional recovery deletion,
-and channel release happen in one transaction.
+Lockdown stores the live `@everyone` allow/deny masks before REST and changes
+only the lockdown bits (`SEND_MESSAGES`, `SEND_MESSAGES_IN_THREADS`,
+`CREATE_PUBLIC_THREADS`, `CREATE_PRIVATE_THREADS`, `ADD_REACTIONS`). A role or
+member overwrite that allows sending still wins. Repeated lockdown preserves the first seed and generation
+while the live send deny remains set. If an external edit clears that deny (or
+removes the overwrite), the next lockdown atomically refreshes the seed and
+recovery generation before PUT.
+
+Unlock reads the live overwrite and restores **only the recorded lockdown
+bits** (a thread or reaction bit only while it still holds the locked state).
+All other live allow/deny bits survive, including a newly added
+`VIEW_CHANNEL` deny. An originally absent overwrite is deleted only when both
+result masks are zero; otherwise unlock PUTs the preserved live masks. Missing
+recovery, unreadable/missing live state, a cleared send deny, or a newly allowed
+send bit refuse without a permission mutation and retain the recovery row.
+The refusal explains send-bit drift and asks for reconciliation rather than
+restoring a stale snapshot. A pre-existing send deny is not cleared by unlock.
+Settlement checks both request claim and recovery generation. Successful
+result/audit persistence, optional recovery deletion, and channel release happen
+in one transaction.
+
+Discord does not offer a conditional overwrite PUT/DELETE: the fresh GET and
+write are not atomic with external admin edits. The channel fence serializes bot
+commands, not Discord administrators. Avoid simultaneous manual overwrite edits
+and bot unlocks; this change prevents stale stored snapshots from widening access,
+not every possible read/write race.
 
 Proven pre-mutation failures release the request/channel reservation atomically
 with a refused audit. Channel/history GET failures (including timeouts and rate
@@ -57,8 +77,8 @@ not uncertain deletions. The entire history body must be a JSON array of rows wi
 canonical nonzero u64 string IDs; unreadable bodies or any malformed ID reject the
 whole read before deletion or success persistence. A valid empty array succeeds
 with zero affected messages.
-Rejected first lockdown also removes only its newly created seed; rejected
-repeated lockdown keeps the original seed. Build-time validation and confirmed
+Rejected first lockdown (or a refreshed cycle) removes only its new seed;
+rejected repeated lockdown with an intact send deny keeps the original seed. Build-time validation and confirmed
 HTTP 400/401/403/404/405 rejections are safe; per-verb accepted statuses still
 complete normally. Uncertain mutation results (unexpected 2xx/3xx, HTTP 408 or
 other ambiguous statuses, timeouts, transport errors, rate limits, 5xx),

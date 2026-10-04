@@ -740,17 +740,26 @@ pub enum RoomAction {
     DeleteRoom {
         channel_id: Snowflake,
     },
-    /// V2 caretaker succession: persist an ownership handoff the worker
-    /// already applied to its tracked row. No Discord write; rename, privacy
-    /// and Join-channel follow-ups belong to later slices.
+    /// Rewrite the room-scoped owner grant, then persist the handoff.
+    /// Keep the previous owner even for stale handoffs so rapid transfers
+    /// cannot strand a former owner's grant.
     UpdateOwnership {
         channel_id: Snowflake,
+        previous_owner_id: Snowflake,
         owner_id: Snowflake,
         original_creator_id: Snowflake,
     },
     RenameRoom {
         channel_id: Snowflake,
         name: String,
+    },
+    /// V3 `/name`: persist the worker's custom-name override for a tracked
+    /// room (`None` after a restore). No Discord write: the rename itself
+    /// rides [`RoomAction::RenameRoom`] on the deferred lane. A stale action
+    /// (the override moved on, or the room was forgotten) persists nothing.
+    SetCustomName {
+        channel_id: Snowflake,
+        custom_name: Option<String>,
     },
     /// V4 enforcement for a passed vote: deny the member Connect on this room
     /// channel only, then disconnect them. Both writes are idempotent, so a
@@ -788,6 +797,7 @@ impl RoomAction {
             | Self::DeleteRoom { channel_id }
             | Self::UpdateOwnership { channel_id, .. }
             | Self::RenameRoom { channel_id, .. }
+            | Self::SetCustomName { channel_id, .. }
             | Self::GrantCompanionView {
                 room_channel_id: channel_id,
                 ..
@@ -1449,6 +1459,10 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
             )
             .max_length(512),
         ]),
+        CommandDefinition::new(
+            "name",
+            "Set a custom name for your temporary voice room, or restore the template name",
+        ),
     ]
 }
 
@@ -1723,6 +1737,7 @@ mod tests {
             GUILD,
             RoomAction::UpdateOwnership {
                 channel_id: 501,
+                previous_owner_id: 301,
                 owner_id: MEMBER,
                 original_creator_id: MEMBER,
             },
@@ -1735,6 +1750,7 @@ mod tests {
             }),
             Some(RoomAction::UpdateOwnership {
                 channel_id: 501,
+                previous_owner_id: 301,
                 owner_id: MEMBER,
                 original_creator_id: MEMBER,
             })
@@ -1745,6 +1761,7 @@ mod tests {
             GUILD,
             RoomAction::UpdateOwnership {
                 channel_id: 502,
+                previous_owner_id: 301,
                 owner_id: MEMBER,
                 original_creator_id: MEMBER,
             },
@@ -2156,7 +2173,8 @@ mod tests {
                 "inheritpermissions",
                 "defaultlimit",
                 "alwaysprivate",
-                "kick"
+                "kick",
+                "name"
             ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
@@ -2306,6 +2324,13 @@ mod tests {
         );
         assert_eq!(kick.options[0].required, Some(true));
         assert_eq!(kick.options[1].required, None);
+        // `/name` is open to every member with no options: the panel and modal
+        // carry the name, and the worker refuses everyone but the owner or an
+        // admin.
+        let name = &defs[17];
+        assert_eq!(name.name, "name");
+        assert_eq!(name.default_member_permissions, None);
+        assert!(name.options.is_empty());
         // `/export` takes no options; `/import` takes one required file
         // attachment. Both are Manage Server (Manage Guild) gated.
         let export = &defs[9];

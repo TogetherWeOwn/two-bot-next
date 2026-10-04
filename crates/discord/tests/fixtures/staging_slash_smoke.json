@@ -1,0 +1,42 @@
+{
+  "populated": {
+    "name": "fixture-display-sensitive",
+    "xp": 1500,
+    "level": 5,
+    "rank": 1,
+    "member_count": 1,
+    "entries": [{"member_id": "7", "xp": 1500, "level": 5, "rank": 1}],
+    "healthy": true,
+    "ready": true
+  },
+  "empty": {
+    "name": "fixture-empty-member",
+    "xp": 0,
+    "level": 0,
+    "rank": null,
+    "member_count": 0,
+    "entries": [],
+    "healthy": true,
+    "ready": true
+  },
+  "unready": {
+    "name": "fixture-unready",
+    "xp": 0,
+    "level": 0,
+    "rank": null,
+    "member_count": 0,
+    "entries": [],
+    "healthy": true,
+    "ready": false
+  },
+  "down": {
+    "name": "fixture-down",
+    "xp": 0,
+    "level": 0,
+    "rank": null,
+    "member_count": 0,
+    "entries": [],
+    "healthy": false,
+    "ready": false
+  }
+}

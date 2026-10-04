@@ -107,7 +107,7 @@ pub fn fold_name(name: &str) -> String {
     name.trim().to_lowercase().nfc().collect()
 }
 
-fn is_refused_control(c: char) -> bool {
+pub(crate) fn is_refused_control(c: char) -> bool {
     // Cc covers C0/C1 (including \n, \r, \t and NEL); add the Unicode line and
     // paragraph separators and the bidirectional embedding/override/isolate
     // controls, which reorder surrounding text in channel names and messages.
