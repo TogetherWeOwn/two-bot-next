@@ -172,7 +172,8 @@ where
     /// `actor` and `target` must be resolved in the configured guild by the
     /// runtime (legacy resolver), NEVER built from caller-supplied
     /// roles/permissions. `bot_highest_role_position` is the runtime's read of
-    /// the bot's own standing in the guild. `now_ms` is the caller's clock
+    /// the bot's own standing in the guild; unknown positions must refuse
+    /// before calling this method. `now_ms` is the caller's clock
     /// reading in unix millis; it is injected so tests assert exact expiries.
     #[allow(clippy::too_many_arguments)]
     pub async fn execute(
@@ -180,7 +181,7 @@ where
         request: &InternalMemberRequest,
         actor: &ModerationActor,
         target: &ModerationTarget,
-        bot_highest_role_position: Option<i64>,
+        bot_highest_role_position: i64,
         request_id: &str,
         idempotency_key: &str,
         now_ms: i64,
