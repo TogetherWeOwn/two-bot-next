@@ -59,6 +59,7 @@ if [[ "${EVENT_NAME:-}" == "pull_request" ]]; then
   fi
 
   if [[ -s "${ignore}" ]]; then
+    rm -f .gitleaksignore
     cp "${ignore}" .gitleaksignore
   else
     rm -f .gitleaksignore

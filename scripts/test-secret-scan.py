@@ -164,9 +164,18 @@ class SecretScanSurfaceTests(unittest.TestCase):
         self.assertIn(':.gitleaksignore"', script)
         self.assertNotIn("continue-on-error", script)
 
+    def test_scan_wrapper_unlinks_ignore_before_copy(self):
+        script = SCAN_SCRIPT.read_text()
+        self.assertRegex(
+            script,
+            r'(?m)^(\s*)rm -f \.gitleaksignore\n\1cp "\$\{ignore\}" \.gitleaksignore$',
+            "unlink the PR-controlled ignore path before copying the base policy",
+        )
+
     def test_self_test_covers_every_pr_bypass(self):
         script = SELF_TEST_SCRIPT.read_text()
         for case in ("allowlist added in .gitleaks.toml", "fingerprint added in .gitleaksignore",
+                     ".gitleaksignore symlink cannot overwrite the running wrapper",
                      "inline gitleaks:allow", "allowlist already on the base branch is honoured",
                      "unfetched base branch fails"):
             self.assertIn(case, script)

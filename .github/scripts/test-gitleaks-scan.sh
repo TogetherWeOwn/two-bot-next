@@ -75,11 +75,11 @@ TOML
 # Stock rules, for fingerprinting findings independent of any repo policy.
 printf '[extend]\nuseDefault = true\n' > "${work}/stock.toml"
 
-# scan EVENT [BASE_REF]: run the wrapper in ${repo}; prints its exit code.
+# scan EVENT [BASE_REF] [WRAPPER]: run the wrapper in ${repo}; prints its exit code.
 scan_rc() {
   local rc=0
   (cd "${repo}" && GITLEAKS_BIN="${GITLEAKS_BIN}" EVENT_NAME="$1" BASE_REF="${2:-main}" \
-    "${scan}" >"${work}/last.log" 2>&1) || rc=$?
+    "${3:-${scan}}" >"${work}/last.log" 2>&1) || rc=$?
   printf '%s' "${rc}"
 }
 
@@ -151,6 +151,20 @@ fp="$(fingerprint_of "${work}/stock.toml")"
 printf '%s\n' "${fp}" >> "${repo}/.gitleaksignore"
 pr_commit
 expect "pr: fingerprint appended to an existing .gitleaksignore does not silence the scan" 1 "$(scan_rc pull_request)"
+
+# A repo-local wrapper must survive a PR-controlled ignore symlink to itself.
+new_repo pr-ignore-symlink
+write_stock_config
+printf '# base ignore file with only a comment\n' > "${repo}/.gitleaksignore"
+mkdir -p "${repo}/.github/scripts"
+cp "${scan}" "${repo}/.github/scripts/gitleaks-scan.sh"
+base_commit
+rm -f "${repo}/.gitleaksignore"
+ln -s .github/scripts/gitleaks-scan.sh "${repo}/.gitleaksignore"
+plant_token
+pr_commit
+expect "pr: .gitleaksignore symlink cannot overwrite the running wrapper" 1 \
+  "$(scan_rc pull_request main "${repo}/.github/scripts/gitleaks-scan.sh")"
 
 new_repo pr-inline
 write_stock_config
