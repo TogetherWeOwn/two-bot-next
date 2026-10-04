@@ -32,7 +32,8 @@ async fn boot_configured_infrastructure_is_protected_in_each_actor() {
 #[test]
 fn malformed_protected_id_configuration_fails_closed() {
     assert!(configured_protected_channels(|_| None).unwrap().is_empty());
-    for value in ["0", "01", "-1", "18446744073709551616", "bad", "1,"] {
+    let overflow = (u128::from(u64::MAX) + 1).to_string();
+    for value in ["0", "01", "-1", overflow.as_str(), "bad", "1,"] {
         assert!(
             configured_protected_channels(|key| {
                 (key == "TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS").then(|| value.to_owned())
