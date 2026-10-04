@@ -83,7 +83,9 @@ impl RecordingFixtures {
             imported_xp: 0,
             rank: self.data["rank"].as_u64(),
             member_count: self.data["member_count"].as_u64().unwrap(),
-            next_level_xp: 0,
+            next_level_xp: two_bot_core::leveling::total_xp_for_level(
+                self.data["level"].as_u64().unwrap() + 1,
+            ),
         }
     }
 
@@ -99,6 +101,27 @@ impl RecordingFixtures {
                 rank: row["rank"].as_u64().unwrap(),
             })
             .collect()
+    }
+}
+
+#[test]
+fn fixture_xp_and_levels_follow_compiled_curve() {
+    for case in ["populated", "empty", "unready", "down"] {
+        let source = RecordingFixtures::new(case);
+        let profile = source.profile();
+        assert_eq!(
+            profile.level,
+            two_bot_core::leveling::level_for_xp(profile.xp),
+            "rank fixture: {case}"
+        );
+        assert!(profile.next_level_xp > profile.xp, "rank fixture: {case}");
+        for entry in source.entries() {
+            assert_eq!(
+                entry.level,
+                two_bot_core::leveling::level_for_xp(entry.xp),
+                "leaderboard fixture: {case}"
+            );
+        }
     }
 }
 

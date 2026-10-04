@@ -71,7 +71,8 @@ CI discovers these unit tests in the existing library-test lane. No workflow,
 credential, service container or database is needed. The fixture pack is
 `crates/discord/tests/fixtures/staging_slash_smoke.json`.
 
-Must-pass cases: populated/empty replies; live and bad-config zero-call refusal;
+Must-pass cases: fixture XP/level consistency with the compiled curve;
+populated/empty replies; live and bad-config zero-call refusal;
 live-mode refusal; down and healthy-but-unready health; source and callback
 timeouts; dropped pending futures; callback errors without retries; wrong read
 model/foreign rank model; sensitive-data exclusion from JSON and Debug; and
