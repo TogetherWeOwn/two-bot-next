@@ -5,11 +5,17 @@
 //! `GUILD_ID` the shard stays parked and `/readyz` reports `gateway: down`
 //! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
+mod activation;
 #[cfg(test)]
 mod admission_test_support;
 mod audit_runtime;
 mod automod_gateway;
 mod backup_cli;
+// Pure burn math: no runtime caller yet, the offline pin test is the consumer.
+#[allow(dead_code)]
+mod burn_rate;
+#[cfg(test)]
+mod burn_rate_tests;
 mod command_runtime;
 #[cfg(test)]
 mod command_runtime_tests;
@@ -25,7 +31,9 @@ mod database_roles_cli;
 mod discord_test_common;
 mod dispatch;
 mod erasure_cli;
+mod feed_jobs;
 mod gateway;
+mod gateway_commands;
 mod gateway_failure;
 mod gateway_metrics;
 #[cfg(test)]
@@ -37,8 +45,12 @@ mod join_risk_runtime;
 mod join_risk_runtime_tests;
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod log_volume_guard_tests;
 mod metrics_http;
 mod moderation_cli;
+#[cfg(test)]
+mod observability_event_conformance_tests;
 mod onboarding;
 #[cfg(test)]
 mod onboarding_tests;
@@ -57,6 +69,8 @@ mod self_role_handlers;
 #[allow(dead_code)]
 mod self_role_runtime;
 mod shutdown;
+#[cfg(test)]
+mod smoke_error_contract_tests;
 mod ticket_runtime;
 #[cfg(test)]
 #[path = "../../core/tests/support/tracing_capture.rs"]
@@ -145,6 +159,10 @@ async fn main() {
         }
     });
 
+    // Evaluate all five capabilities once, before any handler registration.
+    // Refusals narrow the command surface, not liveness or analytics jobs.
+    let activation = activation::BootActivation::from_config(&config);
+    activation.log_refusals();
     if receiver_config.is_some() && internal_receiver_prerequisites(&config).is_err() {
         tracing::error!(
             error_class = "receiver_prerequisites_invalid",
@@ -290,8 +308,12 @@ async fn main() {
     // ONE optional self-role service: gateway dispatch and the supervised
     // recovery job share this Arc. Empty/invalid catalogues, non-staging guilds
     // and failed identity reads leave the surface and the job unregistered.
+    // The activation fence is evaluated first: a refused self_roles capability
+    // composes no service, so neither dispatch nor the recovery job can run.
     let self_roles = match (gateway_prerequisites(&config), store.as_ref()) {
-        (Ok((token, _, guild_id)), Some(db)) => {
+        (Ok((token, _, guild_id)), Some(db))
+            if activation.permitted(two_bot_core::activation::LiveCapability::SelfRoles) =>
+        {
             self_role_handlers::SelfRoleService::from_env(db.pool().clone(), token, guild_id).await
         }
         _ => None,
@@ -361,7 +383,23 @@ async fn main() {
                         guild_id,
                         self_roles,
                         gates,
+                        &activation,
                     );
+                    if let Some(runtime) = &runtime {
+                        let config = gateway_commands::GatewayCommandConfig::from_map(
+                            guild_id,
+                            &std::env::vars().collect(),
+                        )
+                        .map_err(|error| {
+                            step_failure(FailureClass::CustomCommandsInitFailed, error)
+                        })?;
+                        runtime
+                            .initialize_custom_commands(config)
+                            .await
+                            .map_err(|error| {
+                                step_failure(FailureClass::CustomCommandsInitFailed, error)
+                            })?;
+                    }
                     // Onboarding renders through that same executor: one shared
                     // admission lane and pacing, never a private Discord client.
                     // Its identity probe honors the mock REST seam through the
@@ -442,42 +480,51 @@ async fn main() {
                     // builds a private client, router or timer.
                     let vars: std::collections::HashMap<String, String> =
                         std::env::vars().collect();
-                    let automod =
-                        match automod_gateway::resolve(&vars, guild_id).map_err(|reason| {
+                    // A refused automod capability is never resolved or validated:
+                    // stale env on a live identity can neither start the engine
+                    // nor fail the gateway. The refusal was already logged once.
+                    let automod_config = if activation
+                        .permitted(two_bot_core::activation::LiveCapability::Automod)
+                    {
+                        automod_gateway::resolve(&vars, guild_id).map_err(|reason| {
                             tracing::error!(reason, "automod configuration rejected");
                             step_failure(
                                 FailureClass::AutomodConfigInvalid,
                                 sqlx::Error::InvalidArgument(reason.into()),
                             )
-                        })? {
-                            Some(resolved) => {
-                                let executor = match runtime.as_ref() {
-                                    Some(runtime) => runtime.executor(),
-                                    None => two_bot_discord::ActionExecutor::with_proxy(
-                                        token.clone(),
-                                        std::env::var("DISCORD_API_BASE")
-                                            .ok()
-                                            .filter(|value| !value.is_empty()),
+                        })?
+                    } else {
+                        None
+                    };
+                    let automod = match automod_config {
+                        Some(resolved) => {
+                            let executor = match runtime.as_ref() {
+                                Some(runtime) => runtime.executor(),
+                                None => two_bot_discord::ActionExecutor::with_proxy(
+                                    token.clone(),
+                                    std::env::var("DISCORD_API_BASE")
+                                        .ok()
+                                        .filter(|value| !value.is_empty()),
+                                )
+                                .map_err(|_| {
+                                    step_failure(
+                                        FailureClass::AutomodExecutorFailed,
+                                        sqlx::Error::InvalidArgument(
+                                            "automod REST executor failed".into(),
+                                        ),
                                     )
-                                    .map_err(|_| {
-                                        step_failure(
-                                            FailureClass::AutomodExecutorFailed,
-                                            sqlx::Error::InvalidArgument(
-                                                "automod REST executor failed".into(),
-                                            ),
-                                        )
-                                    })?,
-                                };
-                                let automod = automod_gateway::build(resolved, pool, executor);
-                                let _ = slot.set(Arc::clone(&automod));
-                                info!("automod activation wired into the gateway loop");
-                                Some(automod)
-                            }
-                            None => None,
-                        };
+                                })?,
+                            };
+                            let automod = automod_gateway::build(resolved, pool, executor);
+                            let _ = slot.set(Arc::clone(&automod));
+                            info!("automod activation wired into the gateway loop");
+                            Some(automod)
+                        }
+                        None => None,
+                    };
                     let shard = build_shard(
                         token,
-                        intents_from_env(),
+                        intents_from_env(&activation),
                         saved.as_ref(),
                         gateway_url.as_deref(),
                     );

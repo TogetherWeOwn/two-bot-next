@@ -142,7 +142,8 @@ mod tests {
         // New tables, sequences and trigger functions must be deliberately
         // included rather than silently receiving wildcard permissions.
         // Enumerate the migrations directory so a new CREATE without a matrix
-        // row fails CI. No database connection is needed.
+        // row fails CI. No database connection is needed. Our 0130 custom
+        // commands migration is covered automatically: the file lives in-tree.
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cutover/migrations");
         let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
             .expect("migrations directory")

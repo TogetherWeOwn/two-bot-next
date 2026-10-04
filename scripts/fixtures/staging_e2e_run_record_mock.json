@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "mock": true,
+  "run": {
+    "id": "staging-e2e-MOCK-001",
+    "plan_ref": "Mock run proving the record shape only; no staging was touched."
+  },
+  "environment": {
+    "target": "staging",
+    "guild_id": "1545644954272137297",
+    "worker_env": "staging"
+  },
+  "deployment": {
+    "revision": "c3efe26ba1d4e5f60718293a4b5c6d7e8f90a1b2",
+    "deploy_staging_run_id": "37154963396",
+    "worker_version": "mock-worker-version",
+    "first_readyz_utc": "2026-10-04T00:00:41Z"
+  },
+  "tester": {
+    "identity": "Mock Tester (worked example; not a real run)"
+  },
+  "window": {
+    "start_utc": "2026-10-04T00:12:00Z",
+    "end_utc": "2026-10-04T00:18:30Z"
+  },
+  "commands": [
+    {
+      "name": "/rank",
+      "started_utc": "2026-10-04T00:12:03Z",
+      "duration_ms": 842,
+      "result": "pass",
+      "expected": "Rank card for the fixture member.",
+      "actual": "Rank card shown; no other guild data.",
+      "evidence_ref": "mock: redacted screenshot placeholder"
+    },
+    {
+      "name": "/leaderboard",
+      "started_utc": "2026-10-04T00:13:10Z",
+      "duration_ms": 915,
+      "result": "pass",
+      "expected": "Ordering agrees with the two fixture XP awards.",
+      "actual": "Ordering and ties match the fixture awards.",
+      "evidence_ref": "mock: redacted screenshot placeholder"
+    },
+    {
+      "name": "/timeout target:<disposable-member> duration_seconds:60",
+      "started_utc": "2026-10-04T00:15:44Z",
+      "duration_ms": 1210,
+      "result": "fail",
+      "expected": "Allowed timeout expires; one correlated moderation audit.",
+      "actual": "Reply never arrived within the 5s moderation abort bound.",
+      "failure_signature": "SIG-MOCK-TIMEOUT-001",
+      "evidence_ref": "mock: sanitized log excerpt placeholder",
+      "notes": "Mock failure showing the failure_signature column; see the failure-signature triage runbook for real IDs."
+    }
+  ],
+  "cleanup": {
+    "result": "restored",
+    "notes": "Mock: disposable fixtures removed through the normal UI; nothing pending."
+  },
+  "verdict": {
+    "disposition": "NEEDS WORK",
+    "summary": "Mock verdict: 2/3 commands passed; the /timeout row cites SIG-MOCK-TIMEOUT-001 for triage.",
+    "follow_up_refs": [
+      "Mock follow-up: re-run the /timeout row after the triage runbook resolves SIG-MOCK-TIMEOUT-001."
+    ]
+  }
+}

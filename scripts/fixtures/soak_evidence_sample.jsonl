@@ -1,0 +1,12 @@
+{"ts": "2026-09-20T00:00:01Z", "event": "connect", "session": "s1"}
+{"ts": "2026-09-20T00:00:02Z", "event": "dispatch", "session": "s1", "seq": 1, "kind": "MESSAGE_CREATE"}
+{"ts": "2026-09-20T00:00:03Z", "event": "dispatch", "session": "s1", "seq": 2, "kind": "MESSAGE_CREATE"}
+{"ts": "2026-09-20T00:00:04Z", "event": "dispatch", "session": "s1", "seq": 3, "kind": "VOICE_STATE_UPDATE"}
+{"ts": "2026-09-20T00:00:05Z", "event": "dispatch", "session": "s1", "seq": 6, "kind": "MESSAGE_CREATE"}
+{"ts": "2026-09-20T00:00:06Z", "event": "dispatch", "session": "s1", "seq": 6, "kind": "MESSAGE_CREATE"}
+{"ts": "2026-09-20T00:00:07Z", "event": "disconnect", "session": "s1", "code": 4007}
+{"ts": "2026-09-20T00:00:19Z", "event": "connect", "session": "s2"}
+{"ts": "2026-09-20T00:00:20Z", "event": "dispatch", "session": "s2", "seq": 1, "kind": "GUILD_MEMBER_ADD"}
+{"ts": "2026-09-20T00:00:21Z", "event": "resume", "session": "s2", "seq": 1}
+{"ts": "2026-09-20T00:00:22Z", "event": "unknown", "start": "2026-09-20T00:00:22Z", "end": "2026-09-20T00:00:25Z", "reason": "log gap: supervisor restart"}
+{"ts": "2026-09-20T00:00:26Z", "event": "heartbeat_oops", "session": "s2"}

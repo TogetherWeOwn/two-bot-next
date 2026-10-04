@@ -57,20 +57,86 @@ test("transitions notify once on fire and once on resolve", () => {
   assert.match(transitionMessages(["job_stale:rank"], [])[0]!, /RESOLVED/);
 });
 
+test("db errors fire on a burst, ignore trickles and restarts", () => {
+  const base = ev([`two_bot_db_errors_total{op="admission"} 0`, `two_bot_db_errors_total{op="other"} 0`]);
+  assert.deepEqual(base.firing, []);
+  const trickle = ev([`two_bot_db_errors_total{op="admission"} 2`, `two_bot_db_errors_total{op="other"} 0`], base.state);
+  assert.deepEqual(trickle.firing, []);
+  const burst = ev([`two_bot_db_errors_total{op="admission"} 5`, `two_bot_db_errors_total{op="other"} 0`], base.state);
+  assert.deepEqual(burst.firing, ["db_errors"]);
+  const restart = ev([`two_bot_db_errors_total{op="admission"} 1`], burst.state);
+  assert.deepEqual(restart.firing, []);
+});
+
+test("send admission blocked needs three consecutive windows with new refusals", () => {
+  const lines = (n: number) => [`two_bot_send_admissions_total{outcome="blocked"} ${n}`];
+  let state = EMPTY_STATE;
+  for (const expected of [[], [], ["send_admission_blocked"]]) {
+    const r = ev(lines(state.sendBlocked + 1), state);
+    assert.deepEqual(r.firing, expected);
+    state = r.state;
+  }
+  // A quiet window clears the streak; a counter reset (restart) resets it.
+  assert.equal(ev(lines(state.sendBlocked), state).state.sendBlockedStreak, 0);
+  assert.equal(ev([`two_bot_send_admissions_total{outcome="blocked"} 0`], state).state.sendBlockedStreak, 0);
+});
+
+test("voice failures fire on the lifecycle-drill failure exposition, silent on healthy", () => {
+  // Synthetic exposition mirroring docs/voice-lifecycle-alert-drill.md Q4:
+  // 42 successful creates, then injected create/discord x7,
+  // move/persistence x4 and dead-letter create x3.
+  const failing = [
+    `two_bot_voice_operations_total{op="create",outcome="success"} 42`,
+    `two_bot_voice_operations_total{op="create",outcome="discord"} 7`,
+    `two_bot_voice_operations_total{op="move",outcome="persistence"} 4`,
+    `two_bot_voice_dead_letters_total{action="create"} 3`,
+  ];
+  assert.deepEqual(ev(failing).firing, ["voice_failures"]);
+  const healthy = [`two_bot_voice_operations_total{op="create",outcome="success"} 42`];
+  assert.deepEqual(ev(healthy).firing, []);
+});
+
+test("voice failures ignore trickles and restarts, fire on lone dead-letters/orphans", () => {
+  const base = ev([`two_bot_voice_operations_total{op="create",outcome="success"} 42`]);
+  // One failure in 43 ops (2.3%) is a trickle, not a storm.
+  const trickle = ev(
+    [`two_bot_voice_operations_total{op="create",outcome="success"} 42`, `two_bot_voice_operations_total{op="create",outcome="discord"} 1`],
+    base.state,
+  );
+  assert.deepEqual(trickle.firing, []);
+  // A counter that went backwards means the process restarted: no window.
+  const restart = ev([`two_bot_voice_operations_total{op="create",outcome="success"} 1`], ev([
+    `two_bot_voice_operations_total{op="create",outcome="success"} 42`,
+    `two_bot_voice_operations_total{op="create",outcome="discord"} 7`,
+    `two_bot_voice_operations_total{op="move",outcome="persistence"} 4`,
+  ]).state);
+  assert.deepEqual(restart.firing, []);
+  // A single new dead-letter or orphan pages even below the ratio window.
+  const quiet = ev([]);
+  assert.deepEqual(ev([`two_bot_voice_dead_letters_total{action="create"} 1`], quiet.state).firing, ["voice_failures"]);
+  assert.deepEqual(ev([`two_bot_voice_orphans_total 1`], quiet.state).firing, ["voice_failures"]);
+});
+
 test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   const window = "2026-10-09T20-11-06Z";
   // Single shared spelling with the Rust canonical list (ALERT_RULE_IDS in
-  // crates/core/src/evidence.rs); both sides pin all four here and there.
+  // crates/core/src/evidence.rs); both sides pin all seven here and there.
   assert.deepEqual(RULES.map((r) => r.id), [
     "job_stale",
     "job_consecutive_failures",
     "rest_429_rate",
     "db_pool_saturated",
+    "db_errors",
+    "send_admission_blocked",
+    "voice_failures",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
   assert.equal(packetFilename("rest_429_rate", window), `evidence-rest_429_rate-${window}.json`);
   assert.equal(packetFilename("db_pool_saturated", window), `evidence-db_pool_saturated-${window}.json`);
+  assert.equal(packetFilename("db_errors", window), `evidence-db_errors-${window}.json`);
+  assert.equal(packetFilename("send_admission_blocked", window), `evidence-send_admission_blocked-${window}.json`);
+  assert.equal(packetFilename("voice_failures", window), `evidence-voice_failures-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
@@ -100,6 +166,25 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   let pool = EMPTY_STATE;
   for (let i = 0; i < 3; i++) pool = ev(poolLines, pool).state;
   firing.push(...pool.firing);
+  firing.push(
+    ...ev(
+      [`two_bot_db_errors_total{op="admission"} 5`, `two_bot_db_errors_total{op="other"} 0`],
+      ev([`two_bot_db_errors_total{op="admission"} 0`, `two_bot_db_errors_total{op="other"} 0`]).state,
+    ).firing,
+  );
+  let blocked = EMPTY_STATE;
+  for (let i = 1; i <= 3; i++) {
+    blocked = ev([`two_bot_send_admissions_total{outcome="blocked"} ${i}`], blocked).state;
+  }
+  firing.push(...blocked.firing);
+  firing.push(
+    ...ev([
+      `two_bot_voice_operations_total{op="create",outcome="success"} 42`,
+      `two_bot_voice_operations_total{op="create",outcome="discord"} 7`,
+      `two_bot_voice_operations_total{op="move",outcome="persistence"} 4`,
+      `two_bot_voice_dead_letters_total{action="create"} 3`,
+    ]).firing,
+  );
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);
   assert.equal(packets.length, RULES.length);

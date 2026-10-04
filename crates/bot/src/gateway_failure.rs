@@ -42,6 +42,8 @@ pub enum FailureClass {
     OnboardingGatesInvalid,
     /// Onboarding runtime initialisation (identity probe over REST).
     OnboardingInitFailed,
+    /// Custom-command registry bootstrap (store read and command publication).
+    CustomCommandsInitFailed,
     /// Reading the persisted leveling milestones.
     MilestonesLoadFailed,
     /// Automod environment rejected by `automod_gateway::resolve`.
@@ -59,12 +61,13 @@ pub enum FailureClass {
 impl FailureClass {
     /// Every variant, for the vocabulary tests.
     #[cfg(test)]
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::StoreUnavailable,
         Self::GatewayPoolConnectFailed,
         Self::CheckpointLoadFailed,
         Self::OnboardingGatesInvalid,
         Self::OnboardingInitFailed,
+        Self::CustomCommandsInitFailed,
         Self::MilestonesLoadFailed,
         Self::AutomodConfigInvalid,
         Self::AutomodExecutorFailed,
@@ -81,6 +84,7 @@ impl FailureClass {
             Self::CheckpointLoadFailed => "checkpoint_load_failed",
             Self::OnboardingGatesInvalid => "onboarding_gates_invalid",
             Self::OnboardingInitFailed => "onboarding_init_failed",
+            Self::CustomCommandsInitFailed => "custom_commands_init_failed",
             Self::MilestonesLoadFailed => "milestones_load_failed",
             Self::AutomodConfigInvalid => "automod_config_invalid",
             Self::AutomodExecutorFailed => "automod_executor_failed",
@@ -170,18 +174,19 @@ mod tests {
                 FailureClass::CheckpointLoadFailed => 2,
                 FailureClass::OnboardingGatesInvalid => 3,
                 FailureClass::OnboardingInitFailed => 4,
-                FailureClass::MilestonesLoadFailed => 5,
-                FailureClass::AutomodConfigInvalid => 6,
-                FailureClass::AutomodExecutorFailed => 7,
-                FailureClass::RaidExecutorFailed => 8,
-                FailureClass::GatewayRuntimeFailed => 9,
-                FailureClass::GatewayTaskPanicked => 10,
+                FailureClass::CustomCommandsInitFailed => 5,
+                FailureClass::MilestonesLoadFailed => 6,
+                FailureClass::AutomodConfigInvalid => 7,
+                FailureClass::AutomodExecutorFailed => 8,
+                FailureClass::RaidExecutorFailed => 9,
+                FailureClass::GatewayRuntimeFailed => 10,
+                FailureClass::GatewayTaskPanicked => 11,
             }
         }
         for (position, class) in FailureClass::ALL.into_iter().enumerate() {
             assert_eq!(index(class), position);
         }
-        assert_eq!(FailureClass::ALL.len(), 11);
+        assert_eq!(FailureClass::ALL.len(), 12);
     }
 
     #[test]

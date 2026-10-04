@@ -49,6 +49,10 @@
       "sha256": "5cd8d34365dd82e49cb7a801d2047371ee26b6857bd600e9bf61e47b5eb4072b",
       "justification": "Align shared channel/member ledger timestamps without changing applied SQL for TOG-10174."
       },
+    "crates/cutover/migrations/0130_custom_commands.sql": {
+      "sha256": "805f43fcdad3c5d401ef9e975e49d59dd4fe01b18eed2de742d1952b76c20e96",
+      "justification": "Register custom-command persistence and shared automation audit for TOG-10080; existing branch SQL unchanged."
+    },
     "crates/cutover/migrations/0140_scheduled_messages.sql": {
       "sha256": "eda397a2c691b5001b9aee0bd46f407d7b83cabb47382259c810ad7fc1bbf164",
       "justification": "Add scheduled-message storage and shared automation audit table for TOG-10081; reserved migration block 0140-0149."

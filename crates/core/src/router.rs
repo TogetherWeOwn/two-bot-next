@@ -79,9 +79,9 @@ pub const LFG_PREFIX: &str = "two:lfg:";
 pub const SELF_ROLE_PREFIX: &str = "two:self-role:";
 
 // --- refusal texts ------------------------------------------------------------
-// Actionable denials (TOG-13624): every refusal names the Discord permission,
-// who to ask, or the admin-only enable path. Legacy one-liners live in git
-// history; these are what Discord shows.
+// Actionable denials: every refusal names the Discord permission, who to ask,
+// or the admin-only enable path. Legacy one-liners live in git history; these
+// are what Discord shows.
 
 /// Automations gate: env-gated, not a Discord role — say who enables it.
 pub const AUTOMATIONS_DISABLED_REPLY: &str = "Automations are disabled on this server. Ask a server admin to enable them in the bot configuration — this is a host setting, not a Discord role.";
