@@ -525,6 +525,43 @@ def receipt(args, client=None):
     print("wrangler deploy receipt accepted")
 
 
+def image_drift_detail(client, app, row, image):
+    """Fixed-vocabulary diagnostic for `application_image_drift`.
+
+    Says where the application listing's image points relative to the pinned
+    rollout (`target`, its pre-deploy `baseline`, or `other`) and whether a
+    rollout created after the pinned one exists, with its target class. Tokens
+    and integers only; digests, configurations and ids never reach the log.
+    Returns None rather than raising, so it cannot mask the gate failure.
+    """
+    def kind(candidate, before):
+        return ("target" if candidate == image
+                else "baseline" if candidate is not None and candidate == before else "other")
+
+    try:
+        before = mapping(row.get("current_configuration")).get("image")
+        parts = [f"listing_image={kind(mapping(app.get('configuration')).get('image'), before)}"]
+        version = app.get("version")
+        target = number(row.get("target_version"))
+        if type(version) is int:
+            parts.append("app_version=" + ("equal" if version == target
+                                            else "ahead" if version > target else "behind"))
+        later = [mapping(item) for item in rollouts(client, app["id"])
+                 if mapping(item).get("id") != row.get("id")
+                 and timestamp(mapping(item).get("created_at")) > timestamp(row.get("created_at"))]
+        parts.append(f"later_rollouts={len(later)}")
+        if later:
+            newest = max(later, key=lambda item: timestamp(item.get("created_at")))
+            status = newest.get("status")
+            parts.append("latest_later="
+                         + (status if status in ("pending", "progressing", "completed", "replaced",
+                                                 "reverted") else "unknown")
+                         + ":" + kind(mapping(newest.get("target_configuration")).get("image"), before))
+        return " ".join(parts)
+    except Exception:
+        return None
+
+
 def verify(args, client):
     baseline = mapping(decode(Path(args.receipt).read_bytes()))
     version = deploy_version(read_records(args.output), baseline["started"])
@@ -552,8 +589,9 @@ def verify(args, client):
             stale = (complete or lag) and mapping(app.get("configuration")).get("image") != image
             if stale:
                 image_stale += 1
-                require(image_stale <= APPLICATION_IMAGE_STALE_POLLS, "application_image_drift")
-                client.observation += " application_image=stale"
+                client.observation += f" application_image=stale polls={image_stale}"
+                if image_stale > APPLICATION_IMAGE_STALE_POLLS:
+                    raise GateError("application_image_drift", image_drift_detail(client, app, row, image))
             else:
                 image_stale = 0
             if (complete or lag) and not stale:
@@ -580,10 +618,12 @@ def verify(args, client):
                                 or active_lag(final, image, pinned["target_version"]),
                                 "rollout_not_converged")
                         final_app = application(client)
-                        require(final_app["id"] == app["id"]
+                        if not (final_app["id"] == app["id"]
                                 and final_app["durable_objects"]["namespace_id"] == baseline["namespace_id"]
-                                and mapping(final_app.get("configuration")).get("image") == image,
-                                "application_image_drift")
+                                and mapping(final_app.get("configuration")).get("image") == image):
+                            client.observation += " application_image=final_mismatch"
+                            raise GateError("application_image_drift",
+                                            image_drift_detail(client, final_app, row, image))
                         if complete or lag_streak + 1 >= ACTIVE_LAG_CONFIRMATIONS:
                             evidence = {"worker_version": version, "application_id": app["id"],
                                         "rollout_id": pinned["id"],
@@ -630,8 +670,9 @@ def main():
         print(f"staging rollout gate failed: {error}")
         if error.detail:
             print(f"staging rollout diagnostic: {error.detail}")
-        if str(error) == "rollout_timeout" and client is not None and client.observation:
-            print(f"last observation before timeout: {client.observation}")
+        if client is not None and client.observation:
+            print(f"last observation before {'timeout' if str(error) == 'rollout_timeout' else 'failure'}: "
+                  f"{client.observation}")
         return 1
     except Exception:
         # No traceback: filesystem, SDK receipt and JSON errors may carry data.

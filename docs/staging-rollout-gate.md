@@ -63,8 +63,9 @@ not production authorization or a migration tool.
    it. Raw session arguments/log paths are never published. A failure prints,
    after the fixed gate code, only an allowlisted diagnostic: record-type counts,
    session class counts (deploy / probe / other), each session's record/Wrangler
-   version, and which deploy-record checks failed. A verify timeout separately
-   prints the last rollout/readiness observation (fixed vocabulary only).
+   version, and which deploy-record checks failed. A verify failure after the
+   first control-plane poll also prints the last rollout/readiness observation
+   (fixed vocabulary only).
 4. Resolve that exact Worker version's `TWO_BOT`/`TwoBotContainer` namespace through
    the versions API and match it to the application. Find the unique local
    Cloudflare registry tag for the expected application and Worker UUID prefix;
@@ -92,7 +93,16 @@ not production authorization or a migration tool.
    from the rollout record and can briefly trail it, so a completed rollout whose
    target digest the listing does not yet show is not accepted and not failed
    immediately: `verify` keeps polling (last observation `application_image=stale`)
-   for up to twelve polls, then fails closed as `application_image_drift`.
+   for up to twelve polls, then fails closed as `application_image_drift`. That
+   failure (also raised if the listing stops matching on the final re-read) prints
+   a fixed-vocabulary diagnostic: `listing_image=target|baseline|other` (where the
+   listing points, `baseline` being the pre-deploy image), `app_version=behind|equal|ahead`
+   when the listing reports a version, and `later_rollouts=<n>` with
+   `latest_later=<status>:<target|baseline|other>` when a rollout created after the
+   pinned one exists. `listing_image=baseline` with a later `completed:baseline`
+   rollout means the control plane reverted the application after the pinned rollout
+   completed; `listing_image=baseline` with `later_rollouts=0` means the listing never
+   moved. Digests, configurations and ids are never printed.
 7. Require the intended Worker version at 100% traffic, `/readyz` **200** with all
    components ready and the exact compiled revision/build ID, and `/health` 200.
    Both responses carry `x-two-worker-version`, overwritten by the outer Worker
