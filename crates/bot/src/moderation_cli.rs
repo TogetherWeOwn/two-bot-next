@@ -3,7 +3,9 @@
 //! Read-only guard for disabling moderation/automation: reports the releases
 //! still owed in Postgres (pending tempban unbans, active lockdowns, enabled
 //! scheduled messages) and refuses — exit 1, naming outstanding ids — while
-//! any are owed. Exit 0 is CLEAR (or an explicit override, logged loudly);
+//! any are owed. Unbans left `running` by a stopped worker are tagged apart
+//! from the rest: they never drain on their own and need the documented
+//! recovery steps. Exit 0 is CLEAR (or an explicit override, logged loudly);
 //! exit 2 means the state could not be read. State comes from the database,
 //! never Discord; nothing here writes, migrates, or starts the gateway.
 
@@ -20,6 +22,8 @@ pub const USAGE: &str = "\
   two-bot moderation preflight [--json] [--allow-owed]
       Read-only disable guard: refuse (exit 1) while Postgres still holds
       pending tempban unbans, active lockdowns or enabled scheduled messages.
+      A `running` unban claim (left by a stopped worker) is tagged [running]
+      and listed in --json as running_unbans, a subset of pending_unbans.
       Exit 0 is CLEAR, or an explicit override (--allow-owed, logged loudly).
       Exit 2 means the state could not be read.
       Env: TWO_DATABASE_URL (or DATABASE_URL when unset), TWO_MODERATION,
@@ -45,6 +49,7 @@ fn render_json(owed: &OwedReleases, overridden: bool) {
             "clear": owed.is_clear(),
             "overridden": overridden,
             "pending_unbans": owed.unbans,
+            "running_unbans": owed.running_unbans,
             "active_lockdowns": owed.lockdowns,
             "enabled_scheduled": owed.scheduled,
         })

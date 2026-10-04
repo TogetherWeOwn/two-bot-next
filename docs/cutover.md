@@ -56,8 +56,9 @@ Create a B4 evidence manifest before scheduling:
   migration plan's TypeScript/no-copy assumptions are not evidence for the Rust
   schema: resolve actual table compatibility before moving data.
 - [ ] Candidate is merged, independently reviewed on its exact head, and
-  `check` (fmt, clippy `-D warnings`, tests, cargo-deny), `worker check`, `pr-lint`
-  and `gitleaks` are green on that head. Pin the resulting deployment digest.
+  `ci-ok` (the full verdict over lint, worker checks and all selected Rust/DB
+  test lanes), `worker check`, `pr-lint` and `gitleaks` are green on that head.
+  A green lint-only `check` is not enough. Pin the resulting deployment digest.
 - [ ] Each tool required below is merged into that candidate; its argument
   parsing, safety behavior and rollback have been rehearsed with disposable
   fixtures. Inspect source before invoking any help flag: in this baseline,

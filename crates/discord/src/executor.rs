@@ -57,9 +57,9 @@ use twilight_model::id::marker::{
 };
 use twilight_model::id::Id;
 use two_bot_core::{
-    backoff_ms, classify_kick_status, pace_wait_ms, parse_retry_after_secs, retry_after_ms,
-    utf16_len, ActionOutcome, KickOutcome, KickResult, KickStatus, ModerationExecution,
-    MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
+    backoff_ms, classify_kick_status, pace_wait_ms, parse_retry_after_secs, plan_purge,
+    retry_after_ms, utf16_len, ActionOutcome, KickOutcome, KickResult, KickStatus,
+    ModerationExecution, MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
 };
 
 /// Minimum gap between paced requests, ms (legacy `rest.ts` default).
@@ -1949,8 +1949,9 @@ impl ActionExecutor {
         self.call_once(req, &[200]).await.map(|_| ())
     }
 
-    /// Purge: list then one `DELETE` or `POST .../bulk-delete` (legacy
-    /// `ModerationDiscord::purge` returns the affected count).
+    /// Purge: list, then `POST .../bulk-delete` for recent messages and one
+    /// `DELETE` per older or lone message (legacy `ModerationDiscord::purge`
+    /// returns the affected count).
     pub async fn purge(
         &self,
         channel_id: &str,
@@ -1964,6 +1965,9 @@ impl ActionExecutor {
     }
 
     /// Read-only purge phase. Even a timeout here proves no deletion was sent.
+    /// Pinned messages and this bot's own posts (ticket, sticky and LFG panels)
+    /// are listed but never returned for deletion. The bot identity is read only
+    /// when a listed message was authored by some bot.
     pub(crate) async fn list_purge_messages(
         &self,
         channel_id: &str,
@@ -1980,21 +1984,37 @@ impl ActionExecutor {
             || DiscordError::Unavailable(format!("unreadable channel {channel_id} purge history"));
         let listed: Vec<serde_json::Value> =
             serde_json::from_slice(&res.body).map_err(|_| unreadable())?;
-        listed
+        let mut rows = Vec::with_capacity(listed.len());
+        for row in &listed {
+            let value = row.get("id").and_then(serde_json::Value::as_str);
+            let value = value.ok_or_else(unreadable)?;
+            let id: Id<MessageMarker> = snowflake(value).map_err(|_| unreadable())?;
+            if id.to_string() != value {
+                return Err(unreadable());
+            }
+            rows.push((id, row));
+        }
+        let any_bot = rows
             .iter()
-            .map(|row| {
-                let value = row.get("id").and_then(serde_json::Value::as_str);
-                let value = value.ok_or_else(unreadable)?;
-                let id: Id<MessageMarker> = snowflake(value).map_err(|_| unreadable())?;
-                if id.to_string() != value {
-                    return Err(unreadable());
-                }
-                Ok(id)
-            })
-            .collect()
+            .any(|(_, row)| row["author"]["bot"].as_bool() == Some(true));
+        let own_id = if any_bot {
+            Some(self.current_bot_user_id().await?.to_string())
+        } else {
+            None
+        };
+        Ok(rows
+            .into_iter()
+            .filter(|(_, row)| !purge_protected(row, own_id.as_deref()))
+            .map(|(id, _)| id)
+            .collect())
     }
 
-    /// Single deletion phase; uncertain wire failures must retain caller fences.
+    /// Deletion phase. Messages Discord still bulk-deletes go in one bulk call;
+    /// older ones, which make the whole bulk call fail with a 400, are deleted
+    /// singly. Uncertain wire failures must retain caller fences. Once some
+    /// message is gone, a failure that proves only the failing call had no
+    /// effect stops the purge and reports the count deleted so far; it must not
+    /// claim that no mutation was accepted.
     pub(crate) async fn purge_messages(
         &self,
         channel_id: &str,
@@ -2003,29 +2023,58 @@ impl ActionExecutor {
     ) -> Result<u64, DiscordError> {
         let channel: Id<ChannelMarker> = snowflake(channel_id)?;
         let reason = audit_reason(reason)?;
-        if ids.is_empty() {
-            return Ok(0);
-        }
-        if ids.len() == 1 {
+        let raw: Vec<u64> = ids.iter().map(|id| id.get()).collect();
+        let plan = plan_purge(&raw, unix_millis_now());
+        let typed = |raw: Vec<u64>| -> Vec<Id<MessageMarker>> {
+            raw.into_iter().filter_map(Id::new_checked).collect()
+        };
+        let (bulk, single) = (typed(plan.bulk), typed(plan.single));
+        let mut deleted = 0_u64;
+        if !bulk.is_empty() {
             let req = Self::request_of(
                 self.inner
                     .factory
-                    .delete_message(channel, ids[0])
+                    .delete_messages(channel, &bulk)
                     .reason(&reason),
             )?;
             // request_of maps pre-send build failures to Rejected (finding 7).
             self.call_once(req, &[200, 204]).await?;
-            return Ok(1);
+            deleted += bulk.len() as u64;
         }
+        for message in single {
+            match self.delete_purged_message(channel, message, &reason).await {
+                Ok(true) => deleted += 1,
+                // Already gone: the purge's end state holds.
+                Ok(false) => {}
+                Err(error) if deleted == 0 => return Err(error),
+                Err(error @ (DiscordError::Timeout | DiscordError::Unavailable(_))) => {
+                    return Err(error)
+                }
+                Err(_) => break,
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// One purge delete. A 404 means the message vanished after the listing, so
+    /// it reports `false` instead of failing the purge.
+    async fn delete_purged_message(
+        &self,
+        channel: Id<ChannelMarker>,
+        message: Id<MessageMarker>,
+        reason: &str,
+    ) -> Result<bool, DiscordError> {
         let req = Self::request_of(
             self.inner
                 .factory
-                .delete_messages(channel, ids)
-                .reason(&reason),
+                .delete_message(channel, message)
+                .reason(reason),
         )?;
         // request_of maps pre-send build failures to Rejected (finding 7).
-        self.call_once(req, &[200, 204]).await?;
-        Ok(ids.len() as u64)
+        let mut res = self.call_once_raw(req, &[200, 204, 404]).await?;
+        let deleted = res.status != 404;
+        res.complete().await;
+        Ok(deleted)
     }
 
     /// Delete one message (legacy `ModerationDiscord` single delete — the
@@ -2982,6 +3031,9 @@ pub struct EveryoneOverwrite {
 
 /// Lockdown write for a channel whose @everyone entry reads `current`
 /// (deny send, drop any allow — every other bit preserved for unlock).
+/// Legacy parity helper behind [`ActionExecutor::execute_outcome`] only: the
+/// recorded `/lockdown` runtime plans through `two_bot_core::plan_lockdown`,
+/// which also denies the thread and reaction bits.
 #[must_use]
 pub fn lockdown_masks(current: Option<&EveryoneOverwrite>) -> (String, String) {
     let (allow, deny) = current
@@ -3054,6 +3106,19 @@ impl IntoOther for DiscordError {
             other => other,
         }
     }
+}
+
+/// Messages `/purge` leaves alone: pinned ones, and this bot's own posts.
+fn purge_protected(row: &serde_json::Value, own_id: Option<&str>) -> bool {
+    row["pinned"].as_bool() == Some(true)
+        || own_id.is_some_and(|own| row["author"]["id"].as_str() == Some(own))
+}
+
+fn unix_millis_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 pub(crate) fn snowflake<T>(value: &str) -> Result<Id<T>, DiscordError> {

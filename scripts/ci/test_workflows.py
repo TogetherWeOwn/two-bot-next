@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from pathlib import Path
+import tomllib
 import unittest
 
 import yaml
@@ -12,10 +13,10 @@ JOB_INVENTORY = {
     # Branch keeps the moderation-db job; main #84 added the supply-chain job.
     # The pin must be the union of both sides.
     "check.yml": {"check", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
-                  "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "required-checks",
-                  # TOG-14881: CI standard aggregator; required-checks stays
-                  # until the protect-main ruleset flips to ci-ok.
-                  "ci-ok"},
+                  "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "ci-ok",
+                  # `check` is now the lint lane; the test steps it used to
+                  # carry run in these three parallel lanes, all gated by ci-ok.
+                  "rust-tests", "ignored-db-stores", "ignored-db-runtime"},
     "deploy-production.yml": {"guard", "production"},
     "deploy-staging.yml": {"deploy"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
@@ -729,6 +730,28 @@ class WorkflowTests(unittest.TestCase):
                 def change(w, job_id=job_id, permissions=permissions):
                     w["jobs"][job_id]["permissions"] = permissions
                 self.assertTrue(mutated(change))
+
+    def test_check_toolchains_match_the_repository_pin(self):
+        channel = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
+        self.assertRegex(channel, r"^\d+\.\d+\.\d+$")
+        installers = {
+            job_id: [step for step in job.get("steps", [])
+                     if step.get("uses", "").startswith("dtolnay/rust-toolchain@")]
+            for job_id, job in self.workflows["check.yml"]["jobs"].items()
+        }
+        installers = {job: steps for job, steps in installers.items() if steps}
+        self.assertEqual(set(installers), {
+            "check", "rust-tests", "ignored-db-stores", "ignored-db-runtime",
+            "moderation-db", "self-role-store", "community-db", "tickets-postgres", "feeds-db",
+        })
+        for job_id, steps in installers.items():
+            with self.subTest(job=job_id):
+                self.assertEqual(len(steps), 1)
+                # Floating stable can install a different fmt/clippy than Cargo
+                # selects from the repository pin inside the job container.
+                self.assertEqual(steps[0].get("with", {}).get("toolchain"), channel)
+        self.assertEqual(set(installers["check"][0]["with"]["components"].replace(" ", "").split(",")),
+                         {"rustfmt", "clippy"})
 
     def test_overflow_runner_must_name_its_own_job(self):
         self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))

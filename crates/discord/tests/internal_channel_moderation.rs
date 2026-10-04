@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{MockRest, ScriptedResponse};
+use common::{fresh_message_id, MockRest, ScriptedResponse};
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{PgPool, Row};
@@ -873,7 +873,7 @@ async fn purge_history_failures_are_retryable_without_any_deletion() {
                 channel(None, "0"),
                 ScriptedResponse::json(
                     200,
-                    json!([{"id":"555555555555555555"},{"id":"666666666666666666"}]),
+                    json!([{"id":fresh_message_id(1)},{"id":fresh_message_id(2)}]),
                 ),
                 ScriptedResponse::status(204),
                 channel(None, "0"),
@@ -929,7 +929,7 @@ async fn uncertain_purge_deletions_keep_same_key_and_distinct_key_fenced() {
     for count in [1, 2] {
         for status in [202, 302, 408, 429, 503] {
             let db = TestDb::new().await;
-            let messages: Vec<Value> = ["555555555555555555", "666666666666666666"]
+            let messages: Vec<Value> = [fresh_message_id(1), fresh_message_id(2)]
                 .iter()
                 .take(count)
                 .map(|id| json!({"id":id}))
@@ -1294,7 +1294,7 @@ async fn purge_counts_bulk_delete_and_replays_without_rest_or_duplicate_audit() 
             channel(None, "0"),
             ScriptedResponse::json(
                 200,
-                json!([{"id":"555555555555555555"},{"id":"666666666666666666"}]),
+                json!([{"id":fresh_message_id(1)},{"id":fresh_message_id(2)}]),
             ),
             ScriptedResponse::status(204),
         ],
@@ -1397,11 +1397,13 @@ async fn lockdown_and_unlock_restore_full_masks_and_replay_independently() {
     let db = TestDb::new().await;
     let allow = ((1u64 << 48) | 2048 | 1024).to_string();
     let deny = "8192";
+    // Lockdown denies sending, thread and reaction bits, not just SEND_MESSAGES.
+    let locked_deny = (8192 | two_bot_core::LOCKDOWN_BITS).to_string();
     let mock = MockRest::start(
         vec![
             channel(Some(&allow), deny),
             ScriptedResponse::status(204),
-            channel(Some(&((1u64 << 48) | 1024).to_string()), "10240"),
+            channel(Some(&((1u64 << 48) | 1024).to_string()), &locked_deny),
             ScriptedResponse::status(204),
         ],
         ScriptedResponse::status(500),
@@ -1443,7 +1445,7 @@ async fn lockdown_and_unlock_restore_full_masks_and_replay_independently() {
     assert_eq!(wire.len(), 4);
     let written: Value = serde_json::from_slice(&wire[1].body).unwrap();
     assert_eq!(written["allow"], ((1u64 << 48) | 1024).to_string());
-    assert_eq!(written["deny"], "10240");
+    assert_eq!(written["deny"], locked_deny);
     let restored: Value = serde_json::from_slice(&wire[3].body).unwrap();
     assert_eq!(restored["allow"], allow);
     assert_eq!(restored["deny"], deny);

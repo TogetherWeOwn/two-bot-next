@@ -198,6 +198,7 @@ jobs:
           --skip disabled_command_uses_ephemeral_lifecycle_and_other_slices_are_untouched
           --skip shared_router_gates_bounds_and_required_reason_refuse_without_http
           --skip purge_and_slowmode_success_audit_and_replay_without_repeating_effects
+          --skip purge_of_messages_older_than_fourteen_days_deletes_them_singly
           --skip repeated_lockdown_keeps_first_seed_and_unlock_restores_exact_masks
           --skip initially_absent_overwrite_is_deleted_only_after_recorded_lockdown
           --skip unlock_preserves_access_restrictions_added_after_lockdown
