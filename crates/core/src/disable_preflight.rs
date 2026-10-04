@@ -40,12 +40,23 @@ pub const OVERRIDE_FLAG: &str = "--allow-owed";
 /// Counts are always exact; only the listed ids truncate.
 pub const MAX_NAMED_IDS: usize = 10;
 
+/// Where the operator recovery steps for a `running` unban claim live. Named
+/// in the refusal report so the boot log and the CLI point at the same place.
+pub const STRANDED_RUNNING_DOC: &str =
+    "docs/moderation-disable-preflight.md#stranded-running-unban-claims";
+
 /// Releases still owed while a disable is in effect. Ids are request,
 /// channel, or schedule ids only — never reasons, bodies, or user content.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OwedReleases {
-    /// `moderation_scheduled_unbans.request_id` in non-terminal states.
+    /// `moderation_scheduled_unbans.request_id` in non-terminal states,
+    /// `running` claims included.
     pub unbans: Vec<String>,
+    /// The subset of [`Self::unbans`] whose state is `running`: a worker
+    /// dispatched the Discord DELETE and never recorded the outcome. Nothing
+    /// reclaims these by age, so they never drain on their own. Always a
+    /// subset of `unbans`; ids absent from `unbans` are not reported.
+    pub running_unbans: Vec<String>,
     /// `moderation_lockdowns.channel_id` rows still holding recovery state.
     pub lockdowns: Vec<String>,
     /// Enabled `scheduled_messages.id` rows that would stop firing.
@@ -65,23 +76,62 @@ impl OwedReleases {
         self.unbans.len() + self.lockdowns.len() + self.scheduled.len()
     }
 
-    fn section(label: &str, ids: &[String], out: &mut Vec<String>) {
-        if ids.is_empty() {
-            return;
-        }
+    /// `MAX_NAMED_IDS` ids, then `+N more` only when ids were actually cut.
+    fn named_ids(ids: &[String]) -> String {
         let mut named = ids.iter().take(MAX_NAMED_IDS).cloned().collect::<Vec<_>>();
         if ids.len() > MAX_NAMED_IDS {
             named.push(format!("+{} more", ids.len() - MAX_NAMED_IDS));
         }
-        out.push(format!("{} {}: {}", ids.len(), label, named.join(", ")));
+        named.join(", ")
+    }
+
+    fn section(label: &str, ids: &[String], out: &mut Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        out.push(format!("{} {}: {}", ids.len(), label, Self::named_ids(ids)));
+    }
+
+    /// Owed unbans that are not `running`: staged, pending or quarantined.
+    fn unbans_not_running(&self) -> Vec<String> {
+        self.unbans
+            .iter()
+            .filter(|id| !self.running_unbans.contains(id))
+            .cloned()
+            .collect()
+    }
+
+    /// `running` unbans named in [`Self::unbans`], in the same order.
+    fn running_named(&self) -> Vec<String> {
+        self.unbans
+            .iter()
+            .filter(|id| self.running_unbans.contains(id))
+            .cloned()
+            .collect()
     }
 
     /// Single-line refusal detail: exact counts plus outstanding ids.
-    /// Never echoes caller-supplied values beyond the stored ids.
+    /// `running` unbans get their own tagged section so a stranded claim is
+    /// never hidden behind `+N more` of the pending list. Never echoes
+    /// caller-supplied values beyond the stored ids; never names a claim
+    /// token, which fences the close.
     #[must_use]
     pub fn report(&self) -> String {
         let mut sections = Vec::new();
-        Self::section("pending unban(s)", &self.unbans, &mut sections);
+        Self::section(
+            "pending unban(s)",
+            &self.unbans_not_running(),
+            &mut sections,
+        );
+        let running = self.running_named();
+        if !running.is_empty() {
+            sections.push(format!(
+                "{} running unban claim(s) [running]: {} (a claim left by a stopped worker \
+                 never drains on its own, see {STRANDED_RUNNING_DOC})",
+                running.len(),
+                Self::named_ids(&running),
+            ));
+        }
         Self::section("active lockdown(s)", &self.lockdowns, &mut sections);
         Self::section(
             "enabled scheduled message(s)",
@@ -153,7 +203,7 @@ pub async fn outstanding_for_gates(
 ) -> Result<OwedReleases, sqlx::Error> {
     let mut owed = OwedReleases::default();
     if !gates.moderation {
-        owed.unbans = pending_unbans(pool).await?;
+        (owed.unbans, owed.running_unbans) = pending_unbans(pool).await?;
         owed.lockdowns = active_lockdowns(pool).await?;
     }
     if !gates.automations {
@@ -197,25 +247,31 @@ pub async fn boot_check(
     Ok(BootVerdict::Refused(owed))
 }
 
-/// `request_id`s of unban schedules that still owe a release, ordered.
+/// `request_id`s of unban schedules that still owe a release, ordered, plus
+/// the subset in `running`.
 /// Terminal states (`cancelled`, `done`, `superseded`) owe nobody anything;
 /// every other state — `staged`, `pending`, `running`, `quarantined`, or
 /// anything a future migration adds — still owes the member their release.
 /// A missing table reads as empty (see module docs).
 #[cfg(feature = "db")]
-async fn pending_unbans(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
-    let rows: Vec<(String,)> = match sqlx::query_as(
-        "SELECT request_id FROM moderation_scheduled_unbans
+async fn pending_unbans(pool: &PgPool) -> Result<(Vec<String>, Vec<String>), sqlx::Error> {
+    let rows: Vec<(String, String)> = match sqlx::query_as(
+        "SELECT request_id, state FROM moderation_scheduled_unbans
           WHERE state NOT IN ('cancelled', 'done', 'superseded') ORDER BY request_id",
     )
     .fetch_all(pool)
     .await
     {
         Ok(rows) => rows,
-        Err(error) if is_missing_table(&error) => return Ok(Vec::new()),
+        Err(error) if is_missing_table(&error) => return Ok((Vec::new(), Vec::new())),
         Err(error) => return Err(error),
     };
-    Ok(rows.into_iter().map(|(id,)| id).collect())
+    let running = rows
+        .iter()
+        .filter(|(_, state)| state == "running")
+        .map(|(id, _)| id.clone())
+        .collect();
+    Ok((rows.into_iter().map(|(id, _)| id).collect(), running))
 }
 
 /// `channel_id`s still holding lockdown recovery state, ordered.
@@ -280,7 +336,7 @@ mod tests {
         let owed = OwedReleases {
             unbans: vec!["req-b".to_owned(), "req-a".to_owned()],
             lockdowns: vec!["chan-1".to_owned()],
-            scheduled: vec![],
+            ..OwedReleases::default()
         };
         assert!(!owed.is_clear());
         assert_eq!(owed.total(), 3);
@@ -295,13 +351,150 @@ mod tests {
     fn report_truncates_ids_but_keeps_exact_counts() {
         let owed = OwedReleases {
             unbans: (0..13).map(|n| format!("req-{n:02}")).collect(),
-            lockdowns: vec![],
-            scheduled: vec![],
+            ..OwedReleases::default()
         };
         let report = owed.report();
         assert!(report.contains("13 pending unban(s): "));
         assert!(report.contains("+3 more"));
         assert!(!report.contains("req-12"));
+    }
+
+    /// `count` ids named `{prefix}-00`, `{prefix}-01`, ...
+    fn ids(prefix: &str, count: usize) -> Vec<String> {
+        (0..count).map(|n| format!("{prefix}-{n:02}")).collect()
+    }
+
+    /// One `OwedReleases` per section sharing the truncation helper.
+    fn owed_with(section: &str, count: usize) -> OwedReleases {
+        let mut owed = OwedReleases::default();
+        match section {
+            "pending unban(s)" => owed.unbans = ids("id", count),
+            "running unban claim(s) [running]" => {
+                owed.unbans = ids("id", count);
+                owed.running_unbans = ids("id", count);
+            }
+            "active lockdown(s)" => owed.lockdowns = ids("id", count),
+            "enabled scheduled message(s)" => owed.scheduled = ids("id", count),
+            other => panic!("unknown section {other}"),
+        }
+        owed
+    }
+
+    const TRUNCATING_SECTIONS: [&str; 4] = [
+        "pending unban(s)",
+        "running unban claim(s) [running]",
+        "active lockdown(s)",
+        "enabled scheduled message(s)",
+    ];
+
+    #[test]
+    fn exactly_the_limit_names_every_id_and_reports_no_truncation() {
+        for section in TRUNCATING_SECTIONS {
+            let report = owed_with(section, MAX_NAMED_IDS).report();
+            assert!(
+                report.contains(&format!("{MAX_NAMED_IDS} {section}: id-00, id-01")),
+                "{section}: exact count and first ids: {report}"
+            );
+            assert!(
+                report.contains("id-09"),
+                "{section}: the last id at the limit is named: {report}"
+            );
+            assert!(
+                !report.contains("more"),
+                "{section}: nothing was cut at exactly the limit: {report}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_past_the_limit_cuts_one_id_and_keeps_the_exact_count() {
+        for section in TRUNCATING_SECTIONS {
+            let report = owed_with(section, MAX_NAMED_IDS + 1).report();
+            assert!(
+                report.contains(&format!("{} {section}: id-00", MAX_NAMED_IDS + 1)),
+                "{section}: exact count 11: {report}"
+            );
+            assert!(
+                report.contains("id-09, +1 more"),
+                "{section}: first {MAX_NAMED_IDS} named then +1 more: {report}"
+            );
+            assert!(
+                !report.contains("id-10"),
+                "{section}: the eleventh id is the one cut: {report}"
+            );
+        }
+    }
+
+    #[test]
+    fn running_claims_get_their_own_tagged_section_with_the_recovery_pointer() {
+        let owed = OwedReleases {
+            unbans: vec![
+                "req-pending".to_owned(),
+                "req-running".to_owned(),
+                "req-staged".to_owned(),
+            ],
+            running_unbans: vec!["req-running".to_owned()],
+            ..OwedReleases::default()
+        };
+        assert_eq!(owed.total(), 3);
+        let report = owed.report();
+        assert!(
+            report.contains("2 pending unban(s): req-pending, req-staged"),
+            "running id leaves the pending section: {report}"
+        );
+        assert!(
+            report.contains("1 running unban claim(s) [running]: req-running"),
+            "{report}"
+        );
+        assert!(report.contains("never drains on its own"), "{report}");
+        assert!(report.contains(STRANDED_RUNNING_DOC), "{report}");
+        // Exactly one mention per id: the split never double-reports a claim.
+        assert_eq!(report.matches("req-running").count(), 1, "{report}");
+    }
+
+    #[test]
+    fn a_stranded_claim_is_never_hidden_behind_the_pending_truncation() {
+        let mut unbans = ids("req", MAX_NAMED_IDS + 3);
+        unbans.push("req-zz-running".to_owned());
+        let owed = OwedReleases {
+            unbans,
+            running_unbans: vec!["req-zz-running".to_owned()],
+            ..OwedReleases::default()
+        };
+        let report = owed.report();
+        assert!(report.contains("13 pending unban(s)"), "{report}");
+        assert!(report.contains("+3 more"), "{report}");
+        assert!(
+            report.contains("1 running unban claim(s) [running]: req-zz-running"),
+            "the running claim sorts past the cut yet is still named: {report}"
+        );
+    }
+
+    #[test]
+    fn only_running_unbans_refuse_without_a_pending_section() {
+        let owed = OwedReleases {
+            unbans: vec!["req-running".to_owned()],
+            running_unbans: vec!["req-running".to_owned()],
+            ..OwedReleases::default()
+        };
+        assert!(!owed.is_clear());
+        let report = owed.report();
+        assert!(report.starts_with("REFUSED: 1 running unban claim(s) [running]"));
+        assert!(!report.contains("pending unban(s)"), "{report}");
+    }
+
+    #[test]
+    fn pending_only_refusal_carries_no_running_tag_or_recovery_pointer() {
+        let owed = OwedReleases {
+            unbans: vec!["req-pending".to_owned(), "req-staged".to_owned()],
+            lockdowns: vec!["chan-1".to_owned()],
+            ..OwedReleases::default()
+        };
+        let report = owed.report();
+        assert!(report.contains("2 pending unban(s): req-pending, req-staged"));
+        for absent in ["running", "[running]", STRANDED_RUNNING_DOC, "drain"] {
+            assert!(!report.contains(absent), "{absent:?} in {report}");
+        }
     }
 
     #[test]

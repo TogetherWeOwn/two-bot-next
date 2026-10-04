@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use two_bot_core::disable_preflight::{
-    boot_check, outstanding, BootVerdict, DisableGates, OwedReleases,
+    boot_check, outstanding, BootVerdict, DisableGates, OwedReleases, STRANDED_RUNNING_DOC,
 };
 use two_bot_testsupport::TestDatabase;
 
@@ -127,6 +127,7 @@ async fn non_terminal_unban_states_refuse_naming_request_ids() {
         .map(str::to_owned)
         .collect::<Vec<_>>(),
     );
+    assert_eq!(owed.running_unbans, vec!["req-running".to_owned()]);
     let report = owed.report();
     for id in [
         "req-staged",
@@ -142,6 +143,78 @@ async fn non_terminal_unban_states_refuse_naming_request_ids() {
             .expect("checks owed unbans"),
         BootVerdict::Refused(owed),
     );
+    db.close().await.expect("drops fixture database");
+}
+
+#[tokio::test]
+async fn running_unban_left_by_a_stopped_worker_is_tagged_with_the_recovery_pointer() {
+    let Some(db) = fixture().await else { return };
+    // A worker claimed the job, dispatched the DELETE and stopped before it
+    // recorded the outcome: the row keeps `running` and its claim token.
+    seed_unban(db.pool(), "req-stranded", "running").await;
+    sqlx::query(
+        "UPDATE moderation_scheduled_unbans
+            SET claim_token = 'secret-claim-token', claimed_at = '2026-02-01T00:00:00Z'
+          WHERE request_id = 'req-stranded'",
+    )
+    .execute(db.pool())
+    .await
+    .expect("marks the claim as held by a stopped worker");
+    seed_unban(db.pool(), "req-waiting", "pending").await;
+
+    let owed = outstanding(db.pool()).await.expect("reads owed unbans");
+    assert_eq!(
+        owed.unbans,
+        vec!["req-stranded".to_owned(), "req-waiting".to_owned()],
+        "running stays in the existing owed-unban list"
+    );
+    assert_eq!(owed.running_unbans, vec!["req-stranded".to_owned()]);
+    let report = owed.report();
+    assert!(
+        report.contains("1 pending unban(s): req-waiting"),
+        "{report}"
+    );
+    assert!(
+        report.contains("1 running unban claim(s) [running]: req-stranded"),
+        "{report}"
+    );
+    assert!(report.contains("never drains on its own"), "{report}");
+    assert!(report.contains(STRANDED_RUNNING_DOC), "{report}");
+    assert!(
+        !report.contains("secret-claim-token"),
+        "the claim token fences the close and is never reported: {report}"
+    );
+    // The boot guard refuses and carries the same detail.
+    assert_eq!(
+        boot_check(db.pool(), &gates_off(), false)
+            .await
+            .expect("checks the stranded claim"),
+        BootVerdict::Refused(owed),
+    );
+    db.close().await.expect("drops fixture database");
+}
+
+#[tokio::test]
+async fn pending_only_unbans_refuse_without_running_tag_or_recovery_steps() {
+    let Some(db) = fixture().await else { return };
+    for (request, state) in [
+        ("req-staged", "staged"),
+        ("req-pending", "pending"),
+        ("req-quarantined", "quarantined"),
+    ] {
+        seed_unban(db.pool(), request, state).await;
+    }
+    let owed = outstanding(db.pool()).await.expect("reads owed unbans");
+    assert!(owed.running_unbans.is_empty());
+    assert_eq!(owed.unbans.len(), 3);
+    let report = owed.report();
+    assert!(
+        report.starts_with("REFUSED: 3 pending unban(s)"),
+        "{report}"
+    );
+    for absent in ["running", "[running]", STRANDED_RUNNING_DOC] {
+        assert!(!report.contains(absent), "{absent:?} in {report}");
+    }
     db.close().await.expect("drops fixture database");
 }
 

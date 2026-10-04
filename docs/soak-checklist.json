@@ -2899,19 +2899,17 @@
           "[673cd13](https://github.com/TogetherWeOwn/two-bot/commit/673cd13005499ab1289760e81f67f868118c3e0c)",
           "`src/moderation/`",
           "fix(moderation): report truncated only when rows were actually cut (#307)",
-          "gap"
+          "ported"
         ]
       },
       "owner": [
-        "TOG-10869",
-        "TOG-10078"
+        "TOG-15281"
       ],
-      "status": "waived",
-      "action": "Run TOG-10869’s shutdown-preflight fixture with pending rows exactly at and above the report limit.",
-      "expected": "Truncated is reported only when rows were actually cut.",
-      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "automated",
+      "action": "Run the disable-preflight report fixtures in `crates/core/src/disable_preflight.rs` with exactly 10 and exactly 11 owed ids in each of the unban, running-claim, lockdown and scheduled-message sections.",
+      "expected": "Exactly 10 ids are all named with the exact count and no `+N more`; 11 ids name the first 10, end in `+1 more` and keep the exact count 11. Truncation is reported only when ids were actually cut.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with the sanitized report lines for 10 and 11 ids; fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib disable_preflight::tests"
     },
     {
       "id": "s13-df990c9",
@@ -3027,19 +3025,17 @@
           "[cad94b6](https://github.com/TogetherWeOwn/two-bot/commit/cad94b6db5dc21869d9ca9cd112c497a070556ab)",
           "`src/moderation/`",
           "fix(moderation): name stranded running unban claims with hand-release steps (#320)",
-          "gap"
+          "ported"
         ]
       },
       "owner": [
-        "TOG-10869",
-        "TOG-10078"
+        "TOG-15281"
       ],
-      "status": "waived",
-      "action": "Run TOG-10869’s shutdown-preflight fixture with a running unban claim left by a stopped worker.",
-      "expected": "The preflight names each stranded claim with hand-release steps; the executor itself stays TOG-10078.",
-      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "automated",
+      "action": "With `TWO_TEST_DATABASE_URL` set to the disposable agent-testdb or CI service (an unset URL skips the DB cases), run the disable-preflight fixtures: a `running` unban left by a stopped worker, and a pending-only refusal.",
+      "expected": "The refusal and `two-bot moderation preflight [--json]` list the stranded claim in a `[running]` section with the recovery pointer, and add `running_unbans` beside the unchanged `pending_unbans`; a pending-only refusal has neither the tag nor the pointer. Exit codes are unchanged and the claim token is never reported. The close is the documented claim-token-fenced store call; no operator command for it exists.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with the sanitized report lines and `running_unbans` array; fixture proof only, not a deployed-network soak receipt or a recovery rehearsal.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib disable_preflight::tests && python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test disable_preflight_db && python3 scripts/cargo_cache.py run -- test -p two-bot --test moderation_preflight_cli"
     },
     {
       "id": "s13-db84b22",

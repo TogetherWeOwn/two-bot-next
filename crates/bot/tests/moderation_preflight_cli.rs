@@ -174,6 +174,89 @@ async fn json_reports_owed_sections() {
     db.close().await.expect("drops fixture database");
 }
 
+async fn seed_unban(pool: &sqlx::PgPool, request: &str, state: &str) {
+    sqlx::query(
+        "INSERT INTO moderation_scheduled_unbans
+           (request_id, guild_id, user_id, execute_at, reason, state, created_at)
+         VALUES ($1, 'g1', 'u1', '2026-02-01T00:00:00Z', 'tempban', $2, '2026-01-01T00:00:00Z')",
+    )
+    .bind(request)
+    .bind(state)
+    .execute(pool)
+    .await
+    .expect("seeds a scheduled unban");
+}
+
+#[tokio::test]
+async fn stranded_running_unban_is_tagged_in_text_and_json_without_changing_exit_codes() {
+    let Some(db) = migrated().await else { return };
+    seed_unban(db.pool(), "req-cli-stranded", "running").await;
+    seed_unban(db.pool(), "req-cli-waiting", "pending").await;
+    let url = db_url(&db);
+
+    let text = cli(&["moderation", "preflight"], &[("TWO_DATABASE_URL", &url)]).await;
+    assert_eq!(text.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.contains("1 running unban claim(s) [running]: req-cli-stranded"),
+        "{text}"
+    );
+    assert!(
+        text.contains("1 pending unban(s): req-cli-waiting"),
+        "{text}"
+    );
+    assert!(
+        text.contains("docs/moderation-disable-preflight.md#stranded-running-unban-claims"),
+        "{text}"
+    );
+
+    let json = cli(
+        &["moderation", "preflight", "--json"],
+        &[("TWO_DATABASE_URL", &url)],
+    )
+    .await;
+    assert_eq!(json.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).expect("stdout is JSON");
+    assert_eq!(report["schema_version"], 1);
+    // Existing key keeps every owed unban; the new key is the running subset.
+    assert_eq!(
+        report["pending_unbans"],
+        serde_json::json!(["req-cli-stranded", "req-cli-waiting"])
+    );
+    assert_eq!(
+        report["running_unbans"],
+        serde_json::json!(["req-cli-stranded"])
+    );
+
+    let overridden = cli(
+        &["moderation", "preflight", "--allow-owed"],
+        &[("TWO_DATABASE_URL", &url)],
+    )
+    .await;
+    assert_eq!(overridden.status.code(), Some(0));
+    db.close().await.expect("drops fixture database");
+}
+
+#[tokio::test]
+async fn pending_only_cli_refusal_carries_no_running_tag() {
+    let Some(db) = migrated().await else { return };
+    seed_owed(db.pool()).await;
+    let url = db_url(&db);
+    let text = cli(&["moderation", "preflight"], &[("TWO_DATABASE_URL", &url)]).await;
+    assert_eq!(text.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(!text.contains("[running]"), "{text}");
+    assert!(!text.contains("stranded-running-unban-claims"), "{text}");
+    let json = cli(
+        &["moderation", "preflight", "--json"],
+        &[("TWO_DATABASE_URL", &url)],
+    )
+    .await;
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).expect("stdout is JSON");
+    assert_eq!(report["running_unbans"], serde_json::json!([]));
+    db.close().await.expect("drops fixture database");
+}
+
 #[tokio::test]
 async fn unreadable_state_is_unknown_not_refused() {
     // No database is contacted: an invalid URL cannot be confused with owed.
