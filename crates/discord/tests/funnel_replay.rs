@@ -851,6 +851,56 @@ fn pipeline_voice_boundaries_and_reconnect_drop() {
     }));
 }
 
+/// A fresh session (READY after re-identify, not RESUMED) also drops open
+/// voice sessions (legacy 7da2c15): the leave that follows an outage ends
+/// unknown-start instead of spanning the gap. A first connect has nothing to
+/// drop and writes no rows.
+#[test]
+fn pipeline_fresh_session_ready_drops_open_voice_sessions() {
+    let ready = Event::Ready(
+        serde_json::from_value(serde_json::json!({
+            "v": 10,
+            "user": {"id": "999", "username": "mock-bot", "discriminator": "0", "bot": true, "mfa_enabled": false},
+            "session_id": "fresh-session",
+            "resume_gateway_url": "wss://gateway.discord.gg",
+            "guilds": [{"id": GUILD.to_string(), "unavailable": true}],
+            "application": {"id": "1111", "flags": 0}
+        }))
+        .expect("ready fixture"),
+    );
+    let open_sessions = |pipeline: &MemPipeline| {
+        pipeline
+            .handlers()
+            .voice_sessions
+            .lock()
+            .expect("lock")
+            .open_count()
+    };
+
+    let pipeline = MemPipeline::for_replay();
+    pipeline.handle(&ready);
+    assert_eq!(open_sessions(&pipeline), 0, "first READY is a no-op");
+    assert!(pipeline.handlers().store().rows().is_empty());
+
+    pipeline.handle(&voice_event(A, Some(CH_VOICE_A)));
+    assert_eq!(open_sessions(&pipeline), 1);
+    pipeline.handle(&ready);
+    assert_eq!(open_sessions(&pipeline), 0, "READY drops the open session");
+
+    pipeline.handle(&voice_event(A, None));
+    let rows = pipeline.handlers().store().rows();
+    let end = rows
+        .iter()
+        .find(|r| r.event_type == two_bot_core::EventType::VoiceSessionEnd)
+        .expect("leave after READY writes an unknown-start end");
+    let metadata = end.metadata.as_ref().expect("end metadata");
+    assert_eq!(metadata["startKnown"], false);
+    assert!(
+        metadata["durationSeconds"].is_null(),
+        "no duration is invented across the reconnect: {metadata}"
+    );
+}
+
 /// Server leave closes the open voice session first (TOG-6122).
 #[test]
 fn pipeline_leave_closes_voice_first() {
