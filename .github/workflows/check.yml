@@ -528,6 +528,23 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-cutover --test staging_migrate_db --locked -- --ignored
 
+      # Ignored-DB audit: every #[ignore]d store test file is routed to a step
+      # in this job. These three had no step, so they silently never ran. The
+      # doc-regeneration test in reference_docs.rs stays unrouted on purpose:
+      # it rewrites committed files and must only run as an explicit manual
+      # regen, never in CI.
+      - name: invite store atomicity (CI service container only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-cutover --locked --test invite_store -- --ignored
+
+      - name: cutover reward ladder lib regression (CI service container only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-cutover --locked --lib -- --ignored
+
+      - name: sticky live store regressions (CI service container only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-core --features db --locked --test sticky_store_live -- --ignored
+
       - name: channel moderation store clippy
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
