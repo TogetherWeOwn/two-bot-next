@@ -210,8 +210,8 @@ policy; that fence must not be taken from a caller-supplied guild ID.
 | `moderation.warn` | Create reputational/audit consequences for one member | Same policy, trusted actor/target and mandatory reason; no arbitrary text in scalar store audit. | Yes |
 | `moderation.purge` | Irreversibly delete up to 100 messages per intent; repeated intents multiply loss | Same policy with channel authorization; count 1–100, configured guild/channel ownership check. | Yes |
 | `moderation.slowmode` | Restrict a channel for up to six hours or remove its slowmode | Same policy with channel authorization; seconds 0–21,600 and guild/channel fence. | Yes |
-| `moderation.lockdown` | Deny channel participation; repeated intents can silence the guild | Same policy; snapshot/restore precise overwrites, validate channel ownership, do not grant new permissions as a side effect. | Yes |
-| `moderation.unlock` | Restore participation; bad overwrite restoration can widen access | Same policy; only trusted saved overwrite state, not arbitrary caller permission bits; serialize with lockdown. | Yes |
+| `moderation.lockdown` | Deny channel participation; repeated intents can silence the guild | Same policy; change only SEND_MESSAGES, validate channel ownership, refresh recovery seed/generation only when the live send deny is absent; do not grant new permissions as a side effect. | Yes |
+| `moderation.unlock` | Restore participation; bad overwrite restoration can widen access | Same policy; read live masks, restore only recorded SEND_MESSAGES bits, preserve other live bits, refuse send-bit drift; serialize with lockdown. External admin GET/write races are not fenced. | Yes |
 | `event.read` (additional nineteenth) | Disclose one mapped event's status/details | `ALLOW_EVENT_READ`; mapped event and guild ownership checks, minimal response, no arbitrary event enumeration. | No |
 
 The nine moderation actions require **both** `TWO_INTERNAL_ALLOW_MODERATION=1`

@@ -1278,66 +1278,61 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-720419b: 720419b — TOG-5683: voice blind-window reconcile report (count startKnown:false per gap)
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Run TOG-11152’s voice reconcile report on a test-container fixture with startKnown:false sessions across a blind window.
-- **Expected:** Per-gap startKnown:false counts match the fixture; the report writes nothing.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the voice blind-window unit fixtures and the DB-backed `report_cli` scenario (events-write gaps with startKnown:false ends across two blind windows).
+- **Expected:** Per-gap startKnown:false counts match the fixture (2 and 1, one end unattributed); known-start sessions are not counted; the report writes nothing and no `_sqlx_migrations` table appears.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-40e266e: 40e266e — TOG-5683: reconcile heartbeat from events write series, not the contained probe table
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Seed a test-container fixture with an events-write gap and a healthy probe table; run the reconcile report.
-- **Expected:** The heartbeat comes from the events write series, so the gap is reported despite healthy probes.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the DB-backed `report_cli` scenario: an events-write gap with a healthy probe table seeded through it.
+- **Expected:** The heartbeat comes from `events.recorded_at`, so the gap is reported despite healthy probes; a backfilled row (old `occurred_at`) does not close it.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only
 
 ### s13-edaf2dd: edaf2dd — TOG-5684: enforce startKnown:false exclusion from duration averages
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Run the duration averages in TOG-11152’s report on a fixture mixing known and startKnown:false sessions.
-- **Expected:** Averages exclude startKnown:false sessions; those sessions are still counted as unknown.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the duration summary fixtures and the DB-backed `report_cli` scenario mixing known and startKnown:false sessions.
+- **Expected:** `durations` averages known-start sessions only (the unknown start carrying a number is excluded) and counts the excluded unknown starts.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests
 
 ### s13-59965d0: 59965d0 — TOG-5981: serialize same-member voice frames, scope voice idempotency keys by channel
 
 - **Method:** `waived` (not an execution verdict).
-- **Action:** Replay interleaved same-member voice frames across two channels through TOG-11149’s contract suite.
+- **Action:** Replay a same-tick burst of same-member voice frames across two channels through the fixture added by TOG-15277.
 - **Expected:** Frames apply serially per member and idempotency keys are channel-scoped: one session per channel, no cross-channel dedupe.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
-- **Owner:** [TOG-11149](/TOG/issues/TOG-11149)
+- **Owner:** [TOG-15277](/TOG/issues/TOG-15277)
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-7da2c15: 7da2c15 — TOG-6123: drop open voice sessions on fresh session (ShardReady) as well as resume
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** In TOG-11149’s contract suite, open voice sessions and then deliver a fresh ShardReady and a resume.
-- **Expected:** Open sessions are dropped on both fresh session and resume.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the READY and RESUMED reconnect-drop fixtures in `crates/discord/tests/funnel_replay.rs`.
+- **Expected:** Open voice sessions are dropped on both a fresh session (READY) and a resume; a first READY with nothing open writes nothing and the next leave ends unknown-start.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11149](/TOG/issues/TOG-11149)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test funnel_replay -- pipeline_fresh_session_ready_drops_open_voice_sessions pipeline_voice_boundaries_and_reconnect_drop
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-448cf1d: 448cf1d — TOG-6122: close open voice session on server-leave (end to open channel, duration to leave time)
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** In TOG-11149’s contract suite, have a member in voice leave the server.
-- **Expected:** The open session closes on its open channel with duration ending at the leave time.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the server-leave-mid-voice fixtures in `crates/discord/tests/funnel_replay.rs`, `crates/core/src/handlers.rs` and `crates/core/src/voice.rs`.
+- **Expected:** The open session closes on its open channel with duration ending at the leave time; the tracker is emptied and a repeated leave writes no second end row.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11149](/TOG/issues/TOG-11149)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test funnel_replay -- pipeline_leave_closes_voice_first pipeline_voice_move_and_server_leave_share_receipt_boundaries && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib -- handlers::tests::leave_closes_open_session_then_records voice::tests::resolve_measured_and_unknown
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-6928f11: 6928f11 — TOG-6817: guard so backfill gate_cleared never feeds time-to-clear
@@ -1450,10 +1445,10 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s13-673cd13: 673cd13 — fix(moderation): report truncated only when rows were actually cut (#307)
 
 - **Method:** `waived` (not an execution verdict).
-- **Action:** Run TOG-10869’s shutdown-preflight fixture with pending rows exactly at and above the report limit.
-- **Expected:** Truncated is reported only when rows were actually cut.
+- **Action:** Run the disable-guard report fixture with owed ids exactly at and just above the 10-id naming limit (TOG-15281).
+- **Expected:** `+N more` appears only when ids were actually left unnamed; counts stay exact.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
-- **Owner:** [TOG-10869](/TOG/issues/TOG-10869), [TOG-10078](/TOG/issues/TOG-10078)
+- **Owner:** [TOG-15281](/TOG/issues/TOG-15281)
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
@@ -1479,10 +1474,10 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s13-3c3e7e8: 3c3e7e8 — fix(voice): treat malformed leave timestamp as unknown-start (#265)
 
 - **Method:** `waived` (not an execution verdict).
-- **Action:** Deliver a voice leave with a malformed timestamp through TOG-11149’s contract suite.
-- **Expected:** The session is treated as unknown-start, not a fabricated duration.
+- **Action:** Deliver a voice leave with a malformed timestamp, with and without an open session, through the fixture added by TOG-15277.
+- **Expected:** The session is treated as unknown-start, not a fabricated duration, and no leveling XP is awarded.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
-- **Owner:** [TOG-11149](/TOG/issues/TOG-11149)
+- **Owner:** [TOG-15277](/TOG/issues/TOG-15277)
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
@@ -1509,10 +1504,10 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s13-cad94b6: cad94b6 — fix(moderation): name stranded running unban claims with hand-release steps (#320)
 
 - **Method:** `waived` (not an execution verdict).
-- **Action:** Run TOG-10869’s shutdown-preflight fixture with a running unban claim left by a stopped worker.
-- **Expected:** The preflight names each stranded claim with hand-release steps; the executor itself stays TOG-10078.
+- **Action:** Run the disable-guard fixture with a running unban claim left by a stopped worker (TOG-15281).
+- **Expected:** The refusal tags each running claim and gives the supported release steps.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
-- **Owner:** [TOG-10869](/TOG/issues/TOG-10869), [TOG-10078](/TOG/issues/TOG-10078)
+- **Owner:** [TOG-15281](/TOG/issues/TOG-15281)
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
@@ -1703,11 +1698,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-8b5d1e1: 8b5d1e1 — fix(lfg): reject reserved leave-action role keys (#414)
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Attempt to configure an LFG role key equal to the reserved leave action through the normal config path.
-- **Expected:** The key is refused; the leave action keeps working.
-- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the reserved leave-action role-key refusals in `crates/core/tests/lfg_acceptance.rs` and `crates/core/src/lfg.rs`.
+- **Expected:** The reserved `__leave__` key is refused wherever it appears in a role spec and the leave action keeps routing.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-10260](/TOG/issues/TOG-10260)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --test lfg_acceptance && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib -- lfg::tests::role_spec_refuses_reserved_leave_key lfg::tests::select_parsing_routes_signup_and_leave
 
 ### s13-218e469: 218e469 — fix(dump): validate non-table record shapes before declaring a backup verified (#416)
 
@@ -1742,10 +1738,10 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s13-a8d9f53: a8d9f53 — fix(announcements): defer interactions before service I/O (#424)
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Invoke the announcement and LFG commands in the staging guild; take a slow-service leg from a local mock.
+- **Action:** Invoke the LFG commands and select in the staging guild with a slow-service leg from a local mock; invoke /rsvp once TOG-10293 wires it.
 - **Expected:** Each interaction is deferred before service I/O, so no interaction-failed reply appears.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
-- **Owner:** [TOG-10260](/TOG/issues/TOG-10260), [TOG-11022](/TOG/issues/TOG-11022)
+- **Owner:** [TOG-10293](/TOG/issues/TOG-10293)
 
 ### s13-f5edc70: f5edc70 — fix(leveling): show absent members as unranked (#429)
 
@@ -1794,10 +1790,9 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-bffccf3: bffccf3 — fix(events): keep membership projections chronological (#387)
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Deliver out-of-order and same-time join/leave events and a replay through TOG-11149’s contract suite.
-- **Expected:** Membership projections follow event chronology and tie rules, not arrival order; replay is idempotent.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the membership chronology contract in `crates/core/tests/membership_contract.rs` (out-of-order and same-time join/leave events, replay).
+- **Expected:** Membership projections follow event chronology and tie rules, not arrival order; replay is idempotent. Store contract only; the Postgres run is the `--ignored` step in the check workflow.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-11149](/TOG/issues/TOG-11149)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --test membership_contract

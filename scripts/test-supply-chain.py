@@ -158,12 +158,19 @@ class SupplyChainTests(unittest.TestCase):
                 if not action.startswith("./"):
                     self.assertRegex(action, r"@[0-9a-f]{40}$", f"Unpinned action in {path}: {action}")
 
+    def test_all_workflow_container_and_service_images_are_digest_pinned(self):
+        # Dependabot's docker ecosystem scans Dockerfiles only, so a floating
+        # tag in a workflow container/service would never be bumped or noticed.
+        for path in (ROOT / ".github/workflows").glob("*.yml"):
+            for image in re.findall(r"^[ \t]+image:[ \t]+(\S+)", path.read_text(), re.MULTILINE):
+                self.assertRegex(image, r"@sha256:[0-9a-f]{64}$", f"Unpinned image in {path}: {image}")
+
     def test_base_images_are_digest_pinned_and_dependabot_tracks_docker(self):
         images = re.findall(r"^FROM (\S+)", (ROOT / "Dockerfile").read_text(), re.MULTILINE)
         self.assertEqual(len(images), 2)
         for image in images:
             self.assertRegex(image, r"@sha256:[0-9a-f]{64}$")
-        self.assertTrue(images[0].startswith("rust:1.94-trixie@"))
+        self.assertTrue(images[0].startswith("rust:1.98-trixie@"))
         self.assertTrue(images[1].startswith("gcr.io/distroless/cc-debian13:nonroot@"))
         self.assertIn("package-ecosystem: docker", (ROOT / ".github/dependabot.yml").read_text())
 
