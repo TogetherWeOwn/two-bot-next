@@ -782,9 +782,15 @@ async fn refused_creation_plan_records_a_failure_before_any_channel_is_created()
     dispatch(&mut worker, 0).await;
     assert_eq!(
         worker.failures().back(),
-        Some(&LifecycleFailure::Discord {
+        Some(&LifecycleFailure::MissingPermission {
+            write: RefusedWrite::Create,
             channel_id: CREATOR,
-            error: RoomHttpError::AccessDenied,
+            findings: vec![PermissionFinding {
+                permission: VoicePermission::ManageChannels,
+                scope: VoicePermissionScope::Guild,
+                category_id: None,
+                channel_id: None,
+            }],
         })
     );
     assert!(worker.creations.is_empty());
@@ -808,13 +814,14 @@ async fn refused_creation_plan_records_a_failure_before_any_channel_is_created()
         .roles = vec![role(permissions() & !Permissions::MANAGE_ROLES)];
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
-    assert_eq!(
+    assert!(matches!(
         worker.failures().back(),
-        Some(&LifecycleFailure::Discord {
+        Some(LifecycleFailure::MissingPermission {
+            write: RefusedWrite::Create,
             channel_id: CREATOR,
-            error: RoomHttpError::AccessDenied,
+            ..
         })
-    );
+    ));
     assert!(worker.creations.is_empty());
     assert!(worker.tracked().is_empty());
     assert!(!worker.dispatch_one(1).await);
