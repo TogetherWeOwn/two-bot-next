@@ -826,6 +826,32 @@ impl RoomHttp {
             .map_err(|_| RoomHttpError::RenameDeferred)??;
         Ok(())
     }
+
+    /// V3 `/limit` and `/unlimit`: set one room channel's user limit (`0` is
+    /// unlimited). Discord accepts `0..=99`; anything larger is refused before
+    /// the request is built. The write is idempotent, so a retry after an
+    /// unknown outcome is safe.
+    pub async fn set_room_user_limit(
+        &self,
+        channel_id: Snowflake,
+        user_limit: u32,
+        still_valid: impl Fn() -> bool + Send + 'static,
+    ) -> Result<(), RoomHttpError> {
+        let Ok(user_limit) = u16::try_from(user_limit) else {
+            return Err(RoomHttpError::InvalidRequest);
+        };
+        if channel_id == 0 || user_limit > 99 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let request = self
+            .http
+            .update_channel(Id::new(channel_id))
+            .user_limit(user_limit)
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        self.send(request, still_valid).await?;
+        Ok(())
+    }
 }
 
 fn classify_http_error(error: twilight_http::Error) -> RoomHttpError {

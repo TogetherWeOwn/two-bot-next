@@ -36,7 +36,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
 | `two_bot_voice_operations_total{op,outcome}` | Finished room create/move/delete outcomes; `op` is `create`, `move` or `delete`, `outcome` is `success`, `category_full`, `discord`, `persistence` or `cancelled`; retries and 429 backoffs are not outcomes |
 | `two_bot_voice_reconcile_actions_total{action}` | Reconcile plan sizes; `action` is `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued` |
-| `two_bot_voice_dead_letters_total{action}` | Queue writes that exhausted `QUEUE_MAX_ATTEMPTS` (10); `action` is `create`, `move`, `delete`, `companion`, `ownership`, `kick`, `rename` or `other` |
+| `two_bot_voice_dead_letters_total{action}` | Queue writes that exhausted `QUEUE_MAX_ATTEMPTS` (10); `action` is `create`, `move`, `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other` |
 | `two_bot_voice_tracked_rooms` | Rooms tracked in memory; compare with live Discord channels for ghosts |
 | `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
@@ -140,7 +140,7 @@ as dynamic labels.
 - `two_bot_voice_reconcile_actions_total{action}` — `action` is
   `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued`.
 - `two_bot_voice_dead_letters_total{action}` — `action` is `create`, `move`,
-  `delete`, `companion`, `ownership`, `kick`, `rename` or `other`.
+  `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other`.
 - `two_bot_db_errors_total{op}` — `op` is `admission` or `other`. Recorded
   by `Metrics::db_error`; currently only send-admission SQL
   (admit/extend/complete storage failures) reports, so `other` stays zero
