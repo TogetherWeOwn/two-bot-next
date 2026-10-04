@@ -41,6 +41,8 @@ mod join_risk_runtime_tests;
 mod lifecycle_tests;
 mod metrics_http;
 mod moderation_cli;
+#[cfg(test)]
+mod observability_event_conformance_tests;
 mod onboarding;
 #[cfg(test)]
 mod onboarding_tests;
