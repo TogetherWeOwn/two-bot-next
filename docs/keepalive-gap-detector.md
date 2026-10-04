@@ -98,18 +98,34 @@ No deployed reader, scrape job or target name is created by this spec.
 For a manual watch, use the same metric contract and adjacent observations
 in §4; fetching only two window-edge files cannot prove consecutive coverage.
 
-Prometheus ranges are left-open/right-closed. The one-second padding below
-includes the baseline at the exact 120/300-second boundary. Minimum sample
-counts and explicit reset predicates reject incomplete fixed-cadence ranges
-and observed counter resets, which `increase()` otherwise adjusts away.
-They **do not** establish readiness, process continuity or evenly spaced
-coverage: inspect the stored timestamps and apply every §2 gate. With jitter
-or a different cadence, a template may omit a boundary or retain earlier
-activity; adjudicate the complete adjacent-observation record, not an empty
-query result. A result is a screening hit, **not** an automatic page; no result
-is not a claim of health.
+**Required evaluation alignment:** evaluate each template as an instant query
+at a completed scrape's **stored timestamp**, after all four current samples
+are present at that same timestamp. Do not use the dashboard's wall-clock
+"now" or assume a 60-second evaluation step shares the scrape phase. A reader
+that cannot select or verify this timestamp has **unknown/unsupported query
+coverage**; use the complete manual adjacent-observation path in §4 instead.
+Do not change a scrape job or dashboard to satisfy this offline proposal.
 
-Five-minute screening shape (six observations, five quiet intervals):
+Prometheus ranges are left-open/right-closed. At that aligned evaluation time,
+the one-second padding below includes the baseline at the exact 120/300-second
+boundary. For scrapes at `t=0,60,120,...`, `[5m1s]` at `t=300` selects
+`(-1,300]` and includes six observations. At `t=330` it selects `(29,330]`
+and includes only five; `[2m1s]` at `t=150` similarly includes only two.
+Even exactly one second after the scrape, the baseline is the excluded left
+endpoint. Complete 60-second scrapes can therefore produce empty screens
+indefinitely at an off-phase evaluation; that is not evidence of ACK activity.
+
+Minimum sample counts and explicit reset predicates reject incomplete aligned
+ranges and observed counter resets, which `increase()` otherwise adjusts away.
+They **do not** establish readiness, process continuity or evenly spaced
+coverage: inspect the stored timestamps and apply every §2 gate. With unknown
+alignment, jitter or a different cadence, a template may omit a boundary or
+retain earlier activity; adjudicate the complete adjacent-observation record,
+not an empty query result. A result is a screening hit, **not** an automatic
+page; no result is not a claim of health.
+
+Five-minute scrape-aligned screening shape (six observations, five quiet
+intervals):
 
 ```promql
 sum(increase(two_bot_gateway_events_total{event="HEARTBEAT_ACK"}[5m1s])) == 0
@@ -126,8 +142,9 @@ sum(increase(two_bot_gateway_events_total{event="HEARTBEAT_ACK"}[5m1s])) == 0
   and min(count_over_time(two_bot_gateway_events_total{event="READY"}[5m1s])) >= 6
 ```
 
-Two-minute screening shape (three observations, two quiet intervals), with
-identical recovery/reset/coverage gates:
+Two-minute scrape-aligned screening shape (three observations, two quiet
+intervals), with the same stored-timestamp requirement and
+recovery/reset/coverage gates:
 
 ```promql
 sum(increase(two_bot_gateway_events_total{event="HEARTBEAT_ACK"}[2m1s])) == 0
@@ -173,6 +190,8 @@ revision), record an initial observation alongside the
 - latency value (NaN means no current RTT measurement, not no HELLO/ACK);
 - gateway readiness and positive session evidence, or explicitly unknown;
 - observation cadence and DO keepalive cadence **separately**;
+- if a query screen is used, its evaluation timestamp and the matching four
+  stored sample timestamps, or query coverage unknown with the manual path used;
 - metric/log evidence pointers; tick liveness unknown unless positively shown.
 
 Preserve T0 for audit context only. Each later observation compares against
@@ -220,9 +239,13 @@ link its runbook section and update this spec in the same reviewed PR.
 
 The review evidence carries reproducible synthetic `promtool test rules`
 fixtures for all three literal query blocks, plus offline cases for the manual
-eligibility/baseline gates. They use no live scrape, Prometheus server, database,
-staging or production system. Syntax/fixture evaluation is not evidence that a
-live reader, target, cadence, eligibility integration or tick signal exists.
+eligibility/baseline gates. Alignment cases cover both thresholds at offsets
+0, 1, 2, 30 and 59 seconds across consecutive cycles: aligned complete quiet
+windows screen positive; tested off-phase windows return empty and require
+manual adjudication, not a healthy classification. They use no live scrape,
+Prometheus server, database, staging or production system. Syntax/fixture
+evaluation is not evidence that a live reader, target, cadence, eligibility
+integration or tick signal exists.
 See the PR verification section for the exact validator version and results.
 
 - Metric semantics: `crates/bot/src/gateway_metrics.rs`,
