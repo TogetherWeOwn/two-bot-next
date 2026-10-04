@@ -325,7 +325,9 @@ impl CommandRuntime {
     /// boot-composed service shared with the recovery job; only its presence
     /// opens the self-role router surface. `member` is the boot-composed
     /// member-moderation consumer shared with the unban sweep; only its
-    /// presence opens the five member verbs.
+    /// presence opens the five member verbs. `voice_live` is whether the voice
+    /// sink actually built (not just `TWO_VOICE=1`): the voice commands publish
+    /// only while something is there to answer them.
     #[must_use]
     pub fn from_env(
         pool: Pool<Postgres>,
@@ -335,6 +337,7 @@ impl CommandRuntime {
         onboarding: two_bot_core::OnboardingGates,
         member: Option<Arc<MemberRuntime>>,
         activation: &BootActivation,
+        voice_live: bool,
     ) -> Option<Arc<Self>> {
         let features = match FeatureGates::from_env() {
             Ok(features) => features,
@@ -369,6 +372,9 @@ impl CommandRuntime {
             &moderation,
             SurfaceFlags {
                 scorecard: std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|value| value == "1"),
+                voice: voice_live,
+                voice_assistant: two_bot_core::voice_assistant::AssistantConfig::from_env()
+                    .is_some(),
                 session_picker: onboarding.mode == two_bot_core::OnboardingMode::Session,
                 tickets: ticket_config.is_some(),
                 self_roles: self_roles.is_some(),
@@ -713,6 +719,8 @@ impl CommandRuntime {
             automations: false,
             announcements: false,
             moderation: false,
+            voice: false,
+            voice_assistant: false,
             self_roles: false,
             onboarding_picker: false,
             session_picker: false,
