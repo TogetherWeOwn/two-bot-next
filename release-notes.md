@@ -1,16 +1,52 @@
 :robot: I have created a release *beep* *boop*
 
-## Summary
+## Thinking Path
 
-Publish the next synchronized Rust workspace release through release-please.
+> - two-bot-next is the Together We Own Discord bot, written in Rust, running as one always-on container.
+> - Its workspace ships as one synchronized release with one root changelog and tag.
+> - Version 0.3.0 must carry the generated changes and the preserved bootstrap notes.
+> - The release description also needs the repository's seven completed PR sections without changing native note parsing.
+> - This pull request updates release metadata; it does not authorize production cutover.
 
-## Changes
+## Linked Issues or Issue Description
 
-Update the release manifest, Cargo versions and lockfile, and preserve generated and bootstrap changelog notes.
+- Publish the synchronized 0.3.0 workspace release, replacing 0.2.0 metadata and preserving all release and bootstrap notes. Repair the missing PR-template sections in the canonical overflow document without replacing its native link.
 
-## Testing
+## What Changed
 
-Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publication.cjs`, `python3 scripts/test-release-retry.py` and `python3 scripts/test-pr-lint.py`. Required checks are dispatched on this PR head; their green results and independent review are mandatory before merge.
+- Update the root release manifest, seven package versions and local dependency pins, Cargo.lock, and CHANGELOG.md through release-please.
+- Complete the seven PR sections before the first native notes delimiter. Keep the generated release-note region and overflow link unchanged.
+- Credit release-please automation and the repository contributors whose changes appear in the notes below.
+
+## Verification
+
+- `node scripts/test-release-publication.cjs` with release-please 17.6.0: passed the offline native publication and misplaced-template negative control.
+- `node verify-release-metadata.cjs` with release-please 17.6.0: verified byte-identical notes, one v0.3.0 native payload, and unchanged publication through the overflow representation.
+- Strict local PR-standards validation passed all seven sections without the generated-branch exemption.
+- Regenerated head `b80d30f928cd1a4e4d894440e0191790a299f98b`: [check dispatch](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/37196605796) is still running; [supply-chain dispatch](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/37196607309) passed. The reviewer must verify all required exact-head PR-event gates before approval. Older green heads do not satisfy this gate. This repair changes only notes-branch metadata.
+- No local Rust suite, staging E2E, or production tests ran in this metadata-only repair. Independent review and publication verification remain pending.
+
+## Risks
+
+- Pre-1.0 release publication is not production deployment or cutover approval.
+- Changing native delimiter placement could empty the release payload; the offline parser and publication comparison protect against that regression.
+- Keep the native overflow link and all stored notes. A later regeneration must repeat the seven-section validation before review.
+
+## Model Used
+
+- OpenAI `gpt-6.1-sol` repaired the release description and checked its preservation. release-please 17.6.0 generated the versions and release notes; the historical implementation remains credited to its contributors.
+
+## Checklist
+
+- [x] I wrote a thinking path that runs from the project to this change
+- [x] I named the model used, with its version
+- [ ] I searched for duplicate or related PRs and linked them above (not required for this generated chore release)
+- [x] I ran the relevant offline metadata and publication tests locally and they pass (no local Rust suite)
+- [ ] I added or updated repository tests where applicable (this repair changes canonical metadata only)
+- [x] I updated the release description this change touches
+- [x] No secret, token or credential is in the diff, the title, the body or the branch name
+- [x] No internal ticket id, instance link or private host is in the title, body, commits or branch name
+- [ ] CI is green on the regenerated exact head before approval (full check is pending; review handoff is conditional)
 ---
 
 
