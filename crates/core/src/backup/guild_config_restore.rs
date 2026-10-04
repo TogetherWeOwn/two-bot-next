@@ -264,10 +264,10 @@ fn validate_input_shape(input: &Map<String, Value>, label: &str) -> Result<(), R
                 }
             }
             if collection == "channels" {
-                if !row
+                if row
                     .get("type")
                     .and_then(Value::as_i64)
-                    .is_some_and(|t| t >= 0)
+                    .is_none_or(|t| t < 0)
                 {
                     return Err(shape_error(
                         &format!("{path}.type"),
