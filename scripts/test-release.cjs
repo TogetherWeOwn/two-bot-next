@@ -142,7 +142,8 @@ async function simulate(snapshot, {message, file, tagged, bootstrap}) {
   const version = assertSynchronizedSnapshot(content);
   assert.notEqual(version, seed, 'Native release must advance the input snapshot version');
   assert(latestNotes.includes(version));
-  assert(body.includes('Refs: TOG-9865'));
+  assert(!/\b(TOG|PAP)-\d+\b/.test(body), 'Generated release PR body must carry no internal tracker ID');
+  assert(!body.includes('Refs:'), 'Generated release PR body must carry no footer trailer');
   if (message.startsWith('feat')) assert(latestNotes.includes('### Added'));
   if (/^(fix|security)/.test(message)) assert(latestNotes.includes('### Fixed'));
   state.merged = [{
@@ -346,7 +347,7 @@ async function overflowLifecycle() {
     assert.equal(migrated.changelog.split(note).length - 1, 1, 'Overflow changelog must preserve each RSVP note once');
     assert.equal(migrated.body.split(note).length - 1, 1, 'Overflow stored notes must preserve each RSVP note once');
   }
-  assert(migrated.body.includes('Refs: TOG-9865'));
+  assert(!/\b(TOG|PAP)-\d+\b/.test(migrated.body), 'Overflow release PR body must carry no internal tracker ID');
   console.log(`PASS overflow lifecycle: 490 commits, ${fullBody.length}-char native body, stored-notes migration idempotent`);
 }
 
