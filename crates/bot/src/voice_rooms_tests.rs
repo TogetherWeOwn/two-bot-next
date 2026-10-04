@@ -811,6 +811,44 @@ async fn failed_rollback_keeps_the_room_tracked_until_a_later_sweep_removes_it()
     assert!(!worker.deletes.contains(&500));
 }
 
+/// Pending acceptance for the durable half of "retain provenance after a
+/// failed rollback": the exact channel must outlive the worker that created
+/// it. Today the failed persist writes nothing, so the only record is the
+/// creating worker's in-memory `rooms`/`compensation`, and a worker rebuilt
+/// from persisted state cannot rediscover the channel. Run it with
+/// `--ignored` to see the gap; enable it, unedited, once a durable witness
+/// exists. The parity row for the legacy rollback commit stays `carded` until
+/// then.
+#[tokio::test]
+#[ignore = "pending: no durable witness survives a failed persist plus a refused rollback"]
+async fn a_restarted_worker_rediscovers_a_channel_whose_rollback_failed() {
+    let (live, mut store, http, _) = fixture();
+    store.persist_error = Some(StoreError::Unavailable);
+    http.delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert!(worker.tracked().contains_key(&500), "same-worker retention");
+
+    // Restart: a fresh worker, store connection and live snapshot built only
+    // from what the first worker's store persisted. Nothing in memory crosses.
+    let (live, fresh_store, http, _) = fixture();
+    live.publish(snapshot(&[500], vec![]));
+    *fresh_store.rooms.lock().unwrap() = worker.store.rooms.lock().unwrap().clone();
+    drop(worker);
+    let restarted = GuildRoomWorker::load(live, fresh_store, http)
+        .await
+        .unwrap();
+    assert!(
+        restarted.tracked().contains_key(&500) || restarted.compensation.contains(&500),
+        "the channel whose rollback failed must be rediscoverable after a restart"
+    );
+}
+
 #[tokio::test]
 async fn voice_change_during_persistence_compensates_instead_of_moving() {
     let (live, mut store, http, trace) = fixture();
