@@ -1,183 +1,242 @@
 # Keepalive-gap detector spec (offline, doc-only)
 
-Status: offline draft. This file installs no monitor, adds no alert rule,
-sets no threshold, changes no scrape job, dashboard, webhook, or secret,
-and touches no staging or production system. It specifies the
-missed-heartbeat threshold sketch, one copy-paste dashboard query pack for
-gateway keepalive gaps, the `T_0` owner, and the ack step. When this file
-and a live rule disagree, the live rule wins and this file is the one to
-fix.
+Status: offline proposal. This file installs no monitor, sets no live
+threshold, and changes no alert, dashboard, scrape job, webhook, or secret.
+The query examples are dashboard input, not deployed rules or permission to
+query a live system. Existing cutover, read-access and paging gates still
+apply; this proposal does not override their budgets or thresholds.
 
 Scope: the single always-on container's Discord gateway heartbeat path
-(opcode 10 HELLO interval, opcode 1 heartbeats, opcode 11 ACKs) as observed
-through the already-shipped series, plus the Container keepalive tick that
-samples them. Out of scope: wiring a new alert rule, paging tests,
-scrape-job changes, log-catalog extraction, reconnect tuning.
+(opcode 10 HELLO, opcode 1 heartbeat, opcode 11 ACK), using the already-shipped
+metrics. The Container Durable Object (DO) keepalive tick is a separate
+observer. No new telemetry, paging test or reconnect tuning belongs here.
 
-## 1. The two gaps (do not conflate them)
+## 1. Separate the three observations
 
-| # | Gap | What stalls | Observed through | Covered today by |
-| --- | --- | --- | --- | --- |
-| G1 | Gateway heartbeat-ACK gap | Discord opcode-11 ACKs stop arriving while the shard loop claims to be connected (zombie connection, stalled reception task) | `two_bot_gateway_events_total{event="HEARTBEAT_ACK"}` stops increasing; `two_bot_gateway_latency_seconds` goes stale | Nothing pages on this; disconnect/missed-event counters cover transport loss, not a silent-but-connected shard |
-| G2 | Keepalive-sample gap | The Container DO tick itself stops sampling (Worker down, alarm lost, `container_keepalive_arm_failed`) | No new keepalive samples at all: no alert/recovery lines, no metric deltas | `container_keepalive_arm_failed` log + the external uptime check ([watch-external-uptime](watch-external-uptime.md)) |
-
-This spec's threshold sketch is for **G1**. G2 reuses the existing
-monitoring-outage path; §4 gives only the dashboard staleness query that
-tells the two apart.
-
-Background cadence: Discord's HELLO carries the heartbeat interval
-(typically ~41.25 s), so a healthy shard completes roughly 1.4 ACKs per
-60 s keepalive sample. Expecting at least one new ACK per sample is the
-normal case, not a tight bound: interval jitter, an in-flight heartbeat
-at the sample edge, and a clean reconnect all legitimately produce a
-single quiet sample.
-
-## 2. Missed-heartbeat threshold sketch (not a threshold)
-
-Read the ACK counter together with the session-recovery series from the
-[query pack](watch-signal-queries.md#8-gateway-disconnects-and-missed-events):
-`two_bot_gateway_reconnects_total` (new HELLOs),
-`two_bot_gateway_resumes_total` (accepted RESUMEs), and
-`two_bot_gateway_events_total{event="READY"}` (fresh IDENTIFYs). A quiet
-ACK counter next to rising reconnects is transport loss in progress
-(§8 owns it); a quiet ACK counter next to flat reconnects is the zombie
-this spec describes.
-
-| Level | Condition (consecutive keepalive samples, default 60 s cadence) | Action |
+| Observation | Existing evidence | What it cannot prove |
 | --- | --- | --- |
-| Watch | 0 new `HEARTBEAT_ACK`s across 2 consecutive samples (~2 min, ~3 missed beats), session-recovery series flat | Watcher on shift records a §5 finding (record-and-watch); keep watching |
-| Page candidate | 0 new `HEARTBEAT_ACK`s across 5 consecutive samples (~5 min, ~7 missed beats), session-recovery series flat, gateway component not `down`/parked | On-call operator investigates per §6; pages like any other sustained outage signal |
+| G1: gateway ACK inactivity | Adjacent `two_bot_gateway_events_total{event="HEARTBEAT_ACK"}` counter values, with recovery and eligibility checks below | A flat counter alone does not prove a connected zombie; startup, recovery, a parked gateway or a restart can also be quiet |
+| Scrape availability | Timestamp of a stored `/ops/metrics` scrape; missing series or failed scrape recorded separately | Scrape time is not the last ACK time and is not a keepalive-tick receipt |
+| G2: DO keepalive-tick liveness | A positive, time-bounded tick observation or the existing `container_keepalive_arm_failed` failure signal | Healthy ticks need not emit alert/recovery lines; silence in those logs does not prove a dead tick |
 
-Exclusions (a sample meeting these never extends the streak):
+`/ops/metrics` fetches the Rust process directly, independently of the
+DO's saved readiness observation. The DO persists `lastProbeAt` privately;
+the current public metrics/readiness contract exposes no last-tick timestamp.
+Consequently these queries **cannot establish G2 liveness or distinguish
+G1 from G2**. External uptime measures HTTP availability, not tick execution.
+Record tick liveness as **unknown** without independent positive evidence;
+use the existing monitoring-outage path for an arm failure. Do not add a
+metric or live monitor as a workaround in this doc-only change.
 
-- Pre-first-HELLO: `two_bot_gateway_latency_seconds` is `NaN` and the ACK
-  counter has never left zero since process start (no heartbeat negotiated
-  yet, not a gap).
-- Parked prerequisites: `/readyz` gateway is `down` with the
-  `gateway prerequisites missing` line (no shard running, not a zombie).
-- Process restart: any `/metrics` counter dropped to zero between the two
-  scrapes (counters reset on restart) — re-baseline both scrapes, restart
-  the streak.
-- Clean reconnect in progress: reconnects, RESUMEs, or READYs rose in the
-  same window (transport owned by §8, not this spec).
+The gateway interval comes from Discord's HELLO, not `KEEPALIVE_SECONDS`.
+The default DO cadence is 60 seconds; it is not the gateway heartbeat
+cadence and does not timestamp these independent scrapes. An illustrative
+41.25-second HELLO interval would mean approximately 3 missed ACK opportunities
+in 120 seconds and 7 in 300 seconds. Those are estimates, not measured beat
+counts or a hard-coded Discord interval.
 
-## 3. Dashboard queries (read-only)
+## 2. Proposed thresholds and mandatory eligibility
 
-Same scrape method as the query pack: the operator supplies the Worker
-URL and the already-provisioned scrape token (never in a PR or log),
-fetches `${WORKER_URL}/ops/metrics` into two files at the window edges,
-and diffs the counters. PromQL below assumes a Prometheus-compatible
-reader over those scrapes; with no server, compare the two files by hand.
-Never run these against staging or production databases; they read metric
-scrapes only. Series contract: [metrics](metrics.md).
+Thresholds count **quiet observation intervals**, not samples or DO ticks.
+At a fixed 60-second scrape cadence, two intervals require three observations
+spanning 120 seconds; five require six observations spanning 300 seconds.
+Each interval compares its two adjacent observations in the same process
+and session epoch. The thresholds are not live alert rules.
 
-G1 gap detector — zero new heartbeat ACKs over 5 minutes with no
-concurrent session recovery (the page-candidate shape):
+| Level | Condition | Action |
+| --- | --- | --- |
+| Watch | Two consecutive eligible quiet intervals spanning at least 120 seconds | Watcher records one finding with disposition record-and-watch |
+| Page candidate | Five consecutive eligible quiet intervals spanning at least 300 seconds | Watcher hands the finding to the on-call operator for investigation and the existing paging path, if applicable; this proposal sends no page |
+
+Before either level is classified, require **all** of the following:
+
+1. Successful, timestamped observations on the declared scrape schedule,
+   with all four counters present: ACK, reconnect, RESUME and READY. Missing,
+   stale, invalid or skipped observations are **unknown**, never zero activity.
+   A missed scheduled observation breaks the streak; do not bridge it with
+   a later scrape. Record the actual elapsed span, not just a sample count.
+2. Positive session evidence for the watched process/revision (for example,
+   its READY/RESUMED event and current `/readyz` gateway `ready`), and gateway
+   `ready` at each observation. Gateway `down` with prerequisites missing is
+   parked/ineligible; `starting`, failed dials or active recovery belong to
+   [session investigation](watch-signal-queries.md#8-gateway-disconnects-and-missed-events).
+3. No process/revision boundary and no observed cumulative-counter decrease
+   between adjacent observations. **Any decrease**, including 100 to 2, is
+   reset evidence: discard the streak and re-baseline all counters. Absence
+   of a decrease does not prove continuity: a restarted counter can catch
+   up before the next scrape. Cross-check revision and positive process/startup
+   evidence from the existing operator record. No process-start/uptime metric
+   is emitted; revision alone cannot distinguish a same-revision restart.
+   If continuity cannot be established, classify as unknown.
+4. No increase in reconnect, RESUME or READY across any interval. These three
+   gates apply to **both** watch and page-candidate levels. A rise resets the
+   streak and routes the finding to the existing session-recovery path.
+   Reconnects count later successful HELLOs, not failed dial attempts; flat
+   recovery counters alone are not evidence of a connected session.
+
+With eligibility satisfied, ACK delta zero extends the streak; ACK delta
+positive clears it. NaN latency and zero ACKs do **not** establish
+pre-HELLO: HELLO/READY does not initialize latency; an ACK without an RTT
+measurement can leave NaN, and later HELLOs clear the previous RTT.
+A positively established ready session that never receives its first ACK
+is eligible and can reach these thresholds. Without positive session
+evidence, record startup/session **unknown**, clear the streak and hand the
+finding to the operator at the next watch checkpoint; never label it healthy
+or silently exclude it forever.
+
+For a non-60-second observation schedule, record the cadence and require
+complete adjacent coverage over the same 120/300-second spans. Do not reuse
+the query templates' three/six-sample guards as if they were cadence-neutral.
+
+## 3. Dashboard query templates (read-only, not a complete detector)
+
+These examples assume a Prometheus-compatible reader scoped to **exactly one
+watched target/process**, with the four series sampled together every 60
+seconds. Select the correct target in that reader before use; summing across
+revisions, staging targets or multiple processes can hide gaps and resets.
+No deployed reader, scrape job or target name is created by this spec.
+For a manual watch, use the same metric contract and adjacent observations
+in §4; fetching only two window-edge files cannot prove consecutive coverage.
+
+Prometheus ranges are left-open/right-closed. The one-second padding below
+includes the baseline at the exact 120/300-second boundary. Minimum sample
+counts and explicit reset predicates reject incomplete fixed-cadence ranges
+and observed counter resets, which `increase()` otherwise adjusts away.
+They **do not** establish readiness, process continuity or evenly spaced
+coverage: inspect the stored timestamps and apply every §2 gate. With jitter
+or a different cadence, a template may omit a boundary or retain earlier
+activity; adjudicate the complete adjacent-observation record, not an empty
+query result. A result is a screening hit, **not** an automatic page; no result
+is not a claim of health.
+
+Five-minute screening shape (six observations, five quiet intervals):
 
 ```promql
-sum(increase(two_bot_gateway_events_total{event="HEARTBEAT_ACK"}[5m])) == 0
-  and sum(increase(two_bot_gateway_reconnects_total[5m])) == 0
-  and sum(increase(two_bot_gateway_resumes_total[5m])) == 0
-  and sum(increase(two_bot_gateway_events_total{event="READY"}[5m])) == 0
+sum(increase(two_bot_gateway_events_total{event="HEARTBEAT_ACK"}[5m1s])) == 0
+  and sum(increase(two_bot_gateway_reconnects_total[5m1s])) == 0
+  and sum(increase(two_bot_gateway_resumes_total[5m1s])) == 0
+  and sum(increase(two_bot_gateway_events_total{event="READY"}[5m1s])) == 0
+  and sum(resets(two_bot_gateway_events_total{event="HEARTBEAT_ACK"}[5m1s])) == 0
+  and sum(resets(two_bot_gateway_reconnects_total[5m1s])) == 0
+  and sum(resets(two_bot_gateway_resumes_total[5m1s])) == 0
+  and sum(resets(two_bot_gateway_events_total{event="READY"}[5m1s])) == 0
+  and min(count_over_time(two_bot_gateway_events_total{event="HEARTBEAT_ACK"}[5m1s])) >= 6
+  and min(count_over_time(two_bot_gateway_reconnects_total[5m1s])) >= 6
+  and min(count_over_time(two_bot_gateway_resumes_total[5m1s])) >= 6
+  and min(count_over_time(two_bot_gateway_events_total{event="READY"}[5m1s])) >= 6
 ```
 
-G1 early-watch shape — same test over 2 minutes:
+Two-minute screening shape (three observations, two quiet intervals), with
+identical recovery/reset/coverage gates:
 
 ```promql
-sum(increase(two_bot_gateway_events_total{event="HEARTBEAT_ACK"}[2m])) == 0
-  and sum(increase(two_bot_gateway_reconnects_total[2m])) == 0
-  and sum(increase(two_bot_gateway_resumes_total[2m])) == 0
+sum(increase(two_bot_gateway_events_total{event="HEARTBEAT_ACK"}[2m1s])) == 0
+  and sum(increase(two_bot_gateway_reconnects_total[2m1s])) == 0
+  and sum(increase(two_bot_gateway_resumes_total[2m1s])) == 0
+  and sum(increase(two_bot_gateway_events_total{event="READY"}[2m1s])) == 0
+  and sum(resets(two_bot_gateway_events_total{event="HEARTBEAT_ACK"}[2m1s])) == 0
+  and sum(resets(two_bot_gateway_reconnects_total[2m1s])) == 0
+  and sum(resets(two_bot_gateway_resumes_total[2m1s])) == 0
+  and sum(resets(two_bot_gateway_events_total{event="READY"}[2m1s])) == 0
+  and min(count_over_time(two_bot_gateway_events_total{event="HEARTBEAT_ACK"}[2m1s])) >= 3
+  and min(count_over_time(two_bot_gateway_reconnects_total[2m1s])) >= 3
+  and min(count_over_time(two_bot_gateway_resumes_total[2m1s])) >= 3
+  and min(count_over_time(two_bot_gateway_events_total{event="READY"}[2m1s])) >= 3
 ```
 
-G1-vs-G2 disambiguator — ACK staleness in seconds (large value with fresh
-keepalive samples means G1; large value with no fresh samples of any
-series means G2, the tick itself is gone):
+Stored ACK-series **scrape age** in seconds, only while an instant sample is
+available under the reader's lookback/staleness rules:
 
 ```promql
 time() - timestamp(two_bot_gateway_events_total{event="HEARTBEAT_ACK"})
 ```
 
-Cross-check with one log filter over the same window (container stdout in
-the Cloudflare dashboard for the affected container; Worker tail is not
-Rust stdout): count `gateway shard loop started` against
-`gateway ready; checkpoint committed` and look for
-`gateway reconnect failed; Twilight will retry`. No reconnect-failed
-lines plus a flat ACK counter is the zombie shape; reconnect-failed lines
-plus a flat ACK counter is transport loss (§8). Event spellings:
-[observability event catalog](observability-event-catalog.md).
+A freshly scraped but unchanged ACK counter has scrape age near zero, even
+if the last ACK was ten minutes ago. An absent/stale instant series returns
+no value, not a large age. Show that as unknown/missing, never coalesce it to
+zero or healthy. This query supplies neither last-ACK age nor last-tick age.
 
-Query validation receipt: every query above was checked offline on
-2026-10-04 with a local validator (balanced delimiters, function names in
-the PromQL allowlist, metric/label names and label values against the
-[metrics](metrics.md) contract and the `crates/core/src/metrics.rs`
-allowlists, valid range durations). The queries were never executed
-against staging or production. See the PR verification section for the
-validator output.
+Correlate container stdout for the watched process (Worker tail is not Rust
+stdout): `gateway ready; checkpoint committed`, session recovery, and
+`gateway reconnect failed; Twilight will retry`. These are corroborating
+observations, not a proof of tick execution or continuous connection.
+See the [event catalog](observability-event-catalog.md) for spellings.
 
-## 4. `T_0` owner and baseline step
+## 4. `T_0` owner and advancing observation baseline
 
-Owner: the cutover executor. At `T_0` (first `/readyz` 200 on the
-production revision), alongside copying §1 of the
-[run-record sheet](watch-run-record.md#1-watch-header-fill-once-at-t_0)
-onto the execution card, the executor records one baseline line on the
-card:
+Owner: the cutover executor. At `T_0` (first `/readyz` 200 on the production
+revision), record an initial observation alongside the
+[watch header](watch-run-record.md#1-watch-header-fill-once-at-t_0):
 
-- `HEARTBEAT_ACK` counter value + scrape UTC time,
-- `two_bot_gateway_latency_seconds` value (`NaN` is expected pre-first-ACK),
-- keepalive cadence in effect (`KEEPALIVE_SECONDS` or the default 60 s).
+- UTC timestamp, revision and available process/startup evidence;
+- ACK, reconnect, RESUME and READY counter values;
+- latency value (NaN means no current RTT measurement, not no HELLO/ACK);
+- gateway readiness and positive session evidence, or explicitly unknown;
+- observation cadence and DO keepalive cadence **separately**;
+- metric/log evidence pointers; tick liveness unknown unless positively shown.
 
-Every later gap reading diffs against this baseline, not against zero.
-A missing baseline line is a gap in the watch, not a silent waiver.
+Preserve T0 for audit context only. Each later observation compares against
+**the immediately previous eligible observation**, then becomes the next
+baseline. Retain enough adjacent timestamps and counter values to cover the
+full watch/page-candidate window (three/six at 60 seconds). Restart/recovery/unknown breaks the
+streak and requires a new baseline; do not compare across process boundaries.
+
+Example: T0 ACKs=10, later ACKs=100, then six observations at 100 over five
+minutes. Deltas against T0 stay +90 and hide the stall; adjacent deltas are
+`[0, 0, 0, 0, 0]` and reach the page-candidate threshold if all gates hold.
+A missing baseline or observation is a watch-coverage gap, not a waiver.
 
 ## 5. Ack step
 
-- Watch-level gap (2 quiet samples): the watcher on shift records one
-  [run-record §3](watch-run-record.md#3-signal-check-rows) row with
-  disposition record-and-watch. No page, no escalation.
-- Page-candidate gap (5 quiet samples): the on-call operator owns the
-  ack with the standard 15-minute bound from the page, then works §6.
-  Unacked past 30 minutes escalates to the watch lead per the
-  [ack-owners ladder](watch-ack-owners.md#3-escalation-ladder).
-- An incident open at a checkpoint forces that row to EXTEND or
-  ROLLBACK — never GO ([run-record §5](watch-run-record.md#5-checkpoint-gono-go-annotations)).
+- Watch-level finding: watcher on shift records one
+  [signal row](watch-run-record.md#3-signal-check-rows), the actual covered
+  interval, all eligibility checks and disposition record-and-watch. No page.
+- Page-candidate finding: watcher hands the evidence to the on-call operator;
+  if the existing incident/paging process emits a page, the operator owns its
+  15-minute ack bound. Unacked past 30 minutes escalates to the watch lead
+  under the [existing ladder](watch-ack-owners.md#3-escalation-ladder).
+- Unknown coverage/session/tick evidence is recorded explicitly and handed
+  to the operator/watch lead through existing paths, not cleared as healthy.
+- An incident open at a checkpoint forces EXTEND or ROLLBACK, never GO
+  ([checkpoint annotations](watch-run-record.md#5-checkpoint-gono-go-annotations)).
 
-No new rule id, paging path, or escalation level is created here. If a
-future change wires this sketch into `wrangler/src/alert-rules.ts`, that
-change names the rule, links the [runbook](runbook.md) section, and
-updates this file in the same PR.
+No rule id, paging path or escalation level is created here. A future wiring
+change must name the rule, supply its missing observation/eligibility evidence,
+link its runbook section and update this spec in the same reviewed PR.
 
-## 6. First response (investigation only — no control plane change)
+## 6. First response (investigation only)
 
-1. Confirm the shape with the §3 queries: flat ACKs, flat recovery
-   series, fresh keepalive samples (G1) versus stale everything (G2).
-2. Read `/readyz`: gateway `starting` with a fresh HELLO storm is a
-   reconnect, not a zombie; gateway `ready` with flat ACKs is the zombie.
-3. Correlate container stdout for disconnect/reconnect, invalid-session,
-   and close-code lines. Do not fetch or paste credentials.
-4. This monitor observes only; it does not restart the bot, reset a
-   breaker, replay writes, or change Discord permissions/intents. Fix
-   through the existing rollback/runbook paths.
+1. Confirm complete adjacent observations, reset/recovery predicates and
+   positive gateway/session evidence before classifying ACK inactivity.
+2. Separate successful scrapes from tick evidence. If the tick is unobservable,
+   say unknown; do not infer G2 from scrape age or transition-log silence.
+3. Correlate `/readyz`, revision/startup evidence and container session logs.
+   A parked/starting gateway follows the existing readiness/recovery runbook.
+4. Record the finding, coverage and ack ownership. Do not restart the bot,
+   reset a breaker, replay writes, or change permissions, intents or secrets.
+   Any operational response retains its existing runbook/approval gates.
 
-## What this spec does not do
+## Offline validation and sources
 
-- No threshold is set or changed here; the sketches in §2 are wiring
-  input, not live rules.
-- No alert rule, webhook, scrape job, dashboard, or external monitor is
-  added or modified.
-- No database probe is authorized against staging or production.
-- No retry, breaker-reset, takeover, rollback, or credential step is
-  included; those live in the runbook and cutover docs.
+The review evidence carries reproducible synthetic `promtool test rules`
+fixtures for all three literal query blocks, plus offline cases for the manual
+eligibility/baseline gates. They use no live scrape, Prometheus server, database,
+staging or production system. Syntax/fixture evaluation is not evidence that a
+live reader, target, cadence, eligibility integration or tick signal exists.
+See the PR verification section for the exact validator version and results.
 
-## Sources
-
-- ACK/latency semantics: `crates/bot/src/gateway_metrics.rs`,
-  `crates/core/src/metrics.rs`, [metrics](metrics.md).
-- Session continuity and the zero-missed-events acceptance:
-  [watch-signal-queries §8](watch-signal-queries.md#8-gateway-disconnects-and-missed-events).
-- Keepalive tick, unready threshold, arm-failure signal:
-  [container-readiness](container-readiness.md), [runbook](runbook.md#logs-and-keepalive).
-- Event spellings: [observability-event-catalog](observability-event-catalog.md).
-- Run-record sheet, ack owners, handover:
-  [watch-run-record](watch-run-record.md),
-  [watch-ack-owners](watch-ack-owners.md),
-  [cutover-watch-handover](cutover-watch-handover.md).
+- Metric semantics: `crates/bot/src/gateway_metrics.rs`,
+  `crates/core/src/metrics.rs`, [metrics contract](metrics.md).
+- Worker scrape and private readiness state: `wrangler/src/index.ts`,
+  [container readiness](container-readiness.md).
+- [Session signals](watch-signal-queries.md#8-gateway-disconnects-and-missed-events),
+  [event catalog](observability-event-catalog.md),
+  [watch run record](watch-run-record.md), [ack owners](watch-ack-owners.md),
+  [watch handover](cutover-watch-handover.md).
+- Prometheus [range endpoints](https://prometheus.io/docs/prometheus/latest/querying/basics/#range-vector-selectors)
+  and [staleness](https://prometheus.io/docs/prometheus/latest/querying/basics/#staleness).
+- Prometheus [increase](https://prometheus.io/docs/prometheus/latest/querying/functions/#increase),
+  [resets](https://prometheus.io/docs/prometheus/latest/querying/functions/#resets),
+  [sample counts](https://prometheus.io/docs/prometheus/latest/querying/functions/#aggregation_over_time)
+  and [timestamp](https://prometheus.io/docs/prometheus/latest/querying/functions/#timestamp).
+- Prometheus [offline expression tests](https://prometheus.io/docs/prometheus/latest/configuration/unit_testing_rules/).
