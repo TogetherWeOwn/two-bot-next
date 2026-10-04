@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, VecDeque};
 use proptest::prelude::*;
 use two_bot_core::voice_private::{
     join_channel_name, ChannelId, EntryOutcome, JoinChannel, JoinDecision, JoinRequest, MemberId,
-    PrivacyEffect, PrivacyError, PrivateRoom, RequestId, MAX_CHANNEL_NAME_CHARS,
+    PrivacyEffect, PrivacyError, PrivacyRecord, PrivateRoom, RequestId, MAX_CHANNEL_NAME_CHARS,
 };
 
 const ROOM: ChannelId = ChannelId(10);
@@ -823,4 +823,96 @@ proptest! {
             None => prop_assert!(world.live.is_empty(), "orphan Join channel {:?}", world.live),
         }
     }
+}
+
+// ---- durable record ----
+
+#[test]
+fn a_new_room_has_the_default_record() {
+    assert_eq!(public_room().to_record(), PrivacyRecord::default());
+    let restored = PrivateRoom::from_record(ROOM, OWNER, "Ana", &PrivacyRecord::default()).unwrap();
+    assert_eq!(restored, public_room());
+}
+
+#[test]
+fn only_a_created_join_channel_is_durable() {
+    // Planned but not yet reported: nothing to persist for it.
+    let requested = public_room().make_private().unwrap().room;
+    assert_eq!(
+        requested.to_record(),
+        PrivacyRecord {
+            private: true,
+            join_channel_id: None,
+            blocked: BTreeSet::new(),
+        }
+    );
+    // Reported: the id is durable.
+    assert_eq!(private_room().to_record().join_channel_id, Some(20));
+}
+
+#[test]
+fn the_record_round_trips_privacy_and_the_block_list() {
+    let mut room = private_room();
+    room.blocked.insert(BOB);
+    room.blocked.insert(CAROL);
+    let record = room.to_record();
+    assert_eq!(record.blocked, BTreeSet::from([3, 4]));
+    let restored = PrivateRoom::from_record(ROOM, OWNER, "Ana", &record).unwrap();
+    assert!(restored.private);
+    assert_eq!(restored.blocked, room.blocked);
+    // The stored channel's name is unknown, so it reads back empty and a
+    // later `set_owner` renames it once.
+    assert_eq!(restored.join_channel, created(JOIN, ""));
+    assert_eq!(restored.to_record(), record);
+}
+
+#[test]
+fn the_block_list_survives_going_public_in_the_record() {
+    let mut room = private_room();
+    room.blocked.insert(BOB);
+    let public = room.make_public().unwrap().room;
+    assert_eq!(
+        public.to_record(),
+        PrivacyRecord {
+            private: false,
+            join_channel_id: None,
+            blocked: BTreeSet::from([3]),
+        }
+    );
+    // The record alone rebuilds the public room, blocks included.
+    assert_eq!(
+        PrivateRoom::from_record(ROOM, OWNER, "Ana", &public.to_record()).unwrap(),
+        public
+    );
+}
+
+#[test]
+fn a_corrupt_record_is_refused_not_repaired() {
+    let join_on_public = PrivacyRecord {
+        private: false,
+        join_channel_id: Some(20),
+        blocked: BTreeSet::new(),
+    };
+    assert_eq!(
+        PrivateRoom::from_record(ROOM, OWNER, "Ana", &join_on_public),
+        Err(PrivacyError::PublicRoomHasPrivateState)
+    );
+    let join_is_room = PrivacyRecord {
+        private: true,
+        join_channel_id: Some(10),
+        blocked: BTreeSet::new(),
+    };
+    assert_eq!(
+        PrivateRoom::from_record(ROOM, OWNER, "Ana", &join_is_room),
+        Err(PrivacyError::JoinChannelIsRoom)
+    );
+    let zero_block = PrivacyRecord {
+        private: true,
+        join_channel_id: None,
+        blocked: BTreeSet::from([0]),
+    };
+    assert_eq!(
+        PrivateRoom::from_record(ROOM, OWNER, "Ana", &zero_block),
+        Err(PrivacyError::InvalidId)
+    );
 }

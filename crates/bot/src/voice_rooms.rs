@@ -10,7 +10,7 @@
 //! (gated on `TWO_VOICE=1` by the binary).
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
     sync::{
@@ -37,7 +37,7 @@ use twilight_model::{
             component::{ActionRow, Button, ButtonStyle, Component},
             AllowedMentions, MessageFlags,
         },
-        permission_overwrite::PermissionOverwriteType,
+        permission_overwrite::{PermissionOverwrite, PermissionOverwriteType},
         Channel, ChannelType,
     },
     guild::{Permissions, Role},
@@ -81,6 +81,8 @@ use two_bot_core::{
         decide_ownership, OwnershipDecision, OwnershipError, OwnershipRequest, RoomActor,
         RoomMember, RoomOwnership,
     },
+    voice_permissions::OWNER_ALLOW_BITS,
+    voice_private::{PrivacyRecord, PrivateRoom},
     voice_rooms::{
         category_full_message, is_usable_channel_name, voice_commands, ActionQueue, CreatorChannel,
         NewRoomSpec, PermissionSource, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction,
@@ -104,7 +106,7 @@ use two_bot_core::{
     AutomodPolicy, CommandDefinition, OverwriteTarget, PermissionFinding,
     PermissionOverwrite as HealthOverwrite, Snowflake, VoicePermission, VoicePermissionScope,
 };
-use two_bot_cutover::voice_rooms::PgRoomStore;
+use two_bot_cutover::voice_rooms::{OwnerGrantIntent, PgRoomStore};
 use two_bot_discord::voice_rooms::{
     can_enforce_kick, can_manage_room, effective_permissions, RoomChannelAttributes, RoomHttp,
     RoomHttpError,
@@ -169,12 +171,22 @@ pub trait RoomPersistence: Send + Sync {
         channel: Snowflake,
     ) -> impl Future<Output = Result<Option<CreatorChannel>, StoreError>> + Send;
     fn persist(&self, room: &VoiceRoom) -> impl Future<Output = Result<(), StoreError>> + Send;
-    /// Persist a V2 caretaker/command handoff on an already-tracked room.
-    /// Returns `Ok(true)` when the row existed, `Ok(false)` when the tracked
-    /// row has no database counterpart (deleted out-of-band).
+    fn pending_owner_grants(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<Vec<Snowflake>, StoreError>> + Send;
+    /// Persist every possible grant recipient before writing Discord overwrites.
+    fn prepare_owner_grants(
+        &self,
+        room: &VoiceRoom,
+        previous_owner_id: Snowflake,
+    ) -> impl Future<Output = Result<OwnerGrantIntent, StoreError>> + Send;
+    /// Atomically persist ownership and acknowledge exactly this cleanup intent.
+    /// A missing row or superseded revision returns false without clearing work.
     fn update_ownership(
         &self,
         room: &VoiceRoom,
+        revision: &str,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
     /// Every V3 `/name` custom-name override in the guild, for worker load.
     /// Rooms on their template name have no entry.
@@ -261,6 +273,20 @@ pub trait RoomPersistence: Send + Sync {
         &self,
         rows: &[KickAuditRow],
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// V3 privacy records for the guild's rooms that are not public with an
+    /// empty block list; every other room reads as the default.
+    fn privacy(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<BTreeMap<Snowflake, PrivacyRecord>, StoreError>> + Send;
+    /// Replace one room's privacy record. `Ok(false)` when the room has no
+    /// database row, so a record never outlives its room.
+    fn save_privacy(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        record: &PrivacyRecord,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
 }
 
 impl RoomPersistence for PgRoomStore {
@@ -299,15 +325,25 @@ impl RoomPersistence for PgRoomStore {
         Ok(())
     }
 
-    async fn update_ownership(&self, room: &VoiceRoom) -> Result<bool, StoreError> {
-        self.update_ownership(
-            room.guild_id,
-            room.channel_id,
-            room.owner_id,
-            room.original_creator_id,
-        )
-        .await
-        .map_err(store_error)
+    async fn pending_owner_grants(&self, guild: Snowflake) -> Result<Vec<Snowflake>, StoreError> {
+        self.pending_owner_grants(guild).await.map_err(store_error)
+    }
+
+    async fn prepare_owner_grants(
+        &self,
+        room: &VoiceRoom,
+        previous_owner_id: Snowflake,
+    ) -> Result<OwnerGrantIntent, StoreError> {
+        self.prepare_owner_grants(room, previous_owner_id)
+            .await
+            .map_err(store_error)?
+            .ok_or(StoreError::Conflict)
+    }
+
+    async fn update_ownership(&self, room: &VoiceRoom, revision: &str) -> Result<bool, StoreError> {
+        self.complete_owner_grants(room, revision)
+            .await
+            .map_err(store_error)
     }
 
     async fn custom_names(&self, guild: Snowflake) -> Result<Vec<(Snowflake, String)>, StoreError> {
@@ -403,6 +439,24 @@ impl RoomPersistence for PgRoomStore {
     async fn record_kick_audit(&self, rows: &[KickAuditRow]) -> Result<(), StoreError> {
         self.add_kick_audit(rows).await.map_err(store_error)
     }
+
+    async fn privacy(
+        &self,
+        guild: Snowflake,
+    ) -> Result<BTreeMap<Snowflake, PrivacyRecord>, StoreError> {
+        self.privacy_in_guild(guild).await.map_err(store_error)
+    }
+
+    async fn save_privacy(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        record: &PrivacyRecord,
+    ) -> Result<bool, StoreError> {
+        PgRoomStore::save_privacy(self, guild, room, record)
+            .await
+            .map_err(store_error)
+    }
 }
 
 fn store_error(error: sqlx::Error) -> StoreError {
@@ -450,6 +504,12 @@ fn voice_dead_action(action: &RoomAction) -> &'static str {
         // The override write belongs to the rename family: same feature,
         // and the bounded `action` label set stays as documented.
         RoomAction::RenameRoom { .. } | RoomAction::SetCustomName { .. } => "rename",
+        // V3 privacy writes share the unknown-shape family so the bounded
+        // metric label set stays unchanged.
+        RoomAction::SetEveryoneConnect { .. }
+        | RoomAction::CreateJoinChannel { .. }
+        | RoomAction::DeleteJoinChannel { .. }
+        | RoomAction::SavePrivacy { .. } => "other",
     }
 }
 
@@ -516,6 +576,16 @@ pub trait RoomWrites: Send + Sync {
         member: Snowflake,
         guard: WriteGuard,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// Replace one tracked room's overwrites after an ownership handoff.
+    fn update_overwrites(
+        &self,
+        channel: Snowflake,
+        overwrites: &[PermissionOverwrite],
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<Channel, RoomHttpError>> + Send {
+        let _ = (channel, overwrites, guard);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
     fn delete(
         &self,
         channel: Snowflake,
@@ -559,6 +629,32 @@ pub trait RoomWrites: Send + Sync {
         member_id: Snowflake,
         guard: WriteGuard,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// V3 `/private` and `/public`: replace one role or member overwrite on a
+    /// room channel (a PUT, so the caller passes every bit it wants kept). The
+    /// default refuses, so a writer without overwrite access fails closed.
+    fn put_overwrite(
+        &self,
+        channel: Snowflake,
+        overwrite: PermissionOverwrite,
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send {
+        let _ = (channel, overwrite, guard);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
+    /// V3: create the Join voice channel in the room's category, next to the
+    /// room, with no overwrites of its own (it syncs to the category). The
+    /// default refuses.
+    fn create_join_channel(
+        &self,
+        guild: Snowflake,
+        name: &str,
+        parent_id: Option<Snowflake>,
+        position: Option<u64>,
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<Channel, RoomHttpError>> + Send {
+        let _ = (guild, name, parent_id, position, guard);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
     /// V10 error notice. `mention_role` is pinged on channel targets only.
     /// The default refuses, so a writer that cannot post notices fails closed
     /// (the worker counts the attempt and moves on) instead of dropping them
@@ -616,6 +712,16 @@ impl RoomWrites for RoomHttp {
             .await
     }
 
+    async fn update_overwrites(
+        &self,
+        channel: Snowflake,
+        overwrites: &[PermissionOverwrite],
+        guard: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        self.update_room_overwrites(channel, overwrites, move || guard())
+            .await
+    }
+
     async fn delete(&self, channel: Snowflake, guard: WriteGuard) -> Result<(), RoomHttpError> {
         self.delete_room(channel, move || guard()).await
     }
@@ -658,6 +764,28 @@ impl RoomWrites for RoomHttp {
         guard: WriteGuard,
     ) -> Result<(), RoomHttpError> {
         self.revoke_companion_view(text_channel_id, member_id, move || guard())
+            .await
+    }
+
+    async fn put_overwrite(
+        &self,
+        channel: Snowflake,
+        overwrite: PermissionOverwrite,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.put_channel_overwrite(channel, &overwrite, move || guard())
+            .await
+    }
+
+    async fn create_join_channel(
+        &self,
+        guild: Snowflake,
+        name: &str,
+        parent_id: Option<Snowflake>,
+        position: Option<u64>,
+        guard: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        self.create_join_voice_channel(guild, name, parent_id, position, move || guard())
             .await
     }
 
@@ -737,7 +865,9 @@ struct LiveState {
     ready: bool,
     generation: u64,
     next_transition: u64,
+    next_channel_revision: u64,
     channels: HashMap<Snowflake, Channel>,
+    channel_revisions: HashMap<Snowflake, u64>,
     members: HashMap<Snowflake, MemberState>,
     bot: Option<BotAccess>,
 }
@@ -885,6 +1015,7 @@ impl LiveGuild {
             .into_iter()
             .map(|channel| (channel.id.get(), channel))
             .collect();
+        live.channel_revisions = live.channels.keys().map(|id| (*id, 0)).collect();
         // One shared stamp: bootstrap order is unknown, so tenure ties
         // break by member id until transitions establish real seniority.
         // A snapshot rebuild resets tenure — tenure is continuous tracked
@@ -1043,20 +1174,39 @@ impl LiveGuild {
 
     pub fn upsert_channel(&self, channel: Channel) {
         if channel.guild_id.map(Id::get) == Some(self.guild_id) {
-            self.inner
-                .write()
-                .expect("live voice lock")
-                .channels
-                .insert(channel.id.get(), channel);
+            let mut live = self.inner.write().expect("live voice lock");
+            live.next_channel_revision += 1;
+            let revision = live.next_channel_revision;
+            live.channel_revisions.insert(channel.id.get(), revision);
+            live.channels.insert(channel.id.get(), channel);
         }
     }
 
     pub fn remove_channel(&self, channel: Snowflake) {
-        self.inner
-            .write()
-            .expect("live voice lock")
-            .channels
-            .remove(&channel);
+        let mut live = self.inner.write().expect("live voice lock");
+        live.channel_revisions.remove(&channel);
+        live.channels.remove(&channel);
+    }
+
+    /// REST completion must never roll back gateway evidence or resurrect a
+    /// deleted channel, even after an identical-looking reconnect snapshot.
+    fn publish_owner_overwrites(&self, channel: Channel, generation: u64, revision: u64) -> bool {
+        let mut live = self.inner.write().expect("live voice lock");
+        let id = channel.id.get();
+        if !live.ready
+            || live.generation != generation
+            || live.channel_revisions.get(&id) != Some(&revision)
+        {
+            return false;
+        }
+        let Some(current) = live.channels.get_mut(&id) else {
+            return false;
+        };
+        current.permission_overwrites = channel.permission_overwrites;
+        live.next_channel_revision += 1;
+        let revision = live.next_channel_revision;
+        live.channel_revisions.insert(id, revision);
+        true
     }
 
     fn join_guard(&self, ticket: JoinTicket) -> GuardedWrite {
@@ -1262,6 +1412,10 @@ pub struct GuildRoomWorker<S, H> {
     /// Compared against live occupancy via [`occupancy_diff`] on reconcile.
     companion_seen: HashMap<Snowflake, Vec<Snowflake>>,
     queue: ActionQueue,
+    /// Security cleanup survives the queue's finite retry cohorts. Only one
+    /// ownership action per room is queued; exhausted cohorts wait a minute.
+    ownership_repairs: HashMap<Snowflake, u64>,
+    ownership_queued: HashSet<Snowflake>,
     renames: RenameCoalescer,
     desired_names: HashMap<Snowflake, String>,
     /// V3 `/name` overrides by room: the owner's text as typed, template
@@ -1274,6 +1428,15 @@ pub struct GuildRoomWorker<S, H> {
     deletes: HashSet<Snowflake>,
     compensation: HashSet<Snowflake>,
     denied: HashMap<Snowflake, (u64, Option<Permissions>)>,
+    /// V3 privacy state by room (private flag, Join channel, block list),
+    /// loaded from the store and changed only after the matching Discord
+    /// write lands. See [`private_runtime`].
+    privacy: HashMap<Snowflake, PrivateRoom>,
+    /// Rooms whose in-memory privacy state is not yet durable.
+    privacy_dirty: HashSet<Snowflake>,
+    /// Join channel ids this worker created or loaded from its own store:
+    /// the only ones a `DeleteJoinChannel` may delete.
+    join_deletable: HashSet<Snowflake>,
     failures: VecDeque<LifecycleFailure>,
     notices: Vec<NoticeState>,
     halted: bool,
@@ -1368,6 +1531,8 @@ const KICK_AUDIT_BATCH: usize = 32;
 /// Pause after a failed flush before the next attempt.
 const KICK_AUDIT_RETRY_MS: u64 = 5_000;
 
+const OWNER_REPAIR_COOLDOWN_MS: u64 = 60_000;
+
 /// Repeat bookkeeping for one tracked failure. `last_attempt_ms` is the
 /// actor's monotonic clock, so a restart begins a fresh budget.
 #[derive(Debug, Clone)]
@@ -1398,6 +1563,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .into_iter()
             .map(|c| (c.room_channel_id, c))
             .collect();
+        let ownership_repairs = store
+            .pending_owner_grants(live.guild_id)
+            .await?
+            .into_iter()
+            .map(|channel| (channel, 0))
+            .collect();
+        let (privacy, join_deletable) =
+            Self::load_privacy(&rooms, store.privacy(live.guild_id).await?);
         let custom_names = store
             .custom_names(live.guild_id)
             .await?
@@ -1415,6 +1588,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             unpersisted_companions: HashSet::new(),
             companion_seen: HashMap::new(),
             queue: ActionQueue::new(),
+            ownership_repairs,
+            ownership_queued: HashSet::new(),
             renames: RenameCoalescer::new(),
             desired_names: HashMap::new(),
             custom_names,
@@ -1425,6 +1600,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             deletes: HashSet::new(),
             compensation: HashSet::new(),
             denied: HashMap::new(),
+            privacy,
+            privacy_dirty: HashSet::new(),
+            join_deletable,
             failures: VecDeque::new(),
             notices: Vec::new(),
             halted: false,
@@ -1710,6 +1888,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.companion_seen.insert(channel, current);
         }
         drop(live);
+        self.reconcile_privacy();
         let delete_enqueued = empty.len() as u64;
         for channel in empty {
             self.queue_delete(channel, false);
@@ -1805,18 +1984,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 return false;
             }
         };
+        let previous_owner_id = room.owner_id;
         let mut updated = room;
         updated.owner_id = next.owner_id;
         updated.original_creator_id = next.original_creator_id;
         self.rooms.insert(channel, updated);
-        self.queue.enqueue(
-            self.live.guild_id,
-            RoomAction::UpdateOwnership {
-                channel_id: channel,
-                owner_id: next.owner_id,
-                original_creator_id: next.original_creator_id,
-            },
-        );
+        self.queue_owner_handoff(channel, previous_owner_id);
         true
     }
 
@@ -1915,6 +2088,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             }
             Err(error) => return ownership_refusal(error),
         };
+        let previous_owner_id = room.owner_id;
         let mut updated = room;
         updated.owner_id = next.owner_id;
         updated.original_creator_id = next.original_creator_id;
@@ -1923,14 +2097,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         // any lingering post-move uncertainty is stale — clear it so the next
         // reconcile (and the persisted handoff) stop skipping this channel.
         self.uncertain_moves.remove(&channel);
-        self.queue.enqueue(
-            self.live.guild_id,
-            RoomAction::UpdateOwnership {
-                channel_id: channel,
-                owner_id: next.owner_id,
-                original_creator_id: next.original_creator_id,
-            },
-        );
+        self.queue_owner_handoff(channel, previous_owner_id);
         match command {
             OwnershipCommand::Reclaim if was_creator => {
                 "You're the owner of this room again.".to_owned()
@@ -1940,6 +2107,181 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 format!("Transferred ownership of this room to <@{target_id}>.")
             }
         }
+    }
+
+    fn queue_owner_handoff(&mut self, channel_id: Snowflake, previous_owner_id: Snowflake) {
+        self.ownership_repairs.entry(channel_id).or_insert(0);
+        if self.ownership_queued.insert(channel_id) {
+            let room = &self.rooms[&channel_id];
+            self.queue.enqueue(
+                self.live.guild_id,
+                RoomAction::UpdateOwnership {
+                    channel_id,
+                    previous_owner_id,
+                    owner_id: room.owner_id,
+                    original_creator_id: room.original_creator_id,
+                },
+            );
+        }
+    }
+
+    /// Replay durable cleanup independently of caretaker succession. A present
+    /// owner does not prove Discord grants have converged to the ledger.
+    fn enqueue_owner_repairs(&mut self, now_ms: u64) {
+        self.ownership_repairs
+            .retain(|channel, _| self.rooms.contains_key(channel));
+        self.ownership_queued
+            .retain(|channel| self.rooms.contains_key(channel));
+        let due: Vec<_> = {
+            let live = self.live.inner.read().expect("live voice lock");
+            if !live.ready || self.halted {
+                return;
+            }
+            self.ownership_repairs
+                .iter()
+                .filter_map(|(channel, not_before)| {
+                    (*not_before <= now_ms
+                        && !self.ownership_queued.contains(channel)
+                        && live
+                            .permissions(self.live.guild_id, *channel)
+                            .is_some_and(|p| {
+                                p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES)
+                            }))
+                    .then_some(*channel)
+                })
+                .collect()
+        };
+        for channel in due {
+            self.queue_owner_handoff(channel, self.rooms[&channel].owner_id);
+        }
+    }
+
+    fn owner_action_failed(&mut self, action: QueuedAction, reason: &str, now_ms: u64) {
+        if action.attempts.saturating_add(1) >= QUEUE_MAX_ATTEMPTS {
+            let channel = action.action.channel_id().expect("ownership channel");
+            self.ownership_queued.remove(&channel);
+            self.ownership_repairs
+                .insert(channel, now_ms.saturating_add(OWNER_REPAIR_COOLDOWN_MS));
+        }
+        self.mark_failed_observed(action, reason.to_owned(), now_ms);
+    }
+
+    async fn rewrite_owner_grant(
+        &self,
+        channel_id: Snowflake,
+        issued_members: &[Snowflake],
+        owner_id: Snowflake,
+    ) -> Result<(), RoomHttpError> {
+        let (overwrites, changed, expected_overwrites, generation, revision) = {
+            let live = self.live.inner.read().expect("live voice lock");
+            if !live.ready {
+                return Err(RoomHttpError::Cancelled);
+            }
+            // A deleted channel drops its revision too, so test presence first:
+            // the cleanup caller must see NotFound, not a retryable Cancelled.
+            let channel = live
+                .channels
+                .get(&channel_id)
+                .ok_or(RoomHttpError::NotFound)?;
+            let revision = *live
+                .channel_revisions
+                .get(&channel_id)
+                .ok_or(RoomHttpError::Cancelled)?;
+            let current = channel
+                .permission_overwrites
+                .as_deref()
+                .ok_or(RoomHttpError::Cancelled)?;
+            let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+            let can_write = live
+                .permissions(self.live.guild_id, channel_id)
+                .is_some_and(|p| p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES));
+            if !can_write {
+                // Rooms created without Manage Roles are category-synced and
+                // have no bot-issued owner grant to move. Do not invent one.
+                if current.iter().any(|o| {
+                    o.kind == PermissionOverwriteType::Member
+                        && o.id.get() != owner_id
+                        && issued_members.contains(&o.id.get())
+                        && o.allow.intersects(owner_mask)
+                }) {
+                    return Err(RoomHttpError::AccessDenied);
+                }
+                return Ok(());
+            }
+            let mut overwrites = current.to_vec();
+            for old in &mut overwrites {
+                if old.kind == PermissionOverwriteType::Member
+                    && old.id.get() != owner_id
+                    && issued_members.contains(&old.id.get())
+                {
+                    old.allow &= !owner_mask;
+                }
+            }
+            overwrites.retain(|o| {
+                !(o.kind == PermissionOverwriteType::Member
+                    && o.id.get() != owner_id
+                    && issued_members.contains(&o.id.get())
+                    && o.allow.is_empty()
+                    && o.deny.is_empty())
+            });
+            let owner_bits = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+            if let Some(owner) = overwrites
+                .iter_mut()
+                .find(|o| o.kind == PermissionOverwriteType::Member && o.id.get() == owner_id)
+            {
+                // Preserve independent denies, like creation-time inheritance.
+                owner.allow = (owner.allow | owner_bits) & !owner.deny;
+            } else {
+                overwrites.push(PermissionOverwrite {
+                    id: Id::new(owner_id),
+                    kind: PermissionOverwriteType::Member,
+                    allow: owner_bits,
+                    deny: Permissions::empty(),
+                });
+            }
+            let changed = overwrites != current;
+            (
+                overwrites,
+                changed,
+                current.to_vec(),
+                live.generation,
+                revision,
+            )
+        };
+        if !changed {
+            return Ok(());
+        }
+        let live = self.live.clone();
+        let guard: WriteGuard = Arc::new(move || {
+            let state = live.inner.read().expect("live voice lock");
+            state.ready
+                && state.generation == generation
+                && state.channel_revisions.get(&channel_id) == Some(&revision)
+                && state.channels.get(&channel_id).is_some_and(|channel| {
+                    channel.permission_overwrites.as_deref() == Some(expected_overwrites.as_slice())
+                })
+                && state
+                    .permissions(live.guild_id, channel_id)
+                    .is_some_and(|p| {
+                        p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES)
+                    })
+        });
+        let channel = self
+            .http
+            .update_overwrites(channel_id, &overwrites, guard)
+            .await?;
+        if channel.id.get() != channel_id
+            || channel.guild_id.map(Id::get) != Some(self.live.guild_id)
+        {
+            return Err(RoomHttpError::UnknownOutcome);
+        }
+        if !self
+            .live
+            .publish_owner_overwrites(channel, generation, revision)
+        {
+            return Err(RoomHttpError::Cancelled);
+        }
+        Ok(())
     }
 
     pub fn propose_name(
@@ -2488,6 +2830,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 RoomAction::RenameRoom { channel_id, name },
             );
         }
+        self.enqueue_owner_repairs(now_ms);
         let Some(action) = self.queue.pop_due(self.live.guild_id, now_ms) else {
             return false;
         };
@@ -2758,10 +3101,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             );
                             return true;
                         }
+                        // V3: the Join channel goes with its room, ahead of the
+                        // row: a failed delete retries instead of leaking it.
+                        if !self.delete_join_for(channel_id).await {
+                            self.mark_failed_observed(
+                                action,
+                                "Join channel delete unavailable".to_owned(),
+                                elapsed_ms(now_ms, started),
+                            );
+                            return true;
+                        }
                         match self.store.forget(self.live.guild_id, channel_id).await {
                             Ok(()) => {
                                 self.queue.mark_succeeded(&action);
                                 self.queue.drop_for_channel(self.live.guild_id, channel_id);
+                                self.forget_privacy(channel_id);
                                 self.rooms.remove(&channel_id);
                                 self.companions.remove(&channel_id);
                                 self.companion_channels.remove(&channel_id);
@@ -2979,52 +3333,104 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             }
             RoomAction::UpdateOwnership {
                 channel_id,
-                owner_id,
-                original_creator_id,
+                previous_owner_id,
+                ..
             } => {
-                // No Discord write: the worker row already carries this
-                // handoff. A stale action (a newer succession moved the row,
-                // or the room was forgotten) persists nothing.
                 let Some(room) = self.rooms.get(&channel_id).cloned() else {
+                    self.ownership_queued.remove(&channel_id);
+                    self.ownership_repairs.remove(&channel_id);
                     self.queue.mark_succeeded(&action);
                     return true;
                 };
-                if room.owner_id != owner_id || room.original_creator_id != original_creator_id {
-                    self.queue.mark_succeeded(&action);
+                // A grant is never issued without durable recipient provenance.
+                // Retries/reloads retain every earlier possible recipient.
+                let intent = match self
+                    .store
+                    .prepare_owner_grants(&room, previous_owner_id)
+                    .await
+                {
+                    Ok(intent) => intent,
+                    Err(error) => {
+                        self.record(LifecycleFailure::Persistence {
+                            channel_id: Some(channel_id),
+                            error,
+                        });
+                        if error == StoreError::CredentialRefused {
+                            self.halted = true;
+                            self.queue.mark_succeeded(&action);
+                        } else {
+                            self.owner_action_failed(
+                                action,
+                                "owner grant preparation unavailable",
+                                elapsed_ms(now_ms, started),
+                            );
+                        }
+                        return true;
+                    }
+                };
+                // Always converge to the latest worker owner, never a stale
+                // queued recipient. After a restart that is the SQL owner.
+                if let Err(error) = self
+                    .rewrite_owner_grant(channel_id, &intent.members, room.owner_id)
+                    .await
+                {
+                    match error {
+                        RoomHttpError::RateLimited { retry_after_ms, .. } => {
+                            self.queue.mark_rate_limited(
+                                self.live.guild_id,
+                                retry_after_ms,
+                                elapsed_ms(now_ms, started),
+                                action,
+                            );
+                        }
+                        RoomHttpError::Unauthorized => {
+                            self.halted = true;
+                            self.record(LifecycleFailure::Discord { channel_id, error });
+                            self.queue.mark_succeeded(&action);
+                        }
+                        _ => {
+                            self.record(LifecycleFailure::Discord { channel_id, error });
+                            self.owner_action_failed(
+                                action,
+                                "owner overwrite update unavailable",
+                                elapsed_ms(now_ms, started),
+                            );
+                        }
+                    }
                     return true;
                 }
-                match self.store.update_ownership(&room).await {
+                match self.store.update_ownership(&room, &intent.revision).await {
                     Ok(true) => {
+                        self.ownership_queued.remove(&channel_id);
+                        self.ownership_repairs.remove(&channel_id);
                         self.queue.mark_succeeded(&action);
                     }
                     Ok(false) => {
-                        // Tracked but no database row (deleted out-of-band):
-                        // never retry a write that cannot land. The handoff
-                        // stays in the worker row and surfaces below.
                         self.record(LifecycleFailure::Persistence {
                             channel_id: Some(channel_id),
                             error: StoreError::Conflict,
                         });
-                        self.queue.mark_succeeded(&action);
-                    }
-                    Err(StoreError::CredentialRefused) => {
-                        self.record(LifecycleFailure::Persistence {
-                            channel_id: Some(channel_id),
-                            error: StoreError::CredentialRefused,
-                        });
-                        self.halted = true;
-                        self.queue.mark_succeeded(&action);
+                        self.owner_action_failed(
+                            action,
+                            "owner cleanup completion superseded",
+                            elapsed_ms(now_ms, started),
+                        );
                     }
                     Err(error) => {
                         self.record(LifecycleFailure::Persistence {
                             channel_id: Some(channel_id),
                             error,
                         });
-                        self.mark_failed_observed(
-                            action,
-                            "voice-room persistence unavailable".to_owned(),
-                            elapsed_ms(now_ms, started),
-                        );
+                        if error == StoreError::CredentialRefused {
+                            self.halted = true;
+                            self.queue.mark_succeeded(&action);
+                        } else {
+                            self.owner_action_failed(
+                                action,
+                                "voice-room persistence unavailable",
+                                elapsed_ms(now_ms, started),
+                            );
+                        }
                     }
                 }
             }
@@ -3133,6 +3539,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             } => {
                 self.dispatch_custom_name(action, channel_id, custom_name, now_ms, started)
                     .await;
+            }
+            RoomAction::SetEveryoneConnect { .. }
+            | RoomAction::CreateJoinChannel { .. }
+            | RoomAction::DeleteJoinChannel { .. }
+            | RoomAction::SavePrivacy { .. } => {
+                self.dispatch_privacy(action, now_ms, started).await;
             }
             RoomAction::RenameRoom { channel_id, name } => {
                 let valid = {
@@ -3585,6 +3997,16 @@ enum ActorCommand {
         command: OwnershipCommand,
         reply: oneshot::Sender<String>,
     },
+    /// V3 owner command (`/private`, `/public`): the worker resolves the
+    /// caller's current room, gates on owner-or-admin, queues the @everyone
+    /// Connect write and replies with the user-facing text.
+    Privacy {
+        actor_id: Snowflake,
+        is_admin: bool,
+        actor_display: String,
+        command: PrivacyCommand,
+        reply: oneshot::Sender<String>,
+    },
     /// V4: start a vote-kick; the reply carries the vote state or the refusal.
     KickStart {
         vote_id: Snowflake,
@@ -3707,6 +4129,31 @@ where
             .cloned()
     }
 
+    /// Interaction member.permissions includes source-channel overwrites, so
+    /// it must never authorize guild-wide configuration or owner overrides.
+    /// Use the member's role IDs with our complete guild-role snapshot instead.
+    /// Missing/disconnected snapshots fail closed, including for admin claims.
+    /// Source: <https://docs.discord.com/developers/resources/guild#guild-member-object>
+    fn guild_permissions(&self, interaction: &Interaction) -> Option<Permissions> {
+        let guild = interaction_guild(interaction)?;
+        let member = interaction.member.as_ref()?;
+        let member_id = member.user.as_ref()?.id.get();
+        let actor = self.live_actor(guild)?;
+        let live = actor.live.inner.read().expect("live voice lock");
+        if !live.ready {
+            return None;
+        }
+        let bot = live.bot.as_ref()?;
+        effective_permissions(
+            guild,
+            bot.guild_owner_id,
+            member_id,
+            &member.roles,
+            &bot.roles,
+            &[],
+        )
+    }
+
     fn ensure_actor(&self, guild: Snowflake) -> Option<GuildActor> {
         if !self.enabled {
             return None;
@@ -3818,6 +4265,33 @@ where
             .send(ActorCommand::Ownership {
                 actor_id,
                 is_admin,
+                command,
+                reply,
+            })
+            .ok()?;
+        inbox.await.ok()
+    }
+
+    /// Run one V3 owner command (`/private`, `/public`) on the live worker
+    /// and return the ephemeral reply text. `actor_display` names the Join
+    /// channel when the caller owns the room. `None` when the guild has no
+    /// live actor.
+    pub async fn run_privacy(
+        &self,
+        guild: Snowflake,
+        actor_id: Snowflake,
+        is_admin: bool,
+        actor_display: String,
+        command: PrivacyCommand,
+    ) -> Option<String> {
+        let actor = self.live_actor(guild)?;
+        let (reply, inbox) = oneshot::channel();
+        actor
+            .tx
+            .send(ActorCommand::Privacy {
+                actor_id,
+                is_admin,
+                actor_display,
                 command,
                 reply,
             })
@@ -4059,6 +4533,12 @@ where
                     self.update_live(guild_id, |live| live.remove_channel(deleted.id.get()));
                 }
             }
+            Event::GuildUpdate(updated) => {
+                let guild_id = updated.id.get();
+                if let Some(access) = bot_access_from_cache(cache, guild_id) {
+                    self.update_live(guild_id, |live| live.refresh_bot(access));
+                }
+            }
             Event::RoleCreate(created) => {
                 let guild_id = created.guild_id.get();
                 if let Some(access) = bot_access_from_cache(cache, guild_id) {
@@ -4207,6 +4687,15 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             reply,
         } => {
             let _ = reply.send(worker.apply_ownership(actor_id, is_admin, command));
+        }
+        ActorCommand::Privacy {
+            actor_id,
+            is_admin,
+            actor_display,
+            command,
+            reply,
+        } => {
+            let _ = reply.send(worker.apply_privacy(actor_id, is_admin, &actor_display, command));
         }
         ActorCommand::KickStart {
             vote_id,
@@ -5279,6 +5768,11 @@ pub enum VoiceCommand {
     Transfer {
         target_id: Snowflake,
     },
+    /// V3 owner (or admin) denies Connect to @everyone and opens the Join
+    /// channel.
+    Private,
+    /// V3 owner (or admin) restores access and deletes the Join channel.
+    Public,
     Access(AccessAction),
     Logging(LoggingAction),
     Export,
@@ -5500,6 +5994,8 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
             })
         }
         "reclaim" => Some(VoiceCommand::Reclaim),
+        "private" => Some(VoiceCommand::Private),
+        "public" => Some(VoiceCommand::Public),
         "transfer" => {
             // The `member` option is required at registration, so Discord
             // always sends it; zero means a malformed payload and refuses
@@ -5570,23 +6066,18 @@ fn parse_kick_reason(options: &[CommandDataOption]) -> Option<String> {
         })
 }
 
-/// Invoking member id plus effective Manage Channels authority, from the
-/// interaction payload (guild `member.user`, else the top-level user).
-/// `None` when Discord sent no identifiable invoker — the handler refuses
-/// closed rather than acting as nobody.
-fn interaction_actor(interaction: &Interaction) -> Option<(Snowflake, bool)> {
-    let user = interaction
-        .member
-        .as_ref()
+/// The invoker's server display name: nickname, then global name, then user
+/// name. Empty when the interaction carries no user.
+fn interaction_display_name(interaction: &Interaction) -> String {
+    let member = interaction.member.as_ref();
+    let user = member
         .and_then(|member| member.user.as_ref())
-        .or(interaction.user.as_ref())?;
-    let is_admin = is_voice_admin(
-        interaction
-            .member
-            .as_ref()
-            .and_then(|member| member.permissions),
-    );
-    Some((user.id.get(), is_admin))
+        .or(interaction.user.as_ref());
+    member
+        .and_then(|member| member.nick.clone())
+        .or_else(|| user.and_then(|user| user.global_name.clone()))
+        .or_else(|| user.map(|user| user.name.clone()))
+        .unwrap_or_default()
 }
 
 fn parse_logging_action(options: &[CommandDataOption]) -> LoggingAction {
@@ -5696,6 +6187,8 @@ impl VoiceCommand {
             Self::AlwaysPrivate { .. } => "alwaysprivate",
             Self::Access(_) => "access",
             Self::Reclaim => "reclaim",
+            Self::Private => "private",
+            Self::Public => "public",
             Self::Transfer { .. } => "transfer",
             Self::Logging(_) => "logging",
             Self::Export => "export",
@@ -5735,11 +6228,14 @@ fn vote_button_id(vote_id: Snowflake, ballot: VoteBallot) -> String {
     format!("{VOTE_BUTTON_PREFIX}{vote_id}:{vote}")
 }
 
-/// The invoking member's access facts: effective admin flag and role IDs.
-fn access_member(interaction: &Interaction) -> AccessMember {
+/// The invoking member's access facts: guild-level admin flag and role IDs.
+fn access_member(
+    interaction: &Interaction,
+    guild_permissions: Option<Permissions>,
+) -> AccessMember {
     let member = interaction.member.as_ref();
     AccessMember {
-        is_admin: is_voice_admin(member.and_then(|member| member.permissions)),
+        is_admin: is_voice_admin(guild_permissions),
         roles: member.map_or_else(Vec::new, |member| {
             member.roles.iter().map(|role| role.get()).collect()
         }),
@@ -6305,7 +6801,7 @@ where
     };
     // Guild-level role gate first. Settings that cannot be read fail closed for
     // members: only an admin proceeds without them.
-    let member = access_member(interaction);
+    let member = access_member(interaction, runtime.guild_permissions(interaction));
     let (gate_store, _) = runtime.make_pair();
     if let Some(denial) = command_gate(&gate_store, guild_id, &member, command.name()).await {
         reply(denial).await;
@@ -6414,10 +6910,7 @@ where
             true
         }
         VoiceCommand::Setup => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             let status = runtime.worker_status(guild_id).await;
             let panel = if is_voice_admin(permissions) {
                 let (store, _) = runtime.make_pair();
@@ -6459,10 +6952,7 @@ where
             true
         }
         VoiceCommand::Create { name } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /create.",
@@ -6497,10 +6987,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /textchannels.",
@@ -6532,10 +7019,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /position.",
@@ -6567,10 +7051,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /group.",
@@ -6602,10 +7083,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /inheritpermissions.",
@@ -6637,10 +7115,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /defaultlimit.",
@@ -6672,10 +7147,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /alwaysprivate.",
@@ -6704,7 +7176,7 @@ where
             true
         }
         VoiceCommand::Reclaim => {
-            let Some((actor_id, is_admin)) = interaction_actor(interaction) else {
+            let Some(actor_id) = invoker_member_id(interaction) else {
                 reply(ephemeral_response(
                     "I couldn't tell who invoked /reclaim — try again.",
                 ))
@@ -6712,7 +7184,12 @@ where
                 return true;
             };
             let text = runtime
-                .run_ownership(guild_id, actor_id, is_admin, OwnershipCommand::Reclaim)
+                .run_ownership(
+                    guild_id,
+                    actor_id,
+                    member.is_admin,
+                    OwnershipCommand::Reclaim,
+                )
                 .await
                 .unwrap_or_else(|| {
                     "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
@@ -6721,7 +7198,7 @@ where
             true
         }
         VoiceCommand::Transfer { target_id } => {
-            let Some((actor_id, is_admin)) = interaction_actor(interaction) else {
+            let Some(actor_id) = invoker_member_id(interaction) else {
                 reply(ephemeral_response(
                     "I couldn't tell who invoked /transfer — try again.",
                 ))
@@ -6741,7 +7218,7 @@ where
                 .run_ownership(
                     guild_id,
                     actor_id,
-                    is_admin,
+                    member.is_admin,
                     OwnershipCommand::Transfer { target_id },
                 )
                 .await
@@ -6763,6 +7240,34 @@ where
             )
             .await
         }
+        VoiceCommand::Private | VoiceCommand::Public => {
+            let (command, name) = if matches!(command, VoiceCommand::Private) {
+                (PrivacyCommand::Private, "private")
+            } else {
+                (PrivacyCommand::Public, "public")
+            };
+            let Some(actor_id) = invoker_member_id(interaction) else {
+                reply(ephemeral_response(&format!(
+                    "I couldn't tell who invoked /{name} — try again."
+                )))
+                .await;
+                return true;
+            };
+            let text = runtime
+                .run_privacy(
+                    guild_id,
+                    actor_id,
+                    member.is_admin,
+                    interaction_display_name(interaction),
+                    command,
+                )
+                .await
+                .unwrap_or_else(|| {
+                    "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+                });
+            reply(ephemeral_response(&text)).await;
+            true
+        }
         VoiceCommand::Export => {
             let Some(inventory) = inventory else {
                 reply(ephemeral_response(
@@ -6771,10 +7276,7 @@ where
                 .await;
                 return true;
             };
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_manage_server(permissions) {
                 reply(ephemeral_response("You need Manage Server to use /export.")).await;
                 return true;
@@ -6841,10 +7343,7 @@ where
         .await;
         return true;
     };
-    let permissions = interaction
-        .member
-        .as_ref()
-        .and_then(|member| member.permissions);
+    let permissions = runtime.guild_permissions(interaction);
     if !may_manage_server(permissions) {
         reply(ephemeral_response("You need Manage Server to use /import.")).await;
         return true;
@@ -6973,10 +7472,7 @@ where
         .await;
         return true;
     }
-    let permissions = interaction
-        .member
-        .as_ref()
-        .and_then(|member| member.permissions);
+    let permissions = runtime.guild_permissions(interaction);
     if !may_manage_server(permissions) {
         reply(ephemeral_response(
             "You need Manage Server to confirm an import.",
@@ -6984,7 +7480,7 @@ where
         .await;
         return true;
     }
-    let member = access_member(interaction);
+    let member = access_member(interaction, runtime.guild_permissions(interaction));
     let (store, _) = runtime.make_pair();
     if let Some(denial) = command_gate(&store, guild_id, &member, "import").await {
         reply(denial).await;
@@ -7427,6 +7923,9 @@ where
         Box::pin(async move { runtime.kick_room_of(guild, member).await })
     }
 }
+
+mod private_runtime;
+pub use private_runtime::PrivacyCommand;
 
 #[cfg(test)]
 #[path = "voice_rooms_tests.rs"]
