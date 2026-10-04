@@ -3003,7 +3003,7 @@
           "[7587037](https://github.com/TogetherWeOwn/two-bot/commit/758703733ee2b0227e0440a39be67b71e26699ac)",
           "`src/tempVoice/`",
           "fix(temp-voice): stop conferring ManageRoles on channel create (#314)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
