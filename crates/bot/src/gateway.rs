@@ -29,7 +29,7 @@ use two_bot_core::gateway_session::{
     boot_action_with, dispatch_action, invalidates_session, BootAction, DispatchAction,
     GatewaySession,
 };
-use two_bot_core::{ComponentStatus, Config, InviteState, Snowflake};
+use two_bot_core::{AutomodConfig, AutomodPolicy, ComponentStatus, Config, InviteState, Snowflake};
 use two_bot_cutover::gateway_session::{GatewayJob, GatewaySessionStore};
 use two_bot_cutover::{connect, DB_POOL_MAX_DEFAULT};
 use two_bot_discord::{
@@ -1037,7 +1037,18 @@ pub async fn build_voice_runtime(
             return None;
         }
     };
-    match build_production_runtime(token, db.pool().clone()) {
+    // Room names are filtered under the configured automod policy, whether or
+    // not automod itself is enabled. An unreadable automod environment falls
+    // back to the default policy (links still blocked); enabling automod with
+    // that environment is refused at its own gate.
+    let name_policy = match AutomodConfig::from_env() {
+        Ok(config) => config.policy,
+        Err(_) => {
+            warn!("automod environment invalid; voice room names use the default filter policy");
+            AutomodPolicy::default()
+        }
+    };
+    match build_production_runtime(token, db.pool().clone(), name_policy) {
         Ok(runtime) => {
             info!("voice rooms enabled; gateway sink attached");
             Some(Arc::new(runtime))

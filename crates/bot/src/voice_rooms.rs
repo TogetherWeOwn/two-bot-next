@@ -70,6 +70,10 @@ use two_bot_core::{
         parse_detail_level, resolve_log_target, should_log, DetailLevel, LogTarget,
         LoggingCandidates, LoggingSettings, RepeatLedger,
     },
+    voice_name_filter::{
+        filter_channel_name, resolve_create_name, BlockedRoomName, NameError, NameFilterContext,
+        ResolvedRoomName, NAME_BLOCKED_AUDIT_REASON,
+    },
     voice_ownership::{
         decide_ownership, OwnershipDecision, OwnershipError, OwnershipRequest, RoomActor,
         RoomMember, RoomOwnership,
@@ -90,8 +94,8 @@ use two_bot_core::{
         VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError, VoteKickRef,
         VoteKickStatus, VoteKickUpdate, VoteRoomFacts,
     },
-    CommandDefinition, OverwriteTarget, PermissionFinding, PermissionOverwrite as HealthOverwrite,
-    Snowflake, VoicePermission, VoicePermissionScope,
+    AutomodPolicy, CommandDefinition, OverwriteTarget, PermissionFinding,
+    PermissionOverwrite as HealthOverwrite, Snowflake, VoicePermission, VoicePermissionScope,
 };
 use two_bot_cutover::voice_rooms::PgRoomStore;
 use two_bot_discord::voice_rooms::{
@@ -1010,25 +1014,36 @@ fn health_overwrites(guild_id: Snowflake, channel: &Channel) -> Vec<HealthOverwr
         .collect()
 }
 
-/// One `/setup` line for a missing permission. Ids only: the category or
-/// channel is mentioned, never named.
-#[must_use]
-pub fn health_line(finding: &PermissionFinding) -> String {
-    let permission = match finding.permission {
+fn permission_name(permission: VoicePermission) -> &'static str {
+    match permission {
         VoicePermission::ManageChannels => "Manage Channels",
         VoicePermission::MoveMembers => "Move Members",
         VoicePermission::ManageRoles => "Manage Roles",
         VoicePermission::ViewChannel => "View Channel",
-    };
+    }
+}
+
+/// What removes one permission from the bot, naming the category or channel
+/// override responsible. Ids only: the category or channel is mentioned,
+/// never named.
+fn finding_clause(finding: &PermissionFinding) -> String {
+    let permission = permission_name(finding.permission);
     match (finding.scope, finding.category_id, finding.channel_id) {
         (VoicePermissionScope::Category, Some(category), _) => format!(
-            "health: the permission override on category <#{category}> removes {permission} from the bot"
+            "the permission override on category <#{category}> removes {permission} from the bot"
         ),
-        (VoicePermissionScope::Channel, _, Some(channel)) => format!(
-            "health: the permission override on <#{channel}> removes {permission} from the bot"
-        ),
-        _ => format!("health: the bot lacks {permission} for the whole server"),
+        (VoicePermissionScope::Channel, _, Some(channel)) => {
+            format!("the permission override on <#{channel}> removes {permission} from the bot")
+        }
+        _ => format!("the bot lacks {permission} for the whole server"),
     }
+}
+
+/// One `/setup` line for a missing permission. Ids only: the category or
+/// channel is mentioned, never named.
+#[must_use]
+pub fn health_line(finding: &PermissionFinding) -> String {
+    format!("health: {}", finding_clause(finding))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1045,6 +1060,31 @@ pub enum LifecycleFailure {
         channel_id: Option<Snowflake>,
         error: StoreError,
     },
+    /// Discord (or the live permission cache) refused a join-time write for a
+    /// missing permission. `findings` is the health check's attribution for
+    /// `channel_id`; empty when the cache shows nothing missing (a refusal
+    /// the cache could not explain, such as a missing Connect or stale roles).
+    MissingPermission {
+        write: RefusedWrite,
+        channel_id: Snowflake,
+        findings: Vec<PermissionFinding>,
+    },
+    /// The joiner's room name, and even the bare template, is blocked by the
+    /// automod name filter: no room was created. An operator misconfiguration
+    /// to fix, not a member to punish.
+    NameBlocked {
+        creator_id: Snowflake,
+        error: NameError,
+    },
+}
+
+/// The join-time Discord write that was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedWrite {
+    /// Creating the room channel (needs Manage Channels).
+    Create,
+    /// Moving the joiner into the new room (needs Move Members).
+    Move,
 }
 
 #[derive(Debug, Clone)]
@@ -1095,6 +1135,10 @@ pub struct GuildRoomWorker<S, H> {
     /// from the payload.
     vote_refs: HashMap<Snowflake, VoteKickRef>,
     active_votes: Vec<VoteKickRef>,
+    /// Automod policy the create-path name filter runs under. The default
+    /// policy still blocks invite and external links; the runtime installs the
+    /// configured word list through [`GuildRoomWorker::with_name_policy`].
+    name_policy: Arc<AutomodPolicy>,
 }
 
 /// Why `/kick` could not start or accept a ballot.
@@ -1181,13 +1225,27 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             votes: VoteKickCore::new(),
             vote_refs: HashMap::new(),
             active_votes: Vec::new(),
+            name_policy: Arc::new(AutomodPolicy::default()),
         })
     }
 
+    /// Run the create-path name filter under `policy` from here on.
+    #[must_use]
+    pub fn with_name_policy(mut self, policy: Arc<AutomodPolicy>) -> Self {
+        self.name_policy = policy;
+        self
+    }
+
+    /// Accept one join-to-create ticket. `display` is the joiner's display
+    /// name: the room name is rendered from it and passed through the automod
+    /// name filter before anything is queued. A name containing a blocked term
+    /// is retried without the username; when even the bare template is
+    /// blocked, no create is queued and the refusal is recorded as
+    /// [`LifecycleFailure::NameBlocked`]. Returns whether a create was queued.
     pub fn accept_join(
         &mut self,
         ticket: JoinTicket,
-        name: String,
+        display: &str,
         seed: u64,
         created_at: String,
     ) -> bool {
@@ -1209,6 +1267,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
         self.accepted
             .insert(ticket.member_id, (ticket.generation, ticket.transition));
+        let context = NameFilterContext {
+            guild_id: self.live.guild_id.to_string(),
+            channel_id: ticket.creator_id.to_string(),
+            user_id: ticket.member_id.to_string(),
+        };
+        let name = match resolve_room_name(display, &self.name_policy, &context) {
+            Ok(resolved) => resolved.name,
+            Err(blocked) => {
+                self.record(LifecycleFailure::NameBlocked {
+                    creator_id: ticket.creator_id,
+                    error: blocked.error,
+                });
+                return false;
+            }
+        };
         let id = self.queue.enqueue(
             self.live.guild_id,
             RoomAction::CreateRoom {
@@ -2103,10 +2176,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             observe_voice_operation("create", "category_full");
                         } else if error != RoomHttpError::Cancelled {
                             let outcome = voice_outcome_from_http(&error);
-                            self.record(LifecycleFailure::Discord {
-                                channel_id: creator_channel_id,
-                                error,
-                            });
+                            self.record_refusal(RefusedWrite::Create, creator_channel_id, error);
                             observe_voice_operation("create", outcome);
                         }
                         self.creations.remove(&action.id);
@@ -2189,7 +2259,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         if error != RoomHttpError::Cancelled {
                             observe_voice_operation("create", voice_outcome_from_http(&error));
                         }
-                        self.complete_error(action, creator_channel_id, error);
+                        self.finish_error(
+                            action,
+                            creator_channel_id,
+                            error,
+                            Some(RefusedWrite::Create),
+                        );
                     }
                 }
             }
@@ -2247,7 +2322,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         if error != RoomHttpError::Cancelled {
                             observe_voice_operation("move", voice_outcome_from_http(&error));
                         }
-                        self.complete_error(action, channel_id, error);
+                        self.finish_error(action, channel_id, error, Some(RefusedWrite::Move));
                         self.queue_delete(channel_id, true);
                         self.observe_voice_state();
                     }
@@ -2953,11 +3028,45 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         channel_id: Snowflake,
         error: RoomHttpError,
     ) {
+        self.finish_error(action, channel_id, error, None);
+    }
+
+    /// Settle a failed write. A join-time create or move (`write` set) that
+    /// Discord or the permission cache refused for access names the missing
+    /// permission; every other failure keeps the plain Discord line.
+    fn finish_error(
+        &mut self,
+        action: QueuedAction,
+        channel_id: Snowflake,
+        error: RoomHttpError,
+        write: Option<RefusedWrite>,
+    ) {
         self.queue.mark_succeeded(&action);
         if error == RoomHttpError::Unauthorized {
             self.halted = true;
         }
-        if error != RoomHttpError::Cancelled {
+        if error == RoomHttpError::Cancelled {
+            return;
+        }
+        match write {
+            Some(write) => self.record_refusal(write, channel_id, error),
+            None => self.record(LifecycleFailure::Discord { channel_id, error }),
+        }
+    }
+
+    /// Record a refused join-time write. An access refusal becomes
+    /// [`LifecycleFailure::MissingPermission`], carrying the health check's
+    /// attribution for `channel_id` so the notice and `/setup` line name the
+    /// permission and the category or channel override that removes it.
+    fn record_refusal(&mut self, write: RefusedWrite, channel_id: Snowflake, error: RoomHttpError) {
+        if error == RoomHttpError::AccessDenied {
+            let findings = self.live.permission_findings(&[channel_id]);
+            self.record(LifecycleFailure::MissingPermission {
+                write,
+                channel_id,
+                findings,
+            });
+        } else {
             self.record(LifecycleFailure::Discord { channel_id, error });
         }
     }
@@ -3007,7 +3116,9 @@ enum ActorCommand {
     Reconcile,
     Join {
         ticket: JoinTicket,
-        name: String,
+        /// The joiner's display name; the worker renders and filters the room
+        /// name from it.
+        display: String,
         seed: u64,
         created_at: String,
     },
@@ -3097,6 +3208,8 @@ pub struct VoiceRuntime<S, H> {
     /// hash). Confirm consumes the entry, so a double click cannot apply
     /// twice; Cancel and expiry remove it with no write.
     pending_imports: Mutex<HashMap<(Snowflake, Snowflake, String), PendingImport>>,
+    /// Automod policy every room-name and `/create` name is filtered under.
+    name_policy: Arc<AutomodPolicy>,
 }
 
 impl<S, H> VoiceRuntime<S, H>
@@ -3120,7 +3233,16 @@ where
             actors: Mutex::new(HashMap::new()),
             access_lock: tokio::sync::Mutex::new(()),
             pending_imports: Mutex::new(HashMap::new()),
+            name_policy: Arc::new(AutomodPolicy::default()),
         }
+    }
+
+    /// Filter room names under the guild's configured automod policy. Without
+    /// this the default policy applies (links blocked, no word list).
+    #[must_use]
+    pub fn with_name_policy(mut self, policy: AutomodPolicy) -> Self {
+        self.name_policy = Arc::new(policy);
+        self
     }
 
     fn live_actor(&self, guild: Snowflake) -> Option<GuildActor> {
@@ -3152,11 +3274,13 @@ where
         let live = actor.live.clone();
         let make = Arc::clone(&self.make);
         let tick = self.tick;
+        let name_policy = Arc::clone(&self.name_policy);
         tokio::spawn(async move {
             let (store, http) = make();
-            let Ok(mut worker) = GuildRoomWorker::load(live, store, http).await else {
+            let Ok(worker) = GuildRoomWorker::load(live, store, http).await else {
                 return;
             };
+            let mut worker = worker.with_name_policy(name_policy);
             run_actor(&mut worker, rx, tick).await;
         });
         actors.insert(guild, actor.clone());
@@ -3190,7 +3314,7 @@ where
         member: Snowflake,
         channel: Option<Snowflake>,
         bot: Option<bool>,
-        name: String,
+        display: String,
     ) -> bool {
         let Some(actor) = self.live_actor(guild) else {
             return false;
@@ -3198,7 +3322,7 @@ where
         let command = match actor.live.voice_update(member, channel, bot) {
             Some(ticket) => ActorCommand::Join {
                 ticket,
-                name,
+                display,
                 seed: self.seeds.fetch_add(1, Ordering::Relaxed),
                 created_at: now_iso(),
             },
@@ -3336,6 +3460,24 @@ where
         }
     }
 
+    /// Pass an admin-supplied `/create` name through the same automod name
+    /// filter as generated room names. Returns the sanitized name to create
+    /// with, or the user-facing refusal; nothing is created for a refusal.
+    fn filter_creator_name(
+        &self,
+        guild_id: Snowflake,
+        channel_id: Snowflake,
+        user_id: Snowflake,
+        name: &str,
+    ) -> Result<String, String> {
+        let context = NameFilterContext {
+            guild_id: guild_id.to_string(),
+            channel_id: channel_id.to_string(),
+            user_id: user_id.to_string(),
+        };
+        filter_channel_name(name, &self.name_policy, &context).map_err(|error| error.to_string())
+    }
+
     fn creator_added(&self, creator: &CreatorChannel, channel: Channel) {
         if let Some(actor) = self.live_actor(creator.guild_id) {
             actor.live.upsert_channel(channel);
@@ -3441,13 +3583,12 @@ where
                 };
                 let member_id = update.user_id.get();
                 let bot = update.member.as_ref().map(|member| member.user.bot);
-                let name = room_name(&display_name(cache, guild_id, member_id));
                 self.voice_frame(
                     guild_id,
                     member_id,
                     update.channel_id.map(|id| id.get()),
                     bot,
-                    name,
+                    display_name(cache, guild_id, member_id),
                 );
             }
             Event::ChannelCreate(created) => {
@@ -3575,11 +3716,11 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         ActorCommand::Reconcile => worker.reconcile(),
         ActorCommand::Join {
             ticket,
-            name,
+            display,
             seed,
             created_at,
         } => {
-            worker.accept_join(ticket, name, seed, created_at);
+            worker.accept_join(ticket, &display, seed, created_at);
             worker.reconcile();
         }
         ActorCommand::CreatorAdded(creator) => {
@@ -3638,16 +3779,20 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
 pub fn build_production_runtime(
     token: &str,
     pool: sqlx::PgPool,
+    name_policy: AutomodPolicy,
 ) -> Result<VoiceResponder<PgRoomStore, RoomHttp, RoomHttp>, RoomHttpError> {
     let replies = RoomHttp::new(token.to_owned())?;
     let http = replies.clone();
     let store = PgRoomStore::new(pool);
     Ok(VoiceResponder::new(
-        Arc::new(VoiceRuntime::new(
-            move || (store.clone(), http.clone()),
-            Duration::from_millis(250),
-            true,
-        )),
+        Arc::new(
+            VoiceRuntime::new(
+                move || (store.clone(), http.clone()),
+                Duration::from_millis(250),
+                true,
+            )
+            .with_name_policy(name_policy),
+        ),
         Arc::new(replies),
     ))
 }
@@ -3791,17 +3936,25 @@ fn initial_seed() -> u64 {
         .unwrap_or(0x9E37_79B9_7F4A_7C15)
 }
 
-/// V1 room name until the V5 template engine owns naming: the joiner's
-/// display name, truncated to the Discord 100-character ceiling.
-fn room_name(display: &str) -> String {
-    const SUFFIX: &str = "'s room";
-    let base = format!("{display}{SUFFIX}");
-    if base.chars().count() <= MAX_CHANNEL_NAME_LEN as usize {
-        return base;
-    }
-    let keep = (MAX_CHANNEL_NAME_LEN as usize).saturating_sub(SUFFIX.chars().count());
-    let head: String = display.chars().take(keep).collect();
-    format!("{head}{SUFFIX}")
+/// V1 room-name template until the V5 engine owns naming, in the legacy
+/// placeholder syntax the create-path filter renders.
+const ROOM_NAME_TEMPLATE: &str = "{username}'s room";
+/// Characters of the template's fixed text, which a long display name must
+/// leave room for inside the Discord 100-character ceiling.
+const ROOM_NAME_SUFFIX_CHARS: usize = "'s room".len();
+
+/// The V1 room name for a joiner, passed through the automod name filter: the
+/// joiner's display name plus the template suffix, truncated to the Discord
+/// ceiling by shortening the display name. A name containing a blocked term is
+/// retried without the username; only a blocked bare template is refused.
+fn resolve_room_name(
+    display: &str,
+    policy: &AutomodPolicy,
+    context: &NameFilterContext,
+) -> Result<ResolvedRoomName, BlockedRoomName> {
+    let keep = (MAX_CHANNEL_NAME_LEN as usize).saturating_sub(ROOM_NAME_SUFFIX_CHARS);
+    let username: String = display.chars().take(keep).collect();
+    resolve_create_name(ROOM_NAME_TEMPLATE, &username, 0, 0, policy, context)
 }
 
 // --- `/create` + `/setup` decisions (pure, no Discord) -------------------------
@@ -5261,6 +5414,36 @@ fn failure_line(failure: &LifecycleFailure) -> String {
             Some(channel) => format!("store <#{channel}>: {error:?}"),
             None => format!("store: {error:?}"),
         },
+        LifecycleFailure::MissingPermission {
+            write,
+            channel_id,
+            findings,
+        } => {
+            let (verb, doing, lead) = match write {
+                RefusedWrite::Create => ("create", "creating the room", "Manage Channels"),
+                RefusedWrite::Move => ("move", "moving the member into the room", "Move Members"),
+            };
+            if findings.is_empty() {
+                format!(
+                    "{verb} <#{channel_id}>: Discord refused {doing}; the bot needs {lead} (and View Channel and Connect) on <#{channel_id}> and its category, so check for a deny override"
+                )
+            } else {
+                let causes: Vec<String> = findings.iter().map(finding_clause).collect();
+                format!(
+                    "{verb} <#{channel_id}>: Discord refused {doing}; {}",
+                    causes.join("; ")
+                )
+            }
+        }
+        LifecycleFailure::NameBlocked { creator_id, error } => {
+            let why = error.filter().map_or_else(
+                || "invalid name".to_owned(),
+                |filter| filter.as_str().replace('_', " "),
+            );
+            format!(
+                "create <#{creator_id}>: {NAME_BLOCKED_AUDIT_REASON}, no room created (the room name template is blocked by the automod name filter: {why}); fix the template or the automod policy"
+            )
+        }
     }
 }
 
@@ -5694,11 +5877,21 @@ where
             let text = match decide_create_channel(CreateChannelRequest { guild_id, name }) {
                 CreateChannelPlan::Refuse { message } => message,
                 CreateChannelPlan::Create { guild_id, name } => {
-                    let (store, http) = runtime.make_pair();
-                    execute_create(&store, &http, guild_id, &name, |creator, channel| {
-                        runtime.creator_added(creator, channel);
-                    })
-                    .await
+                    let channel_id = interaction
+                        .channel
+                        .as_ref()
+                        .map_or(0, |channel| channel.id.get());
+                    let user_id = interaction.author_id().map_or(0, |id| id.get());
+                    match runtime.filter_creator_name(guild_id, channel_id, user_id, &name) {
+                        Err(refusal) => refusal,
+                        Ok(name) => {
+                            let (store, http) = runtime.make_pair();
+                            execute_create(&store, &http, guild_id, &name, |creator, channel| {
+                                runtime.creator_added(creator, channel);
+                            })
+                            .await
+                        }
+                    }
                 }
             };
             reply(ephemeral_response(&text)).await;
