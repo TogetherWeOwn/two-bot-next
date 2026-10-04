@@ -192,25 +192,6 @@ def parse_readyz(status, value):
     return state, value
 
 
-def check_readyz(origin, fetch_fn):
-    status, _, value = get_json(fetch_fn, origin + "/readyz", "readyz")
-    state, _ = parse_readyz(status, value)
-    expected = 200 if all(text == "ready" for text in state.values()) else 503
-    if status != expected:
-        raise ProbeError(f"readyz {status} contradicts the component breakdown "
-                         f"(expected {expected})")
-    if status == 200:
-        return "readyz 200: every component ready"
-    down = sorted(name for name, text in state.items() if text != "ready")
-    failure = value.get("gateway_failure") or {}
-    if failure.get("class") == DB_BEHIND_CLASS:
-        raise ProbeError(f"readyz 503: db-behind-binary signature "
-                         f"(gateway_failure durable_gateway:{DB_BEHIND_CLASS}); "
-                         "migrate before redeploying")
-    raise ProbeError(f"readyz 503: parked ({', '.join(down)} not ready); "
-                     "truthful, not E2E approval")
-
-
 def check_build(report, expected_sha):
     if not isinstance(report, dict):
         return Result("build", False, "no readyz body to read build identity from")
