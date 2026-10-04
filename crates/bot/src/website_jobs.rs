@@ -198,7 +198,9 @@ pub async fn serve(
                         }),
                     });
                 }
-                registered.push(scheduled_jobs::register(context.clone()));
+                let scheduled = scheduled_jobs::register(context.clone());
+                let scheduled_parked = scheduled.is_none();
+                registered.extend(scheduled);
                 // The unban sweep shares the boot-composed member consumer:
                 // one guild store across commands and sweep, never a second
                 // same-guild consumer with its own local queues.
@@ -208,6 +210,9 @@ pub async fn serve(
                 let registration = community_jobs::register(context.clone());
                 registered.extend(registration.jobs);
                 parked = registration.parked;
+                if scheduled_parked {
+                    parked.push(scheduled_jobs::NAMES[0]);
+                }
                 if let Some(job) = feed_jobs::register(context.clone()) {
                     registered.push(job);
                 } else {

@@ -1224,6 +1224,33 @@ async fn foreign_non_moderation_commands_remain_silent() {
     mock.shutdown().await;
 }
 
+/// The inner leveling fence (legacy 7df2a95, `registerLeveling`): a foreign or
+/// missing guild returns `Ok(false)` before the profile or leaderboard read.
+/// The pool here is a never-used lazy connection to a closed port, so a read
+/// moved ahead of the fence would fail this test instead of passing silently.
+#[tokio::test]
+async fn leveling_interaction_fence_precedes_any_store_read() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    let leveling = runtime.leveling();
+    for (name, handler) in [
+        ("rank", two_bot_core::HandlerId::Rank),
+        ("leaderboard", two_bot_core::HandlerId::Leaderboard),
+    ] {
+        for guild in [Some(Id::new(9999)), None] {
+            let mut interaction = slash(name, Some(CHANNEL), Vec::new());
+            interaction.guild_id = guild;
+            let handled = leveling
+                .handle_interaction(&interaction, handler)
+                .await
+                .expect("the guild fence returns before any store read");
+            assert!(!handled, "{name} in guild {guild:?} is not handled");
+        }
+    }
+    assert!(mock.requests().is_empty(), "no foreign-guild effects");
+    mock.shutdown().await;
+}
+
 #[tokio::test]
 async fn foreign_moderation_preserves_the_router_guild_refusal() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
