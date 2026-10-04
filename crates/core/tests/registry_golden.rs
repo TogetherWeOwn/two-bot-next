@@ -120,7 +120,13 @@ fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
         .join("\n")
         .contains("unexpected_field"));
     let mut reordered = next_registry();
-    reordered[11]["options"].as_array_mut().unwrap().swap(0, 1); // /rsvp
+    let rsvp = reordered
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|command| command["name"] == "rsvp")
+        .expect("rsvp is published");
+    rsvp["options"].as_array_mut().unwrap().swap(0, 1);
     assert!(!registry_diff(reordered).is_empty());
 }
 
