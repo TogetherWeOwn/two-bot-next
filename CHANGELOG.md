@@ -90,7 +90,7 @@
   catalogue or a failed identity read parks the surface and the job.
 - Pure `scan_joins_for_bursts` raid replay over recorded joins (fresh watch per
   call, instant-ordered, strict RFC 3339) with the legacy historical-raid
-  scenarios as integration tests. No runtime or database wiring. (TOG-12378)
+  scenarios as integration tests. No runtime or database wiring.
 - Wire leveling through the shared command runtime, interaction router and REST executor with ordered, awaited gateway awards. Preserve message eligibility, measured voice duration, session/dry-run reward suppression, ephemeral rank and mention-suppressed public top 10. Ordinary level-ups only grant roles; explicit revokes require a pinned staging fence and whole-set permission/hierarchy preflight. Mock REST and migrated disposable database proofs run in CI, including a shared-runtime single-callback regression.
 - Wire LFG commands and role selects through the shared interaction runtime and REST executor, with ephemeral replies, mention-free message refresh, serialized capacity/closure, nonce recovery, failed-post cleanup and shared announcement audit outcomes.
 - Add bounded component-bearing posts, member-role deltas and deferred-response edits to the shared Discord executor, with explicit onboarding mention/menu rendering and fail-closed per-guild configuration. Wire pre-update gateway capture and shared-router orchestration with live settings/permissions, guarded welcomes and post-role routing; verify through mock Discord and isolated testdb acceptance. Persist pre-pipeline welcome/goodbye jobs atomically with gateway checkpoints and bound restart attempts; retain token-free interrupted-component receipts instead of replaying uncertain role writes. Commit anchor marker/routing together and finish deferred processing errors with bounded honest replies. Recovery validation remains in progress; no live activation is claimed.
@@ -98,7 +98,7 @@
   staging/live-approval and dry-run fences, protected-target enforcement plans,
   repeat-history expiration, and replay-safe delivery claims with the
   legacy-compatible once-per-message violation ledger. Shared executor/shard
-  activation is not enabled by this slice. (TOG-10089)
+  activation is not enabled by this slice.
 - Scheduled-message domain logic, PostgreSQL store and migration, with validation, prefix-resolved removal, recurring timing and retry outcomes. Discord router/executor wiring follows separately.
 - Scheduled-store integration tests run against the isolated PostgreSQL service container in CI.
 - Add ticket lifecycle domain logic and guild-scoped Postgres persistence, with atomic transcript capture, 300-second cooldowns, restart-recovery plans and 90-day transcript purge. Shared-router/REST runtime wiring remains pending.
@@ -152,7 +152,7 @@
 ### Security
 
 - Require authenticated TLS for `two_bot_cutover::connect` (threat-model F6). `TWO_DATABASE_TLS` defaults to `required`, which refuses local hosts and missing, `disable`, `allow` or `prefer` sslmode, and always connects as `verify-full`. `local-only` (tests and CI only) allows loopback, CI service and socket hosts and refuses remote ones. Refusals are fixed strings that never echo the URL. See `docs/database-tls.md`.
-- Fence the remaining Postgres connect paths with the same TLS policy (threat-model F6): the gateway store pool, both `two-bot backup` URL parses, and `channel_moderation_store::connect`. Each refuses a `sslmode=disable` remote URL with the same fixed string and connects `Required` URLs as `verify-full`. (TOG-12208)
+- Fence the remaining Postgres connect paths with the same TLS policy (threat-model F6): the gateway store pool, both `two-bot backup` URL parses, and `channel_moderation_store::connect`. Each refuses a `sslmode=disable` remote URL with the same fixed string and connects `Required` URLs as `verify-full`.
 
 ### Fixed
 
@@ -167,18 +167,18 @@
   text, not an invalid YAML mapping; retain the isolated mocked acceptance opt-in.
 - Accept and strip Neon's `channel_binding` URL option before SQLx without changing TLS mode; retain fatal startup exits with fixed, credential-safe diagnostics and sanitized Worker HTTP 500 responses. Gate staging deployments on the intended new container rollout, immutable image/build identity and serving Worker version; parked readiness 503 no longer passes deployment acceptance.
 - Keep parallel settings DB fixture schemas distinct when wall-clock readings
-  repeat, without sharing schemas or serializing the CAS regressions. (TOG-10089)
+  repeat, without sharing schemas or serializing the CAS regressions.
 - Grant runtime-only CRUD on the automod relations and cover migrations 0220–0223
   in least-privilege role tests. Keep edit retry identity stable across member
   role changes, and inspect updates without replacing or evicting CREATE repeat
-  history needed by queued deliveries. (TOG-10089)
+  history needed by queued deliveries.
 - Give owned disposable-database teardown a separate finite 30-second statement
   timeout for checkpoint waits, retaining five-second fixture query deadlines and
   verified cleanup after failures or caller cancellation.
 - Bound automod repeat inspection to each revision's time window without letting
   unstamped updates prune delayed creates; retain immutable CREATE facts during
   role enrichment and clarify enforce-only preserved-match recovery. Run the
-  preserved-replay database regression alongside durable dedupe in CI. (TOG-10089)
+  preserved-replay database regression alongside durable dedupe in CI.
 - Redact automod delivery-claim capabilities from derived debug output, including
   acquired and preserved results; expose tokens only at SQL fencing binds.
 - Grant the least-privilege runtime role scheduled-message CRUD and claim access, with web-reader denial coverage.
