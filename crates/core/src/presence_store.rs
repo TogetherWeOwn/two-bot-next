@@ -374,7 +374,7 @@ mod tests {
         }
         sqlx::query(
             "INSERT INTO presence_probe (guild_id, observed_at, approximate_presence_count)
-             VALUES ('guild-b', '2026-08-25T00:00:00.000Z', 5)",
+             VALUES ('guild-b', '2026-08-20T00:00:00.000Z', 5)",
         )
         .execute(&pool)
         .await
@@ -395,19 +395,18 @@ mod tests {
         assert!(windowed
             .windows(2)
             .all(|w| w[0].observed_at_ms < w[1].observed_at_ms));
-        // Another guild never leaks into the window, and an absent bound is the
-        // old whole-series read.
-        assert_eq!(
-            read_series_since(&pool, "guild-b", None)
-                .await
-                .expect("other guild")
-                .len(),
-            1
-        );
-        assert!(read_series_since(&pool, "guild-b", Some(&since))
-            .await
-            .expect("other guild windowed")
-            .is_empty());
+        // The other guild's row sits inside the window: it is neither in
+        // guild-a's 28 rows nor hidden from its own read, and an absent bound
+        // is the old whole-series read.
+        for bound in [None, Some(since.as_str())] {
+            assert_eq!(
+                read_series_since(&pool, "guild-b", bound)
+                    .await
+                    .expect("other guild")
+                    .len(),
+                1
+            );
+        }
         drop_schema(&pool, &schema).await;
     }
 
