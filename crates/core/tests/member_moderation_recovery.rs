@@ -54,7 +54,7 @@ fn execution(action: ModerationAction, id: &str) -> MemberExecution {
             is_bot: false,
             is_guild_owner: false,
         }),
-        bot_highest_role_position: Some(100),
+        bot_highest_role_position: 100,
         reason: "spam".into(),
         duration_seconds: Some(3600),
         request_id: id.into(),

@@ -4,6 +4,7 @@ import contextlib
 import io
 import os
 from pathlib import Path
+import re
 import tempfile
 import textwrap
 import unittest
@@ -13,10 +14,19 @@ from unittest import mock
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/check.yml"
 
 
+MARKER = "      - name: Pin native tests to one CPU (loaded-runner validation)\n"
+# A step ends at the next list item or comment at step indent; blank lines
+# inside its heredoc are indented deeper, so they never match.
+STEP_END = re.compile(r"\n\n      (?:- |#)")
+
+
+def pin_steps():
+    """Every copy of the pin step, one per native-test lane."""
+    return [STEP_END.split(part, 1)[0] for part in WORKFLOW.read_text().split(MARKER)[1:]]
+
+
 def validation_script():
-    workflow = WORKFLOW.read_text()
-    marker = "      - name: Pin native tests to one CPU (loaded-runner validation)\n"
-    step = workflow.split(marker, 1)[1].split("      # Fail-fast (TOG-12055)", 1)[0]
+    step = pin_steps()[0]
     assert "if: github.event_name == 'workflow_dispatch' && inputs.single_core_tests" in step
     return textwrap.dedent(step.split("python3 - <<'PY'\n", 1)[1].rsplit("          PY", 1)[0])
 
@@ -73,6 +83,13 @@ class SingleCoreValidationTests(unittest.TestCase):
         for threads in ["0", "-1", "not-a-count", "2\n"]:
             with self.subTest(threads=threads), self.assertRaisesRegex(SystemExit, "positive RUST_TEST_THREADS"):
                 self.run_script(threads)
+
+    def test_every_native_test_lane_carries_the_same_pin(self):
+        # The opt-in flake validation must cover every lane that runs native
+        # test binaries: rust-tests and both database lanes, and nothing else.
+        steps = pin_steps()
+        self.assertEqual(len(steps), 3)
+        self.assertEqual(len(set(steps)), 1, "the lanes' pin steps drifted apart")
 
     def test_missing_taskset_fails_instead_of_claiming_load_validation(self):
         with mock.patch("shutil.which", return_value=None):

@@ -7,7 +7,8 @@
 //!   actionable copy (Discord permission name, slash command, granter).
 //! - policy/executor (`MemberModerationService::execute`): the same bit plus
 //!   bot-then-actor hierarchy, each refusal carrying its exact user-facing
-//!   copy. A refused ban never touches Discord and never writes an audit.
+//!   copy. A policy-refused ban writes a denied audit without touching Discord
+//!   or claiming the idempotency key.
 //! - audit: a successful ban writes exactly one `moderation_audit` row shaped
 //!   like legacy (`moderation.ban` / `banned`, guild/actor/target/request and
 //!   idempotency binding, trimmed reason, duration-free metadata plus the
@@ -96,7 +97,7 @@ fn ban_execution() -> MemberExecution {
         guild_id: GUILD_ID.to_owned(),
         actor: actor_with(PERM_BAN_MEMBERS, 50),
         target: Some(plain_target(10)),
-        bot_highest_role_position: Some(100),
+        bot_highest_role_position: 100,
         reason: "spam in #general".to_owned(),
         duration_seconds: None,
         request_id: "req-ban".to_owned(),
@@ -109,6 +110,23 @@ fn service_with(
     store: MemMemberStore,
 ) -> MemberModerationService<MockMemberDiscord, MemMemberStore, fn() -> i64> {
     MemberModerationService::new(discord, store, policy(), || 1_700_000_000_000)
+}
+
+fn assert_policy_denial(store: &MemMemberStore) {
+    let audits = store.audits();
+    assert_eq!(audits.len(), 1);
+    let row = &audits[0];
+    assert_eq!(row.action, "moderation.ban");
+    assert_eq!(row.outcome, "denied");
+    assert_eq!(row.request_id, "req-ban:denied");
+    assert_eq!(row.idempotency_key, "req-ban");
+    assert_eq!(row.reason, "Member moderation policy refused the request");
+    let metadata: serde_json::Value =
+        serde_json::from_str(&row.metadata_json).expect("audit metadata is JSON");
+    assert_eq!(
+        metadata,
+        serde_json::json!({ "stage": "policy", "request_id": "req-ban" })
+    );
 }
 
 #[test]
@@ -191,7 +209,7 @@ async fn ban_executor_refuses_missing_permission_with_legacy_copy() {
     );
     assert_eq!(err.to_string(), BAN_POLICY_DENIED_COPY);
     assert_eq!(discord.call_count("ban"), 0);
-    assert!(store.audits().is_empty());
+    assert_policy_denial(&store);
 }
 
 #[tokio::test]
@@ -201,7 +219,7 @@ async fn ban_hierarchy_denials_name_the_rank_with_exact_copy() {
     let store = MemMemberStore::new();
     let svc = service_with(discord.clone(), store.clone());
     let mut exec = ban_execution();
-    exec.bot_highest_role_position = Some(10);
+    exec.bot_highest_role_position = 10;
     let err = svc
         .execute(&exec)
         .await
@@ -224,7 +242,7 @@ async fn ban_hierarchy_denials_name_the_rank_with_exact_copy() {
 
     // Both sides fail at once: the bot refusal wins (policy order).
     let mut exec = ban_execution();
-    exec.bot_highest_role_position = Some(10);
+    exec.bot_highest_role_position = 10;
     exec.target
         .as_mut()
         .expect("ban target")
@@ -236,9 +254,9 @@ async fn ban_hierarchy_denials_name_the_rank_with_exact_copy() {
     assert_eq!(err, MemberError::Policy(PolicyError::BotHierarchy));
     assert_eq!(err.to_string(), BOT_HIERARCHY_COPY);
 
-    // No refused ban may mutate or record.
+    // Repeated policy refusals never mutate and share one denied audit row.
     assert_eq!(discord.call_count("ban"), 0);
-    assert!(store.audits().is_empty());
+    assert_policy_denial(&store);
 }
 
 #[tokio::test]

@@ -4,8 +4,9 @@
 //! security contract: (a) no output grants a bit the source did not allow,
 //! except the documented owner/required-role grants on their own targets,
 //! (b) deny wins over allow on every output target, (c) no duplicate
-//! targets. An extra property proves owner grants can never carry Manage
-//! Roles or Administrator, however the caller sets `owner_extra_allow`.
+//! targets, (d) no emitted allow includes Manage Roles, even if inherited.
+//! Newly added owner grants still cannot carry Manage Roles or Administrator,
+//! however the caller sets `owner_extra_allow`.
 //!
 //! No tests in this fixture use a database, Redis, Discord, or a staging
 //! identity.
@@ -108,6 +109,73 @@ fn public_room_copies_source_and_adds_owner_grant() {
         &member(OWNER, OWNER_ALLOW_BITS, 0)
     );
     assert_eq!(list.len(), 3);
+}
+
+#[test]
+fn inherited_manage_roles_is_removed_from_every_allow_and_denies_are_preserved() {
+    let source = [
+        role(
+            EVERYONE,
+            PERM_MANAGE_ROLES | PERM_VIEW_CHANNEL | PERM_CONNECT,
+            0,
+        ),
+        member(OWNER, PERM_MANAGE_ROLES | PERM_VIEW_CHANNEL, PERM_SPEAK),
+        role(REQUIRED, PERM_MANAGE_ROLES | PERM_VIEW_CHANNEL, 0),
+        role(
+            300,
+            PERM_MANAGE_ROLES | PERM_SPEAK,
+            PERM_MANAGE_ROLES | PERM_CONNECT,
+        ),
+        member(400, PERM_MANAGE_ROLES | PERM_SPEAK, PERM_VIEW_CHANNEL),
+        member(900, PERM_MANAGE_ROLES | PERM_CONNECT, 0),
+    ];
+    for source_kind in [
+        InheritanceSource::CreatorChannel,
+        InheritanceSource::Category,
+        InheritanceSource::ChosenChannel,
+    ] {
+        for private in [false, true] {
+            let input = RoomPermissionInput {
+                source: source_kind,
+                source_overrides: &source,
+                owner_extra_allow: u64::MAX,
+                required_role: Some(REQUIRED),
+                ..base(private)
+            };
+            let list = overrides(plan_room_overrides(&input).unwrap());
+            assert_eq!(list.len(), source.len());
+            for entry in &list {
+                assert_eq!(entry.allow & PERM_MANAGE_ROLES, 0, "{entry:?}");
+                assert_eq!(entry.allow & entry.deny, 0, "{entry:?}");
+            }
+            for original in &source {
+                let entry = find(&list, original.id, original.kind);
+                assert_eq!(entry.deny & original.deny, original.deny);
+                let added_deny = if private && original.id == EVERYONE {
+                    PRIVATE_EVERYONE_DENY
+                } else {
+                    0
+                };
+                assert_eq!(entry.deny, original.deny | added_deny);
+                assert_eq!(
+                    entry.allow & original.allow & !PERM_MANAGE_ROLES,
+                    original.allow & !PERM_MANAGE_ROLES & !entry.deny
+                );
+            }
+            let owner = find(&list, OWNER, OverrideKind::Member);
+            assert_eq!(owner.allow, OWNER_EXTRA_MASK & !PERM_SPEAK);
+            assert_eq!(owner.allow & PERM_ADMINISTRATOR, 0);
+            let required = find(&list, REQUIRED, OverrideKind::Role);
+            assert_eq!(
+                required.allow,
+                if private {
+                    REQUIRED_ROLE_ALLOW_BITS
+                } else {
+                    PERM_VIEW_CHANNEL
+                }
+            );
+        }
+    }
 }
 
 #[test]
@@ -360,6 +428,8 @@ proptest! {
         for o in &list {
             prop_assert!(seen.insert((o.id, o.kind)), "duplicate target {o:?}");
             prop_assert!(o.id != 0, "zero id in output");
+            // No create-time overwrite can confer Manage Roles, even from a source.
+            prop_assert_eq!(o.allow & PERM_MANAGE_ROLES, 0, "Manage Roles on {:?}", o);
             // (b) Deny wins over allow on every output target.
             prop_assert_eq!(o.allow & o.deny, 0, "allow/deny overlap on {:?}", o);
             // (a) No granted bit the source did not allow, except the
@@ -386,9 +456,9 @@ proptest! {
             .find(|o| o.id == OWNER && o.kind == OverrideKind::Member);
         let (src_allow, src_deny) =
             owner_source.map_or((0, 0), |o| (o.allow, o.deny));
-        prop_assert_eq!(owner_out.allow, (src_allow | grant) & !src_deny);
-        // Bits the builder added (beyond the source) never escalate. A
-        // source allow on the owner is inherited, not granted.
+        prop_assert_eq!(owner_out.allow, (src_allow | grant) & !src_deny & !PERM_MANAGE_ROLES);
+        // Newly added owner bits still never escalate; inherited Manage Roles
+        // is forbidden too, as checked for every output target above.
         let added = owner_out.allow & !src_allow;
         prop_assert_eq!(added & (PERM_MANAGE_ROLES | PERM_ADMINISTRATOR), 0);
 

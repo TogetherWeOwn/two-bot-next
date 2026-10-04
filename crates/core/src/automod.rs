@@ -207,6 +207,26 @@ pub struct AutomodMessage {
 }
 
 impl AutomodPolicy {
+    /// Load only the content restrictions used for channel names. Invalid
+    /// chat counts, sanctions or exemptions must not discard configured words
+    /// or domains. This is not a validated chat-moderation configuration.
+    #[must_use]
+    pub fn name_policy_from_map(vars: &HashMap<String, String>) -> Self {
+        let get = |key: &str| vars.get(key).map(String::as_str);
+        Self {
+            bad_words: csv(get("TWO_AUTOMOD_BAD_WORDS"))
+                .into_iter()
+                .map(|word| normalize_content(&word))
+                .filter(|word| !word.is_empty())
+                .collect(),
+            allowed_domains: csv(get("TWO_AUTOMOD_ALLOWED_DOMAINS"))
+                .into_iter()
+                .map(|domain| domain.to_lowercase())
+                .collect(),
+            ..Self::default()
+        }
+    }
+
     /// Service-level exemptions, pure and unit-testable (legacy
     /// `AutomodService.inspect` early returns): bots, exempt channels, and
     /// bypass-role holders are never inspected.
@@ -748,11 +768,6 @@ impl AutomodConfig {
     pub fn from_map(vars: &HashMap<String, String>) -> Result<Self, AutomodGateError> {
         let get = |key: &str| vars.get(key).map(String::as_str);
         let policy = AutomodPolicy {
-            bad_words: csv(get("TWO_AUTOMOD_BAD_WORDS"))
-                .into_iter()
-                .map(|w| normalize_content(&w))
-                .filter(|w| !w.is_empty())
-                .collect(),
             blocked_attachment_extensions: {
                 let raw = get("TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS");
                 let list = if raw.is_none_or(|s| s.is_empty()) {
@@ -767,10 +782,6 @@ impl AutomodConfig {
                     .map(|v| v.to_lowercase().trim_start_matches('.').to_owned())
                     .collect()
             },
-            allowed_domains: csv(get("TWO_AUTOMOD_ALLOWED_DOMAINS"))
-                .into_iter()
-                .map(|d| d.to_lowercase())
-                .collect(),
             repeated_message_count: integer(
                 get("TWO_AUTOMOD_REPEAT_COUNT"),
                 3,
@@ -801,6 +812,7 @@ impl AutomodConfig {
                 "TWO_AUTOMOD_EXEMPT_CHANNEL_IDS",
             )?,
             sanctions: parse_sanctions(get("TWO_AUTOMOD_SANCTIONS"))?,
+            ..AutomodPolicy::name_policy_from_map(vars)
         };
         Ok(Self {
             enabled: vars.get("TWO_AUTOMOD").is_some_and(|v| v == "1"),
@@ -1247,6 +1259,44 @@ mod tests {
             parse_sanctions(Some("1:timeout:30")),
             Err(AutomodGateError::InvalidSanctionTimeout)
         );
+    }
+
+    #[test]
+    fn name_policy_preserves_normalized_content_rules_when_chat_config_is_invalid() {
+        let vars: HashMap<String, String> = [
+            ("TWO_AUTOMOD", "0"),
+            (
+                "TWO_AUTOMOD_BAD_WORDS",
+                " ＢＬＯＲＰ , blocked   phrase , , ",
+            ),
+            ("TWO_AUTOMOD_ALLOWED_DOMAINS", " Trusted.GG , , "),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        let expected = AutomodPolicy::name_policy_from_map(&vars);
+        assert_eq!(expected.bad_words, ["blorp", "blocked phrase"]);
+        assert_eq!(expected.allowed_domains, ["trusted.gg"]);
+        let validated = AutomodConfig::from_map(&vars).unwrap();
+        assert_eq!(validated.policy.bad_words, expected.bad_words);
+        assert_eq!(validated.policy.allowed_domains, expected.allowed_domains);
+        for (key, value) in [
+            ("TWO_AUTOMOD_REPEAT_COUNT", "21"),
+            ("TWO_AUTOMOD_REPEAT_WINDOW_SECONDS", "0"),
+            ("TWO_AUTOMOD_MENTION_LIMIT", "0"),
+            ("TWO_AUTOMOD_SANCTIONS", "1:banhammer"),
+            ("TWO_AUTOMOD_BYPASS_ROLE_IDS", "nope"),
+            ("TWO_AUTOMOD_EXEMPT_CHANNEL_IDS", "nope"),
+        ] {
+            let mut invalid = vars.clone();
+            invalid.insert(key.to_owned(), value.to_owned());
+            assert!(AutomodConfig::from_map(&invalid).is_err(), "{key}");
+            assert_eq!(
+                AutomodPolicy::name_policy_from_map(&invalid),
+                expected,
+                "{key}"
+            );
+        }
     }
 
     #[test]

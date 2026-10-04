@@ -877,3 +877,25 @@ async fn read_rest_request(
     body.truncate(content_len);
     Some((method, path, headers, body))
 }
+
+/// A message snowflake created `age` ago, so purge fixtures sit on a known side
+/// of Discord's 14-day bulk-delete limit. `sequence` keeps the ids distinct.
+pub fn message_id_aged(age: Duration, sequence: u64) -> String {
+    const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_millis() as u64;
+    let created_ms = now_ms - age.as_millis() as u64;
+    (((created_ms - DISCORD_EPOCH_MS) << 22) | sequence).to_string()
+}
+
+/// A message created a minute ago: eligible for bulk delete.
+pub fn fresh_message_id(sequence: u64) -> String {
+    message_id_aged(Duration::from_secs(60), sequence)
+}
+
+/// A message older than the 14-day bulk-delete limit.
+pub fn aged_message_id(sequence: u64) -> String {
+    message_id_aged(Duration::from_secs(20 * 24 * 60 * 60), sequence)
+}

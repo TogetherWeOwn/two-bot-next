@@ -38,13 +38,16 @@ use this reservation/settlement protocol too; the low-level REST executor's
 unrecorded unlock fallback is **not** a durable unlock path.
 
 Lockdown stores the live `@everyone` allow/deny masks before REST and changes
-only `SEND_MESSAGES`. Repeated lockdown preserves the first seed and generation
+only the lockdown bits (`SEND_MESSAGES`, `SEND_MESSAGES_IN_THREADS`,
+`CREATE_PUBLIC_THREADS`, `CREATE_PRIVATE_THREADS`, `ADD_REACTIONS`). A role or
+member overwrite that allows sending still wins. Repeated lockdown preserves the first seed and generation
 while the live send deny remains set. If an external edit clears that deny (or
 removes the overwrite), the next lockdown atomically refreshes the seed and
 recovery generation before PUT.
 
-Unlock reads the live overwrite and restores **only the recorded SEND_MESSAGES
-bits**. All other live allow/deny bits survive, including a newly added
+Unlock reads the live overwrite and restores **only the recorded lockdown
+bits** (a thread or reaction bit only while it still holds the locked state).
+All other live allow/deny bits survive, including a newly added
 `VIEW_CHANNEL` deny. An originally absent overwrite is deleted only when both
 result masks are zero; otherwise unlock PUTs the preserved live masks. Missing
 recovery, unreadable/missing live state, a cleared send deny, or a newly allowed
