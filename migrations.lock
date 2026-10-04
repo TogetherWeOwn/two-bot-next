@@ -249,6 +249,10 @@
       "sha256": "9dfe6648848bc7d42ba7534b710eab36473ac57ad5c4eee26d88d3f453d60b2f",
       "justification": "Voice V2 ownership handoff stamp so the rollback delta keeps measuring rooms whose owner_id changes in place."
     },
+    "crates/cutover/migrations/0413_voice_owner_grants.sql": {
+      "sha256": "08abf240948ea282757a3bd45158f3af83c20a5025c1f4315e9579775371b7f1",
+      "justification": "Persist room-scoped owner-grant recipients and revision-fenced cleanup before Discord writes; retain interrupted and exhausted handoffs for recovery."
+    },
     "crates/cutover/migrations/0414_voice_rooms_custom_name.sql": {
       "sha256": "a0c811fdde11f483bd2eab9cbb55677fff60585063e6b2f608fc4f4b3b5e9f6d",
       "justification": "Voice V3 /name per-room custom-name override plus a change stamp so the rollback delta keeps measuring rooms renamed in place."
