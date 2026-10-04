@@ -4,6 +4,7 @@
 
 ### Added
 
+- Enforce the live-activation identity and capability fence at boot: derive the application id from the bot token (never config), permit every capability only for the staging guild/application pair, and restrict the live pair to the reviewed `LIVE_CLEARED_CAPABILITIES` allowlist (shipped: `self_roles` only). Refused capabilities validate no feature gates, register no commands, construct no runtime, request no privileged intents, and log one structured refusal line while the process stays up for cleared surfaces. The tickets runtime and its ticket-driven `MESSAGE_CONTENT` request land under the same default-deny rule.
 - Register an immediate-first, non-overlapping feed poll job with the existing owned job supervisor, pinned HTTPS connector, shared REST executor and fenced SQLx ledger. Preserve exact string nonces (including decimal-looking values), recover pending deliveries even after items leave the feed, rotate the bounded recovery queue without starving XML-present items, and surface bounded-history misses or uncertain send/completion receipts as recovery-required rather than reposting. Announcements remain off by default; no deployment or activation is included.
 - Add self-role reads and singular role operations to the shared REST executor:
   authoritative member/bot/role/channel policy snapshots, fetched reaction-message

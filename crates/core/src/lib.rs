@@ -6,6 +6,7 @@
 //! or by future transports. Slices S3+ build on these seams.
 
 pub mod action_outcomes;
+pub mod activation;
 pub mod anchor_event;
 pub mod audit;
 pub mod audit_mirror;
@@ -44,6 +45,7 @@ pub mod database_roles;
 pub mod database_tls;
 pub mod database_url;
 pub mod disable_preflight;
+pub mod e2e_matrix;
 pub mod events;
 pub mod evidence;
 pub mod expected_joins;
