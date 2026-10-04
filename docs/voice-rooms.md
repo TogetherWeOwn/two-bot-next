@@ -31,10 +31,7 @@ library code with no Discord dependency and can start immediately.
 - `/create`: makes a new creator channel.
 - `/setup`: status panel with a guided walkthrough, health check, recent failures,
   the creator-channel list, a "New creator channel" quick action and "More
-  settings". Anyone can run it, but only an admin sees the detail (creator
-  channels, store errors, failures and permission gaps) and the actions. Everyone
-  else gets a generic status: running or paused, and whether anything needs
-  attention.
+  settings". Anyone can view it; actions need admin.
 - **Accept when:**
   - Each join produces exactly one room, the member ends up in it, and the room is
     deleted within seconds of emptying.
@@ -265,8 +262,7 @@ library code with no Discord dependency and can start immediately.
 - `/export` (Manage Server): downloads the guild's voice configuration (creators,
   templates, aliases, lists, logging) as a versioned JSON file, ephemerally.
 - `/import file` (Manage Server): shows a diff preview and confirms before writing.
-  Unknown channel IDs are reported and skipped. A file that adds a creator channel
-  also needs Manage Channels, as `/create` does.
+  Unknown channel IDs are reported and skipped.
 
 ## V12: Template assistant (optional, config-gated)
 
