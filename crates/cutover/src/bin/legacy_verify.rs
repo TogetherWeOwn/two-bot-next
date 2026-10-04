@@ -33,9 +33,8 @@ impl Args {
         let mut mapping = None;
         let mut groups = Vec::new();
         let mut sample_limit = None;
-        let mut pairs = argv.chunks_exact(2);
-        for pair in &mut pairs {
-            let (key, value) = (&pair[0], &pair[1]);
+        let (pairs, remainder) = argv.as_chunks::<2>();
+        for [key, value] in pairs {
             match key.as_str() {
                 "--source-url" if source.is_none() => source = Some(value.clone()),
                 "--target-url" if target.is_none() => target = Some(value.clone()),
@@ -61,7 +60,7 @@ impl Args {
                 _ => return Err("unknown or duplicate argument"),
             }
         }
-        if !pairs.remainder().is_empty() {
+        if !remainder.is_empty() {
             return Err("argument needs a value");
         }
         Ok(Self {
