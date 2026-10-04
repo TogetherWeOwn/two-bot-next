@@ -738,12 +738,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             id: Id::new(member),
             kind: PermissionOverwriteType::Member,
         };
+        let mut grant_landed = false;
         let result = match self
             .http
             .put_overwrite(room, grant, self.live.room_guard(room))
             .await
         {
             Ok(()) => {
+                grant_landed = true;
                 self.note_overwrite(room, &grant);
                 self.move_in_from_join(room, member).await
             }
@@ -770,9 +772,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 );
             }
             Err(error) => {
-                // The access was never written: do not claim it, so the member
-                // can ask again.
-                self.unwind_grant(room, member);
+                // A grant that never landed is not claimed, so the member can
+                // ask again. One that landed stays recorded even when the
+                // move failed (a full room, say): they hold the access and
+                // `/public` must still take it back.
+                if !grant_landed {
+                    self.unwind_grant(room, member);
+                }
                 self.complete_error(action, room, error);
             }
         }

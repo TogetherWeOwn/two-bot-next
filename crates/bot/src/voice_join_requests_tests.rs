@@ -644,6 +644,35 @@ async fn a_failed_approval_write_is_not_claimed_so_the_member_can_ask_again() {
         .any(|request| request.member_id == MemberId(OUTSIDER)));
 }
 
+#[tokio::test]
+async fn a_failed_move_keeps_the_grant_that_landed() {
+    let (mut worker, trace) = private_room().await;
+    enter(&worker, OUTSIDER, 2_000);
+    worker.reconcile();
+    drain(&mut worker).await;
+    trace.lock().unwrap().clear();
+    let request = request_of(&worker, OUTSIDER);
+    worker
+        .http
+        .move_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    press(&mut worker, OWNER, JoinDecision::Approve, request.id.0);
+    drain(&mut worker).await;
+    // The member holds Connect on the room even though the move failed, so the
+    // state keeps saying so and `/public` will take it back.
+    assert_eq!(
+        calls(&trace),
+        [
+            format!("overwrite:{ROOM}:{OUTSIDER}:Member"),
+            format!("move:{OUTSIDER}:{ROOM}"),
+        ]
+    );
+    assert!(worker.privacy[&ROOM].granted.contains(&MemberId(OUTSIDER)));
+    assert!(!worker.failures().is_empty());
+}
+
 // --- the interaction surface --------------------------------------------------
 
 fn join_id(decision: JoinDecision, room: u64, request: u64) -> String {
