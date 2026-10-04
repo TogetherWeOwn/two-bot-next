@@ -496,7 +496,7 @@ async fn limit_room_runtime(
         Duration::from_millis(10),
         true,
     );
-    assert!(runtime.publish_snapshot(GUILD, snapshot(&[], vec![])));
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
     assert!(runtime.voice_frame(
         GUILD,
         MEMBER,
