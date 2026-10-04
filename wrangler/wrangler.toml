@@ -125,6 +125,15 @@ TWO_ANNOUNCEMENTS = "1"
 # Never top-level and never production. Rollback: delete both lines, redeploy.
 TWO_COMMANDS_PUBLISH_ON_BOOT = "1"
 DISCORD_APPLICATION_ID = "1469137636663758888"
+# Staging-only temporary voice gate (docs/voice-cutover-rehearsal.md): attaches
+# the voice sink to the gateway so the staging guild exercises room lifecycle
+# events. It reads the voice tables (migrations 0224-0229, 0412-0414, 0416), so
+# the staging ledger must already carry them. Reconcile only touches rows the
+# bot tracks; the guild's permanent voice channels stay untouched. Forwarded
+# into the container via FORWARDED_FLAGS (wrangler/src/container-env.ts).
+# Never top-level and never production: scripts/check-env-bindings.py fails
+# either. Rollback: delete the line, redeploy.
+TWO_VOICE = "1"
 
 [env.production.version_metadata]
 binding = "CF_VERSION_METADATA"

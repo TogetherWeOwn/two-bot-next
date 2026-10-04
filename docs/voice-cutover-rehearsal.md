@@ -189,3 +189,30 @@ staging returning to healthy; it is not listed here as a code gap.
    admin-gated slash commands with single-field writes, covered by unit
    tests. Still open: live staging practice of each command on the
    staging guild once staging is healthy (§4 live run).
+
+## 7. Staging gate (`TWO_VOICE`)
+
+The staging Worker binds `TWO_VOICE = "1"` under `[env.staging.vars]` in
+`wrangler/wrangler.toml`. The var is forwarded into the container
+(`FORWARDED_FLAGS`, `wrangler/src/container-env.ts`) and `build_voice_runtime`
+attaches the voice sink to the gateway only when it is exactly `1`.
+`scripts/check-env-bindings.py` fails a top-level or production declaration,
+so production voice stays an Operator-approved binding.
+
+- **Order matters.** The voice store reads the migrated voice tables, so the
+  staging ledger must already carry the voice migrations (0224-0229,
+  0412-0414 and 0416) before the var ships: apply through `staging-migrate`,
+  then re-apply the role plan so the runtime role holds the new tables. Merge
+  the flip only after a post-apply plan shows no pending migrations.
+- **Permanent channels stay untouched.** `reconcile` iterates the rooms the
+  store tracks and nothing else, so the guild's three permanent voice
+  channels (`Lobby`, `Squad`, `Voice 1`) are never deleted: with zero tracked
+  rows the live ghost count reads `untracked_present=[3]`, which is the
+  documented residual baseline for staging until a creator channel exists.
+- **No commands yet.** The gate attaches the sink and the reconciler; the
+  guild registry only gains the voice commands once the registry wiring
+  publishes them behind the same gate. Live create/move/delete practice (§4)
+  needs both that and a second human account in the staging guild.
+- **Rollback.** Delete the `TWO_VOICE` line and redeploy `deploy-staging`.
+  Tracked rooms stay in the database; any whose channel has gone are
+  forgotten by the first reconcile after the gate is back on.
