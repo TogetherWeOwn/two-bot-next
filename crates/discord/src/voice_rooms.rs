@@ -754,6 +754,73 @@ impl RoomHttp {
         }
     }
 
+    /// V3 `/private` and `/public`: replace one role or member overwrite on a
+    /// room channel. The write is a PUT that replaces the target's whole
+    /// overwrite, so the caller passes the bits it wants kept. Manage Roles is
+    /// never written as an allow, whatever the caller passes (the create-time
+    /// exclusion holds for every overwrite this adapter emits), and CONNECT or
+    /// any other bit may not sit in both lists.
+    pub async fn put_channel_overwrite(
+        &self,
+        channel_id: Snowflake,
+        overwrite: &PermissionOverwrite,
+        still_valid: impl Fn() -> bool + Send + 'static,
+    ) -> Result<(), RoomHttpError> {
+        if channel_id == 0 || overwrite.id.get() == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let kind = match overwrite.kind {
+            PermissionOverwriteType::Role => HttpPermissionOverwriteType::Role,
+            PermissionOverwriteType::Member => HttpPermissionOverwriteType::Member,
+            _ => return Err(RoomHttpError::InvalidRequest),
+        };
+        let deny = overwrite.deny;
+        let allow = (overwrite.allow & !Permissions::MANAGE_ROLES) & !deny;
+        let wire = HttpPermissionOverwrite {
+            allow: Some(allow),
+            deny: Some(deny),
+            id: overwrite.id,
+            kind,
+        };
+        let request = self
+            .http
+            .update_channel_permission(Id::new(channel_id), &wire)
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        self.send(request, still_valid).await?;
+        Ok(())
+    }
+
+    /// V3: create the Join voice channel next to a private room. No
+    /// overwrites ride the POST, so it syncs to the category and the bot's own
+    /// access comes from the category rather than a new grant. Single attempt:
+    /// an unknown outcome must not produce another POST.
+    pub async fn create_join_voice_channel(
+        &self,
+        guild_id: Snowflake,
+        name: &str,
+        parent_id: Option<Snowflake>,
+        position: Option<u64>,
+        still_valid: impl Fn() -> bool + Send + 'static,
+    ) -> Result<Channel, RoomHttpError> {
+        if guild_id == 0 || parent_id == Some(0) {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let mut request = self
+            .http
+            .create_guild_channel(Id::new(guild_id), name)
+            .kind(ChannelType::GuildVoice);
+        if let Some(position) = position {
+            request = request.position(position);
+        }
+        if let Some(parent_id) = parent_id {
+            request = request.parent_id(Id::new(parent_id));
+        }
+        let request = request.try_into_request().map_err(classify_http_error)?;
+        let body = self.send(request, still_valid).await?;
+        serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)
+    }
+
     /// Post an operator notice to a channel. Only the given role (if any) can
     /// be pinged: `allowed_mentions` is otherwise empty, so notice text can
     /// never ping members, `@everyone` or other roles.

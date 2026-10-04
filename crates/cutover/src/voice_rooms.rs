@@ -8,10 +8,11 @@
 
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
 use two_bot_core::voice_access::{validate_access_controls, AccessControls};
 use two_bot_core::voice_logging::{parse_detail_level, LoggingSettings};
+use two_bot_core::voice_private::PrivacyRecord;
 use two_bot_core::voice_rooms::{
     CreatorChannel, PermissionSource, RoomPosition, TextCompanion, VoiceRoom,
 };
@@ -178,6 +179,113 @@ impl PgRoomStore {
         .await?
         .rows_affected()
             != 0)
+    }
+
+    /// V3 privacy records for the guild's rooms that differ from the default
+    /// (private, holding a Join channel, or carrying blocks), keyed by room
+    /// channel. A room absent from the map is public with no Join channel and
+    /// an empty block list.
+    pub async fn privacy_in_guild(
+        &self,
+        guild_id: Snowflake,
+    ) -> Result<BTreeMap<Snowflake, PrivacyRecord>, sqlx::Error> {
+        let mut records: BTreeMap<Snowflake, PrivacyRecord> = BTreeMap::new();
+        for row in sqlx::query(
+            "SELECT channel_id, private, join_channel_id FROM voice_rooms
+             WHERE guild_id = $1 AND (private OR join_channel_id IS NOT NULL)",
+        )
+        .bind(guild_id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        {
+            let join_channel_id = row
+                .try_get::<Option<String>, _>("join_channel_id")?
+                .map(|id| {
+                    id.parse::<u64>()
+                        .map_err(|error| sqlx::Error::Decode(Box::new(error)))
+                })
+                .transpose()?;
+            records.insert(
+                decode_id(&row, "channel_id")?,
+                PrivacyRecord {
+                    private: row.try_get("private")?,
+                    join_channel_id,
+                    blocked: BTreeSet::new(),
+                },
+            );
+        }
+        for row in sqlx::query(
+            "SELECT room_channel_id, blocked_member_id FROM voice_room_blocks
+             WHERE guild_id = $1",
+        )
+        .bind(guild_id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        {
+            let blocked = row
+                .try_get::<String, _>("blocked_member_id")?
+                .parse::<u64>()
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+            records
+                .entry(decode_id(&row, "room_channel_id")?)
+                .or_default()
+                .blocked
+                .insert(blocked);
+        }
+        Ok(records)
+    }
+
+    /// Persist one room's privacy record in a single transaction: the flag and
+    /// Join channel on the room row, and the block list replaced to match.
+    /// Returns false (writing nothing) when no row tracks the room, so a
+    /// record can never outlive the room.
+    pub async fn save_privacy(
+        &self,
+        guild_id: Snowflake,
+        channel_id: Snowflake,
+        record: &PrivacyRecord,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE voice_rooms
+             SET private = $3, join_channel_id = $4, privacy_touched_at = now()
+             WHERE guild_id = $1 AND channel_id = $2",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(record.private)
+        .bind(record.join_channel_id.map(|id| id.to_string()))
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            != 0;
+        if !updated {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let blocked: Vec<String> = record.blocked.iter().map(ToString::to_string).collect();
+        sqlx::query(
+            "DELETE FROM voice_room_blocks
+             WHERE guild_id = $1 AND room_channel_id = $2
+               AND NOT (blocked_member_id = ANY($3))",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(&blocked)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO voice_room_blocks (guild_id, room_channel_id, blocked_member_id)
+             SELECT $1, $2, unnest($3::text[])
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(&blocked)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn room_for(

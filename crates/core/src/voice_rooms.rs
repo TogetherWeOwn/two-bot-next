@@ -759,6 +759,32 @@ pub enum RoomAction {
         channel_id: Snowflake,
         member_id: Snowflake,
     },
+    /// V3 `/private` (`deny`) and `/public` (`!deny`): set or clear the
+    /// @everyone Connect deny on a room. View Channel is never touched and
+    /// the write is idempotent. The worker flips the room's privacy state and
+    /// plans the Join channel only after it lands.
+    SetEveryoneConnect {
+        channel_id: Snowflake,
+        deny: bool,
+    },
+    /// V3: create the "⇩ Join ‹owner›" voice channel next to a private room.
+    CreateJoinChannel {
+        room_channel_id: Snowflake,
+        name: String,
+    },
+    /// V3: delete a room's Join channel. Carries its target and scopes to no
+    /// room, like `CreateRoom`: a room deleted meanwhile must not drop the
+    /// delete and leak the channel. The dispatch refuses an id the worker
+    /// does not hold as a bot-created Join channel.
+    DeleteJoinChannel {
+        room_channel_id: Snowflake,
+        channel_id: Snowflake,
+    },
+    /// V3: persist the room's current privacy record. Reads the worker's row
+    /// at dispatch time, so a retry never writes stale state.
+    SavePrivacy {
+        channel_id: Snowflake,
+    },
 }
 
 /// Queue lane.
@@ -783,11 +809,19 @@ impl RoomAction {
     #[must_use]
     pub fn channel_id(&self) -> Option<Snowflake> {
         match self {
-            Self::CreateRoom { .. } | Self::CreateCompanion { .. } => None,
+            Self::CreateRoom { .. }
+            | Self::CreateCompanion { .. }
+            | Self::DeleteJoinChannel { .. } => None,
             Self::MoveMember { channel_id, .. }
             | Self::DeleteRoom { channel_id }
             | Self::UpdateOwnership { channel_id, .. }
             | Self::RenameRoom { channel_id, .. }
+            | Self::SetEveryoneConnect { channel_id, .. }
+            | Self::SavePrivacy { channel_id }
+            | Self::CreateJoinChannel {
+                room_channel_id: channel_id,
+                ..
+            }
             | Self::GrantCompanionView {
                 room_channel_id: channel_id,
                 ..
@@ -1449,6 +1483,14 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
             )
             .max_length(512),
         ]),
+        CommandDefinition::new(
+            "private",
+            "Deny new members from joining your voice room and open a Join channel",
+        ),
+        CommandDefinition::new(
+            "public",
+            "Let anyone join your voice room again and remove its Join channel",
+        ),
     ]
 }
 
@@ -2156,7 +2198,9 @@ mod tests {
                 "inheritpermissions",
                 "defaultlimit",
                 "alwaysprivate",
-                "kick"
+                "kick",
+                "private",
+                "public"
             ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.

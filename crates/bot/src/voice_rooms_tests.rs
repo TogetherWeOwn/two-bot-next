@@ -4,6 +4,8 @@ use std::sync::Mutex;
 
 #[path = "voice_kick_tests.rs"]
 mod kick;
+#[path = "voice_private_runtime_tests.rs"]
+mod private;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
 
@@ -93,6 +95,8 @@ struct Store {
     save_logging_error: Option<StoreError>,
     forget_errors: Mutex<VecDeque<StoreError>>,
     companion_errors: Mutex<VecDeque<StoreError>>,
+    privacy: Mutex<BTreeMap<u64, PrivacyRecord>>,
+    save_privacy_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
     after_persist: Option<Hook>,
     config: Arc<Mutex<VoiceConfiguration>>,
@@ -116,6 +120,8 @@ impl Store {
             save_logging_error: None,
             forget_errors: Mutex::new(VecDeque::new()),
             companion_errors: Mutex::new(VecDeque::new()),
+            privacy: Mutex::new(BTreeMap::new()),
+            save_privacy_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
             after_persist: None,
             config: Arc::new(Mutex::new(empty_config())),
@@ -229,6 +235,7 @@ impl RoomPersistence for Store {
             return Err(error);
         }
         self.rooms.lock().unwrap().remove(&channel);
+        self.privacy.lock().unwrap().remove(&channel);
         Ok(())
     }
     async fn config_snapshot(&self, _: u64) -> Result<VoiceConfiguration, StoreError> {
@@ -278,6 +285,30 @@ impl RoomPersistence for Store {
             .push(format!("remove_companion:{room}"));
         Ok(self.companions.lock().unwrap().remove(&(guild, room)))
     }
+    async fn privacy(&self, _: u64) -> Result<BTreeMap<u64, PrivacyRecord>, StoreError> {
+        Ok(self.privacy.lock().unwrap().clone())
+    }
+    async fn save_privacy(
+        &self,
+        _: u64,
+        room: u64,
+        record: &PrivacyRecord,
+    ) -> Result<bool, StoreError> {
+        self.trace.lock().unwrap().push(format!(
+            "save_privacy:{room}:{}:{:?}:{}",
+            record.private,
+            record.join_channel_id,
+            record.blocked.len()
+        ));
+        if let Some(error) = self.save_privacy_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        if !self.rooms.lock().unwrap().contains_key(&room) {
+            return Ok(false);
+        }
+        self.privacy.lock().unwrap().insert(room, record.clone());
+        Ok(true)
+    }
 }
 
 /// Scripted `/import` download queue shared with the harness.
@@ -292,6 +323,9 @@ struct Http {
     rename_errors: Mutex<VecDeque<RoomHttpError>>,
     companion_errors: Mutex<VecDeque<RoomHttpError>>,
     view_errors: Mutex<VecDeque<RoomHttpError>>,
+    overwrite_errors: Mutex<VecDeque<RoomHttpError>>,
+    join_errors: Mutex<VecDeque<RoomHttpError>>,
+    written_overwrites: Mutex<Vec<(u64, PermissionOverwrite)>>,
     notices: Mutex<Vec<(NoticeTarget, String, Option<u64>)>>,
     refused_notices: Mutex<Vec<NoticeTarget>>,
     created_attributes: Mutex<Vec<RoomChannelAttributes>>,
@@ -314,6 +348,9 @@ impl Http {
             rename_errors: Mutex::new(VecDeque::new()),
             companion_errors: Mutex::new(VecDeque::new()),
             view_errors: Mutex::new(VecDeque::new()),
+            overwrite_errors: Mutex::new(VecDeque::new()),
+            join_errors: Mutex::new(VecDeque::new()),
+            written_overwrites: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             refused_notices: Mutex::new(Vec::new()),
             created_attributes: Mutex::new(Vec::new()),
@@ -508,6 +545,57 @@ impl RoomWrites for Http {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+    async fn put_overwrite(
+        &self,
+        channel: u64,
+        overwrite: PermissionOverwrite,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace.lock().unwrap().push(format!(
+            "overwrite:{channel}:{}:{:?}",
+            overwrite.id.get(),
+            overwrite.kind
+        ));
+        if let Some(error) = self.overwrite_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        self.written_overwrites
+            .lock()
+            .unwrap()
+            .push((channel, overwrite));
+        Ok(())
+    }
+    async fn create_join_channel(
+        &self,
+        _: u64,
+        name: &str,
+        parent_id: Option<u64>,
+        position: Option<u64>,
+        guard: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("create_join:{name}:{parent_id:?}:{position:?}"));
+        if let Some(error) = self.join_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        let id = {
+            let mut id = self.next_id.lock().unwrap();
+            let next = *id;
+            *id += 1;
+            next
+        };
+        let mut created = channel(id, 2, parent_id);
+        created.name = Some(name.to_owned());
+        Ok(created)
     }
     async fn send_notice(
         &self,
@@ -1471,7 +1559,9 @@ fn voice_command_set_is_gated_on_two_voice() {
             "inheritpermissions",
             "defaultlimit",
             "alwaysprivate",
-            "kick"
+            "kick",
+            "private",
+            "public"
         ]
     );
     let off = VoiceGates::from_map(&Default::default());

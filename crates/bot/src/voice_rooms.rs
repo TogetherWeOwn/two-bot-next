@@ -10,7 +10,7 @@
 //! (gated on `TWO_VOICE=1` by the binary).
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
     sync::{
@@ -35,7 +35,7 @@ use twilight_model::{
             component::{ActionRow, Button, ButtonStyle, Component},
             AllowedMentions, MessageFlags,
         },
-        permission_overwrite::PermissionOverwriteType,
+        permission_overwrite::{PermissionOverwrite, PermissionOverwriteType},
         Channel, ChannelType,
     },
     guild::{Permissions, Role},
@@ -74,6 +74,7 @@ use two_bot_core::{
         decide_ownership, OwnershipDecision, OwnershipError, OwnershipRequest, RoomActor,
         RoomMember, RoomOwnership,
     },
+    voice_private::{PrivacyRecord, PrivateRoom},
     voice_rooms::{
         category_full_message, is_usable_channel_name, voice_commands, ActionQueue, CreatorChannel,
         NewRoomSpec, PermissionSource, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction,
@@ -196,6 +197,20 @@ pub trait RoomPersistence: Send + Sync {
         guild: Snowflake,
         room: Snowflake,
     ) -> impl Future<Output = Result<Option<TextCompanion>, StoreError>> + Send;
+    /// V3 privacy records for the guild's rooms that are not public with an
+    /// empty block list; every other room reads as the default.
+    fn privacy(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<BTreeMap<Snowflake, PrivacyRecord>, StoreError>> + Send;
+    /// Replace one room's privacy record. `Ok(false)` when the room has no
+    /// database row, so a record never outlives its room.
+    fn save_privacy(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        record: &PrivacyRecord,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
 }
 
 impl RoomPersistence for PgRoomStore {
@@ -315,6 +330,24 @@ impl RoomPersistence for PgRoomStore {
             .await
             .map_err(store_error)
     }
+
+    async fn privacy(
+        &self,
+        guild: Snowflake,
+    ) -> Result<BTreeMap<Snowflake, PrivacyRecord>, StoreError> {
+        self.privacy_in_guild(guild).await.map_err(store_error)
+    }
+
+    async fn save_privacy(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        record: &PrivacyRecord,
+    ) -> Result<bool, StoreError> {
+        PgRoomStore::save_privacy(self, guild, room, record)
+            .await
+            .map_err(store_error)
+    }
 }
 
 fn store_error(error: sqlx::Error) -> StoreError {
@@ -360,6 +393,12 @@ fn voice_dead_action(action: &RoomAction) -> &'static str {
         RoomAction::UpdateOwnership { .. } => "ownership",
         RoomAction::KickMember { .. } => "kick",
         RoomAction::RenameRoom { .. } => "rename",
+        // V3 privacy writes share the unknown-shape family so the bounded
+        // metric label set stays unchanged.
+        RoomAction::SetEveryoneConnect { .. }
+        | RoomAction::CreateJoinChannel { .. }
+        | RoomAction::DeleteJoinChannel { .. }
+        | RoomAction::SavePrivacy { .. } => "other",
     }
 }
 
@@ -469,6 +508,32 @@ pub trait RoomWrites: Send + Sync {
         member_id: Snowflake,
         guard: WriteGuard,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// V3 `/private` and `/public`: replace one role or member overwrite on a
+    /// room channel (a PUT, so the caller passes every bit it wants kept). The
+    /// default refuses, so a writer without overwrite access fails closed.
+    fn put_overwrite(
+        &self,
+        channel: Snowflake,
+        overwrite: PermissionOverwrite,
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send {
+        let _ = (channel, overwrite, guard);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
+    /// V3: create the Join voice channel in the room's category, next to the
+    /// room, with no overwrites of its own (it syncs to the category). The
+    /// default refuses.
+    fn create_join_channel(
+        &self,
+        guild: Snowflake,
+        name: &str,
+        parent_id: Option<Snowflake>,
+        position: Option<u64>,
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<Channel, RoomHttpError>> + Send {
+        let _ = (guild, name, parent_id, position, guard);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
     /// V10 error notice. `mention_role` is pinged on channel targets only.
     /// The default refuses, so a writer that cannot post notices fails closed
     /// (the worker counts the attempt and moves on) instead of dropping them
@@ -568,6 +633,28 @@ impl RoomWrites for RoomHttp {
         guard: WriteGuard,
     ) -> Result<(), RoomHttpError> {
         self.revoke_companion_view(text_channel_id, member_id, move || guard())
+            .await
+    }
+
+    async fn put_overwrite(
+        &self,
+        channel: Snowflake,
+        overwrite: PermissionOverwrite,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.put_channel_overwrite(channel, &overwrite, move || guard())
+            .await
+    }
+
+    async fn create_join_channel(
+        &self,
+        guild: Snowflake,
+        name: &str,
+        parent_id: Option<Snowflake>,
+        position: Option<u64>,
+        guard: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        self.create_join_voice_channel(guild, name, parent_id, position, move || guard())
             .await
     }
 
@@ -1086,6 +1173,15 @@ pub struct GuildRoomWorker<S, H> {
     deletes: HashSet<Snowflake>,
     compensation: HashSet<Snowflake>,
     denied: HashMap<Snowflake, (u64, Option<Permissions>)>,
+    /// V3 privacy state by room (private flag, Join channel, block list),
+    /// loaded from the store and changed only after the matching Discord
+    /// write lands. See [`private_runtime`].
+    privacy: HashMap<Snowflake, PrivateRoom>,
+    /// Rooms whose in-memory privacy state is not yet durable.
+    privacy_dirty: HashSet<Snowflake>,
+    /// Join channel ids this worker created or loaded from its own store:
+    /// the only ones a `DeleteJoinChannel` may delete.
+    join_deletable: HashSet<Snowflake>,
     failures: VecDeque<LifecycleFailure>,
     notices: Vec<NoticeState>,
     halted: bool,
@@ -1154,6 +1250,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .into_iter()
             .map(|c| (c.room_channel_id, c))
             .collect();
+        let (privacy, join_deletable) =
+            Self::load_privacy(&rooms, store.privacy(live.guild_id).await?);
         Ok(Self {
             live,
             store,
@@ -1175,6 +1273,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             deletes: HashSet::new(),
             compensation: HashSet::new(),
             denied: HashMap::new(),
+            privacy,
+            privacy_dirty: HashSet::new(),
+            join_deletable,
             failures: VecDeque::new(),
             notices: Vec::new(),
             halted: false,
@@ -1428,6 +1529,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.companion_seen.insert(channel, current);
         }
         drop(live);
+        self.reconcile_privacy();
         let delete_enqueued = empty.len() as u64;
         for channel in empty {
             self.queue_delete(channel, false);
@@ -2309,10 +2411,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             );
                             return true;
                         }
+                        // V3: the Join channel goes with its room, ahead of the
+                        // row: a failed delete retries instead of leaking it.
+                        if !self.delete_join_for(channel_id).await {
+                            self.mark_failed_observed(
+                                action,
+                                "Join channel delete unavailable".to_owned(),
+                                elapsed_ms(now_ms, started),
+                            );
+                            return true;
+                        }
                         match self.store.forget(self.live.guild_id, channel_id).await {
                             Ok(()) => {
                                 self.queue.mark_succeeded(&action);
                                 self.queue.drop_for_channel(self.live.guild_id, channel_id);
+                                self.forget_privacy(channel_id);
                                 self.rooms.remove(&channel_id);
                                 self.companions.remove(&channel_id);
                                 self.companion_channels.remove(&channel_id);
@@ -2645,6 +2758,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                     Err(error) => self.complete_error(action, channel_id, error),
                 }
+            }
+            RoomAction::SetEveryoneConnect { .. }
+            | RoomAction::CreateJoinChannel { .. }
+            | RoomAction::DeleteJoinChannel { .. }
+            | RoomAction::SavePrivacy { .. } => {
+                self.dispatch_privacy(action, now_ms, started).await;
             }
             RoomAction::RenameRoom { channel_id, name } => {
                 let valid = {
@@ -3027,6 +3146,16 @@ enum ActorCommand {
         command: OwnershipCommand,
         reply: oneshot::Sender<String>,
     },
+    /// V3 owner command (`/private`, `/public`): the worker resolves the
+    /// caller's current room, gates on owner-or-admin, queues the @everyone
+    /// Connect write and replies with the user-facing text.
+    Privacy {
+        actor_id: Snowflake,
+        is_admin: bool,
+        actor_display: String,
+        command: PrivacyCommand,
+        reply: oneshot::Sender<String>,
+    },
     /// V4: start a vote-kick; the reply carries the vote state or the refusal.
     KickStart {
         vote_id: Snowflake,
@@ -3241,6 +3370,33 @@ where
             .send(ActorCommand::Ownership {
                 actor_id,
                 is_admin,
+                command,
+                reply,
+            })
+            .ok()?;
+        inbox.await.ok()
+    }
+
+    /// Run one V3 owner command (`/private`, `/public`) on the live worker
+    /// and return the ephemeral reply text. `actor_display` names the Join
+    /// channel when the caller owns the room. `None` when the guild has no
+    /// live actor.
+    pub async fn run_privacy(
+        &self,
+        guild: Snowflake,
+        actor_id: Snowflake,
+        is_admin: bool,
+        actor_display: String,
+        command: PrivacyCommand,
+    ) -> Option<String> {
+        let actor = self.live_actor(guild)?;
+        let (reply, inbox) = oneshot::channel();
+        actor
+            .tx
+            .send(ActorCommand::Privacy {
+                actor_id,
+                is_admin,
+                actor_display,
                 command,
                 reply,
             })
@@ -3609,6 +3765,15 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             reply,
         } => {
             let _ = reply.send(worker.apply_ownership(actor_id, is_admin, command));
+        }
+        ActorCommand::Privacy {
+            actor_id,
+            is_admin,
+            actor_display,
+            command,
+            reply,
+        } => {
+            let _ = reply.send(worker.apply_privacy(actor_id, is_admin, &actor_display, command));
         }
         ActorCommand::KickStart {
             vote_id,
@@ -4584,6 +4749,11 @@ pub enum VoiceCommand {
     Transfer {
         target_id: Snowflake,
     },
+    /// V3 owner (or admin) denies Connect to @everyone and opens the Join
+    /// channel.
+    Private,
+    /// V3 owner (or admin) restores access and deletes the Join channel.
+    Public,
     Access(AccessAction),
     Logging(LoggingAction),
     Export,
@@ -4802,6 +4972,8 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
             })
         }
         "reclaim" => Some(VoiceCommand::Reclaim),
+        "private" => Some(VoiceCommand::Private),
+        "public" => Some(VoiceCommand::Public),
         "transfer" => {
             // The `member` option is required at registration, so Discord
             // always sends it; zero means a malformed payload and refuses
@@ -4888,6 +5060,20 @@ fn interaction_actor(interaction: &Interaction) -> Option<(Snowflake, bool)> {
             .and_then(|member| member.permissions),
     );
     Some((user.id.get(), is_admin))
+}
+
+/// The invoker's server display name: nickname, then global name, then user
+/// name. Empty when the interaction carries no user.
+fn interaction_display_name(interaction: &Interaction) -> String {
+    let member = interaction.member.as_ref();
+    let user = member
+        .and_then(|member| member.user.as_ref())
+        .or(interaction.user.as_ref());
+    member
+        .and_then(|member| member.nick.clone())
+        .or_else(|| user.and_then(|user| user.global_name.clone()))
+        .or_else(|| user.map(|user| user.name.clone()))
+        .unwrap_or_default()
 }
 
 fn parse_logging_action(options: &[CommandDataOption]) -> LoggingAction {
@@ -4996,6 +5182,8 @@ impl VoiceCommand {
             Self::AlwaysPrivate { .. } => "alwaysprivate",
             Self::Access(_) => "access",
             Self::Reclaim => "reclaim",
+            Self::Private => "private",
+            Self::Public => "public",
             Self::Transfer { .. } => "transfer",
             Self::Logging(_) => "logging",
             Self::Export => "export",
@@ -5962,6 +6150,34 @@ where
             reply(ephemeral_response(&text)).await;
             true
         }
+        VoiceCommand::Private | VoiceCommand::Public => {
+            let (command, name) = if matches!(command, VoiceCommand::Private) {
+                (PrivacyCommand::Private, "private")
+            } else {
+                (PrivacyCommand::Public, "public")
+            };
+            let Some((actor_id, is_admin)) = interaction_actor(interaction) else {
+                reply(ephemeral_response(&format!(
+                    "I couldn't tell who invoked /{name} — try again."
+                )))
+                .await;
+                return true;
+            };
+            let text = runtime
+                .run_privacy(
+                    guild_id,
+                    actor_id,
+                    is_admin,
+                    interaction_display_name(interaction),
+                    command,
+                )
+                .await
+                .unwrap_or_else(|| {
+                    "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+                });
+            reply(ephemeral_response(&text)).await;
+            true
+        }
         VoiceCommand::Export => {
             let Some(inventory) = inventory else {
                 reply(ephemeral_response(
@@ -6498,6 +6714,9 @@ where
         Box::pin(async move { runtime.kick_room_of(guild, member).await })
     }
 }
+
+mod private_runtime;
+pub use private_runtime::PrivacyCommand;
 
 #[cfg(test)]
 #[path = "voice_rooms_tests.rs"]

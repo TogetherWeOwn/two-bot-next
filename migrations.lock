@@ -249,6 +249,10 @@
       "sha256": "9dfe6648848bc7d42ba7534b710eab36473ac57ad5c4eee26d88d3f453d60b2f",
       "justification": "Voice V2 ownership handoff stamp so the rollback delta keeps measuring rooms whose owner_id changes in place."
     },
+    "crates/cutover/migrations/0414_voice_room_privacy.sql": {
+      "sha256": "339abf52f877b7ee310ef73f5abfa204918219503a8a6f01c4b9c29c20db4637",
+      "justification": "Voice V3 owner privacy persistence: private flag, Join channel id and the per-room block list; additive column and table only."
+    },
     "crates/store/migrations/0400_initial.sql": {
       "sha256": "49c7136827484e0625cad889208a03e48026acb854282de3a0a9c5aa4d951b00",
       "justification": "Add unpublished S6 funnel foundation for TOG-9811 under an unused workspace number; preserve proposed SQL bytes."
