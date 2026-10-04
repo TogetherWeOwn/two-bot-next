@@ -1146,6 +1146,23 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Reason:** Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
+### s12-28: Read-only `report voice-ghosts` ghost-channel count (tracked-present, tracked-gone, untracked-present plus clean flag)
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** Run `report voice-ghosts --seed` for the demo counts, then poll the live command against the disposable staging guild during a cutover rehearsal until both gaps read empty; confirm the clean flag.
+- **Expected:** Seed demo reports the fixture gaps; live staging polling shows tracked-present, tracked-gone and untracked-present counts with no deletes or writes; the clean flag is set only when both gaps are empty.
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel IDs (no tokens), sanitized command output and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119), [TOG-13123](/TOG/issues/TOG-13123)
+- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
+
+### s12-29: Actionable denied-path interaction copy with next steps
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** On the disposable staging guild as a non-privileged member, trigger each denial path: a permission-gated command, a disabled-feature command, an unknown slash name, a stale button/control and a forced handler failure.
+- **Expected:** Every denial names the Discord permission and who grants it (or the admin-only enable path), unknown names and expired controls are distinguishable, and generic failures keep the ref correlation id with a retry hint; all replies stay ephemeral and under the 2000-character cap.
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized reply text or screenshots and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
+
 ## 13. Post-freeze ledger obligations (non-dropped rows)
 
 ### s13-f114c44: f114c44 — TOG-3052: temp-voice generator (join-to-create), staging only

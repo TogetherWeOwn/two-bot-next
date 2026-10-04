@@ -203,6 +203,48 @@ when exhaustion coincides with gateway `starting`/`down` or job-failure
 alerts, or when the Neon dashboard shows trouble on the staging branch — the
 fix then belongs to the dependency owner, not a redeploy.
 
+#### Alert: DB errors
+
+Three or more storage-layer failures arrived between two keepalive samples
+(`two_bot_db_errors_total`, currently counting send-admission SQL; other
+stores adopt the counter incrementally). Unlike the pool rule above, this is
+errors, not pressure: queries already failed, they are not merely waiting.
+A counter reset (process restart) skips the window rather than firing, and a
+slow trickle below threshold stays silent — sustained low-rate failures
+surface instead through `job_consecutive_failures`.
+
+First response: check Neon status for the staging branch before touching the
+bot; then correlate with the `op` label and recent deploys (a new query path
+or migration can explain a fresh error burst). Do not run SQL probes against
+staging or production, add grants, or restart the container to "clear" the
+errors; a replacement restarts the shard without fixing the failing writes.
+
+Escalate when the burst repeats across windows, when it coincides with pool
+saturation or job-failure alerts, or when the Neon dashboard shows trouble on
+the staging branch — the fix then belongs to the dependency owner.
+
+#### Alert: send admission blocked
+
+Discord sends were refused send-admission in three consecutive keepalive
+windows (`two_bot_send_admissions_total{outcome="blocked"}`). Admission is
+the token-wide lane in front of every Discord send: a held lane or an active
+cooldown refuses new sends rather than queueing them. One busy tick with a
+refusal is normal contention and stays silent; only windows with *new*
+refusals extend the streak, so an idle bot or a self-clearing burst never
+pages. Storage failures of the admission SQL itself count in
+`two_bot_db_errors_total`, not here, so one outage pages once via that rule.
+
+First response: read the recent sends from the container logs (rate-limit
+cooldowns, held lanes after failed completions) and confirm no deploy is in
+progress — a fresh deploy can briefly contend the lane. Do not replay
+uncertain writes, hammer Discord, or restart the container to "free" the
+lane; a replacement leaves the durable lane row occupied.
+
+Escalate when refusals persist after the suspect deploy or cooldown is
+identified, when they coincide with 429 or DB-error alerts, or when sends
+stay refused with no cooldown in the logs — the lane may be stuck and the
+fix belongs to the on-call engineer, not another redeploy.
+
 ## Persisted ownership control
 
 The Worker/DO fence is implemented, not implicitly released by deployment.
