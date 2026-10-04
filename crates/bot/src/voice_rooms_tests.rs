@@ -289,6 +289,7 @@ struct Http {
     create_errors: Mutex<VecDeque<RoomHttpError>>,
     move_errors: Mutex<VecDeque<RoomHttpError>>,
     delete_errors: Mutex<VecDeque<RoomHttpError>>,
+    delete_channel_errors: Mutex<HashMap<u64, VecDeque<RoomHttpError>>>,
     rename_errors: Mutex<VecDeque<RoomHttpError>>,
     companion_errors: Mutex<VecDeque<RoomHttpError>>,
     view_errors: Mutex<VecDeque<RoomHttpError>>,
@@ -311,6 +312,7 @@ impl Http {
             create_errors: Mutex::new(VecDeque::new()),
             move_errors: Mutex::new(VecDeque::new()),
             delete_errors: Mutex::new(VecDeque::new()),
+            delete_channel_errors: Mutex::new(HashMap::new()),
             rename_errors: Mutex::new(VecDeque::new()),
             companion_errors: Mutex::new(VecDeque::new()),
             view_errors: Mutex::new(VecDeque::new()),
@@ -419,6 +421,15 @@ impl RoomWrites for Http {
             return Err(RoomHttpError::Cancelled);
         }
         self.trace.lock().unwrap().push(format!("delete:{channel}"));
+        if let Some(error) = self
+            .delete_channel_errors
+            .lock()
+            .unwrap()
+            .get_mut(&channel)
+            .and_then(VecDeque::pop_front)
+        {
+            return Err(error);
+        }
         match self.delete_errors.lock().unwrap().pop_front() {
             Some(error) => Err(error),
             None => Ok(()),
@@ -1129,6 +1140,201 @@ async fn delete_403_suspends_without_a_retry_storm_and_refresh_resumes() {
         *trace.lock().unwrap(),
         ["delete:500", "delete:500", "forget:500"]
     );
+}
+
+/// Prime one eligible delete before reconciling both rooms, so each sweep
+/// visitation order is deterministic despite the tracked-room HashMap.
+async fn two_empty_rooms(
+    first: u64,
+    failures: VecDeque<RoomHttpError>,
+) -> (GuildRoomWorker<Store, Http>, Trace) {
+    let (live, store, http, trace) = fixture();
+    for id in [500, 501] {
+        store.rooms.lock().unwrap().insert(id, room(id));
+        live.upsert_channel(channel(id, 2, Some(CATEGORY)));
+    }
+    http.delete_channel_errors
+        .lock()
+        .unwrap()
+        .insert(500, failures);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.queue_delete(first, false);
+    worker.reconcile();
+    assert_eq!(worker.queue.pending_counts(GUILD), (2, 0));
+    (worker, trace)
+}
+
+#[tokio::test]
+async fn transient_delete_isolated_in_either_sweep_order_and_retried_after_backoff() {
+    for first in [500, 501] {
+        let (mut worker, trace) =
+            two_empty_rooms(first, VecDeque::from([RoomHttpError::UnknownOutcome])).await;
+        dispatch(&mut worker, 0).await;
+        dispatch(&mut worker, 1).await;
+        let expected = if first == 500 {
+            vec!["delete:500", "delete:501", "forget:501"]
+        } else {
+            vec!["delete:501", "forget:501", "delete:500"]
+        };
+        assert_eq!(*trace.lock().unwrap(), expected, "first room {first}");
+        assert_eq!(worker.tracked().get(&500), Some(&room(500)));
+        assert!(!worker.tracked().contains_key(&501));
+        assert_eq!(
+            worker.store.rooms.lock().unwrap().get(&500),
+            Some(&room(500))
+        );
+        assert!(!worker.store.rooms.lock().unwrap().contains_key(&501));
+        assert!(worker
+            .live
+            .inner
+            .read()
+            .unwrap()
+            .channels
+            .contains_key(&500));
+        worker.reconcile();
+        assert_eq!(worker.queue.pending_counts(GUILD), (1, 0));
+        for time in [2, 100, 1_999] {
+            assert!(
+                !worker.dispatch_one(time).await,
+                "retry must wait for its backoff"
+            );
+        }
+        assert_eq!(*trace.lock().unwrap(), expected);
+        dispatch(&mut worker, 3_000).await;
+        assert!(worker.tracked().is_empty());
+        assert!(worker.store.rooms.lock().unwrap().is_empty());
+        assert!(worker.queue.failed().is_empty());
+        assert_eq!(
+            &trace.lock().unwrap()[expected.len()..],
+            ["delete:500", "forget:500"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn transient_delete_dead_letter_retains_provenance_without_requeue_storms() {
+    let (mut worker, trace) = two_empty_rooms(
+        500,
+        VecDeque::from(vec![
+            RoomHttpError::UnknownOutcome;
+            QUEUE_MAX_ATTEMPTS as usize
+        ]),
+    )
+    .await;
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    let mut previous = 0;
+    for attempt in 1..QUEUE_MAX_ATTEMPTS {
+        worker.reconcile();
+        let before_due = previous + two_bot_core::voice_rooms::fail_backoff_ms(attempt) - 1;
+        assert!(!worker.dispatch_one(before_due).await);
+        let due = u64::from(attempt) * 61_000;
+        dispatch(&mut worker, due).await;
+        previous = due;
+    }
+    let failed = worker.queue.failed();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(
+        failed[0].action.action,
+        RoomAction::DeleteRoom { channel_id: 500 }
+    );
+    assert_eq!(failed[0].action.attempts, QUEUE_MAX_ATTEMPTS);
+    assert_eq!(worker.tracked().get(&500), Some(&room(500)));
+    assert_eq!(
+        worker.store.rooms.lock().unwrap().get(&500),
+        Some(&room(500))
+    );
+    assert!(worker
+        .live
+        .inner
+        .read()
+        .unwrap()
+        .channels
+        .contains_key(&500));
+    for time in [previous + 1, previous + 60_000, previous + 600_000] {
+        worker.reconcile();
+        assert!(!worker.dispatch_one(time).await);
+    }
+    assert_eq!(
+        trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| *call == "delete:500")
+            .count(),
+        QUEUE_MAX_ATTEMPTS as usize
+    );
+    assert!(!trace.lock().unwrap().contains(&"forget:500".to_owned()));
+    // A new eligible room still progresses after the earlier failure is terminal.
+    worker.store.rooms.lock().unwrap().insert(502, room(502));
+    worker.rooms.insert(502, room(502));
+    worker.live.upsert_channel(channel(502, 2, Some(CATEGORY)));
+    worker.reconcile();
+    dispatch(&mut worker, previous + 600_001).await;
+    assert!(!worker.tracked().contains_key(&502));
+    assert!(trace.lock().unwrap().contains(&"forget:502".to_owned()));
+    assert_eq!(worker.queue.failed(), failed);
+}
+
+#[tokio::test]
+async fn refused_delete_isolated_in_either_sweep_order_without_retry_storms() {
+    for first in [500, 501] {
+        let (mut worker, trace) =
+            two_empty_rooms(first, VecDeque::from([RoomHttpError::AccessDenied])).await;
+        dispatch(&mut worker, 0).await;
+        dispatch(&mut worker, 1).await;
+        assert_eq!(worker.tracked().get(&500), Some(&room(500)));
+        assert!(!worker.tracked().contains_key(&501));
+        assert!(worker.queue.is_suspended(GUILD, 500));
+        for time in [3_000, 60_000, 600_000] {
+            worker.reconcile();
+            assert!(!worker.dispatch_one(time).await);
+        }
+        let calls = trace.lock().unwrap();
+        assert_eq!(calls.iter().filter(|call| *call == "delete:500").count(), 1);
+        assert!(calls.contains(&"forget:501".to_owned()));
+        assert!(!calls.contains(&"forget:500".to_owned()));
+    }
+}
+
+#[tokio::test]
+async fn transient_delete_retry_rechecks_occupancy_permissions_and_readiness() {
+    for changed in ["occupancy", "permissions", "readiness"] {
+        let (mut worker, trace) =
+            two_empty_rooms(500, VecDeque::from([RoomHttpError::UnknownOutcome])).await;
+        dispatch(&mut worker, 0).await;
+        dispatch(&mut worker, 1).await;
+        match changed {
+            "occupancy" => {
+                worker.live.voice_update(MEMBER, Some(500), Some(false));
+            }
+            "permissions" => {
+                worker
+                    .live
+                    .inner
+                    .write()
+                    .unwrap()
+                    .bot
+                    .as_mut()
+                    .unwrap()
+                    .roles = vec![role(Permissions::VIEW_CHANNEL)];
+            }
+            "readiness" => worker.live.disconnect(),
+            _ => unreachable!(),
+        }
+        // No reconcile is needed to invalidate the previously queued write.
+        // Dispatch and its last-moment guard must recheck current live facts.
+        worker.dispatch_one(3_000).await;
+        assert_eq!(
+            *trace.lock().unwrap(),
+            ["delete:500", "delete:501", "forget:501"]
+        );
+        assert_eq!(worker.tracked().get(&500), Some(&room(500)));
+        assert_eq!(
+            worker.store.rooms.lock().unwrap().get(&500),
+            Some(&room(500))
+        );
+    }
 }
 
 #[tokio::test]
