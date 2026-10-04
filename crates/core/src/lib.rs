@@ -139,6 +139,7 @@ pub mod voice_private;
 pub mod voice_reconcile;
 pub mod voice_rename_coalescer;
 pub mod voice_room_controls;
+pub mod voice_room_name;
 pub mod voice_rooms;
 pub mod voice_style;
 pub mod voice_template;
