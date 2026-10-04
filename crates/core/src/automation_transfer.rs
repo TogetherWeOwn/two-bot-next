@@ -509,7 +509,10 @@ mod tests {
         }));
         assert_eq!(parsed.invalid_entries, 0);
         let diff = diff_import(&existing, &parsed, &builtins(), false).expect("diff plans");
-        assert_eq!(diff.to_create, ["new"]);
+        assert!(
+            diff.to_create.is_empty(),
+            "`new` wants a trigger the live `holder` row owns, so it is refused, not created"
+        );
         assert!(
             diff.to_update.is_empty(),
             "overwrite off refuses the live row"
