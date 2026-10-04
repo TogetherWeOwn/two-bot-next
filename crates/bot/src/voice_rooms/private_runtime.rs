@@ -517,19 +517,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.queue.mark_succeeded(&action);
             return;
         }
-        let planned = {
-            let live = self.live.inner.read().expect("live voice lock");
-            match (live.channels.get(&room), live.bot.as_ref()) {
-                (None, _) => None,
-                (Some(_), None) => Some(Err(RoomHttpError::AccessDenied)),
-                (Some(channel), Some(bot)) => {
-                    let current = channel.permission_overwrites.clone().unwrap_or_default();
-                    Some(self.plan_everyone_connect(&live, room, bot, &current, deny))
-                }
-            }
-        };
         // The room channel is gone: reconcile deletes the row, nothing to write.
-        let Some(planned) = planned else {
+        let Some(planned) = self.plan_connect_write(room, deny) else {
             self.queue.mark_succeeded(&action);
             return;
         };
@@ -572,6 +561,22 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             }
             Err(error) => self.complete_error(action, room, error),
         }
+    }
+
+    /// One live read of the room and the bot, planned into the writes.
+    /// `None` when the room channel is not in the snapshot.
+    fn plan_connect_write(
+        &self,
+        room: Snowflake,
+        deny: bool,
+    ) -> Option<Result<(Option<PermissionOverwrite>, PermissionOverwrite), RoomHttpError>> {
+        let live = self.live.inner.read().expect("live voice lock");
+        let channel = live.channels.get(&room)?;
+        let Some(bot) = live.bot.as_ref() else {
+            return Some(Err(RoomHttpError::AccessDenied));
+        };
+        let current = channel.permission_overwrites.clone().unwrap_or_default();
+        Some(self.plan_everyone_connect(&live, room, bot, &current, deny))
     }
 
     /// The writes `/private` or `/public` needs, planned from one live read:
