@@ -2,6 +2,8 @@ use super::*;
 use serde_json::json;
 use std::sync::Mutex;
 
+#[path = "voice_join_requests_tests.rs"]
+mod join;
 #[path = "voice_kick_tests.rs"]
 mod kick;
 #[path = "voice_name_tests.rs"]
@@ -455,6 +457,16 @@ struct OverwriteGate {
     release: tokio::sync::Notify,
 }
 
+/// One join-request message the fake Discord accepted.
+#[derive(Clone)]
+struct SentPrompt {
+    target: NoticeTarget,
+    content: String,
+    mention: Option<u64>,
+    components: Vec<Component>,
+    message: MessageRef,
+}
+
 struct Http {
     trace: Trace,
     next_id: Mutex<u64>,
@@ -469,6 +481,11 @@ struct Http {
     written_overwrites: Mutex<Vec<(u64, PermissionOverwrite)>>,
     notices: Mutex<Vec<(NoticeTarget, String, Option<u64>)>>,
     refused_notices: Mutex<Vec<NoticeTarget>>,
+    /// V3 join-request prompts the owner was sent, and the scripted errors
+    /// (one per attempt) the next sends fail with.
+    prompts: Mutex<Vec<SentPrompt>>,
+    prompt_errors: Mutex<VecDeque<RoomHttpError>>,
+    next_message: Mutex<u64>,
     created_attributes: Mutex<Vec<RoomChannelAttributes>>,
     created_names: Mutex<Vec<String>>,
     companion_plans: Mutex<Vec<TextChannelPlan>>,
@@ -497,6 +514,9 @@ impl Http {
             written_overwrites: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             refused_notices: Mutex::new(Vec::new()),
+            prompts: Mutex::new(Vec::new()),
+            prompt_errors: Mutex::new(VecDeque::new()),
+            next_message: Mutex::new(9_000),
             created_attributes: Mutex::new(Vec::new()),
             created_names: Mutex::new(Vec::new()),
             companion_plans: Mutex::new(Vec::new()),
@@ -771,6 +791,76 @@ impl RoomWrites for Http {
         let mut created = channel(id, 2, parent_id);
         created.name = Some(name.to_owned());
         Ok(created)
+    }
+    async fn delete_overwrite(
+        &self,
+        channel: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("delete_overwrite:{channel}:{member}"));
+        match self.overwrite_errors.lock().unwrap().pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    async fn send_component_message(
+        &self,
+        target: NoticeTarget,
+        content: &str,
+        mention_user: Option<u64>,
+        components: &[Component],
+    ) -> Result<MessageRef, RoomHttpError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("prompt:{target:?}"));
+        if let Some(error) = self.prompt_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        let message_id = {
+            let mut id = self.next_message.lock().unwrap();
+            let next = *id;
+            *id += 1;
+            next
+        };
+        let channel_id = match target {
+            NoticeTarget::Channel(channel) => channel,
+            NoticeTarget::DirectMessage(user) => 8_000 + user,
+        };
+        let message = MessageRef {
+            channel_id,
+            message_id,
+        };
+        self.prompts.lock().unwrap().push(SentPrompt {
+            target,
+            content: content.to_owned(),
+            mention: mention_user,
+            components: components.to_vec(),
+            message,
+        });
+        Ok(message)
+    }
+    async fn edit_component_message(
+        &self,
+        message: MessageRef,
+        content: &str,
+        components: &[Component],
+    ) -> Result<(), RoomHttpError> {
+        self.trace.lock().unwrap().push(format!(
+            "edit_prompt:{}:{}:{}:{}",
+            message.channel_id,
+            message.message_id,
+            content,
+            components.len()
+        ));
+        Ok(())
     }
     async fn send_notice(
         &self,

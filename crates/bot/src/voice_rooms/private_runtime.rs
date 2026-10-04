@@ -210,7 +210,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         (privacy, deletable)
     }
 
-    fn join_channel_of(&self, room: Snowflake) -> Option<Snowflake> {
+    pub(super) fn join_channel_of(&self, room: Snowflake) -> Option<Snowflake> {
         match self.privacy.get(&room)?.join_channel.as_ref()? {
             JoinChannel::Created { id, .. } => Some(id.0),
             JoinChannel::Requested => None,
@@ -218,7 +218,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     }
 
     /// The room's cached overwrites, for rewriting one entry.
-    fn live_overwrites(&self, room: Snowflake) -> Option<Vec<PermissionOverwrite>> {
+    pub(super) fn live_overwrites(&self, room: Snowflake) -> Option<Vec<PermissionOverwrite>> {
         let live = self.live.inner.read().expect("live voice lock");
         live.channels
             .get(&room)
@@ -237,7 +237,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
 
     /// Record a written overwrite in the live snapshot, so the next decision
     /// reads what Discord now holds without waiting for the gateway echo.
-    fn note_overwrite(&self, room: Snowflake, overwrite: &PermissionOverwrite) {
+    pub(super) fn note_overwrite(&self, room: Snowflake, overwrite: &PermissionOverwrite) {
         let mut live = self.live.inner.write().expect("live voice lock");
         if let Some(channel) = live.channels.get_mut(&room) {
             let current = channel.permission_overwrites.take().unwrap_or_default();
@@ -689,8 +689,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     }
 
     /// `/public` landed and the Join channel is already deleted: flip the
-    /// flag. Nothing is revoked (grants are runtime-only until the join-request
-    /// slice).
+    /// flag, take back every approved member's Connect allow and retire the
+    /// buttons of requests that can no longer be answered.
     fn finish_public(&mut self, room: Snowflake) {
         let Some(state) = self.privacy.get(&room).cloned() else {
             return;
@@ -699,6 +699,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return;
         };
         self.privacy.insert(room, plan.room);
+        self.enqueue_join_effects(room, &plan.effects);
     }
 
     /// Create the Join channel next to a private room, once.
@@ -958,6 +959,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// Drop a deleted room's privacy state. The database rows go with the room
     /// row (`voice_room_blocks` cascades), so nothing else is written.
     pub(super) fn forget_privacy(&mut self, room: Snowflake) {
+        self.forget_join_requests(room);
         if let Some(channel_id) = self.join_channel_of(room) {
             self.join_deletable.remove(&channel_id);
         }

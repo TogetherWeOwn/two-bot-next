@@ -271,6 +271,14 @@ pub enum RoomHttpError {
     UnknownOutcome,
 }
 
+/// A message the bot posted: the channel it landed in (a room's chat or a DM)
+/// and its id, so the same message can be edited later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MessageRef {
+    pub channel_id: Snowflake,
+    pub message_id: Snowflake,
+}
+
 #[derive(Clone)]
 pub struct RoomHttp {
     // Twilight builds and validates requests, but its ResponseFuture retries
@@ -736,19 +744,30 @@ impl RoomHttp {
         member_id: Snowflake,
         still_managing: impl Fn() -> bool + Send + 'static,
     ) -> Result<(), RoomHttpError> {
-        if text_channel_id == 0 || member_id == 0 {
+        self.delete_member_overwrite(text_channel_id, member_id, still_managing)
+            .await
+    }
+
+    /// Delete one member's overwrite on a channel. Deleting an absent
+    /// overwrite (or a channel already gone) is success: the end state — no
+    /// overwrite — already holds.
+    pub async fn delete_member_overwrite(
+        &self,
+        channel_id: Snowflake,
+        member_id: Snowflake,
+        still_valid: impl Fn() -> bool + Send + 'static,
+    ) -> Result<(), RoomHttpError> {
+        if channel_id == 0 || member_id == 0 {
             return Err(RoomHttpError::InvalidRequest);
         }
         let request = self
             .http
-            .delete_channel_permission(Id::new(text_channel_id))
+            .delete_channel_permission(Id::new(channel_id))
             .member(Id::new(member_id))
             .try_into_request()
             .map_err(classify_http_error)?;
-        match self.send(request, still_managing).await {
+        match self.send(request, still_valid).await {
             Ok(_) => Ok(()),
-            // Deleting an absent overwrite (or a channel already gone) is
-            // success: the end state — no overwrite — already holds.
             Err(RoomHttpError::NotFound) => Ok(()),
             Err(other) => Err(other),
         }
@@ -858,6 +877,12 @@ impl RoomHttp {
         user_id: Snowflake,
         content: &str,
     ) -> Result<(), RoomHttpError> {
+        let channel_id = self.direct_channel(user_id).await?;
+        self.post_notice(channel_id, content, None).await
+    }
+
+    /// Open (or reuse) the DM channel with `user_id`.
+    async fn direct_channel(&self, user_id: Snowflake) -> Result<Snowflake, RoomHttpError> {
         if user_id == 0 {
             return Err(RoomHttpError::InvalidRequest);
         }
@@ -869,7 +894,76 @@ impl RoomHttp {
         let body = self.send(request, || true).await?;
         let channel: Channel =
             serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)?;
-        self.post_notice(channel.id.get(), content, None).await
+        Ok(channel.id.get())
+    }
+
+    /// V3 join request: post a message with buttons to a channel and return
+    /// where it landed. Only `mention_user` (if any) can be pinged:
+    /// `allowed_mentions` is otherwise empty, so any other mention in
+    /// `content` renders without a ping. Single attempt, so an unknown
+    /// outcome never posts a second prompt on its own.
+    pub async fn post_component_message(
+        &self,
+        channel_id: Snowflake,
+        content: &str,
+        mention_user: Option<Snowflake>,
+        components: &[Component],
+    ) -> Result<MessageRef, RoomHttpError> {
+        if channel_id == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let mut mentions = AllowedMentions::default();
+        if let Some(user) = mention_user.filter(|user| *user != 0) {
+            mentions.users.push(Id::new(user));
+        }
+        let request = self
+            .http
+            .create_message(Id::new(channel_id))
+            .content(content)
+            .components(components)
+            .allowed_mentions(Some(&mentions))
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        let body = self.send(request, || true).await?;
+        parse_posted_message(channel_id, &body)
+    }
+
+    /// Like [`Self::post_component_message`], into a DM with `user_id`.
+    pub async fn post_direct_component_message(
+        &self,
+        user_id: Snowflake,
+        content: &str,
+        mention_user: Option<Snowflake>,
+        components: &[Component],
+    ) -> Result<MessageRef, RoomHttpError> {
+        let channel_id = self.direct_channel(user_id).await?;
+        self.post_component_message(channel_id, content, mention_user, components)
+            .await
+    }
+
+    /// Replace the text and buttons of a message the bot posted. An empty
+    /// `components` list removes the buttons. No mentions are allowed. A
+    /// message (or its channel) that is already gone is `NotFound`.
+    pub async fn edit_component_message(
+        &self,
+        message: MessageRef,
+        content: &str,
+        components: &[Component],
+    ) -> Result<(), RoomHttpError> {
+        if message.channel_id == 0 || message.message_id == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let mentions = AllowedMentions::default();
+        let request = self
+            .http
+            .update_message(Id::new(message.channel_id), Id::new(message.message_id))
+            .content(Some(content))
+            .components(Some(components))
+            .allowed_mentions(Some(&mentions))
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        self.send(request, || true).await?;
+        Ok(())
     }
 
     /// Atomic room-scoped overwrite replacement for an owner handoff.
@@ -913,6 +1007,23 @@ impl RoomHttp {
             .await
             .map_err(|_| RoomHttpError::RenameDeferred)??;
         Ok(())
+    }
+}
+
+/// The id of a message Discord just created. A 2xx whose body does not name a
+/// message is an unknown outcome, never an id of zero.
+fn parse_posted_message(channel_id: Snowflake, body: &[u8]) -> Result<MessageRef, RoomHttpError> {
+    #[derive(Deserialize)]
+    struct Posted {
+        id: String,
+    }
+    let posted: Posted = serde_json::from_slice(body).map_err(|_| RoomHttpError::UnknownOutcome)?;
+    match posted.id.parse::<Snowflake>() {
+        Ok(message_id) if message_id != 0 => Ok(MessageRef {
+            channel_id,
+            message_id,
+        }),
+        _ => Err(RoomHttpError::UnknownOutcome),
     }
 }
 

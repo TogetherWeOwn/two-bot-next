@@ -67,8 +67,10 @@ pub struct PrivateRoom {
 /// The durable part of one room's privacy state, as `voice_rooms` and
 /// `voice_room_blocks` hold it: the private flag, the Join channel once it
 /// exists, and the block list. Grants, pending requests and request ids stay
-/// runtime-only until the join-request slice persists them, so a restart
-/// forgets requests but never access, blocks or the Join channel.
+/// runtime-only: a restart forgets requests (the runtime keeps a pre-restart
+/// button from matching a new request by starting its ids from a per-worker
+/// epoch) and which members were approved, but never the blocks or the Join
+/// channel, and Discord keeps the approved members' Connect allow.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrivacyRecord {
     pub private: bool,

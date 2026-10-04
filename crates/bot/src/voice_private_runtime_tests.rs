@@ -246,7 +246,7 @@ async fn public_restores_connect_deletes_the_join_channel_and_keeps_blocks() {
     let (mut worker, trace) = worker().await;
     private_cmd(&mut worker, OWNER);
     drain(&mut worker).await;
-    // A block (written by the join-request slice) must outlive the toggle.
+    // A block (written by a Block press) must outlive the toggle.
     worker
         .privacy
         .get_mut(&ROOM)
