@@ -1342,6 +1342,107 @@ impl LiveGuild {
         self.inner.write().expect("live voice lock").bot = Some(access);
     }
 
+    /// Validate logging targets against the live cache, not resolved picker data.
+    fn validate_logging(
+        &self,
+        interaction: &Interaction,
+        action: &LoggingAction,
+    ) -> Result<(), &'static str> {
+        let live = self.inner.read().expect("live voice lock");
+        if !live.ready {
+            return Err("Voice state is syncing right now. Try again shortly.");
+        }
+        let bot = live
+            .bot
+            .as_ref()
+            .ok_or("Guild roles are not available yet.")?;
+        let member = interaction
+            .member
+            .as_ref()
+            .ok_or("Could not verify your guild roles.")?;
+        let actor = interaction
+            .author_id()
+            .ok_or("Could not identify the member.")?;
+        match action {
+            LoggingAction::Mention(Some(id)) => {
+                let role = bot
+                    .roles
+                    .iter()
+                    .find(|role| role.id.get() == *id)
+                    .ok_or("Choose a role from this server.")?;
+                if *id == self.guild_id || role.managed || !role.mentionable {
+                    return Err("Choose a mentionable, unmanaged role other than @everyone.");
+                }
+                if actor.get() != bot.guild_owner_id {
+                    let everyone = bot
+                        .roles
+                        .iter()
+                        .find(|role| role.id.get() == self.guild_id)
+                        .ok_or("Guild roles are not available yet.")?;
+                    let mut highest = everyone;
+                    for id in &member.roles {
+                        let held = bot
+                            .roles
+                            .iter()
+                            .find(|role| role.id == *id)
+                            .ok_or("Could not verify your guild roles.")?;
+                        highest = highest.max(held);
+                    }
+                    // Twilight's Role ordering includes Discord's snowflake tie-break.
+                    if role >= highest {
+                        return Err("Choose a role below your highest role.");
+                    }
+                }
+            }
+            LoggingAction::Channel(Some(id)) => {
+                let channel = live
+                    .channels
+                    .get(id)
+                    .filter(|channel| {
+                        channel.guild_id.map(Id::get) == Some(self.guild_id)
+                            && channel.kind == ChannelType::GuildText
+                    })
+                    .ok_or("Choose a text channel from this server.")?;
+                let permissions = effective_permissions(
+                    self.guild_id,
+                    bot.guild_owner_id,
+                    actor.get(),
+                    &member.roles,
+                    &bot.roles,
+                    channel.permission_overwrites.as_deref().unwrap_or_default(),
+                )
+                .ok_or("Could not verify your channel permissions.")?;
+                if !permissions.contains(Permissions::VIEW_CHANNEL | Permissions::SEND_MESSAGES) {
+                    return Err("Choose a text channel where you can view and send messages.");
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Stored roles can become managed/unmentionable or be deleted after a save.
+    /// Never use the bot's Mention Everyone permission to override mentionability.
+    fn safe_notice_role(&self, id: Snowflake) -> bool {
+        let live = self.inner.read().expect("live voice lock");
+        live.ready
+            && id != self.guild_id
+            && live.bot.as_ref().is_some_and(|bot| {
+                bot.roles
+                    .iter()
+                    .any(|role| role.id.get() == id && !role.managed && role.mentionable)
+            })
+    }
+
+    fn text_notice_channel(&self, id: Snowflake) -> bool {
+        let live = self.inner.read().expect("live voice lock");
+        live.ready
+            && live.channels.get(&id).is_some_and(|channel| {
+                channel.guild_id.map(Id::get) == Some(self.guild_id)
+                    && channel.kind == ChannelType::GuildText
+            })
+    }
+
     /// System channel and owner for V10 notice routing; `None` until the bot
     /// evidence is published.
     fn notice_context(&self) -> Option<(Option<Snowflake>, Snowflake)> {
@@ -2974,8 +3075,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// channel's chat. A destination that fails is dropped and the next is
     /// tried.
     async fn deliver_notice(&self, settings: &LoggingSettings, text: &str) -> bool {
-        let mention = settings.mention_role_id.filter(|role| *role != 0);
-        if let Some(channel) = settings.channel_id.filter(|channel| *channel != 0) {
+        let mention = settings
+            .mention_role_id
+            .filter(|role| self.live.safe_notice_role(*role));
+        if let Some(channel) = settings
+            .channel_id
+            .filter(|channel| self.live.text_notice_channel(*channel))
+        {
             if self
                 .http
                 .send_notice(NoticeTarget::Channel(channel), text, mention)
@@ -6629,14 +6735,20 @@ fn parse_logging_action(options: &[CommandDataOption]) -> LoggingAction {
                 _ => None,
             })
             .unwrap_or(LoggingAction::Invalid),
-        "channel" => LoggingAction::Channel(arg("channel").and_then(|option| match option.value {
-            CommandOptionValue::Channel(channel) => Some(channel.get()),
-            _ => None,
-        })),
-        "mention" => LoggingAction::Mention(arg("role").and_then(|option| match option.value {
-            CommandOptionValue::Role(role) => Some(role.get()),
-            _ => None,
-        })),
+        "channel" => match arg("channel") {
+            None => LoggingAction::Channel(None),
+            Some(option) => match option.value {
+                CommandOptionValue::Channel(channel) => LoggingAction::Channel(Some(channel.get())),
+                _ => LoggingAction::Invalid,
+            },
+        },
+        "mention" => match arg("role") {
+            None => LoggingAction::Mention(None),
+            Some(option) => match option.value {
+                CommandOptionValue::Role(role) => LoggingAction::Mention(Some(role.get())),
+                _ => LoggingAction::Invalid,
+            },
+        },
         _ => LoggingAction::Invalid,
     }
 }
@@ -7382,6 +7494,22 @@ where
             }
             // Same lock as `/access`: admin-only and rare, so one lock is enough.
             let _serialized = runtime.access_lock.lock().await;
+            if matches!(
+                action,
+                LoggingAction::Mention(Some(_)) | LoggingAction::Channel(Some(_))
+            ) {
+                let validation = runtime
+                    .live_actor(guild_id)
+                    .ok_or("Voice state is syncing right now. Try again shortly.")
+                    .and_then(|actor| actor.live.validate_logging(interaction, &action));
+                if let Err(reason) = validation {
+                    reply(ephemeral_response(&format!(
+                        "{reason} Nothing was changed."
+                    )))
+                    .await;
+                    return true;
+                }
+            }
             let (store, _) = runtime.make_pair();
             let text = execute_logging(&store, guild_id, action).await;
             reply(ephemeral_response(&text)).await;

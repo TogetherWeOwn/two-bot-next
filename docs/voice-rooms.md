@@ -283,6 +283,14 @@ library code with no Discord dependency and can start immediately.
 ## V10: Logging, health, errors, utilities
 
 - `/logging`: log channel, detail level, who gets mentioned on errors, or off.
+  Setting a channel requires a cached guild text channel where the invoking
+  member can view and send messages. Setting a mention requires a cached,
+  mentionable, unmanaged role other than @everyone, strictly below the member's
+  highest role (the guild owner is exempt from hierarchy only). Mention Everyone
+  does not bypass these checks. Missing cache evidence refuses the change;
+  clearing either setting still works. Delivery suppresses stored roles that
+  are deleted, managed or no longer mentionable, and skips configured channels
+  that are no longer cached guild text channels.
 - Error notices go to the first place that works: the guild system channel
   (mentioning whoever last set up the bot), a DM to that person or the guild
   owner, then the creator channel's chat.

@@ -4053,11 +4053,26 @@ fn channel_option(name: &str, id: u64) -> CommandDataOption {
 }
 
 fn logging_interaction(sub: CommandDataOption, admin: bool) -> Interaction {
-    voice_interaction(
+    let mut interaction = voice_interaction_as(
         Some(command_data("logging", vec![sub])),
         admin.then_some(Permissions::MANAGE_CHANNELS),
-        true,
-    )
+        MEMBER,
+    );
+    interaction.member.as_mut().unwrap().roles = vec![Id::new(10)];
+    interaction
+}
+
+fn logging_snapshot() -> GuildSnapshot {
+    let mut snapshot = snapshot(&[], vec![]);
+    snapshot.channels.push(channel(5, 0, None));
+    snapshot.bot.roles[0].permissions |= Permissions::SEND_MESSAGES;
+    let mut target = role_with(9, Permissions::empty());
+    target.position = 1;
+    target.mentionable = true;
+    let mut actor = role_with(10, Permissions::MANAGE_CHANNELS);
+    actor.position = 2;
+    snapshot.bot.roles.extend([target, actor]);
+    snapshot
 }
 
 fn logging_action(sub: CommandDataOption) -> LoggingAction {
@@ -4114,7 +4129,12 @@ fn parse_logging_subcommands() {
         LoggingAction::Mention(None)
     );
     // Malformed shapes are answered, never ignored.
-    for sub in [sub_option("bogus", vec![]), sub_option("level", vec![])] {
+    for sub in [
+        sub_option("bogus", vec![]),
+        sub_option("level", vec![]),
+        sub_option("mention", vec![channel_option("role", 9)]),
+        sub_option("channel", vec![role_option("channel", 5)]),
+    ] {
         assert_eq!(logging_action(sub), LoggingAction::Invalid);
     }
     let bare = voice_interaction(Some(command_data("logging", Vec::new())), None, true);
@@ -4140,6 +4160,7 @@ async fn logging_command_needs_an_admin() {
 async fn logging_command_changes_are_saved_and_shown() {
     let shared = Arc::new(Mutex::new(LoggingSettings::default()));
     let runtime = logging_runtime(shared.clone(), None, None);
+    assert!(runtime.publish_snapshot(GUILD, logging_snapshot()));
     let run = |sub| {
         let interaction = logging_interaction(sub, true);
         let runtime = &runtime;
@@ -4198,6 +4219,217 @@ async fn logging_command_refuses_bad_input_without_changing_anything() {
         assert!(!text.starts_with("Saved."), "{text}");
         assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
     }
+}
+
+#[tokio::test]
+async fn logging_mention_refuses_unsafe_roles_without_saving() {
+    for case in [
+        "everyone",
+        "managed",
+        "higher",
+        "same",
+        "tie",
+        "unmentionable",
+        "unknown",
+        "missing-held",
+    ] {
+        let initial = LoggingSettings {
+            channel_id: Some(5),
+            mention_role_id: Some(9),
+            ..LoggingSettings::default()
+        };
+        let shared = Arc::new(Mutex::new(initial));
+        let runtime = logging_runtime(shared.clone(), None, None);
+        let mut snapshot = logging_snapshot();
+        let mut target = 9;
+        match case {
+            "everyone" => {
+                target = GUILD;
+                snapshot.bot.roles[0].mentionable = true;
+            }
+            "managed" => snapshot.bot.roles[1].managed = true,
+            "higher" => snapshot.bot.roles[1].position = 3,
+            "same" => {
+                target = 10;
+                snapshot.bot.roles[2].mentionable = true;
+            }
+            "tie" => snapshot.bot.roles[1].position = 2, // Lower ID wins the tie.
+            "unmentionable" => snapshot.bot.roles[1].mentionable = false,
+            "unknown" => target = 99,
+            "missing-held" => {
+                snapshot.bot.roles.pop();
+            }
+            _ => unreachable!(),
+        }
+        assert!(runtime.publish_snapshot(GUILD, snapshot));
+        let (_, response) = handle_capture(
+            &runtime,
+            &logging_interaction(
+                sub_option("mention", vec![role_option("role", target)]),
+                true,
+            ),
+        )
+        .await;
+        let response = response.expect("refusal");
+        assert!(
+            response_text(&response).contains("Nothing was changed"),
+            "{case}"
+        );
+        assert_eq!(
+            response.data.as_ref().unwrap().flags,
+            Some(MessageFlags::EPHEMERAL)
+        );
+        assert_eq!(*shared.lock().unwrap(), initial, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn logging_role_hierarchy_uses_the_highest_role_and_owner_exception() {
+    for owner in [false, true] {
+        let shared = Arc::new(Mutex::new(LoggingSettings::default()));
+        let runtime = logging_runtime(shared.clone(), None, None);
+        let mut snapshot = logging_snapshot();
+        snapshot.bot.roles[1].position = 2;
+        snapshot.bot.roles[1].id = Id::new(11); // Higher ID is lower at equal position.
+        if owner {
+            snapshot.bot.roles[1].position = 3;
+        }
+        assert!(runtime.publish_snapshot(GUILD, snapshot));
+        let mut interaction =
+            logging_interaction(sub_option("mention", vec![role_option("role", 11)]), true);
+        interaction
+            .member
+            .as_mut()
+            .unwrap()
+            .roles
+            .insert(0, Id::new(GUILD));
+        if owner {
+            interaction.member.as_mut().unwrap().user = Some(test_user(OWNER));
+        }
+        let (_, response) = handle_capture(&runtime, &interaction).await;
+        assert!(response_text(&response.unwrap()).starts_with("Saved."));
+        assert_eq!(shared.lock().unwrap().mention_role_id, Some(11));
+    }
+}
+
+#[tokio::test]
+async fn logging_channel_refuses_non_text_unknown_and_hidden_targets() {
+    use twilight_model::channel::permission_overwrite::{
+        PermissionOverwrite, PermissionOverwriteType,
+    };
+    for case in [
+        "voice",
+        "stage",
+        "category",
+        "thread",
+        "announcement",
+        "dm",
+        "unknown",
+        "hidden",
+        "read-only",
+        "missing-held",
+    ] {
+        let initial = LoggingSettings {
+            channel_id: Some(5),
+            mention_role_id: Some(9),
+            ..LoggingSettings::default()
+        };
+        let shared = Arc::new(Mutex::new(initial));
+        let runtime = logging_runtime(shared.clone(), None, None);
+        let mut snapshot = logging_snapshot();
+        let target = if case == "unknown" { 99 } else { 5 };
+        let channel = snapshot.channels.last_mut().unwrap();
+        match case {
+            "voice" => channel.kind = ChannelType::GuildVoice,
+            "stage" => channel.kind = ChannelType::GuildStageVoice,
+            "category" => channel.kind = ChannelType::GuildCategory,
+            "thread" => channel.kind = ChannelType::PublicThread,
+            "announcement" => channel.kind = ChannelType::GuildAnnouncement,
+            "dm" => channel.kind = ChannelType::Private,
+            "hidden" | "read-only" => {
+                channel.permission_overwrites = Some(vec![PermissionOverwrite {
+                    id: Id::new(MEMBER),
+                    kind: PermissionOverwriteType::Member,
+                    allow: Permissions::empty(),
+                    deny: if case == "hidden" {
+                        Permissions::VIEW_CHANNEL
+                    } else {
+                        Permissions::SEND_MESSAGES
+                    },
+                }])
+            }
+            "missing-held" => {
+                snapshot.bot.roles.pop();
+            }
+            "unknown" => {}
+            _ => unreachable!(),
+        }
+        assert!(runtime.publish_snapshot(GUILD, snapshot));
+        let (_, response) = handle_capture(
+            &runtime,
+            &logging_interaction(
+                sub_option("channel", vec![channel_option("channel", target)]),
+                true,
+            ),
+        )
+        .await;
+        assert!(
+            response_text(&response.unwrap()).contains("Nothing was changed"),
+            "{case}"
+        );
+        assert_eq!(*shared.lock().unwrap(), initial, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn logging_targets_fail_closed_without_live_evidence_but_clearing_still_works() {
+    let initial = LoggingSettings {
+        channel_id: Some(5),
+        mention_role_id: Some(9),
+        ..LoggingSettings::default()
+    };
+    let shared = Arc::new(Mutex::new(initial));
+    let runtime = logging_runtime(shared.clone(), None, None);
+    for sub in [
+        sub_option("channel", vec![channel_option("channel", 5)]),
+        sub_option("mention", vec![role_option("role", 9)]),
+    ] {
+        let (_, response) = handle_capture(&runtime, &logging_interaction(sub, true)).await;
+        assert!(response_text(&response.unwrap()).contains("Nothing was changed"));
+        assert_eq!(*shared.lock().unwrap(), initial);
+    }
+    for sub in [sub_option("channel", vec![]), sub_option("mention", vec![])] {
+        let (_, response) = handle_capture(&runtime, &logging_interaction(sub, true)).await;
+        assert!(response_text(&response.unwrap()).starts_with("Saved."));
+    }
+    assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
+}
+
+#[tokio::test]
+async fn logging_rejects_foreign_channel_and_disconnected_or_unidentified_actor() {
+    let live = LiveGuild::new(GUILD);
+    assert!(live.publish(logging_snapshot()));
+    let interaction = logging_interaction(
+        sub_option("channel", vec![channel_option("channel", 5)]),
+        true,
+    );
+    let mut foreign = channel(5, 0, None);
+    foreign.guild_id = Some(Id::new(101));
+    // Inject inconsistent cache evidence, not an interaction's resolved map.
+    live.inner.write().unwrap().channels.insert(5, foreign);
+    assert!(live
+        .validate_logging(&interaction, &LoggingAction::Channel(Some(5)))
+        .is_err());
+    assert!(live.publish(logging_snapshot()));
+    let mut anonymous = interaction.clone();
+    anonymous.member.as_mut().unwrap().user = None;
+    assert!(live
+        .validate_logging(&anonymous, &LoggingAction::Channel(Some(5)))
+        .is_err());
+    live.disconnect();
+    assert!(live
+        .validate_logging(&interaction, &LoggingAction::Mention(Some(9)))
+        .is_err());
 }
 
 #[tokio::test]
@@ -7863,12 +8095,14 @@ const OWNER: u64 = 998;
 const NOTICE_ROLE: u64 = 55;
 
 fn notice_bot(system_channel_id: Option<u64>) -> BotAccess {
+    let mut notice_role = role_with(NOTICE_ROLE, Permissions::empty());
+    notice_role.mentionable = true;
     BotAccess {
         member_id: 999,
         guild_owner_id: OWNER,
         system_channel_id,
         member_roles: vec![],
-        roles: vec![role(permissions())],
+        roles: vec![role(permissions()), notice_role],
     }
 }
 
@@ -7881,6 +8115,7 @@ async fn failed_worker(
     store.persist_error = Some(StoreError::Unavailable);
     *store.logging.lock().unwrap() = settings;
     live.refresh_bot(notice_bot(system_channel_id));
+    live.upsert_channel(channel(650, 0, None));
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
@@ -7924,6 +8159,80 @@ async fn notice_goes_to_the_system_channel_with_the_role_mention_then_repeats_ar
     assert_eq!(sent(&worker).len(), 3);
     // The failure stays listed for /setup even though notices stopped.
     assert_eq!(worker.failures().len(), 1);
+}
+
+#[tokio::test]
+async fn notice_suppresses_everyone_unknown_managed_and_unmentionable_roles() {
+    for case in ["everyone", "unknown", "managed", "unmentionable"] {
+        let target = match case {
+            "everyone" => GUILD,
+            "unknown" => 99,
+            _ => NOTICE_ROLE,
+        };
+        let settings = LoggingSettings {
+            mention_role_id: Some(target),
+            ..LoggingSettings::default()
+        };
+        let mut worker = failed_worker(settings, Some(SYSTEM_CHANNEL)).await;
+        let mut bot = notice_bot(Some(SYSTEM_CHANNEL));
+        if case == "managed" {
+            bot.roles[1].managed = true;
+        }
+        if case == "unmentionable" {
+            bot.roles[1].mentionable = false;
+        }
+        bot.roles[0].mentionable = true;
+        worker.live.refresh_bot(bot);
+        assert!(worker.send_notices(0).await);
+        assert_eq!(sent(&worker)[0].2, None, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn notice_role_drift_is_rechecked_before_a_repeat() {
+    let settings = LoggingSettings {
+        mention_role_id: Some(NOTICE_ROLE),
+        ..LoggingSettings::default()
+    };
+    let mut worker = failed_worker(settings, Some(SYSTEM_CHANNEL)).await;
+    assert!(worker.send_notices(0).await);
+    assert_eq!(sent(&worker)[0].2, Some(NOTICE_ROLE));
+    let mut bot = notice_bot(Some(SYSTEM_CHANNEL));
+    bot.roles[1].mentionable = false;
+    worker.live.refresh_bot(bot);
+    assert!(worker.send_notices(NOTICE_REPEAT_INTERVAL_MS).await);
+    assert_eq!(sent(&worker)[1].2, None);
+}
+
+#[tokio::test]
+async fn rejected_everyone_logging_command_cannot_add_a_notice_mention() {
+    let shared = Arc::new(Mutex::new(LoggingSettings::default()));
+    let runtime = logging_runtime(shared.clone(), None, None);
+    assert!(runtime.publish_snapshot(GUILD, logging_snapshot()));
+    let (_, response) = handle_capture(
+        &runtime,
+        &logging_interaction(
+            sub_option("mention", vec![role_option("role", GUILD)]),
+            true,
+        ),
+    )
+    .await;
+    assert!(response_text(&response.unwrap()).contains("Nothing was changed"));
+    let settings = *shared.lock().unwrap();
+    let mut worker = failed_worker(settings, Some(SYSTEM_CHANNEL)).await;
+    assert!(worker.send_notices(0).await);
+    assert_eq!(sent(&worker)[0].2, None);
+}
+
+#[tokio::test]
+async fn notice_skips_a_stored_non_text_channel() {
+    let settings = LoggingSettings {
+        channel_id: Some(CREATOR),
+        ..LoggingSettings::default()
+    };
+    let mut worker = failed_worker(settings, Some(SYSTEM_CHANNEL)).await;
+    assert!(worker.send_notices(0).await);
+    assert_eq!(sent(&worker)[0].0, NoticeTarget::Channel(SYSTEM_CHANNEL));
 }
 
 #[tokio::test]

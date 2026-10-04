@@ -581,7 +581,13 @@ fn option_to_twilight(opt: &two_bot_core::commands::CommandOption) -> CommandOpt
     };
     CommandOption {
         autocomplete: None,
-        channel_types: None,
+        channel_types: (!opt.channel_types.is_empty()).then(|| {
+            opt.channel_types
+                .iter()
+                .copied()
+                .map(twilight_model::channel::ChannelType::from)
+                .collect()
+        }),
         choices: if opt.choices.is_empty() {
             None
         } else {
