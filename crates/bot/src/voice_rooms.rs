@@ -1793,14 +1793,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             if !live.ready {
                 return Err(RoomHttpError::Cancelled);
             }
-            let revision = *live
-                .channel_revisions
-                .get(&channel_id)
-                .ok_or(RoomHttpError::Cancelled)?;
+            // A deleted channel drops its revision too, so test presence first:
+            // the cleanup caller must see NotFound, not a retryable Cancelled.
             let channel = live
                 .channels
                 .get(&channel_id)
                 .ok_or(RoomHttpError::NotFound)?;
+            let revision = *live
+                .channel_revisions
+                .get(&channel_id)
+                .ok_or(RoomHttpError::Cancelled)?;
             let current = channel
                 .permission_overwrites
                 .as_deref()
