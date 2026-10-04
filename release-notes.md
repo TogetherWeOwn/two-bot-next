@@ -254,7 +254,7 @@ Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publi
   catalogue or a failed identity read parks the surface and the job.
 - Pure `scan_joins_for_bursts` raid replay over recorded joins (fresh watch per
   call, instant-ordered, strict RFC 3339) with the legacy historical-raid
-  scenarios as integration tests. No runtime or database wiring. (TOG-12378)
+  scenarios as integration tests. No runtime or database wiring.
 - Wire leveling through the shared command runtime, interaction router and REST executor with ordered, awaited gateway awards. Preserve message eligibility, measured voice duration, session/dry-run reward suppression, ephemeral rank and mention-suppressed public top 10. Ordinary level-ups only grant roles; explicit revokes require a pinned staging fence and whole-set permission/hierarchy preflight. Mock REST and migrated disposable database proofs run in CI, including a shared-runtime single-callback regression.
 - Wire LFG commands and role selects through the shared interaction runtime and REST executor, with ephemeral replies, mention-free message refresh, serialized capacity/closure, nonce recovery, failed-post cleanup and shared announcement audit outcomes.
 - Add bounded component-bearing posts, member-role deltas and deferred-response edits to the shared Discord executor, with explicit onboarding mention/menu rendering and fail-closed per-guild configuration. Wire pre-update gateway capture and shared-router orchestration with live settings/permissions, guarded welcomes and post-role routing; verify through mock Discord and isolated testdb acceptance. Persist pre-pipeline welcome/goodbye jobs atomically with gateway checkpoints and bound restart attempts; retain token-free interrupted-component receipts instead of replaying uncertain role writes. Commit anchor marker/routing together and finish deferred processing errors with bounded honest replies. Recovery validation remains in progress; no live activation is claimed.
@@ -262,7 +262,7 @@ Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publi
   staging/live-approval and dry-run fences, protected-target enforcement plans,
   repeat-history expiration, and replay-safe delivery claims with the
   legacy-compatible once-per-message violation ledger. Shared executor/shard
-  activation is not enabled by this slice. (TOG-10089)
+  activation is not enabled by this slice.
 - Scheduled-message domain logic, PostgreSQL store and migration, with validation, prefix-resolved removal, recurring timing and retry outcomes. Discord router/executor wiring follows separately.
 - Scheduled-store integration tests run against the isolated PostgreSQL service container in CI.
 - Add ticket lifecycle domain logic and guild-scoped Postgres persistence, with atomic transcript capture, 300-second cooldowns, restart-recovery plans and 90-day transcript purge. Shared-router/REST runtime wiring remains pending.
@@ -334,6 +334,7 @@ Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publi
 * **ci:** report last observed stage when the staging rollout gate times out ([#367](https://github.com/TogetherWeOwn/two-bot-next/issues/367)) ([a863199](https://github.com/TogetherWeOwn/two-bot-next/commit/a863199ced3e00ba6588ad453b766a4c5cf4d330))
 * **ci:** restore a runnable green check gate on hosted runners ([#263](https://github.com/TogetherWeOwn/two-bot-next/issues/263)) ([e0a15bb](https://github.com/TogetherWeOwn/two-bot-next/commit/e0a15bbea0d62f485daf2b13f17bd5f5a26ba0db))
 * **ci:** scope SBOM handoff artifact to run attempt ([#426](https://github.com/TogetherWeOwn/two-bot-next/issues/426)) ([11d3f3a](https://github.com/TogetherWeOwn/two-bot-next/commit/11d3f3a2ce48a852cb2b4b491e161a2402393d27))
+* **ci:** warn on case-insensitive internal ids in public head refs ([#534](https://github.com/TogetherWeOwn/two-bot-next/issues/534)) ([2c78420](https://github.com/TogetherWeOwn/two-bot-next/commit/2c78420cf41af5f38bbb1e062f475f4232872ad0))
 * **cli:** make --help print usage instead of running backup or guild-config-snapshot ([#271](https://github.com/TogetherWeOwn/two-bot-next/issues/271)) ([581680c](https://github.com/TogetherWeOwn/two-bot-next/commit/581680cacb4ec7c13f144a534970bfcdf304e020))
 * **commands:** build send admission for live Discord targets ([#527](https://github.com/TogetherWeOwn/two-bot-next/issues/527)) ([4c1cfa4](https://github.com/TogetherWeOwn/two-bot-next/commit/4c1cfa4162acd654544e041b245c3163dbf607a7))
 * **containment:** include incident ID in staff alert ([#405](https://github.com/TogetherWeOwn/two-bot-next/issues/405)) ([9bdc4ef](https://github.com/TogetherWeOwn/two-bot-next/commit/9bdc4efdbaab87149391b8db1db1e01145569bbb))
@@ -347,8 +348,10 @@ Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publi
 * **cutover:** preserve Unicode literals in MEE6 template translation ([#171](https://github.com/TogetherWeOwn/two-bot-next/issues/171)) ([a99b59b](https://github.com/TogetherWeOwn/two-bot-next/commit/a99b59b6eccd9f3c0a8a663810164598e20eac86))
 * **cutover:** preserve UTF-8 boundaries in leave-attribution parsing ([#176](https://github.com/TogetherWeOwn/two-bot-next/issues/176)) ([b86b6c6](https://github.com/TogetherWeOwn/two-bot-next/commit/b86b6c64bc41b9777de13114cb68915c74ec929b))
 * **cutover:** reject everyone roles in MEE6 reward preflight ([#153](https://github.com/TogetherWeOwn/two-bot-next/issues/153)) ([4cbcde0](https://github.com/TogetherWeOwn/two-bot-next/commit/4cbcde05220fbac6d90f162ee9a4f06004447daf))
+* **cutover:** reject valued and ambiguous safety opt-ins ([#140](https://github.com/TogetherWeOwn/two-bot-next/issues/140)) ([c0206db](https://github.com/TogetherWeOwn/two-bot-next/commit/c0206db38a70b38ef9ab5535bc998fb52e5948f6))
 * **cutover:** repair multi-width verify decode and add end-to-end rehearsal ([#216](https://github.com/TogetherWeOwn/two-bot-next/issues/216)) ([a73d327](https://github.com/TogetherWeOwn/two-bot-next/commit/a73d327922715a5c1ce04ffee846e3d1c2de98c2))
 * **cutover:** report interrupted history scans as incomplete ([#175](https://github.com/TogetherWeOwn/two-bot-next/issues/175)) ([b82e76d](https://github.com/TogetherWeOwn/two-bot-next/commit/b82e76d929592ad9a13ea5eecb5d5af6b6215e33))
+* **cutover:** run the staging plan as the read-only role ([#530](https://github.com/TogetherWeOwn/two-bot-next/issues/530)) ([3d1e2dd](https://github.com/TogetherWeOwn/two-bot-next/commit/3d1e2ddd59dd0b1787eee6141e502f596ffa7b1e))
 * **cutover:** validate MEE6 XP ceiling before level evaluation ([#172](https://github.com/TogetherWeOwn/two-bot-next/issues/172)) ([8d87fc5](https://github.com/TogetherWeOwn/two-bot-next/commit/8d87fc55d77e9f184d4e9ddd409882a831bd5684))
 * **cutover:** validate reward levels and role uniqueness before DB access ([#158](https://github.com/TogetherWeOwn/two-bot-next/issues/158)) ([f2da7da](https://github.com/TogetherWeOwn/two-bot-next/commit/f2da7da10eed1f8afa1c9e776e57f9bc0c410812))
 * **db-roles:** complete matrix and enumerate migrations for coverage ([#389](https://github.com/TogetherWeOwn/two-bot-next/issues/389)) ([6a74563](https://github.com/TogetherWeOwn/two-bot-next/commit/6a7456345cb512cd29090b4693740adee7b99e14))
@@ -358,6 +361,7 @@ Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publi
 * **db:** require authenticated TLS for remote Postgres URLs ([#245](https://github.com/TogetherWeOwn/two-bot-next/issues/245)) ([a6bc262](https://github.com/TogetherWeOwn/two-bot-next/commit/a6bc262c27f4eb2b596b06540247b6a323b922b8))
 * **db:** runbook env names and sixth read-only drift case ([#410](https://github.com/TogetherWeOwn/two-bot-next/issues/410)) ([35ec6bc](https://github.com/TogetherWeOwn/two-bot-next/commit/35ec6bcddf5ac74dc66176fca2aa58b678e17e21))
 * **deploy:** retry staging ownership takeover across version propagation ([#521](https://github.com/TogetherWeOwn/two-bot-next/issues/521)) ([e64a3d6](https://github.com/TogetherWeOwn/two-bot-next/commit/e64a3d67db4658b6fe02249bd2ca972a6d357c1b))
+* **deploy:** tolerate a trailing application image listing in staging verify ([#529](https://github.com/TogetherWeOwn/two-bot-next/issues/529)) ([695a644](https://github.com/TogetherWeOwn/two-bot-next/commit/695a6441c1590c9ade94908e9f5bc85f19506ba3))
 * **deploy:** tolerate completed-rollout active-counter lag in staging verify ([#525](https://github.com/TogetherWeOwn/two-bot-next/issues/525)) ([0bbbf84](https://github.com/TogetherWeOwn/two-bot-next/commit/0bbbf8401e84000803f03333e3418e062b0b0a01))
 * **discord:** bound outbound text and suppress injected mentions ([#80](https://github.com/TogetherWeOwn/two-bot-next/issues/80)) ([8af9b23](https://github.com/TogetherWeOwn/two-bot-next/commit/8af9b23be40935b97cf29512be3aa45a8b368858))
 * **discord:** map stalled body timeout to wire Timeout ([#306](https://github.com/TogetherWeOwn/two-bot-next/issues/306)) ([7b2da29](https://github.com/TogetherWeOwn/two-bot-next/commit/7b2da294107296f85a4558528eb21af7c39580f0))
@@ -384,6 +388,7 @@ Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publi
 * **redirect:** forward real hold retry-after on redirect 429 ([#296](https://github.com/TogetherWeOwn/two-bot-next/issues/296)) ([9dc2dd6](https://github.com/TogetherWeOwn/two-bot-next/commit/9dc2dd628a107471f59f2119d8f95e7809185fca))
 * **redirect:** validate configuration and reserve healthz inputs ([#130](https://github.com/TogetherWeOwn/two-bot-next/issues/130)) ([abf5b07](https://github.com/TogetherWeOwn/two-bot-next/commit/abf5b07a44fa37eb7b634d17817c10b2782e2163))
 * **release:** accept Security section in bootstrap migration ([#329](https://github.com/TogetherWeOwn/two-bot-next/issues/329)) ([b6a34d6](https://github.com/TogetherWeOwn/two-bot-next/commit/b6a34d6a8d763366f57e1ca8ca3a113ff45402c7))
+* **release:** drop internal tracker footer from release-please config ([#531](https://github.com/TogetherWeOwn/two-bot-next/issues/531)) ([5ca08aa](https://github.com/TogetherWeOwn/two-bot-next/commit/5ca08aabe3af558fe4038a9c33f0d1ebc8f14357))
 * **release:** emit valid JSON when no release PR remains ([#70](https://github.com/TogetherWeOwn/two-bot-next/issues/70)) ([44338b2](https://github.com/TogetherWeOwn/two-bot-next/commit/44338b28a7feac0093cbd72dc9cecc45ab33a15d))
 * **release:** reconcile post-release Unreleased notes ([#112](https://github.com/TogetherWeOwn/two-bot-next/issues/112)) ([9a4040f](https://github.com/TogetherWeOwn/two-bot-next/commit/9a4040f2fa747d3d6509b573e3bd348e7155f9b3))
 * **release:** support pagination on older gh CLIs ([#146](https://github.com/TogetherWeOwn/two-bot-next/issues/146)) ([4fce302](https://github.com/TogetherWeOwn/two-bot-next/commit/4fce30241d18d370c0e5789a4ccf4b8415d98ac7))
@@ -410,18 +415,18 @@ Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publi
   text, not an invalid YAML mapping; retain the isolated mocked acceptance opt-in.
 - Accept and strip Neon's `channel_binding` URL option before SQLx without changing TLS mode; retain fatal startup exits with fixed, credential-safe diagnostics and sanitized Worker HTTP 500 responses. Gate staging deployments on the intended new container rollout, immutable image/build identity and serving Worker version; parked readiness 503 no longer passes deployment acceptance.
 - Keep parallel settings DB fixture schemas distinct when wall-clock readings
-  repeat, without sharing schemas or serializing the CAS regressions. (TOG-10089)
+  repeat, without sharing schemas or serializing the CAS regressions.
 - Grant runtime-only CRUD on the automod relations and cover migrations 0220–0223
   in least-privilege role tests. Keep edit retry identity stable across member
   role changes, and inspect updates without replacing or evicting CREATE repeat
-  history needed by queued deliveries. (TOG-10089)
+  history needed by queued deliveries.
 - Give owned disposable-database teardown a separate finite 30-second statement
   timeout for checkpoint waits, retaining five-second fixture query deadlines and
   verified cleanup after failures or caller cancellation.
 - Bound automod repeat inspection to each revision's time window without letting
   unstamped updates prune delayed creates; retain immutable CREATE facts during
   role enrichment and clarify enforce-only preserved-match recovery. Run the
-  preserved-replay database regression alongside durable dedupe in CI. (TOG-10089)
+  preserved-replay database regression alongside durable dedupe in CI.
 - Redact automod delivery-claim capabilities from derived debug output, including
   acquired and preserved results; expose tokens only at SQL fencing binds.
 - Grant the least-privilege runtime role scheduled-message CRUD and claim access, with web-reader denial coverage.
@@ -476,7 +481,7 @@ Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publi
 ### Security
 
 - Require authenticated TLS for `two_bot_cutover::connect` (threat-model F6). `TWO_DATABASE_TLS` defaults to `required`, which refuses local hosts and missing, `disable`, `allow` or `prefer` sslmode, and always connects as `verify-full`. `local-only` (tests and CI only) allows loopback, CI service and socket hosts and refuses remote ones. Refusals are fixed strings that never echo the URL. See `docs/database-tls.md`.
-- Fence the remaining Postgres connect paths with the same TLS policy (threat-model F6): the gateway store pool, both `two-bot backup` URL parses, and `channel_moderation_store::connect`. Each refuses a `sslmode=disable` remote URL with the same fixed string and connects `Required` URLs as `verify-full`. (TOG-12208)
+- Fence the remaining Postgres connect paths with the same TLS policy (threat-model F6): the gateway store pool, both `two-bot backup` URL parses, and `channel_moderation_store::connect`. Each refuses a `sslmode=disable` remote URL with the same fixed string and connects `Required` URLs as `verify-full`.
 
 ---
-Refs: TOG-9865
+This PR was generated with [Release Please](https://github.com/googleapis/release-please). See [documentation](https://github.com/googleapis/release-please#release-please).
