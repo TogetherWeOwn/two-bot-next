@@ -150,7 +150,7 @@ fn exactly_five_covered_with_response_links_rest_deferred_with_reasons() {
     covered_names.sort_unstable();
     assert_eq!(
         covered_names,
-        ["ban", "lfg", "leaderboard", "rank", "rsvp"],
+        ["ban", "leaderboard", "lfg", "rank", "rsvp"],
         "the smoke five, one per routing family"
     );
 
