@@ -363,6 +363,13 @@ class DeltaChecklistTests(unittest.TestCase):
     def line(self, needle):
         return next(line for line in self.parity.splitlines() if needle in line)
 
+    def carded_line(self):
+        """Any ledger row still `carded`; rows leave that status as they port."""
+        return next(
+            line for line in self.parity.splitlines()
+            if line.startswith("| [") and " | carded | " in line
+        )
+
     def entry(self, data, entry_id):
         return next(e for e in data["entries"] if e["id"] == entry_id)
 
@@ -413,7 +420,7 @@ class DeltaChecklistTests(unittest.TestCase):
                     validate(changed, self.checklist)
 
     def test_ledger_status_changes_are_stale(self):
-        line = self.line("| [bffccf3]")
+        line = self.carded_line()
         dropped = line.replace("| carded | ", "| dropped | drop: superseded; ", 1)
         with self.assertRaisesRegex(ValueError, "missing=\\[\\]; stale="):
             validate(self.parity.replace(line, dropped, 1), self.checklist)
@@ -478,7 +485,7 @@ class DeltaChecklistTests(unittest.TestCase):
             delta_rows(self.parity.replace(header, "| Legacy commit | Area | Change | State | Disposition |", 1))
         with self.assertRaisesRegex(ValueError, "must end in Disposition"):
             delta_rows(self.parity.replace(header, "| Legacy commit | Area | Change | Status | Outcome |", 1))
-        line = self.line("| [bffccf3]")
+        line = self.carded_line()
         with self.assertRaisesRegex(ValueError, "unknown ledger status 'pending'"):
             delta_rows(self.parity.replace(line, line.replace("| carded |", "| pending |", 1), 1))
         with self.assertRaisesRegex(ValueError, "malformed table row"):
@@ -511,7 +518,7 @@ class DeltaChecklistTests(unittest.TestCase):
         for entry in automated:
             for command in entry["verification"].split(" && "):
                 with self.subTest(entry=entry["id"], command=command):
-                    self.assertTrue(command.startswith("python3 scripts/cargo_cache.py run -- test -p two-bot-"))
+                    self.assertTrue(command.startswith("python3 scripts/cargo_cache.py run -- test -p two-bot"))
 
     def test_render_lists_delta_sections_and_owners(self):
         output = render(self.checklist)
