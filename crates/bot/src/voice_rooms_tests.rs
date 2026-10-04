@@ -2896,7 +2896,7 @@ async fn access_command_reaches_the_live_actor_without_a_restart() {
     let trace = Trace::default();
     let shared = Arc::new(Mutex::new(AccessControls::default()));
     let runtime = shared_runtime(trace.clone(), shared, None);
-    assert!(runtime.publish_snapshot(GUILD, snapshot(&[], vec![])));
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
     // The actor is loaded once it can answer a status request.
     for _ in 0..500 {
         if runtime.worker_status(GUILD).await.is_some() {
@@ -4127,6 +4127,7 @@ fn create_interaction() -> Interaction {
 async fn responder_defers_before_any_create_and_completes_once() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
     let replies = Replies::new(trace.clone());
     VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None, None).await;
     assert_eq!(
@@ -4136,6 +4137,18 @@ async fn responder_defers_before_any_create_and_completes_once() {
     let completed = replies.completed.lock().unwrap();
     assert_eq!(completed.len(), 1);
     assert!(response_text(&completed[0]).contains("Created <#500>"));
+}
+
+#[tokio::test]
+async fn responder_without_guild_roles_refuses_channel_permission_claims_without_creating() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let replies = Replies::new(trace.clone());
+    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None, None).await;
+    assert_eq!(*trace.lock().unwrap(), ["defer", "complete"]);
+    let completed = replies.completed.lock().unwrap();
+    assert_eq!(completed.len(), 1);
+    assert!(response_text(&completed[0]).contains("You need Manage Channels"));
 }
 
 #[tokio::test]
@@ -4166,6 +4179,7 @@ async fn responder_failed_or_ambiguous_ack_never_executes_or_retries() {
 async fn responder_completion_failure_does_not_repeat_channel_creation() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
     let mut replies = Replies::new(trace.clone());
     replies.complete_error = Some(RoomHttpError::UnknownOutcome);
     VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None, None).await;

@@ -401,13 +401,18 @@ async fn create_notifies_existing_actor_before_next_join() {
     let pipeline = MemPipeline::for_replay();
     bootstrap(&runtime, &pipeline, &[]);
     status(&runtime).await;
-    let interaction = voice_interaction(
-        Some(command_data(
-            "create",
-            vec![command_option("name", "new creator")],
-        )),
-        Some(Permissions::MANAGE_CHANNELS),
-        true,
+    // This guild grants Manage Channels through @everyone; the invoker has
+    // no additional role IDs, especially none missing from the guild cache.
+    let interaction = with_roles(
+        voice_interaction(
+            Some(command_data(
+                "create",
+                vec![command_option("name", "new creator")],
+            )),
+            Some(Permissions::MANAGE_CHANNELS),
+            true,
+        ),
+        &[],
     );
     let seen = Arc::new(Mutex::new(None));
     let writer = seen.clone();
