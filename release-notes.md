@@ -1,63 +1,16 @@
 :robot: I have created a release *beep* *boop*
 
-## Thinking Path
+## Summary
 
-> - two-bot-next is the Together We Own Discord bot, written in Rust, running as one always-on container.
-> - Its workspace ships as one synchronized release with one root changelog and tag.
-> - Generated metadata must use the main snapshot that is independently reviewed and merged.
-> - Regeneration must retain excluded-consumer synchronization, contributor-example CI coverage and every historical release note.
-> - This pull request prepares synchronized 0.3.0 metadata; it does not authorize production cutover or a stale-main merge.
+Publish the next synchronized Rust workspace release through release-please.
 
-## Linked Issues or Issue Description
+## Changes
 
-- Address the [latest freshness finding](https://github.com/TogetherWeOwn/two-bot-next/pull/71#pullrequestreview-5406543783) on this same PR. Regenerate from snapshot `48b070a2`, incorporating #566 staging-apply claims and #564 safety-flag tests, and retain the reviewed source and canonical-metadata repairs. Main moved again after that generation, so a new green head alone cannot satisfy the live freshness gate.
+Update the release manifest, Cargo versions and lockfile, and preserve generated and bootstrap changelog notes.
 
-## What Changed
+## Testing
 
-- Regenerate the root release manifest, seven package versions and local dependency pins, Cargo.lock, and CHANGELOG.md through release-please 17.6.0.
-- Restore the same seven-file source repair: excluded fuzz path requirements, copyable testsupport dependency example, native generic extra-file updates, lifecycle regression coverage, release documentation, and contributor-only Worker CI selection.
-- Preserve those seven repair files byte-for-byte from the prior repaired source. Keep the reconciled incoming changelog verbatim, not a hand-spliced conflict resolution.
-- Retain the native overflow link and full freshly generated notes region/footer unchanged by this seven-section metadata repair. Preserve every prior notes line and its bullet multiplicity; add the native fix entry for #566.
-- Include #564 in the source snapshot without inventing a user-facing changelog entry for its `test` type. Preserve #550/#533 notes and the prior #350 source/toolchain changes.
-- Credit release-please automation and the repository contributors whose changes appear below.
-
-## Verification
-
-- [Regeneration workflow 37208033953](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/37208033953): SUCCESS from snapshot `48b070a24e8db01b0576ea349cb6ef97ba82de10`; reconciled generated head `b8765488e20df1d5f04ea7af9cf27cc24351e8d5`.
-- The previous head `8ccbad3f` passed [check/ci-ok 37203426434](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/37203426434) and [supply-chain 37203426228](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/37203426228). Those are historical results, not proof for this regenerated head.
-- Before this regeneration, current-main release planning returned `reuse_pr=false`. Main subsequently moved to observed `c60167e4` after #540 while this generation was in flight. Do not merge this snapshot as though it were fresh.
-- Current repair pushed as `6b88aa3f`. `NODE_PATH=<pinned-dependencies> node scripts/test-release.cjs`: PASS, 22 bootstrap plus 22 post-release native lifecycles and all migration/overflow/snapshot guards.
-- `node scripts/test-release-publication.cjs` with release-please 17.6.0: PASS, publication/retry and misplaced-template negative control.
-- `python3 scripts/test-release-retry.py`: 28 tests PASS. `python3 scripts/test-pr-lint.py`: 27 tests PASS.
-- `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_job_inputs.py' -v`: 58 tests PASS; equivalent discovery for `test_container_inputs.py`: 26 tests PASS.
-- `python3 scripts/test-docker-deps.py`: seven valid package targets PASS without Cargo compilation. `git diff --check`: PASS. All seven repair files match the prior repaired source; CHANGELOG.md matches the incoming generated head byte-for-byte.
-- No old CI or approval is substituted for new exact-head checks and independent review.
-- Canonical-body verification checks strict seven-section metadata with the generated-branch exemption removed, byte-identical native region/footer and unchanged visible link, preservation of historical bullet counts, and the actual pinned native overflow publication path with a misplaced-template negative control. The replay mocks all GitHub transport and creates no real release.
-- No local Rust compilation, full fuzz campaign, staging E2E, production test, deployment, tag verification or SBOM publication verification is claimed. Exact-head CI and independent approval remain pending, and live freshness must be restored before merge.
-
-## Risks
-
-- Pre-1.0 release publication is not production deployment or cutover approval.
-- A merge during the generation/CI/review window invalidates the snapshot, even when its source CI is green and the branch is mergeable. Resolve the merge-admission coordination rather than weakening freshness.
-- Native delimiter placement controls published notes; the pinned publication fixture protects that boundary.
-- The generic updater changes only annotated version lines; native lifecycles preserve the unpublished fuzz package version, external dependencies and target definitions.
-- The freeze stays until tag/Release, attached SBOMs and the tagged label are verified. No author merge or stale-main exception.
-
-## Model Used
-
-- OpenAI `gpt-6.1-sol` authored the earlier source repairs and this regeneration integration, canonical metadata repair and verification. release-please 17.6.0 generated versions and release notes. No routed model output was incorporated. Historical work remains credited to its contributors; context-window size was not supplied.
-
-## Checklist
-
-- [x] I wrote a thinking path that runs from the project to this change
-- [x] I named the model used, with its version
-- [x] I searched for related PRs and linked them above
-- [x] I ran the relevant offline release tests locally and they pass
-- [x] I retained regression coverage for excluded consumers, subsequent releases and contributor-only CI selection
-- [x] I updated the documentation this change touches
-- [x] No secret, token or credential is in the diff, the title, the body or the branch name
-- [x] No internal ticket id, instance link or private host is in the title, body, commits or branch name
-- [ ] CI is green on the regenerated exact head before independent approval (pending)
+Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publication.cjs`, `python3 scripts/test-release-retry.py` and `python3 scripts/test-pr-lint.py`. Required checks are dispatched on this PR head; their green results and independent review are mandatory before merge.
 ---
 
 
@@ -108,6 +61,7 @@
 * **cutover:** add staging-only SQLx migration runner ([#169](https://github.com/TogetherWeOwn/two-bot-next/issues/169)) ([f6ce78b](https://github.com/TogetherWeOwn/two-bot-next/commit/f6ce78b0cd6b64d1f4cd13752b521cceef2dd121))
 * **cutover:** on-demand reengagement list CLI (never scheduled) ([#236](https://github.com/TogetherWeOwn/two-bot-next/issues/236)) ([c57dc8d](https://github.com/TogetherWeOwn/two-bot-next/commit/c57dc8d64689b52563599e023e075b9e6834ca32))
 * **cutover:** paginate archived-thread discovery beyond first page ([#189](https://github.com/TogetherWeOwn/two-bot-next/issues/189)) ([71bba75](https://github.com/TogetherWeOwn/two-bot-next/commit/71bba7564fcf5c794486bb954f1442457f3798c3))
+* **cutover:** report blind windows and unknown-start counts in voice reconcile ([#548](https://github.com/TogetherWeOwn/two-bot-next/issues/548)) ([8b332f6](https://github.com/TogetherWeOwn/two-bot-next/commit/8b332f6cb5c5c62937f3216063840175e6ae1d51))
 * **db:** bind staging apply to reviewed plan manifest hash ([#430](https://github.com/TogetherWeOwn/two-bot-next/issues/430)) ([5d876c0](https://github.com/TogetherWeOwn/two-bot-next/commit/5d876c0b759529bedf6c5a99baa03dc74d27a911))
 * **db:** bootstrap role-plan phase with ephemeral membership ([#391](https://github.com/TogetherWeOwn/two-bot-next/issues/391)) ([7a99911](https://github.com/TogetherWeOwn/two-bot-next/commit/7a999118bcb160f208f4c294710ef3a0ad22b4d5))
 * **db:** read-only plan group plus plan/apply job split ([#408](https://github.com/TogetherWeOwn/two-bot-next/issues/408)) ([f7863c8](https://github.com/TogetherWeOwn/two-bot-next/commit/f7863c8cf51bdcc2bfb225e25ea38ceb95cbae5e))
@@ -426,6 +380,7 @@
 * **message-safety:** pin mention refusals and webhook redaction ([#185](https://github.com/TogetherWeOwn/two-bot-next/issues/185)) ([50e6d71](https://github.com/TogetherWeOwn/two-bot-next/commit/50e6d71143202e04b35d658b6fe0b1200062e468))
 * **metrics:** build SharedState in the scrape-contract test ([#192](https://github.com/TogetherWeOwn/two-bot-next/issues/192)) ([6418cac](https://github.com/TogetherWeOwn/two-bot-next/commit/6418cac233a1650eeae2184a2077135db658eac0))
 * **moderation:** keep signed audit reasons within the outbound limit ([#170](https://github.com/TogetherWeOwn/two-bot-next/issues/170)) ([8189cc4](https://github.com/TogetherWeOwn/two-bot-next/commit/8189cc410c69af0f2d46c8cfd3fed2833b65cc11))
+* **moderation:** preserve live overwrite edits when unlocking ([#562](https://github.com/TogetherWeOwn/two-bot-next/issues/562)) ([c2214ab](https://github.com/TogetherWeOwn/two-bot-next/commit/c2214ab581d636c8c4e93f1cdfdb8b598b8eb1f8))
 * **onboarding:** retain valid picks and withhold hidden fallbacks ([#128](https://github.com/TogetherWeOwn/two-bot-next/issues/128)) ([66ab305](https://github.com/TogetherWeOwn/two-bot-next/commit/66ab305bc0e30f1473dcfb0355cbde625929dca4))
 * **permissions:** centralize runtime command authorization ([#88](https://github.com/TogetherWeOwn/two-bot-next/issues/88)) ([bbddaca](https://github.com/TogetherWeOwn/two-bot-next/commit/bbddacaebcee39194430fe3e62d9a0c55531f424))
 * **preflight:** validate ticket staff-role and category ([#181](https://github.com/TogetherWeOwn/two-bot-next/issues/181)) ([1c6481b](https://github.com/TogetherWeOwn/two-bot-next/commit/1c6481b6ff04e8dc8532239fc813e4b214d274e1))
