@@ -12,6 +12,9 @@ A complete reconnect snapshot starts a new grace. This deliberately takes the
 safer path than the legacy boot-time immediate-empty delete. Missing channels
 need no Discord delete; forgetting their row remains idempotent. Exact-result
 failed-create compensation bypasses only grace, not protected IDs or humans.
+Real-time lifecycle-race fixtures that predate the grace shorten it through
+`VoiceRuntime::with_empty_grace`; no production path calls it, and the paused-time
+guard tests pin the 60-second default.
 
 ## Legacy obligation map
 

@@ -654,6 +654,8 @@ struct LiveState {
     /// Continuous human-empty evidence in this authoritative gateway session.
     /// Reconnects restart the grace; human joins cancel it even between ticks.
     empty_since: HashMap<Snowflake, tokio::time::Instant>,
+    /// Fixture-only override of [`EMPTY_ROOM_GRACE`]; production never sets it.
+    empty_grace: Option<Duration>,
 }
 
 /// Ordinary empty rooms get a full reconnect grace. Failed-create compensation
@@ -711,7 +713,7 @@ impl LiveState {
     fn empty_grace_elapsed(&self, channel: Snowflake) -> bool {
         self.empty_since
             .get(&channel)
-            .is_some_and(|since| since.elapsed() >= EMPTY_ROOM_GRACE)
+            .is_some_and(|since| since.elapsed() >= self.empty_grace.unwrap_or(EMPTY_ROOM_GRACE))
     }
 
     fn ticket_valid(&self, ticket: JoinTicket) -> bool {
@@ -812,6 +814,12 @@ impl LiveGuild {
             .expect("live voice lock")
             .protected_channels
             .extend(channels);
+    }
+
+    /// Shorten the empty-room grace for offline fixtures that exercise
+    /// unrelated lifecycle races. Production keeps the 60 s default.
+    pub fn set_empty_grace(&self, grace: Duration) {
+        self.inner.write().expect("live voice lock").empty_grace = Some(grace);
     }
 
     pub fn publish(&self, snapshot: GuildSnapshot) -> bool {
@@ -3237,6 +3245,7 @@ pub struct VoiceRuntime<S, H> {
     tick: Duration,
     enabled: bool,
     protected_channels: HashSet<Snowflake>,
+    empty_grace: Option<Duration>,
     seeds: AtomicU64,
     actors: Mutex<HashMap<Snowflake, GuildActor>>,
     /// Serializes `/access` read-modify-write cycles so two admins cannot
@@ -3266,6 +3275,7 @@ where
             tick,
             enabled,
             protected_channels: HashSet::new(),
+            empty_grace: None,
             seeds: AtomicU64::new(initial_seed()),
             actors: Mutex::new(HashMap::new()),
             access_lock: tokio::sync::Mutex::new(()),
@@ -3276,6 +3286,13 @@ where
     /// Install boot configuration before spawning any actors.
     pub fn with_protected_channels(mut self, channels: HashSet<Snowflake>) -> Self {
         self.protected_channels = channels;
+        self
+    }
+
+    /// Offline-fixture seam: shorten the empty-room grace for tests that
+    /// exercise unrelated lifecycle races. Production keeps the 60 s default.
+    pub fn with_empty_grace(mut self, grace: Duration) -> Self {
+        self.empty_grace = Some(grace);
         self
     }
 
@@ -3308,6 +3325,9 @@ where
         actor
             .live
             .protect_channels(self.protected_channels.iter().copied());
+        if let Some(grace) = self.empty_grace {
+            actor.live.set_empty_grace(grace);
+        }
         let live = actor.live.clone();
         let make = Arc::clone(&self.make);
         let tick = self.tick;
