@@ -648,6 +648,14 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+      # Per-job dependency cache: the key includes the job id (no
+      # shared-key), so this job keeps its own entry; saved on pushes only.
+      - name: Restore cargo cache
+        if: needs.job-inputs.outputs.rust != 'false'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: ${{ runner.os }}-cargo
+          save-if: ${{ github.event_name == 'push' }}
       - name: Check feature-gated moderation store
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
@@ -715,6 +723,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
           toolchain: stable
+      # Per-job dependency cache: the key includes the job id (no
+      # shared-key), so this job keeps its own entry; saved on pushes only.
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: ${{ runner.os }}-cargo
+          save-if: ${{ github.event_name == 'push' }}
       - name: self-role claim, renewal, recovery and fencing tests
         run: cargo test -p two-bot-cutover --test self_role_store --locked -- --ignored
       - name: self-role runtime admission and immutable snapshots (mock REST and isolated schema)
@@ -924,6 +939,13 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+      # Per-job dependency cache: the key includes the job id (no
+      # shared-key), so this job keeps its own entry; saved on pushes only.
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: ${{ runner.os }}-cargo
+          save-if: ${{ github.event_name == 'push' }}
       - name: Check feature-gated community stores
         run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - name: Test presence, scorecard and inactivity ledgers on ephemeral Postgres
@@ -967,6 +989,13 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+      # Per-job dependency cache: the key includes the job id (no
+      # shared-key), so this job keeps its own entry; saved on pushes only.
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: ${{ runner.os }}-cargo
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - run: cargo test -p two-bot-core --features db --test feeds --locked
       - run: cargo test -p two-bot-core --features db --test feeds_store --locked -- --ignored
