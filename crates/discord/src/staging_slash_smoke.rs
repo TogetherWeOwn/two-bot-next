@@ -19,7 +19,10 @@ use twilight_model::{
 };
 use two_bot_core::{
     backup::guild_config::{LIVE_GUILD_ID, STAGING_BOT_APPLICATION_ID, TWO_STAGING_GUILD_ID},
-    leveling::{leaderboard_reply, rank_reply, LeaderboardEntry, LevelProfile},
+    leveling::{
+        leaderboard_reply, level_for_xp, rank_reply, total_xp_for_level, LeaderboardEntry,
+        LevelProfile, MAX_STORED_XP,
+    },
     router::replies::{InteractionReply, ReplyTransport},
     HandlerId, InteractionRouter, RouterGates, SlashOutcome,
 };
@@ -102,6 +105,12 @@ pub trait SmokeFixtures: Sync {
     ) -> impl Future<Output = Result<FixtureObservation, FixtureDown>> + Send;
 }
 
+/// Create a fresh local, interaction-scoped transport for each slash step.
+/// Never return a shared single-interaction transport or connect a live adapter.
+pub trait SmokeTransports: Sync {
+    fn for_interaction(&self, interaction_id: u64) -> impl ReplyTransport + '_;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StepResult {
@@ -180,8 +189,18 @@ fn validate(config: &SmokeConfig<'_>) -> Result<(u64, u64), Refusal> {
     ))
 }
 
+fn valid_rank_profile(profile: &LevelProfile) -> bool {
+    if profile.guild_id != TWO_STAGING_GUILD_ID || profile.xp > MAX_STORED_XP {
+        return false;
+    }
+    // Bound XP before curve evaluation, and use its canonical level rather than
+    // evaluating unchecked arithmetic on the fixture's arbitrary level.
+    let level = level_for_xp(profile.xp);
+    profile.level == level && profile.next_level_xp == total_xp_for_level(level + 1)
+}
+
 #[allow(deprecated)]
-fn synthetic_slash(name: &str, application: u64, guild: u64) -> Interaction {
+fn synthetic_slash(name: &str, application: u64, guild: u64, interaction_id: u64) -> Interaction {
     Interaction {
         app_permissions: None,
         application_id: Id::new(application),
@@ -205,7 +224,7 @@ fn synthetic_slash(name: &str, application: u64, guild: u64) -> Interaction {
         guild: None,
         guild_id: Some(Id::new(guild)),
         guild_locale: None,
-        id: Id::new(1),
+        id: Id::new(interaction_id),
         kind: InteractionType::ApplicationCommand,
         locale: None,
         member: None,
@@ -215,13 +234,13 @@ fn synthetic_slash(name: &str, application: u64, guild: u64) -> Interaction {
     }
 }
 
-async fn exercise<T: ReplyTransport, S: SmokeFixtures>(
+async fn exercise<T: SmokeTransports, S: SmokeFixtures>(
     step: SmokeStep,
     router: &InteractionRouter,
     application: u64,
     guild: u64,
     fixtures: &S,
-    transport: &T,
+    transports: &T,
 ) -> Observation {
     // These older smoke-plan names must not turn into invented interactions.
     if step == SmokeStep::Help {
@@ -234,7 +253,7 @@ async fn exercise<T: ReplyTransport, S: SmokeFixtures>(
         Ok(observation) => observation,
         Err(FixtureDown) => return Observation::Down,
     };
-    let (handler, reply) = match (step, observation) {
+    let (handler, reply, interaction_id) = match (step, observation) {
         (SmokeStep::Health, FixtureObservation::Health { healthy, ready }) => {
             return if healthy && ready {
                 Observation::HealthReady
@@ -249,23 +268,25 @@ async fn exercise<T: ReplyTransport, S: SmokeFixtures>(
                 display_name,
             },
         ) => {
-            if profile.guild_id != TWO_STAGING_GUILD_ID {
+            if !valid_rank_profile(&profile) {
                 return Observation::FixtureMismatch;
             }
             let reply = rank_reply(&profile, &display_name);
             (
                 HandlerId::Rank,
                 InteractionReply::new(reply.content, reply.ephemeral),
+                1,
             )
         }
         (SmokeStep::Leaderboard, FixtureObservation::Leaderboard(entries)) => (
             HandlerId::Leaderboard,
             InteractionReply::new(leaderboard_reply(&entries).content, false),
+            2,
         ),
         _ => return Observation::FixtureMismatch,
     };
     let name = step.name().trim_start_matches('/');
-    let interaction = synthetic_slash(name, application, guild);
+    let interaction = synthetic_slash(name, application, guild, interaction_id);
     if !router
         .publish_set(&[])
         .is_ok_and(|definitions| definitions.iter().any(|definition| definition.name == name))
@@ -275,10 +296,11 @@ async fn exercise<T: ReplyTransport, S: SmokeFixtures>(
     {
         return Observation::RouterMismatch;
     }
+    let transport = transports.for_interaction(interaction.id.get());
     match dispatch_interaction(
         router,
         &interaction,
-        transport,
+        &transport,
         DispatchOptions {
             ephemeral: reply.ephemeral,
             ..Default::default()
@@ -295,10 +317,10 @@ async fn exercise<T: ReplyTransport, S: SmokeFixtures>(
 
 /// Fence all configuration before even calling the fixture source. Execution
 /// is sequential and bounded; a timed-out reply is never retried or detached.
-pub async fn run_offline<T: ReplyTransport, S: SmokeFixtures>(
+pub async fn run_offline<T: SmokeTransports, S: SmokeFixtures>(
     config: &SmokeConfig<'_>,
     fixtures: &S,
-    transport: &T,
+    transports: &T,
 ) -> SmokeReport {
     let mut report = SmokeReport {
         mock: true,
@@ -337,7 +359,7 @@ pub async fn run_offline<T: ReplyTransport, S: SmokeFixtures>(
         let started = Instant::now();
         let actual = timeout(
             config.step_timeout,
-            exercise(step, &router, application, guild, fixtures, transport),
+            exercise(step, &router, application, guild, fixtures, transports),
         )
         .await
         .unwrap_or(Observation::Timeout);

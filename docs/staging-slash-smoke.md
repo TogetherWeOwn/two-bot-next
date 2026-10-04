@@ -6,7 +6,10 @@ no HTTP client, credential loader, command publisher, environment lookup or CLI.
 It is absent from normal release builds; it is available only to tests or through
 the default-off `test-support` feature.
 
-Use local `SmokeFixtures` and an in-memory `ReplyTransport` only. There is no
+Use local `SmokeFixtures` and a fresh `SmokeTransports` factory for each run.
+The factory returns a new in-memory `ReplyTransport` for each distinct local
+slash interaction identity; never reuse one interaction's transport across
+commands. Health and skipped commands create no transport. There is no
 live adapter in this slice. A request setting `live_execution` is refused, not an
 opt-in. Do not connect `InteractionReplyTransport`, automate a Discord user token,
 or submit invented interactions to a Discord endpoint. Real slash-command E2E
@@ -22,10 +25,18 @@ zero, whitespace-padded, leading-zero and wrong-application identities refuse
 without reading a fixture or issuing a callback. Default configuration is missing
 identities and live execution is disabled. There is no live-guild override.
 
+Rank observations must use the canonical guild, XP within the existing storage
+ceiling, and the compiled XP curve's level and next-level floor. Validation
+bounds XP before curve evaluation and rejects arbitrary/overflowing fixture
+levels without rendering a reply or creating a rank transport. Bad models leave
+a failed receipt and do not prevent the remaining steps from being recorded.
+
 The per-step deadline must be greater than zero and at most five seconds. The
 runner awaits each step sequentially and drops a timed-out future; it never
-spawns detached work or blindly retries a possibly delivered callback. As with
-other async deadlines, fixture implementations must yield rather than block.
+spawns detached work or blindly retries a possibly delivered callback. A failed
+or timed-out rank ACK is not reused by the leaderboard's separate transport.
+As with other async deadlines, fixture implementations must yield rather than
+block, and transport factories must remain lightweight and local.
 
 ## Honest scope
 
@@ -75,6 +86,8 @@ Must-pass cases: fixture XP/level consistency with the compiled curve;
 populated/empty replies; live and bad-config zero-call refusal;
 live-mode refusal; down and healthy-but-unready health; source and callback
 timeouts; dropped pending futures; callback errors without retries; wrong read
-model/foreign rank model; sensitive-data exclusion from JSON and Debug; and
+model/foreign rank model; inconsistent and extreme numeric rank models; the
+maximum supported XP boundary; strict one-ACK transport scopes and isolated
+rank timeout/failure; sensitive-data exclusion from JSON and Debug; and
 independent simultaneous offline runs. Local timings are fixture timings, not
 production performance measurements.

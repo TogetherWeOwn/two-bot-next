@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     future::pending,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -22,21 +23,54 @@ fn config() -> SmokeConfig<'static> {
 }
 
 #[derive(Default)]
-struct RecordingTransport {
+struct RecordingTransports {
     operations: Mutex<Vec<ReplyOperation>>,
+    interaction_ids: Mutex<Vec<u64>>,
+    acknowledged: Mutex<BTreeSet<u64>>,
     fail: bool,
     hang: bool,
+    fail_rank: bool,
+    hang_rank: bool,
 }
 
-impl ReplyTransport for RecordingTransport {
+struct ScopedTransport<'a> {
+    owner: &'a RecordingTransports,
+    interaction_id: u64,
+}
+
+impl SmokeTransports for RecordingTransports {
+    fn for_interaction(&self, interaction_id: u64) -> impl ReplyTransport + '_ {
+        self.interaction_ids.lock().unwrap().push(interaction_id);
+        ScopedTransport {
+            owner: self,
+            interaction_id,
+        }
+    }
+}
+
+impl ReplyTransport for ScopedTransport<'_> {
     type Error = std::io::Error;
 
     async fn execute(&self, operation: ReplyOperation) -> Result<Option<u64>, Self::Error> {
-        self.operations.lock().unwrap().push(operation);
-        if self.hang {
+        let initial = matches!(
+            operation,
+            ReplyOperation::Respond(_) | ReplyOperation::Defer { .. }
+        );
+        self.owner.operations.lock().unwrap().push(operation);
+        if initial
+            && !self
+                .owner
+                .acknowledged
+                .lock()
+                .unwrap()
+                .insert(self.interaction_id)
+        {
+            return Err(std::io::Error::other("fixture-already-acknowledged"));
+        }
+        if self.owner.hang || (self.owner.hang_rank && self.interaction_id == 1) {
             pending::<()>().await;
         }
-        if self.fail {
+        if self.owner.fail || (self.owner.fail_rank && self.interaction_id == 1) {
             return Err(std::io::Error::other("fixture-remote-error-sensitive"));
         }
         Ok(None)
@@ -51,6 +85,7 @@ struct RecordingFixtures {
     hang: bool,
     wrong_shape: bool,
     wrong_guild: bool,
+    profile_override: Option<LevelProfile>,
 }
 
 impl RecordingFixtures {
@@ -64,10 +99,14 @@ impl RecordingFixtures {
             hang: false,
             wrong_shape: false,
             wrong_guild: false,
+            profile_override: None,
         }
     }
 
     fn profile(&self) -> LevelProfile {
+        if let Some(profile) = &self.profile_override {
+            return profile.clone();
+        }
         LevelProfile {
             guild_id: if self.wrong_guild {
                 LIVE_GUILD_ID
@@ -237,13 +276,14 @@ async fn live_guild_and_bad_configuration_refuse_before_all_calls() {
     }
     for (config, expected) in cases {
         let source = RecordingFixtures::new("populated");
-        let transport = RecordingTransport::default();
+        let transport = RecordingTransports::default();
         let report = run_offline(&config, &source, &transport).await;
         assert_eq!(report.refusal, Some(expected));
         assert_eq!(report.verdict, OfflineVerdict::Refused);
         assert!(report.commands.is_empty());
         assert!(source.calls.lock().unwrap().is_empty());
         assert!(transport.operations.lock().unwrap().is_empty());
+        assert!(transport.interaction_ids.lock().unwrap().is_empty());
         assert!(!serde_json::to_string(&report)
             .unwrap()
             .contains("fixture-config-sensitive"));
@@ -253,7 +293,7 @@ async fn live_guild_and_bad_configuration_refuse_before_all_calls() {
 #[tokio::test]
 async fn live_guild_fence_precedes_missing_application_and_live_opt_in() {
     let source = RecordingFixtures::new("populated");
-    let transport = RecordingTransport::default();
+    let transport = RecordingTransports::default();
     let config = SmokeConfig {
         guild_id: Some(LIVE_GUILD_ID),
         live_execution: true,
@@ -269,7 +309,7 @@ async fn live_guild_fence_precedes_missing_application_and_live_opt_in() {
 async fn populated_and_empty_fixtures_use_compiled_routes_and_real_reply_builders() {
     for case in ["populated", "empty"] {
         let source = RecordingFixtures::new(case);
-        let transport = RecordingTransport::default();
+        let transport = RecordingTransports::default();
         let report = run_offline(&config(), &source, &transport).await;
         assert!(report.mock);
         assert!(!report.live_execution);
@@ -311,6 +351,8 @@ async fn populated_and_empty_fixtures_use_compiled_routes_and_real_reply_builder
             *source.calls.lock().unwrap(),
             vec![SmokeStep::Rank, SmokeStep::Leaderboard, SmokeStep::Health]
         );
+        assert_eq!(*transport.interaction_ids.lock().unwrap(), vec![1, 2]);
+        assert_eq!(transport.acknowledged.lock().unwrap().len(), 2);
         let operations = transport.operations.lock().unwrap();
         let rank = rank_reply(&source.profile(), source.data["name"].as_str().unwrap());
         assert_eq!(
@@ -357,7 +399,7 @@ async fn populated_and_empty_fixtures_use_compiled_routes_and_real_reply_builder
 async fn healthy_but_unready_and_down_health_are_failures() {
     for case in ["unready", "down"] {
         let source = RecordingFixtures::new(case);
-        let transport = RecordingTransport::default();
+        let transport = RecordingTransports::default();
         let report = run_offline(&config(), &source, &transport).await;
         assert_eq!(report.verdict, OfflineVerdict::Fail);
         assert_eq!(report.commands[4].actual, Observation::Down);
@@ -371,7 +413,7 @@ async fn healthy_but_unready_and_down_health_are_failures() {
 async fn fixture_source_down_never_replies_or_masks_failure() {
     let mut source = RecordingFixtures::new("populated");
     source.down = true;
-    let transport = RecordingTransport::default();
+    let transport = RecordingTransports::default();
     let report = run_offline(&config(), &source, &transport).await;
     assert_eq!(report.verdict, OfflineVerdict::Fail);
     assert_eq!(
@@ -389,7 +431,7 @@ async fn fixture_source_down_never_replies_or_masks_failure() {
 async fn pending_fixture_times_out_is_dropped_and_remaining_steps_are_recorded() {
     let mut source = RecordingFixtures::new("populated");
     source.hang = true;
-    let transport = RecordingTransport::default();
+    let transport = RecordingTransports::default();
     let config = SmokeConfig {
         step_timeout: Duration::from_millis(50),
         ..config()
@@ -409,7 +451,7 @@ async fn pending_fixture_times_out_is_dropped_and_remaining_steps_are_recorded()
 #[tokio::test(start_paused = true)]
 async fn reply_timeout_is_bounded_without_callback_retry() {
     let source = RecordingFixtures::new("populated");
-    let transport = RecordingTransport {
+    let transport = RecordingTransports {
         hang: true,
         ..Default::default()
     };
@@ -428,7 +470,7 @@ async fn reply_timeout_is_bounded_without_callback_retry() {
 #[tokio::test]
 async fn reply_errors_are_redacted_and_not_retried() {
     let source = RecordingFixtures::new("populated");
-    let transport = RecordingTransport {
+    let transport = RecordingTransports {
         fail: true,
         ..Default::default()
     };
@@ -449,7 +491,7 @@ async fn wrong_fixture_type_and_foreign_rank_model_fail_without_rank_reply() {
         let mut source = RecordingFixtures::new("populated");
         source.wrong_shape = wrong_shape;
         source.wrong_guild = !wrong_shape;
-        let transport = RecordingTransport::default();
+        let transport = RecordingTransports::default();
         let report = run_offline(&config(), &source, &transport).await;
         assert_eq!(report.commands[0].actual, Observation::FixtureMismatch);
         assert_eq!(report.verdict, OfflineVerdict::Fail);
@@ -476,11 +518,102 @@ fn skipped_plan_names_are_not_compiled_core_commands() {
 }
 
 #[tokio::test]
+async fn inconsistent_numeric_rank_models_fail_before_rendering() {
+    for (xp, level, next_level_xp) in [
+        (0, 5, 1625),
+        (1625, 5, 1625),
+        (1500, 4, 1150),
+        (1500, u64::MAX, 1625),
+        (1500, u64::MAX / 2, 1625),
+        (MAX_STORED_XP + 1, 5, 1625),
+        (u64::MAX, 5, 1625),
+        (1500, 5, 0),
+        (1500, 5, u64::MAX),
+    ] {
+        let mut source = RecordingFixtures::new("populated");
+        source.profile_override = Some(LevelProfile {
+            xp,
+            level,
+            next_level_xp,
+            ..source.profile()
+        });
+        let transport = RecordingTransports::default();
+        let report = run_offline(&config(), &source, &transport).await;
+        assert_eq!(report.verdict, OfflineVerdict::Fail);
+        assert_eq!(report.commands[0].actual, Observation::FixtureMismatch);
+        assert_eq!(report.commands.len(), 5);
+        assert_eq!(report.commands[1].actual, Observation::ReplyValidated);
+        assert_eq!(report.commands[4].actual, Observation::HealthReady);
+        assert_eq!(*transport.interaction_ids.lock().unwrap(), vec![2]);
+        assert_eq!(transport.operations.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn maximum_supported_rank_xp_renders_without_overflow() {
+    let mut source = RecordingFixtures::new("populated");
+    let level = level_for_xp(MAX_STORED_XP);
+    source.profile_override = Some(LevelProfile {
+        xp: MAX_STORED_XP,
+        level,
+        next_level_xp: total_xp_for_level(level + 1),
+        ..source.profile()
+    });
+    let transport = RecordingTransports::default();
+    let report = run_offline(&config(), &source, &transport).await;
+    assert_eq!(report.commands[0].actual, Observation::ReplyValidated);
+    assert_eq!(report.verdict, OfflineVerdict::Incomplete);
+    assert_eq!(*transport.interaction_ids.lock().unwrap(), vec![1, 2]);
+}
+
+#[tokio::test]
+async fn strict_local_transport_refuses_a_second_initial_ack() {
+    let transports = RecordingTransports::default();
+    let transport = transports.for_interaction(1);
+    let operation = ReplyOperation::Respond(InteractionReply::new("fixture", true));
+    assert!(transport.execute(operation.clone()).await.is_ok());
+    assert!(transport.execute(operation).await.is_err());
+    assert_eq!(transports.acknowledged.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn rank_timeout_or_failure_does_not_reuse_its_ack_for_leaderboard() {
+    for hang_rank in [true, false] {
+        let source = RecordingFixtures::new("populated");
+        let transport = RecordingTransports {
+            hang_rank,
+            fail_rank: !hang_rank,
+            ..Default::default()
+        };
+        let config = SmokeConfig {
+            step_timeout: Duration::from_millis(50),
+            ..config()
+        };
+        let report = run_offline(&config, &source, &transport).await;
+        assert_eq!(
+            report.commands[0].actual,
+            if hang_rank {
+                Observation::Timeout
+            } else {
+                Observation::ReplyTransportFailed
+            }
+        );
+        assert_eq!(report.commands[1].actual, Observation::ReplyValidated);
+        assert_eq!(report.commands[4].actual, Observation::HealthReady);
+        assert_eq!(report.verdict, OfflineVerdict::Fail);
+        assert_eq!(report.commands.len(), 5);
+        assert_eq!(*transport.interaction_ids.lock().unwrap(), vec![1, 2]);
+        assert_eq!(transport.acknowledged.lock().unwrap().len(), 2);
+        assert_eq!(transport.operations.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
 async fn simultaneous_offline_runs_keep_independent_receipts() {
     let first = RecordingFixtures::new("populated");
     let second = RecordingFixtures::new("empty");
-    let first_transport = RecordingTransport::default();
-    let second_transport = RecordingTransport::default();
+    let first_transport = RecordingTransports::default();
+    let second_transport = RecordingTransports::default();
     let config = config();
     let (a, b) = tokio::join!(
         run_offline(&config, &first, &first_transport),
