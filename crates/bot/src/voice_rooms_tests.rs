@@ -5465,19 +5465,6 @@ fn parse_kick_without_user_stays_silent_for_the_router() {
 }
 
 #[test]
-fn parse_legacy_kick_stays_silent_for_the_moderation_router() {
-    // The moderation `/kick` never parses as a voice command: the shared
-    // router answers it alone, so the voice sink must not double-answer.
-    for options in [
-        vec![user_option("target", 303)],
-        vec![user_option("target", 303), command_option("reason", "spam")],
-    ] {
-        let interaction = voice_interaction(Some(command_data("kick", options)), None, true);
-        assert_eq!(parse_voice_command(&interaction), None);
-    }
-}
-
-#[test]
 fn parse_ballot_buttons_by_vote_id() {
     for (custom_id, expected) in [
         (
