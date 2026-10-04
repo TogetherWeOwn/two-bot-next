@@ -18,7 +18,7 @@ JOB_INVENTORY = {
                   "ci-ok"},
     "deploy-production.yml": {"guard", "production"},
     "deploy-staging.yml": {"deploy"},
-    "nightly.yml": {"pipeline-benchmark", "advisories", "sweep"},
+    "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"release-please", "dispatch-checks", "sbom-target", "release-sbom",
                     "attach-sbom"},
