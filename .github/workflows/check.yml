@@ -198,6 +198,10 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_probe.py' -v
 
+      - name: soak evidence parser (offline, fixtures only)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_evidence.py' -v
+
       - name: staging E2E run-record template (offline)
         run: |
           python3 scripts/check_run_record.py --record scripts/fixtures/staging_e2e_run_record_mock.json --allow-mock
