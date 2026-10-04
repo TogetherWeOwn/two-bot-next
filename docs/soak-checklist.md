@@ -1301,11 +1301,11 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s13-edaf2dd: edaf2dd — TOG-5684: enforce startKnown:false exclusion from duration averages
 
 - **Method:** `automated` (not an execution verdict).
-- **Action:** Run the duration summary fixtures and the DB-backed `report_cli` scenario mixing known and startKnown:false sessions.
-- **Expected:** `durations` averages known-start sessions only (the unknown start carrying a number is excluded) and counts the excluded unknown starts.
-- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Fixture proof only, not a deployed-network soak receipt.
+- **Action:** Run the duration summary fixtures, the core metadata-parsing fixtures in `crates/core/src/voice.rs` and the DB-backed `report_cli` scenario mixing known and startKnown:false sessions.
+- **Expected:** `durations` averages known-start sessions only (the unknown start carrying a number is excluded) and counts the excluded unknown starts. Known 60 / unknown 600 averages to 60 (removing the start-known filter yields 330); mixed numeric/numeric-string metadata averages to 60 with measured=2 and excluded_unknown_starts=4; invalid-only metadata yields no average, not fabricated zeroes. Finite decimal numeric strings are measured; legacy JavaScript coercions of empty strings, booleans, containers and radix-prefixed strings are deliberately rejected.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Include the core `voice::tests` results (`averages_filter_on_flag_not_null`, `metadata_average_excludes_unknown_numbers_and_numeric_strings`, `metadata_numbers_and_numeric_strings_enter_known_average`, `metadata_invalid_durations_never_become_measured_zeroes`). Fixture proof only, not a deployed-network soak receipt; the separate voice receipt gate is unchanged.
 - **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
-- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib voice::tests::
 
 ### s13-59965d0: 59965d0 — TOG-5981: serialize same-member voice frames, scope voice idempotency keys by channel
 
@@ -1389,13 +1389,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-dc2b507: dc2b507 — feat(voice): reconcile open-half sessions with explicit reasons (#273)
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Run the TOG-15675 reconcile metadata fixtures on a test-container database: an end whose `startedAt` has a multi-byte UTC offset and an end with a hex or other `Number()`-coercible string duration. The existing open-half fixtures stay green.
-- **Expected:** Every open-half session is reported with an explicit reason or resolution without aborting the report: a malformed offset falls through to the bad-end-row or earlier-start path (no panic) and string durations follow legacy `Number()` coercion, or the card records an accepted divergence with fixtures. Nothing is repaired. The read-only CLI check is DB-backed and runs in CI.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
-- **Owner:** [TOG-15675](/TOG/issues/TOG-15675)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the open-half reconcile fixtures (every reason), the timestamp-parser boundary fixtures in `crates/core/src/funnel.rs`, the `Number()` duration-string fixtures and the DB-backed `report_cli` legacy-fixture scenario.
+- **Expected:** Every open-half session is reported with its explicit reason (restart-gap, server-leave and metadata-recompute resolve; still-open, superseded, no-start-on-file and bad-end-row are flagged) and nothing is repaired. A timestamp with a multi-byte zone (`+1é1`) or an absurd year is unparseable (legacy `Date.parse` NaN): the row is skipped or falls through to the bad-end-row or earlier-start path, and the sweep never panics. A `durationSeconds` string reads as legacy `Number()` does (`"0x3c"` is 60, `"6e1"` is 60, whitespace is trimmed, `""` is 0; `"nan"`, `"inf"` and `"Infinity"` are unmeasured); negative and non-finite values never become a measured time. Accepted divergence: a JSON array or object is unmeasured (legacy `Number([])` is 0).
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Include the core `funnel::tests` results (`multibyte_zone_is_unparseable_not_a_panic`, `non_ascii_anywhere_in_a_timestamp_never_panics`, `absurd_years_are_unparseable_not_an_overflow`) and the cutover `voice_reconcile::tests` results. Fixture proof only, not a deployed-network soak receipt; the separate voice receipt gate is unchanged.
+- **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_matches_legacy_fixtures_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib funnel::tests::
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-860557f: 860557f — test(backfill): refuse malformed export rows without throwing (#289)
@@ -1499,13 +1498,11 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-7587037: 7587037 — fix(temp-voice): stop conferring ManageRoles on channel create (#314)
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Run the TOG-15673 property and actual create-request fixtures with inherited Manage Roles allows on bot, owner, role and other member overwrites; retain the existing added-owner-grant pins.
-- **Expected:** No create-time allow confers Manage Roles on any overwrite. Current fixtures constrain newly added owner grants, not inherited allows. Without bot Manage Roles, only public rooms may use the no-overwrite category-sync fallback; private defaults must be refused before creation, never made public.
-- **Evidence:** Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
-- **Owner:** [TOG-15673](/TOG/issues/TOG-15673), [TOG-10119](/TOG/issues/TOG-10119)
-- **Reason:** Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Method:** `manual` (not an execution verdict).
+- **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Inspect the permission overwrites on a created room.
+- **Expected:** The owner overwrite grants room controls but never ManageRoles.
+- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.
+- **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-cad94b6: cad94b6 — fix(moderation): name stranded running unban claims with hand-release steps (#320)
