@@ -1177,10 +1177,10 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s13-681dc29: 681dc29 — TOG-3052: mutation harness proving the delete guards are real
 
 - **Method:** `waived` (not an execution verdict).
-- **Action:** Run TOG-10093’s delete-guard mutation fixture against the sweep.
-- **Expected:** Mutating or removing temp-voice provenance makes the guard refuse deletion; a channel without provenance is never deleted.
+- **Action:** Run the worker suite and separately remove the protected-ID and grace checks on the disposable offline fixture, restoring the original between mutations. Follow the six-obligation map in docs/voice-delete-guards.md; no CI mutation-harness or live fault-injection claim.
+- **Expected:** Protected Lobby/creator/category IDs and untracked channels receive zero deletes; ordinary human-empty rooms survive until the deadline; human joins reset grace and delayed writes recheck current occupancy; occupied rooms survive reconnect. Both separate mutations fail assertions, then the restored worker suite passes. Missing receipts leave this row carded.
 - **Evidence:** Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
-- **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
+- **Owner:** [TOG-15672](/TOG/issues/TOG-15672), [TOG-10119](/TOG/issues/TOG-10119)
 - **Reason:** Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.

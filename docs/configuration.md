@@ -30,6 +30,11 @@ and `intents_from_env` (`TWO_AUTOMOD`, `DISCORD_TICKET_CATEGORY_ID`,
 `DISCORD_GATEWAY_URL` as a loopback-only test override. Rows for storable keys
 read this way say “env at boot”; every other storable row's stored value is
 unwired, and `env_only` rows are never dashboard-stored.
+When voice is enabled, `build_production_runtime` also reads
+`DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`, `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`,
+`TWO_TEMP_VOICE_CATEGORY_ID` and `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` solely
+for delete protection, not creator provisioning. Its empty grace is fixed at
+60 seconds; `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` remains unwired.
 Onboarding, automod, scorecard and classifier typed loaders exist but are not
 called during boot; their defaults below come from empty-map calls. The separate
 `preflight` operator CLI validates further catalog keys from the environment
@@ -85,7 +90,7 @@ Catalog entries: 121.
 | `DISCORD_GUILD_ID` | env_only | Not specified in Next | environment only | Legacy managed guild identifier; distinct from Container GUILD_ID. |
 | `DISCORD_LANDING_CHANNEL_IDS` | hot | Not specified in Next | stored unwired (reload-report hot) | Onboarding landing destinations for game-picker routing. |
 | `DISCORD_MODERATION_LOG_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Destination for moderation logs. |
-| `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Voice lobby offered by session onboarding. |
+| `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID` | hot | Not specified in Next | env at boot; stored unwired | Voice lobby offered by session onboarding. |
 | `DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Looking-to-play destination offered by session onboarding. |
 | `DISCORD_STAFF_ALERT_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Destination for staff alerts. |
 | `DISCORD_STAGING_BOT_TOKEN` | env_only | Not rendered (secret) | environment only | Staging Discord authentication token; never rendered. |
@@ -184,16 +189,16 @@ Catalog entries: 121.
 | `TWO_STAGING_RESTART_CONTAINMENT` | env_only | Not specified in Next | environment only | Staging restart containment gate; legacy boot input with no Next reader. |
 | `TWO_STAGING_RESTART_SYNTHETIC_ACTORS` | env_only | Not specified in Next | environment only | Synthetic-actor allowlist for staging restart containment; legacy input with no Next reader. |
 | `TWO_TEMP_VOICE` | cold | Not specified in Next | stored unwired | Temporary-voice capability flag; classification does not imply runtime wiring. |
-| `TWO_TEMP_VOICE_CATEGORY_ID` | cold | Not specified in Next | stored unwired | Category for generated temporary voice rooms. |
+| `TWO_TEMP_VOICE_CATEGORY_ID` | cold | Not specified in Next | env at boot; stored unwired | Category for generated temporary voice rooms. |
 | `TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS` | cold | Not specified in Next | stored unwired | Cooldown between a member's temporary-room creations. |
 | `TWO_TEMP_VOICE_DISABLED_CONTROLS` | cold | Not specified in Next | stored unwired | Temporary-room controls; classification does not imply runtime wiring. |
 | `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` | cold | Not specified in Next | stored unwired | Grace period before an empty temporary room is removed. |
-| `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID` | cold | Not specified in Next | stored unwired | Voice channel used to request a temporary room. |
+| `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID` | cold | Not specified in Next | env at boot; stored unwired | Voice channel used to request a temporary room. |
 | `TWO_TEMP_VOICE_MAX_PER_GUILD` | cold | Not specified in Next | stored unwired | Maximum temporary rooms per guild. |
 | `TWO_TEMP_VOICE_MAX_PER_USER` | cold | Not specified in Next | stored unwired | Maximum temporary rooms owned by one member. |
 | `TWO_TEMP_VOICE_NAME_TEMPLATE` | cold | Not specified in Next | stored unwired | Temporary-room naming template; classification does not imply runtime wiring. |
 | `TWO_TEMP_VOICE_PANEL_CHANNEL_ID` | cold | Not specified in Next | stored unwired | Destination for temporary-room control panels. |
-| `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` | cold | Not specified in Next | stored unwired | Channels temporary-room cleanup may not remove. |
+| `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` | cold | Not specified in Next | env at boot; stored unwired | Channels temporary-room cleanup may not remove. |
 | `TWO_TEMP_VOICE_SWEEP_SECONDS` | cold | Not specified in Next | stored unwired | Temporary-room cleanup sweep interval. |
 | `TWO_TEXT_COMMANDS` | cold | `false` | env at boot; stored unwired | Enable optional text triggers only while automations are enabled. |
 | `TWO_TICKET_COOLDOWN_SECONDS` | cold | Not specified in Next | stored unwired | Cooldown between ticket openings. |

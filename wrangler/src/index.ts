@@ -84,6 +84,8 @@ export interface Env extends ForwardedFlagEnv {
   TWO_AUTOMOD?: string;
   // Explicit: not a TWO_* flag, so outside the container-env allowlist.
   DISCORD_APPLICATION_ID?: string;
+  /** Infrastructure ID protected from temporary-room deletion. */
+  DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID?: string;
   BOT_PORT?: string;
   KEEPALIVE_SECONDS?: string;
   /** Consecutive failed probes; default covers ~10 minutes of keepalive ticks. */
@@ -268,6 +270,8 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
   }
   const applicationId = env[APPLICATION_ID_KEY];
   if (applicationId !== undefined) vars[APPLICATION_ID_KEY] = applicationId;
+  const lobbyId = env.DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID;
+  if (lobbyId !== undefined) vars["DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID"] = lobbyId;
   vars["LISTEN_ADDR"] = `0.0.0.0:${port}`;
   // Private internal-actions receiver (TOG-12980). Dark unless the Operator
   // sets TWO_INTERNAL_ACTIONS to exactly "1"; any other value forwards nothing,

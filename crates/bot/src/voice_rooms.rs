@@ -650,9 +650,70 @@ struct LiveState {
     channels: HashMap<Snowflake, Channel>,
     members: HashMap<Snowflake, MemberState>,
     bot: Option<BotAccess>,
+    protected_channels: HashSet<Snowflake>,
+    /// Continuous human-empty evidence in this authoritative gateway session.
+    /// Reconnects restart the grace; human joins cancel it even between ticks.
+    empty_since: HashMap<Snowflake, tokio::time::Instant>,
+}
+
+/// Ordinary empty rooms get a full reconnect grace. Failed-create compensation
+/// has exact in-hand provenance and bypasses only this deadline, not occupancy.
+const EMPTY_ROOM_GRACE: Duration = Duration::from_secs(60);
+
+/// Boot-only infrastructure protection. Stored settings remain unwired; these
+/// already-forwarded process keys must never be inferred from room rows.
+fn configured_protected_channels(
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<HashSet<Snowflake>, &'static str> {
+    let mut protected = HashSet::new();
+    for (key, multiple) in [
+        ("DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID", false),
+        ("TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID", false),
+        ("TWO_TEMP_VOICE_CATEGORY_ID", false),
+        ("TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS", true),
+    ] {
+        let Some(raw) = env(key).filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        for value in raw.split(',') {
+            let value = value.trim();
+            let id = value
+                .parse::<Snowflake>()
+                .map_err(|_| "invalid protected channel id")?;
+            if id == 0 || value != id.to_string() || (!multiple && raw.contains(',')) {
+                return Err("invalid protected channel id");
+            }
+            protected.insert(id);
+        }
+    }
+    Ok(protected)
 }
 
 impl LiveState {
+    fn delete_protected(&self, channel: Snowflake) -> bool {
+        self.protected_channels.contains(&channel)
+            || self
+                .channels
+                .get(&channel)
+                .is_some_and(|channel| channel.kind == ChannelType::GuildCategory)
+    }
+
+    fn refresh_empty_since(&mut self, channel: Snowflake) {
+        if self.channels.contains_key(&channel) && self.humans(channel) == 0 {
+            self.empty_since
+                .entry(channel)
+                .or_insert_with(tokio::time::Instant::now);
+        } else {
+            self.empty_since.remove(&channel);
+        }
+    }
+
+    fn empty_grace_elapsed(&self, channel: Snowflake) -> bool {
+        self.empty_since
+            .get(&channel)
+            .is_some_and(|since| since.elapsed() >= EMPTY_ROOM_GRACE)
+    }
+
     fn ticket_valid(&self, ticket: JoinTicket) -> bool {
         self.ready
             && self.generation == ticket.generation
@@ -743,6 +804,16 @@ impl LiveGuild {
         }
     }
 
+    /// Add configured infrastructure IDs, independently of room provenance.
+    /// Keep this in shared state so a write awaiting a rate limit sees updates.
+    pub fn protect_channels(&self, channels: impl IntoIterator<Item = Snowflake>) {
+        self.inner
+            .write()
+            .expect("live voice lock")
+            .protected_channels
+            .extend(channels);
+    }
+
     pub fn publish(&self, snapshot: GuildSnapshot) -> bool {
         if snapshot
             .channels
@@ -780,6 +851,11 @@ impl LiveGuild {
             })
             .collect();
         live.bot = Some(snapshot.bot);
+        live.empty_since.clear();
+        let channels: Vec<_> = live.channels.keys().copied().collect();
+        for channel in channels {
+            live.refresh_empty_since(channel);
+        }
         live.ready = true;
         true
     }
@@ -788,6 +864,7 @@ impl LiveGuild {
         let mut live = self.inner.write().expect("live voice lock");
         live.ready = false;
         live.generation += 1;
+        live.empty_since.clear();
     }
 
     /// V10 health check: the bot's missing Manage Channels, Move Members,
@@ -889,9 +966,16 @@ impl LiveGuild {
         now_ms: u64,
     ) -> Option<JoinTicket> {
         let mut live = self.inner.write().expect("live voice lock");
+        let previous_channel = live
+            .members
+            .get(&member)
+            .and_then(|previous| previous.channel_id);
         if let Some(previous) = live.members.get_mut(&member) {
             if previous.channel_id == channel {
                 previous.bot = bot.or(previous.bot);
+                if let Some(channel) = channel {
+                    live.refresh_empty_since(channel);
+                }
                 return None;
             }
         }
@@ -907,6 +991,12 @@ impl LiveGuild {
                 joined_at_ms: now_ms,
             },
         );
+        if let Some(previous) = previous_channel {
+            live.refresh_empty_since(previous);
+        }
+        if let Some(channel) = channel {
+            live.refresh_empty_since(channel);
+        }
         channel.filter(|_| live.ready).map(|creator_id| JoinTicket {
             member_id: member,
             creator_id,
@@ -917,20 +1007,17 @@ impl LiveGuild {
 
     pub fn upsert_channel(&self, channel: Channel) {
         if channel.guild_id.map(Id::get) == Some(self.guild_id) {
-            self.inner
-                .write()
-                .expect("live voice lock")
-                .channels
-                .insert(channel.id.get(), channel);
+            let mut live = self.inner.write().expect("live voice lock");
+            let id = channel.id.get();
+            live.channels.insert(id, channel);
+            live.refresh_empty_since(id);
         }
     }
 
     pub fn remove_channel(&self, channel: Snowflake) {
-        self.inner
-            .write()
-            .expect("live voice lock")
-            .channels
-            .remove(&channel);
+        let mut live = self.inner.write().expect("live voice lock");
+        live.channels.remove(&channel);
+        live.empty_since.remove(&channel);
     }
 
     fn join_guard(&self, ticket: JoinTicket) -> WriteGuard {
@@ -1135,12 +1222,13 @@ struct NoticeState {
 
 impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     pub async fn load(live: LiveGuild, store: S, http: H) -> Result<Self, StoreError> {
-        let creators = store
+        let creators: HashMap<_, _> = store
             .creators(live.guild_id)
             .await?
             .into_iter()
             .map(|c| (c.channel_id, c))
             .collect();
+        live.protect_channels(creators.keys().copied());
         let access = store.access_controls(live.guild_id).await?;
         let rooms = store
             .rooms(live.guild_id)
@@ -1348,6 +1436,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let mut suspended: u64 = 0;
         let mut resumed: u64 = 0;
         for channel in self.rooms.keys().copied() {
+            if live.delete_protected(channel) {
+                continue;
+            }
             if !live.channels.contains_key(&channel) {
                 self.queue.resume(self.live.guild_id, channel);
                 resumed = resumed.saturating_add(1);
@@ -1381,7 +1472,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     .uncertain_moves
                     .get(&channel)
                     .is_some_and(|ticket| live.ticket_valid(*ticket));
-            if live.humans(channel) == 0 && !move_pending {
+            if live.humans(channel) == 0
+                && !move_pending
+                && (self.compensation.contains(&channel) || live.empty_grace_elapsed(channel))
+            {
                 empty.push(channel);
             } else if live.humans(channel) > 0 && !move_pending {
                 occupied.push(channel);
@@ -2264,7 +2358,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 let guard: WriteGuard = Arc::new(move || {
                     let state = live.inner.read().expect("live voice lock");
                     state.ready
+                        && !state.delete_protected(channel_id)
                         && state.humans(channel_id) == 0
+                        && (compensate || state.empty_grace_elapsed(channel_id))
                         && state
                             .permissions(live.guild_id, channel_id)
                             .is_some_and(|p| {
@@ -2284,7 +2380,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     .expect("live voice lock")
                     .channels
                     .contains_key(&channel_id);
-                let result = if !present {
+                let protected = self
+                    .live
+                    .inner
+                    .read()
+                    .expect("live voice lock")
+                    .delete_protected(channel_id);
+                let result = if protected || (present && !guard()) {
+                    Err(RoomHttpError::Cancelled)
+                } else if !present {
                     Ok(())
                 } else {
                     self.http.delete(channel_id, guard).await
@@ -2818,6 +2922,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             let guard: WriteGuard = Arc::new(move || {
                 let state = live.inner.read().expect("live voice lock");
                 state.ready
+                    && !state.delete_protected(text_channel_id)
                     && state
                         .permissions(guild_id, text_channel_id)
                         .is_some_and(|permissions| {
@@ -2825,6 +2930,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 .contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_CHANNELS)
                         })
             });
+            if !guard() {
+                return false;
+            }
             if let Err(error) = self.http.delete(text_channel_id, guard).await {
                 self.record(LifecycleFailure::Discord {
                     channel_id: text_channel_id,
@@ -3088,6 +3196,7 @@ pub struct VoiceRuntime<S, H> {
     make: Arc<dyn Fn() -> (S, H) + Send + Sync>,
     tick: Duration,
     enabled: bool,
+    protected_channels: HashSet<Snowflake>,
     seeds: AtomicU64,
     actors: Mutex<HashMap<Snowflake, GuildActor>>,
     /// Serializes `/access` read-modify-write cycles so two admins cannot
@@ -3116,11 +3225,18 @@ where
             make: Arc::new(make),
             tick,
             enabled,
+            protected_channels: HashSet::new(),
             seeds: AtomicU64::new(initial_seed()),
             actors: Mutex::new(HashMap::new()),
             access_lock: tokio::sync::Mutex::new(()),
             pending_imports: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Install boot configuration before spawning any actors.
+    pub fn with_protected_channels(mut self, channels: HashSet<Snowflake>) -> Self {
+        self.protected_channels = channels;
+        self
     }
 
     fn live_actor(&self, guild: Snowflake) -> Option<GuildActor> {
@@ -3149,6 +3265,9 @@ where
             live: LiveGuild::new(guild),
             tx,
         };
+        actor
+            .live
+            .protect_channels(self.protected_channels.iter().copied());
         let live = actor.live.clone();
         let make = Arc::clone(&self.make);
         let tick = self.tick;
@@ -3339,6 +3458,7 @@ where
     fn creator_added(&self, creator: &CreatorChannel, channel: Channel) {
         if let Some(actor) = self.live_actor(creator.guild_id) {
             actor.live.upsert_channel(channel);
+            actor.live.protect_channels([creator.channel_id]);
             let _ = actor.tx.send(ActorCommand::CreatorAdded(creator.clone()));
         }
     }
@@ -3404,6 +3524,7 @@ where
     /// settings snapshot taken when it was created.
     fn creator_updated(&self, creator: &CreatorChannel) {
         if let Some(actor) = self.live_actor(creator.guild_id) {
+            actor.live.protect_channels([creator.channel_id]);
             let _ = actor.tx.send(ActorCommand::CreatorAdded(creator.clone()));
         }
     }
@@ -3583,6 +3704,7 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             worker.reconcile();
         }
         ActorCommand::CreatorAdded(creator) => {
+            worker.live.protect_channels([creator.channel_id]);
             worker.creators.insert(creator.channel_id, creator);
             worker.reconcile();
         }
@@ -3639,15 +3761,22 @@ pub fn build_production_runtime(
     token: &str,
     pool: sqlx::PgPool,
 ) -> Result<VoiceResponder<PgRoomStore, RoomHttp, RoomHttp>, RoomHttpError> {
+    let protected = configured_protected_channels(|key| std::env::var(key).ok()).map_err(|_| {
+        warn!("invalid voice protected-channel configuration; voice rooms disabled");
+        RoomHttpError::Cancelled
+    })?;
     let replies = RoomHttp::new(token.to_owned())?;
     let http = replies.clone();
     let store = PgRoomStore::new(pool);
     Ok(VoiceResponder::new(
-        Arc::new(VoiceRuntime::new(
-            move || (store.clone(), http.clone()),
-            Duration::from_millis(250),
-            true,
-        )),
+        Arc::new(
+            VoiceRuntime::new(
+                move || (store.clone(), http.clone()),
+                Duration::from_millis(250),
+                true,
+            )
+            .with_protected_channels(protected),
+        ),
         Arc::new(replies),
     ))
 }

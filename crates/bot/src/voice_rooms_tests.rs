@@ -2,6 +2,8 @@ use super::*;
 use serde_json::json;
 use std::sync::Mutex;
 
+#[path = "voice_delete_guard_tests.rs"]
+mod delete_guards;
 #[path = "voice_kick_tests.rs"]
 mod kick;
 #[path = "voice_rooms_sink_tests.rs"]
@@ -708,7 +710,7 @@ async fn stale_move_guard_is_rechecked_after_transport_wait() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reconnect_only_prunes_tracked_empty_channels_and_counts_unknown_members_as_human() {
     let (live, store, http, trace) = fixture();
     for id in [500, 501, 502, 503] {
@@ -735,6 +737,7 @@ async fn reconnect_only_prunes_tracked_empty_channels_and_counts_unknown_members
         ],
     ));
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     for time in 0..2 {
         dispatch(&mut worker, time).await;
@@ -1064,7 +1067,7 @@ async fn ownership_commands_while_halted_refuse_paused() {
     assert!(text.contains("paused"), "{text}");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn not_ready_and_disconnected_snapshots_never_allow_destructive_reconciliation() {
     let (_, store, http, trace) = fixture();
     store.rooms.lock().unwrap().insert(500, room(500));
@@ -1073,6 +1076,7 @@ async fn not_ready_and_disconnected_snapshots_never_allow_destructive_reconcilia
     worker.reconcile();
     assert!(!worker.dispatch_one(0).await);
     worker.live.publish(snapshot(&[500], vec![]));
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     worker.live.disconnect();
     assert!(!worker.dispatch_one(1).await);
@@ -1089,7 +1093,7 @@ async fn not_ready_and_disconnected_snapshots_never_allow_destructive_reconcilia
     assert_eq!(worker.tracked().len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn occupants_arriving_during_delete_backoff_cancel_the_write() {
     let (live, store, mut http, trace) = fixture();
     store.rooms.lock().unwrap().insert(500, room(500));
@@ -1099,13 +1103,14 @@ async fn occupants_arriving_during_delete_backoff_cancel_the_write() {
         shared.voice_update(MEMBER, Some(500), Some(false));
     }));
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     dispatch(&mut worker, 0).await;
     assert!(trace.lock().unwrap().is_empty());
     assert_eq!(worker.tracked().len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn delete_403_suspends_without_a_retry_storm_and_refresh_resumes() {
     let (live, store, http, trace) = fixture();
     store.rooms.lock().unwrap().insert(500, room(500));
@@ -1115,6 +1120,7 @@ async fn delete_403_suspends_without_a_retry_storm_and_refresh_resumes() {
         .unwrap()
         .push_back(RoomHttpError::AccessDenied);
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     dispatch(&mut worker, 0).await;
     for time in [3000, 6000, 10000] {
@@ -1123,6 +1129,7 @@ async fn delete_403_suspends_without_a_retry_storm_and_refresh_resumes() {
     }
     assert_eq!(*trace.lock().unwrap(), ["delete:500"]);
     worker.live.publish(snapshot(&[500], vec![]));
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     dispatch(&mut worker, 10000).await;
     assert_eq!(
@@ -1171,7 +1178,7 @@ async fn unknown_create_is_never_retried_or_inferred_from_untracked_channels() {
     assert!(worker.tracked().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn uncertain_move_waits_for_occupancy_evidence_and_last_human_leave_deletes() {
     let (live, store, http, trace) = fixture();
     http.move_errors
@@ -1188,6 +1195,7 @@ async fn uncertain_move_waits_for_occupancy_evidence_and_last_human_leave_delete
     worker.reconcile();
     assert!(!worker.dispatch_one(3).await);
     worker.live.voice_update(MEMBER, None, Some(false));
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     dispatch(&mut worker, 4).await;
     assert_eq!(
@@ -1202,7 +1210,7 @@ async fn uncertain_move_waits_for_occupancy_evidence_and_last_human_leave_delete
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn database_forget_failure_retries_only_sql_after_successful_delete() {
     let (live, store, http, trace) = fixture();
     store.rooms.lock().unwrap().insert(500, room(500));
@@ -1213,6 +1221,7 @@ async fn database_forget_failure_retries_only_sql_after_successful_delete() {
         .push_back(StoreError::Unavailable);
     live.upsert_channel(channel(500, 2, Some(CATEGORY)));
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     dispatch(&mut worker, 0).await;
     assert_eq!(worker.tracked().len(), 1);
@@ -1248,7 +1257,7 @@ async fn credential_refusal_stops_all_further_writes() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn rename_backoff_never_delays_deleting_another_room_and_keeps_latest_name() {
     let (live, store, http, trace) = fixture();
     for id in [500, 501] {
@@ -1269,6 +1278,7 @@ async fn rename_backoff_never_delays_deleting_another_room_and_keeps_latest_name
     dispatch(&mut worker, 0).await;
     worker.propose_name(500, "latest", 1);
     worker.live.voice_update(MEMBER + 1, None, None);
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     dispatch(&mut worker, 2).await;
     // Coalescing replaces the retry's stale name once its budget is due.
@@ -4016,16 +4026,17 @@ async fn join_grants_view_and_leave_revokes_without_deny() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn companion_deleted_with_its_room_and_delete_is_idempotent() {
     let (live, store, http, trace) = companion_fixture();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     let mut now = 0;
     join_with_companion(&mut worker, MEMBER, &mut now).await;
     let text_id = worker.companions[&500].text_channel_id;
-    // Everyone leaves: reconcile queues the room delete, which deletes the
-    // companion first.
+    // Everyone leaves: after the grace, reconcile queues the room delete and
+    // its companion cleanup.
     worker.live.voice_update(MEMBER, None, Some(false));
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     dispatch(&mut worker, now).await;
     let calls = trace.lock().unwrap().clone();
@@ -5843,7 +5854,7 @@ async fn terminal_queue_failure_dead_letters_exactly_once_per_family() {
     assert_eq!(worker.queue.failed()[0].action.attempts, QUEUE_MAX_ATTEMPTS);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reconcile_pass_reports_its_plan_sizes() {
     let (live, store, http, _) = fixture();
     store.rooms.lock().unwrap().insert(500, room(500));
@@ -5851,6 +5862,7 @@ async fn reconcile_pass_reports_its_plan_sizes() {
     live.upsert_channel(channel(500, 2, Some(CATEGORY)));
     live.upsert_channel(channel(501, 2, Some(CATEGORY)));
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     let resumed_before = global_series("two_bot_voice_reconcile_actions_total{action=\"resumed\"}");
     let enqueued_before =
         global_series("two_bot_voice_reconcile_actions_total{action=\"delete_enqueued\"}");

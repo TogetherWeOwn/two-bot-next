@@ -2314,12 +2314,12 @@
         ]
       },
       "owner": [
-        "TOG-10093",
+        "TOG-15672",
         "TOG-10119"
       ],
       "status": "waived",
-      "action": "Run TOG-10093’s delete-guard mutation fixture against the sweep.",
-      "expected": "Mutating or removing temp-voice provenance makes the guard refuse deletion; a channel without provenance is never deleted.",
+      "action": "Run the worker suite and separately remove the protected-ID and grace checks on the disposable offline fixture, restoring the original between mutations. Follow the six-obligation map in docs/voice-delete-guards.md; no CI mutation-harness or live fault-injection claim.",
+      "expected": "Protected Lobby/creator/category IDs and untracked channels receive zero deletes; ordinary human-empty rooms survive until the deadline; human joins reset grace and delayed writes recheck current occupancy; occupied rooms survive reconnect. Both separate mutations fail assertions, then the restored worker suite passes. Missing receipts leave this row carded.",
       "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
       "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
