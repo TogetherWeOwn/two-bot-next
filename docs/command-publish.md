@@ -3,7 +3,10 @@
 `two-bot commands` compares Discord's current guild registry with this build's
 feature-gated registry. It uses the existing `InteractionRouter::publish_set`
 and Twilight conversion, without changing any command definitions. These
-operator commands do not connect to Postgres or start a gateway shard.
+operator commands start no gateway shard. Live Discord targets build shared
+send admission from `TWO_DATABASE_URL` (or `DATABASE_URL` when unset), the same
+admission Postgres the gateway uses; loopback `DISCORD_API_BASE` fixtures open
+no database.
 
 ## Configuration and safety
 
