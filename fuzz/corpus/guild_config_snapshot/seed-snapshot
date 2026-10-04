@@ -1,0 +1,1 @@
+{"version":1,"applicationId":"app","guildId":"guild","guild":{"name":"Synthetic guild"},"roles":[{"id":"guild","name":"@everyone","managed":false,"permissions":"0","position":0}],"channels":[{"id":"text","name":"chat","type":0,"parent_id":null,"position":0,"permission_overwrites":[]}],"emojis":[]}
