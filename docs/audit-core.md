@@ -117,3 +117,5 @@ git diff --check
 
 The workspace-wide integration suite is delegated to CI; this slice only needs
 an incremental core build locally.
+
+<!-- probe: required-checks skipped-path -->
