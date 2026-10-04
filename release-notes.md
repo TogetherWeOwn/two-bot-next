@@ -1,16 +1,63 @@
 :robot: I have created a release *beep* *boop*
 
-## Summary
+## Thinking Path
 
-Publish the next synchronized Rust workspace release through release-please.
+> - two-bot-next is the Together We Own Discord bot, written in Rust, running as one always-on container.
+> - Its workspace ships as one synchronized release with one root changelog and tag.
+> - Generated metadata must use the main snapshot that is independently reviewed and merged.
+> - Regeneration must retain excluded-consumer synchronization, contributor-example CI coverage and every historical release note.
+> - This pull request prepares synchronized 0.3.0 metadata; it does not authorize production cutover or a stale-main merge.
 
-## Changes
+## Linked Issues or Issue Description
 
-Update the release manifest, Cargo versions and lockfile, and preserve generated and bootstrap changelog notes.
+- Address the [latest freshness finding](https://github.com/TogetherWeOwn/two-bot-next/pull/71#pullrequestreview-5406543783) on this same PR. Regenerate from snapshot `48b070a2`, incorporating #566 staging-apply claims and #564 safety-flag tests, and retain the reviewed source and canonical-metadata repairs. Main moved again after that generation, so a new green head alone cannot satisfy the live freshness gate.
 
-## Testing
+## What Changed
 
-Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publication.cjs`, `python3 scripts/test-release-retry.py` and `python3 scripts/test-pr-lint.py`. Required checks are dispatched on this PR head; their green results and independent review are mandatory before merge.
+- Regenerate the root release manifest, seven package versions and local dependency pins, Cargo.lock, and CHANGELOG.md through release-please 17.6.0.
+- Restore the same seven-file source repair: excluded fuzz path requirements, copyable testsupport dependency example, native generic extra-file updates, lifecycle regression coverage, release documentation, and contributor-only Worker CI selection.
+- Preserve those seven repair files byte-for-byte from the prior repaired source. Keep the reconciled incoming changelog verbatim, not a hand-spliced conflict resolution.
+- Retain the native overflow link and full freshly generated notes region/footer unchanged by this seven-section metadata repair. Preserve every prior notes line and its bullet multiplicity; add the native fix entry for #566.
+- Include #564 in the source snapshot without inventing a user-facing changelog entry for its `test` type. Preserve #550/#533 notes and the prior #350 source/toolchain changes.
+- Credit release-please automation and the repository contributors whose changes appear below.
+
+## Verification
+
+- [Regeneration workflow 37208033953](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/37208033953): SUCCESS from snapshot `48b070a24e8db01b0576ea349cb6ef97ba82de10`; reconciled generated head `b8765488e20df1d5f04ea7af9cf27cc24351e8d5`.
+- The previous head `8ccbad3f` passed [check/ci-ok 37203426434](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/37203426434) and [supply-chain 37203426228](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/37203426228). Those are historical results, not proof for this regenerated head.
+- Before this regeneration, current-main release planning returned `reuse_pr=false`. Main subsequently moved to observed `c60167e4` after #540 while this generation was in flight. Do not merge this snapshot as though it were fresh.
+- Current repair pushed as `6b88aa3f`. `NODE_PATH=<pinned-dependencies> node scripts/test-release.cjs`: PASS, 22 bootstrap plus 22 post-release native lifecycles and all migration/overflow/snapshot guards.
+- `node scripts/test-release-publication.cjs` with release-please 17.6.0: PASS, publication/retry and misplaced-template negative control.
+- `python3 scripts/test-release-retry.py`: 28 tests PASS. `python3 scripts/test-pr-lint.py`: 27 tests PASS.
+- `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_job_inputs.py' -v`: 58 tests PASS; equivalent discovery for `test_container_inputs.py`: 26 tests PASS.
+- `python3 scripts/test-docker-deps.py`: seven valid package targets PASS without Cargo compilation. `git diff --check`: PASS. All seven repair files match the prior repaired source; CHANGELOG.md matches the incoming generated head byte-for-byte.
+- No old CI or approval is substituted for new exact-head checks and independent review.
+- Canonical-body verification checks strict seven-section metadata with the generated-branch exemption removed, byte-identical native region/footer and unchanged visible link, preservation of historical bullet counts, and the actual pinned native overflow publication path with a misplaced-template negative control. The replay mocks all GitHub transport and creates no real release.
+- No local Rust compilation, full fuzz campaign, staging E2E, production test, deployment, tag verification or SBOM publication verification is claimed. Exact-head CI and independent approval remain pending, and live freshness must be restored before merge.
+
+## Risks
+
+- Pre-1.0 release publication is not production deployment or cutover approval.
+- A merge during the generation/CI/review window invalidates the snapshot, even when its source CI is green and the branch is mergeable. Resolve the merge-admission coordination rather than weakening freshness.
+- Native delimiter placement controls published notes; the pinned publication fixture protects that boundary.
+- The generic updater changes only annotated version lines; native lifecycles preserve the unpublished fuzz package version, external dependencies and target definitions.
+- The freeze stays until tag/Release, attached SBOMs and the tagged label are verified. No author merge or stale-main exception.
+
+## Model Used
+
+- OpenAI `gpt-6.1-sol` authored the earlier source repairs and this regeneration integration, canonical metadata repair and verification. release-please 17.6.0 generated versions and release notes. No routed model output was incorporated. Historical work remains credited to its contributors; context-window size was not supplied.
+
+## Checklist
+
+- [x] I wrote a thinking path that runs from the project to this change
+- [x] I named the model used, with its version
+- [x] I searched for related PRs and linked them above
+- [x] I ran the relevant offline release tests locally and they pass
+- [x] I retained regression coverage for excluded consumers, subsequent releases and contributor-only CI selection
+- [x] I updated the documentation this change touches
+- [x] No secret, token or credential is in the diff, the title, the body or the branch name
+- [x] No internal ticket id, instance link or private host is in the title, body, commits or branch name
+- [ ] CI is green on the regenerated exact head before independent approval (pending)
 ---
 
 
