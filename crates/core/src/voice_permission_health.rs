@@ -28,6 +28,8 @@ pub const PERM_ADMINISTRATOR: u64 = 8;
 pub const PERM_MANAGE_CHANNELS: u64 = 16;
 /// View Channel.
 pub const PERM_VIEW_CHANNEL: u64 = 1024;
+/// Connect.
+pub const PERM_CONNECT: u64 = 1 << 20;
 /// Move Members.
 pub const PERM_MOVE_MEMBERS: u64 = 1 << 24;
 /// Manage Roles.
@@ -186,6 +188,47 @@ pub fn evaluate_permissions(
         });
     }
     findings
+}
+
+/// Diagnose only the permissions required by a refused write on the actual
+/// checked surface. Unlike the general health check, a parent category cannot
+/// explain a missing bit on an unsynced channel. The caller supplies the same
+/// effective permissions and required mask used by its write gate.
+#[must_use]
+pub fn evaluate_write_permissions(
+    guild_base: u64,
+    effective: u64,
+    required: u64,
+    surface_scope: VoicePermissionScope,
+    surface_id: Snowflake,
+) -> Vec<PermissionFinding> {
+    if guild_base & PERM_ADMINISTRATOR != 0 {
+        return Vec::new();
+    }
+    let permissions = [
+        (VoicePermission::ManageChannels, PERM_MANAGE_CHANNELS),
+        (VoicePermission::MoveMembers, PERM_MOVE_MEMBERS),
+        (VoicePermission::ManageRoles, PERM_MANAGE_ROLES),
+        (VoicePermission::ViewChannel, PERM_VIEW_CHANNEL),
+        (VoicePermission::Connect, PERM_CONNECT),
+    ];
+    permissions
+        .into_iter()
+        .filter(|(_, bit)| required & *bit != 0 && effective & *bit == 0)
+        .map(|(permission, bit)| {
+            let scope = if guild_base & bit == 0 {
+                VoicePermissionScope::Guild
+            } else {
+                surface_scope
+            };
+            PermissionFinding {
+                permission,
+                scope,
+                category_id: (scope == VoicePermissionScope::Category).then_some(surface_id),
+                channel_id: (scope == VoicePermissionScope::Channel).then_some(surface_id),
+            }
+        })
+        .collect()
 }
 
 fn partition(

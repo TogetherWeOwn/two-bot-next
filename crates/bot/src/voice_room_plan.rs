@@ -27,7 +27,7 @@ use two_bot_core::{
         CategoryEntryKind, PlacementRequest,
     },
     voice_rooms::{CreatorChannel, PermissionSource, RoomPosition, VoiceRoom},
-    Snowflake,
+    PermissionFinding, Snowflake, VoicePermissionScope,
 };
 use two_bot_discord::voice_rooms::{
     can_manage_room, effective_permissions, RoomChannelAttributes, RoomHttpError,
@@ -39,10 +39,29 @@ use crate::voice_rooms::BotAccess;
 /// owner in. Granted only when the room's overrides would otherwise take it
 /// away (a private room denies Connect to @everyone, which includes the bot's
 /// guild-level grant).
-const BOT_ROOM_ACCESS: u64 = (Permissions::VIEW_CHANNEL.bits())
+pub(crate) const BOT_ROOM_ACCESS: u64 = (Permissions::VIEW_CHANNEL.bits())
     | Permissions::CONNECT.bits()
     | Permissions::MANAGE_CHANNELS.bits()
     | Permissions::MOVE_MEMBERS.bits();
+
+/// Sanitized planning failure plus the exact permission evidence that refused
+/// the plan, before the live snapshot can change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoomPlanError {
+    pub error: RoomHttpError,
+    pub source_id: Option<Snowflake>,
+    pub findings: Vec<PermissionFinding>,
+}
+
+impl From<RoomHttpError> for RoomPlanError {
+    fn from(error: RoomHttpError) -> Self {
+        Self {
+            error,
+            source_id: None,
+            findings: Vec::new(),
+        }
+    }
+}
 
 pub(crate) struct RoomPlanInput<'a> {
     pub guild_id: Snowflake,
@@ -195,11 +214,58 @@ fn placement(input: &RoomPlanInput<'_>) -> Option<u64> {
     Some(position_for_index(&order, index))
 }
 
-/// Plan one room. Errors are sanitized `RoomHttpError`s the worker already
-/// knows how to record: `AccessDenied` when the bot cannot build the room as
-/// configured (never silently weaker), `InvalidRequest` for settings or
-/// snapshot data that cannot be honoured.
-pub(crate) fn plan_room(input: &RoomPlanInput<'_>) -> Result<RoomChannelAttributes, RoomHttpError> {
+fn permission_error(
+    input: &RoomPlanInput<'_>,
+    surface: Option<(Snowflake, VoicePermissionScope)>,
+    overwrites: &[PermissionOverwrite],
+    required: u64,
+) -> RoomPlanError {
+    let bot = input.bot;
+    let base = effective_permissions(
+        input.guild_id,
+        bot.guild_owner_id,
+        bot.member_id,
+        &bot.member_roles,
+        &bot.roles,
+        &[],
+    );
+    let effective = effective_permissions(
+        input.guild_id,
+        bot.guild_owner_id,
+        bot.member_id,
+        &bot.member_roles,
+        &bot.roles,
+        overwrites,
+    );
+    let findings = match (base, effective, surface) {
+        (Some(base), Some(effective), Some((id, scope))) => {
+            two_bot_core::voice_permission_health::evaluate_write_permissions(
+                base.bits(),
+                effective.bits(),
+                required,
+                scope,
+                id,
+            )
+        }
+        _ => Vec::new(),
+    };
+    RoomPlanError {
+        error: RoomHttpError::AccessDenied,
+        source_id: surface.map(|(id, _)| id),
+        findings,
+    }
+}
+
+#[cfg(test)]
+fn plan_room(input: &RoomPlanInput<'_>) -> Result<RoomChannelAttributes, RoomHttpError> {
+    plan_room_diagnosed(input).map_err(|failure| failure.error)
+}
+
+/// Plan one room, preserving findings from the exact final overwrites that
+/// refused it rather than diagnosing a later or unrelated cache snapshot.
+pub(crate) fn plan_room_diagnosed(
+    input: &RoomPlanInput<'_>,
+) -> Result<RoomChannelAttributes, RoomPlanError> {
     let settings = input.settings;
     // The companion text channel (`settings.text_channels`) is not part of the
     // voice-channel attributes: the worker creates it through the same
@@ -224,12 +290,30 @@ pub(crate) fn plan_room(input: &RoomPlanInput<'_>) -> Result<RoomChannelAttribut
         PermissionSource::Category => (InheritanceSource::Category, parent),
         PermissionSource::Channel(id) => (InheritanceSource::ChosenChannel, Some(id)),
     };
+    let source_surface = source_channel.map(|id| {
+        (
+            id,
+            if input
+                .channels
+                .get(&id)
+                .is_some_and(|channel| channel.kind == ChannelType::GuildCategory)
+            {
+                VoicePermissionScope::Category
+            } else {
+                VoicePermissionScope::Channel
+            },
+        )
+    });
     let source_overrides = match (bot_can_manage_roles, source_channel) {
         (true, Some(id)) => to_core(
             input
                 .channels
                 .get(&id)
-                .ok_or(RoomHttpError::AccessDenied)?
+                .ok_or_else(|| RoomPlanError {
+                    error: RoomHttpError::NotFound,
+                    source_id: Some(id),
+                    findings: Vec::new(),
+                })?
                 .permission_overwrites
                 .as_deref()
                 .unwrap_or_default(),
@@ -256,7 +340,12 @@ pub(crate) fn plan_room(input: &RoomPlanInput<'_>) -> Result<RoomChannelAttribut
                 grant_bot(&mut list, bot.member_id);
                 evaluated = to_twilight(&list)?;
                 if !bot_can_manage(input.guild_id, bot, &evaluated) {
-                    return Err(RoomHttpError::AccessDenied);
+                    return Err(permission_error(
+                        input,
+                        source_surface,
+                        &evaluated,
+                        BOT_ROOM_ACCESS,
+                    ));
                 }
             }
             evaluated
@@ -266,14 +355,28 @@ pub(crate) fn plan_room(input: &RoomPlanInput<'_>) -> Result<RoomChannelAttribut
             // cannot honour a private default or the owner's extra access. Do
             // not fall back to a public room.
             if initial.private {
-                return Err(RoomHttpError::AccessDenied);
+                return Err(permission_error(
+                    input,
+                    Some((input.creator.id.get(), VoicePermissionScope::Channel)),
+                    input
+                        .creator
+                        .permission_overwrites
+                        .as_deref()
+                        .unwrap_or_default(),
+                    Permissions::MANAGE_ROLES.bits(),
+                ));
             }
             let category = parent
                 .and_then(|id| input.channels.get(&id))
                 .and_then(|channel| channel.permission_overwrites.as_deref())
                 .unwrap_or_default();
             if !bot_can_manage(input.guild_id, bot, category) {
-                return Err(RoomHttpError::AccessDenied);
+                return Err(permission_error(
+                    input,
+                    parent.map(|id| (id, VoicePermissionScope::Category)),
+                    category,
+                    BOT_ROOM_ACCESS,
+                ));
             }
             Vec::new()
         }

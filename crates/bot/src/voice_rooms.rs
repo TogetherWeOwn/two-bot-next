@@ -20,7 +20,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::voice_room_plan::{category_room_ids, plan_room, RoomPlanInput};
+use crate::voice_room_plan::{
+    category_room_ids, plan_room_diagnosed, RoomPlanError, RoomPlanInput, BOT_ROOM_ACCESS,
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 use twilight_cache_inmemory::DefaultInMemoryCache;
@@ -104,6 +106,13 @@ use two_bot_discord::voice_rooms::{
 };
 
 pub type WriteGuard = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Keep a permission refusal observed at send time distinct from a stale
+/// ticket cancellation, without changing the adapter's boolean guard contract.
+struct GuardedWrite {
+    check: WriteGuard,
+    permission_failure: Arc<Mutex<Option<LifecycleFailure>>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreError {
@@ -732,6 +741,42 @@ impl LiveState {
     }
 }
 
+/// Findings from the same snapshot and surface as the create/move gate.
+/// The caller already owns the read lock; do not reacquire it here.
+fn write_permission_findings(
+    state: &LiveState,
+    guild_id: Snowflake,
+    channel_id: Snowflake,
+) -> Vec<PermissionFinding> {
+    let (Some(bot), Some(channel)) = (state.bot.as_ref(), state.channels.get(&channel_id)) else {
+        return Vec::new();
+    };
+    let Some(base) = effective_permissions(
+        guild_id,
+        bot.guild_owner_id,
+        bot.member_id,
+        &bot.member_roles,
+        &bot.roles,
+        &[],
+    ) else {
+        return Vec::new();
+    };
+    let Some(effective) = state.permissions(guild_id, channel_id) else {
+        return Vec::new();
+    };
+    two_bot_core::voice_permission_health::evaluate_write_permissions(
+        base.bits(),
+        effective.bits(),
+        BOT_ROOM_ACCESS,
+        if channel.kind == ChannelType::GuildCategory {
+            VoicePermissionScope::Category
+        } else {
+            VoicePermissionScope::Channel
+        },
+        channel_id,
+    )
+}
+
 /// Shared with the gateway, not locked across network/database awaits.
 #[derive(Debug, Clone)]
 pub struct LiveGuild {
@@ -937,27 +982,49 @@ impl LiveGuild {
             .remove(&channel);
     }
 
-    fn join_guard(&self, ticket: JoinTicket) -> WriteGuard {
-        let live = self.clone();
-        Arc::new(move || {
-            let state = live.inner.read().expect("live voice lock");
-            state.ticket_valid(ticket)
-                && can_manage_room(state.permissions(live.guild_id, ticket.creator_id))
-        })
+    fn join_guard(&self, ticket: JoinTicket) -> GuardedWrite {
+        self.join_write_guard(ticket, RefusedWrite::Create, vec![ticket.creator_id])
     }
 
-    fn move_guard(&self, ticket: JoinTicket, channel: Snowflake) -> WriteGuard {
+    fn move_guard(&self, ticket: JoinTicket, channel: Snowflake) -> GuardedWrite {
+        self.join_write_guard(ticket, RefusedWrite::Move, vec![ticket.creator_id, channel])
+    }
+
+    fn join_write_guard(
+        &self,
+        ticket: JoinTicket,
+        write: RefusedWrite,
+        channels: Vec<Snowflake>,
+    ) -> GuardedWrite {
         let live = self.clone();
-        let join = self.join_guard(ticket);
-        Arc::new(move || {
-            join()
-                && can_manage_room(
-                    live.inner
-                        .read()
-                        .expect("live voice lock")
-                        .permissions(live.guild_id, channel),
-                )
-        })
+        let permission_failure = Arc::new(Mutex::new(None));
+        let observed = Arc::clone(&permission_failure);
+        let check = Arc::new(move || {
+            let state = live.inner.read().expect("live voice lock");
+            // Lost authority or a member who left is not a permission finding.
+            if !state.ticket_valid(ticket) {
+                return false;
+            }
+            for channel_id in &channels {
+                let Some(permissions) = state.permissions(live.guild_id, *channel_id) else {
+                    return false;
+                };
+                if !can_manage_room(Some(permissions)) {
+                    *observed.lock().expect("voice guard lock") =
+                        Some(LifecycleFailure::MissingPermission {
+                            write,
+                            channel_id: *channel_id,
+                            findings: write_permission_findings(&state, live.guild_id, *channel_id),
+                        });
+                    return false;
+                }
+            }
+            true
+        });
+        GuardedWrite {
+            check,
+            permission_failure,
+        }
     }
 
     /// Guard for a passed vote's writes: evidence must be authoritative and the
@@ -1020,6 +1087,7 @@ fn permission_name(permission: VoicePermission) -> &'static str {
         VoicePermission::MoveMembers => "Move Members",
         VoicePermission::ManageRoles => "Manage Roles",
         VoicePermission::ViewChannel => "View Channel",
+        VoicePermission::Connect => "Connect",
     }
 }
 
@@ -1061,9 +1129,9 @@ pub enum LifecycleFailure {
         error: StoreError,
     },
     /// Discord (or the live permission cache) refused a join-time write for a
-    /// missing permission. `findings` is the health check's attribution for
-    /// `channel_id`; empty when the cache shows nothing missing (a refusal
-    /// the cache could not explain, such as a missing Connect or stale roles).
+    /// missing permission. `findings` captures the refused operation's actual
+    /// permissions and causal surface; empty when a Discord refusal cannot be
+    /// explained by the cache (for example, stale roles).
     MissingPermission {
         write: RefusedWrite,
         channel_id: Snowflake,
@@ -2081,10 +2149,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         released
     }
 
-    fn prepare(&self, ticket: JoinTicket) -> Result<RoomChannelAttributes, RoomHttpError> {
+    fn prepare(&self, ticket: JoinTicket) -> Result<RoomChannelAttributes, RoomPlanError> {
         let live = self.live.inner.read().expect("live voice lock");
         if !live.ticket_valid(ticket) {
-            return Err(RoomHttpError::Cancelled);
+            return Err(RoomHttpError::Cancelled.into());
         }
         let settings = self
             .creators
@@ -2096,7 +2164,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .ok_or(RoomHttpError::NotFound)?;
         let permissions = live.permissions(self.live.guild_id, ticket.creator_id);
         if !can_manage_room(permissions) {
-            return Err(RoomHttpError::AccessDenied);
+            return Err(RoomPlanError {
+                error: RoomHttpError::AccessDenied,
+                source_id: Some(ticket.creator_id),
+                findings: write_permission_findings(&live, self.live.guild_id, ticket.creator_id),
+            });
         }
         if let Some(parent) = channel.parent_id {
             if live
@@ -2109,7 +2181,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 return Err(RoomHttpError::Rejected {
                     status: 400,
                     code: 50035,
-                });
+                }
+                .into());
             }
         }
         let bot = live.bot.as_ref().ok_or(RoomHttpError::AccessDenied)?;
@@ -2119,7 +2192,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         } else {
             Vec::new()
         };
-        plan_room(&RoomPlanInput {
+        plan_room_diagnosed(&RoomPlanInput {
             guild_id: self.live.guild_id,
             owner_id: ticket.member_id,
             settings,
@@ -2162,7 +2235,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 };
                 let attributes = match self.prepare(creation.ticket) {
                     Ok(attributes) => attributes,
-                    Err(error) => {
+                    Err(failure) => {
+                        let error = failure.error;
                         if error
                             == (RoomHttpError::Rejected {
                                 status: 400,
@@ -2176,7 +2250,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             observe_voice_operation("create", "category_full");
                         } else if error != RoomHttpError::Cancelled {
                             let outcome = voice_outcome_from_http(&error);
-                            self.record_refusal(RefusedWrite::Create, creator_channel_id, error);
+                            if error == RoomHttpError::AccessDenied {
+                                self.record(LifecycleFailure::MissingPermission {
+                                    write: RefusedWrite::Create,
+                                    channel_id: failure
+                                        .source_id
+                                        .filter(|_| failure.findings.is_empty())
+                                        .unwrap_or(creator_channel_id),
+                                    findings: failure.findings,
+                                });
+                            } else {
+                                self.record(LifecycleFailure::Discord {
+                                    channel_id: failure.source_id.unwrap_or(creator_channel_id),
+                                    error,
+                                });
+                            }
                             observe_voice_operation("create", outcome);
                         }
                         self.creations.remove(&action.id);
@@ -2184,13 +2272,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         return true;
                     }
                 };
+                let guard = self.live.join_guard(creation.ticket);
                 match self
                     .http
                     .create(
                         self.live.guild_id,
                         &name,
                         &attributes,
-                        self.live.join_guard(creation.ticket),
+                        Arc::clone(&guard.check),
                     )
                     .await
                 {
@@ -2259,11 +2348,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         if error != RoomHttpError::Cancelled {
                             observe_voice_operation("create", voice_outcome_from_http(&error));
                         }
-                        self.finish_error(
+                        self.finish_join_error(
                             action,
                             creator_channel_id,
                             error,
-                            Some(RefusedWrite::Create),
+                            RefusedWrite::Create,
+                            &guard,
                         );
                     }
                 }
@@ -2276,7 +2366,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     self.queue.mark_succeeded(&action);
                     return true;
                 };
-                let result = if !can_manage_room(
+                let guard = self.live.move_guard(ticket, channel_id);
+                let result = if !self
+                    .live
+                    .inner
+                    .read()
+                    .expect("live voice lock")
+                    .ticket_valid(ticket)
+                {
+                    Err(RoomHttpError::Cancelled)
+                } else if !can_manage_room(
                     self.live
                         .inner
                         .read()
@@ -2290,7 +2389,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             self.live.guild_id,
                             member_id,
                             channel_id,
-                            self.live.move_guard(ticket, channel_id),
+                            Arc::clone(&guard.check),
                         )
                         .await
                 };
@@ -2322,7 +2421,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         if error != RoomHttpError::Cancelled {
                             observe_voice_operation("move", voice_outcome_from_http(&error));
                         }
-                        self.finish_error(action, channel_id, error, Some(RefusedWrite::Move));
+                        self.finish_join_error(
+                            action,
+                            channel_id,
+                            error,
+                            RefusedWrite::Move,
+                            &guard,
+                        );
                         self.queue_delete(channel_id, true);
                         self.observe_voice_state();
                     }
@@ -3022,6 +3127,36 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
     }
 
+    fn finish_join_error(
+        &mut self,
+        action: QueuedAction,
+        channel_id: Snowflake,
+        error: RoomHttpError,
+        write: RefusedWrite,
+        guard: &GuardedWrite,
+    ) {
+        if error == RoomHttpError::Cancelled {
+            if let Some(failure) = guard
+                .permission_failure
+                .lock()
+                .expect("voice guard lock")
+                .take()
+            {
+                self.queue.mark_succeeded(&action);
+                observe_voice_operation(
+                    match write {
+                        RefusedWrite::Create => "create",
+                        RefusedWrite::Move => "move",
+                    },
+                    voice_outcome_from_http(&RoomHttpError::AccessDenied),
+                );
+                self.record(failure);
+                return;
+            }
+        }
+        self.finish_error(action, channel_id, error, Some(write));
+    }
+
     fn complete_error(
         &mut self,
         action: QueuedAction,
@@ -3055,12 +3190,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     }
 
     /// Record a refused join-time write. An access refusal becomes
-    /// [`LifecycleFailure::MissingPermission`], carrying the health check's
-    /// attribution for `channel_id` so the notice and `/setup` line name the
-    /// permission and the category or channel override that removes it.
+    /// [`LifecycleFailure::MissingPermission`], checking the write gate's
+    /// actual requirements (including Connect), not unrelated health gaps.
+    /// Planner and final-guard refusals use their already-captured findings.
     fn record_refusal(&mut self, write: RefusedWrite, channel_id: Snowflake, error: RoomHttpError) {
         if error == RoomHttpError::AccessDenied {
-            let findings = self.live.permission_findings(&[channel_id]);
+            let findings = write_permission_findings(
+                &self.live.inner.read().expect("live voice lock"),
+                self.live.guild_id,
+                channel_id,
+            );
             self.record(LifecycleFailure::MissingPermission {
                 write,
                 channel_id,
@@ -5385,11 +5524,13 @@ pub struct WorkerStatus {
     pub halted: bool,
 }
 
-/// Notice body for one failure. `brief` points at `/setup`; `full` adds the
-/// failure itself. Never `off`: callers gate on [`should_log`] first.
+/// Notice body for one failure. `brief` includes actionable permission/name
+/// causes; `full` adds every failure. Callers gate `off` on [`should_log`] first.
 fn notice_text(failure: &LifecycleFailure, level: DetailLevel) -> String {
-    let mut text = match level {
-        DetailLevel::Full => format!(
+    let mut text = match (level, failure) {
+        (DetailLevel::Full, _)
+        | (DetailLevel::Brief, LifecycleFailure::MissingPermission { .. })
+        | (DetailLevel::Brief, LifecycleFailure::NameBlocked { .. }) => format!(
             "Voice rooms need attention: {}. Run /setup to see all current problems.",
             failure_line(failure)
         ),
@@ -5419,13 +5560,13 @@ fn failure_line(failure: &LifecycleFailure) -> String {
             channel_id,
             findings,
         } => {
-            let (verb, doing, lead) = match write {
-                RefusedWrite::Create => ("create", "creating the room", "Manage Channels"),
-                RefusedWrite::Move => ("move", "moving the member into the room", "Move Members"),
+            let (verb, doing) = match write {
+                RefusedWrite::Create => ("create", "creating the room"),
+                RefusedWrite::Move => ("move", "moving the member into the room"),
             };
             if findings.is_empty() {
                 format!(
-                    "{verb} <#{channel_id}>: Discord refused {doing}; the bot needs {lead} (and View Channel and Connect) on <#{channel_id}> and its category, so check for a deny override"
+                    "{verb} <#{channel_id}>: Discord refused {doing}; the bot needs Manage Channels, Move Members, View Channel and Connect on <#{channel_id}>, so check for a deny override"
                 )
             } else {
                 let causes: Vec<String> = findings.iter().map(finding_clause).collect();

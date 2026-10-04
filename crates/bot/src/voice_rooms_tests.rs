@@ -297,6 +297,7 @@ struct Http {
     created_attributes: Mutex<Vec<RoomChannelAttributes>>,
     created_names: Mutex<Vec<String>>,
     companion_plans: Mutex<Vec<TextChannelPlan>>,
+    before_create: Option<Hook>,
     after_create: Option<Hook>,
     before_move: Option<Hook>,
     before_delete: Option<Hook>,
@@ -320,6 +321,7 @@ impl Http {
             created_attributes: Mutex::new(Vec::new()),
             created_names: Mutex::new(Vec::new()),
             companion_plans: Mutex::new(Vec::new()),
+            before_create: None,
             after_create: None,
             before_move: None,
             before_delete: None,
@@ -337,6 +339,9 @@ impl RoomWrites for Http {
         attributes: &RoomChannelAttributes,
         guard: WriteGuard,
     ) -> Result<Channel, RoomHttpError> {
+        if let Some(hook) = &self.before_create {
+            hook();
+        }
         if !guard() {
             return Err(RoomHttpError::Cancelled);
         }
@@ -709,6 +714,85 @@ async fn stale_move_guard_is_rechecked_after_transport_wait() {
         *trace.lock().unwrap(),
         ["create", "persist:500", "delete:500", "forget:500"]
     );
+    assert!(
+        worker.failures().is_empty(),
+        "a stale ticket is not a permission refusal"
+    );
+}
+
+#[tokio::test]
+async fn missing_permission_final_create_guard_records_the_lost_permission() {
+    let (live, store, mut http, trace) = fixture();
+    let shared = live.clone();
+    http.before_create = Some(Arc::new(move || {
+        shared.upsert_channel(channel_with_overwrites(
+            CREATOR,
+            2,
+            Some(CATEGORY),
+            json!([everyone_overwrite(Permissions::MANAGE_CHANNELS)]),
+        ));
+    }));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(
+        trace.lock().unwrap().is_empty(),
+        "the final guard prevents the create"
+    );
+    assert_eq!(
+        failure_line(worker.failures().back().expect("permission refusal")),
+        "create <#200>: Discord refused creating the room; the permission override on <#200> removes Manage Channels from the bot"
+    );
+    assert!(worker.send_notices(0).await);
+    assert!(sent(&worker)[0].1.contains("Manage Channels"));
+}
+
+#[tokio::test]
+async fn missing_permission_final_move_guard_records_the_lost_permission_and_compensates() {
+    let (live, store, mut http, trace) = fixture();
+    let shared = live.clone();
+    http.before_move = Some(Arc::new(move || {
+        shared.upsert_channel(channel_with_overwrites(
+            500,
+            2,
+            Some(CATEGORY),
+            json!([everyone_overwrite(Permissions::MOVE_MEMBERS)]),
+        ));
+    }));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    for time in 0..3 {
+        dispatch(&mut worker, time).await;
+    }
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "delete:500", "forget:500"]
+    );
+    assert_eq!(
+        failure_line(worker.failures().back().expect("permission refusal")),
+        "move <#500>: Discord refused moving the member into the room; the permission override on <#500> removes Move Members from the bot"
+    );
+    assert!(worker.send_notices(0).await);
+    assert!(sent(&worker)[0].1.contains("<#500> removes Move Members"));
+}
+
+#[tokio::test]
+async fn stale_create_guard_stays_silent_even_when_permissions_also_change() {
+    let (live, store, mut http, trace) = fixture();
+    let shared = live.clone();
+    http.before_create = Some(Arc::new(move || {
+        shared.voice_update(MEMBER, None, None);
+        shared.refresh_bot(BotAccess {
+            roles: vec![role(Permissions::empty())],
+            ..notice_bot(None)
+        });
+    }));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.failures().is_empty());
+    assert!(!worker.send_notices(0).await);
 }
 
 #[tokio::test]
@@ -4469,6 +4553,10 @@ fn everyone_overwrite(deny: Permissions) -> serde_json::Value {
     json!({ "id": GUILD.to_string(), "type": 0, "allow": "0", "deny": deny.bits().to_string() })
 }
 
+fn bot_overwrite(allow: Permissions, deny: Permissions) -> serde_json::Value {
+    json!({ "id": "999", "type": 1, "allow": allow.bits().to_string(), "deny": deny.bits().to_string() })
+}
+
 #[test]
 fn health_check_is_clean_when_every_level_grants_the_four_permissions() {
     let live = health_guild(permissions(), vec![], vec![]);
@@ -4565,23 +4653,21 @@ async fn health_worker(
 
 #[tokio::test]
 async fn missing_permission_create_names_manage_channels_and_the_category_override() {
-    // The cache cannot see the category override on the creator, so the
-    // create goes out and Discord answers 403; the health check attributes it.
+    // A bot-member deny survives copying the category and the bot's grant;
+    // diagnose those final rows, not the healthy unsynced creator.
     let (mut worker, trace) = health_worker(
         permissions(),
-        vec![everyone_overwrite(Permissions::MANAGE_CHANNELS)],
+        vec![bot_overwrite(
+            Permissions::empty(),
+            Permissions::MANAGE_CHANNELS,
+        )],
         vec![],
     )
     .await;
-    worker
-        .http
-        .create_errors
-        .lock()
-        .unwrap()
-        .push_back(RoomHttpError::AccessDenied);
+    worker.creators.get_mut(&CREATOR).unwrap().permission_source = PermissionSource::Category;
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
-    assert_eq!(*trace.lock().unwrap(), ["create"]);
+    assert!(trace.lock().unwrap().is_empty());
     let failure = worker.failures().back().expect("a recorded failure");
     assert_eq!(
         failure_line(failure),
@@ -4590,6 +4676,35 @@ async fn missing_permission_create_names_manage_channels_and_the_category_overri
     let notice = notice_text(failure, DetailLevel::Full);
     assert!(notice.contains("removes Manage Channels from the bot"));
     assert!(notice.contains("Run /setup"));
+}
+
+#[tokio::test]
+async fn missing_permission_default_brief_notice_names_permission_and_override() {
+    let (mut worker, _) = health_worker(
+        permissions(),
+        vec![bot_overwrite(
+            Permissions::empty(),
+            Permissions::MANAGE_CHANNELS,
+        )],
+        vec![],
+    )
+    .await;
+    worker.creators.get_mut(&CREATOR).unwrap().permission_source = PermissionSource::Category;
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        worker.store.logging.lock().unwrap().level,
+        DetailLevel::Brief
+    );
+    assert!(worker.send_notices(0).await);
+    let notices = sent(&worker);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].0, NoticeTarget::DirectMessage(OWNER));
+    assert!(notices[0]
+        .1
+        .contains("category <#400> removes Manage Channels"));
+    assert!(notices[0].1.contains("/setup"));
+    assert!(notices[0].1.chars().count() <= NOTICE_MAX_CHARS);
 }
 
 #[tokio::test]
@@ -4678,7 +4793,7 @@ async fn missing_permission_unexplained_create_403_still_names_manage_channels()
     assert_eq!(*trace.lock().unwrap(), ["create"]);
     assert_eq!(
         failure_line(worker.failures().back().unwrap()),
-        "create <#200>: Discord refused creating the room; the bot needs Manage Channels (and View Channel and Connect) on <#200> and its category, so check for a deny override"
+        "create <#200>: Discord refused creating the room; the bot needs Manage Channels, Move Members, View Channel and Connect on <#200>, so check for a deny override"
     );
 }
 
@@ -4699,7 +4814,7 @@ async fn missing_permission_move_names_move_members() {
     );
     assert_eq!(
         failure_line(worker.failures().back().unwrap()),
-        "move <#500>: Discord refused moving the member into the room; the bot needs Move Members (and View Channel and Connect) on <#500> and its category, so check for a deny override"
+        "move <#500>: Discord refused moving the member into the room; the bot needs Manage Channels, Move Members, View Channel and Connect on <#500>, so check for a deny override"
     );
 }
 
@@ -4718,6 +4833,104 @@ async fn missing_permission_move_names_the_room_override_when_the_cache_knows_it
         failure_line(worker.failures().back().unwrap()),
         "move <#500>: Discord refused moving the member into the room; the permission override on <#500> removes Move Members from the bot"
     );
+}
+
+#[tokio::test]
+async fn missing_permission_connect_is_not_hidden_by_an_unrelated_manage_roles_gap() {
+    for (base, category, creator, cause) in [
+        (
+            permissions() - Permissions::CONNECT - Permissions::MANAGE_ROLES,
+            vec![],
+            vec![],
+            "the bot lacks Connect for the whole server",
+        ),
+        (
+            permissions() - Permissions::MANAGE_ROLES,
+            vec![],
+            vec![everyone_overwrite(Permissions::CONNECT)],
+            "the permission override on <#200> removes Connect from the bot",
+        ),
+        (
+            permissions() - Permissions::MANAGE_ROLES,
+            vec![everyone_overwrite(Permissions::CONNECT)],
+            vec![],
+            "the permission override on category <#400> removes Connect from the bot",
+        ),
+    ] {
+        let (mut worker, trace) = health_worker(base, category, creator).await;
+        join(&mut worker, MEMBER);
+        dispatch(&mut worker, 0).await;
+        assert!(trace.lock().unwrap().is_empty());
+        let line = failure_line(worker.failures().back().expect("Connect refusal"));
+        assert_eq!(
+            line,
+            format!("create <#200>: Discord refused creating the room; {cause}")
+        );
+        assert!(!line.contains("Manage Roles"));
+        assert!(worker.send_notices(0).await);
+        assert!(sent(&worker)[0].1.contains(cause));
+    }
+}
+
+#[tokio::test]
+async fn missing_permission_chosen_source_refusal_names_source_in_setup_and_notice() {
+    const SOURCE: u64 = 850;
+    for allow in [Permissions::empty(), Permissions::CONNECT] {
+        let (live, store, http, trace) = fixture();
+        live.upsert_channel(channel_with_overwrites(
+            SOURCE,
+            2,
+            None,
+            json!([bot_overwrite(allow, Permissions::CONNECT)]),
+        ));
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        let settings = worker.creators.get_mut(&CREATOR).unwrap();
+        settings.permission_source = PermissionSource::Channel(SOURCE);
+        settings.permission_channel_id = Some(SOURCE);
+        join(&mut worker, MEMBER);
+        dispatch(&mut worker, 0).await;
+        assert!(
+            trace.lock().unwrap().is_empty(),
+            "refused plans send no create"
+        );
+        let failure = worker.failures().back().unwrap();
+        assert_eq!(
+            *failure,
+            LifecycleFailure::MissingPermission {
+                write: RefusedWrite::Create,
+                channel_id: CREATOR,
+                findings: vec![PermissionFinding {
+                    permission: VoicePermission::Connect,
+                    scope: VoicePermissionScope::Channel,
+                    category_id: None,
+                    channel_id: Some(SOURCE),
+                }],
+            }
+        );
+        let setup_line = failure_line(failure);
+        assert_eq!(setup_line, "create <#200>: Discord refused creating the room; the permission override on <#850> removes Connect from the bot");
+        assert!(!setup_line.contains("category <#400>"));
+        assert!(worker.send_notices(0).await);
+        assert!(sent(&worker)[0].1.contains("<#850> removes Connect"));
+        assert!(worker.http.created_names.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn missing_permission_unknown_source_is_not_a_fabricated_permission_gap() {
+    let (live, store, http, trace) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.creators.get_mut(&CREATOR).unwrap().permission_source = PermissionSource::Channel(850);
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        worker.failures().back(),
+        Some(&LifecycleFailure::Discord {
+            channel_id: 850,
+            error: RoomHttpError::NotFound,
+        })
+    );
+    assert!(trace.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -4755,6 +4968,73 @@ async fn filtering_worker(words: &[&str]) -> (GuildRoomWorker<Store, Http>, Trac
         .unwrap()
         .with_name_policy(Arc::new(fixture_policy(words)));
     (worker, trace)
+}
+
+fn policy_with_invalid_chat_setting(words: &str, key: &str, value: &str) -> AutomodPolicy {
+    let vars: HashMap<String, String> = [
+        ("TWO_AUTOMOD", "0"),
+        ("TWO_AUTOMOD_BAD_WORDS", words),
+        ("TWO_AUTOMOD_ALLOWED_DOMAINS", "Trusted.GG"),
+        (key, value),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+    .collect();
+    assert!(two_bot_core::AutomodConfig::from_map(&vars).is_err());
+    AutomodPolicy::name_policy_from_map(&vars)
+}
+
+#[tokio::test]
+async fn name_filter_preserves_words_with_invalid_chat_config_on_both_create_paths() {
+    for (key, value) in [
+        ("TWO_AUTOMOD_REPEAT_COUNT", "21"),
+        ("TWO_AUTOMOD_SANCTIONS", "1:banhammer"),
+    ] {
+        let policy = policy_with_invalid_chat_setting(" ＢＬＯＲＰ ", key, value);
+        let (live, store, http, _) = fixture();
+        let mut worker = GuildRoomWorker::load(live, store, http)
+            .await
+            .unwrap()
+            .with_name_policy(Arc::new(policy.clone()));
+        assert!(join_as(&mut worker, MEMBER, "Blorp"));
+        dispatch(&mut worker, 0).await;
+        assert_eq!(*worker.http.created_names.lock().unwrap(), ["'s room"]);
+
+        let trace = Trace::default();
+        let runtime = test_runtime(trace.clone()).with_name_policy(policy);
+        let interaction = voice_interaction(
+            Some(command_data(
+                "create",
+                vec![command_option("name", "blorp lobby")],
+            )),
+            Some(Permissions::MANAGE_CHANNELS),
+            true,
+        );
+        let (owned, response) = handle_capture(&runtime, &interaction).await;
+        assert!(owned);
+        assert!(response_text(response.as_ref().unwrap()).contains("not allowed"));
+        assert!(
+            trace.lock().unwrap().is_empty(),
+            "a blocked /create sends no REST call"
+        );
+    }
+}
+
+#[tokio::test]
+async fn name_filter_invalid_chat_config_does_not_unblock_the_bare_template() {
+    let (live, store, http, trace) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http)
+        .await
+        .unwrap()
+        .with_name_policy(Arc::new(policy_with_invalid_chat_setting(
+            "room",
+            "TWO_AUTOMOD_REPEAT_COUNT",
+            "21",
+        )));
+    assert!(!join_as(&mut worker, MEMBER, "Ava"));
+    assert!(!worker.dispatch_one(0).await);
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(failure_line(worker.failures().back().unwrap()).contains("name_blocked"));
 }
 
 #[tokio::test]
@@ -4815,6 +5095,29 @@ async fn name_filter_refuses_a_blocked_bare_template_and_never_creates() {
     // The reason carries the stable audit string and never the member's name.
     assert!(!failure_line(failure).contains("Ava"));
     assert_eq!(NAME_BLOCKED_AUDIT_REASON, "name_blocked");
+}
+
+#[tokio::test]
+async fn name_filter_default_brief_notice_names_refusal_and_preserves_logging_limits() {
+    let (mut worker, _) = filtering_worker(&["room"]).await;
+    assert!(!join_as(&mut worker, MEMBER, "Ava"));
+    worker.store.logging.lock().unwrap().level = DetailLevel::Off;
+    assert!(!worker.send_notices(0).await);
+    assert!(sent(&worker).is_empty());
+
+    *worker.store.logging.lock().unwrap() = LoggingSettings::default();
+    for step in 1..=3 {
+        assert!(worker.send_notices(step * NOTICE_REPEAT_INTERVAL_MS).await);
+        let notices = sent(&worker);
+        assert_eq!(notices.len(), step as usize);
+        let text = &notices.last().unwrap().1;
+        assert!(text.contains("name_blocked"));
+        assert!(text.contains("bad words"));
+        assert!(!text.contains("Ava"));
+        assert!(text.chars().count() <= NOTICE_MAX_CHARS);
+    }
+    assert!(!worker.send_notices(4 * NOTICE_REPEAT_INTERVAL_MS).await);
+    assert!(worker.http.created_names.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

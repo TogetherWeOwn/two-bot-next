@@ -69,8 +69,20 @@ without the username; a blocked bare template queues nothing, so no Discord
 create call is made, and the worker records the refusal as `name_blocked` in
 its failure list. That list feeds the operator error notice and the `/setup`
 failure line; it carries only the stable reason and the blocking filter,
-never the member's name. `/create` names run through `filter_channel_name`
-under the same policy before the REST call.
+never the member's name. Default Brief notices include the bounded `name_blocked`
+cause or the missing permission and known override, not just a link to `/setup`.
+Logging Off still sends nothing; existing notice size and repeat bounds apply.
+`/create` names run through `filter_channel_name` under the same policy before
+the REST call.
+
+Join-time permission diagnostics use the actual create/move requirements,
+including Connect, rather than treating generic permission health as the cause.
+Planning refusals capture the final normalized/post-grant overrides and their
+configured inheritance source. Category-sync checks instead name the actual
+parent category, and a private default that requires Manage Roles says so.
+The send-time guard retains permission-loss evidence before refusing the write;
+a stale ticket, lost authoritative snapshot or member who left stays a silent
+cancellation. Move compensation, logging limits and write guards are unchanged.
 
 ## Residual parent work
 
