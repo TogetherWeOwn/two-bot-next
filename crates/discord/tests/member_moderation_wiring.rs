@@ -100,8 +100,13 @@ async fn kick_completes_gone_member() {
 
 #[tokio::test]
 async fn timeout_patches_communication_disabled_until() {
+    // The executor treats the PATCHed member object as the effect receipt, so
+    // a 200 without a member id is an uncertain outcome, not a completion.
     let mock = MockRest::start(
-        vec![ScriptedResponse::status(200)],
+        vec![ScriptedResponse::json(
+            200,
+            serde_json::json!({"user": {"id": USER}}),
+        )],
         ScriptedResponse::status(500),
     )
     .await;
