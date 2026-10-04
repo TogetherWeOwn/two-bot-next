@@ -83,11 +83,14 @@ fuzz_target!(|data: &[u8]| {
 
     let text = String::from_utf8_lossy(data);
     let mut fields = text.splitn(4, '\n');
+    // Fall back to fuzzer-derived input, never a constant: a hardcoded nonce
+    // both trips the nonce-reuse scanner and wastes the fuzzer on one value.
+    let fuzzer_nonce: &str = &text;
     check_request(
         &AuthHeaders {
             key_id: fields.next().unwrap_or(""),
             timestamp: fields.next().unwrap_or(""),
-            nonce: fields.next().unwrap_or(""),
+            nonce: fields.next().unwrap_or(fuzzer_nonce),
             signature: fields.next().unwrap_or(""),
         },
         data,
