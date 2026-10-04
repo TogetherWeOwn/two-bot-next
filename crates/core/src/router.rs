@@ -53,6 +53,7 @@
 pub mod replies;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use super::command_permissions::command_permission;
 use super::commands::{
@@ -63,6 +64,15 @@ use super::feature_commands::{
 };
 use super::moderation::{ModerationAction, ModerationGates};
 use super::onboarding::{GAME_SELECT_ID, SESSION_SELECT_ID};
+use super::voice_assistant::assistant_commands;
+use super::voice_rooms::voice_commands;
+
+/// Names of the voice command set, computed once: the router consults them on
+/// every slash dispatch while `TWO_VOICE=1`.
+fn voice_command_names() -> &'static HashSet<String> {
+    static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
+    NAMES.get_or_init(|| voice_commands().into_iter().map(|def| def.name).collect())
+}
 
 // --- component ids (legacy exact) --------------------------------------------
 
@@ -163,6 +173,14 @@ pub struct RouterGates {
     pub announcements: bool,
     /// `TWO_MODERATION=1` — moderation commands (#3–#11).
     pub moderation: bool,
+    /// `TWO_VOICE=1` — the temporary-voice command set. Merged after
+    /// moderation, so the voice `kick` loses first-wins to moderation
+    /// `/kick`; the bot-crate voice sink answers every voice name, so the
+    /// router yields silently for them.
+    pub voice: bool,
+    /// Assistant endpoint configured (`TWO_ASSISTANT_ENDPOINT`). Publishes
+    /// `/templateassistant`, and only while `voice` is also on.
+    pub voice_assistant: bool,
     /// Ticket env triple set (category + staff role + panel channel).
     pub tickets: bool,
     /// Non-empty self-role panel catalogue (`TWO_SELF_ROLE_PANELS`).
@@ -181,6 +199,10 @@ pub struct RouterGates {
 pub struct SurfaceFlags {
     /// `TWO_COMMUNITY_SCORECARD=1` — scorecard `attendance` (#12).
     pub scorecard: bool,
+    /// `TWO_VOICE=1` — the temporary-voice command set.
+    pub voice: bool,
+    /// Assistant endpoint configured (`TWO_ASSISTANT_ENDPOINT`).
+    pub voice_assistant: bool,
     /// Ticket env triple set (category + staff role + panel channel).
     pub tickets: bool,
     /// Non-empty self-role panel catalogue (`TWO_SELF_ROLE_PANELS`).
@@ -206,6 +228,8 @@ impl RouterGates {
             automations: features.automations,
             announcements: features.announcements,
             moderation: moderation.enabled,
+            voice: surfaces.voice,
+            voice_assistant: surfaces.voice_assistant,
             tickets: surfaces.tickets,
             self_roles: surfaces.self_roles,
             onboarding_picker: surfaces.onboarding_picker,
@@ -369,6 +393,14 @@ impl InteractionRouter {
         // the publish merge).
         if let Some(outcome) = self.route_builtin(ctx.name, ctx.guild_id, ctx.actor_permissions) {
             return outcome;
+        }
+        // Voice names belong to the bot-crate voice sink, which answers every
+        // one exactly once. Yield silently so the shared runtime never adds an
+        // unknown-command reply (or runs a same-named custom row) on top. Only
+        // while `TWO_VOICE=1`: with the gate off nothing is published and the
+        // names stay free for custom commands.
+        if self.gates.voice && voice_command_names().contains(ctx.name) {
+            return SlashOutcome::Ignore;
         }
         // Dynamic DB-backed custom commands (#22): everyone while automations
         // are on; explicit refusal while off. Missing/disabled rows in the
@@ -611,10 +643,24 @@ impl InteractionRouter {
             .collect()
     }
 
+    /// Builtin names plus the voice names while `TWO_VOICE=1`: a published
+    /// voice command shadows a same-named custom row exactly like a builtin
+    /// (dispatch yields to the voice sink above), but with the gate off the
+    /// names stay free for custom commands.
+    fn reserved_names(&self) -> HashSet<String> {
+        let mut reserved = Self::all_builtin_names();
+        if self.gates.voice {
+            reserved.extend(voice_command_names().iter().cloned());
+        }
+        reserved
+    }
+
     /// Assemble the ONE complete guild command set for publish-on-ready
     /// (legacy `CommandRegistry::sync` order: community, automation,
-    /// announcement, moderation — then DB custom commands). First-wins dedupe
-    /// and the 100-command ceiling come from `merge_commands`.
+    /// announcement, moderation, then the voice set and `/templateassistant`
+    /// — then DB custom commands). First-wins dedupe and the 100-command
+    /// ceiling come from `merge_commands`; voice `kick` loses to moderation
+    /// `/kick` there.
     ///
     /// Two publish/routing agreements keep a published command executable:
     /// - custom rows publish only while automations are on. Every custom
@@ -628,7 +674,7 @@ impl InteractionRouter {
         &self,
         custom: &[CustomCommand],
     ) -> Result<Vec<CommandDefinition>, RegistryError> {
-        let mut extra: Vec<Vec<CommandDefinition>> = Vec::with_capacity(4);
+        let mut extra: Vec<Vec<CommandDefinition>> = Vec::with_capacity(6);
         if self.gates.scorecard {
             extra.push(vec![scorecard_attendance_command()]);
         }
@@ -641,11 +687,17 @@ impl InteractionRouter {
         if self.gates.moderation {
             extra.push(super::moderation::moderation_commands());
         }
+        if self.gates.voice {
+            extra.push(voice_commands());
+            if self.gates.voice_assistant {
+                extra.push(assistant_commands());
+            }
+        }
         // `merge_commands` reserves the active builtins; the router additionally
         // withholds disabled builtin names (same precedence as dispatch) and
         // all custom rows while automations are off. `merge_commands` still
         // applies its enabled/dedupe/ceiling rules on top.
-        let reserved = Self::all_builtin_names();
+        let reserved = self.reserved_names();
         let visible: Vec<CustomCommand> = if self.gates.automations {
             custom
                 .iter()
@@ -674,6 +726,8 @@ mod tests {
             automations: true,
             announcements: true,
             moderation: true,
+            voice: false,
+            voice_assistant: false,
             tickets: true,
             self_roles: true,
             onboarding_picker: true,

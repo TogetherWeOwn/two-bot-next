@@ -265,6 +265,8 @@ fn gates(automations: bool, announcements: bool) -> RouterGates {
         automations,
         announcements,
         moderation: false,
+        voice: false,
+        voice_assistant: false,
         tickets: false,
         self_roles: false,
         onboarding_picker: false,
@@ -760,6 +762,7 @@ async fn activation_boot_from_env_fixture() {
             dry_run: false,
         },
         &activation,
+        false,
     );
     if expected == "invalid" {
         assert!(

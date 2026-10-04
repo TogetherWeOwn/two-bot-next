@@ -386,6 +386,7 @@ async fn main() {
                         self_roles,
                         gates,
                         &activation,
+                        voice.is_some(),
                     );
                     if let Some(runtime) = &runtime {
                         let config = gateway_commands::GatewayCommandConfig::from_map(

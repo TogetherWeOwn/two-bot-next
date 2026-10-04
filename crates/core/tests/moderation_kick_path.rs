@@ -51,6 +51,8 @@ fn router() -> InteractionRouter {
         automations: true,
         announcements: true,
         moderation: true,
+        voice: false,
+        voice_assistant: false,
         tickets: true,
         self_roles: true,
         onboarding_picker: true,
