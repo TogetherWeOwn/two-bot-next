@@ -2,7 +2,7 @@
 //!
 //! Executes `moderation.ban`, `moderation.tempban`, `moderation.kick`,
 //! `moderation.timeout` and `moderation.warn` through the shared
-//! [`MemberModerationService`](two_bot_core::member_moderation::MemberModerationService),
+//! [`MemberModerationService`],
 //! so the durable ledger rows are identical whether the action was triggered
 //! by a slash command or by the website. The receiver must authorize the
 //! internal request (HMAC, allowlist, nonce/replay rules), parse its body with

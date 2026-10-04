@@ -418,7 +418,8 @@ It refuses (exit 2, before any DDL) when the binding is absent, the target does
 not equal the pinned staging host/database inputs, either pin is empty or looks
 like production, either host pin or the binding host is a pooler endpoint
 (session `SET ROLE` and the migrator lock need the direct endpoint), the login
-cannot assume `two_bot_migrator`, a reference is missing, `--apply` has no
+cannot assume `two_bot_migrator` (apply) or `two_bot_migrator_ro` (plan), the
+plan login also holds `two_bot_migrator`, a reference is missing, `--apply` has no
 `--expected-pending` or it mismatches, `--apply` has no `plan_manifest_sha256`/
 `plan_run_id` or the hash does not match the recomputed manifest, `--apply`
 has no producing-run manifest or that manifest does not carry the bound hash,
@@ -446,7 +447,11 @@ the secrets: create both before dispatch, or the jobs fail instead of running.
 
 Prerequisites the legitimate principal must verify **before dispatch** (the
 runner cannot, and this change does not claim them): the real staging Neon
-identity; that the dedicated migrator binding already exists; the
+identity; that both dedicated bindings already exist, each in its own
+environment: `TWO_BOT_STAGING_PLAN_DATABASE_URL` (a login holding only
+`two_bot_migrator_ro`) in `staging-migrate-plan` for the `plan` job, and
+`TWO_BOT_STAGING_MIGRATOR_DATABASE_URL` in `staging-migrate-apply` for the
+`apply` job, since the two jobs never share a credential; the
 `staging-migrate-plan` / `staging-migrate-apply` environment protections
 above; and a complete
 recovery set covering the Next schema, `_sqlx_migrations` ledger, object
@@ -455,6 +460,17 @@ SQLx history, and unverified Neon PITR is not a working recovery. Apply the
 reviewed ACL sequence in `docs/database-roles.md` so other shared-database
 services keep their access. Real SQLx proof runs only against disposable CI
 services (`crates/cutover/tests/staging_migrate_db.rs`).
+
+The plan login must hold only `two_bot_migrator_ro`: `--plan` refuses, before it
+reads the ledger, when the login is a member of `two_bot_migrator` (directly,
+by inheritance, or as a superuser), and the refusal names the role and never
+the login or the URL. The `source_sha` input picks the commit whose runner is
+built, while the plan/apply split itself comes from the workflow on `main`. A
+plan dispatched with a `source_sha` older than `3d1e2ddd` therefore builds the
+pre-split runner, which looks for `TWO_BOT_STAGING_MIGRATOR_DATABASE_URL`; the
+`plan` job never exports that binding, so the old runner refuses before any
+connection (fail closed). Dispatch plan and apply with a `source_sha` at or
+after the split.
 
 ### Redeploy the approved revision
 

@@ -2310,18 +2310,20 @@
           "[681dc29](https://github.com/TogetherWeOwn/two-bot/commit/681dc291bca04c91b0e0631dea962ccf30ea5aa5)",
           "`src/tempVoice/`",
           "TOG-3052: mutation harness proving the delete guards are real",
-          "ported"
+          "carded"
         ]
       },
       "owner": [
+        "TOG-15672",
         "TOG-10119"
       ],
-      "status": "automated",
-      "action": "Run the delete-guard pins in `crates/bot/src/voice_rooms_tests.rs`: untracked channels, occupied rooms and refused deletes.",
-      "expected": "A channel without a tracked row is never deleted; an occupied room, or one that gains an occupant before the write, is never deleted; a refused delete is not retried in a storm. No mutation harness runs in CI: the guards were mutation-checked by hand (see the ledger row).",
-      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
+      "status": "waived",
+      "action": "Run the TOG-15672 offline worker guard fixtures for protected Lobby/generator/category IDs even with tracked provenance, and ordinary-sweep human-empty grace; retain the existing untracked-channel, readiness, human-occupancy and 403 pins.",
+      "expected": "Protected IDs get zero delete writes even when tracked. Human occupancy, including unknown bot status, blocks deletion; bot-only cleanup is permitted. Ordinary empty rooms are not deleted before their grace deadline and human rejoin resets it. Existing pins cover only part of the six legacy guards; prior hand mutations of occupancy/provenance are not a CI mutation harness or complete parity proof.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
-      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- untracked_live_channels_enqueue_zero_deletes reconnect_only_prunes_tracked_empty_channels_and_counts_unknown_members_as_human occupants_arriving_during_delete_backoff_cancel_the_write not_ready_and_disconnected_snapshots_never_allow_destructive_reconciliation sink_join_during_awaited_delete_preserves_occupied_room delete_403_suspends_without_a_retry_storm_and_refresh_resumes"
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s13-287d00e",
@@ -2404,8 +2406,8 @@
         "TOG-10119"
       ],
       "status": "waived",
-      "action": "Run the TOG-15334 worker pin: fail a create’s persist, then refuse its rollback delete.",
-      "expected": "The room keeps its provenance so a later sweep removes it; no unmanaged orphan channel.",
+      "action": "Run the TOG-15334 worker and disposable-database recovery fixtures: fail create persistence and refuse rollback delete, then restart an independent worker/store, retry attachment and perform a later guarded sweep.",
+      "expected": "Durable channel provenance and cap accounting survive worker/store restart until guarded delete or verified 404. Attachment failure is retryable; missing-channel cleanup releases the exact witness/slot. Same-worker tracking alone is insufficient and must not promote this row; no unmanaged orphan may be lost on restart.",
       "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
       "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
@@ -2579,17 +2581,20 @@
           "[edaf2dd](https://github.com/TogetherWeOwn/two-bot/commit/edaf2dd930c7bcb22b4f02e5f9f112b5ab420577)",
           "`src/analytics/`, `src/core/`",
           "TOG-5684: enforce startKnown:false exclusion from duration averages",
-          "ported"
+          "carded"
         ]
       },
       "owner": [
+        "TOG-15675",
         "TOG-15338"
       ],
-      "status": "automated",
-      "action": "Run the duration-average pin in `crates/core/src/voice.rs`.",
-      "expected": "Averages exclude startKnown:false sessions; those sessions are still counted as unknown. Library level only: no report consumes the average yet.",
-      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
-      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib -- voice::tests::averages_filter_on_flag_not_null"
+      "status": "waived",
+      "action": "Run the TOG-15675 duration-average fixture with unequal known/unknown durations and metadata numeric-string/malformed inputs; consumer ownership remains TOG-15338.",
+      "expected": "The average excludes unknown starts even when their numeric duration differs from known rows; counts remain correct. Pin numeric-string metadata parity or an independently accepted parsing divergence. The existing equal-duration primitive fixture does not distinguish average exclusion, and no report consumer is merged yet.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
     },
     {
       "id": "s13-59965d0",
@@ -2775,11 +2780,11 @@
         "TOG-15338"
       ],
       "status": "automated",
-      "action": "Run the open-half reconcile pins in `crates/core/tests` and the cutover reconcile unit tests.",
-      "expected": "Every open-half session is reported with its explicit reason or resolution; nothing is repaired. The read-only CLI check is DB-backed and runs in CI.",
+      "action": "Run the open-half reconcile pins in `crates/core/tests` and the cutover reconcile unit tests. Require exported TWO_TEST_DATABASE_URL for the authorized disposable agent-testdb/CI target before the CLI step; its test guard validates the target. No application, staging or production database.",
+      "expected": "Every open-half session is reported with its explicit reason or resolution; nothing is repaired. The read-only CLI check is DB-backed and runs in CI. The verification chain fails if the CLI opt-in is absent or not exported; a silently skipped CLI test is not PASS.",
       "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
-      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_integrity_acceptance --test voice_reconcile_retirement && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib -- voice_reconcile::tests::second_start_supersedes_the_first && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli -- voice_reconcile_matches_legacy_fixtures_read_only"
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_integrity_acceptance --test voice_reconcile_retirement && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib -- voice_reconcile::tests::second_start_supersedes_the_first && python3 -c 'import os,sys; sys.exit(0 if os.environ.get(\"TWO_TEST_DATABASE_URL\") else \"export TWO_TEST_DATABASE_URL for the authorized disposable test database\")' && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli -- voice_reconcile_matches_legacy_fixtures_read_only"
     },
     {
       "id": "s13-860557f",
@@ -2999,18 +3004,20 @@
           "[7587037](https://github.com/TogetherWeOwn/two-bot/commit/758703733ee2b0227e0440a39be67b71e26699ac)",
           "`src/tempVoice/`",
           "fix(temp-voice): stop conferring ManageRoles on channel create (#314)",
-          "ported"
+          "carded"
         ]
       },
       "owner": [
+        "TOG-15673",
         "TOG-10119"
       ],
-      "status": "automated",
-      "action": "Run the owner-override permission pins in `crates/core/tests/voice_permissions.rs` and the bot create-request tests.",
-      "expected": "The owner overwrite grants room controls but never Manage Roles or Administrator, and a bot without Manage Roles creates the room with no overwrites.",
-      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
+      "status": "waived",
+      "action": "Run the TOG-15673 property and actual create-request fixtures with inherited Manage Roles allows on bot, owner, role and other member overwrites; retain the existing added-owner-grant pins.",
+      "expected": "No create-time allow confers Manage Roles on any overwrite. Current fixtures constrain newly added owner grants, not inherited allows. Without bot Manage Roles, only public rooms may use the no-overwrite category-sync fallback; private defaults must be refused before creation, never made public.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
-      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_permissions && python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- owner_override_is_included_at_creation_and_never_escalates created_rooms_carry_the_owner_override_and_a_placement_from_the_start lacking_manage_roles_creates_without_overrides_so_the_room_syncs_to_its_category"
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s13-cad94b6",
@@ -3212,10 +3219,10 @@
         "TOG-15338"
       ],
       "status": "automated",
-      "action": "Run the leave-gap sweep pins in `crates/cutover/src/leave_gap.rs` and `crates/core/tests/voice_integrity_acceptance.rs`.",
-      "expected": "Each gap is classified and reported with proposed fills only; nothing is backfilled. The read-only CLI check is DB-backed and runs in CI.",
+      "action": "Run the leave-gap sweep pins in `crates/cutover/src/leave_gap.rs` and `crates/core/tests/voice_integrity_acceptance.rs`. Require exported TWO_TEST_DATABASE_URL for the authorized disposable agent-testdb/CI target before the CLI step; its test guard validates the target. No application, staging or production database.",
+      "expected": "Each gap is classified and reported with proposed fills only; nothing is backfilled. The read-only CLI check is DB-backed and runs in CI. The verification chain fails if the CLI opt-in is absent or not exported; a silently skipped CLI test is not PASS.",
       "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
-      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib -- leave_gap::tests::seeded_gaps_cover_every_path && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_integrity_acceptance && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli -- leave_gap_matches_legacy_fixtures_read_only"
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib -- leave_gap::tests::seeded_gaps_cover_every_path && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_integrity_acceptance && python3 -c 'import os,sys; sys.exit(0 if os.environ.get(\"TWO_TEST_DATABASE_URL\") else \"export TWO_TEST_DATABASE_URL for the authorized disposable test database\")' && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli -- leave_gap_matches_legacy_fixtures_read_only"
     },
     {
       "id": "s13-f5e62b7",
@@ -3365,18 +3372,20 @@
           "[cc27351](https://github.com/TogetherWeOwn/two-bot/commit/cc27351da5c7946fe1652ff697fbdabb6bbed029)",
           "`src/tempVoice/`",
           "fix(tempvoice): isolate per-channel sweep failures (#393)",
-          "ported"
+          "carded"
         ]
       },
       "owner": [
+        "TOG-15674",
         "TOG-10119"
       ],
-      "status": "automated",
-      "action": "Run the refused-delete sweep pins in `crates/bot/src/voice_rooms_tests.rs`.",
-      "expected": "With two empty tracked rooms and one delete refused (403), the other room is still deleted and forgotten, only the refused room stays tracked, and exactly one failure is recorded for it. Transient failures keep the ordered guild lane (backoff, dead-letter after 10 attempts).",
-      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
+      "status": "waived",
+      "action": "Run the TOG-15674 offline worker sweep fixture with a transient failure on one empty tracked room and another eligible room; retain the 403-isolation test added in this ledger pass.",
+      "expected": "Other eligible channels progress despite a failed channel while same-channel order, one in-flight guild write, guarded deletes and bounded retries remain intact. The new test proves 403 isolation only. Current transient backoff holds the guild lane until retry/dead-letter; generic per-channel isolation remains open, not an accepted divergence.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
-      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- one_rooms_refused_delete_does_not_stop_the_sweep_of_other_empty_rooms delete_403_suspends_without_a_retry_storm_and_refresh_resumes && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib -- queue_suspends_without_retry_storms_and_drops_forgotten_rooms backoff_preserves_lifecycle_order queue_dead_letters_after_max_attempts"
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s13-d3d9afe",
