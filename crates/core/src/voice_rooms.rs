@@ -740,11 +740,12 @@ pub enum RoomAction {
     DeleteRoom {
         channel_id: Snowflake,
     },
-    /// V2 caretaker succession: persist an ownership handoff the worker
-    /// already applied to its tracked row. No Discord write; rename, privacy
-    /// and Join-channel follow-ups belong to later slices.
+    /// Rewrite the room-scoped owner grant, then persist the handoff.
+    /// Keep the previous owner even for stale handoffs so rapid transfers
+    /// cannot strand a former owner's grant.
     UpdateOwnership {
         channel_id: Snowflake,
+        previous_owner_id: Snowflake,
         owner_id: Snowflake,
         original_creator_id: Snowflake,
     },
@@ -1723,6 +1724,7 @@ mod tests {
             GUILD,
             RoomAction::UpdateOwnership {
                 channel_id: 501,
+                previous_owner_id: 301,
                 owner_id: MEMBER,
                 original_creator_id: MEMBER,
             },
@@ -1735,6 +1737,7 @@ mod tests {
             }),
             Some(RoomAction::UpdateOwnership {
                 channel_id: 501,
+                previous_owner_id: 301,
                 owner_id: MEMBER,
                 original_creator_id: MEMBER,
             })
@@ -1745,6 +1748,7 @@ mod tests {
             GUILD,
             RoomAction::UpdateOwnership {
                 channel_id: 502,
+                previous_owner_id: 301,
                 owner_id: MEMBER,
                 original_creator_id: MEMBER,
             },

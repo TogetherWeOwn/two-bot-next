@@ -4,8 +4,14 @@ Owner priority (2026-09-29): full temporary voice-room support in two-bot-next,
 built from this behaviour spec. It is an original implementation: write it from
 this document only, and don't copy code from any other project.
 
-Commands are slash commands with ephemeral replies. "Admin" means the member has
-Manage Channels unless a row says otherwise. Room state and per-guild settings
+Commands are slash commands with ephemeral replies. "Admin" means the guild owner
+or a member with guild-level Manage Channels or Administrator role permissions,
+unless a row says otherwise. Interaction `member.permissions` includes source-channel
+overwrites and is never an admin credential: owning a room does not authorize
+another room or guild-wide settings. Missing guild-role snapshots fail closed.
+See [Discord's member definition](https://docs.discord.com/developers/resources/guild#guild-member-object)
+and [base permission calculation](https://docs.discord.com/developers/topics/permissions#permission-hierarchy).
+Room state and per-guild settings
 are stored in Postgres (sqlx, bot migration range 0001–0999). Tests never touch
 production; DB tests run on agent-testdb.
 
@@ -50,8 +56,14 @@ library code with no Discord dependency and can start immediately.
   still there. It also lets a member claim a room whose owner has left.
 - `/transfer member`: hands the room to a member who is in it. The recipient also
   becomes the original creator.
-- Owner-only commands refuse everyone else. Admins may use owner commands in any
-  room.
+- Owner-only commands refuse everyone else. Guild admins may use owner commands
+  in any tracked room; channel-scoped grants never provide that override.
+- Succession, reclaim and transfer queue a room-scoped overwrite rewrite before
+  persisting ownership. The former owner's owner-grant bits are removed and the
+  current owner's grant is installed; unrelated overwrites and denies remain.
+  Rapid transfers retain each prior owner for cleanup, and HTTP failures retry
+  through the bounded guild queue. Rooms created without Manage Roles stay
+  category-synced rather than gaining a grant the bot cannot write.
 - **Accept when:**
   - The caretaker is chosen by earliest join time.
   - `/transfer` rejects a target who is not in the room.

@@ -35,7 +35,7 @@ use twilight_model::{
             component::{ActionRow, Button, ButtonStyle, Component},
             AllowedMentions, MessageFlags,
         },
-        permission_overwrite::PermissionOverwriteType,
+        permission_overwrite::{PermissionOverwrite, PermissionOverwriteType},
         Channel, ChannelType,
     },
     guild::{Permissions, Role},
@@ -74,6 +74,7 @@ use two_bot_core::{
         decide_ownership, OwnershipDecision, OwnershipError, OwnershipRequest, RoomActor,
         RoomMember, RoomOwnership,
     },
+    voice_permissions::{OWNER_ALLOW_BITS, OWNER_EXTRA_MASK},
     voice_rooms::{
         category_full_message, is_usable_channel_name, voice_commands, ActionQueue, CreatorChannel,
         NewRoomSpec, PermissionSource, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction,
@@ -426,6 +427,16 @@ pub trait RoomWrites: Send + Sync {
         member: Snowflake,
         guard: WriteGuard,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// Replace one tracked room's overwrites after an ownership handoff.
+    fn update_overwrites(
+        &self,
+        channel: Snowflake,
+        overwrites: &[PermissionOverwrite],
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<Channel, RoomHttpError>> + Send {
+        let _ = (channel, overwrites, guard);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
     fn delete(
         &self,
         channel: Snowflake,
@@ -523,6 +534,16 @@ impl RoomWrites for RoomHttp {
         guard: WriteGuard,
     ) -> Result<(), RoomHttpError> {
         self.deny_member_connect(channel, member, move || guard())
+            .await
+    }
+
+    async fn update_overwrites(
+        &self,
+        channel: Snowflake,
+        overwrites: &[PermissionOverwrite],
+        guard: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        self.update_room_overwrites(channel, overwrites, move || guard())
             .await
     }
 
@@ -1523,6 +1544,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 return false;
             }
         };
+        let previous_owner_id = room.owner_id;
         let mut updated = room;
         updated.owner_id = next.owner_id;
         updated.original_creator_id = next.original_creator_id;
@@ -1531,6 +1553,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.live.guild_id,
             RoomAction::UpdateOwnership {
                 channel_id: channel,
+                previous_owner_id,
                 owner_id: next.owner_id,
                 original_creator_id: next.original_creator_id,
             },
@@ -1633,6 +1656,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             }
             Err(error) => return ownership_refusal(error),
         };
+        let previous_owner_id = room.owner_id;
         let mut updated = room;
         updated.owner_id = next.owner_id;
         updated.original_creator_id = next.original_creator_id;
@@ -1645,6 +1669,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.live.guild_id,
             RoomAction::UpdateOwnership {
                 channel_id: channel,
+                previous_owner_id,
                 owner_id: next.owner_id,
                 original_creator_id: next.original_creator_id,
             },
@@ -1658,6 +1683,90 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 format!("Transferred ownership of this room to <@{target_id}>.")
             }
         }
+    }
+
+    async fn rewrite_owner_grant(
+        &self,
+        channel_id: Snowflake,
+        previous_owner_id: Snowflake,
+        owner_id: Snowflake,
+    ) -> Result<(), RoomHttpError> {
+        let (overwrites, changed) = {
+            let live = self.live.inner.read().expect("live voice lock");
+            let channel = live
+                .channels
+                .get(&channel_id)
+                .ok_or(RoomHttpError::NotFound)?;
+            let current = channel
+                .permission_overwrites
+                .as_deref()
+                .ok_or(RoomHttpError::Cancelled)?;
+            let owner_mask = Permissions::from_bits_retain(OWNER_EXTRA_MASK);
+            let can_write = live
+                .permissions(self.live.guild_id, channel_id)
+                .is_some_and(|p| p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES));
+            if !can_write {
+                // Rooms created without Manage Roles are category-synced and
+                // have no bot-issued owner grant to move. Do not invent one.
+                if current.iter().any(|o| {
+                    o.kind == PermissionOverwriteType::Member
+                        && o.id.get() == previous_owner_id
+                        && o.allow.intersects(owner_mask)
+                }) {
+                    return Err(RoomHttpError::AccessDenied);
+                }
+                return Ok(());
+            }
+            let mut overwrites = current.to_vec();
+            if previous_owner_id != owner_id {
+                if let Some(old) = overwrites.iter_mut().find(|o| {
+                    o.kind == PermissionOverwriteType::Member && o.id.get() == previous_owner_id
+                }) {
+                    old.allow &= !owner_mask;
+                }
+            }
+            let owner_bits = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+            if let Some(owner) = overwrites
+                .iter_mut()
+                .find(|o| o.kind == PermissionOverwriteType::Member && o.id.get() == owner_id)
+            {
+                // Preserve independent denies, like creation-time inheritance.
+                owner.allow = (owner.allow | owner_bits) & !owner.deny;
+            } else {
+                overwrites.push(PermissionOverwrite {
+                    id: Id::new(owner_id),
+                    kind: PermissionOverwriteType::Member,
+                    allow: owner_bits,
+                    deny: Permissions::empty(),
+                });
+            }
+            let changed = overwrites != current;
+            (overwrites, changed)
+        };
+        if !changed {
+            return Ok(());
+        }
+        let live = self.live.clone();
+        let guard: WriteGuard = Arc::new(move || {
+            let state = live.inner.read().expect("live voice lock");
+            state.ready
+                && state
+                    .permissions(live.guild_id, channel_id)
+                    .is_some_and(|p| {
+                        p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES)
+                    })
+        });
+        let channel = self
+            .http
+            .update_overwrites(channel_id, &overwrites, guard)
+            .await?;
+        if channel.id.get() != channel_id
+            || channel.guild_id.map(Id::get) != Some(self.live.guild_id)
+        {
+            return Err(RoomHttpError::UnknownOutcome);
+        }
+        self.live.upsert_channel(channel);
+        Ok(())
     }
 
     pub fn propose_name(
@@ -2529,16 +2638,45 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             }
             RoomAction::UpdateOwnership {
                 channel_id,
+                previous_owner_id,
                 owner_id,
                 original_creator_id,
             } => {
-                // No Discord write: the worker row already carries this
-                // handoff. A stale action (a newer succession moved the row,
-                // or the room was forgotten) persists nothing.
                 let Some(room) = self.rooms.get(&channel_id).cloned() else {
                     self.queue.mark_succeeded(&action);
                     return true;
                 };
+                // Even a stale A -> B action must revoke A after B -> C.
+                // Always grant the current room owner, never a stale recipient.
+                if let Err(error) = self
+                    .rewrite_owner_grant(channel_id, previous_owner_id, room.owner_id)
+                    .await
+                {
+                    match error {
+                        RoomHttpError::RateLimited { retry_after_ms, .. } => {
+                            self.queue.mark_rate_limited(
+                                self.live.guild_id,
+                                retry_after_ms,
+                                elapsed_ms(now_ms, started),
+                                action,
+                            );
+                        }
+                        RoomHttpError::Unauthorized => {
+                            self.halted = true;
+                            self.record(LifecycleFailure::Discord { channel_id, error });
+                            self.queue.mark_succeeded(&action);
+                        }
+                        _ => {
+                            self.record(LifecycleFailure::Discord { channel_id, error });
+                            self.mark_failed_observed(
+                                action,
+                                "owner overwrite update unavailable".to_owned(),
+                                elapsed_ms(now_ms, started),
+                            );
+                        }
+                    }
+                    return true;
+                }
                 if room.owner_id != owner_id || room.original_creator_id != original_creator_id {
                     self.queue.mark_succeeded(&action);
                     return true;
@@ -3130,6 +3268,31 @@ where
             .get(&guild)
             .filter(|actor| !actor.tx.is_closed())
             .cloned()
+    }
+
+    /// Interaction member.permissions includes source-channel overwrites, so
+    /// it must never authorize guild-wide configuration or owner overrides.
+    /// Use the member's role IDs with our complete guild-role snapshot instead.
+    /// Missing/disconnected snapshots fail closed, including for admin claims.
+    /// Source: https://docs.discord.com/developers/resources/guild#guild-member-object
+    fn guild_permissions(&self, interaction: &Interaction) -> Option<Permissions> {
+        let guild = interaction_guild(interaction)?;
+        let member = interaction.member.as_ref()?;
+        let member_id = member.user.as_ref()?.id.get();
+        let actor = self.live_actor(guild)?;
+        let live = actor.live.inner.read().expect("live voice lock");
+        if !live.ready {
+            return None;
+        }
+        let bot = live.bot.as_ref()?;
+        effective_permissions(
+            guild,
+            bot.guild_owner_id,
+            member_id,
+            &member.roles,
+            &bot.roles,
+            &[],
+        )
     }
 
     fn ensure_actor(&self, guild: Snowflake) -> Option<GuildActor> {
@@ -4871,25 +5034,6 @@ fn parse_kick_reason(options: &[CommandDataOption]) -> Option<String> {
         })
 }
 
-/// Invoking member id plus effective Manage Channels authority, from the
-/// interaction payload (guild `member.user`, else the top-level user).
-/// `None` when Discord sent no identifiable invoker — the handler refuses
-/// closed rather than acting as nobody.
-fn interaction_actor(interaction: &Interaction) -> Option<(Snowflake, bool)> {
-    let user = interaction
-        .member
-        .as_ref()
-        .and_then(|member| member.user.as_ref())
-        .or(interaction.user.as_ref())?;
-    let is_admin = is_voice_admin(
-        interaction
-            .member
-            .as_ref()
-            .and_then(|member| member.permissions),
-    );
-    Some((user.id.get(), is_admin))
-}
-
 fn parse_logging_action(options: &[CommandDataOption]) -> LoggingAction {
     let Some(sub) = options.first() else {
         return LoggingAction::Invalid;
@@ -5034,11 +5178,14 @@ fn vote_button_id(vote_id: Snowflake, ballot: VoteBallot) -> String {
     format!("{VOTE_BUTTON_PREFIX}{vote_id}:{vote}")
 }
 
-/// The invoking member's access facts: effective admin flag and role IDs.
-fn access_member(interaction: &Interaction) -> AccessMember {
+/// The invoking member's access facts: guild-level admin flag and role IDs.
+fn access_member(
+    interaction: &Interaction,
+    guild_permissions: Option<Permissions>,
+) -> AccessMember {
     let member = interaction.member.as_ref();
     AccessMember {
-        is_admin: is_voice_admin(member.and_then(|member| member.permissions)),
+        is_admin: is_voice_admin(guild_permissions),
         roles: member.map_or_else(Vec::new, |member| {
             member.roles.iter().map(|role| role.get()).collect()
         }),
@@ -5541,7 +5688,7 @@ where
     };
     // Guild-level role gate first. Settings that cannot be read fail closed for
     // members: only an admin proceeds without them.
-    let member = access_member(interaction);
+    let member = access_member(interaction, runtime.guild_permissions(interaction));
     let (gate_store, _) = runtime.make_pair();
     if let Some(denial) = command_gate(&gate_store, guild_id, &member, command.name()).await {
         reply(denial).await;
@@ -5680,10 +5827,7 @@ where
             true
         }
         VoiceCommand::Create { name } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /create.",
@@ -5708,10 +5852,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /textchannels.",
@@ -5743,10 +5884,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /position.",
@@ -5778,10 +5916,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /group.",
@@ -5813,10 +5948,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /inheritpermissions.",
@@ -5848,10 +5980,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /defaultlimit.",
@@ -5883,10 +6012,7 @@ where
             channel_id,
             request,
         } => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
                 reply(ephemeral_response(
                     "You need Manage Channels to use /alwaysprivate.",
@@ -5915,7 +6041,7 @@ where
             true
         }
         VoiceCommand::Reclaim => {
-            let Some((actor_id, is_admin)) = interaction_actor(interaction) else {
+            let Some(actor_id) = invoker_member_id(interaction) else {
                 reply(ephemeral_response(
                     "I couldn't tell who invoked /reclaim — try again.",
                 ))
@@ -5923,7 +6049,12 @@ where
                 return true;
             };
             let text = runtime
-                .run_ownership(guild_id, actor_id, is_admin, OwnershipCommand::Reclaim)
+                .run_ownership(
+                    guild_id,
+                    actor_id,
+                    member.is_admin,
+                    OwnershipCommand::Reclaim,
+                )
                 .await
                 .unwrap_or_else(|| {
                     "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
@@ -5932,7 +6063,7 @@ where
             true
         }
         VoiceCommand::Transfer { target_id } => {
-            let Some((actor_id, is_admin)) = interaction_actor(interaction) else {
+            let Some(actor_id) = invoker_member_id(interaction) else {
                 reply(ephemeral_response(
                     "I couldn't tell who invoked /transfer — try again.",
                 ))
@@ -5952,7 +6083,7 @@ where
                 .run_ownership(
                     guild_id,
                     actor_id,
-                    is_admin,
+                    member.is_admin,
                     OwnershipCommand::Transfer { target_id },
                 )
                 .await
@@ -5970,10 +6101,7 @@ where
                 .await;
                 return true;
             };
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             if !may_manage_server(permissions) {
                 reply(ephemeral_response("You need Manage Server to use /export.")).await;
                 return true;
@@ -6040,10 +6168,7 @@ where
         .await;
         return true;
     };
-    let permissions = interaction
-        .member
-        .as_ref()
-        .and_then(|member| member.permissions);
+    let permissions = runtime.guild_permissions(interaction);
     if !may_manage_server(permissions) {
         reply(ephemeral_response("You need Manage Server to use /import.")).await;
         return true;
@@ -6168,10 +6293,7 @@ where
         .await;
         return true;
     }
-    let permissions = interaction
-        .member
-        .as_ref()
-        .and_then(|member| member.permissions);
+    let permissions = runtime.guild_permissions(interaction);
     if !may_manage_server(permissions) {
         reply(ephemeral_response(
             "You need Manage Server to confirm an import.",
@@ -6179,7 +6301,7 @@ where
         .await;
         return true;
     }
-    let member = access_member(interaction);
+    let member = access_member(interaction, runtime.guild_permissions(interaction));
     let (store, _) = runtime.make_pair();
     if let Some(denial) = command_gate(&store, guild_id, &member, "import").await {
         reply(denial).await;
