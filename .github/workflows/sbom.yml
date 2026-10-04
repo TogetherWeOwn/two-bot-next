@@ -132,7 +132,12 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: sbom-partial
+          # Per-attempt name (same run_id/run_attempt scheme as IMAGE):
+          # v4 artifacts are immutable and same-named uploads coexist, so a
+          # bare `sbom-partial` download on a `rerun failed jobs` retry can
+          # hand `verify` the previous attempt's BOMs/image. The suffixed
+          # name can only match this attempt's upload.
+          name: sbom-partial-${{ github.run_id }}-${{ github.run_attempt }}
           path: sbom/
           if-no-files-found: error
           retention-days: 1
@@ -169,7 +174,10 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: sbom-partial
+          # Must match the per-attempt upload name in `image` above: a bare
+          # `sbom-partial` download on a retry can resolve to a previous
+          # attempt's same-named artifact instead of this attempt's.
+          name: sbom-partial-${{ github.run_id }}-${{ github.run_attempt }}
           path: sbom
       - name: Load image under verification
         run: |

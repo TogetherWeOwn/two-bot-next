@@ -14,7 +14,7 @@ use two_bot_core::{
 use two_bot_discord::executor::ActionExecutor;
 
 use crate::{
-    audit_runtime, community_jobs,
+    audit_runtime, community_jobs, feed_jobs,
     jobs::{self, ErrorClass, Job},
     member_runtime::{self, MemberRuntime},
     scheduled_jobs,
@@ -118,6 +118,9 @@ fn admission_pool(url: &str) -> Result<PgPool, String> {
         .connect_lazy_with(options))
 }
 
+/// Boot-composed single call: the eight parameters are the full supervised
+/// surface (config, listener, gateway, shutdown plus one slot per consumer).
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     config: &Config,
     listener: tokio::net::TcpListener,
@@ -193,6 +196,11 @@ pub async fn serve(
                 let registration = community_jobs::register(context.clone());
                 registered.extend(registration.jobs);
                 parked = registration.parked;
+                if let Some(job) = feed_jobs::register(context.clone()) {
+                    registered.push(job);
+                } else {
+                    parked.push(feed_jobs::NAME);
+                }
                 // Repeat-history expiry rides the shared supervisor.
                 if crate::automod_gateway::enabled() {
                     registered.push(crate::automod_gateway::expiry_job(automod));
@@ -236,6 +244,7 @@ async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::Share
         .chain(scheduled_jobs::NAMES)
         .chain(member_runtime::NAMES)
         .chain([RECOVERY_JOB_NAME])
+        .chain([feed_jobs::NAME])
         .collect();
     if crate::automod_gateway::enabled() {
         names.push(crate::automod_gateway::JOB_NAME);

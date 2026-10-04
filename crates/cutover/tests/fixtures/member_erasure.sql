@@ -50,6 +50,9 @@ BEGIN
       INSERT INTO sticky_messages
         (guild_id, channel_id, body, created_by, created_at, updated_by, updated_at)
         VALUES (g, u, 'fixture', u, now(), u, now());
+      INSERT INTO automation_commands
+        (guild_id, name, description, template, text_trigger, enabled, created_by, created_at, updated_by, updated_at)
+        VALUES (g, 'fixture-' || u, 'fixture', 'fixture', NULL, TRUE, u, now(), u, now());
       INSERT INTO scheduled_messages
         (id, guild_id, channel_id, body, next_run_at, created_by, created_at, updated_by, updated_at)
         VALUES (k, g, u, 'fixture', '2026-10-01T00:00:00.000Z', u, '2026-10-01T00:00:00.000Z', u, '2026-10-01T00:00:00.000Z');

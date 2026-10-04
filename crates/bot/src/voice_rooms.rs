@@ -12,6 +12,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
@@ -19,9 +20,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::voice_room_plan::{plan_room, RoomPlanInput};
+use crate::voice_room_plan::{category_room_ids, plan_room, RoomPlanInput};
 use tokio::sync::{mpsc, oneshot};
-use tracing::warn;
+use tracing::{info, warn};
 use twilight_cache_inmemory::DefaultInMemoryCache;
 use twilight_gateway::Event;
 use twilight_model::{
@@ -29,16 +30,41 @@ use twilight_model::{
         application_command::{CommandDataOption, CommandOptionValue},
         Interaction, InteractionData, InteractionType,
     },
-    channel::{message::MessageFlags, permission_overwrite::PermissionOverwriteType, Channel},
+    channel::{
+        message::{
+            component::{ActionRow, Button, ButtonStyle, Component},
+            AllowedMentions, MessageFlags,
+        },
+        permission_overwrite::PermissionOverwriteType,
+        Channel, ChannelType,
+    },
     guild::{Permissions, Role},
-    http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
-    id::{marker::RoleMarker, Id},
+    http::{
+        attachment::Attachment,
+        interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
+    },
+    id::{
+        marker::{AttachmentMarker, RoleMarker, UserMarker},
+        Id,
+    },
 };
 use two_bot_core::{
-    evaluate_permissions as evaluate_health, now_iso,
+    evaluate_permissions as evaluate_health, metrics, now_iso,
     voice_access::{
         is_voice_command, may_create_room, may_use_command, validate_access_controls,
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
+    },
+    voice_config::{
+        export_configuration, validate_configuration, ChannelKind, ChannelReference,
+        GuildInventory, VoiceConfiguration, MAX_IMPORT_BYTES, VOICE_CONFIG_VERSION,
+    },
+    voice_config_diff::{
+        diff_configuration, diff_content_hash, render_preview, skip_unknown_channels,
+        DIFF_HASH_CHARS,
+    },
+    voice_custom_id::{
+        import_cancel_custom_id, import_confirm_custom_id, parse_voice_custom_id, VoiceAction,
+        IMPORT_HASH_CHARS,
     },
     voice_logging::{
         parse_detail_level, resolve_log_target, should_log, DetailLevel, LogTarget,
@@ -50,9 +76,9 @@ use two_bot_core::{
     },
     voice_rooms::{
         category_full_message, is_usable_channel_name, voice_commands, ActionQueue, CreatorChannel,
-        NewRoomSpec, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, RoomPosition,
-        TextCompanion, VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN,
-        RENAME_MIN_INTERVAL_MS,
+        NewRoomSpec, PermissionSource, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction,
+        RoomPosition, TextCompanion, VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY,
+        MAX_CHANNEL_NAME_LEN, QUEUE_MAX_ATTEMPTS, RENAME_MIN_INTERVAL_MS,
     },
     voice_text_channel::{
         admin_view_roles, occupancy_diff, text_channel_plan,
@@ -61,8 +87,8 @@ use two_bot_core::{
     },
     voice_utilities::{invite_render, ping_render},
     voice_vote_kick::{
-        VoteBallot, VoteClock, VoteKickCore, VoteKickError, VoteKickRef, VoteKickStatus,
-        VoteKickUpdate, VoteRoomFacts,
+        VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError, VoteKickRef,
+        VoteKickStatus, VoteKickUpdate, VoteRoomFacts,
     },
     CommandDefinition, OverwriteTarget, PermissionFinding, PermissionOverwrite as HealthOverwrite,
     Snowflake, VoicePermission, VoicePermissionScope,
@@ -133,6 +159,19 @@ pub trait RoomPersistence: Send + Sync {
         &self,
         guild: Snowflake,
         settings: &LoggingSettings,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// The guild's V11 voice configuration; a never-configured guild reads
+    /// as the defaults, so `/export` works on a fresh guild.
+    fn config_snapshot(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<VoiceConfiguration, StoreError>> + Send;
+    /// Replace the guild's V11 voice configuration in one transaction
+    /// (`/import` Confirm only; never touches live rooms or companions).
+    fn config_apply(
+        &self,
+        guild: Snowflake,
+        config: &VoiceConfiguration,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
     fn forget(
         &self,
@@ -241,6 +280,24 @@ impl RoomPersistence for PgRoomStore {
         Ok(())
     }
 
+    async fn config_snapshot(&self, guild: Snowflake) -> Result<VoiceConfiguration, StoreError> {
+        self.voice_configs()
+            .snapshot(guild)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn config_apply(
+        &self,
+        guild: Snowflake,
+        config: &VoiceConfiguration,
+    ) -> Result<(), StoreError> {
+        self.voice_configs()
+            .apply(guild, config)
+            .await
+            .map_err(store_error)
+    }
+
     async fn companions(&self, guild: Snowflake) -> Result<Vec<TextCompanion>, StoreError> {
         self.companions_in_guild(guild).await.map_err(store_error)
     }
@@ -270,6 +327,63 @@ fn store_error(error: sqlx::Error) -> StoreError {
             StoreError::CredentialRefused
         }
         _ => StoreError::Unavailable,
+    }
+}
+
+/// Bounded outcome class for a terminal Discord error (TOG-13543). Rate
+/// limits are retries, never outcomes; callers skip them before reaching
+/// here. `Rejected` status/code values never become labels.
+fn voice_outcome_from_http(error: &RoomHttpError) -> &'static str {
+    match error {
+        RoomHttpError::Cancelled => "cancelled",
+        _ => "discord",
+    }
+}
+
+/// Bounded outcome class for a terminal store error (TOG-13543). All three
+/// variants share one `persistence` outcome to keep cardinality fixed; the
+/// sanitized debug already rides the failure line for `/setup`.
+fn voice_outcome_from_store(_error: &StoreError) -> &'static str {
+    "persistence"
+}
+
+/// Bounded dead-letter family for a queue action (TOG-13543). Companion
+/// creates/grants/revokes share `companion`; unknown shapes share `other`.
+fn voice_dead_action(action: &RoomAction) -> &'static str {
+    match action {
+        RoomAction::CreateRoom { .. } => "create",
+        RoomAction::MoveMember { .. } => "move",
+        RoomAction::DeleteRoom { .. } => "delete",
+        RoomAction::CreateCompanion { .. }
+        | RoomAction::GrantCompanionView { .. }
+        | RoomAction::RevokeCompanionView { .. } => "companion",
+        RoomAction::UpdateOwnership { .. } => "ownership",
+        RoomAction::KickMember { .. } => "kick",
+        RoomAction::RenameRoom { .. } => "rename",
+    }
+}
+
+/// One finished room lifecycle outcome (TOG-13543): a fixed-cardinality
+/// counter plus a token-free log line. Event name `voice_operation` with
+/// `op`/`outcome` fields is the catalog entry coordinated with blocked
+/// TOG-10870 (which owns JSON formatting): no IDs, bodies, tokens or member
+/// data, only the bounded operation and outcome.
+fn observe_voice_operation(op: &'static str, outcome: &'static str) {
+    metrics::global().voice_operation(op, outcome);
+    if outcome == "success" {
+        info!(
+            voice_event = "voice_operation",
+            op = op,
+            outcome = outcome,
+            "voice_operation succeeded"
+        );
+    } else {
+        warn!(
+            voice_event = "voice_operation",
+            op = op,
+            outcome = outcome,
+            "voice_operation failed"
+        );
     }
 }
 
@@ -322,6 +436,14 @@ pub trait RoomWrites: Send + Sync {
         channel: Snowflake,
         name: &str,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// Download a Discord-hosted `/import` file, capped at `max_bytes`
+    /// (the caller checks the attachment size before asking).
+    fn download_attachment(
+        &self,
+        url: &str,
+        max_bytes: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, RoomHttpError>> + Send;
+
     /// Create a V9 companion text channel with its full overwrite set in the
     /// POST (never patched afterwards). The bot's own View allow rides the
     /// POST via `bot_id`.
@@ -410,6 +532,14 @@ impl RoomWrites for RoomHttp {
 
     async fn rename(&self, channel: Snowflake, name: &str) -> Result<(), RoomHttpError> {
         self.rename_room(channel, name).await
+    }
+
+    async fn download_attachment(
+        &self,
+        url: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RoomHttpError> {
+        self.download_attachment(url, max_bytes).await
     }
 
     async fn create_companion(
@@ -1215,9 +1345,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
         let mut empty = Vec::new();
         let mut occupied = Vec::new();
+        let mut suspended: u64 = 0;
+        let mut resumed: u64 = 0;
         for channel in self.rooms.keys().copied() {
             if !live.channels.contains_key(&channel) {
                 self.queue.resume(self.live.guild_id, channel);
+                resumed = resumed.saturating_add(1);
                 empty.push(channel);
                 continue;
             }
@@ -1238,9 +1371,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             // Move Members was revoked between the create and move.
             if !accessible && !self.moves.contains_key(&channel) {
                 self.queue.suspend(self.live.guild_id, channel);
+                suspended = suspended.saturating_add(1);
                 continue;
             }
             self.queue.resume(self.live.guild_id, channel);
+            resumed = resumed.saturating_add(1);
             let move_pending = self.moves.contains_key(&channel)
                 || self
                     .uncertain_moves
@@ -1293,6 +1428,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.companion_seen.insert(channel, current);
         }
         drop(live);
+        let delete_enqueued = empty.len() as u64;
         for channel in empty {
             self.queue_delete(channel, false);
         }
@@ -1318,8 +1454,26 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 );
             }
         }
+        let mut succession_enqueued: u64 = 0;
         for channel in occupied {
-            self.apply_succession(channel);
+            if self.apply_succession(channel) {
+                succession_enqueued = succession_enqueued.saturating_add(1);
+            }
+        }
+        metrics::global().voice_reconcile("delete_enqueued", delete_enqueued);
+        metrics::global().voice_reconcile("suspended", suspended);
+        metrics::global().voice_reconcile("resumed", resumed);
+        metrics::global().voice_reconcile("succession_enqueued", succession_enqueued);
+        self.observe_voice_state();
+        if delete_enqueued > 0 || suspended > 0 || resumed > 0 || succession_enqueued > 0 {
+            info!(
+                voice_event = "voice_reconcile",
+                delete_enqueued = delete_enqueued,
+                suspended = suspended,
+                resumed = resumed,
+                succession_enqueued = succession_enqueued,
+                "voice_reconcile planned"
+            );
         }
     }
 
@@ -1329,24 +1483,24 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// tick is idempotent; the queued [`RoomAction::UpdateOwnership`] persists
     /// the handoff. Skipped while the owner's move is still in flight and
     /// while occupancy is uncertain after a successful move.
-    fn apply_succession(&mut self, channel: Snowflake) {
+    fn apply_succession(&mut self, channel: Snowflake) -> bool {
         if self.moves.contains_key(&channel) {
-            return;
+            return false;
         }
         let (room, occupants) = {
             let live = self.live.inner.read().expect("live voice lock");
             if !live.ready {
-                return;
+                return false;
             }
             let Some(room) = self.rooms.get(&channel).cloned() else {
-                return;
+                return false;
             };
             if self
                 .uncertain_moves
                 .get(&channel)
                 .is_some_and(|ticket| live.ticket_valid(*ticket))
             {
-                return;
+                return false;
             }
             (room, live.ownership_snapshot(channel))
         };
@@ -1355,7 +1509,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 .iter()
                 .any(|member| member.member_id == room.owner_id)
         {
-            return;
+            return false;
         }
         let ownership = RoomOwnership {
             owner_id: room.owner_id,
@@ -1363,10 +1517,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         };
         let next = match decide_ownership(ownership, &occupants, OwnershipRequest::Reconcile) {
             Ok(OwnershipDecision::Changed { next, .. }) => next,
-            Ok(_) => return,
+            Ok(_) => return false,
             Err(error) => {
                 warn!(channel_id = channel, %error, "voice succession refused");
-                return;
+                return false;
             }
         };
         let mut updated = room;
@@ -1381,6 +1535,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 original_creator_id: next.original_creator_id,
             },
         );
+        true
     }
 
     /// V2 ownership command (`/reclaim`, `/transfer`), serialized in the guild
@@ -1523,6 +1678,19 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .unwrap_or_default();
         self.desired_names.insert(channel, name.to_owned());
         Some(self.renames.propose(channel, current, name, now_ms))
+    }
+
+    /// The tracked temporary room a member is currently in, if any. `None`
+    /// while live evidence is not authoritative, when the member is not in
+    /// voice, or when their channel is not a tracked room. The router claim
+    /// check uses this to tell vote-kick targets from moderation targets.
+    pub fn kick_room_of(&self, member: Snowflake) -> Option<Snowflake> {
+        let live = self.live.inner.read().expect("live voice lock");
+        if !live.ready || self.halted {
+            return None;
+        }
+        let channel = live.members.get(&member)?.channel_id?;
+        self.rooms.contains_key(&channel).then_some(channel)
     }
 
     /// Owner, original creator and human occupants of a tracked room. `None`
@@ -1813,6 +1981,33 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         self.failures.push_back(failure);
     }
 
+    /// Publish current ghost-verification gauges (TOG-13543): tracked rooms
+    /// plus compensation-pending orphans. No IDs leave the process.
+    fn observe_voice_state(&self) {
+        metrics::global().voice_state(self.rooms.len() as u64, self.compensation.len() as u64);
+    }
+
+    /// Retry through the queue budget and observe the dead letter (TOG-13543).
+    /// Returns the queue's release verdict. On the terminal attempt the
+    /// bounded family counter advances and one token-free warn line names
+    /// the family and attempt budget, never the channel, member or reason
+    /// body.
+    fn mark_failed_observed(&self, action: QueuedAction, reason: String, now_ms: u64) -> bool {
+        let family = voice_dead_action(&action.action);
+        let will_dead_letter = action.attempts.saturating_add(1) >= QUEUE_MAX_ATTEMPTS;
+        let released = self.queue.mark_failed(action, reason, now_ms);
+        if will_dead_letter && released {
+            metrics::global().voice_dead_letter(family);
+            warn!(
+                voice_event = "voice_dead_letter",
+                action = family,
+                attempts = QUEUE_MAX_ATTEMPTS,
+                "voice action dead-lettered"
+            );
+        }
+        released
+    }
+
     fn prepare(&self, ticket: JoinTicket) -> Result<RoomChannelAttributes, RoomHttpError> {
         let live = self.live.inner.read().expect("live voice lock");
         if !live.ticket_valid(ticket) {
@@ -1845,6 +2040,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             }
         }
         let bot = live.bot.as_ref().ok_or(RoomHttpError::AccessDenied)?;
+        let grouped = settings.group_by_category;
+        let group_room_ids = if grouped {
+            category_room_ids(channel, &live.channels, &self.rooms)
+        } else {
+            Vec::new()
+        };
         plan_room(&RoomPlanInput {
             guild_id: self.live.guild_id,
             owner_id: ticket.member_id,
@@ -1855,6 +2056,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             rooms: &self.rooms,
             bot,
             bot_permissions: permissions,
+            grouped,
+            group_room_ids: &group_room_ids,
         })
     }
 
@@ -1897,11 +2100,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 creator_id: creator_channel_id,
                                 message: category_full_message(),
                             });
+                            observe_voice_operation("create", "category_full");
                         } else if error != RoomHttpError::Cancelled {
+                            let outcome = voice_outcome_from_http(&error);
                             self.record(LifecycleFailure::Discord {
                                 channel_id: creator_channel_id,
                                 error,
                             });
+                            observe_voice_operation("create", outcome);
                         }
                         self.creations.remove(&action.id);
                         self.queue.mark_succeeded(&action);
@@ -1932,6 +2138,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 // the move. The plan's settings snapshot is the
                                 // creator row at room-creation time, so later
                                 // `/textchannels` changes never alter it.
+                                observe_voice_operation("create", "success");
+                                self.observe_voice_state();
                                 self.enqueue_companion_create(channel_id);
                                 if self
                                     .live
@@ -1953,14 +2161,17 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 }
                             }
                             Err(error) => {
+                                let outcome = voice_outcome_from_store(&error);
                                 self.record(LifecycleFailure::Persistence {
                                     channel_id: Some(channel_id),
                                     error,
                                 });
+                                observe_voice_operation("create", outcome);
                                 if error == StoreError::CredentialRefused {
                                     self.halted = true;
                                 }
                                 self.queue_delete(channel_id, true);
+                                self.observe_voice_state();
                             }
                         }
                     }
@@ -1975,6 +2186,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     Err(error) => {
                         // Unknown create outcomes must never produce another POST.
                         self.creations.remove(&action.id);
+                        if error != RoomHttpError::Cancelled {
+                            observe_voice_operation("create", voice_outcome_from_http(&error));
+                        }
                         self.complete_error(action, creator_channel_id, error);
                     }
                 }
@@ -2012,6 +2226,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         // Occupancy may lag the successful REST response. Wait for
                         // this member's transition or a complete refresh before pruning.
                         self.uncertain_moves.insert(channel_id, ticket);
+                        observe_voice_operation("move", "success");
                     }
                     Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
                         self.queue.mark_rate_limited(
@@ -2024,12 +2239,17 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     Err(RoomHttpError::UnknownOutcome) => {
                         self.moves.remove(&channel_id);
                         self.uncertain_moves.insert(channel_id, ticket);
+                        observe_voice_operation("move", "discord");
                         self.complete_error(action, channel_id, RoomHttpError::UnknownOutcome);
                     }
                     Err(error) => {
                         self.moves.remove(&channel_id);
+                        if error != RoomHttpError::Cancelled {
+                            observe_voice_operation("move", voice_outcome_from_http(&error));
+                        }
                         self.complete_error(action, channel_id, error);
                         self.queue_delete(channel_id, true);
+                        self.observe_voice_state();
                     }
                 }
             }
@@ -2082,7 +2302,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             // Companion Discord delete failed (or its row
                             // write did): retry with the room delete instead
                             // of leaking the text channel.
-                            self.queue.mark_failed(
+                            self.mark_failed_observed(
                                 action,
                                 "companion delete unavailable".to_owned(),
                                 elapsed_ms(now_ms, started),
@@ -2105,17 +2325,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 self.moves.remove(&channel_id);
                                 self.uncertain_moves.remove(&channel_id);
                                 self.desired_names.remove(&channel_id);
+                                observe_voice_operation("delete", "success");
+                                self.observe_voice_state();
                             }
                             Err(error) => {
+                                let outcome = voice_outcome_from_store(&error);
                                 self.record(LifecycleFailure::Persistence {
                                     channel_id: Some(channel_id),
                                     error,
                                 });
                                 if error == StoreError::CredentialRefused {
                                     self.halted = true;
+                                    observe_voice_operation("delete", outcome);
                                     self.queue.mark_succeeded(&action);
                                 } else {
-                                    self.queue.mark_failed(
+                                    self.mark_failed_observed(
                                         action,
                                         "voice-room persistence unavailable".to_owned(),
                                         elapsed_ms(now_ms, started),
@@ -2147,7 +2371,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             channel_id,
                             error: RoomHttpError::AccessDenied,
                         });
-                        self.queue.mark_failed(
+                        observe_voice_operation("delete", "discord");
+                        self.mark_failed_observed(
                             action,
                             "Discord access denied".to_owned(),
                             elapsed_ms(now_ms, started),
@@ -2156,9 +2381,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     Err(RoomHttpError::Cancelled) => {
                         self.queue.mark_succeeded(&action);
                         self.deletes.remove(&channel_id);
+                        observe_voice_operation("delete", "cancelled");
                     }
                     Err(RoomHttpError::UnknownOutcome) => {
-                        self.queue.mark_failed(
+                        self.mark_failed_observed(
                             action,
                             "Discord delete outcome unknown".to_owned(),
                             elapsed_ms(now_ms, started),
@@ -2166,7 +2392,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                     Err(error) => {
                         self.deletes.remove(&channel_id);
+                        if error != RoomHttpError::Cancelled {
+                            observe_voice_operation("delete", voice_outcome_from_http(&error));
+                        }
                         self.complete_error(action, channel_id, error);
+                        self.observe_voice_state();
                     }
                 }
             }
@@ -2253,7 +2483,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             )
                             .await;
                         } else {
-                            self.queue.mark_failed(
+                            self.mark_failed_observed(
                                 action,
                                 "companion create outcome unknown".to_owned(),
                                 elapsed_ms(now_ms, started),
@@ -2340,7 +2570,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             channel_id: Some(channel_id),
                             error,
                         });
-                        self.queue.mark_failed(
+                        self.mark_failed_observed(
                             action,
                             "voice-room persistence unavailable".to_owned(),
                             elapsed_ms(now_ms, started),
@@ -2407,7 +2637,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                     Err(RoomHttpError::UnknownOutcome) => {
                         // Both writes are idempotent, so a retry is safe.
-                        self.queue.mark_failed(
+                        self.mark_failed_observed(
                             action,
                             "Discord kick outcome unknown".to_owned(),
                             elapsed_ms(now_ms, started),
@@ -2549,7 +2779,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     self.companion_channels
                         .insert(room_channel_id, text_channel_id);
                     self.unpersisted_companions.insert(room_channel_id);
-                    self.queue.mark_failed(
+                    self.mark_failed_observed(
                         action.clone(),
                         "companion persistence unavailable".to_owned(),
                         elapsed_ms(now_ms, started),
@@ -2704,7 +2934,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     channel_id: text_channel_id,
                     error,
                 });
-                self.queue.mark_failed(
+                self.mark_failed_observed(
                     action.clone(),
                     if grant {
                         "companion view grant unavailable".to_owned()
@@ -2751,6 +2981,19 @@ pub trait VoiceEventSink: Send + Sync {
     /// A cold RESUME has replayed durably but cannot populate a fresh cache.
     /// The supervisor must IDENTIFY after committing RESUMED, not before replay.
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool;
+    /// Resolve the tracked room a member is currently in, if any. The shared
+    /// router asks this for `/kick`: a tracked-room target means the voice
+    /// sink owns the interaction (vote-kick) and the router must stay silent;
+    /// anything else keeps the existing moderation path. Boxed (not `impl
+    /// Future`) so the trait stays object-safe behind `Arc<dyn _>`.
+    fn kick_claim_room(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
+        let _ = (guild, member);
+        Box::pin(async { None })
+    }
 }
 
 /// The gateway shares only live evidence; the actor owns the mutable queue.
@@ -2799,6 +3042,13 @@ enum ActorCommand {
         ballot: VoteBallot,
         reply: oneshot::Sender<KickReply>,
     },
+    /// V4: resolve the tracked room a member is currently in, if any. The
+    /// shared router uses this to tell vote-kick targets (voice owns the
+    /// interaction) from moderation targets (the router keeps it).
+    KickRoomOf {
+        member: Snowflake,
+        reply: oneshot::Sender<Option<Snowflake>>,
+    },
 }
 
 /// A V2 ownership command from an interaction. `Reclaim` takes the caller's
@@ -2816,6 +3066,24 @@ pub type KickReply = Result<VoteKickUpdate, KickRefusal>;
 /// Per-guild actor registry. Actors spawn lazily on the first complete
 /// snapshot and exit when their guild leaves (sender dropped) or their store
 /// load fails (respawned on the next event via `UnboundedSender::is_closed`).
+/// How long an `/import` preview stays confirmable. Past that the Confirm
+/// button answers "expired" and writes nothing; the member uploads again.
+pub const PENDING_IMPORT_TTL: Duration = Duration::from_secs(15 * 60);
+/// Upper bound on remembered previews across all guilds; the oldest expired
+/// entries are evicted first, then the oldest entries, so a flood of uploads
+/// cannot grow memory without bound.
+const MAX_PENDING_IMPORTS: usize = 128;
+
+/// An `/import` preview awaiting Confirm: the validated, unknown-channel
+/// skipped candidate plus its expiry. The bytes are never re-downloaded:
+/// attachment URLs expire, so Confirm works from this copy and re-diffs it
+/// against freshly read state.
+#[derive(Debug, Clone)]
+struct PendingImport {
+    candidate: VoiceConfiguration,
+    expires_at: Instant,
+}
+
 pub struct VoiceRuntime<S, H> {
     make: Arc<dyn Fn() -> (S, H) + Send + Sync>,
     tick: Duration,
@@ -2825,6 +3093,10 @@ pub struct VoiceRuntime<S, H> {
     /// Serializes `/access` read-modify-write cycles so two admins cannot
     /// overwrite each other's change (rare, admin-only, so one lock is enough).
     access_lock: tokio::sync::Mutex<()>,
+    /// Previewed import candidates by (guild, uploading member, content
+    /// hash). Confirm consumes the entry, so a double click cannot apply
+    /// twice; Cancel and expiry remove it with no write.
+    pending_imports: Mutex<HashMap<(Snowflake, Snowflake, String), PendingImport>>,
 }
 
 impl<S, H> VoiceRuntime<S, H>
@@ -2847,6 +3119,7 @@ where
             seeds: AtomicU64::new(initial_seed()),
             actors: Mutex::new(HashMap::new()),
             access_lock: tokio::sync::Mutex::new(()),
+            pending_imports: Mutex::new(HashMap::new()),
         }
     }
 
@@ -3023,6 +3296,19 @@ where
         inbox.await.ok()
     }
 
+    /// Resolve the tracked room a member is currently in, if any. `None`
+    /// when the guild has no live actor, while evidence is stale, or when
+    /// the member is not in a tracked room.
+    pub async fn kick_room_of(&self, guild: Snowflake, member: Snowflake) -> Option<Snowflake> {
+        let actor = self.live_actor(guild)?;
+        let (reply, inbox) = oneshot::channel();
+        actor
+            .tx
+            .send(ActorCommand::KickRoomOf { member, reply })
+            .ok()?;
+        inbox.await.ok()?
+    }
+
     /// Invalidate first: even an in-flight task cannot write after GuildDelete.
     pub fn remove_guild(&self, guild: Snowflake) {
         if let Some(actor) = self
@@ -3055,6 +3341,62 @@ where
             actor.live.upsert_channel(channel);
             let _ = actor.tx.send(ActorCommand::CreatorAdded(creator.clone()));
         }
+    }
+
+    /// Remember a previewed import candidate for one Confirm. Expired
+    /// entries are dropped first; past the cap the oldest entry goes.
+    fn remember_pending_import(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        hash: &str,
+        candidate: VoiceConfiguration,
+    ) {
+        let mut pending = self.pending_imports.lock().expect("voice runtime lock");
+        let now = Instant::now();
+        pending.retain(|_, entry| entry.expires_at > now);
+        if pending.len() >= MAX_PENDING_IMPORTS {
+            let oldest = pending
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(key, _)| key.clone());
+            if let Some(key) = oldest {
+                pending.remove(&key);
+            }
+        }
+        pending.insert(
+            (guild_id, member_id, hash.to_owned()),
+            PendingImport {
+                candidate,
+                expires_at: now + PENDING_IMPORT_TTL,
+            },
+        );
+    }
+
+    /// Consume a previewed candidate for Confirm. `None` means no preview,
+    /// a foreign member/hash, or expiry: the caller answers without writing.
+    /// Expired entries are dropped as they are found.
+    fn take_pending_import(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        hash: &str,
+    ) -> Option<VoiceConfiguration> {
+        let mut pending = self.pending_imports.lock().expect("voice runtime lock");
+        let now = Instant::now();
+        pending.retain(|_, entry| entry.expires_at > now);
+        pending
+            .remove(&(guild_id, member_id, hash.to_owned()))
+            .map(|entry| entry.candidate)
+    }
+
+    /// Drop a preview without writing (Cancel). Missing entries are fine:
+    /// Cancel is idempotent and also covers already-consumed previews.
+    fn cancel_pending_import(&self, guild_id: Snowflake, member_id: Snowflake, hash: &str) {
+        self.pending_imports
+            .lock()
+            .expect("voice runtime lock")
+            .remove(&(guild_id, member_id, hash.to_owned()));
     }
 
     /// Hand an edited creator row to the guild worker (V9d `/textchannels`).
@@ -3176,6 +3518,14 @@ where
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
         self.enabled && cache.current_user().is_none()
     }
+
+    fn kick_claim_room(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
+        Box::pin(self.kick_room_of(guild, member))
+    }
 }
 
 async fn run_actor<S: RoomPersistence, H: RoomWrites>(
@@ -3278,6 +3628,9 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         } => {
             let _ = reply.send(worker.kick_cast(vote_id, voter_id, ballot, now_ms));
         }
+        ActorCommand::KickRoomOf { member, reply } => {
+            let _ = reply.send(worker.kick_room_of(member));
+        }
     }
 }
 
@@ -3348,6 +3701,65 @@ fn bot_access_from_cache(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> O
         system_channel_id: guild.system_channel_id().map(|id| id.get()),
         member_roles,
         roles,
+    })
+}
+
+/// Trusted guild inventory for V11 export/import, built from the live
+/// gateway cache at dispatch time, never from uploaded data. `None` when the
+/// guild itself is not cached yet (the caller refuses with "try again").
+/// Channel, role and member sets are best-effort: a set the cache has not
+/// populated yet reads as empty, and validation then refuses references to
+/// it instead of silently passing them.
+#[must_use]
+pub fn inventory_from_cache(
+    cache: &DefaultInMemoryCache,
+    guild_id: Snowflake,
+) -> Option<GuildInventory> {
+    let guild_key = Id::new(guild_id);
+    cache.guild(guild_key)?;
+    let guild_string = guild_id.to_string();
+    let mut channels = std::collections::BTreeMap::new();
+    if let Some(ids) = cache.guild_channels(guild_key) {
+        for id in ids.value().iter() {
+            let Some(channel) = cache.channel(*id) else {
+                continue;
+            };
+            let kind = match channel.kind {
+                ChannelType::GuildText => ChannelKind::Text,
+                ChannelType::GuildVoice => ChannelKind::Voice,
+                ChannelType::GuildStageVoice => ChannelKind::Stage,
+                ChannelType::GuildCategory => ChannelKind::Category,
+                _ => continue,
+            };
+            if channel.guild_id.map(Id::get) != Some(guild_id) {
+                continue;
+            }
+            channels.insert(
+                id.get().to_string(),
+                ChannelReference {
+                    guild_id: guild_string.clone(),
+                    kind,
+                },
+            );
+        }
+    }
+    let mut roles = std::collections::BTreeMap::new();
+    if let Some(ids) = cache.guild_roles(guild_key) {
+        for id in ids.value().iter() {
+            roles.insert(id.get().to_string(), guild_string.clone());
+        }
+    }
+    let mut members = std::collections::BTreeMap::new();
+    if let Some(ids) = cache.guild_members(guild_key) {
+        for id in ids.value().iter() {
+            members.insert(id.get().to_string(), guild_string.clone());
+        }
+    }
+    Some(GuildInventory {
+        guild_id: guild_string,
+        channels,
+        roles,
+        members,
     })
 }
 
@@ -3483,6 +3895,222 @@ pub fn decide_text_channels(
     TextChannelsPlan::Update(creator)
 }
 
+// --- V8 per-creator settings decisions (pure, no Discord) ------------------------
+//
+// Each command edits one creator row through `add_creator` (single-field
+// write) with the same bounds the V11 import validates: limits 0-99,
+// first numbers >= 1, permission sources creator/category/channel. The
+// stored row only governs rooms created afterwards; open rooms keep theirs.
+
+/// `/position` input after parsing. Unset options keep the stored value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionRequest {
+    pub position: Option<RoomPosition>,
+    pub first_number: Option<i64>,
+}
+
+/// What `/position` means for one creator channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PositionPlan {
+    Update(CreatorChannel),
+    Refuse { message: String },
+}
+
+/// Fold a `/position` request into the creator row, or refuse. Pure.
+#[must_use]
+pub fn decide_position(creator: Option<CreatorChannel>, request: &PositionRequest) -> PositionPlan {
+    let refuse = |message: &str| PositionPlan::Refuse {
+        message: message.to_owned(),
+    };
+    let Some(mut creator) = creator else {
+        return refuse("That channel is not a voice-room creator. Pick one made with /create.");
+    };
+    if request.position.is_none() && request.first_number.is_none() {
+        return refuse(
+            "Choose a position (above or below) or a first room number, then try again.",
+        );
+    }
+    if let Some(position) = request.position {
+        creator.position = position;
+    }
+    if let Some(first_number) = request.first_number {
+        creator.first_room_number = first_number;
+    }
+    if creator.validate().is_err() {
+        return refuse("The first room number must be 1 or higher.");
+    }
+    PositionPlan::Update(creator)
+}
+
+/// `/group` input after parsing. An omitted toggle turns grouping on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupRequest {
+    pub enabled: Option<bool>,
+}
+
+/// What `/group` means for one creator channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupPlan {
+    Update(CreatorChannel),
+    Refuse { message: String },
+}
+
+/// Fold a `/group` request into the creator row, or refuse. Pure.
+#[must_use]
+pub fn decide_group(creator: Option<CreatorChannel>, request: &GroupRequest) -> GroupPlan {
+    let refuse = |message: &str| GroupPlan::Refuse {
+        message: message.to_owned(),
+    };
+    let Some(mut creator) = creator else {
+        return refuse("That channel is not a voice-room creator. Pick one made with /create.");
+    };
+    creator.group_by_category = request.enabled.unwrap_or(true);
+    if creator.validate().is_err() {
+        return refuse("Those grouping settings are not valid. Try again.");
+    }
+    GroupPlan::Update(creator)
+}
+
+/// `/inheritpermissions` input after parsing. `source` is the raw option
+/// value (`creator`, `category` or `channel`); `source_channel` rides along
+/// only for the channel source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InheritPermissionsRequest {
+    pub source: Option<String>,
+    pub source_channel: Option<Snowflake>,
+}
+
+/// What `/inheritpermissions` means for one creator channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InheritPermissionsPlan {
+    Update(CreatorChannel),
+    Refuse { message: String },
+}
+
+/// Fold an `/inheritpermissions` request into the creator row, or refuse.
+/// Pure: same source bounds the V11 import validates.
+#[must_use]
+pub fn decide_inherit_permissions(
+    creator: Option<CreatorChannel>,
+    request: &InheritPermissionsRequest,
+) -> InheritPermissionsPlan {
+    let refuse = |message: &str| InheritPermissionsPlan::Refuse {
+        message: message.to_owned(),
+    };
+    let Some(mut creator) = creator else {
+        return refuse("That channel is not a voice-room creator. Pick one made with /create.");
+    };
+    let Some(source) = request.source.as_deref() else {
+        return refuse("Choose where new rooms copy overrides from: creator, category or channel.");
+    };
+    match source {
+        "creator" => {
+            if request.source_channel.is_some() {
+                return refuse(
+                    "Only set a source channel together with source channel, not source creator.",
+                );
+            }
+            creator.permission_source = PermissionSource::Creator;
+            creator.permission_channel_id = None;
+        }
+        "category" => {
+            if request.source_channel.is_some() {
+                return refuse(
+                    "Only set a source channel together with source channel, not source category.",
+                );
+            }
+            creator.permission_source = PermissionSource::Category;
+            creator.permission_channel_id = None;
+        }
+        "channel" => {
+            let Some(channel) = request.source_channel.filter(|channel| *channel != 0) else {
+                return refuse(
+                    "Name the channel to copy overrides from together with source channel.",
+                );
+            };
+            creator.permission_source = PermissionSource::Channel(channel);
+            creator.permission_channel_id = Some(channel);
+        }
+        _ => {
+            return refuse(
+                "Choose where new rooms copy overrides from: creator, category or channel.",
+            );
+        }
+    }
+    if creator.validate().is_err() {
+        return refuse("Those permission settings are not valid. Check the source channel.");
+    }
+    InheritPermissionsPlan::Update(creator)
+}
+
+/// `/defaultlimit` input after parsing. `None` clears to inherit the
+/// creator channel's limit; `Some(0)` is unlimited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultLimitRequest {
+    pub limit: Option<i64>,
+}
+
+/// What `/defaultlimit` means for one creator channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultLimitPlan {
+    Update(CreatorChannel),
+    Refuse { message: String },
+}
+
+/// Fold a `/defaultlimit` request into the creator row, or refuse. Pure:
+/// same 0-99 bounds the V11 import validates.
+#[must_use]
+pub fn decide_default_limit(
+    creator: Option<CreatorChannel>,
+    request: &DefaultLimitRequest,
+) -> DefaultLimitPlan {
+    let refuse = |message: &str| DefaultLimitPlan::Refuse {
+        message: message.to_owned(),
+    };
+    let Some(mut creator) = creator else {
+        return refuse("That channel is not a voice-room creator. Pick one made with /create.");
+    };
+    creator.default_limit = request.limit;
+    if creator.validate().is_err() {
+        return refuse(
+            "The starting limit must be 0-99 (0 is unlimited), or leave it empty to inherit.",
+        );
+    }
+    DefaultLimitPlan::Update(creator)
+}
+
+/// `/alwaysprivate` input after parsing. An omitted toggle turns it on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlwaysPrivateRequest {
+    pub enabled: Option<bool>,
+}
+
+/// What `/alwaysprivate` means for one creator channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlwaysPrivatePlan {
+    Update(CreatorChannel),
+    Refuse { message: String },
+}
+
+/// Fold an `/alwaysprivate` request into the creator row, or refuse. Pure.
+#[must_use]
+pub fn decide_always_private(
+    creator: Option<CreatorChannel>,
+    request: &AlwaysPrivateRequest,
+) -> AlwaysPrivatePlan {
+    let refuse = |message: &str| AlwaysPrivatePlan::Refuse {
+        message: message.to_owned(),
+    };
+    let Some(mut creator) = creator else {
+        return refuse("That channel is not a voice-room creator. Pick one made with /create.");
+    };
+    creator.private_default = request.enabled.unwrap_or(true);
+    if creator.validate().is_err() {
+        return refuse("Those privacy settings are not valid. Try again.");
+    }
+    AlwaysPrivatePlan::Update(creator)
+}
+
 fn text_channels_summary(creator: &CreatorChannel) -> String {
     let channel_id = creator.channel_id;
     if !creator.text_channels {
@@ -3502,6 +4130,68 @@ fn text_channels_summary(creator: &CreatorChannel) -> String {
     format!(
         "Companion text channels are on for <#{channel_id}>: named `{name}`, visible to {viewers}. Applies to rooms created from now on; open rooms keep their settings."
     )
+}
+
+fn position_summary(creator: &CreatorChannel) -> String {
+    let channel_id = creator.channel_id;
+    let side = match creator.position {
+        RoomPosition::Above => "above",
+        RoomPosition::Below => "below",
+    };
+    format!(
+        "New rooms from <#{channel_id}> go {side}, numbering from {}. Applies to rooms created from now on; open rooms stay where they are.",
+        creator.first_room_number
+    )
+}
+
+fn group_summary(creator: &CreatorChannel) -> String {
+    let channel_id = creator.channel_id;
+    if creator.group_by_category {
+        format!(
+            "Shared category numbering is on for <#{channel_id}>: new rooms join the category's room block. Applies to rooms created from now on."
+        )
+    } else {
+        format!(
+            "Shared category numbering is off for <#{channel_id}>. New rooms number per creator. Applies to rooms created from now on."
+        )
+    }
+}
+
+fn inherit_permissions_summary(creator: &CreatorChannel) -> String {
+    let channel_id = creator.channel_id;
+    let source = match creator.permission_source {
+        PermissionSource::Creator => "the creator channel".to_owned(),
+        PermissionSource::Category => "the category".to_owned(),
+        PermissionSource::Channel(id) => format!("<#{id}>"),
+    };
+    format!(
+        "New rooms from <#{channel_id}> copy overrides from {source}. Applies to rooms created from now on; open rooms keep theirs."
+    )
+}
+
+fn default_limit_summary(creator: &CreatorChannel) -> String {
+    let channel_id = creator.channel_id;
+    let limit = match creator.default_limit {
+        None => "inherit the creator channel's limit".to_owned(),
+        Some(0) => "start unlimited".to_owned(),
+        Some(limit) => format!("start with a limit of {limit}"),
+    };
+    format!(
+        "New rooms from <#{channel_id}> {limit}. Applies to rooms created from now on; open rooms keep theirs."
+    )
+}
+
+fn always_private_summary(creator: &CreatorChannel) -> String {
+    let channel_id = creator.channel_id;
+    if creator.private_default {
+        format!(
+            "New rooms from <#{channel_id}> start private. Applies to rooms created from now on; open rooms keep theirs."
+        )
+    } else {
+        format!(
+            "New rooms from <#{channel_id}> start public. Applies to rooms created from now on; open rooms keep theirs."
+        )
+    }
 }
 
 /// `/setup` input: creator rows plus live worker state for the guild.
@@ -3582,6 +4272,266 @@ pub fn voice_command_set(gates: &VoiceGates) -> Vec<CommandDefinition> {
     }
 }
 
+// --- V11 `/export` + `/import` decisions (pure, no Discord) ---------------------
+//
+// `/export` snapshots the store and encodes it; `/import` previews an upload
+// against a trusted inventory and only writes on Confirm. Parsing, skipping,
+// revalidation, diffing and hashing stay testable here; the S4 handlers below
+// supply the store snapshot, the attachment bytes and the pending preview.
+
+/// Preview lines in one `/import` message body. The diff renderer also caps
+/// the whole body at its Discord limit; this bounds the line count.
+pub const MAX_IMPORT_PREVIEW_LINES: usize = 20;
+
+/// The spec's Manage Server gate for `/export`, `/import` and their
+/// Confirm/Cancel buttons: Manage Guild, with Administrator implying it.
+/// Fail closed on missing permissions.
+fn may_manage_server(permissions: Option<Permissions>) -> bool {
+    permissions.is_some_and(|permissions| {
+        permissions.intersects(Permissions::ADMINISTRATOR | Permissions::MANAGE_GUILD)
+    })
+}
+
+/// Versioned export filename: the codec version plus the guild, never room
+/// or owner state (the document itself carries none either).
+fn export_filename(guild_id: Snowflake) -> String {
+    format!("voice-config-guild-{guild_id}-v{VOICE_CONFIG_VERSION}.json")
+}
+
+/// One `/import` planning outcome. Refusals and notices reply with text
+/// alone and store nothing; only `Preview` writes a pending entry and only
+/// `Apply` touches the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportDecision {
+    /// Refused before any write: malformed upload, failed revalidation, or
+    /// an unreadable guild. Reply with `message` alone.
+    Refuse { message: String },
+    /// Nothing to confirm (empty diff, cancel, expiry): reply with `text`
+    /// alone and store nothing.
+    Notice { text: String },
+    /// Show `text` with Confirm/Cancel bound to (`member_id`, `hash`) and
+    /// remember `candidate` for Confirm.
+    Preview {
+        candidate: VoiceConfiguration,
+        hash: String,
+        text: String,
+    },
+    /// Confirm verified against fresh state: apply `candidate`, then reply
+    /// with `message`.
+    Apply {
+        candidate: VoiceConfiguration,
+        message: String,
+    },
+}
+
+/// Plan an `/import` preview from uploaded bytes: strict-decode (never from
+/// a trusted source), report and skip unknown channels, revalidate the
+/// remainder, then diff against `current`. Unknown-channel, cross-guild and
+/// wrong-kind entries refuse here with a safe field-level message; uploaded
+/// text is never echoed.
+#[must_use]
+pub fn plan_import_preview(
+    current: &VoiceConfiguration,
+    bytes: &[u8],
+    inventory: &GuildInventory,
+) -> ImportDecision {
+    debug_assert_eq!(DIFF_HASH_CHARS, IMPORT_HASH_CHARS);
+    if bytes.len() > MAX_IMPORT_BYTES {
+        return ImportDecision::Refuse {
+            message: format!(
+                "That file is too large ({} bytes; the limit is {} bytes). Nothing was changed.",
+                bytes.len(),
+                MAX_IMPORT_BYTES,
+            ),
+        };
+    }
+    let incoming: VoiceConfiguration = match serde_json::from_slice(bytes) {
+        Ok(config) => config,
+        Err(error) => {
+            return ImportDecision::Refuse {
+                message: format!(
+                    "Could not import that file: malformed configuration JSON at line {}, column {}. Nothing was changed.",
+                    error.line(),
+                    error.column(),
+                ),
+            };
+        }
+    };
+    let (remaining, _) = skip_unknown_channels(&incoming, inventory);
+    if let Err(error) = validate_configuration(&remaining, inventory) {
+        return ImportDecision::Refuse {
+            message: format!("Could not import that file: {error} Nothing was changed."),
+        };
+    }
+    // Diff the full upload, not the pruned remainder: `diff_configuration`
+    // re-skips unknown channels itself, so diffing `remaining` would always
+    // report an empty skipped list and an unknown-channels-only file would
+    // read as `No changes`. The pruned `remaining` stays the candidate.
+    let diff = diff_configuration(current, &incoming, inventory);
+    let text = render_preview(&diff, MAX_IMPORT_PREVIEW_LINES);
+    if diff.change_count() == 0 {
+        return ImportDecision::Notice { text };
+    }
+    ImportDecision::Preview {
+        hash: diff_content_hash(current, &remaining),
+        candidate: remaining,
+        text,
+    }
+}
+
+/// Plan a Confirm click: re-skip the remembered candidate against a fresh
+/// inventory, revalidate, re-diff against freshly read `current` and compare
+/// the content hash with the button's. A match applies; any concurrent
+/// change (or a guild edit that invalidates the candidate) re-previews or
+/// refuses instead of applying stale state.
+#[must_use]
+pub fn plan_import_confirm(
+    current: &VoiceConfiguration,
+    candidate: &VoiceConfiguration,
+    inventory: &GuildInventory,
+    hash: &str,
+) -> ImportDecision {
+    debug_assert_eq!(DIFF_HASH_CHARS, IMPORT_HASH_CHARS);
+    let (remaining, _) = skip_unknown_channels(candidate, inventory);
+    if let Err(error) = validate_configuration(&remaining, inventory) {
+        return ImportDecision::Refuse {
+            message: format!(
+                "That preview no longer applies cleanly: {error} Nothing was changed. Upload the file again for a fresh preview.",
+            ),
+        };
+    }
+    if diff_content_hash(current, &remaining) == hash {
+        let changes = diff_configuration(current, &remaining, inventory).change_count();
+        return ImportDecision::Apply {
+            candidate: remaining,
+            message: format!(
+                "Import applied: {} {}.",
+                changes,
+                if changes == 1 { "change" } else { "changes" },
+            ),
+        };
+    }
+    let diff = diff_configuration(current, &remaining, inventory);
+    let text = render_preview(&diff, MAX_IMPORT_PREVIEW_LINES);
+    if diff.change_count() == 0 {
+        return ImportDecision::Notice { text };
+    }
+    ImportDecision::Preview {
+        hash: diff_content_hash(current, &remaining),
+        candidate: remaining,
+        text,
+    }
+}
+
+/// Confirm/Cancel buttons for a preview, bound to the uploading member and
+/// the diff's content hash via the voice custom-id codec.
+fn import_preview_components(member_id: Snowflake, hash: &str) -> Vec<Component> {
+    let button = |label: &str, style: ButtonStyle, custom_id: String| {
+        Component::Button(Button {
+            id: None,
+            custom_id: Some(custom_id),
+            disabled: false,
+            emoji: None,
+            label: Some(label.to_owned()),
+            style,
+            url: None,
+            sku_id: None,
+        })
+    };
+    vec![Component::ActionRow(ActionRow {
+        id: None,
+        components: vec![
+            button(
+                "Confirm",
+                ButtonStyle::Success,
+                import_confirm_custom_id(member_id, hash),
+            ),
+            button(
+                "Cancel",
+                ButtonStyle::Secondary,
+                import_cancel_custom_id(member_id, hash),
+            ),
+        ],
+    })]
+}
+
+/// Ephemeral `/export` reply carrying the JSON as a versioned file.
+fn export_file_response(content: &str, filename: String, bytes: Vec<u8>) -> InteractionResponse {
+    InteractionResponse {
+        kind: InteractionResponseType::ChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            content: Some(content.to_owned()),
+            attachments: Some(vec![Attachment::from_bytes(filename, bytes, 0)]),
+            flags: Some(MessageFlags::EPHEMERAL),
+            ..Default::default()
+        }),
+    }
+}
+
+/// Ephemeral `/import` preview reply with Confirm/Cancel buttons.
+fn import_preview_response(text: &str, member_id: Snowflake, hash: &str) -> InteractionResponse {
+    InteractionResponse {
+        kind: InteractionResponseType::ChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            content: Some(text.to_owned()),
+            components: Some(import_preview_components(member_id, hash)),
+            flags: Some(MessageFlags::EPHEMERAL),
+            ..Default::default()
+        }),
+    }
+}
+
+/// The invoking member's user id, binding previews to their uploader.
+/// Guild slash and component interactions carry it on the member; fall back
+/// to the top-level user for other contexts. `None` refuses the command.
+fn invoker_member_id(interaction: &Interaction) -> Option<Snowflake> {
+    interaction
+        .member
+        .as_ref()
+        .and_then(|member| member.user.as_ref())
+        .map(|user| user.id.get())
+        .or_else(|| interaction.user.as_ref().map(|user| user.id.get()))
+}
+
+/// A V11 `/import` Confirm/Cancel component, or `None` for anything this
+/// slice does not own (other commands' components stay untouched).
+fn voice_import_action(interaction: &Interaction) -> Option<VoiceAction> {
+    if interaction.kind != InteractionType::MessageComponent {
+        return None;
+    }
+    let InteractionData::MessageComponent(data) = interaction.data.as_ref()? else {
+        return None;
+    };
+    match parse_voice_custom_id(&data.custom_id)? {
+        action @ (VoiceAction::ImportConfirm { .. } | VoiceAction::ImportCancel { .. }) => {
+            Some(action)
+        }
+        _ => None,
+    }
+}
+
+/// Guild-level role gate shared by voice slash commands and the `/import`
+/// Confirm/Cancel buttons. `None` means proceed; `Some(response)` is the
+/// refusal to send (required role, per-command restriction, or unreadable
+/// settings for non-admins).
+async fn command_gate<S: RoomPersistence + Send + 'static>(
+    store: &S,
+    guild_id: Snowflake,
+    member: &AccessMember,
+    command_name: &str,
+) -> Option<InteractionResponse> {
+    match store.access_controls(guild_id).await {
+        Ok(controls) => match may_use_command(&controls, member, command_name) {
+            AccessDecision::Allow => None,
+            AccessDecision::Deny(reason) => Some(ephemeral_response(access_denied_text(reason))),
+        },
+        Err(_) if !member.is_admin => Some(ephemeral_response(
+            "Voice-room settings are unavailable right now. Try again shortly.",
+        )),
+        Err(_) => None,
+    }
+}
+
 // --- `/create` + `/setup` interaction handlers (S4) ---------------------------
 //
 // Pure parse and auth stay testable without Discord; execution runs one
@@ -3602,6 +4552,31 @@ pub enum VoiceCommand {
         channel_id: Snowflake,
         request: TextChannelsRequest,
     },
+    /// V8 per-creator placement: side plus first room number.
+    Position {
+        channel_id: Snowflake,
+        request: PositionRequest,
+    },
+    /// V8 per-creator shared category numbering toggle.
+    Group {
+        channel_id: Snowflake,
+        request: GroupRequest,
+    },
+    /// V8 per-creator permission-override source.
+    InheritPermissions {
+        channel_id: Snowflake,
+        request: InheritPermissionsRequest,
+    },
+    /// V8 per-creator starting user limit.
+    DefaultLimit {
+        channel_id: Snowflake,
+        request: DefaultLimitRequest,
+    },
+    /// V8 per-creator private default.
+    AlwaysPrivate {
+        channel_id: Snowflake,
+        request: AlwaysPrivateRequest,
+    },
     /// Original creator (or a member whose room owner is gone) claims the room.
     Reclaim,
     /// Owner (or admin) hands the room to an occupant, who becomes the
@@ -3611,6 +4586,22 @@ pub enum VoiceCommand {
     },
     Access(AccessAction),
     Logging(LoggingAction),
+    Export,
+    /// `/import file`: the resolved attachment id; `None` when the option
+    /// is missing or of the wrong type (answered, never ignored).
+    Import {
+        file_id: Option<Id<AttachmentMarker>>,
+    },
+    /// V4 vote-kick: start a vote against a room occupant.
+    Kick {
+        target: Snowflake,
+        reason: Option<String>,
+    },
+    /// V4 vote-kick: one ballot button press, addressed by vote ID.
+    Ballot {
+        vote_id: Snowflake,
+        ballot: VoteBallot,
+    },
 }
 
 /// One `/logging` sub-command. `Invalid` is a malformed or unknown shape; it
@@ -3650,6 +4641,15 @@ pub fn interaction_guild(interaction: &Interaction) -> Option<Snowflake> {
 /// (non-command interactions, other commands, guild-less invocations).
 #[must_use]
 pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
+    // Ballot buttons bypass the slash parser: the custom ID carries the vote.
+    // Unknown custom IDs stay silent here so the shared router keeps them.
+    if interaction.kind == InteractionType::MessageComponent {
+        let InteractionData::MessageComponent(component) = interaction.data.as_ref()? else {
+            return None;
+        };
+        interaction_guild(interaction)?;
+        return parse_vote_button(&component.custom_id);
+    }
     if interaction.kind != InteractionType::ApplicationCommand {
         return None;
     }
@@ -3700,6 +4700,107 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
                 request,
             })
         }
+        "position" => {
+            let mut channel_id = 0;
+            let mut request = PositionRequest {
+                position: None,
+                first_number: None,
+            };
+            for option in &command.options {
+                match (option.name.as_str(), &option.value) {
+                    ("channel", CommandOptionValue::Channel(id)) => channel_id = id.get(),
+                    ("position", CommandOptionValue::String(value)) => {
+                        request.position = match value.as_str() {
+                            "above" => Some(RoomPosition::Above),
+                            "below" => Some(RoomPosition::Below),
+                            _ => None,
+                        };
+                    }
+                    ("first-number", CommandOptionValue::Integer(value)) => {
+                        request.first_number = Some(*value);
+                    }
+                    _ => {}
+                }
+            }
+            Some(VoiceCommand::Position {
+                channel_id,
+                request,
+            })
+        }
+        "group" => {
+            let mut channel_id = 0;
+            let mut request = GroupRequest { enabled: None };
+            for option in &command.options {
+                match (option.name.as_str(), &option.value) {
+                    ("channel", CommandOptionValue::Channel(id)) => channel_id = id.get(),
+                    ("enabled", CommandOptionValue::Boolean(value)) => {
+                        request.enabled = Some(*value);
+                    }
+                    _ => {}
+                }
+            }
+            Some(VoiceCommand::Group {
+                channel_id,
+                request,
+            })
+        }
+        "inheritpermissions" => {
+            let mut channel_id = 0;
+            let mut request = InheritPermissionsRequest {
+                source: None,
+                source_channel: None,
+            };
+            for option in &command.options {
+                match (option.name.as_str(), &option.value) {
+                    ("channel", CommandOptionValue::Channel(id)) => channel_id = id.get(),
+                    ("source", CommandOptionValue::String(value)) => {
+                        request.source = Some(value.clone());
+                    }
+                    ("source-channel", CommandOptionValue::Channel(id)) => {
+                        request.source_channel = Some(id.get());
+                    }
+                    _ => {}
+                }
+            }
+            Some(VoiceCommand::InheritPermissions {
+                channel_id,
+                request,
+            })
+        }
+        "defaultlimit" => {
+            let mut channel_id = 0;
+            let mut request = DefaultLimitRequest { limit: None };
+            for option in &command.options {
+                match (option.name.as_str(), &option.value) {
+                    ("channel", CommandOptionValue::Channel(id)) => channel_id = id.get(),
+                    ("limit", CommandOptionValue::Integer(value)) => {
+                        request.limit = Some(*value);
+                    }
+                    _ => {}
+                }
+            }
+            Some(VoiceCommand::DefaultLimit {
+                channel_id,
+                request,
+            })
+        }
+        "alwaysprivate" => {
+            let mut channel_id = 0;
+            let mut request = AlwaysPrivateRequest { enabled: None };
+            for option in &command.options {
+                match (option.name.as_str(), &option.value) {
+                    ("channel", CommandOptionValue::Channel(id)) => channel_id = id.get(),
+                    ("enabled", CommandOptionValue::Boolean(value)) => {
+                        request.enabled = Some(*value);
+                    }
+                    _ => {}
+                }
+            }
+            Some(VoiceCommand::AlwaysPrivate {
+                channel_id,
+                request,
+            })
+        }
         "reclaim" => Some(VoiceCommand::Reclaim),
         "transfer" => {
             // The `member` option is required at registration, so Discord
@@ -3720,8 +4821,54 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
         "logging" => Some(VoiceCommand::Logging(parse_logging_action(
             &command.options,
         ))),
+        "export" => Some(VoiceCommand::Export),
+        "import" => Some(VoiceCommand::Import {
+            file_id: command.options.iter().find_map(|option| {
+                if option.name == "file" {
+                    match &option.value {
+                        CommandOptionValue::Attachment(id) => Some(*id),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }),
+        }),
+        // The published shape may be ours (`member`, reason optional) or the
+        // moderation one (`target`, reason required): runtime dispatch, not
+        // the published shape, decides vote-kick versus moderation kick, so
+        // accept both. An unparsable shape stays silent here so the shared
+        // router keeps the interaction.
+        "kick" => parse_kick_target(&command.options).map(|target| VoiceCommand::Kick {
+            target,
+            reason: parse_kick_reason(&command.options),
+        }),
         _ => None,
     }
+}
+
+/// The vote target: our `member` option or the moderation `target` option.
+fn parse_kick_target(options: &[CommandDataOption]) -> Option<Snowflake> {
+    options.iter().find_map(|option| match &option.value {
+        CommandOptionValue::User(id) if option.name == "member" || option.name == "target" => {
+            Some(id.get())
+        }
+        _ => None,
+    })
+}
+
+/// The optional vote reason, trimmed and length-capped like the definition.
+fn parse_kick_reason(options: &[CommandDataOption]) -> Option<String> {
+    options
+        .iter()
+        .find(|option| option.name == "reason")
+        .and_then(|option| match &option.value {
+            CommandOptionValue::String(value) => {
+                let reason: String = value.trim().chars().take(512).collect();
+                (!reason.is_empty()).then_some(reason)
+            }
+            _ => None,
+        })
 }
 
 /// Invoking member id plus effective Manage Channels authority, from the
@@ -3818,9 +4965,9 @@ fn parse_access_action(options: &[CommandDataOption]) -> AccessAction {
     }
 }
 
-/// `/create` and `/textchannels` need Manage Channels; admins pass
-/// everywhere. `/setup` is view-open and `/access` checks the admin flag
-/// itself. Fail closed on missing permissions.
+/// `/create`, `/textchannels` and the V8 per-creator settings commands need
+/// Manage Channels; admins pass everywhere. `/setup` is view-open and
+/// `/access` checks the admin flag itself. Fail closed on missing permissions.
 fn may_create(permissions: Option<Permissions>) -> bool {
     is_voice_admin(permissions)
 }
@@ -3842,12 +4989,49 @@ impl VoiceCommand {
             Self::Ping => "ping",
             Self::Invite => "invite",
             Self::TextChannels { .. } => "textchannels",
+            Self::Position { .. } => "position",
+            Self::Group { .. } => "group",
+            Self::InheritPermissions { .. } => "inheritpermissions",
+            Self::DefaultLimit { .. } => "defaultlimit",
+            Self::AlwaysPrivate { .. } => "alwaysprivate",
             Self::Access(_) => "access",
             Self::Reclaim => "reclaim",
             Self::Transfer { .. } => "transfer",
             Self::Logging(_) => "logging",
+            Self::Export => "export",
+            Self::Import { .. } => "import",
+            // Ballots share the `kick` restriction surface: one role gate
+            // covers starting votes and casting them.
+            Self::Kick { .. } | Self::Ballot { .. } => "kick",
         }
     }
+}
+
+/// Button namespace for V4 ballots. The button carries only the vote ID (the
+/// initiating interaction ID); guild, room and target always come from the
+/// worker ledger, never from the payload.
+const VOTE_BUTTON_PREFIX: &str = "votekick:";
+
+/// Parse one ballot button press. `None` when the custom ID is not ours.
+fn parse_vote_button(custom_id: &str) -> Option<VoiceCommand> {
+    let rest = custom_id.strip_prefix(VOTE_BUTTON_PREFIX)?;
+    let (vote_id, ballot) = rest.split_once(':')?;
+    let vote_id: Snowflake = vote_id.parse().ok()?;
+    let ballot = match ballot {
+        "yes" => VoteBallot::Yes,
+        "no" => VoteBallot::No,
+        _ => return None,
+    };
+    Some(VoiceCommand::Ballot { vote_id, ballot })
+}
+
+/// Button custom ID for one ballot. Inverse of [`parse_vote_button`].
+fn vote_button_id(vote_id: Snowflake, ballot: VoteBallot) -> String {
+    let vote = match ballot {
+        VoteBallot::Yes => "yes",
+        VoteBallot::No => "no",
+    };
+    format!("{VOTE_BUTTON_PREFIX}{vote_id}:{vote}")
 }
 
 /// The invoking member's access facts: effective admin flag and role IDs.
@@ -3889,6 +5073,139 @@ fn unix_now_ms() -> u64 {
         .map_or(0, |elapsed| {
             u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+/// Public vote-kick ballot message for a freshly started vote.
+#[must_use]
+fn vote_message(
+    update: &VoteKickUpdate,
+    initiator: Snowflake,
+    target: Snowflake,
+    reason: Option<&str>,
+) -> InteractionResponse {
+    let mut lines = vec![format!(
+        "<@{target}> — <@{initiator}> started a vote to disconnect them from this voice room."
+    )];
+    if let Some(reason) = reason {
+        lines.push(format!("Reason: {reason}"));
+    }
+    lines.push(format!(
+        "Vote with the buttons: {}/{} needed. Not voting counts as No. The vote ends in 2 minutes.",
+        update.progress.required, update.progress.total,
+    ));
+    ballot_response(
+        &lines.join("\n"),
+        update,
+        target,
+        InteractionResponseType::ChannelMessageWithSource,
+        false,
+    )
+}
+
+/// Follow-up ballot state for an in-flight vote, delivered as an in-place
+/// message update so the ballot stays a single message.
+#[must_use]
+fn vote_update_message(update: &VoteKickUpdate) -> InteractionResponse {
+    let content = match update.status {
+        VoteKickStatus::Active => format!(
+            "Vote-kick <@{}>: {}/{} needed. Not voting counts as No. The vote ends in 2 minutes.",
+            update.vote.target_id, update.progress.required, update.progress.total,
+        ),
+        VoteKickStatus::Passed => format!(
+            "Vote passed: <@{}> will be disconnected and kept out of this room.",
+            update.vote.target_id
+        ),
+        VoteKickStatus::Expired => "Vote expired with too few Yes votes.".to_owned(),
+        VoteKickStatus::Cancelled(VoteCancellation::TargetLeft) => {
+            "Vote cancelled: the target left the room.".to_owned()
+        }
+        VoteKickStatus::Cancelled(VoteCancellation::TargetProtected) => {
+            "Vote cancelled: the target can no longer be voted out.".to_owned()
+        }
+    };
+    ballot_response(
+        &content,
+        update,
+        update.vote.target_id,
+        InteractionResponseType::UpdateMessage,
+        update.status != VoteKickStatus::Active,
+    )
+}
+
+/// Shared ballot shell: public message plus Yes/No buttons bound to the vote.
+/// Buttons disable once the vote leaves Active so late presses cannot imply
+/// a live ballot (the worker still rejects them by ID).
+fn ballot_response(
+    content: &str,
+    update: &VoteKickUpdate,
+    target: Snowflake,
+    kind: InteractionResponseType,
+    disabled: bool,
+) -> InteractionResponse {
+    let button = |ballot: VoteBallot, label: &str, style: ButtonStyle| {
+        Component::Button(Button {
+            id: None,
+            custom_id: Some(vote_button_id(update.vote.id, ballot)),
+            disabled,
+            emoji: None,
+            label: Some(label.to_owned()),
+            style,
+            url: None,
+            sku_id: None,
+        })
+    };
+    InteractionResponse {
+        kind,
+        data: Some(InteractionResponseData {
+            content: Some(content.to_owned()),
+            allowed_mentions: Some(AllowedMentions {
+                parse: Vec::new(),
+                users: vec![Id::<UserMarker>::new(target)],
+                roles: Vec::new(),
+                replied_user: false,
+            }),
+            components: Some(vec![Component::ActionRow(ActionRow {
+                id: None,
+                components: vec![
+                    button(VoteBallot::Yes, "Yes", ButtonStyle::Danger),
+                    button(VoteBallot::No, "No", ButtonStyle::Secondary),
+                ],
+            })]),
+            ..Default::default()
+        }),
+    }
+}
+
+/// One-line refusal for a rejected vote-kick start or ballot.
+fn kick_refusal_text(refusal: &KickRefusal) -> &'static str {
+    match refusal {
+        KickRefusal::Unavailable => "Voice state is syncing right now. Try again shortly.",
+        KickRefusal::NotARoom => "That member is not in a temporary voice room.",
+        KickRefusal::Vote(VoteKickError::InitiatorNotOccupant) => {
+            "Only room occupants can start a vote."
+        }
+        KickRefusal::Vote(VoteKickError::TargetNotOccupant) => "The target must be in the room.",
+        KickRefusal::Vote(VoteKickError::SelfTarget) => "You cannot start a vote against yourself.",
+        KickRefusal::Vote(VoteKickError::ProtectedTarget) => {
+            "The room owner and original creator cannot be voted out."
+        }
+        KickRefusal::Vote(VoteKickError::ActiveVoteExists) => {
+            "A vote is already active for that member."
+        }
+        KickRefusal::Vote(VoteKickError::ReusedVoteId) => {
+            "That vote was already started. Try again."
+        }
+        KickRefusal::Vote(VoteKickError::UnknownVote | VoteKickError::WrongVoteBoundary) => {
+            "That vote has already ended."
+        }
+        KickRefusal::Vote(VoteKickError::IneligibleVoter) => {
+            "Only current occupants other than the target can vote."
+        }
+        KickRefusal::Vote(VoteKickError::RepeatedVote) => "You have already voted.",
+        KickRefusal::Vote(VoteKickError::InvalidTime) => {
+            "The vote clock disagrees with this device. Try again shortly."
+        }
+    }
 }
 
 /// Ephemeral `ChannelMessageWithSource` reply shell.
@@ -3987,6 +5304,17 @@ async fn execute_create<S: RoomPersistence, H: RoomWrites>(
         Err(error) => {
             let compensation = http.delete(channel_id, always).await;
             let removed = compensation.is_ok();
+            if !removed {
+                // Untracked orphan: reconcile will not delete it, so count it
+                // here with no channel ID. The ephemeral reply above names the
+                // channel for manual cleanup.
+                metrics::global().voice_orphan();
+                warn!(
+                    voice_event = "voice_creator_orphan",
+                    outcome = "manual_needed",
+                    "voice creator orphan needs manual deletion"
+                );
+            }
             match error {
                 StoreError::CredentialRefused if removed => "Voice rooms are paused: the database refused the bot credential, so the new channel was removed. Tell an admin to fix it, then restart the bot.".to_owned(),
                 StoreError::CredentialRefused => format!("Voice rooms are paused: the database refused the bot credential, and removing the new channel failed. Delete <#{channel_id}> manually, then tell an admin to fix the database."),
@@ -4182,15 +5510,18 @@ where
     H: RoomWrites + Send + 'static,
     F: Future<Output = ()> + Send,
 {
-    handle_voice_interaction_with(runtime, interaction, None, reply).await
+    handle_voice_interaction_with(runtime, interaction, None, None, reply).await
 }
 
 /// [`handle_voice_interaction`] with the guild's vanity invite code, which
 /// only the gateway cache knows. `None` renders the "no invite" notice.
+/// `inventory` is the trusted live guild inventory for `/export` and
+/// `/import`; `None` refuses those two commands as unavailable.
 pub async fn handle_voice_interaction_with<S, H, F>(
     runtime: &VoiceRuntime<S, H>,
     interaction: &Interaction,
     invite_code: Option<&str>,
+    inventory: Option<&GuildInventory>,
     reply: impl FnOnce(InteractionResponse) -> F + Send,
 ) -> bool
 where
@@ -4198,33 +5529,23 @@ where
     H: RoomWrites + Send + 'static,
     F: Future<Output = ()> + Send,
 {
-    let Some(command) = parse_voice_command(interaction) else {
+    let Some(guild_id) = interaction_guild(interaction) else {
         return false;
     };
-    let Some(guild_id) = interaction_guild(interaction) else {
+    if let Some(action) = voice_import_action(interaction) {
+        return handle_import_component(runtime, interaction, guild_id, action, inventory, reply)
+            .await;
+    }
+    let Some(command) = parse_voice_command(interaction) else {
         return false;
     };
     // Guild-level role gate first. Settings that cannot be read fail closed for
     // members: only an admin proceeds without them.
     let member = access_member(interaction);
     let (gate_store, _) = runtime.make_pair();
-    match gate_store.access_controls(guild_id).await {
-        Ok(controls) => {
-            if let AccessDecision::Deny(reason) =
-                may_use_command(&controls, &member, command.name())
-            {
-                reply(ephemeral_response(access_denied_text(reason))).await;
-                return true;
-            }
-        }
-        Err(_) if !member.is_admin => {
-            reply(ephemeral_response(
-                "Voice-room settings are unavailable right now. Try again shortly.",
-            ))
-            .await;
-            return true;
-        }
-        Err(_) => {}
+    if let Some(denial) = command_gate(&gate_store, guild_id, &member, command.name()).await {
+        reply(denial).await;
+        return true;
     }
     match command {
         VoiceCommand::Ping => {
@@ -4266,6 +5587,66 @@ where
             let (store, _) = runtime.make_pair();
             let text = execute_logging(&store, guild_id, action).await;
             reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::Kick { target, reason } => {
+            let Some(initiator) = interaction.author_id().map(|id| id.get()) else {
+                reply(ephemeral_response(
+                    "Could not tell who started the vote. Try again.",
+                ))
+                .await;
+                return true;
+            };
+            // Resolve the room first. The sink only reaches this arm for
+            // claimed votes (it returns before deferring otherwise, leaving
+            // the router to answer), so a refusal here is exactly once.
+            // `kick_start` revalidates atomically, so a join in between
+            // cannot corrupt the ledger.
+            let Some(room_id) = runtime.kick_room_of(guild_id, target).await else {
+                reply(ephemeral_response(kick_refusal_text(
+                    &KickRefusal::NotARoom,
+                )))
+                .await;
+                return true;
+            };
+            match runtime
+                .kick_start(guild_id, interaction.id.get(), room_id, initiator, target)
+                .await
+            {
+                None => {
+                    reply(ephemeral_response(
+                        "Voice state is syncing right now. Try again shortly.",
+                    ))
+                    .await;
+                }
+                Some(Ok(update)) => {
+                    reply(vote_message(&update, initiator, target, reason.as_deref())).await;
+                }
+                Some(Err(refusal)) => {
+                    reply(ephemeral_response(kick_refusal_text(&refusal))).await;
+                }
+            }
+            true
+        }
+        VoiceCommand::Ballot { vote_id, ballot } => {
+            let Some(voter) = interaction.author_id().map(|id| id.get()) else {
+                reply(ephemeral_response("Could not tell who voted. Try again.")).await;
+                return true;
+            };
+            match runtime.kick_ballot(guild_id, vote_id, voter, ballot).await {
+                None => {
+                    reply(ephemeral_response(
+                        "Voice state is syncing right now. Try again shortly.",
+                    ))
+                    .await;
+                }
+                Some(Ok(update)) => {
+                    reply(vote_update_message(&update)).await;
+                }
+                Some(Err(refusal)) => {
+                    reply(ephemeral_response(kick_refusal_text(&refusal))).await;
+                }
+            }
             true
         }
         VoiceCommand::Setup => {
@@ -4358,6 +5739,181 @@ where
             reply(ephemeral_response(&text)).await;
             true
         }
+        VoiceCommand::Position {
+            channel_id,
+            request,
+        } => {
+            let permissions = interaction
+                .member
+                .as_ref()
+                .and_then(|member| member.permissions);
+            if !may_create(permissions) {
+                reply(ephemeral_response(
+                    "You need Manage Channels to use /position.",
+                ))
+                .await;
+                return true;
+            }
+            let (store, _) = runtime.make_pair();
+            let text = match store.creator_for(guild_id, channel_id).await {
+                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Ok(creator) => match decide_position(creator, &request) {
+                    PositionPlan::Refuse { message } => message,
+                    PositionPlan::Update(creator) => match store.add_creator(&creator).await {
+                        Ok(()) => {
+                            runtime.creator_updated(&creator);
+                            position_summary(&creator)
+                        }
+                        Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
+                        Err(error) => {
+                            format!("Could not save the position settings ({error:?}). Try again.")
+                        }
+                    },
+                },
+            };
+            reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::Group {
+            channel_id,
+            request,
+        } => {
+            let permissions = interaction
+                .member
+                .as_ref()
+                .and_then(|member| member.permissions);
+            if !may_create(permissions) {
+                reply(ephemeral_response(
+                    "You need Manage Channels to use /group.",
+                ))
+                .await;
+                return true;
+            }
+            let (store, _) = runtime.make_pair();
+            let text = match store.creator_for(guild_id, channel_id).await {
+                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Ok(creator) => match decide_group(creator, &request) {
+                    GroupPlan::Refuse { message } => message,
+                    GroupPlan::Update(creator) => match store.add_creator(&creator).await {
+                        Ok(()) => {
+                            runtime.creator_updated(&creator);
+                            group_summary(&creator)
+                        }
+                        Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
+                        Err(error) => {
+                            format!("Could not save the grouping settings ({error:?}). Try again.")
+                        }
+                    },
+                },
+            };
+            reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::InheritPermissions {
+            channel_id,
+            request,
+        } => {
+            let permissions = interaction
+                .member
+                .as_ref()
+                .and_then(|member| member.permissions);
+            if !may_create(permissions) {
+                reply(ephemeral_response(
+                    "You need Manage Channels to use /inheritpermissions.",
+                ))
+                .await;
+                return true;
+            }
+            let (store, _) = runtime.make_pair();
+            let text = match store.creator_for(guild_id, channel_id).await {
+                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Ok(creator) => match decide_inherit_permissions(creator, &request) {
+                    InheritPermissionsPlan::Refuse { message } => message,
+                    InheritPermissionsPlan::Update(creator) => match store.add_creator(&creator).await {
+                        Ok(()) => {
+                            runtime.creator_updated(&creator);
+                            inherit_permissions_summary(&creator)
+                        }
+                        Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
+                        Err(error) => {
+                            format!("Could not save the permission settings ({error:?}). Try again.")
+                        }
+                    },
+                },
+            };
+            reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::DefaultLimit {
+            channel_id,
+            request,
+        } => {
+            let permissions = interaction
+                .member
+                .as_ref()
+                .and_then(|member| member.permissions);
+            if !may_create(permissions) {
+                reply(ephemeral_response(
+                    "You need Manage Channels to use /defaultlimit.",
+                ))
+                .await;
+                return true;
+            }
+            let (store, _) = runtime.make_pair();
+            let text = match store.creator_for(guild_id, channel_id).await {
+                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Ok(creator) => match decide_default_limit(creator, &request) {
+                    DefaultLimitPlan::Refuse { message } => message,
+                    DefaultLimitPlan::Update(creator) => match store.add_creator(&creator).await {
+                        Ok(()) => {
+                            runtime.creator_updated(&creator);
+                            default_limit_summary(&creator)
+                        }
+                        Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
+                        Err(error) => {
+                            format!("Could not save the limit settings ({error:?}). Try again.")
+                        }
+                    },
+                },
+            };
+            reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::AlwaysPrivate {
+            channel_id,
+            request,
+        } => {
+            let permissions = interaction
+                .member
+                .as_ref()
+                .and_then(|member| member.permissions);
+            if !may_create(permissions) {
+                reply(ephemeral_response(
+                    "You need Manage Channels to use /alwaysprivate.",
+                ))
+                .await;
+                return true;
+            }
+            let (store, _) = runtime.make_pair();
+            let text = match store.creator_for(guild_id, channel_id).await {
+                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Ok(creator) => match decide_always_private(creator, &request) {
+                    AlwaysPrivatePlan::Refuse { message } => message,
+                    AlwaysPrivatePlan::Update(creator) => match store.add_creator(&creator).await {
+                        Ok(()) => {
+                            runtime.creator_updated(&creator);
+                            always_private_summary(&creator)
+                        }
+                        Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
+                        Err(error) => {
+                            format!("Could not save the privacy settings ({error:?}). Try again.")
+                        }
+                    },
+                },
+            };
+            reply(ephemeral_response(&text)).await;
+            true
+        }
         VoiceCommand::Reclaim => {
             let Some((actor_id, is_admin)) = interaction_actor(interaction) else {
                 reply(ephemeral_response(
@@ -4406,7 +5962,294 @@ where
             reply(ephemeral_response(&text)).await;
             true
         }
+        VoiceCommand::Export => {
+            let Some(inventory) = inventory else {
+                reply(ephemeral_response(
+                    "Voice configuration is unavailable right now. Try again shortly.",
+                ))
+                .await;
+                return true;
+            };
+            let permissions = interaction
+                .member
+                .as_ref()
+                .and_then(|member| member.permissions);
+            if !may_manage_server(permissions) {
+                reply(ephemeral_response("You need Manage Server to use /export.")).await;
+                return true;
+            }
+            let (store, _) = runtime.make_pair();
+            let config = match store.config_snapshot(guild_id).await {
+                Ok(config) => config,
+                Err(_) => {
+                    reply(ephemeral_response(
+                        "Could not read the voice configuration. Nothing was sent; try again.",
+                    ))
+                    .await;
+                    return true;
+                }
+            };
+            match export_configuration(&config, inventory) {
+                Ok(bytes) => {
+                    reply(export_file_response(
+                        &format!(
+                            "Voice configuration for this server (v{}). Re-import it with /import.",
+                            VOICE_CONFIG_VERSION
+                        ),
+                        export_filename(guild_id),
+                        bytes,
+                    ))
+                    .await;
+                }
+                Err(error) => {
+                    reply(ephemeral_response(&format!(
+                        "Could not export the voice configuration: {error} Nothing was sent."
+                    )))
+                    .await;
+                }
+            }
+            true
+        }
+        VoiceCommand::Import { file_id } => {
+            handle_import_upload(runtime, interaction, guild_id, file_id, inventory, reply).await
+        }
     }
+}
+
+/// Handle one `/import file` upload: Manage Server check, attachment size
+/// check before download, snapshot, plan, and either refuse, show the diff
+/// preview with Confirm/Cancel, or note an empty diff. Always replies
+/// exactly once and returns true.
+async fn handle_import_upload<S, H, F>(
+    runtime: &VoiceRuntime<S, H>,
+    interaction: &Interaction,
+    guild_id: Snowflake,
+    file_id: Option<Id<AttachmentMarker>>,
+    inventory: Option<&GuildInventory>,
+    reply: impl FnOnce(InteractionResponse) -> F + Send,
+) -> bool
+where
+    S: RoomPersistence + Send + 'static,
+    H: RoomWrites + Send + 'static,
+    F: Future<Output = ()> + Send,
+{
+    let Some(inventory) = inventory else {
+        reply(ephemeral_response(
+            "Voice configuration is unavailable right now. Try again shortly.",
+        ))
+        .await;
+        return true;
+    };
+    let permissions = interaction
+        .member
+        .as_ref()
+        .and_then(|member| member.permissions);
+    if !may_manage_server(permissions) {
+        reply(ephemeral_response("You need Manage Server to use /import.")).await;
+        return true;
+    }
+    let Some(member_id) = invoker_member_id(interaction) else {
+        reply(ephemeral_response(
+            "Could not tell who uploaded that file. Nothing was changed; try again.",
+        ))
+        .await;
+        return true;
+    };
+    let Some(file_id) = file_id else {
+        reply(ephemeral_response(
+            "Attach a voice configuration JSON file to /import, then try again.",
+        ))
+        .await;
+        return true;
+    };
+    let attachment = match &interaction.data {
+        Some(InteractionData::ApplicationCommand(command)) => command
+            .resolved
+            .as_ref()
+            .and_then(|resolved| resolved.attachments.get(&file_id))
+            .cloned(),
+        _ => None,
+    };
+    let Some(attachment) = attachment else {
+        reply(ephemeral_response(
+            "Could not read that attachment. Nothing was changed; attach the file again.",
+        ))
+        .await;
+        return true;
+    };
+    if attachment.size > MAX_IMPORT_BYTES as u64 {
+        reply(ephemeral_response(&format!(
+            "That file is too large ({} bytes; the limit is {} bytes). Nothing was changed.",
+            attachment.size, MAX_IMPORT_BYTES,
+        )))
+        .await;
+        return true;
+    }
+    let (store, http) = runtime.make_pair();
+    let current = match store.config_snapshot(guild_id).await {
+        Ok(config) => config,
+        Err(_) => {
+            reply(ephemeral_response(
+                "Could not read the current voice configuration. Nothing was changed; try again.",
+            ))
+            .await;
+            return true;
+        }
+    };
+    let bytes = match http
+        .download_attachment(&attachment.url, MAX_IMPORT_BYTES)
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            reply(ephemeral_response(
+                "Could not download that file. Nothing was changed; attach it again.",
+            ))
+            .await;
+            return true;
+        }
+    };
+    match plan_import_preview(&current, &bytes, inventory) {
+        ImportDecision::Refuse { message } => {
+            reply(ephemeral_response(&message)).await;
+        }
+        ImportDecision::Notice { text } => {
+            reply(ephemeral_response(&text)).await;
+        }
+        ImportDecision::Preview {
+            candidate,
+            hash,
+            text,
+        } => {
+            runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
+            reply(import_preview_response(&text, member_id, &hash)).await;
+        }
+        ImportDecision::Apply { .. } => {
+            warn!(
+                guild_id,
+                "import preview planned an apply; refusing without writing"
+            );
+            reply(ephemeral_response(
+                "Could not plan that import. Nothing was changed; try again.",
+            ))
+            .await;
+        }
+    }
+    true
+}
+
+/// Handle one `/import` Confirm/Cancel click: the clicker must be the
+/// uploader with Manage Server, and the preview must be unexpired. Confirm
+/// re-reads current state, re-diffs and applies on a hash match, or shows a
+/// fresh preview when the guild changed underneath. Cancel and expiry write
+/// nothing. Always replies exactly once and returns true.
+async fn handle_import_component<S, H, F>(
+    runtime: &VoiceRuntime<S, H>,
+    interaction: &Interaction,
+    guild_id: Snowflake,
+    action: VoiceAction,
+    inventory: Option<&GuildInventory>,
+    reply: impl FnOnce(InteractionResponse) -> F + Send,
+) -> bool
+where
+    S: RoomPersistence + Send + 'static,
+    H: RoomWrites + Send + 'static,
+    F: Future<Output = ()> + Send,
+{
+    let (member_id, hash, confirm) = match action {
+        VoiceAction::ImportConfirm { member_id, hash } => (member_id, hash, true),
+        VoiceAction::ImportCancel { member_id, hash } => (member_id, hash, false),
+        _ => return false,
+    };
+    if invoker_member_id(interaction) != Some(member_id) {
+        reply(ephemeral_response(
+            "Only the member who uploaded the file can answer this preview.",
+        ))
+        .await;
+        return true;
+    }
+    let permissions = interaction
+        .member
+        .as_ref()
+        .and_then(|member| member.permissions);
+    if !may_manage_server(permissions) {
+        reply(ephemeral_response(
+            "You need Manage Server to confirm an import.",
+        ))
+        .await;
+        return true;
+    }
+    let member = access_member(interaction);
+    let (store, _) = runtime.make_pair();
+    if let Some(denial) = command_gate(&store, guild_id, &member, "import").await {
+        reply(denial).await;
+        return true;
+    }
+    // Cancel needs no inventory: dropping a pending preview must work even
+    // when the guild cache is briefly unavailable.
+    if !confirm {
+        runtime.cancel_pending_import(guild_id, member_id, &hash);
+        reply(ephemeral_response("Import cancelled. Nothing was changed.")).await;
+        return true;
+    }
+    let Some(inventory) = inventory else {
+        reply(ephemeral_response(
+            "Voice configuration is unavailable right now. Try again shortly.",
+        ))
+        .await;
+        return true;
+    };
+    let Some(candidate) = runtime.take_pending_import(guild_id, member_id, &hash) else {
+        reply(ephemeral_response(
+            "That preview expired. Nothing was changed; upload the file again for a fresh preview.",
+        ))
+        .await;
+        return true;
+    };
+    let current = match store.config_snapshot(guild_id).await {
+        Ok(config) => config,
+        Err(_) => {
+            // A transient store blip must not force a re-upload: keep the
+            // preview so Confirm can be retried.
+            runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
+            reply(ephemeral_response(
+                "Could not read the current configuration. Nothing was changed; try confirming again.",
+            ))
+            .await;
+            return true;
+        }
+    };
+    match plan_import_confirm(&current, &candidate, inventory, &hash) {
+        ImportDecision::Refuse { message } => {
+            reply(ephemeral_response(&message)).await;
+        }
+        ImportDecision::Notice { text } => {
+            reply(ephemeral_response(&text)).await;
+        }
+        ImportDecision::Preview {
+            candidate,
+            hash,
+            text,
+        } => {
+            runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
+            reply(import_preview_response(&text, member_id, &hash)).await;
+        }
+        ImportDecision::Apply { candidate, message } => {
+            match store.config_apply(guild_id, &candidate).await {
+                Ok(()) => {
+                    reply(ephemeral_response(&message)).await;
+                }
+                Err(_) => {
+                    runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
+                    reply(ephemeral_response(
+                        "Could not save the import. Nothing was changed; try confirming again.",
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// The invoking guild's vanity invite code from the gateway cache, if any.
@@ -4427,6 +6270,14 @@ pub trait InteractionReplies: Send + Sync {
         interaction: &Interaction,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
     fn complete(
+        &self,
+        interaction: &Interaction,
+        response: InteractionResponse,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// Send the response as the initial interaction callback (type 4 or 7).
+    /// Vote-kick uses this: the public ballot and its in-place updates must
+    /// not travel the ephemeral-defer + PATCH path.
+    fn respond(
         &self,
         interaction: &Interaction,
         response: InteractionResponse,
@@ -4456,16 +6307,39 @@ impl InteractionReplies for RoomHttp {
         interaction: &Interaction,
         response: InteractionResponse,
     ) -> Result<(), RoomHttpError> {
-        let content = response
-            .data
-            .as_ref()
+        let data = response.data.as_ref();
+        let content = data
             .and_then(|data| data.content.as_deref())
             .unwrap_or_default();
         // Discord limits message content to 2000 characters, including setup
         // listings. Keep the transport valid even in a large guild.
         let content: String = content.chars().take(2000).collect();
-        self.complete_interaction(interaction.application_id, &interaction.token, &content)
-            .await
+        let attachments: &[Attachment] = data
+            .and_then(|data| data.attachments.as_deref())
+            .unwrap_or(&[]);
+        let components: Option<&[Component]> = data.and_then(|data| data.components.as_deref());
+        self.complete_interaction(
+            interaction.application_id,
+            &interaction.token,
+            &content,
+            attachments,
+            components,
+        )
+        .await
+    }
+
+    async fn respond(
+        &self,
+        interaction: &Interaction,
+        response: InteractionResponse,
+    ) -> Result<(), RoomHttpError> {
+        self.respond_interaction(
+            interaction.application_id,
+            interaction.id,
+            &interaction.token,
+            &response,
+        )
+        .await
     }
 }
 
@@ -4492,18 +6366,81 @@ where
         replies: &R,
         interaction: &Interaction,
         invite_code: Option<&str>,
+        inventory: Option<GuildInventory>,
     ) {
+        // Vote-kick owns its transport. A non-room `/kick` belongs to the
+        // moderation path, so return before any acknowledgement and let the
+        // router answer: deferring here would race it and hang on "thinking".
+        if let Some(VoiceCommand::Kick { target, .. }) = parse_voice_command(interaction) {
+            let Some(guild) = interaction_guild(interaction) else {
+                return;
+            };
+            if runtime.kick_room_of(guild, target).await.is_none() {
+                return;
+            }
+            let answered: Arc<Mutex<Option<InteractionResponse>>> = Arc::new(Mutex::new(None));
+            let writer = Arc::clone(&answered);
+            handle_voice_interaction_with(
+                runtime,
+                interaction,
+                invite_code,
+                inventory.as_ref(),
+                move |response| async move {
+                    *writer.lock().unwrap() = Some(response);
+                },
+            )
+            .await;
+            let response = answered.lock().unwrap().take();
+            if let Some(response) = response {
+                if let Err(error) = replies.respond(interaction, response).await {
+                    warn!(interaction_id = interaction.id.get(), %error,
+                        "voice vote response failed; not retried");
+                }
+            }
+            return;
+        }
+        if let Some(VoiceCommand::Ballot { .. }) = parse_voice_command(interaction) {
+            // Ballots update the public message in place (type 7). The
+            // defer + PATCH path would edit each voter's own ephemeral
+            // followup instead, so answer with the initial callback.
+            let answered: Arc<Mutex<Option<InteractionResponse>>> = Arc::new(Mutex::new(None));
+            let writer = Arc::clone(&answered);
+            handle_voice_interaction_with(
+                runtime,
+                interaction,
+                invite_code,
+                inventory.as_ref(),
+                move |response| async move {
+                    *writer.lock().unwrap() = Some(response);
+                },
+            )
+            .await;
+            let response = answered.lock().unwrap().take();
+            if let Some(response) = response {
+                if let Err(error) = replies.respond(interaction, response).await {
+                    warn!(interaction_id = interaction.id.get(), %error,
+                        "voice ballot response failed; not retried");
+                }
+            }
+            return;
+        }
         if let Err(error) = replies.defer(interaction).await {
             warn!(interaction_id = interaction.id.get(), %error,
                 "voice acknowledgement failed; command not executed");
             return;
         }
-        handle_voice_interaction_with(runtime, interaction, invite_code, |response| async move {
-            if let Err(error) = replies.complete(interaction, response).await {
-                warn!(interaction_id = interaction.id.get(), %error,
-                    "voice response completion failed; not retried");
-            }
-        })
+        handle_voice_interaction_with(
+            runtime,
+            interaction,
+            invite_code,
+            inventory.as_ref(),
+            |response| async move {
+                if let Err(error) = replies.complete(interaction, response).await {
+                    warn!(interaction_id = interaction.id.get(), %error,
+                        "voice response completion failed; not retried");
+                }
+            },
+        )
         .await;
     }
 }
@@ -4520,15 +6457,26 @@ where
             return;
         }
         if let Event::InteractionCreate(created) = event {
-            if parse_voice_command(&created.0).is_none() {
+            if parse_voice_command(&created.0).is_none()
+                && voice_import_action(&created.0).is_none()
+            {
                 return;
             }
             let interaction = created.0.clone();
             let invite_code = vanity_code_from_cache(cache, &interaction);
+            let inventory = interaction_guild(&interaction)
+                .and_then(|guild_id| inventory_from_cache(cache, guild_id));
             let runtime = Arc::clone(&self.runtime);
             let replies = Arc::clone(&self.replies);
             tokio::spawn(async move {
-                Self::respond_with(&runtime, &replies, &interaction, invite_code.as_deref()).await;
+                Self::respond_with(
+                    &runtime,
+                    &replies,
+                    &interaction,
+                    invite_code.as_deref(),
+                    inventory,
+                )
+                .await;
             });
         }
     }
@@ -4539,6 +6487,15 @@ where
 
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
         self.runtime.needs_bootstrap(cache)
+    }
+
+    fn kick_claim_room(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move { runtime.kick_room_of(guild, member).await })
     }
 }
 

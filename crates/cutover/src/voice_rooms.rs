@@ -17,6 +17,8 @@ use two_bot_core::voice_rooms::{
 };
 use two_bot_core::{format_iso_millis, parse_iso_millis, Snowflake};
 
+use super::voice_config_store::PgVoiceConfigStore;
+
 #[derive(Debug, Clone)]
 pub struct PgRoomStore {
     pool: PgPool,
@@ -26,6 +28,14 @@ impl PgRoomStore {
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// V11 configuration persistence (`/export` reads, `/import` writes)
+    /// over this store's pool. Snapshot and apply each run in one
+    /// transaction; apply never touches live rooms or companions.
+    #[must_use]
+    pub fn voice_configs(&self) -> PgVoiceConfigStore {
+        PgVoiceConfigStore::new(self.pool.clone())
     }
 
     pub async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), sqlx::Error> {
@@ -44,8 +54,8 @@ impl PgRoomStore {
              (guild_id, channel_id, name_template, permission_source,
               permission_channel_id, default_limit, private_default,
               text_channels, text_channel_name, text_viewer_role_id,
-              position, first_room_number)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+              position, first_room_number, group_by_category)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
              ON CONFLICT (guild_id, channel_id) DO UPDATE SET
               name_template = EXCLUDED.name_template,
               permission_source = EXCLUDED.permission_source,
@@ -56,7 +66,8 @@ impl PgRoomStore {
               text_channel_name = EXCLUDED.text_channel_name,
               text_viewer_role_id = EXCLUDED.text_viewer_role_id,
               position = EXCLUDED.position,
-              first_room_number = EXCLUDED.first_room_number",
+              first_room_number = EXCLUDED.first_room_number,
+              group_by_category = EXCLUDED.group_by_category",
         )
         .bind(creator.guild_id.to_string())
         .bind(creator.channel_id.to_string())
@@ -70,6 +81,7 @@ impl PgRoomStore {
         .bind(creator.text_viewer_role_id.map(|id| id.to_string()))
         .bind(position)
         .bind(creator.first_room_number)
+        .bind(creator.group_by_category)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -513,6 +525,7 @@ fn decode_creator(row: &PgRow) -> Result<CreatorChannel, sqlx::Error> {
         text_viewer_role_id,
         position,
         first_room_number: row.try_get("first_room_number")?,
+        group_by_category: row.try_get("group_by_category")?,
     };
     creator.validate().map_err(invalid_argument)?;
     Ok(creator)

@@ -8,7 +8,8 @@ use two_bot_core::voice_config::{
     LoggingConfiguration, PermissionSource, RandomList, RoomPosition, VoiceConfiguration,
 };
 use two_bot_core::voice_config_diff::{
-    apply_diff, diff_configuration, render_preview, skip_unknown_channels, PREVIEW_CHAR_LIMIT,
+    apply_diff, diff_configuration, diff_content_hash, render_preview, skip_unknown_channels,
+    DIFF_HASH_CHARS, PREVIEW_CHAR_LIMIT,
 };
 
 const GUILD: &str = "18446744073709551615";
@@ -192,6 +193,42 @@ fn empty_diff_renders_no_changes() {
     assert_eq!(render_preview(&diff, 10), "No changes");
     assert_eq!(render_preview(&diff, 0), "No changes");
     assert_eq!(apply_diff(&current, &diff), current);
+}
+
+#[test]
+fn content_hash_is_deterministic_hex_of_fixed_length() {
+    let (current, _) = fixture();
+    let mut incoming = current.clone();
+    incoming.aliases.push(alias("new-game", "New Game"));
+    let first = diff_content_hash(&current, &incoming);
+    assert_eq!(first.len(), DIFF_HASH_CHARS);
+    assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(diff_content_hash(&current, &incoming), first);
+}
+
+#[test]
+fn content_hash_changes_when_either_side_changes() {
+    let (current, _) = fixture();
+    let mut incoming = current.clone();
+    incoming.aliases.push(alias("new-game", "New Game"));
+    let baseline = diff_content_hash(&current, &incoming);
+    // A concurrent change to current storage changes the hash.
+    let mut changed_current = current.clone();
+    changed_current
+        .aliases
+        .push(alias("other-game", "Other Game"));
+    assert_ne!(diff_content_hash(&changed_current, &incoming), baseline);
+    // A different candidate changes the hash too.
+    let mut changed_incoming = incoming.clone();
+    changed_incoming
+        .aliases
+        .push(alias("third-game", "Third Game"));
+    assert_ne!(diff_content_hash(&current, &changed_incoming), baseline);
+    // Identical sides hash stably (the confirm step recomputes this).
+    assert_eq!(
+        diff_content_hash(&current, &current),
+        diff_content_hash(&current, &current)
+    );
 }
 
 #[test]

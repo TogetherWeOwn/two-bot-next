@@ -35,9 +35,16 @@ pub mod containment;
 #[cfg(feature = "db")]
 pub mod containment_store;
 #[cfg(feature = "db")]
+pub mod custom_command_service;
+#[cfg(feature = "db")]
+pub mod custom_command_store;
+pub mod custom_commands;
+#[cfg(feature = "db")]
 pub mod database_roles;
 pub mod database_tls;
 pub mod database_url;
+pub mod disable_preflight;
+pub mod e2e_matrix;
 pub mod events;
 pub mod evidence;
 pub mod expected_joins;
@@ -107,6 +114,7 @@ pub mod voice_access;
 pub mod voice_alias;
 pub mod voice_alias_core;
 pub mod voice_assistant;
+pub mod voice_assistant_build;
 pub mod voice_assistant_cap;
 pub mod voice_assistant_request;
 pub mod voice_assistant_validate;
@@ -183,6 +191,20 @@ pub use containment::{
     ContainmentRole, ContainmentSignal, DestructiveAction, DestructiveAuditEvent,
     QuarantineFailure, QuarantinePlan, QuarantineRefusal, CONTAINMENT_ALERT_EVENT,
     CONTAINMENT_ALERT_MAX_IDS, CONTAINMENT_SUPPRESSED_EVENT,
+};
+#[cfg(feature = "db")]
+pub use custom_command_store::{
+    audit as audit_custom_command, delete_command, find_text_trigger, get_command,
+    get_command_by_text_trigger, list_commands, lock_command_capacity, put_command,
+};
+pub use custom_commands::{
+    accepted_text_trigger, adjudicate_delete, adjudicate_put, adjudicate_run,
+    builtin_command_names, check_capacity, deregister_set, error_code, format_command_list,
+    is_builtin_trigger, max_custom_commands, placeholders_in, registry_with_custom,
+    render_template, require_automations_enabled, trigger_word, validate_put_input,
+    validate_template, AuditRecord, CommandError, DeleteDecision, PutCommandInput, PutDecision,
+    RunOutcome, StoredCommand, TemplateContext, TemplateError, MAX_COMMAND_NAME_CHARS,
+    MAX_DESCRIPTION_CHARS, MAX_RENDERED_CHARS, MAX_TEMPLATE_CHARS, TEMPLATE_PLACEHOLDERS,
 };
 pub use events::{CoreEvent, VoiceSessionDelta};
 pub use evidence::{

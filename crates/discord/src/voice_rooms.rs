@@ -29,13 +29,14 @@ use serde::Deserialize;
 use tokio::time::Instant;
 use twilight_http::{error::ErrorType, request::TryIntoRequest, Client};
 use twilight_model::{
-    channel::message::AllowedMentions,
+    channel::message::{component::Component, AllowedMentions},
     channel::{
         permission_overwrite::{PermissionOverwrite, PermissionOverwriteType},
         Channel, ChannelType, VideoQualityMode,
     },
     guild::{Permissions, Role},
     http::{
+        attachment::Attachment,
         interaction::InteractionResponse,
         permission_overwrite::{
             PermissionOverwrite as HttpPermissionOverwrite,
@@ -369,6 +370,12 @@ impl RoomHttp {
                 request.body().unwrap_or_default(),
             )))
             .map_err(|_| RoomHttpError::InvalidRequest)?;
+        // One adapter-visible REST attempt per wire send, shared with the
+        // executor's accounting: template only, never IDs, tokens or bodies.
+        // `Attempt` finishes at headers so 429s stay visible even when the
+        // body is broken; transport failures and outer timeouts fall back to
+        // `transport` via `Drop`.
+        let mut attempt = crate::executor_metrics::Attempt::new(&request);
         let response = tokio::time::timeout(Duration::from_secs(10), async {
             let response = self
                 .transport
@@ -376,6 +383,7 @@ impl RoomHttp {
                 .await
                 .map_err(|_| RoomHttpError::UnknownOutcome)?;
             let status = response.status().as_u16();
+            attempt.finish(Some(status));
             if status == 401 {
                 if bot_authenticated {
                     self.unauthorized.store(true, Ordering::Relaxed);
@@ -447,23 +455,73 @@ impl RoomHttp {
     }
 
     /// Complete the deferred response, never a second initial response.
+    /// `attachments` carries `/export` file bytes; `components` carries the
+    /// `/import` Confirm/Cancel buttons. Both are omitted when empty, so a
+    /// plain text edit changes nothing else on the message.
     pub async fn complete_interaction(
         &self,
         application: Id<ApplicationMarker>,
         token: &str,
         content: &str,
+        attachments: &[Attachment],
+        components: Option<&[Component]>,
     ) -> Result<(), RoomHttpError> {
         let mentions = AllowedMentions::default();
-        let request = self
-            .http
-            .interaction(application)
+        let interaction = self.http.interaction(application);
+        let mut update = interaction
             .update_response(token)
             .content(Some(content))
-            .allowed_mentions(Some(&mentions))
-            .try_into_request()
-            .map_err(classify_http_error)?;
+            .allowed_mentions(Some(&mentions));
+        if !attachments.is_empty() {
+            update = update.attachments(attachments);
+        }
+        if let Some(components) = components {
+            update = update.components(Some(components));
+        }
+        let request = update.try_into_request().map_err(classify_http_error)?;
         self.send_request(request, || true, false).await?;
         Ok(())
+    }
+
+    /// Download a Discord-hosted `/import` file, capped at `max_bytes`.
+    /// Only the Discord CDN host is fetched, over HTTPS and without the bot
+    /// credential: attachment URLs are signed and need no authorization.
+    /// Oversized bodies, non-2xx statuses and transport failures surface as
+    /// errors with no partial bytes.
+    pub async fn download_attachment(
+        &self,
+        url: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RoomHttpError> {
+        let uri: http::Uri = url.parse().map_err(|_| RoomHttpError::InvalidRequest)?;
+        if uri.scheme() != Some(&http::uri::Scheme::HTTPS)
+            || uri.host() != Some("cdn.discordapp.com")
+        {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let request = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Full::new(Bytes::new()))
+            .map_err(|_| RoomHttpError::InvalidRequest)?;
+        let response =
+            tokio::time::timeout(Duration::from_secs(10), self.transport.request(request))
+                .await
+                .map_err(|_| RoomHttpError::UnknownOutcome)?
+                .map_err(|_| RoomHttpError::UnknownOutcome)?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(classify_response(status, &[]));
+        }
+        let body = Limited::new(response.into_body(), max_bytes.saturating_add(1))
+            .collect()
+            .await
+            .map_err(|_| RoomHttpError::UnknownOutcome)?
+            .to_bytes();
+        if body.len() > max_bytes {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        Ok(body.to_vec())
     }
 
     pub async fn create_room(

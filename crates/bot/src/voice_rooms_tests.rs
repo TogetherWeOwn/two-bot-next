@@ -95,6 +95,9 @@ struct Store {
     companion_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
     after_persist: Option<Hook>,
+    config: Arc<Mutex<VoiceConfiguration>>,
+    config_error: Option<StoreError>,
+    save_config_error: Option<StoreError>,
 }
 
 impl Store {
@@ -115,6 +118,9 @@ impl Store {
             companion_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
             after_persist: None,
+            config: Arc::new(Mutex::new(empty_config())),
+            config_error: None,
+            save_config_error: None,
         }
     }
 }
@@ -225,6 +231,21 @@ impl RoomPersistence for Store {
         self.rooms.lock().unwrap().remove(&channel);
         Ok(())
     }
+    async fn config_snapshot(&self, _: u64) -> Result<VoiceConfiguration, StoreError> {
+        match self.config_error {
+            Some(error) => Err(error),
+            None => Ok(self.config.lock().unwrap().clone()),
+        }
+    }
+    async fn config_apply(&self, _: u64, config: &VoiceConfiguration) -> Result<(), StoreError> {
+        if let Some(error) = self.save_config_error {
+            return Err(error);
+        }
+        self.trace.lock().unwrap().push("config_apply".to_owned());
+        *self.config.lock().unwrap() = config.clone();
+        Ok(())
+    }
+
     async fn companions(&self, _: u64) -> Result<Vec<TextCompanion>, StoreError> {
         Ok(self.companions.lock().unwrap().values().cloned().collect())
     }
@@ -259,6 +280,9 @@ impl RoomPersistence for Store {
     }
 }
 
+/// Scripted `/import` download queue shared with the harness.
+type DownloadResults = Arc<Mutex<VecDeque<Result<Vec<u8>, RoomHttpError>>>>;
+
 struct Http {
     trace: Trace,
     next_id: Mutex<u64>,
@@ -275,6 +299,8 @@ struct Http {
     after_create: Option<Hook>,
     before_move: Option<Hook>,
     before_delete: Option<Hook>,
+    downloaded_urls: Mutex<Vec<String>>,
+    download_results: DownloadResults,
 }
 
 impl Http {
@@ -295,6 +321,8 @@ impl Http {
             after_create: None,
             before_move: None,
             before_delete: None,
+            downloaded_urls: Mutex::new(Vec::new()),
+            download_results: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 }
@@ -406,6 +434,19 @@ impl RoomWrites for Http {
             None => Ok(()),
         }
     }
+    async fn download_attachment(
+        &self,
+        url: &str,
+        _max_bytes: usize,
+    ) -> Result<Vec<u8>, RoomHttpError> {
+        self.trace.lock().unwrap().push(format!("download:{url}"));
+        self.downloaded_urls.lock().unwrap().push(url.to_owned());
+        match self.download_results.lock().unwrap().pop_front() {
+            Some(result) => result,
+            None => Err(RoomHttpError::UnknownOutcome),
+        }
+    }
+
     async fn create_companion(
         &self,
         plan: &TextChannelPlan,
@@ -1388,7 +1429,15 @@ fn voice_command_set_is_gated_on_two_voice() {
             "access",
             "reclaim",
             "transfer",
-            "logging"
+            "logging",
+            "export",
+            "import",
+            "position",
+            "group",
+            "inheritpermissions",
+            "defaultlimit",
+            "alwaysprivate",
+            "kick"
         ]
     );
     let off = VoiceGates::from_map(&Default::default());
@@ -1804,7 +1853,7 @@ async fn invite_renders_the_vanity_code_or_the_fixed_notice() {
     );
     let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
     let writer = seen.clone();
-    handle_voice_interaction_with(&runtime, &interaction, Some("abc-123"), |response| {
+    handle_voice_interaction_with(&runtime, &interaction, Some("abc-123"), None, |response| {
         *writer.lock().unwrap() = Some(response);
         async {}
     })
@@ -2807,6 +2856,617 @@ async fn handle_textchannels_surfaces_store_failures() {
     );
 }
 
+// --- V8 per-creator settings commands ------------------------------------------
+
+fn v8_interaction(name: &str, options: Vec<CommandDataOption>) -> Interaction {
+    voice_interaction(
+        Some(command_data(name, options)),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    )
+}
+
+#[test]
+fn parse_position_extracts_side_and_first_number() {
+    let interaction = v8_interaction(
+        "position",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("position", CommandOptionValue::String("below".to_owned())),
+            typed_option("first-number", CommandOptionValue::Integer(5)),
+        ],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Position {
+            channel_id: CREATOR,
+            request: PositionRequest {
+                position: Some(RoomPosition::Below),
+                first_number: Some(5),
+            },
+        })
+    );
+}
+
+#[test]
+fn parse_position_leaves_unset_options_unset() {
+    let interaction = v8_interaction(
+        "position",
+        vec![typed_option(
+            "channel",
+            CommandOptionValue::Channel(Id::new(CREATOR)),
+        )],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Position {
+            channel_id: CREATOR,
+            request: PositionRequest {
+                position: None,
+                first_number: None,
+            },
+        })
+    );
+}
+
+#[test]
+fn parse_group_inherit_defaultlimit_and_alwaysprivate() {
+    let interaction = v8_interaction(
+        "group",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("enabled", CommandOptionValue::Boolean(false)),
+        ],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Group {
+            channel_id: CREATOR,
+            request: GroupRequest {
+                enabled: Some(false),
+            },
+        })
+    );
+    let interaction = v8_interaction(
+        "inheritpermissions",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("source", CommandOptionValue::String("channel".to_owned())),
+            typed_option("source-channel", CommandOptionValue::Channel(Id::new(400))),
+        ],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::InheritPermissions {
+            channel_id: CREATOR,
+            request: InheritPermissionsRequest {
+                source: Some("channel".to_owned()),
+                source_channel: Some(400),
+            },
+        })
+    );
+    let interaction = v8_interaction(
+        "defaultlimit",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("limit", CommandOptionValue::Integer(4)),
+        ],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::DefaultLimit {
+            channel_id: CREATOR,
+            request: DefaultLimitRequest { limit: Some(4) },
+        })
+    );
+    let interaction = v8_interaction(
+        "alwaysprivate",
+        vec![typed_option(
+            "channel",
+            CommandOptionValue::Channel(Id::new(CREATOR)),
+        )],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::AlwaysPrivate {
+            channel_id: CREATOR,
+            request: AlwaysPrivateRequest { enabled: None },
+        })
+    );
+}
+
+#[test]
+fn decide_position_updates_side_and_number() {
+    let base = CreatorChannel::new(GUILD, CREATOR);
+    let updated = match decide_position(
+        Some(base),
+        &PositionRequest {
+            position: Some(RoomPosition::Below),
+            first_number: Some(5),
+        },
+    ) {
+        PositionPlan::Update(creator) => creator,
+        PositionPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(updated.position, RoomPosition::Below);
+    assert_eq!(updated.first_room_number, 5);
+    // A side-only edit keeps the stored number.
+    let side_only = match decide_position(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &PositionRequest {
+            position: Some(RoomPosition::Below),
+            first_number: None,
+        },
+    ) {
+        PositionPlan::Update(creator) => creator,
+        PositionPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(side_only.first_room_number, 1);
+}
+
+#[test]
+fn decide_position_refuses_empty_and_bad_numbers() {
+    let base = || Some(CreatorChannel::new(GUILD, CREATOR));
+    assert!(matches!(
+        decide_position(
+            None,
+            &PositionRequest {
+                position: Some(RoomPosition::Above),
+                first_number: None,
+            }
+        ),
+        PositionPlan::Refuse { .. }
+    ));
+    assert!(matches!(
+        decide_position(
+            base(),
+            &PositionRequest {
+                position: None,
+                first_number: None,
+            }
+        ),
+        PositionPlan::Refuse { .. }
+    ));
+    for bad in [0, -3] {
+        assert!(
+            matches!(
+                decide_position(
+                    base(),
+                    &PositionRequest {
+                        position: None,
+                        first_number: Some(bad),
+                    }
+                ),
+                PositionPlan::Refuse { .. }
+            ),
+            "first number {bad} must refuse"
+        );
+    }
+}
+
+#[test]
+fn decide_group_defaults_to_on() {
+    let on = match decide_group(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &GroupRequest { enabled: None },
+    ) {
+        GroupPlan::Update(creator) => creator,
+        GroupPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert!(on.group_by_category);
+    let off = match decide_group(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &GroupRequest {
+            enabled: Some(false),
+        },
+    ) {
+        GroupPlan::Update(creator) => creator,
+        GroupPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert!(!off.group_by_category);
+    assert!(matches!(
+        decide_group(None, &GroupRequest { enabled: None }),
+        GroupPlan::Refuse { .. }
+    ));
+}
+
+#[test]
+fn decide_inherit_permissions_stores_each_source() {
+    let creator = match decide_inherit_permissions(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &InheritPermissionsRequest {
+            source: Some("category".to_owned()),
+            source_channel: None,
+        },
+    ) {
+        InheritPermissionsPlan::Update(creator) => creator,
+        InheritPermissionsPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(creator.permission_source, PermissionSource::Category);
+    assert_eq!(creator.permission_channel_id, None);
+    let channel = match decide_inherit_permissions(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &InheritPermissionsRequest {
+            source: Some("channel".to_owned()),
+            source_channel: Some(400),
+        },
+    ) {
+        InheritPermissionsPlan::Update(creator) => creator,
+        InheritPermissionsPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(channel.permission_source, PermissionSource::Channel(400));
+    assert_eq!(channel.permission_channel_id, Some(400));
+}
+
+#[test]
+fn decide_inherit_permissions_refuses_bad_input() {
+    let base = || Some(CreatorChannel::new(GUILD, CREATOR));
+    // No creator row, no source, unknown source.
+    assert!(matches!(
+        decide_inherit_permissions(
+            None,
+            &InheritPermissionsRequest {
+                source: Some("creator".to_owned()),
+                source_channel: None,
+            }
+        ),
+        InheritPermissionsPlan::Refuse { .. }
+    ));
+    for bad in [
+        InheritPermissionsRequest {
+            source: None,
+            source_channel: None,
+        },
+        InheritPermissionsRequest {
+            source: Some("everywhere".to_owned()),
+            source_channel: None,
+        },
+        // Channel source without a channel, or with a zero channel.
+        InheritPermissionsRequest {
+            source: Some("channel".to_owned()),
+            source_channel: None,
+        },
+        InheritPermissionsRequest {
+            source: Some("channel".to_owned()),
+            source_channel: Some(0),
+        },
+        // A source channel without the channel source.
+        InheritPermissionsRequest {
+            source: Some("creator".to_owned()),
+            source_channel: Some(400),
+        },
+        InheritPermissionsRequest {
+            source: Some("category".to_owned()),
+            source_channel: Some(400),
+        },
+    ] {
+        assert!(
+            matches!(
+                decide_inherit_permissions(base(), &bad),
+                InheritPermissionsPlan::Refuse { .. }
+            ),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn decide_default_limit_sets_and_clears() {
+    let set = match decide_default_limit(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &DefaultLimitRequest { limit: Some(4) },
+    ) {
+        DefaultLimitPlan::Update(creator) => creator,
+        DefaultLimitPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(set.default_limit, Some(4));
+    let unlimited = match decide_default_limit(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &DefaultLimitRequest { limit: Some(0) },
+    ) {
+        DefaultLimitPlan::Update(creator) => creator,
+        DefaultLimitPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(unlimited.default_limit, Some(0));
+    // An omitted limit clears back to inherit.
+    let inherit = match decide_default_limit(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &DefaultLimitRequest { limit: None },
+    ) {
+        DefaultLimitPlan::Update(creator) => creator,
+        DefaultLimitPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(inherit.default_limit, None);
+    for bad in [100, -1] {
+        assert!(
+            matches!(
+                decide_default_limit(
+                    Some(CreatorChannel::new(GUILD, CREATOR)),
+                    &DefaultLimitRequest { limit: Some(bad) }
+                ),
+                DefaultLimitPlan::Refuse { .. }
+            ),
+            "limit {bad} must refuse"
+        );
+    }
+    assert!(matches!(
+        decide_default_limit(None, &DefaultLimitRequest { limit: Some(4) }),
+        DefaultLimitPlan::Refuse { .. }
+    ));
+}
+
+#[test]
+fn decide_always_private_defaults_to_on() {
+    let on = match decide_always_private(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &AlwaysPrivateRequest { enabled: None },
+    ) {
+        AlwaysPrivatePlan::Update(creator) => creator,
+        AlwaysPrivatePlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert!(on.private_default);
+    let off = match decide_always_private(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &AlwaysPrivateRequest {
+            enabled: Some(false),
+        },
+    ) {
+        AlwaysPrivatePlan::Update(creator) => creator,
+        AlwaysPrivatePlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert!(!off.private_default);
+}
+
+#[test]
+fn v8_summaries_report_the_stored_settings() {
+    let mut creator = CreatorChannel::new(GUILD, CREATOR);
+    creator.position = RoomPosition::Below;
+    creator.first_room_number = 5;
+    let text = position_summary(&creator);
+    assert!(text.contains("below"), "{text}");
+    assert!(text.contains('5'), "{text}");
+    creator.group_by_category = true;
+    let grouped = group_summary(&creator);
+    assert!(grouped.contains("on"), "{grouped}");
+    creator.group_by_category = false;
+    let ungrouped = group_summary(&creator);
+    assert!(ungrouped.contains("off"), "{ungrouped}");
+    creator.permission_source = PermissionSource::Category;
+    let inherit = inherit_permissions_summary(&creator);
+    assert!(inherit.contains("category"), "{inherit}");
+    creator.default_limit = Some(4);
+    let limited = default_limit_summary(&creator);
+    assert!(limited.contains('4'), "{limited}");
+    creator.default_limit = None;
+    let inherited = default_limit_summary(&creator);
+    assert!(inherited.contains("inherit"), "{inherited}");
+    creator.private_default = true;
+    let private = always_private_summary(&creator);
+    assert!(private.contains("private"), "{private}");
+}
+
+#[test]
+fn v8_command_names_key_the_role_restrictions() {
+    let commands = [
+        VoiceCommand::Position {
+            channel_id: CREATOR,
+            request: PositionRequest {
+                position: None,
+                first_number: Some(2),
+            },
+        },
+        VoiceCommand::Group {
+            channel_id: CREATOR,
+            request: GroupRequest { enabled: None },
+        },
+        VoiceCommand::InheritPermissions {
+            channel_id: CREATOR,
+            request: InheritPermissionsRequest {
+                source: Some("creator".to_owned()),
+                source_channel: None,
+            },
+        },
+        VoiceCommand::DefaultLimit {
+            channel_id: CREATOR,
+            request: DefaultLimitRequest { limit: Some(4) },
+        },
+        VoiceCommand::AlwaysPrivate {
+            channel_id: CREATOR,
+            request: AlwaysPrivateRequest { enabled: None },
+        },
+    ];
+    for command in &commands {
+        assert!(
+            two_bot_core::voice_access::VOICE_COMMANDS.contains(&command.name()),
+            "{} is not a restrictable voice command",
+            command.name()
+        );
+    }
+    assert_eq!(commands[0].name(), "position");
+    assert_eq!(commands[1].name(), "group");
+    assert_eq!(commands[2].name(), "inheritpermissions");
+    assert_eq!(commands[3].name(), "defaultlimit");
+    assert_eq!(commands[4].name(), "alwaysprivate");
+}
+
+#[tokio::test]
+async fn handle_v8_commands_refuse_without_manage_channels() {
+    for (name, options) in [
+        (
+            "position",
+            vec![
+                typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+                typed_option("first-number", CommandOptionValue::Integer(2)),
+            ],
+        ),
+        (
+            "group",
+            vec![typed_option(
+                "channel",
+                CommandOptionValue::Channel(Id::new(CREATOR)),
+            )],
+        ),
+        (
+            "inheritpermissions",
+            vec![
+                typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+                typed_option("source", CommandOptionValue::String("category".to_owned())),
+            ],
+        ),
+        (
+            "defaultlimit",
+            vec![
+                typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+                typed_option("limit", CommandOptionValue::Integer(4)),
+            ],
+        ),
+        (
+            "alwaysprivate",
+            vec![typed_option(
+                "channel",
+                CommandOptionValue::Channel(Id::new(CREATOR)),
+            )],
+        ),
+    ] {
+        let trace = Trace::default();
+        let runtime = test_runtime(trace.clone());
+        let interaction = voice_interaction(
+            Some(command_data(name, options)),
+            Some(Permissions::VIEW_CHANNEL),
+            true,
+        );
+        let (owned, response) = handle_capture(&runtime, &interaction).await;
+        assert!(owned, "/{name} owns its interaction");
+        assert!(
+            response_text(response.as_ref().expect("reply")).contains("Manage Channels"),
+            "/{name} refuses without Manage Channels"
+        );
+        assert!(
+            !trace
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.starts_with("add_creator")),
+            "/{name} writes nothing without Manage Channels"
+        );
+    }
+}
+
+#[tokio::test]
+async fn handle_position_saves_side_and_number() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = v8_interaction(
+        "position",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("position", CommandOptionValue::String("below".to_owned())),
+            typed_option("first-number", CommandOptionValue::Integer(5)),
+        ],
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(text.contains("below"), "{text}");
+    assert!(text.contains('5'), "{text}");
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("add_creator:{CREATOR}")));
+}
+
+#[tokio::test]
+async fn handle_group_saves_the_toggle() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = v8_interaction(
+        "group",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("enabled", CommandOptionValue::Boolean(true)),
+        ],
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(
+        response_text(response.as_ref().expect("reply")).contains("on"),
+        "group reports the stored toggle"
+    );
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("add_creator:{CREATOR}")));
+}
+
+#[tokio::test]
+async fn handle_inheritpermissions_saves_the_source() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = v8_interaction(
+        "inheritpermissions",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("source", CommandOptionValue::String("category".to_owned())),
+        ],
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(
+        response_text(response.as_ref().expect("reply")).contains("category"),
+        "inheritpermissions reports the stored source"
+    );
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("add_creator:{CREATOR}")));
+}
+
+#[tokio::test]
+async fn handle_defaultlimit_saves_the_limit() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = v8_interaction(
+        "defaultlimit",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("limit", CommandOptionValue::Integer(4)),
+        ],
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(
+        response_text(response.as_ref().expect("reply")).contains('4'),
+        "defaultlimit reports the stored limit"
+    );
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("add_creator:{CREATOR}")));
+}
+
+#[tokio::test]
+async fn handle_alwaysprivate_saves_the_default() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = v8_interaction(
+        "alwaysprivate",
+        vec![typed_option(
+            "channel",
+            CommandOptionValue::Channel(Id::new(CREATOR)),
+        )],
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(
+        response_text(response.as_ref().expect("reply")).contains("private"),
+        "alwaysprivate defaults on and reports it"
+    );
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("add_creator:{CREATOR}")));
+}
+
 #[test]
 fn ephemeral_response_is_ephemeral_channel_message() {
     let response = ephemeral_response("hello");
@@ -3063,6 +3723,16 @@ impl InteractionReplies for Replies {
         self.completed.lock().unwrap().push(response);
         self.complete_error.map_or(Ok(()), Err)
     }
+
+    async fn respond(
+        &self,
+        _: &Interaction,
+        response: InteractionResponse,
+    ) -> Result<(), RoomHttpError> {
+        self.trace.lock().unwrap().push("respond".to_owned());
+        self.completed.lock().unwrap().push(response);
+        self.complete_error.map_or(Ok(()), Err)
+    }
 }
 
 fn create_interaction() -> Interaction {
@@ -3081,7 +3751,7 @@ async fn responder_defers_before_any_create_and_completes_once() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());
     let replies = Replies::new(trace.clone());
-    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None).await;
+    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None, None).await;
     assert_eq!(
         *trace.lock().unwrap(),
         ["defer", "create", "add_creator:500", "complete"]
@@ -3109,7 +3779,7 @@ async fn responder_failed_or_ambiguous_ack_never_executes_or_retries() {
         let runtime = test_runtime(trace.clone());
         let mut replies = Replies::new(trace.clone());
         replies.defer_error = Some(error);
-        VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None).await;
+        VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None, None).await;
         assert_eq!(*trace.lock().unwrap(), ["defer"]);
         assert!(replies.completed.lock().unwrap().is_empty());
     }
@@ -3121,7 +3791,7 @@ async fn responder_completion_failure_does_not_repeat_channel_creation() {
     let runtime = test_runtime(trace.clone());
     let mut replies = Replies::new(trace.clone());
     replies.complete_error = Some(RoomHttpError::UnknownOutcome);
-    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None).await;
+    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None, None).await;
     assert_eq!(
         *trace.lock().unwrap(),
         ["defer", "create", "add_creator:500", "complete"]
@@ -3846,6 +4516,701 @@ fn health_check_dedups_a_shared_category_override() {
     assert_eq!(live.permission_findings(&[CREATOR, 201]).len(), 1);
 }
 
+// --- V11c `/export` + `/import` handler tests ---------------------------------
+
+use twilight_model::{
+    application::interaction::{
+        message_component::MessageComponentInteractionData, InteractionDataResolved,
+    },
+    channel::message::component::ComponentType,
+};
+use two_bot_core::voice_config as config_codec;
+
+const UPLOADER: u64 = 302;
+const OTHER_MEMBER: u64 = 303;
+const ATTACHMENT_ID: u64 = 900;
+const TEXT_CHANNEL: u64 = 500;
+const TEMPLATE_CHANNEL: u64 = 600;
+const MENTION_ROLE: u64 = 700;
+
+fn empty_config() -> VoiceConfiguration {
+    VoiceConfiguration {
+        version: config_codec::VOICE_CONFIG_VERSION,
+        guild_id: GUILD.to_string(),
+        creators: Vec::new(),
+        templates: Vec::new(),
+        aliases: Vec::new(),
+        lists: Vec::new(),
+        logging: None,
+        settings: config_codec::GuildSettings {
+            creation_enabled: true,
+            unique_names: false,
+            no_game_label: "No game".to_owned(),
+            force_single_game: false,
+            count_members_without_activity: false,
+            time_zone: "UTC".to_owned(),
+            text_channel_name: "voice-chat".to_owned(),
+            text_viewer_role_id: None,
+            command_role_id: None,
+            command_roles: Vec::new(),
+        },
+    }
+}
+
+fn full_config() -> VoiceConfiguration {
+    let mut config = empty_config();
+    config.creators = vec![config_codec::CreatorConfiguration {
+        channel_id: CREATOR.to_string(),
+        name_template: "{game}".to_owned(),
+        status_template: None,
+        default_limit: 0,
+        always_private: false,
+        text_channels: false,
+        position: config_codec::RoomPosition::Above,
+        first_number: 1,
+        group_by_category: false,
+        permission_source: config_codec::PermissionSource::Creator {},
+    }];
+    config.templates = vec![config_codec::ChannelTemplates {
+        channel_id: TEMPLATE_CHANNEL.to_string(),
+        name_template: "Lobby".to_owned(),
+        status_template: None,
+    }];
+    config.aliases = vec![config_codec::GameAlias {
+        game: "chess".to_owned(),
+        alias: "Chess".to_owned(),
+    }];
+    config.lists = vec![config_codec::RandomList {
+        name: "maps".to_owned(),
+        choices: vec!["a".to_owned(), "b".to_owned()],
+    }];
+    config.logging = Some(config_codec::LoggingConfiguration {
+        channel_id: TEXT_CHANNEL.to_string(),
+        detail: config_codec::LogDetail::Errors,
+        mention_member_ids: vec![MEMBER.to_string()],
+        mention_role_ids: vec![MENTION_ROLE.to_string()],
+    });
+    config
+}
+
+fn config_inventory() -> GuildInventory {
+    let guild = GUILD.to_string();
+    let channel = |kind: config_codec::ChannelKind| config_codec::ChannelReference {
+        guild_id: guild.clone(),
+        kind,
+    };
+    GuildInventory {
+        guild_id: guild.clone(),
+        channels: [
+            (
+                CREATOR.to_string(),
+                channel(config_codec::ChannelKind::Voice),
+            ),
+            (
+                CATEGORY.to_string(),
+                channel(config_codec::ChannelKind::Category),
+            ),
+            (
+                TEXT_CHANNEL.to_string(),
+                channel(config_codec::ChannelKind::Text),
+            ),
+            (
+                TEMPLATE_CHANNEL.to_string(),
+                channel(config_codec::ChannelKind::Voice),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        roles: [
+            (GUILD.to_string(), guild.clone()),
+            (MENTION_ROLE.to_string(), guild.clone()),
+        ]
+        .into_iter()
+        .collect(),
+        members: [
+            (MEMBER.to_string(), guild.clone()),
+            (UPLOADER.to_string(), guild.clone()),
+        ]
+        .into_iter()
+        .collect(),
+    }
+}
+
+fn user(id: u64) -> User {
+    serde_json::from_value(json!({
+        "id": id.to_string(), "username": "fixture",
+        "discriminator": "0001", "avatar": null,
+    }))
+    .unwrap()
+}
+
+fn with_user(mut interaction: Interaction, id: u64) -> Interaction {
+    interaction.member.as_mut().expect("member").user = Some(user(id));
+    interaction
+}
+
+fn manager() -> Option<Permissions> {
+    Some(Permissions::MANAGE_GUILD)
+}
+
+fn import_interaction(size: u64, permissions: Option<Permissions>, member_id: u64) -> Interaction {
+    let meta: twilight_model::channel::Attachment = serde_json::from_value(json!({
+        "id": ATTACHMENT_ID.to_string(),
+        "filename": "voice-config.json",
+        "url": "https://cdn.discordapp.com/attachments/1/2/voice-config.json",
+        "proxy_url": "https://media.discordapp.net/attachments/1/2/voice-config.json",
+        "size": size,
+    }))
+    .unwrap();
+    let mut data = command_data(
+        "import",
+        vec![CommandDataOption {
+            name: "file".to_owned(),
+            value: CommandOptionValue::Attachment(Id::new(ATTACHMENT_ID)),
+        }],
+    );
+    data.resolved = Some(InteractionDataResolved {
+        attachments: [(Id::new(ATTACHMENT_ID), meta)].into_iter().collect(),
+        channels: HashMap::new(),
+        members: HashMap::new(),
+        messages: HashMap::new(),
+        roles: HashMap::new(),
+        users: HashMap::new(),
+    });
+    with_user(voice_interaction(Some(data), permissions, true), member_id)
+}
+
+fn component_interaction(
+    custom_id: &str,
+    permissions: Option<Permissions>,
+    member_id: u64,
+) -> Interaction {
+    let mut interaction = with_user(voice_interaction(None, permissions, true), member_id);
+    interaction.kind = InteractionType::MessageComponent;
+    interaction.data = Some(InteractionData::MessageComponent(Box::new(
+        MessageComponentInteractionData {
+            custom_id: custom_id.to_owned(),
+            component_type: ComponentType::Button,
+            resolved: None,
+            values: Vec::new(),
+        },
+    )));
+    interaction
+}
+
+async fn handle_import_capture(
+    runtime: &VoiceRuntime<Store, Http>,
+    interaction: &Interaction,
+    inventory: Option<&GuildInventory>,
+) -> (bool, Option<InteractionResponse>) {
+    let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
+    let writer = seen.clone();
+    let owned = handle_voice_interaction_with(runtime, interaction, None, inventory, |response| {
+        *writer.lock().unwrap() = Some(response);
+        async {}
+    })
+    .await;
+    let response = seen.lock().unwrap().clone();
+    (owned, response)
+}
+
+/// Runtime sharing one configuration and one scripted download queue across
+/// every store/http pair, so an upload and its Confirm see the same state.
+fn import_harness(
+    trace: Trace,
+    config: VoiceConfiguration,
+    downloads: Vec<Result<Vec<u8>, RoomHttpError>>,
+) -> (VoiceRuntime<Store, Http>, Arc<Mutex<VoiceConfiguration>>) {
+    let shared_config = Arc::new(Mutex::new(config));
+    let shared_downloads = Arc::new(Mutex::new(downloads.into_iter().collect::<VecDeque<_>>()));
+    let closure_config = shared_config.clone();
+    let runtime = VoiceRuntime::new(
+        move || {
+            let mut store = Store::new(trace.clone());
+            store.config = closure_config.clone();
+            let mut http = Http::new(trace.clone());
+            http.download_results = shared_downloads.clone();
+            (store, http)
+        },
+        Duration::from_millis(10),
+        true,
+    );
+    (runtime, shared_config)
+}
+
+fn preview_buttons(response: &InteractionResponse) -> (String, String) {
+    let components = response
+        .data
+        .as_ref()
+        .and_then(|data| data.components.as_ref())
+        .expect("preview buttons");
+    let mut confirm = None;
+    let mut cancel = None;
+    for component in components {
+        let Component::ActionRow(row) = component else {
+            continue;
+        };
+        for inner in &row.components {
+            let Component::Button(button) = inner else {
+                continue;
+            };
+            match button.label.as_deref() {
+                Some("Confirm") => confirm = button.custom_id.clone(),
+                Some("Cancel") => cancel = button.custom_id.clone(),
+                _ => {}
+            }
+        }
+    }
+    (
+        confirm.expect("confirm button"),
+        cancel.expect("cancel button"),
+    )
+}
+
+fn applied(trace: &Trace) -> bool {
+    trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry == "config_apply")
+}
+
+#[test]
+fn parse_export_and_import_attachment_option() {
+    let export = with_user(
+        voice_interaction(Some(command_data("export", Vec::new())), manager(), true),
+        UPLOADER,
+    );
+    assert_eq!(parse_voice_command(&export), Some(VoiceCommand::Export));
+    let import = import_interaction(10, manager(), UPLOADER);
+    assert_eq!(
+        parse_voice_command(&import),
+        Some(VoiceCommand::Import {
+            file_id: Some(Id::new(ATTACHMENT_ID)),
+        })
+    );
+    // A missing or wrong-typed option is answered, never silently ignored.
+    let missing = with_user(
+        voice_interaction(Some(command_data("import", Vec::new())), manager(), true),
+        UPLOADER,
+    );
+    assert_eq!(
+        parse_voice_command(&missing),
+        Some(VoiceCommand::Import { file_id: None })
+    );
+    let wrong = with_user(
+        voice_interaction(
+            Some(command_data("import", vec![command_option("file", "x")])),
+            manager(),
+            true,
+        ),
+        UPLOADER,
+    );
+    assert_eq!(
+        parse_voice_command(&wrong),
+        Some(VoiceCommand::Import { file_id: None })
+    );
+    // Other components stay untouched by the import router.
+    let kick = component_interaction("two:voice:kick-yes:99", manager(), UPLOADER);
+    assert_eq!(voice_import_action(&kick), None);
+    let slash = import_interaction(10, manager(), UPLOADER);
+    assert_eq!(voice_import_action(&slash), None);
+}
+
+#[tokio::test]
+async fn export_denied_without_manage_server() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = with_user(
+        voice_interaction(Some(command_data("export", Vec::new())), None, true),
+        MEMBER,
+    );
+    let inventory = config_inventory();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    let response = response.expect("refusal");
+    assert!(response_text(&response).contains("Manage Server"));
+    assert!(response
+        .data
+        .as_ref()
+        .and_then(|data| data.attachments.as_ref())
+        .is_none());
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn export_attaches_versioned_file_ephemerally() {
+    let trace = Trace::default();
+    let (runtime, shared) = import_harness(trace.clone(), full_config(), Vec::new());
+    let interaction = with_user(
+        voice_interaction(Some(command_data("export", Vec::new())), manager(), true),
+        UPLOADER,
+    );
+    let inventory = config_inventory();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    let response = response.expect("export reply");
+    assert_eq!(
+        response.data.as_ref().and_then(|data| data.flags),
+        Some(MessageFlags::EPHEMERAL)
+    );
+    assert!(response_text(&response).contains("/import"));
+    let attachments = response
+        .data
+        .as_ref()
+        .and_then(|data| data.attachments.as_ref())
+        .expect("export file");
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(
+        attachments[0].filename,
+        format!("voice-config-guild-{GUILD}-v1.json")
+    );
+    let decoded: VoiceConfiguration =
+        serde_json::from_slice(&attachments[0].file).expect("exported JSON parses");
+    assert_eq!(decoded, full_config());
+    assert_eq!(decoded, *shared.lock().unwrap());
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn export_and_import_refuse_without_guild_inventory() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let export = with_user(
+        voice_interaction(Some(command_data("export", Vec::new())), manager(), true),
+        UPLOADER,
+    );
+    let (owned, response) = handle_import_capture(&runtime, &export, None).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("unavailable"));
+    let import = import_interaction(10, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &import, None).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("unavailable"));
+}
+
+#[tokio::test]
+async fn import_denied_without_manage_server() {
+    let trace = Trace::default();
+    let (runtime, _) = import_harness(trace.clone(), empty_config(), Vec::new());
+    let interaction = import_interaction(10, None, MEMBER);
+    let inventory = config_inventory();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("Manage Server"));
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn import_refuses_oversize_before_download() {
+    let trace = Trace::default();
+    let (runtime, _) = import_harness(trace.clone(), empty_config(), Vec::new());
+    let interaction = import_interaction(MAX_IMPORT_BYTES as u64 + 1, manager(), UPLOADER);
+    let inventory = config_inventory();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("too large"));
+    // The size check runs before any download.
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn import_refuses_malformed_upload() {
+    let trace = Trace::default();
+    let (runtime, shared) = import_harness(
+        trace.clone(),
+        empty_config(),
+        vec![Ok(b"not json{".to_vec())],
+    );
+    let interaction = import_interaction(9, manager(), UPLOADER);
+    let inventory = config_inventory();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("malformed"));
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_empty_diff_offers_no_confirm() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, _) = import_harness(trace.clone(), full_config(), vec![Ok(bytes.clone())]);
+    let interaction = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let inventory = config_inventory();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    let response = response.expect("empty notice");
+    assert_eq!(response_text(&response), "No changes");
+    assert!(response
+        .data
+        .as_ref()
+        .and_then(|data| data.components.as_ref())
+        .is_none());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_confirm_applies() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (owned, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    assert!(owned);
+    let preview = preview.expect("preview");
+    let (confirm_id, _) = preview_buttons(&preview);
+    assert!(!applied(&trace));
+
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    assert_eq!(*shared.lock().unwrap(), full_config());
+    assert!(applied(&trace));
+}
+
+#[tokio::test]
+async fn import_skips_unknown_channels_and_confirms_remainder() {
+    let trace = Trace::default();
+    let mut incoming = full_config();
+    incoming.aliases[0].alias = "Chess Club".to_owned();
+    incoming.creators.push(config_codec::CreatorConfiguration {
+        channel_id: "999".to_owned(),
+        name_template: "{game}".to_owned(),
+        status_template: None,
+        default_limit: 0,
+        always_private: false,
+        text_channels: false,
+        position: config_codec::RoomPosition::Above,
+        first_number: 1,
+        group_by_category: false,
+        permission_source: config_codec::PermissionSource::Creator {},
+    });
+    let bytes = serde_json::to_vec(&incoming).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), full_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let preview = preview.expect("preview");
+    let text = response_text(&preview);
+    assert!(text.contains("unknown channel"), "{text}");
+    assert!(text.contains("999"), "{text}");
+    let (confirm_id, _) = preview_buttons(&preview);
+
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    // The known change applied; the unknown channel never entered storage.
+    let stored = shared.lock().unwrap().clone();
+    assert_eq!(stored.aliases[0].alias, "Chess Club");
+    assert!(stored
+        .creators
+        .iter()
+        .all(|creator| creator.channel_id != "999"));
+    assert!(applied(&trace));
+}
+
+#[tokio::test]
+async fn import_unknown_channels_only_reports_without_confirm() {
+    let trace = Trace::default();
+    let mut incoming = full_config();
+    incoming.creators.push(config_codec::CreatorConfiguration {
+        channel_id: "999".to_owned(),
+        name_template: "{game}".to_owned(),
+        status_template: None,
+        default_limit: 0,
+        always_private: false,
+        text_channels: false,
+        position: config_codec::RoomPosition::Above,
+        first_number: 1,
+        group_by_category: false,
+        permission_source: config_codec::PermissionSource::Creator {},
+    });
+    let bytes = serde_json::to_vec(&incoming).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), full_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let response = response.expect("notice");
+    let text = response_text(&response);
+    assert!(text.contains("unknown channel"), "{text}");
+    assert!(text.contains("999"), "{text}");
+    assert!(response
+        .data
+        .as_ref()
+        .and_then(|data| data.components.as_ref())
+        .is_none());
+    assert_eq!(*shared.lock().unwrap(), full_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_cancel_needs_no_inventory() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let preview = preview.expect("preview");
+    let (_, cancel_id) = preview_buttons(&preview);
+
+    let cancel = component_interaction(&cancel_id, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &cancel, None).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("cancelled")).contains("cancelled"));
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_cancel_writes_nothing_and_consumes_the_preview() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let preview = preview.expect("preview");
+    let (confirm_id, cancel_id) = preview_buttons(&preview);
+
+    let cancel = component_interaction(&cancel_id, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &cancel, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("cancelled")).contains("cancelled"));
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+
+    // The consumed preview cannot be confirmed afterwards.
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(response_text(&response.expect("expired")).contains("expired"));
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_stale_confirm_repreviews_instead_of_applying() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (stale_confirm_id, _) = preview_buttons(&preview.expect("preview"));
+
+    // A concurrent change lands before Confirm.
+    let mut concurrent = full_config();
+    concurrent.aliases.push(config_codec::GameAlias {
+        game: "go".to_owned(),
+        alias: "Go".to_owned(),
+    });
+    *shared.lock().unwrap() = concurrent.clone();
+
+    let confirm = component_interaction(&stale_confirm_id, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned);
+    let response = response.expect("fresh preview");
+    assert!(
+        response_text(&response).contains("Import preview:"),
+        "{}",
+        response_text(&response)
+    );
+    // The candidate was not applied over the concurrent change.
+    assert_eq!(*shared.lock().unwrap(), concurrent);
+    assert!(!applied(&trace));
+
+    // The fresh preview confirms cleanly.
+    let (fresh_confirm_id, _) = preview_buttons(&response);
+    assert_ne!(fresh_confirm_id, stale_confirm_id);
+    let confirm = component_interaction(&fresh_confirm_id, manager(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    assert_eq!(*shared.lock().unwrap(), full_config());
+    assert!(applied(&trace));
+}
+
+#[tokio::test]
+async fn import_confirm_rejects_foreign_member() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+
+    let foreign = component_interaction(&confirm_id, manager(), OTHER_MEMBER);
+    let (owned, response) = handle_import_capture(&runtime, &foreign, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("Only the member"));
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_confirm_requires_manage_server() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+
+    // Same uploader, but the Manage Server grant is gone at confirm time.
+    let confirm = component_interaction(&confirm_id, None, UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("Manage Server"));
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_confirm_expired_writes_nothing() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+
+    runtime
+        .pending_imports
+        .lock()
+        .expect("voice runtime lock")
+        .iter_mut()
+        .for_each(|(_, entry)| {
+            entry.expires_at = Instant::now() - Duration::from_secs(1);
+        });
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("expired")).contains("expired"));
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_without_file_asks_for_attachment() {
+    let trace = Trace::default();
+    let (runtime, _) = import_harness(trace.clone(), empty_config(), Vec::new());
+    let interaction = with_user(
+        voice_interaction(Some(command_data("import", Vec::new())), manager(), true),
+        UPLOADER,
+    );
+    let inventory = config_inventory();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("Attach"));
+    assert!(trace.lock().unwrap().is_empty());
+}
+
 // --- V10 error notices ----------------------------------------------------
 
 const SYSTEM_CHANNEL: u64 = 700;
@@ -4032,4 +5397,457 @@ fn notice_text_is_bounded() {
         message: "x".repeat(5000),
     };
     assert!(notice_text(&failure, DetailLevel::Full).chars().count() <= NOTICE_MAX_CHARS);
+}
+
+/// Guild-less ballot interaction: the shared builder always attaches a
+/// guild, but unscoped presses must stay silent too.
+#[allow(deprecated)]
+fn guildless_component_interaction(custom_id: &str) -> Interaction {
+    let mut interaction = voice_interaction(None, None, false);
+    interaction.kind = InteractionType::MessageComponent;
+    interaction.data = Some(InteractionData::MessageComponent(Box::new(
+        MessageComponentInteractionData {
+            custom_id: custom_id.to_owned(),
+            component_type: ComponentType::Button,
+            resolved: None,
+            values: Vec::new(),
+        },
+    )));
+    interaction
+}
+
+#[test]
+fn parse_kick_extracts_member_and_reason() {
+    let interaction = voice_interaction(
+        Some(command_data(
+            "kick",
+            vec![
+                user_option("member", 303),
+                command_option("reason", "too loud"),
+            ],
+        )),
+        None,
+        true,
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Kick {
+            target: 303,
+            reason: Some("too loud".to_owned()),
+        })
+    );
+}
+
+#[test]
+fn parse_kick_accepts_moderation_shape_without_reason() {
+    let interaction = voice_interaction(
+        Some(command_data("kick", vec![user_option("target", 303)])),
+        None,
+        true,
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Kick {
+            target: 303,
+            reason: None,
+        })
+    );
+}
+
+#[test]
+fn parse_kick_without_user_stays_silent_for_the_router() {
+    let interaction = voice_interaction(
+        Some(command_data("kick", vec![command_option("reason", "x")])),
+        None,
+        true,
+    );
+    assert_eq!(parse_voice_command(&interaction), None);
+}
+
+#[test]
+fn parse_ballot_buttons_by_vote_id() {
+    for (custom_id, expected) in [
+        (
+            "votekick:7000:yes",
+            VoiceCommand::Ballot {
+                vote_id: 7000,
+                ballot: VoteBallot::Yes,
+            },
+        ),
+        (
+            "votekick:7000:no",
+            VoiceCommand::Ballot {
+                vote_id: 7000,
+                ballot: VoteBallot::No,
+            },
+        ),
+    ] {
+        let interaction = component_interaction(custom_id, None, MEMBER);
+        assert_eq!(parse_voice_command(&interaction), Some(expected));
+    }
+}
+
+#[test]
+fn parse_foreign_buttons_stay_silent() {
+    for custom_id in [
+        "self-role:1",
+        "votekick:abc:yes",
+        "votekick:7000:maybe",
+        "votekick:7000",
+        "votekick:",
+    ] {
+        let interaction = component_interaction(custom_id, None, MEMBER);
+        assert_eq!(parse_voice_command(&interaction), None);
+    }
+    let guildless = guildless_component_interaction("votekick:7000:yes");
+    assert_eq!(parse_voice_command(&guildless), None);
+}
+
+#[test]
+fn vote_button_ids_round_trip() {
+    assert_eq!(vote_button_id(7000, VoteBallot::Yes), "votekick:7000:yes");
+    assert_eq!(vote_button_id(7000, VoteBallot::No), "votekick:7000:no");
+}
+
+#[test]
+fn kick_and_ballot_share_the_kick_restriction_name() {
+    assert_eq!(
+        VoiceCommand::Kick {
+            target: 303,
+            reason: None,
+        }
+        .name(),
+        "kick"
+    );
+    assert_eq!(
+        VoiceCommand::Ballot {
+            vote_id: 7000,
+            ballot: VoteBallot::Yes,
+        }
+        .name(),
+        "kick"
+    );
+}
+
+fn kick_sink_interaction(target: u64, initiator: u64) -> Interaction {
+    with_user(
+        voice_interaction(
+            Some(command_data(
+                "kick",
+                vec![
+                    user_option("member", target),
+                    command_option("reason", "too loud"),
+                ],
+            )),
+            None,
+            true,
+        ),
+        initiator,
+    )
+}
+
+fn voice_member_in(member_id: u64, channel_id: u64) -> VoiceMember {
+    VoiceMember {
+        member_id,
+        channel_id,
+        bot: Some(false),
+    }
+}
+
+#[tokio::test]
+async fn sink_claimed_kick_answers_public_ballot_without_defer() {
+    const VOTER: u64 = 301;
+    const TARGET: u64 = 303;
+    const KICK_ROOM: u64 = 500;
+    let trace = Trace::default();
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            move || {
+                let store = Store::new(trace.clone());
+                store
+                    .rooms
+                    .lock()
+                    .unwrap()
+                    .insert(KICK_ROOM, room(KICK_ROOM));
+                (store, Http::new(trace.clone()))
+            }
+        },
+        Duration::from_millis(10),
+        true,
+    );
+    assert!(runtime.publish_snapshot(
+        GUILD,
+        snapshot(
+            &[KICK_ROOM],
+            vec![
+                voice_member_in(VOTER, KICK_ROOM),
+                voice_member_in(TARGET, KICK_ROOM),
+            ],
+        )
+    ));
+    let replies = Replies::new(trace.clone());
+    VoiceResponder::respond_with(
+        &runtime,
+        &replies,
+        &kick_sink_interaction(TARGET, VOTER),
+        None,
+        None,
+    )
+    .await;
+    // No defer: the ballot goes out as the initial public callback, so every
+    // occupant can see the buttons and reach quorum.
+    assert_eq!(*trace.lock().unwrap(), ["respond"]);
+    let completed = replies.completed.lock().unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(
+        completed[0].kind,
+        InteractionResponseType::ChannelMessageWithSource
+    );
+    let data = completed[0].data.as_ref().expect("ballot body");
+    assert_ne!(data.flags, Some(MessageFlags::EPHEMERAL));
+    let content = data.content.as_deref().unwrap_or_default();
+    assert!(content.contains("<@303>"), "{content}");
+    assert!(content.contains("too loud"), "{content}");
+    assert_eq!(data.components.as_ref().map_or(0, Vec::len), 1);
+}
+
+#[tokio::test]
+async fn sink_unclaimed_kick_stays_fully_silent_for_the_router() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let replies = Replies::new(trace.clone());
+    // No actor, no rooms: a moderation-shaped target must produce no ack at
+    // all here, otherwise the defer races (and loses to) the router answer.
+    VoiceResponder::respond_with(
+        &runtime,
+        &replies,
+        &kick_sink_interaction(303, 301),
+        None,
+        None,
+    )
+    .await;
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(replies.completed.lock().unwrap().is_empty());
+}
+
+// ---- lifecycle-outcome signals (offline cutover verification) ----
+//
+// The worker emits fixed-cardinality outcome signals for every terminal
+// create/move/delete, reconcile plan size, queue dead-letter and
+// creator-orphan. These tests pin the emission wiring end to end through
+// the fake store/HTTP fixtures: pure mapper coverage plus worker-driven
+// metric deltas. Global counters are monotonic, so the worker tests assert
+// `after >= before + expected`: safe under parallel test threads.
+
+/// Read one counter series from the process-global metrics exposition.
+fn global_series(prefix: &str) -> u64 {
+    metrics::global()
+        .render(None)
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .map(|line| {
+            line.rsplit_once(' ')
+                .unwrap_or_else(|| panic!("bad sample: {line}"))
+                .1
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("bad sample: {line}"))
+        })
+        .sum()
+}
+
+#[test]
+fn http_error_outcomes_stay_bounded_for_cutover_queries() {
+    use RoomHttpError::*;
+    // Rate limits are retries, never outcomes; callers skip them before
+    // reaching the mapper. Everything terminal is `discord` except a
+    // stale guard, which is `cancelled`. Status/code values never leak.
+    for error in [
+        AccessDenied,
+        NotFound,
+        Unauthorized,
+        UnknownOutcome,
+        InvalidRequest,
+        RenameDeferred,
+        Rejected {
+            status: 400,
+            code: 50035,
+        },
+        Rejected {
+            status: 403,
+            code: 50013,
+        },
+    ] {
+        assert_eq!(voice_outcome_from_http(&error), "discord", "{error:?}");
+    }
+    assert_eq!(voice_outcome_from_http(&Cancelled), "cancelled");
+}
+
+#[test]
+fn store_errors_share_one_persistence_outcome() {
+    for error in [
+        StoreError::Unavailable,
+        StoreError::CredentialRefused,
+        StoreError::Conflict,
+    ] {
+        assert_eq!(voice_outcome_from_store(&error), "persistence");
+    }
+}
+
+#[test]
+fn dead_letter_families_cover_every_queue_action_shape() {
+    let companion_plan = || TextChannelPlan {
+        room_id: 500,
+        guild_id: GUILD,
+        name: "voice-chat".to_owned(),
+        category_id: CATEGORY,
+        overwrites: Vec::new(),
+        settings: two_bot_core::voice_text_channel::TextChannelSettings::default(),
+    };
+    let cases: Vec<(RoomAction, &str)> = vec![
+        (
+            RoomAction::CreateRoom {
+                creator_channel_id: CREATOR,
+                owner_id: MEMBER,
+                name: "room".to_owned(),
+                seed: 7,
+            },
+            "create",
+        ),
+        (
+            RoomAction::MoveMember {
+                member_id: MEMBER,
+                channel_id: 500,
+            },
+            "move",
+        ),
+        (RoomAction::DeleteRoom { channel_id: 500 }, "delete"),
+        (
+            RoomAction::CreateCompanion {
+                room_channel_id: 500,
+                plan: companion_plan(),
+            },
+            "companion",
+        ),
+        (
+            RoomAction::GrantCompanionView {
+                room_channel_id: 500,
+                text_channel_id: 501,
+                member_id: MEMBER,
+            },
+            "companion",
+        ),
+        (
+            RoomAction::RevokeCompanionView {
+                room_channel_id: 500,
+                text_channel_id: 501,
+                member_id: MEMBER,
+            },
+            "companion",
+        ),
+        (
+            RoomAction::UpdateOwnership {
+                channel_id: 500,
+                owner_id: MEMBER,
+                original_creator_id: MEMBER,
+            },
+            "ownership",
+        ),
+        (
+            RoomAction::KickMember {
+                channel_id: 500,
+                member_id: MEMBER,
+            },
+            "kick",
+        ),
+        (
+            RoomAction::RenameRoom {
+                channel_id: 500,
+                name: "den".to_owned(),
+            },
+            "rename",
+        ),
+    ];
+    for (action, family) in &cases {
+        assert_eq!(voice_dead_action(action), *family, "{action:?}");
+    }
+}
+
+#[tokio::test]
+async fn terminal_queue_failure_dead_letters_exactly_once_per_family() {
+    let (live, store, http, _) = fixture();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Non-terminal attempt: requeues with backoff, emits no dead letter.
+    worker.queue.enqueue(
+        GUILD,
+        RoomAction::RenameRoom {
+            channel_id: 500,
+            name: "den".to_owned(),
+        },
+    );
+    let action = worker.queue.pop_due(GUILD, 0).expect("rename due");
+    let before = global_series("two_bot_voice_dead_letters_total{action=\"rename\"}");
+    assert!(worker.mark_failed_observed(action, "flaky".to_owned(), 0));
+    assert_eq!(
+        global_series("two_bot_voice_dead_letters_total{action=\"rename\"}"),
+        before,
+        "non-terminal failure must not dead-letter"
+    );
+    // Terminal attempt (attempts saturating at QUEUE_MAX_ATTEMPTS): one
+    // dead letter under the action family, surfaced in failed().
+    let mut terminal = worker.queue.pop_due(GUILD, 60_000).expect("retry due");
+    terminal.attempts = QUEUE_MAX_ATTEMPTS - 1;
+    // Re-mark in-flight: pop_due registered this dispatch id.
+    let before = global_series("two_bot_voice_dead_letters_total{action=\"rename\"}");
+    assert!(worker.mark_failed_observed(terminal, "still down".to_owned(), 61_000));
+    assert_eq!(
+        global_series("two_bot_voice_dead_letters_total{action=\"rename\"}"),
+        before + 1,
+        "terminal failure must dead-letter exactly once"
+    );
+    assert_eq!(worker.queue.failed().len(), 1);
+    assert_eq!(worker.queue.failed()[0].action.attempts, QUEUE_MAX_ATTEMPTS);
+}
+
+#[tokio::test]
+async fn reconcile_pass_reports_its_plan_sizes() {
+    let (live, store, http, _) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    store.rooms.lock().unwrap().insert(501, room(501));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.upsert_channel(channel(501, 2, Some(CATEGORY)));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let resumed_before = global_series("two_bot_voice_reconcile_actions_total{action=\"resumed\"}");
+    let enqueued_before =
+        global_series("two_bot_voice_reconcile_actions_total{action=\"delete_enqueued\"}");
+    worker.reconcile();
+    // Both tracked rooms are present, accessible and empty: each pass
+    // resumes its lane and enqueues its delete.
+    assert!(
+        global_series("two_bot_voice_reconcile_actions_total{action=\"resumed\"}")
+            >= resumed_before + 2
+    );
+    assert!(
+        global_series("two_bot_voice_reconcile_actions_total{action=\"delete_enqueued\"}")
+            >= enqueued_before + 2
+    );
+}
+
+#[tokio::test]
+async fn failed_create_compensation_orphan_is_counted_without_a_channel_id() {
+    let trace = Trace::default();
+    let store = Store::new(trace.clone());
+    *store.add_creator_error.lock().unwrap() = Some(StoreError::Unavailable);
+    let http = Http::new(trace.clone());
+    http.delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let before = global_series("two_bot_voice_orphans_total");
+    let text = execute_create(&store, &http, GUILD, "lobby", |_, _| {}).await;
+    assert!(text.contains("manually"), "{text}");
+    assert!(
+        global_series("two_bot_voice_orphans_total") > before,
+        "untracked orphan must advance the counter"
+    );
 }

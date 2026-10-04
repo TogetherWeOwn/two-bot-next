@@ -26,6 +26,9 @@ export const FORWARDED_FLAGS = [
   "TWO_MODERATION",
   "TWO_MODERATION_PROTECTED_ROLE_IDS",
   "TWO_OWEN_USER_ID",
+  // Disable-guard escape hatch: explicit boot/CLI override that proceeds
+  // with owed releases. Unset by default so refusal is the default.
+  "TWO_ALLOW_OWED_RELEASES",
   // Automod (gateway intents + AutomodConfig).
   "TWO_AUTOMOD",
   "TWO_AUTOMOD_ALLOWED_DOMAINS",
@@ -175,6 +178,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_ROLES_TEST_DATABASE_URL: TEST,
   TWO_BOT_TEST_BACKUP_BIN: TEST,
   TWO_LEVELING_TEST_CI: TEST,
+  TWO_CUSTOM_COMMAND_TEST_CI: TEST,
   TWO_LFG_TESTDB_CI: TEST,
   TWO_TEST_COUNTER_INTERVAL_MS: TEST,
   TWO_TEST_EVENTS_INTERVAL_MS: TEST,

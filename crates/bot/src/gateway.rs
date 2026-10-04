@@ -96,10 +96,10 @@ pub fn session_snapshot(shard: &Shard) -> Option<Session> {
     shard.session().cloned()
 }
 
-/// Resolve the gateway intents from the environment, mirroring legacy
-/// `needsMessageContent` (`src/discord/client.ts`): privileged
+/// Resolve the gateway intents from the environment: privileged
 /// `MESSAGE_CONTENT` only when enabled automod inspects public messages
-/// (`TWO_AUTOMOD=1`) or tickets are configured.
+/// (`TWO_AUTOMOD=1`), tickets are configured, or custom text commands are
+/// explicitly enabled (`TWO_AUTOMATIONS=1` and `TWO_TEXT_COMMANDS=1`).
 pub fn intents_from_env() -> Intents {
     fn var(name: &str) -> String {
         std::env::var(name).unwrap_or_default()
@@ -111,6 +111,9 @@ pub fn intents_from_env() -> Intents {
             var("DISCORD_TICKET_STAFF_ROLE_ID").as_str(),
             var("DISCORD_TICKET_PANEL_CHANNEL_ID").as_str(),
         ],
+    ) || two_bot_discord::intents::needs_text_command_message_content(
+        &var("TWO_AUTOMATIONS"),
+        &var("TWO_TEXT_COMMANDS"),
     );
     gateway_intents(message_content)
 }
@@ -305,6 +308,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
     voice: Option<Arc<dyn VoiceEventSink>>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), sqlx::Error> {
+    let _dispatch_guard = runtime.as_ref().map(|runtime| runtime.dispatch_guard());
     let _voice_connection = VoiceConnectionGuard(voice.clone());
     let generation = Arc::new(AtomicU64::new(0));
     let saved = checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, store.load()).await?;

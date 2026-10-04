@@ -20,6 +20,13 @@ use two_bot_cutover::self_role_store::{
 const TEST_NOW_MS: i64 = 1_700_000_000_000;
 const TEST_POOL_SIZE: u32 = 5;
 
+/// Wall-clock lease for the DB-clock wait helpers, in milliseconds. Loaded-CI
+/// setup roundtrips (claim, option set, expiry fetch, pool drain) routinely
+/// consumed the old 1s lease before the blocking assertions ran; 10s leaves
+/// ample headroom so the liveness preconditions below only fail on real
+/// hangs, not scheduling jitter.
+const DB_CLOCK_LEASE_MS: u64 = 10_000;
+
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 fn row(id: &str, order: &str) -> SelfRoleAudit {
@@ -2407,8 +2414,10 @@ enum WaitKind {
 async fn wait_past_expiry(conn: &mut PgConnection, expires: OffsetDateTime) -> TestResult {
     // Derive the wait from the database clock, including on a held pool connection.
     // The timeout bounds failures without trusting the controller's wall clock.
+    // It must cover the full DB-clock lease plus scheduling slack: pg_sleep waits
+    // out the remainder of the lease before returning.
     tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_millis(DB_CLOCK_LEASE_MS + 5_000),
         sqlx::query(
             "SELECT pg_sleep((GREATEST(0, EXTRACT(EPOCH FROM ($1::timestamptz-clock_timestamp()))) + 0.05)::double precision)",
         )
@@ -2437,7 +2446,10 @@ async fn exercise_db_clock_wait(
     operation: WaitOperation,
     kind: WaitKind,
 ) -> TestResult {
-    let store = SelfRoleStore::with_lease(pool.clone(), 1_000)?;
+    // A 1s lease made the liveness precondition below flake whenever loaded-CI
+    // setup roundtrips (claim, option set, expiry fetch, pool drain) consumed
+    // the lease first; see TOG-12129.
+    let store = SelfRoleStore::with_lease(pool.clone(), DB_CLOCK_LEASE_MS)?;
     let suffix = format!("{kind:?}-{operation:?}");
     let mut audit = row(&format!("clock-{suffix}"), &format!("clock-order-{suffix}"));
     audit.panel_id = format!("clock-panel-{suffix}");
@@ -2558,7 +2570,8 @@ async fn exercise_db_clock_wait(
 }
 
 async fn exercise_atomic_finish_wait(pool: &PgPool) -> TestResult {
-    let store = SelfRoleStore::with_lease(pool.clone(), 1_000)?;
+    // Same loaded-CI flake guard as exercise_db_clock_wait; see TOG-12129.
+    let store = SelfRoleStore::with_lease(pool.clone(), DB_CLOCK_LEASE_MS)?;
     let mut audit = row("atomic-clock-event", "atomic-clock-order");
     audit.panel_id = "atomic-clock-panel".to_owned();
     let event = store.claim_audit(&audit).await?.expect("atomic event");

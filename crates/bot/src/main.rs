@@ -15,6 +15,9 @@ mod command_runtime;
 mod command_runtime_tests;
 mod commands_cli;
 mod community_jobs;
+mod containment_runtime;
+#[cfg(test)]
+mod containment_runtime_tests;
 mod database_roles_cli;
 #[cfg(test)]
 #[allow(dead_code)]
@@ -22,7 +25,9 @@ mod database_roles_cli;
 mod discord_test_common;
 mod dispatch;
 mod erasure_cli;
+mod feed_jobs;
 mod gateway;
+mod gateway_commands;
 mod gateway_failure;
 mod gateway_metrics;
 #[cfg(test)]
@@ -37,6 +42,7 @@ mod lifecycle_tests;
 mod member_cli;
 mod member_runtime;
 mod metrics_http;
+mod moderation_cli;
 mod onboarding;
 #[cfg(test)]
 mod onboarding_tests;
@@ -55,6 +61,8 @@ mod self_role_handlers;
 #[allow(dead_code)]
 mod self_role_runtime;
 mod shutdown;
+#[cfg(test)]
+mod smoke_error_contract_tests;
 mod ticket_runtime;
 #[cfg(test)]
 #[path = "../../core/tests/support/tracing_capture.rs"]
@@ -82,6 +90,9 @@ async fn main() {
     let cli_args: Vec<String> = std::env::args().skip(1).collect();
     if cli_args.first().is_some_and(|arg| arg == "preflight") {
         std::process::exit(preflight::dispatch(&cli_args[1..]).await);
+    }
+    if cli_args.first().is_some_and(|arg| arg == "moderation") {
+        std::process::exit(moderation_cli::dispatch(&cli_args[1..]).await);
     }
     // Docker HEALTHCHECK probe: GET /health on the configured port and exit
     // 0/1. Kept dependency-free (std + tokio only) so the check path cannot
@@ -220,6 +231,42 @@ async fn main() {
         store.as_ref().map(|s| s.pool().clone()),
     );
 
+    // Disable guard: refuse to boot with moderation/automation disabled
+    // while releases are still owed (pending tempban unbans, active
+    // lockdowns, enabled scheduled messages). Enabled gates short-circuit without a
+    // database read; the explicit override proceeds and is logged loudly.
+    // Without a database there is no owed state to read.
+    if let Some(pool) = store.as_ref().map(|s| s.pool().clone()) {
+        let vars: std::collections::HashMap<String, String> = std::env::vars().collect();
+        let gates = two_bot_core::disable_preflight::DisableGates::from_map(&vars);
+        if !gates.moderation || !gates.automations {
+            let overridden = two_bot_core::disable_preflight::override_active(&vars, &cli_args);
+            match two_bot_core::disable_preflight::boot_check(&pool, &gates, overridden).await {
+                Ok(two_bot_core::disable_preflight::BootVerdict::Proceed) => {}
+                Ok(two_bot_core::disable_preflight::BootVerdict::Refused(owed)) => {
+                    tracing::error!(
+                        owed = %owed.report(),
+                        "moderation_disable_refused: boot refused with moderation/automation disabled while releases are owed; complete or cancel them, or set TWO_ALLOW_OWED_RELEASES=1 to override"
+                    );
+                    std::process::exit(1);
+                }
+                Ok(two_bot_core::disable_preflight::BootVerdict::Overridden(owed)) => {
+                    tracing::warn!(
+                        owed = %owed.report(),
+                        "moderation_disable_override: booting with moderation/automation disabled while releases are owed; members may stay banned and channels locked"
+                    );
+                }
+                Err(_) => {
+                    tracing::error!(
+                        error_class = "moderation_disable_unknown",
+                        "moderation_disable_refused: owed-release state unreadable while moderation/automation is disabled; refusing boot"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
     // Capture the authoritative pool before the gateway's async move owns it.
     // Bind privately before starting tasks; enabled failures never fall back.
     let receiver = match receiver_config {
@@ -332,6 +379,21 @@ async fn main() {
                         gates,
                         member,
                     );
+                    if let Some(runtime) = &runtime {
+                        let config = gateway_commands::GatewayCommandConfig::from_map(
+                            guild_id,
+                            &std::env::vars().collect(),
+                        )
+                        .map_err(|error| {
+                            step_failure(FailureClass::CustomCommandsInitFailed, error)
+                        })?;
+                        runtime
+                            .initialize_custom_commands(config)
+                            .await
+                            .map_err(|error| {
+                                step_failure(FailureClass::CustomCommandsInitFailed, error)
+                            })?;
+                    }
                     // Onboarding renders through that same executor: one shared
                     // admission lane and pacing, never a private Discord client.
                     // Its identity probe honors the mock REST seam through the
@@ -394,10 +456,20 @@ async fn main() {
                     // the chain is the raid watch alone.
                     pipeline.set_join_observer(join_risk_runtime::chain_from_env(
                         pool.clone(),
-                        raid_executor,
+                        raid_executor.clone(),
                         guild_id,
                         raid,
                     ));
+                    // Containment (R3) watches the audit-log entry slot, a
+                    // separate observer from the join slot above. Without
+                    // exact TWO_ANTI_NUKE=1 on the staging guild there is no
+                    // observer at all; dry-run is the default and only an
+                    // armed worker executes removals.
+                    if let Some(containment) =
+                        containment_runtime::start_from_env(pool.clone(), raid_executor, guild_id)
+                    {
+                        pipeline.set_audit_entry_observer(containment);
+                    }
                     // Automod shares the command runtime's REST executor; it never
                     // builds a private client, router or timer.
                     let vars: std::collections::HashMap<String, String> =
@@ -435,6 +507,17 @@ async fn main() {
                             }
                             None => None,
                         };
+                    // V4 `kick` collision: when the voice sink owns a kick
+                    // target (tracked room), the router yields so the vote
+                    // is answered exactly once. Both runtimes exist only
+                    // inside this task, so the claim wires here.
+                    if let (Some(runtime), Some(voice)) = (runtime.as_ref(), voice.as_ref()) {
+                        let voice = Arc::clone(voice);
+                        runtime.set_voice_kick_claim(Arc::new(move |guild, member| {
+                            let voice = Arc::clone(&voice);
+                            Box::pin(async move { voice.kick_claim_room(guild, member).await })
+                        }));
+                    }
                     let shard = build_shard(
                         token,
                         intents_from_env(),

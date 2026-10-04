@@ -6,8 +6,16 @@ use std::{fmt::Debug, future::Future, panic::AssertUnwindSafe, sync::Arc, time::
 use futures_util::FutureExt;
 use tokio::sync::Mutex;
 
-/// Reply text for stale or unknown commands, components and modals.
-pub const UNKNOWN_INTERACTION_REPLY: &str = "This interaction is no longer available.";
+/// Reply text for unknown slash commands and disabled/missing custom rows:
+/// the name is not a live command, so picking it again from `/` is the fix.
+pub const UNKNOWN_COMMAND_REPLY: &str = "I don't recognize that command. It may have been removed or renamed — pick it again from the / command list.";
+/// Reply text for stale components and modal submits: the control expired, so
+/// re-running the command for a fresh one is the fix.
+pub const EXPIRED_COMPONENT_REPLY: &str =
+    "That button or menu has expired. Run the command again to get a fresh one.";
+/// Back-compat alias for the pre-split uniform text (now the expired-control
+/// wording). Prefer [`UNKNOWN_COMMAND_REPLY`] or [`EXPIRED_COMPONENT_REPLY`].
+pub const UNKNOWN_INTERACTION_REPLY: &str = EXPIRED_COMPONENT_REPLY;
 
 /// A handler's completed text reply. Visibility is fixed by the first ACK.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,5 +323,7 @@ fn completed_reply<E: Debug>(
         }
         Ok(Ok(_)) => unreachable!(),
     }
-    Err(format!("Something went wrong (ref {reference})"))
+    Err(format!(
+        "Something went wrong (ref {reference}). Please try again — if it keeps happening, share this reference with a server admin."
+    ))
 }

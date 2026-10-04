@@ -16,11 +16,7 @@
 //! Until the authenticated audit-reason seam lands, the Discord reason is the
 //! plain moderator reason.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use sqlx::{Pool, Postgres};
 use tokio::sync::OnceCell;
@@ -118,7 +114,7 @@ impl MemberRuntime {
             store: PgMemberModerationStore::new(pool, guild_id.to_owned()),
             policy: ModerationPolicy {
                 owen_user_id: "1".to_owned(),
-                protected_role_ids: HashSet::new(),
+                protected_role_ids: std::collections::HashSet::new(),
                 bot_user_id: None,
             },
             guild_id: guild_id.to_owned(),
@@ -509,7 +505,7 @@ async fn tick(member: &MemberRuntime, rest: &ActionExecutor) -> Result<(), Error
     let service = MemberModerationService::new(
         rest.clone(),
         member.store(),
-        member.policy(bot_id.as_deref()),
+        member.policy(bot_id),
         now_millis_i64,
     );
     match service.run_due_unbans(&member.guild_id).await {

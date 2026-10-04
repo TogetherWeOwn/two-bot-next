@@ -1,0 +1,836 @@
+{
+  "version": 1,
+  "scope": "docs/voice-rooms.md only: V3 (/private, /public, the Join channel), V7 (/alias, /nick) and V10 (the guild-level controls bullet). Written from the spec alone; no implementation was read.",
+  "polarity": {
+    "positive": "the specified effect occurs (grant, change, applies, works)",
+    "negative": "refused, absent, unchanged, or a complement boundary (no grant, no change, still refused)"
+  },
+  "bullets": [
+    {"id": "private-deny-connect", "source": "V3 `/private` denies Connect to @everyone.", "clauses": ["V3-PRIVATE-DENY"]},
+    {"id": "private-stays-visible", "source": "V3 the room stays visible.", "clauses": ["V3-PRIVATE-DENY"]},
+    {"id": "private-ephemeral-reply", "source": "V3 accept: every reply is ephemeral (/private).", "clauses": ["V3-EPHEMERAL"]},
+    {"id": "public-ephemeral-reply", "source": "V3 accept: every reply is ephemeral (/public).", "clauses": ["V3-EPHEMERAL"]},
+    {"id": "join-create", "source": "V3 a companion channel \"⇩ Join ‹owner›\" is created next to a private room.", "clauses": ["V3-JOIN-CREATE"]},
+    {"id": "join-request-options", "source": "V3 an outsider joining the Join channel gives the owner Approve / Deny / Block.", "clauses": ["V3-JOIN-APPROVE", "V3-JOIN-DENY", "V3-JOIN-BLOCK"]},
+    {"id": "join-approve", "source": "V3 Approve grants access and moves the requester in.", "clauses": ["V3-JOIN-APPROVE"]},
+    {"id": "join-deny", "source": "V3 Deny refuses this request without blocking future requests.", "clauses": ["V3-JOIN-DENY"]},
+    {"id": "join-block", "source": "V3 Block stops further requests from that member.", "clauses": ["V3-JOIN-BLOCK"]},
+    {"id": "public-restore", "source": "V3 `/public` restores access.", "clauses": ["V3-PUBLIC-RESTORE"]},
+    {"id": "public-delete-join", "source": "V3 `/public` deletes the Join channel.", "clauses": ["V3-PUBLIC-RESTORE"]},
+    {"id": "privacy-survives-ownership", "source": "V3 accept: privacy survives ownership changes.", "clauses": ["V3-PRIVACY-OWNERSHIP"]},
+    {"id": "join-follows-owner", "source": "V3 accept: the Join channel follows the new owner's name.", "clauses": ["V3-JOIN-RENAME"]},
+    {"id": "join-deleted-with-room", "source": "V3 accept: the Join channel is deleted along with its room.", "clauses": ["V3-JOIN-DELETE"]},
+    {"id": "alias-applies-game-name", "source": "V7 aliases apply to @@game_name@@ (V5: the majority game, after aliases).", "clauses": ["V7-ALIAS-APPLY"]},
+    {"id": "alias-applies-game-cond", "source": "V7 aliases apply to GAME conditions.", "clauses": ["V7-ALIAS-GAME-COND"]},
+    {"id": "alias-crud", "source": "V7 `/alias` panel adds, edits or removes game-name aliases.", "clauses": ["V7-ALIAS-CRUD"]},
+    {"id": "nick-set", "source": "V7 `/nick name`: any member sets the name @@owner@@ shows for them.", "clauses": ["V7-NICK-SET", "V7-NICK-SCOPE"]},
+    {"id": "nick-reset", "source": "V7 `/nick reset` restores the display name.", "clauses": ["V7-NICK-RESET"]},
+    {"id": "creation-toggle", "source": "V10 guild-level controls: turn room creation on or off.", "clauses": ["V10-CREATION-TOGGLE"]},
+    {"id": "commands-keep-working", "source": "V10 room creation off: commands keep working.", "clauses": ["V10-CREATION-TOGGLE"]},
+    {"id": "required-role", "source": "V10 an optional role required to use room commands.", "clauses": ["V10-REQUIRED-ROLE"]},
+    {"id": "per-command-restrictions", "source": "V10 per-command role restrictions.", "clauses": ["V10-PER-COMMAND"]},
+    {"id": "admin-exempt", "source": "V10 admins (Manage Channels) always exempt.", "clauses": ["V10-ADMIN-EXEMPT"]}
+  ],
+  "clauses": [
+    {
+      "id": "V3-PRIVATE-DENY",
+      "spec": "V3 `/private`: denies Connect to @everyone; the room stays visible.",
+      "bullets": ["private-deny-connect", "private-stays-visible"]
+    },
+    {
+      "id": "V3-EPHEMERAL",
+      "spec": "V3 accept: every reply is ephemeral with a clear success or error message (for /private and /public).",
+      "bullets": ["private-ephemeral-reply", "public-ephemeral-reply"]
+    },
+    {
+      "id": "V3-JOIN-CREATE",
+      "spec": "V3: a companion channel \"⇩ Join ‹owner›\" is created next to a private room.",
+      "bullets": ["join-create"]
+    },
+    {
+      "id": "V3-JOIN-APPROVE",
+      "spec": "V3: an outsider joining the Join channel gives the owner Approve / Deny / Block; Approve grants access and moves the requester into the room.",
+      "bullets": ["join-request-options", "join-approve"]
+    },
+    {
+      "id": "V3-JOIN-DENY",
+      "spec": "V3: owner Deny refuses this request without blocking future requests from that member.",
+      "bullets": ["join-deny"]
+    },
+    {
+      "id": "V3-JOIN-BLOCK",
+      "spec": "V3: owner Block stops further requests from that member.",
+      "bullets": ["join-block"]
+    },
+    {
+      "id": "V3-PUBLIC-RESTORE",
+      "spec": "V3 `/public`: restores access and deletes the Join channel.",
+      "bullets": ["public-restore", "public-delete-join"]
+    },
+    {
+      "id": "V3-PRIVACY-OWNERSHIP",
+      "spec": "V3 accept: privacy survives ownership changes.",
+      "bullets": ["privacy-survives-ownership"]
+    },
+    {
+      "id": "V3-JOIN-RENAME",
+      "spec": "V3 accept: the Join channel follows the new owner's name.",
+      "bullets": ["join-follows-owner"]
+    },
+    {
+      "id": "V3-JOIN-DELETE",
+      "spec": "V3 accept: the Join channel is deleted along with its room.",
+      "bullets": ["join-deleted-with-room"]
+    },
+    {
+      "id": "V7-ALIAS-APPLY",
+      "spec": "V7 `/alias` with V5: aliases apply to @@game_name@@ (the majority game, after aliases).",
+      "bullets": ["alias-applies-game-name"]
+    },
+    {
+      "id": "V7-ALIAS-GAME-COND",
+      "spec": "V7 `/alias`: aliases apply to GAME conditions.",
+      "bullets": ["alias-applies-game-cond"]
+    },
+    {
+      "id": "V7-ALIAS-CRUD",
+      "spec": "V7 `/alias`: a panel to add, edit or remove game-name aliases.",
+      "bullets": ["alias-crud"]
+    },
+    {
+      "id": "V7-NICK-SET",
+      "spec": "V7 `/nick name`: any member sets the name that @@owner@@ shows for them (V5: @@owner@@ is the display name, or the /nick name).",
+      "bullets": ["nick-set"]
+    },
+    {
+      "id": "V7-NICK-RESET",
+      "spec": "V7 `/nick reset`: restore the display name shown by @@owner@@.",
+      "bullets": ["nick-reset"]
+    },
+    {
+      "id": "V7-NICK-SCOPE",
+      "spec": "V7: a nick is per-member display feeding @@owner@@ only.",
+      "bullets": ["nick-set"]
+    },
+    {
+      "id": "V10-CREATION-TOGGLE",
+      "spec": "V10 guild-level controls: turn room creation on or off (commands keep working).",
+      "bullets": ["creation-toggle", "commands-keep-working"]
+    },
+    {
+      "id": "V10-REQUIRED-ROLE",
+      "spec": "V10 guild-level controls: an optional role required to use room commands.",
+      "bullets": ["required-role"]
+    },
+    {
+      "id": "V10-PER-COMMAND",
+      "spec": "V10 guild-level controls: per-command role restrictions.",
+      "bullets": ["per-command-restrictions"]
+    },
+    {
+      "id": "V10-ADMIN-EXEMPT",
+      "spec": "V10 guild-level controls: admins (Manage Channels) always exempt.",
+      "bullets": ["admin-exempt"]
+    }
+  ],
+  "cases": [
+    {
+      "id": "V3-PRIVATE-DENY-01",
+      "clause": "V3-PRIVATE-DENY",
+      "polarity": "positive",
+      "title": "owner /private denies Connect to @everyone",
+      "input": {
+        "command": "/private",
+        "actor": {"id": 1, "display": "Aya", "in_room": true, "is_owner": true},
+        "room": {"private": false, "owner_id": 1}
+      },
+      "expected": {"allowed": true, "room_private": true, "connect_for_everyone": "deny"}
+    },
+    {
+      "id": "V3-PRIVATE-DENY-02",
+      "clause": "V3-PRIVATE-DENY",
+      "polarity": "positive",
+      "title": "outsider cannot connect to a private room",
+      "input": {
+        "action": "connect",
+        "actor": {"id": 7, "display": "Rin", "in_room": false, "is_owner": false},
+        "room": {"private": true, "owner_id": 1, "connect_for_everyone": "deny"}
+      },
+      "expected": {"allowed": false, "room_private": true}
+    },
+    {
+      "id": "V3-PRIVATE-DENY-03",
+      "clause": "V3-PRIVATE-DENY",
+      "polarity": "positive",
+      "title": "admin may /private any room (owner-command rule)",
+      "input": {
+        "command": "/private",
+        "actor": {"id": 9, "display": "Mod", "permissions": ["ManageChannels"], "in_room": false, "is_owner": false},
+        "room": {"private": false, "owner_id": 1}
+      },
+      "expected": {"allowed": true, "room_private": true, "connect_for_everyone": "deny"}
+    },
+    {
+      "id": "V3-PRIVATE-DENY-04",
+      "clause": "V3-PRIVATE-DENY",
+      "polarity": "negative",
+      "title": "ordinary occupant /private is refused and room stays public",
+      "input": {
+        "command": "/private",
+        "actor": {"id": 2, "display": "Bea", "in_room": true, "is_owner": false},
+        "room": {"private": false, "owner_id": 1}
+      },
+      "expected": {"allowed": false, "room_private": false, "connect_for_everyone": "allow"}
+    },
+    {
+      "id": "V3-PRIVATE-DENY-05",
+      "clause": "V3-PRIVATE-DENY",
+      "polarity": "negative",
+      "title": "private room stays visible (View Channel not denied)",
+      "input": {
+        "action": "view",
+        "actor": {"id": 7, "display": "Rin", "in_room": false, "is_owner": false},
+        "room": {"private": true, "owner_id": 1, "connect_for_everyone": "deny"}
+      },
+      "expected": {"allowed": true}
+    },
+    {
+      "id": "V3-EPHEMERAL-01",
+      "clause": "V3-EPHEMERAL",
+      "polarity": "positive",
+      "title": "/private success reply is ephemeral with a clear message",
+      "input": {
+        "command": "/private",
+        "actor": {"id": 1, "display": "Aya", "in_room": true, "is_owner": true},
+        "room": {"private": false, "owner_id": 1}
+      },
+      "expected": {"allowed": true, "reply_ephemeral": true, "reply_message_present": true}
+    },
+    {
+      "id": "V3-EPHEMERAL-02",
+      "clause": "V3-EPHEMERAL",
+      "polarity": "positive",
+      "title": "/public success reply is ephemeral with a clear message",
+      "input": {
+        "command": "/public",
+        "actor": {"id": 1, "display": "Aya", "in_room": true, "is_owner": true},
+        "room": {"private": true, "owner_id": 1, "join_channel": "⇩ Join Aya"}
+      },
+      "expected": {"allowed": true, "reply_ephemeral": true, "reply_message_present": true}
+    },
+    {
+      "id": "V3-EPHEMERAL-03",
+      "clause": "V3-EPHEMERAL",
+      "polarity": "negative",
+      "title": "refused /private still answers ephemeral with a clear error, not silence",
+      "input": {
+        "command": "/private",
+        "actor": {"id": 2, "display": "Bea", "in_room": true, "is_owner": false},
+        "room": {"private": false, "owner_id": 1}
+      },
+      "expected": {"allowed": false, "reply_ephemeral": true, "reply_message_present": true}
+    },
+    {
+      "id": "V3-JOIN-CREATE-01",
+      "clause": "V3-JOIN-CREATE",
+      "polarity": "positive",
+      "title": "/private creates the Join channel named for the owner",
+      "input": {
+        "command": "/private",
+        "actor": {"id": 1, "display": "Aya", "in_room": true, "is_owner": true},
+        "room": {"private": false, "owner_id": 1, "join_channel": null}
+      },
+      "expected": {"allowed": true, "room_private": true, "join_channel": "⇩ Join Aya", "join_channel_adjacent": true}
+    },
+    {
+      "id": "V3-JOIN-CREATE-02",
+      "clause": "V3-JOIN-CREATE",
+      "polarity": "positive",
+      "title": "Join channel is a separate channel next to the room",
+      "input": {
+        "command": "/private",
+        "actor": {"id": 1, "display": "Aya", "in_room": true, "is_owner": true},
+        "room": {"private": false, "owner_id": 1, "channel_id": 100}
+      },
+      "expected": {"allowed": true, "join_channel": "⇩ Join Aya", "join_channel_same_as_room": false}
+    },
+    {
+      "id": "V3-JOIN-CREATE-03",
+      "clause": "V3-JOIN-CREATE",
+      "polarity": "negative",
+      "title": "public room has no Join channel",
+      "input": {
+        "room": {"private": false, "owner_id": 1}
+      },
+      "expected": {"join_channel": null}
+    },
+    {
+      "id": "V3-JOIN-APPROVE-01",
+      "clause": "V3-JOIN-APPROVE",
+      "polarity": "positive",
+      "title": "outsider joining the Join channel raises Approve/Deny/Block for the owner",
+      "input": {
+        "action": "join_join_channel",
+        "actor": {"id": 7, "display": "Rin", "in_room": false, "is_owner": false},
+        "room": {"private": true, "owner_id": 1, "join_channel": "⇩ Join Aya"}
+      },
+      "expected": {"request_state": "pending", "owner_notified": true, "owner_options": ["Approve", "Deny", "Block"]}
+    },
+    {
+      "id": "V3-JOIN-APPROVE-02",
+      "clause": "V3-JOIN-APPROVE",
+      "polarity": "positive",
+      "title": "owner Approve grants access and moves the requester in",
+      "input": {
+        "action": "approve_request",
+        "actor": {"id": 1, "display": "Aya", "is_owner": true},
+        "request": {"requester_id": 7, "state": "pending"},
+        "room": {"private": true, "owner_id": 1}
+      },
+      "expected": {"request_state": "approved", "requester_can_connect": true, "requester_moved": true}
+    },
+    {
+      "id": "V3-JOIN-APPROVE-03",
+      "clause": "V3-JOIN-APPROVE",
+      "polarity": "negative",
+      "title": "non-owner Approve is refused; request stays pending",
+      "input": {
+        "action": "approve_request",
+        "actor": {"id": 2, "display": "Bea", "in_room": true, "is_owner": false},
+        "request": {"requester_id": 7, "state": "pending"},
+        "room": {"private": true, "owner_id": 1}
+      },
+      "expected": {"allowed": false, "request_state": "pending", "requester_moved": false}
+    },
+    {
+      "id": "V3-JOIN-DENY-01",
+      "clause": "V3-JOIN-DENY",
+      "polarity": "positive",
+      "title": "owner Deny closes the request; requester stays out",
+      "input": {
+        "action": "deny_request",
+        "actor": {"id": 1, "display": "Aya", "is_owner": true},
+        "request": {"requester_id": 7, "state": "pending"},
+        "room": {"private": true, "owner_id": 1}
+      },
+      "expected": {"request_state": "denied", "requester_moved": false, "requester_can_connect": false}
+    },
+    {
+      "id": "V3-JOIN-DENY-02",
+      "clause": "V3-JOIN-DENY",
+      "polarity": "positive",
+      "title": "after Deny the same member may request again",
+      "input": {
+        "action": "join_join_channel",
+        "actor": {"id": 7, "display": "Rin", "in_room": false, "is_owner": false},
+        "room": {"private": true, "owner_id": 1, "join_channel": "⇩ Join Aya", "blocked_ids": []}
+      },
+      "expected": {"request_state": "pending", "owner_notified": true}
+    },
+    {
+      "id": "V3-JOIN-DENY-03",
+      "clause": "V3-JOIN-DENY",
+      "polarity": "negative",
+      "title": "denied requester joining the room channel directly is still refused",
+      "input": {
+        "action": "connect",
+        "actor": {"id": 7, "display": "Rin", "in_room": false, "is_owner": false},
+        "room": {"private": true, "owner_id": 1, "connect_for_everyone": "deny"}
+      },
+      "expected": {"allowed": false}
+    },
+    {
+      "id": "V3-JOIN-BLOCK-01",
+      "clause": "V3-JOIN-BLOCK",
+      "polarity": "positive",
+      "title": "owner Block refuses the request and marks the member blocked",
+      "input": {
+        "action": "block_request",
+        "actor": {"id": 1, "display": "Aya", "is_owner": true},
+        "request": {"requester_id": 7, "state": "pending"},
+        "room": {"private": true, "owner_id": 1, "blocked_ids": []}
+      },
+      "expected": {"request_state": "blocked", "blocked_ids": [7], "requester_moved": false}
+    },
+    {
+      "id": "V3-JOIN-BLOCK-02",
+      "clause": "V3-JOIN-BLOCK",
+      "polarity": "positive",
+      "title": "blocked member re-joining raises no new request",
+      "input": {
+        "action": "join_join_channel",
+        "actor": {"id": 7, "display": "Rin", "in_room": false, "is_owner": false},
+        "room": {"private": true, "owner_id": 1, "join_channel": "⇩ Join Aya", "blocked_ids": [7]}
+      },
+      "expected": {"request_state": "blocked", "owner_notified": false, "requester_moved": false}
+    },
+    {
+      "id": "V3-JOIN-BLOCK-03",
+      "clause": "V3-JOIN-BLOCK",
+      "polarity": "negative",
+      "title": "block is member-scoped: another outsider still raises a request",
+      "input": {
+        "action": "join_join_channel",
+        "actor": {"id": 8, "display": "Cy", "in_room": false, "is_owner": false},
+        "room": {"private": true, "owner_id": 1, "join_channel": "⇩ Join Aya", "blocked_ids": [7]}
+      },
+      "expected": {"request_state": "pending", "owner_notified": true}
+    },
+    {
+      "id": "V3-JOIN-BLOCK-04",
+      "clause": "V3-JOIN-BLOCK",
+      "polarity": "negative",
+      "title": "blocked member gains no access by re-joining",
+      "input": {
+        "action": "join_join_channel",
+        "actor": {"id": 7, "display": "Rin", "in_room": false, "is_owner": false},
+        "room": {"private": true, "owner_id": 1, "join_channel": "⇩ Join Aya", "blocked_ids": [7]}
+      },
+      "expected": {"requester_can_connect": false}
+    },
+    {
+      "id": "V3-PUBLIC-RESTORE-01",
+      "clause": "V3-PUBLIC-RESTORE",
+      "polarity": "positive",
+      "title": "/public restores access and deletes the Join channel",
+      "input": {
+        "command": "/public",
+        "actor": {"id": 1, "display": "Aya", "in_room": true, "is_owner": true},
+        "room": {"private": true, "owner_id": 1, "join_channel": "⇩ Join Aya"}
+      },
+      "expected": {"allowed": true, "room_private": false, "connect_for_everyone": "allow", "join_channel": null}
+    },
+    {
+      "id": "V3-PUBLIC-RESTORE-02",
+      "clause": "V3-PUBLIC-RESTORE",
+      "polarity": "positive",
+      "title": "after /public an outsider can connect directly",
+      "input": {
+        "action": "connect",
+        "actor": {"id": 7, "display": "Rin", "in_room": false, "is_owner": false},
+        "room": {"private": false, "owner_id": 1, "connect_for_everyone": "allow"}
+      },
+      "expected": {"allowed": true}
+    },
+    {
+      "id": "V3-PUBLIC-RESTORE-03",
+      "clause": "V3-PUBLIC-RESTORE",
+      "polarity": "negative",
+      "title": "non-owner /public is refused; room stays private with its Join channel",
+      "input": {
+        "command": "/public",
+        "actor": {"id": 2, "display": "Bea", "in_room": true, "is_owner": false},
+        "room": {"private": true, "owner_id": 1, "join_channel": "⇩ Join Aya"}
+      },
+      "expected": {"allowed": false, "room_private": true, "join_channel": "⇩ Join Aya"}
+    },
+    {
+      "id": "V3-PUBLIC-RESTORE-04",
+      "clause": "V3-PUBLIC-RESTORE",
+      "polarity": "negative",
+      "title": "/public on an already-public room is a no-op",
+      "input": {
+        "command": "/public",
+        "actor": {"id": 1, "display": "Aya", "in_room": true, "is_owner": true},
+        "room": {"private": false, "owner_id": 1, "join_channel": null}
+      },
+      "expected": {"allowed": true, "room_private": false, "join_channel": null}
+    },
+    {
+      "id": "V3-PRIVACY-OWNERSHIP-01",
+      "clause": "V3-PRIVACY-OWNERSHIP",
+      "polarity": "positive",
+      "title": "room stays private when the caretaker takes over",
+      "input": {
+        "event": "owner_left",
+        "room": {"private": true, "owner_id": 1, "connect_for_everyone": "deny"},
+        "remaining": [{"id": 2, "display": "Bea"}]
+      },
+      "expected": {"room_private": true, "connect_for_everyone": "deny", "owner_id": 2}
+    },
+    {
+      "id": "V3-PRIVACY-OWNERSHIP-02",
+      "clause": "V3-PRIVACY-OWNERSHIP",
+      "polarity": "positive",
+      "title": "room stays private across /transfer",
+      "input": {
+        "command": "/transfer",
+        "actor": {"id": 1, "display": "Aya", "is_owner": true},
+        "target_id": 3,
+        "room": {"private": true, "owner_id": 1, "connect_for_everyone": "deny"}
+      },
+      "expected": {"allowed": true, "room_private": true, "connect_for_everyone": "deny", "owner_id": 3}
+    },
+    {
+      "id": "V3-PRIVACY-OWNERSHIP-03",
+      "clause": "V3-PRIVACY-OWNERSHIP",
+      "polarity": "negative",
+      "title": "after succession an outsider still cannot connect",
+      "input": {
+        "action": "connect",
+        "actor": {"id": 7, "display": "Rin", "in_room": false, "is_owner": false},
+        "room": {"private": true, "owner_id": 2, "connect_for_everyone": "deny"}
+      },
+      "expected": {"allowed": false}
+    },
+    {
+      "id": "V3-JOIN-RENAME-01",
+      "clause": "V3-JOIN-RENAME",
+      "polarity": "positive",
+      "title": "Join channel follows the caretaker's name",
+      "input": {
+        "event": "owner_left",
+        "room": {"private": true, "owner_id": 1, "join_channel": "⇩ Join Aya"},
+        "remaining": [{"id": 2, "display": "Bea"}]
+      },
+      "expected": {"owner_id": 2, "join_channel": "⇩ Join Bea"}
+    },
+    {
+      "id": "V3-JOIN-RENAME-02",
+      "clause": "V3-JOIN-RENAME",
+      "polarity": "positive",
+      "title": "Join channel follows /transfer to the new owner",
+      "input": {
+        "command": "/transfer",
+        "actor": {"id": 1, "display": "Aya", "is_owner": true},
+        "target": {"id": 3, "display": "Cy"},
+        "room": {"private": true, "owner_id": 1, "join_channel": "⇩ Join Aya"}
+      },
+      "expected": {"allowed": true, "owner_id": 3, "join_channel": "⇩ Join Cy"}
+    },
+    {
+      "id": "V3-JOIN-RENAME-03",
+      "clause": "V3-JOIN-RENAME",
+      "polarity": "negative",
+      "title": "rename keeps exactly one Join channel (no duplicate)",
+      "input": {
+        "event": "owner_left",
+        "room": {"private": true, "owner_id": 1, "join_channel": "⇩ Join Aya"},
+        "remaining": [{"id": 2, "display": "Bea"}]
+      },
+      "expected": {"join_channel": "⇩ Join Bea", "join_channel_count": 1}
+    },
+    {
+      "id": "V3-JOIN-DELETE-01",
+      "clause": "V3-JOIN-DELETE",
+      "polarity": "positive",
+      "title": "Join channel is deleted along with its room",
+      "input": {
+        "event": "last_human_left",
+        "room": {"private": true, "owner_id": 1, "join_channel": "⇩ Join Aya"}
+      },
+      "expected": {"room_exists": false, "join_channel": null}
+    },
+    {
+      "id": "V3-JOIN-DELETE-02",
+      "clause": "V3-JOIN-DELETE",
+      "polarity": "negative",
+      "title": "denying a request does not delete the Join channel",
+      "input": {
+        "action": "deny_request",
+        "actor": {"id": 1, "display": "Aya", "is_owner": true},
+        "request": {"requester_id": 7, "state": "pending"},
+        "room": {"private": true, "owner_id": 1, "join_channel": "⇩ Join Aya"}
+      },
+      "expected": {"request_state": "denied", "join_channel": "⇩ Join Aya"}
+    },
+    {
+      "id": "V7-ALIAS-APPLY-01",
+      "clause": "V7-ALIAS-APPLY",
+      "polarity": "positive",
+      "title": "alias replaces the raw game name in @@game_name@@",
+      "input": {
+        "aliases": {"Apex Legends": "Apex"},
+        "member_game": "Apex Legends"
+      },
+      "expected": {"rendered_game": "Apex"}
+    },
+    {
+      "id": "V7-ALIAS-APPLY-02",
+      "clause": "V7-ALIAS-APPLY",
+      "polarity": "negative",
+      "title": "game with no alias renders its raw detected name",
+      "input": {
+        "aliases": {"Apex Legends": "Apex"},
+        "member_game": "Valorant"
+      },
+      "expected": {"rendered_game": "Valorant"}
+    },
+    {
+      "id": "V7-ALIAS-GAME-COND-01",
+      "clause": "V7-ALIAS-GAME-COND",
+      "polarity": "positive",
+      "title": "GAME condition matches through the alias name",
+      "input": {
+        "aliases": {"Counter-Strike 2": "CS2"},
+        "condition": "GAME:CS2",
+        "member_game": "Counter-Strike 2"
+      },
+      "expected": {"game_condition_match": true}
+    },
+    {
+      "id": "V7-ALIAS-GAME-COND-02",
+      "clause": "V7-ALIAS-GAME-COND",
+      "polarity": "negative",
+      "title": "GAME condition does not match an unrelated game",
+      "input": {
+        "aliases": {"Counter-Strike 2": "CS2"},
+        "condition": "GAME:Valorant",
+        "member_game": "Counter-Strike 2"
+      },
+      "expected": {"game_condition_match": false}
+    },
+    {
+      "id": "V7-ALIAS-CRUD-01",
+      "clause": "V7-ALIAS-CRUD",
+      "polarity": "positive",
+      "title": "added alias applies to @@game_name@@",
+      "input": {
+        "action": "alias_add",
+        "alias": {"raw": "Apex Legends", "display": "Apex"},
+        "member_game": "Apex Legends"
+      },
+      "expected": {"aliases": {"Apex Legends": "Apex"}, "rendered_game": "Apex"}
+    },
+    {
+      "id": "V7-ALIAS-CRUD-02",
+      "clause": "V7-ALIAS-CRUD",
+      "polarity": "positive",
+      "title": "removed alias restores the raw game name",
+      "input": {
+        "action": "alias_remove",
+        "alias": {"raw": "Apex Legends"},
+        "aliases_before": {"Apex Legends": "Apex"},
+        "member_game": "Apex Legends"
+      },
+      "expected": {"aliases": {}, "rendered_game": "Apex Legends"}
+    },
+    {
+      "id": "V7-ALIAS-CRUD-03",
+      "clause": "V7-ALIAS-CRUD",
+      "polarity": "negative",
+      "title": "removing one alias leaves the others intact",
+      "input": {
+        "action": "alias_remove",
+        "alias": {"raw": "Apex Legends"},
+        "aliases_before": {"Apex Legends": "Apex", "Counter-Strike 2": "CS2"},
+        "member_game": "Counter-Strike 2"
+      },
+      "expected": {"aliases": {"Counter-Strike 2": "CS2"}, "rendered_game": "CS2"}
+    },
+    {
+      "id": "V7-NICK-SET-01",
+      "clause": "V7-NICK-SET",
+      "polarity": "positive",
+      "title": "member /nick sets the name @@owner@@ shows for them",
+      "input": {
+        "command": "/nick",
+        "actor": {"id": 1, "display": "Aya"},
+        "nick": "Lex"
+      },
+      "expected": {"allowed": true, "rendered_owner_for_1": "Lex"}
+    },
+    {
+      "id": "V7-NICK-SET-02",
+      "clause": "V7-NICK-SET",
+      "polarity": "positive",
+      "title": "any member (not only the owner) may set their own nick",
+      "input": {
+        "command": "/nick",
+        "actor": {"id": 2, "display": "Bea", "in_room": true, "is_owner": false},
+        "nick": "Bee"
+      },
+      "expected": {"allowed": true, "rendered_owner_for_2": "Bee"}
+    },
+    {
+      "id": "V7-NICK-SET-03",
+      "clause": "V7-NICK-SET",
+      "polarity": "negative",
+      "title": "one member's nick does not change another member's rendering",
+      "input": {
+        "nicks": {"1": "Lex"},
+        "member_displays": {"1": "Aya", "2": "Bea"}
+      },
+      "expected": {"rendered_owner_for_1": "Lex", "rendered_owner_for_2": "Bea"}
+    },
+    {
+      "id": "V7-NICK-RESET-01",
+      "clause": "V7-NICK-RESET",
+      "polarity": "positive",
+      "title": "/nick reset restores the display name",
+      "input": {
+        "command": "/nick",
+        "actor": {"id": 1, "display": "Aya"},
+        "nick": "reset",
+        "nicks_before": {"1": "Lex"}
+      },
+      "expected": {"allowed": true, "rendered_owner_for_1": "Aya"}
+    },
+    {
+      "id": "V7-NICK-RESET-02",
+      "clause": "V7-NICK-RESET",
+      "polarity": "negative",
+      "title": "after reset the old nick no longer renders",
+      "input": {
+        "nicks_before": {"1": "Lex"},
+        "action": "nick_reset",
+        "actor": {"id": 1, "display": "Aya"}
+      },
+      "expected": {"rendered_owner_for_1": "Aya", "rendered_owner_not": "Lex"}
+    },
+    {
+      "id": "V7-NICK-SCOPE-01",
+      "clause": "V7-NICK-SCOPE",
+      "polarity": "positive",
+      "title": "each nicked member renders their own nick",
+      "input": {
+        "nicks": {"1": "Lex", "2": "Bee"},
+        "member_displays": {"1": "Aya", "2": "Bea"}
+      },
+      "expected": {"rendered_owner_for_1": "Lex", "rendered_owner_for_2": "Bee"}
+    },
+    {
+      "id": "V7-NICK-SCOPE-02",
+      "clause": "V7-NICK-SCOPE",
+      "polarity": "negative",
+      "title": "nick does not leak into game-name rendering",
+      "input": {
+        "nicks": {"1": "Lex"},
+        "aliases": {},
+        "member_game": "Valorant"
+      },
+      "expected": {"rendered_game": "Valorant"}
+    },
+    {
+      "id": "V10-CREATION-TOGGLE-01",
+      "clause": "V10-CREATION-TOGGLE",
+      "polarity": "positive",
+      "title": "creation off: joining a creator channel creates no room",
+      "input": {
+        "event": "join_creator_channel",
+        "actor": {"id": 7, "display": "Rin"},
+        "guild": {"room_creation": false}
+      },
+      "expected": {"room_created": false, "actor_moved": false}
+    },
+    {
+      "id": "V10-CREATION-TOGGLE-02",
+      "clause": "V10-CREATION-TOGGLE",
+      "polarity": "positive",
+      "title": "creation off: commands keep working",
+      "input": {
+        "command": "/ping",
+        "actor": {"id": 7, "display": "Rin"},
+        "guild": {"room_creation": false}
+      },
+      "expected": {"allowed": true}
+    },
+    {
+      "id": "V10-CREATION-TOGGLE-03",
+      "clause": "V10-CREATION-TOGGLE",
+      "polarity": "negative",
+      "title": "creation off does not remove existing rooms",
+      "input": {
+        "guild": {"room_creation": false},
+        "room": {"private": false, "owner_id": 1}
+      },
+      "expected": {"room_exists": true}
+    },
+    {
+      "id": "V10-REQUIRED-ROLE-01",
+      "clause": "V10-REQUIRED-ROLE",
+      "polarity": "positive",
+      "title": "member with the required role may use room commands",
+      "input": {
+        "command": "/nick",
+        "actor": {"id": 2, "display": "Bea", "roles": [77]},
+        "guild": {"required_role": 77}
+      },
+      "expected": {"allowed": true}
+    },
+    {
+      "id": "V10-REQUIRED-ROLE-02",
+      "clause": "V10-REQUIRED-ROLE",
+      "polarity": "negative",
+      "title": "member without the required role is refused",
+      "input": {
+        "command": "/nick",
+        "actor": {"id": 7, "display": "Rin", "roles": []},
+        "guild": {"required_role": 77}
+      },
+      "expected": {"allowed": false}
+    },
+    {
+      "id": "V10-PER-COMMAND-01",
+      "clause": "V10-PER-COMMAND",
+      "polarity": "positive",
+      "title": "member with the per-command role may use the restricted command",
+      "input": {
+        "command": "/limit",
+        "actor": {"id": 2, "display": "Bea", "roles": [78]},
+        "guild": {"command_roles": {"/limit": 78}}
+      },
+      "expected": {"allowed": true}
+    },
+    {
+      "id": "V10-PER-COMMAND-02",
+      "clause": "V10-PER-COMMAND",
+      "polarity": "negative",
+      "title": "member without the per-command role is refused",
+      "input": {
+        "command": "/limit",
+        "actor": {"id": 7, "display": "Rin", "roles": []},
+        "guild": {"command_roles": {"/limit": 78}}
+      },
+      "expected": {"allowed": false}
+    },
+    {
+      "id": "V10-PER-COMMAND-03",
+      "clause": "V10-PER-COMMAND",
+      "polarity": "negative",
+      "title": "restriction is per-command: unrestricted commands still work",
+      "input": {
+        "command": "/nick",
+        "actor": {"id": 7, "display": "Rin", "roles": []},
+        "guild": {"command_roles": {"/limit": 78}}
+      },
+      "expected": {"allowed": true}
+    },
+    {
+      "id": "V10-ADMIN-EXEMPT-01",
+      "clause": "V10-ADMIN-EXEMPT",
+      "polarity": "positive",
+      "title": "admin without the required role may use room commands",
+      "input": {
+        "command": "/nick",
+        "actor": {"id": 9, "display": "Mod", "permissions": ["ManageChannels"], "roles": []},
+        "guild": {"required_role": 77}
+      },
+      "expected": {"allowed": true}
+    },
+    {
+      "id": "V10-ADMIN-EXEMPT-02",
+      "clause": "V10-ADMIN-EXEMPT",
+      "polarity": "positive",
+      "title": "admin without the per-command role may use the restricted command",
+      "input": {
+        "command": "/limit",
+        "actor": {"id": 9, "display": "Mod", "permissions": ["ManageChannels"], "roles": []},
+        "guild": {"command_roles": {"/limit": 78}}
+      },
+      "expected": {"allowed": true}
+    },
+    {
+      "id": "V10-ADMIN-EXEMPT-03",
+      "clause": "V10-ADMIN-EXEMPT",
+      "polarity": "negative",
+      "title": "Manage Channels is the admin line: member without it and without the role is refused",
+      "input": {
+        "command": "/limit",
+        "actor": {"id": 7, "display": "Rin", "permissions": ["MoveMembers"], "roles": []},
+        "guild": {"command_roles": {"/limit": 78}}
+      },
+      "expected": {"allowed": false}
+    }
+  ]
+}

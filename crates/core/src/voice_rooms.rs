@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::commands::{
     CommandChoice, CommandDefinition, CommandOption, CommandOptionType, PERM_MANAGE_CHANNELS,
+    PERM_MANAGE_GUILD,
 };
 use super::voice_text_channel::{
     TextChannelPlan, TextChannelSettings, MAX_TEXT_CHANNEL_NAME_CHARS,
@@ -89,11 +90,14 @@ pub struct CreatorChannel {
     /// First room number; the numbering engine (V5) assigns the lowest free
     /// number at or above this.
     pub first_room_number: i64,
+    /// V8 `/group`: shared numbering and contiguous block per category.
+    /// Stored by the V11 import; honored by the room planner.
+    pub group_by_category: bool,
 }
 
 impl CreatorChannel {
     /// Spec defaults: creator-source permissions and limit, public, no text
-    /// channel, rooms above, numbering from 1.
+    /// channel, rooms above, numbering from 1, ungrouped.
     #[must_use]
     pub fn new(guild_id: Snowflake, channel_id: Snowflake) -> Self {
         Self {
@@ -109,6 +113,7 @@ impl CreatorChannel {
             text_viewer_role_id: None,
             position: RoomPosition::Above,
             first_room_number: 1,
+            group_by_category: false,
         }
     }
 
@@ -1286,6 +1291,164 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::Role,
             )]),
         ]),
+        CommandDefinition::new(
+            "export",
+            "Download this server's voice configuration as a versioned JSON file",
+        )
+        .permissions(PERM_MANAGE_GUILD),
+        CommandDefinition::new(
+            "import",
+            "Preview a voice configuration file before applying it",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![CommandOption::new(
+            "file",
+            "Voice configuration JSON file from /export",
+            CommandOptionType::Attachment,
+        )
+        .required()]),
+        CommandDefinition::new(
+            "position",
+            "Set where new rooms appear and the first room number",
+        )
+        .permissions(PERM_MANAGE_CHANNELS)
+        .options(vec![
+            CommandOption::new(
+                "channel",
+                "Creator voice channel to configure",
+                CommandOptionType::Channel,
+            )
+            .required(),
+            CommandOption::new(
+                "position",
+                "New rooms go above or below the creator channel",
+                CommandOptionType::String,
+            )
+            .choices(vec![
+                CommandChoice {
+                    name: "Above".to_owned(),
+                    value: "above".to_owned(),
+                },
+                CommandChoice {
+                    name: "Below".to_owned(),
+                    value: "below".to_owned(),
+                },
+            ]),
+            CommandOption::new(
+                "first-number",
+                "First room number (numbering starts here)",
+                CommandOptionType::Integer,
+            )
+            .min_value(1),
+        ]),
+        CommandDefinition::new(
+            "group",
+            "Toggle shared numbering per category for one creator channel",
+        )
+        .permissions(PERM_MANAGE_CHANNELS)
+        .options(vec![
+            CommandOption::new(
+                "channel",
+                "Creator voice channel to configure",
+                CommandOptionType::Channel,
+            )
+            .required(),
+            CommandOption::new(
+                "enabled",
+                "Share numbering across the category (default on)",
+                CommandOptionType::Boolean,
+            ),
+        ]),
+        CommandDefinition::new(
+            "inheritpermissions",
+            "Set where new rooms copy permission overrides from",
+        )
+        .permissions(PERM_MANAGE_CHANNELS)
+        .options(vec![
+            CommandOption::new(
+                "channel",
+                "Creator voice channel to configure",
+                CommandOptionType::Channel,
+            )
+            .required(),
+            CommandOption::new(
+                "source",
+                "Copy overrides from the creator, the category, or a channel",
+                CommandOptionType::String,
+            )
+            .required()
+            .choices(vec![
+                CommandChoice {
+                    name: "Creator".to_owned(),
+                    value: "creator".to_owned(),
+                },
+                CommandChoice {
+                    name: "Category".to_owned(),
+                    value: "category".to_owned(),
+                },
+                CommandChoice {
+                    name: "Channel".to_owned(),
+                    value: "channel".to_owned(),
+                },
+            ]),
+            CommandOption::new(
+                "source-channel",
+                "Channel to copy overrides from (only with source channel)",
+                CommandOptionType::Channel,
+            ),
+        ]),
+        CommandDefinition::new("defaultlimit", "Set the starting user limit for new rooms")
+            .permissions(PERM_MANAGE_CHANNELS)
+            .options(vec![
+                CommandOption::new(
+                    "channel",
+                    "Creator voice channel to configure",
+                    CommandOptionType::Channel,
+                )
+                .required(),
+                CommandOption::new(
+                    "limit",
+                    "Starting limit 0-99 (0 is unlimited; leave empty to inherit)",
+                    CommandOptionType::Integer,
+                )
+                .int_range(0, MAX_USER_LIMIT),
+            ]),
+        CommandDefinition::new(
+            "alwaysprivate",
+            "Start new rooms from one creator as private",
+        )
+        .permissions(PERM_MANAGE_CHANNELS)
+        .options(vec![
+            CommandOption::new(
+                "channel",
+                "Creator voice channel to configure",
+                CommandOptionType::Channel,
+            )
+            .required(),
+            CommandOption::new(
+                "enabled",
+                "Start new rooms private (default on)",
+                CommandOptionType::Boolean,
+            ),
+        ]),
+        CommandDefinition::new(
+            "kick",
+            "Start a vote to disconnect a member from your voice room",
+        )
+        .options(vec![
+            CommandOption::new(
+                "member",
+                "Room occupant to put to a vote",
+                CommandOptionType::User,
+            )
+            .required(),
+            CommandOption::new(
+                "reason",
+                "Why the vote was started (shown on the ballot)",
+                CommandOptionType::String,
+            )
+            .max_length(512),
+        ]),
     ]
 }
 
@@ -1985,7 +2148,15 @@ mod tests {
                 "access",
                 "reclaim",
                 "transfer",
-                "logging"
+                "logging",
+                "export",
+                "import",
+                "position",
+                "group",
+                "inheritpermissions",
+                "defaultlimit",
+                "alwaysprivate",
+                "kick"
             ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
@@ -2071,6 +2242,88 @@ mod tests {
                 .all(|o| o.required != Some(true));
             assert!(required_first, "{} lists a required option late", sub.name);
         }
+        // V8 per-creator settings: admin-gated, each names its creator
+        // channel first (required) with the tuned field after it.
+        for name in [
+            "position",
+            "group",
+            "inheritpermissions",
+            "defaultlimit",
+            "alwaysprivate",
+        ] {
+            let def = defs
+                .iter()
+                .find(|def| def.name == name)
+                .unwrap_or_else(|| panic!("missing /{name}"));
+            assert_eq!(
+                def.default_member_permissions,
+                Some(PERM_MANAGE_CHANNELS.to_string()),
+                "/{name} is admin-gated"
+            );
+            assert_eq!(def.options[0].name, "channel");
+            assert_eq!(def.options[0].kind, CommandOptionType::Channel.as_u8());
+            assert!(def.options[0].required == Some(true));
+        }
+        // `/position` carries an optional side plus an optional start number.
+        let position = defs.iter().find(|def| def.name == "position").unwrap();
+        assert_eq!(
+            position
+                .options
+                .iter()
+                .map(|o| o.name.as_str())
+                .collect::<Vec<_>>(),
+            ["channel", "position", "first-number"]
+        );
+        // `/inheritpermissions` requires its source; the channel rides along
+        // only for the channel source.
+        let inherit = defs
+            .iter()
+            .find(|def| def.name == "inheritpermissions")
+            .unwrap();
+        assert_eq!(
+            inherit
+                .options
+                .iter()
+                .map(|o| o.name.as_str())
+                .collect::<Vec<_>>(),
+            ["channel", "source", "source-channel"]
+        );
+        assert!(inherit.options[1].required == Some(true));
+        // `/defaultlimit` bounds match the import validation (0-99).
+        let limit = defs.iter().find(|def| def.name == "defaultlimit").unwrap();
+        assert_eq!(limit.options[1].min_value, Some(0));
+        assert_eq!(limit.options[1].max_value, Some(MAX_USER_LIMIT));
+        // `/kick` is open to every occupant; the worker refuses
+        // non-occupant initiators and protected targets.
+        let kick = &defs[16];
+        assert_eq!(kick.default_member_permissions, None);
+        assert_eq!(
+            kick.options
+                .iter()
+                .map(|o| o.name.as_str())
+                .collect::<Vec<_>>(),
+            ["member", "reason"]
+        );
+        assert_eq!(kick.options[0].required, Some(true));
+        assert_eq!(kick.options[1].required, None);
+        // `/export` takes no options; `/import` takes one required file
+        // attachment. Both are Manage Server (Manage Guild) gated.
+        let export = &defs[9];
+        let import = &defs[10];
+        for def in [export, import] {
+            assert_eq!(
+                def.default_member_permissions,
+                Some(PERM_MANAGE_GUILD.to_string())
+            );
+        }
+        assert!(export.options.is_empty());
+        assert_eq!(import.options.len(), 1);
+        assert_eq!(import.options[0].name, "file");
+        assert_eq!(
+            import.options[0].kind,
+            CommandOptionType::Attachment.as_u8()
+        );
+        assert!(import.options[0].required == Some(true));
         // `/reclaim` takes no options; `/transfer` names its recipient.
         assert_eq!(defs[6].default_member_permissions, None);
         assert!(defs[6].options.is_empty());
@@ -2080,6 +2333,9 @@ mod tests {
         assert_eq!(defs[7].options[0].kind, CommandOptionType::User as u8);
         assert!(defs[7].options[0].required == Some(true));
         // Merges cleanly alongside the other slices, first-wins.
+        // Moderation's `kick` sorts before the voice one, so the shared
+        // merge keeps the moderation definition; runtime dispatch (not the
+        // published shape) decides vote-kick versus moderation kick.
         let merged = merge_commands(
             &[feature_commands(), moderation_commands(), voice_commands()],
             &[],
