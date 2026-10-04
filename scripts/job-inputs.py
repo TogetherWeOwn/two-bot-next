@@ -179,11 +179,12 @@ SKIP_EXACT = frozenset({
     ".github/dependabot.yml",
 })
 
-# The release-please config is read by the worker job's release-lifecycle
-# verification step.
+# The worker job's release-lifecycle verification reads the release-please
+# config and the copyable testsupport dependency example in CONTRIBUTING.md.
 WORKER_EXACT = frozenset({
     "release-please-config.json",
     ".release-please-manifest.json",
+    "CONTRIBUTING.md",
     "wrangler/wrangler.toml",
 })
 
@@ -282,7 +283,7 @@ def classify(path):
         return frozenset({WORKER})
     if path.startswith(FAIL_CLOSED_PREFIXES):
         return ALL_JOBS
-    # Markdown outside docs//.github/ is never compiled or asserted on.
+    # Other markdown outside docs//.github/ has no content reader.
     if Path(path).suffix.lower() == ".md" and not path.startswith(".github/"):
         return NO_JOBS
     # Fail-closed: unrecognized paths (e.g. a brand-new top-level directory)
