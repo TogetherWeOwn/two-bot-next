@@ -16,6 +16,7 @@ use two_bot_discord::executor::ActionExecutor;
 use crate::{
     audit_runtime, community_jobs, feed_jobs,
     jobs::{self, ErrorClass, Job},
+    member_runtime::{self, MemberRuntime},
     scheduled_jobs,
     self_role_handlers::{SelfRoleService, RECOVERY_JOB_NAME},
     server,
@@ -117,6 +118,9 @@ fn admission_pool(url: &str) -> Result<PgPool, String> {
         .connect_lazy_with(options))
 }
 
+/// Boot-composed single call: the eight parameters are the full supervised
+/// surface (config, listener, gateway, shutdown plus one slot per consumer).
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     config: &Config,
     listener: tokio::net::TcpListener,
@@ -125,6 +129,7 @@ pub async fn serve(
     self_roles: Option<Arc<SelfRoleService>>,
     automod: crate::automod_gateway::Slot,
     receiver: Option<crate::internal_action_http::BoundReceiver>,
+    member: Option<Arc<MemberRuntime>>,
 ) -> std::io::Result<()> {
     let mut registered = Vec::new();
     let mut parked = Vec::new();
@@ -182,6 +187,12 @@ pub async fn serve(
                     });
                 }
                 registered.push(scheduled_jobs::register(context.clone()));
+                // The unban sweep shares the boot-composed member consumer:
+                // one guild store across commands and sweep, never a second
+                // same-guild consumer with its own local queues.
+                if let Some(member) = member {
+                    registered.push(member_runtime::sweep_job(member, context.rest.clone()));
+                }
                 let registration = community_jobs::register(context.clone());
                 registered.extend(registration.jobs);
                 parked = registration.parked;
@@ -231,6 +242,7 @@ async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::Share
         .chain(community_jobs::NAMES)
         .chain(audit_runtime::NAMES)
         .chain(scheduled_jobs::NAMES)
+        .chain(member_runtime::NAMES)
         .chain([RECOVERY_JOB_NAME])
         .chain([feed_jobs::NAME])
         .collect();
