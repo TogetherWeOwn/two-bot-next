@@ -1,0 +1,10 @@
+{
+  "type": 4,
+  "data": {
+    "allowed_mentions": {
+      "parse": []
+    },
+    "content": "I don't recognize that command. It may have been removed or renamed — pick it again from the / command list.",
+    "flags": 64
+  }
+}
