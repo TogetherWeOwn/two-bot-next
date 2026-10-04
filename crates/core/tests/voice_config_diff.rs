@@ -116,11 +116,11 @@ fn golden_full_preview_reports_every_section() {
         render_preview(&diff, usize::MAX),
         "Import preview: 9 changes, 0 unknown channels skipped\n\
          ~ creator 101 (default_limit)\n\
-         + creator 106\n\
+         + creator 106 → name=\"new\" status=none\n\
          - template 102\n\
-         ~ template 103 (name_template)\n\
-         ~ alias \"A game\" (alias)\n\
-         + alias \"B game\"\n\
+         ~ template 103 (name_template) → name=\"renamed\"\n\
+         ~ alias \"A game\" (alias) → \"changed\"\n\
+         + alias \"B game\" → \"new\"\n\
          - list \"rooms\"\n\
          - logging\n\
          ~ settings (unique_names)"
@@ -249,9 +249,9 @@ fn diff_is_sorted_by_section_then_key() {
         render_preview(&diff, usize::MAX),
         "Import preview: 4 changes, 0 unknown channels skipped\n\
          ~ creator 101 (default_limit)\n\
-         + creator 106\n\
-         + alias \"a game\"\n\
-         + alias \"z game\""
+         + creator 106 → name=\"new\" status=none\n\
+         + alias \"a game\" → \"a\"\n\
+         + alias \"z game\" → \"z\""
     );
 }
 
@@ -268,11 +268,11 @@ fn preview_truncates_with_more_and_stays_within_limit() {
     assert_eq!(
         render_preview(&diff, 5),
         "Import preview: 40 changes, 0 unknown channels skipped\n\
-         + alias \"game 00\"\n\
-         + alias \"game 01\"\n\
-         + alias \"game 02\"\n\
-         + alias \"game 03\"\n\
-         + alias \"game 04\"\n\
+         + alias \"game 00\" → \"alias 00\"\n\
+         + alias \"game 01\" → \"alias 01\"\n\
+         + alias \"game 02\" → \"alias 02\"\n\
+         + alias \"game 03\" → \"alias 03\"\n\
+         + alias \"game 04\" → \"alias 04\"\n\
          +35 more"
     );
     assert_eq!(
@@ -306,6 +306,60 @@ fn preview_truncates_with_more_and_stays_within_limit() {
 }
 
 #[test]
+fn preview_shows_only_the_changed_template_text() {
+    let (current, inventory) = fixture();
+    // Scalar-only edit: no new text to confirm.
+    let mut incoming = current.clone();
+    incoming.creators[0].default_limit = 4;
+    let diff = diff_configuration(&current, &incoming, &inventory);
+    assert_eq!(
+        render_preview(&diff, usize::MAX),
+        "Import preview: 1 change, 0 unknown channels skipped\n\
+         ~ creator 101 (default_limit)"
+    );
+
+    // Name-only edit: only the new name is shown.
+    let mut incoming = current.clone();
+    incoming.creators[0].name_template = "@everyone join".to_owned();
+    let diff = diff_configuration(&current, &incoming, &inventory);
+    assert_eq!(
+        render_preview(&diff, usize::MAX),
+        "Import preview: 1 change, 0 unknown channels skipped\n\
+         ~ creator 101 (name_template) → name=\"@everyone join\""
+    );
+
+    // Both templates edited: both new values are shown.
+    let mut incoming = current.clone();
+    incoming.templates[0].name_template = "lobby".to_owned();
+    incoming.templates[0].status_template = Some("LIVE".to_owned());
+    let diff = diff_configuration(&current, &incoming, &inventory);
+    assert_eq!(
+        render_preview(&diff, usize::MAX),
+        "Import preview: 1 change, 0 unknown channels skipped\n\
+         ~ template 102 (name_template, status_template) → name=\"lobby\" status=\"LIVE\""
+    );
+
+    // Long template text is bounded per value and per line.
+    let mut incoming = current.clone();
+    incoming.creators[0].name_template = "z".repeat(500);
+    let preview = render_preview(
+        &diff_configuration(&current, &incoming, &inventory),
+        usize::MAX,
+    );
+    let line = preview.lines().nth(1).unwrap();
+    assert!(line.len() <= 200, "line too long: {line:?}");
+    assert!(line.contains(&format!("\"{}\"…", "z".repeat(80))));
+
+    // The hash binding is unchanged by the extra text.
+    let mut incoming = current.clone();
+    incoming.aliases.push(alias("new-game", "New Game"));
+    assert_eq!(
+        diff_content_hash(&current, &incoming).len(),
+        DIFF_HASH_CHARS
+    );
+}
+
+#[test]
 fn uploaded_text_cannot_break_the_layout() {
     let (current, inventory) = fixture();
     let mut incoming = current.clone();
@@ -318,12 +372,15 @@ fn uploaded_text_cannot_break_the_layout() {
         usize::MAX,
     );
     let lines: Vec<&str> = preview.lines().collect();
-    let long_list = format!("+ list \"{}\"…", "y".repeat(80));
+    let long_list = format!(
+        "+ list \"{}\"… → [\"den\", \"crew\", \"🎮\"]",
+        "y".repeat(80)
+    );
     assert_eq!(
         lines[1..],
         [
             "- alias \"A game\"",
-            "+ alias \"line\\nbreak \\\"q\\\"\"",
+            "+ alias \"line\\nbreak \\\"q\\\"\" → \"x\"",
             "- list \"rooms\"",
             long_list.as_str(),
             "! skipped unknown channel \"not\\na snowflake\"",

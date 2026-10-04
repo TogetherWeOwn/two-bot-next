@@ -5240,6 +5240,33 @@ async fn import_confirm_applies() {
 }
 
 #[tokio::test]
+async fn import_preview_shows_template_text_without_mentions() {
+    let trace = Trace::default();
+    let mut incoming = full_config();
+    incoming.templates[0].name_template = "@everyone lobby".to_owned();
+    let bytes = serde_json::to_vec(&incoming).unwrap();
+    let (runtime, _) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (owned, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    assert!(owned);
+    let preview = preview.expect("preview");
+    let text = response_text(&preview);
+    assert!(
+        text.contains("@everyone lobby"),
+        "preview must show the new template text: {text:?}"
+    );
+    let mentions = preview
+        .data
+        .as_ref()
+        .and_then(|data| data.allowed_mentions.as_ref())
+        .expect("preview disables mentions");
+    assert!(mentions.parse.is_empty());
+    assert!(mentions.users.is_empty());
+    assert!(mentions.roles.is_empty());
+}
+
+#[tokio::test]
 async fn import_skips_unknown_channels_and_confirms_remainder() {
     let trace = Trace::default();
     let mut incoming = full_config();
