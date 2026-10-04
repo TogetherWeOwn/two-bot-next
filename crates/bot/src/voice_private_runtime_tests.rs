@@ -660,8 +660,8 @@ fn parse_private_and_public() {
         ("public", VoiceCommand::Public),
     ] {
         let interaction = voice_interaction(Some(command_data(name, Vec::new())), None, true);
-        assert_eq!(parse_voice_command(&interaction), Some(expected));
         assert_eq!(expected.name(), name);
+        assert_eq!(parse_voice_command(&interaction), Some(expected));
         assert!(two_bot_core::voice_access::VOICE_COMMANDS.contains(&name));
         let guildless = voice_interaction(Some(command_data(name, Vec::new())), None, false);
         assert_eq!(parse_voice_command(&guildless), None);

@@ -41,6 +41,10 @@ impl PrivacyCommand {
     }
 }
 
+/// The writes one `/private` or `/public` needs: an optional bot-member grant,
+/// then the @everyone entry.
+type ConnectWrites = (Option<PermissionOverwrite>, PermissionOverwrite);
+
 const PAUSED: &str = "Voice rooms are paused: Discord refused the bot credential. \
                       Fix the token, then restart the bot.";
 const WARMING: &str = "The voice worker isn't warmed up yet — try again in a moment.";
@@ -569,7 +573,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         &self,
         room: Snowflake,
         deny: bool,
-    ) -> Option<Result<(Option<PermissionOverwrite>, PermissionOverwrite), RoomHttpError>> {
+    ) -> Option<Result<ConnectWrites, RoomHttpError>> {
         let live = self.live.inner.read().expect("live voice lock");
         let channel = live.channels.get(&room)?;
         let Some(bot) = live.bot.as_ref() else {
@@ -590,7 +594,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         bot: &BotAccess,
         current: &[PermissionOverwrite],
         deny: bool,
-    ) -> Result<(Option<PermissionOverwrite>, PermissionOverwrite), RoomHttpError> {
+    ) -> Result<ConnectWrites, RoomHttpError> {
         if !can_edit_overwrites(live.permissions(self.live.guild_id, room)) {
             return Err(RoomHttpError::AccessDenied);
         }
