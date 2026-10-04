@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from pathlib import Path
+import tomllib
 import unittest
 
 import yaml
@@ -22,7 +23,7 @@ JOB_INVENTORY = {
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"release-please", "dispatch-checks", "sbom-target", "release-sbom",
                     "attach-sbom"},
-    "staging-migrate.yml": {"plan", "apply"},
+    "staging-migrate.yml": {"plan", "claim", "apply"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
     # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
     # `image` builds/scans the untrusted ref with pinned actions only; `verify`
@@ -98,6 +99,59 @@ def staging_dispatch_errors(workflow):
     return errors
 
 
+def staging_claim_errors(claim):
+    """Claim transport must complete before the protected apply job waits."""
+    errors = []
+    prefix = "staging-migrate.yml:claim:"
+    if claim.get("name") != "staging-migrate (claim)":
+        errors.append(f"{prefix} consumer job identity changed")
+    if "environment" in claim or "secrets." in str(claim) or "uses" in claim:
+        errors.append(f"{prefix} must be unprotected with no secrets or reusable job")
+    if claim.get("permissions") != {"contents": "read"}:
+        errors.append(f"{prefix} must keep contents:read only")
+    if claim.get("needs") != "plan" or claim.get("if") != "github.ref == 'refs/heads/main' && inputs.mode == 'apply'":
+        errors.append(f"{prefix} must wait for a green plan, main and mode=apply")
+    if not runner_allowed("claim", claim.get("runs-on")):
+        errors.append(f"{prefix} must use the claim routed runner")
+    steps = claim.get("steps", [])
+    if len(steps) != 4 or any("if" in s or "continue-on-error" in s for s in steps):
+        errors.append(f"{prefix} must execute four fail-closed transport steps")
+        return errors
+    checkout, fetch, publish, upload = steps
+    if (not str(checkout.get("uses", "")).startswith("actions/checkout@")
+            or checkout.get("with") != {"persist-credentials": "false", "ref": "${{ github.sha }}"}):
+        errors.append(f"{prefix} checkout must pin the workflow head without persisted credentials")
+    if (not str(fetch.get("uses", "")).startswith("actions/download-artifact@")
+            or fetch.get("with") != {"name": "staging-migrate-manifest", "path": "current-plan"}):
+        errors.append(f"{prefix} must read this dispatch's plan artifact, not an arbitrary run")
+    expected_env = {key: "${{ inputs." + value + " }}" for key, value in (
+        ("MODE", "mode"), ("SOURCE_SHA", "source_sha"), ("STAGING_HOST", "staging_host"),
+        ("STAGING_DATABASE", "staging_database"), ("RECOVERY_REF", "recovery_evidence_ref"),
+        ("ACL_REF", "acl_plan_ref"), ("EXPECTED_PENDING", "expected_pending"),
+        ("PLAN_MANIFEST_SHA256", "plan_manifest_sha256"), ("PLAN_RUN_ID", "plan_run_id"))}
+    if publish.get("env") != expected_env or publish.get("shell") != "bash":
+        errors.append(f"{prefix} must pass exactly the dispatch fields via env, in bash")
+    script = str(publish.get("run", ""))
+    for pin in ("set -o pipefail", "python3 scripts/ci/staging_migrate_claim.py",
+                "--manifest current-plan/staging-migrate-manifest.json",
+                "--output staging-migrate-apply-claim.json"):
+        if pin not in script:
+            errors.append(f"{prefix} missing publisher pin {pin}")
+    if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
+        errors.append(f"{prefix} must upload the claim")
+    options = upload.get("with", {})
+    if options != {"name": "staging-migrate-apply-claim", "path": "staging-migrate-apply-claim.json",
+                   "if-no-files-found": "error", "retention-days": "14", "compression-level": "0"}:
+        errors.append(f"{prefix} must publish the named claim with stored ZIP entries and fail if absent")
+    return errors
+
+
+def job_env_text(job):
+    """Job-level `env` plus every step's `env`: everywhere a binding can be exported."""
+    return " ".join([str(job.get("env", ""))]
+                    + [str(step.get("env", "")) for step in job.get("steps", [])])
+
+
 def staging_migrate_errors(workflow):
     """Manual staging-only SQLx migration runner (TOG-11572).
 
@@ -105,10 +159,11 @@ def staging_migrate_errors(workflow):
     defaulting to plan, the six identity/evidence inputs required, the
     plan-bound expected_pending list optional at dispatch but required by the
     runner for apply, and the plan_manifest_sha256/plan_run_id pair optional
-    at dispatch but required by the runner for apply). Two jobs: `plan` always
+    at dispatch but required by the runner for apply). Three jobs: `plan` always
     runs through the no-reviewer staging-migrate-plan environment, reads only
     the read-only TWO_BOT_STAGING_PLAN_DATABASE_URL binding, and uploads
-    the manifest artifact; `apply` runs only for mode=apply after a green plan
+    the manifest artifact; unprotected `claim` transports the apply request;
+    `apply` runs only for mode=apply after a green plan and claim
     through the reviewed staging-migrate-apply environment, reads only the
     migrator TWO_BOT_STAGING_MIGRATOR_DATABASE_URL binding, and passes the
     plan-bound inputs to the runner. Each job pins main-branch dispatch, its
@@ -157,10 +212,11 @@ def staging_migrate_errors(workflow):
             errors.append(f"{name}: acl_plan_ref must document the bare reference contract "
                           "(refused before any DDL otherwise)")
     jobs = workflow.get("jobs") or {}
-    if set(jobs) != {"plan", "apply"}:
-        errors.append(f"{name}: jobs must be exactly plan and apply")
+    if set(jobs) != {"plan", "claim", "apply"}:
+        errors.append(f"{name}: jobs must be exactly plan, claim and apply")
         return errors
-    plan, apply = jobs.get("plan", {}), jobs.get("apply", {})
+    plan, claim, apply = jobs.get("plan", {}), jobs.get("claim", {}), jobs.get("apply", {})
+    errors.extend(staging_claim_errors(claim))
     if plan.get("environment") != "staging-migrate-plan":
         errors.append(f"{name}:plan: must read the staging-migrate-plan Environment binding")
     if apply.get("environment") != "staging-migrate-apply":
@@ -178,8 +234,8 @@ def staging_migrate_errors(workflow):
         errors.append(f"{name}:plan: must run only from main")
     if apply.get("if") != "github.ref == 'refs/heads/main' && inputs.mode == 'apply'":
         errors.append(f"{name}:apply: must run only from main for mode=apply")
-    if apply.get("needs") != "plan":
-        errors.append(f"{name}:apply: must wait for a green plan")
+    if apply.get("needs") != ["plan", "claim"]:
+        errors.append(f"{name}:apply: must wait for a green plan and pre-approval claim")
     for job_id, job in (("plan", plan), ("apply", apply)):
         if not runner_allowed(job_id, job.get("runs-on")):
             errors.append(f"{name}:{job_id}: must use the routed runner expression for job '{job_id}'")
@@ -193,18 +249,27 @@ def staging_migrate_errors(workflow):
             if step.get("shell") != "bash" or "set -o pipefail" not in str(step.get("run", "")):
                 errors.append(f"{name}:{job_id}: Run step must use a pipefail shell so a "
                               "migrator refusal/failure fails the job instead of reporting green")
-    plan_env = " ".join(str(step.get("env", "")) for step in plan.get("steps", []))
-    apply_env = " ".join(str(step.get("env", "")) for step in apply.get("steps", []))
+    # Whole-job scope (job `env` plus every step `env`): a secret exported at
+    # job level reaches every step, so a step-only scan would miss it.
+    plan_env = job_env_text(plan)
+    apply_env = job_env_text(apply)
     # Plan is physically read-only: it reads only the RO binding and must never
-    # see the migrator credential; apply reads only the migrator binding.
+    # see the migrator credential; apply reads only the migrator binding. The
+    # absence checks scan the entire job mapping (env, run, with, ...), since
+    # secret names are case-insensitive and any key can carry a `secrets.*`.
+    plan_job, apply_job = str(plan).lower(), str(apply).lower()
     if "TWO_BOT_STAGING_PLAN_DATABASE_URL" not in plan_env:
         errors.append(f"{name}:plan: must read only the TWO_BOT_STAGING_PLAN_DATABASE_URL binding")
-    if "TWO_BOT_STAGING_MIGRATOR_DATABASE_URL" in plan_env:
+    if "two_bot_staging_migrator_database_url" in plan_job:
         errors.append(f"{name}:plan: must never read the migrator TWO_BOT_STAGING_MIGRATOR_DATABASE_URL binding")
     if "TWO_BOT_STAGING_MIGRATOR_DATABASE_URL" not in apply_env:
         errors.append(f"{name}:apply: must read only the TWO_BOT_STAGING_MIGRATOR_DATABASE_URL binding")
-    if "TWO_BOT_STAGING_PLAN_DATABASE_URL" in apply_env:
+    if "two_bot_staging_plan_database_url" in apply_job:
         errors.append(f"{name}:apply: must never read the plan TWO_BOT_STAGING_PLAN_DATABASE_URL binding")
+    for job_id, text in (("plan", plan_job), ("apply", apply_job)):
+        if "tojson(secrets" in text.replace(" ", "") or "secrets[" in text.replace(" ", ""):
+            errors.append(f"{name}:{job_id}: must name each secret explicitly "
+                          "(no toJSON(secrets) or indexed secrets access)")
     plan_runs = " ".join(str(step.get("run", "")) for step in plan.get("steps", []))
     apply_runs = " ".join(str(step.get("run", "")) for step in apply.get("steps", []))
     # Match the standalone mode flag: the plan-binding flags
@@ -249,6 +314,10 @@ def staging_migrate_errors(workflow):
     plan_text = str(plan.get("steps", []))
     if "staging-migrate-manifest" not in plan_text:
         errors.append(f"{name}:plan: must name the staging-migrate-manifest artifact")
+    uploads = [step for step in plan.get("steps", [])
+               if str(step.get("uses", "")).startswith("actions/upload-artifact@")]
+    if len(uploads) != 1 or uploads[0].get("with", {}).get("compression-level") != "0":
+        errors.append(f"{name}:plan: must upload the manifest with stored ZIP entries")
     return errors
 
 
@@ -514,6 +583,51 @@ class WorkflowTests(unittest.TestCase):
                     def add(w, s=step, job_id=job_id):
                         w["jobs"][job_id]["steps"].append(s)
                     self.assertTrue(mutated(add))
+        # Credential split holds for the whole job mapping, not just step env:
+        # a binding exported at job level (or smuggled through any other key,
+        # in any case) reaches every step of the wrong job.
+        migrator_secret = "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"
+        plan_secret = "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}"
+        for job_id, wrong_binding, wrong_secret in (
+                ("plan", "TWO_BOT_STAGING_MIGRATOR_DATABASE_URL", migrator_secret),
+                ("apply", "TWO_BOT_STAGING_PLAN_DATABASE_URL", plan_secret)):
+            with self.subTest(job=job_id, wrong_binding="job-level-env"):
+                def leak(w, job_id=job_id, wrong_binding=wrong_binding, wrong_secret=wrong_secret):
+                    w["jobs"][job_id].setdefault("env", {})[wrong_binding] = wrong_secret
+                self.assertTrue(mutated(leak))
+            with self.subTest(job=job_id, wrong_binding="lowercase-job-level-env"):
+                def leak(w, job_id=job_id, wrong_binding=wrong_binding, wrong_secret=wrong_secret):
+                    w["jobs"][job_id].setdefault("env", {})["DB"] = wrong_secret.lower()
+                self.assertTrue(mutated(leak))
+            with self.subTest(job=job_id, wrong_binding="step-with"):
+                def leak(w, job_id=job_id, wrong_secret=wrong_secret):
+                    w["jobs"][job_id]["steps"].append(
+                        {"uses": "actions/cache@pinned", "with": {"key": wrong_secret}})
+                self.assertTrue(mutated(leak))
+            with self.subTest(job=job_id, wrong_binding="step-run"):
+                def leak(w, job_id=job_id, wrong_secret=wrong_secret):
+                    w["jobs"][job_id]["steps"].append({"run": f"echo {wrong_secret}"})
+                self.assertTrue(mutated(leak))
+            for blanket in ("${{ toJSON(secrets) }}", "${{ secrets['TWO_BOT_STAGING_X'] }}"):
+                with self.subTest(job=job_id, blanket=blanket):
+                    def leak(w, job_id=job_id, blanket=blanket):
+                        w["jobs"][job_id].setdefault("env", {})["ALL"] = blanket
+                    self.assertTrue(mutated(leak))
+        with self.subTest(plan="own-binding-at-job-level"):
+            # Positive control: relocating the job's own binding to job `env`
+            # is still that job reading only its own credential.
+            def relocate(w):
+                job = w["jobs"]["plan"]
+                job["env"] = {"TWO_BOT_STAGING_PLAN_DATABASE_URL": plan_secret}
+                for step in job["steps"]:
+                    step.get("env", {}).pop("TWO_BOT_STAGING_PLAN_DATABASE_URL", None)
+            self.assertEqual(mutated(relocate), [])
+        with self.subTest(plan="no-own-binding"):
+            def drop(w):
+                job = w["jobs"]["plan"]
+                for step in job["steps"]:
+                    step.get("env", {}).pop("TWO_BOT_STAGING_PLAN_DATABASE_URL", None)
+            self.assertTrue(mutated(drop))
         with self.subTest(apply="no-needs"):
             def drop(w):
                 del w["jobs"]["apply"]["needs"]
@@ -616,6 +730,28 @@ class WorkflowTests(unittest.TestCase):
                 def change(w, job_id=job_id, permissions=permissions):
                     w["jobs"][job_id]["permissions"] = permissions
                 self.assertTrue(mutated(change))
+
+    def test_check_toolchains_match_the_repository_pin(self):
+        channel = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
+        self.assertRegex(channel, r"^\d+\.\d+\.\d+$")
+        installers = {
+            job_id: [step for step in job.get("steps", [])
+                     if step.get("uses", "").startswith("dtolnay/rust-toolchain@")]
+            for job_id, job in self.workflows["check.yml"]["jobs"].items()
+        }
+        installers = {job: steps for job, steps in installers.items() if steps}
+        self.assertEqual(set(installers), {
+            "check", "rust-tests", "ignored-db-stores", "ignored-db-runtime",
+            "moderation-db", "self-role-store", "community-db", "tickets-postgres", "feeds-db",
+        })
+        for job_id, steps in installers.items():
+            with self.subTest(job=job_id):
+                self.assertEqual(len(steps), 1)
+                # Floating stable can install a different fmt/clippy than Cargo
+                # selects from the repository pin inside the job container.
+                self.assertEqual(steps[0].get("with", {}).get("toolchain"), channel)
+        self.assertEqual(set(installers["check"][0]["with"]["components"].replace(" ", "").split(",")),
+                         {"rustfmt", "clippy"})
 
     def test_overflow_runner_must_name_its_own_job(self):
         self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))

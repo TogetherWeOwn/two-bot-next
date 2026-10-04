@@ -163,7 +163,7 @@ class SupplyChainTests(unittest.TestCase):
         self.assertEqual(len(images), 2)
         for image in images:
             self.assertRegex(image, r"@sha256:[0-9a-f]{64}$")
-        self.assertTrue(images[0].startswith("rust:1.94-trixie@"))
+        self.assertTrue(images[0].startswith("rust:1.98-trixie@"))
         self.assertTrue(images[1].startswith("gcr.io/distroless/cc-debian13:nonroot@"))
         self.assertIn("package-ecosystem: docker", (ROOT / ".github/dependabot.yml").read_text())
 

@@ -199,7 +199,7 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
-          toolchain: stable
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
 
       # Fail-fast (TOG-12055): cheap lint/format/guard checks run before the
@@ -342,7 +342,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
-          toolchain: stable
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
 
       - name: Pin native tests to one CPU (loaded-runner validation)
@@ -540,7 +540,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
-          toolchain: stable
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
 
       - name: Pin native tests to one CPU (loaded-runner validation)
@@ -813,7 +813,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
-          toolchain: stable
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
 
       - name: Pin native tests to one CPU (loaded-runner validation)
@@ -1011,7 +1011,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         if: needs.job-inputs.outputs.rust != 'false'
         with:
-          toolchain: stable
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
@@ -1087,7 +1087,7 @@ jobs:
           fetch-depth: 1
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
-          toolchain: stable
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
       - name: Restore cargo cache
@@ -1312,7 +1312,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
-          toolchain: stable
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
@@ -1362,7 +1362,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
-          toolchain: stable
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
@@ -1408,7 +1408,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
-          toolchain: stable
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
       # TOG-11810: dependency build cache, as in the `check` job. The key
       # includes the job id, so this job keeps its own entry (it builds a
       # different dependency set); saved only on pushes to main.

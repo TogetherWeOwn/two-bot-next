@@ -2834,7 +2834,7 @@
           "[8371181](https://github.com/TogetherWeOwn/two-bot/commit/83711812364c451926eafe4ba0859db279eb7e7c)",
           "`src/announcements/`",
           "feat(feeds): follow same-host redirects, refuse cross-host distinctly (#299)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -2855,7 +2855,7 @@
           "[b5038fb](https://github.com/TogetherWeOwn/two-bot/commit/b5038fbc6b265978accfea0df448e518cd1449f5)",
           "`src/announcements/`",
           "fix(feeds): bound each pollFeeds read with a timeout (#298)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -2876,7 +2876,7 @@
           "[a50e747](https://github.com/TogetherWeOwn/two-bot/commit/a50e7474fb4e5493d1a412dab24eeb14748d9860)",
           "`src/announcements/`",
           "fix(feeds): isolate per-item failures in pollFeeds batch (#302)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -2918,7 +2918,7 @@
           "[df990c9](https://github.com/TogetherWeOwn/two-bot/commit/df990c96db0615ef7e6db5f4736395b7eb89ec31)",
           "`src/announcements/`",
           "fix(announcements): prefer alternate link for multi-link Atom entries (#306)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -2982,7 +2982,7 @@
           "[c99fec7](https://github.com/TogetherWeOwn/two-bot/commit/c99fec78c4b211c9421cd0785e6fdc0aac8c5e73)",
           "`src/announcements/`",
           "fix(announcements): reclaim crashed feed-delivery claims after 60s lease (#312)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3045,7 +3045,7 @@
           "[db84b22](https://github.com/TogetherWeOwn/two-bot/commit/db84b22cb55d8eb2a446ac23fdd3362cefcabed6)",
           "`src/announcements/`",
           "fix(feeds): advance poll window past 20-post cap across polls (#318)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3128,7 +3128,7 @@
           "[4931aec](https://github.com/TogetherWeOwn/two-bot/commit/4931aec4754e374e8c4dbfb8f8be85e1b7ee8285)",
           "`src/redirect/`",
           "fix(redirect): cache campaign misses at short negative TTL (#339)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3230,7 +3230,7 @@
           "[f5e62b7](https://github.com/TogetherWeOwn/two-bot/commit/f5e62b701038d45cc26cce29cd4684186f2540b2)",
           "`src/core/`, `src/redirect/`",
           "fix(redirect): resolve throttle bucket through trusted-proxy chain (#342)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3517,7 +3517,7 @@
           "[287a181](https://github.com/TogetherWeOwn/two-bot/commit/287a181c53ffa7884c345c9e1377f743f61f67cd)",
           "`src/jobs/`",
           "fix(snapshots): discard pending collector cycles after stop (#421)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3596,7 +3596,7 @@
           "[3f3f969](https://github.com/TogetherWeOwn/two-bot/commit/3f3f96906c577026bf6eea52061b73c79e7b651f)",
           "`src/jobs/`",
           "fix(events): reject malformed scheduled-event response elements (#436)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3617,7 +3617,7 @@
           "[881d21d](https://github.com/TogetherWeOwn/two-bot/commit/881d21d5f4bde7038060e3fb866175ee6891a2bd)",
           "`src/jobs/`",
           "fix(events): reject malformed optional snapshot fields (#432)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
