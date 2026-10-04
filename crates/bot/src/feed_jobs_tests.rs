@@ -272,6 +272,72 @@ async fn registration_parks_off_values_without_constructing_work() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
+/// Identity pairs, written out so a mutated constant cannot move expectations.
+/// The tokens are synthetic first segments for the public application ids.
+const STAGING: (u64, &str) = (
+    1545644954272137297,
+    "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+);
+const LIVE: (u64, &str) = (
+    326474832151838730,
+    "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature",
+);
+
+fn announcements(value: Option<&str>) -> FeatureGates {
+    let mut vars = std::collections::HashMap::new();
+    if let Some(value) = value {
+        vars.insert("TWO_ANNOUNCEMENTS".to_owned(), value.to_owned());
+    }
+    FeatureGates::from_map(&vars).unwrap()
+}
+
+/// TOG-15758: the poller delivers under the token's identity, so the capability
+/// fence binds it like the announcement verbs. With `TWO_ANNOUNCEMENTS=1` the
+/// staging pair registers; the live pair (announcements uncleared), an unknown
+/// guild, a mismatched pair and a missing or unparseable token build no job.
+#[tokio::test(start_paused = true)]
+async fn identity_fence_registers_the_poller_only_where_announcements_are_permitted() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let action: JobAction = Arc::new({
+        let calls = calls.clone();
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    });
+    let on = announcements(Some("1"));
+
+    let activation = BootActivation::from_token(Some(STAGING.0), Some(STAGING.1));
+    let job = register_fenced(on, &activation, action.clone())
+        .expect("staging identity registers the poller");
+    assert_eq!(job.name, "feeds");
+    (job.action)().await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    for (label, guild, token) in [
+        ("live pair", Some(LIVE.0), Some(LIVE.1)),
+        ("unknown guild", Some(1555555555555555555), Some(STAGING.1)),
+        ("staging guild, live token", Some(STAGING.0), Some(LIVE.1)),
+        ("live guild, staging token", Some(LIVE.0), Some(STAGING.1)),
+        ("no guild", None, Some(STAGING.1)),
+        ("unparseable token", Some(STAGING.0), Some("nope")),
+        ("no token", Some(STAGING.0), None),
+    ] {
+        let activation = BootActivation::from_token(guild, token);
+        assert!(
+            register_fenced(on, &activation, action.clone()).is_none(),
+            "{label} must not register the poller"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "refused jobs never run");
+
+    // Identity never enables what the environment left off.
+    let activation = BootActivation::from_token(Some(STAGING.0), Some(STAGING.1));
+    for value in [None, Some("0")] {
+        assert!(register_fenced(announcements(value), &activation, action.clone()).is_none());
+    }
+}
+
 struct Active(Arc<AtomicUsize>);
 impl Drop for Active {
     fn drop(&mut self) {

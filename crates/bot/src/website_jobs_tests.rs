@@ -74,6 +74,62 @@ async fn recovery_registration_does_not_unpark_unavailable_jobs() {
     }
 }
 
+/// TOG-15758: a job the identity fence refuses is absent from the supervised
+/// set, so `/readyz` lists it parked and never running, while the staging pair
+/// with the same environment unparks both posting jobs.
+#[tokio::test]
+async fn refused_identity_parks_the_posting_jobs_in_the_readyz_status_map() {
+    let gates = two_bot_core::FeatureGates::from_map(&std::collections::HashMap::from([
+        ("TWO_AUTOMATIONS".to_owned(), "1".to_owned()),
+        ("TWO_ANNOUNCEMENTS".to_owned(), "1".to_owned()),
+    ]))
+    .unwrap();
+    let action: jobs::JobAction = Arc::new(|| Box::pin(async { Ok(()) }));
+    let register = |activation: &BootActivation| {
+        let mut registered = Vec::new();
+        registered.extend(scheduled_jobs::register_fenced(
+            gates,
+            activation,
+            action.clone(),
+        ));
+        registered.extend(feed_jobs::register_fenced(
+            gates,
+            activation,
+            action.clone(),
+        ));
+        registered
+    };
+    let posting = [scheduled_jobs::NAMES[0], feed_jobs::NAME];
+
+    let staging = BootActivation::from_token(
+        Some(1545644954272137297),
+        Some("MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature"),
+    );
+    let registered = register(&staging);
+    let status = registered_statuses(&registered, &[]).await;
+    let entries = status.read().await;
+    for name in posting {
+        assert!(
+            !entries[name].parked,
+            "{name} registers on the staging pair"
+        );
+    }
+    drop(entries);
+
+    let live = BootActivation::from_token(
+        Some(326474832151838730),
+        Some("MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature"),
+    );
+    let registered = register(&live);
+    assert!(registered.is_empty(), "live identity builds no posting job");
+    let status = registered_statuses(&registered, &[]).await;
+    let entries = status.read().await;
+    for name in posting {
+        assert!(entries[name].parked, "{name} is parked on the live pair");
+        assert!(!entries[name].running);
+    }
+}
+
 #[tokio::test]
 async fn roster_paginates_and_rejects_failed_or_repeated_pages() {
     let page: Vec<_> = (1..=1000).map(|id| member(id, false, &[])).collect();

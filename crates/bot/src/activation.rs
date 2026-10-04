@@ -3,7 +3,7 @@
 use two_bot_core::{
     activation::{evaluate_activation, ActivationDecision, LiveCapability},
     backup::guild_config::application_id_from_token,
-    Config, RouterGates,
+    Config, FeatureGates, RouterGates,
 };
 
 #[derive(Clone)]
@@ -73,11 +73,69 @@ impl BootActivation {
         gates.tickets &= self.permitted(LiveCapability::Tickets);
         gates
     }
+
+    /// The supervised jobs that post under the bot identity (the scheduled-message
+    /// ticker and the feed poller) obey the same fence as the router verbs that
+    /// feed them. Narrowing only: a refused capability turns the gate off, a
+    /// permitted one leaves the configured value alone.
+    #[must_use]
+    pub(crate) fn constrain_features(&self, mut gates: FeatureGates) -> FeatureGates {
+        gates.automations &= self.permitted(LiveCapability::Automations);
+        gates.announcements &= self.permitted(LiveCapability::Announcements);
+        // Text commands are only effective while automations are on.
+        gates.text_commands &= gates.automations;
+        gates
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const STAGING_GUILD: u64 = 1545644954272137297;
+    const STAGING_TOKEN: &str = "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature";
+    const LIVE_GUILD: u64 = 326474832151838730;
+    const LIVE_TOKEN: &str = "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature";
+
+    fn all_on() -> FeatureGates {
+        FeatureGates::from_map(&std::collections::HashMap::from([
+            ("TWO_AUTOMATIONS".to_owned(), "1".to_owned()),
+            ("TWO_ANNOUNCEMENTS".to_owned(), "1".to_owned()),
+            ("TWO_TEXT_COMMANDS".to_owned(), "1".to_owned()),
+            ("TWO_FEED_POLL_SECONDS".to_owned(), "120".to_owned()),
+        ]))
+        .expect("gates parse")
+    }
+
+    #[test]
+    fn constrain_features_follows_identity_and_only_narrows() {
+        let on = all_on();
+        // Staging pair: every capability is permitted, so nothing narrows.
+        let staging = BootActivation::from_token(Some(STAGING_GUILD), Some(STAGING_TOKEN));
+        assert_eq!(staging.constrain_features(on), on);
+        // Live pair: only self_roles is cleared, so the posting jobs turn off and
+        // the unrelated poll interval is untouched.
+        let live = BootActivation::from_token(Some(LIVE_GUILD), Some(LIVE_TOKEN));
+        let narrowed = live.constrain_features(on);
+        assert!(!narrowed.automations && !narrowed.announcements && !narrowed.text_commands);
+        assert_eq!(narrowed.feed_poll_seconds, 120);
+        // Unknown guild, mismatched pair, unparseable or missing token: refused.
+        for activation in [
+            BootActivation::from_token(Some(1555555555555555555), Some(STAGING_TOKEN)),
+            BootActivation::from_token(Some(STAGING_GUILD), Some(LIVE_TOKEN)),
+            BootActivation::from_token(Some(LIVE_GUILD), Some(STAGING_TOKEN)),
+            BootActivation::from_token(None, Some(STAGING_TOKEN)),
+            BootActivation::from_token(Some(STAGING_GUILD), Some("not-a-token")),
+            BootActivation::from_token(Some(STAGING_GUILD), None),
+        ] {
+            let narrowed = activation.constrain_features(on);
+            assert!(!narrowed.automations && !narrowed.announcements);
+            assert!(!narrowed.text_commands);
+        }
+        // Permission never enables a gate the environment left off.
+        let off = FeatureGates::from_map(&std::collections::HashMap::new()).unwrap();
+        assert_eq!(staging.constrain_features(off), off);
+    }
 
     #[test]
     fn activation_bare_and_prefixed_token_decisions_match() {

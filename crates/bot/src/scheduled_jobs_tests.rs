@@ -150,6 +150,85 @@ async fn registration_builds_no_job_while_automations_are_off() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
+/// Identity pairs, written out so a mutated constant cannot move expectations.
+/// The tokens are synthetic first segments for the public application ids.
+const STAGING: (u64, &str) = (
+    1545644954272137297,
+    "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+);
+const LIVE: (u64, &str) = (
+    326474832151838730,
+    "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature",
+);
+
+fn identity(guild: Option<u64>, token: Option<&str>) -> BootActivation {
+    BootActivation::from_token(guild, token)
+}
+
+/// TOG-15758: the ticker posts under the token's identity, so the capability
+/// fence binds it like the `/schedule` verbs. With `TWO_AUTOMATIONS=1` the
+/// staging pair registers; the live pair (automations uncleared), an unknown
+/// guild, a mismatched pair and a missing or unparseable token build no job.
+#[tokio::test]
+async fn identity_fence_registers_the_ticker_only_where_automations_are_permitted() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let action: JobAction = Arc::new({
+        let calls = calls.clone();
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    });
+    let on = gates(Some("1"));
+
+    let job = register_fenced(
+        on,
+        &identity(Some(STAGING.0), Some(STAGING.1)),
+        action.clone(),
+    )
+    .expect("staging identity registers the ticker");
+    assert_eq!(job.name, "scheduled_messages");
+    (job.action)().await.expect("staging action runs");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    for (label, activation) in [
+        ("live pair", identity(Some(LIVE.0), Some(LIVE.1))),
+        (
+            "unknown guild",
+            identity(Some(1555555555555555555), Some(STAGING.1)),
+        ),
+        (
+            "staging guild with live token",
+            identity(Some(STAGING.0), Some(LIVE.1)),
+        ),
+        (
+            "live guild with staging token",
+            identity(Some(LIVE.0), Some(STAGING.1)),
+        ),
+        ("no guild", identity(None, Some(STAGING.1))),
+        ("unparseable token", identity(Some(STAGING.0), Some("nope"))),
+        ("no token", identity(Some(STAGING.0), None)),
+    ] {
+        assert!(
+            register_fenced(on, &activation, action.clone()).is_none(),
+            "{label} must not register the ticker"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "refused jobs never run");
+
+    // Identity never enables what the environment left off.
+    for value in [None, Some("0")] {
+        assert!(register_fenced(
+            gates(value),
+            &identity(Some(STAGING.0), Some(STAGING.1)),
+            action.clone()
+        )
+        .is_none());
+    }
+}
+
 /// The same legacy row against a database with a due row: the disabled
 /// registration leaves the row unclaimed, unposted and unaudited, while the
 /// enabled control with the same action posts it once.
