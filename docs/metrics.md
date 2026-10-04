@@ -250,6 +250,7 @@ server, no new infrastructure.
 | `db_pool_saturated` | pool at max, 0 idle, 3 consecutive samples | [DB pool](runbook.md#alert-db-pool) |
 | `db_errors` | 3+ storage failures between samples (restarts skip the window) | [DB errors](runbook.md#alert-db-errors) |
 | `send_admission_blocked` | new admission refusals in 3 consecutive samples | [send admission blocked](runbook.md#alert-send-admission-blocked) |
+| `voice_failures` | room-op failures > 5% of >= 10 ops between samples, or any new dead-letter/orphan (restarts skip the window) | [voice failures](runbook.md#alert-voice-failures) |
 
 `job_stale` uses `JOB_INTERVAL_SECONDS`, which must equal each scheduled job's
 Rust `*_INTERVAL_MS / 1000`. `invite_snapshot`, `session_checkpoint` and `other`
@@ -263,7 +264,7 @@ used on both sides of the B2 soak evidence seam. The Rust canonical list is
 is named `evidence-{ruleId}-{window}.json` (soak-ledger packets stamp the
 `soak_expected_committed` ledger identity), so the QA evidence table can
 attribute packets when several rules fire in one window. Both sides pin all
-six spellings with tests; the payload shape is unchanged.
+seven spellings with tests; the payload shape is unchanged.
 
 Known gaps: the DB error counter currently records only send-admission SQL,
 so non-admission stores still surface only through the pool proxy and the
