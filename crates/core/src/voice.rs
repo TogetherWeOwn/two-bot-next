@@ -353,6 +353,57 @@ mod tests {
         assert_eq!(end.duration_seconds, Some(0));
     }
 
+    /// Legacy `3c3e7e8` (#265): a leave stamp that does not parse must not
+    /// fabricate a duration even when the session start WAS seen. The row is
+    /// stamped with processing time and carries no start or duration.
+    #[test]
+    fn malformed_leave_with_open_session_is_unknown_start() {
+        let open = OpenSession {
+            channel_id: 10,
+            started_at: "2026-09-20T12:00:00.000Z".to_owned(),
+            session_key: Some("session-a".to_owned()),
+        };
+        let end = resolve_voice_end(Some(open), 99, "garbage", "2026-09-20T12:05:31.000Z");
+        assert_eq!(
+            end,
+            VoiceEnd {
+                // The open session still decides the credited channel.
+                channel_id: 10,
+                end_at: "2026-09-20T12:05:31.000Z".to_owned(),
+                start_known: false,
+                started_at: None,
+                duration_seconds: None,
+            }
+        );
+    }
+
+    /// The mirror case: a valid leave against a session whose recorded start
+    /// is unreadable is also unmeasurable. The leave stamp is kept as is.
+    #[test]
+    fn malformed_open_start_with_valid_leave_is_unknown_start() {
+        let open = OpenSession {
+            channel_id: 10,
+            started_at: "garbage".to_owned(),
+            session_key: None,
+        };
+        let end = resolve_voice_end(
+            Some(open),
+            99,
+            "2026-09-20T12:05:30.000Z",
+            "2026-09-20T12:05:31.000Z",
+        );
+        assert_eq!(
+            end,
+            VoiceEnd {
+                channel_id: 10,
+                end_at: "2026-09-20T12:05:30.000Z".to_owned(),
+                start_known: false,
+                started_at: None,
+                duration_seconds: None,
+            }
+        );
+    }
+
     #[test]
     fn blind_windows_and_counts() {
         let hb = [
