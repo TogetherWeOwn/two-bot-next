@@ -7,6 +7,10 @@
 
 use crate::{is_snowflake, CutoverDb, ScanCompletion, DB_POOL_MAX_DEFAULT, LIVE_GUILD_ID};
 
+#[cfg(test)]
+#[path = "safety_flag_refusal_matrix_tests.rs"]
+mod safety_flag_refusal_matrix_tests;
+
 /// Shared completion accounting for both history CLIs. Probes are recorded only
 /// when interrupted; their intentional one-page cap is not a backfill outcome.
 #[derive(Debug, Default)]

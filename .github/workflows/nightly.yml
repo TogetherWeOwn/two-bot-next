@@ -137,6 +137,7 @@ jobs:
           --skip channel_moderation_store::
           --skip channel_moderation_store::tests::lockdown_round_trip_stores_and_restores_exact_masks
           --skip channel_moderation_store::tests::repeated_lockdown_preserves_first_masks
+          --skip channel_moderation_store::tests::live_unlock_refreshes_the_next_lockdown_seed_and_generation
           --skip channel_moderation_store::tests::delayed_unlock_cleanup_cannot_delete_a_later_lockdown
           --skip channel_moderation_store::tests::retried_cleanup_after_recreation_reports_stale
           --skip channel_moderation_store::tests::claim_complete_replay_refuses_reuse
@@ -160,6 +161,9 @@ jobs:
           --skip purge_and_slowmode_success_audit_and_replay_without_repeating_effects
           --skip repeated_lockdown_keeps_first_seed_and_unlock_restores_exact_masks
           --skip initially_absent_overwrite_is_deleted_only_after_recorded_lockdown
+          --skip unlock_preserves_access_restrictions_added_after_lockdown
+          --skip unlock_drift_and_read_failure_refuse_without_mutation_or_recovery_loss
+          --skip lockdown_after_an_external_unlock_refreshes_seed_and_fences_old_cleanup
           --skip ambiguous_unlock_retains_recovery_and_both_claims_across_all_keys
           --skip rejected_first_lock_retires_only_its_seed_and_finishes_refusal
           --skip audit_failure_retries_only_finalization_not_a_successful_discord_effect
@@ -169,6 +173,8 @@ jobs:
           --skip delayed_unlock_cannot_overwrite_a_later_lockdown_cycle
           --skip post_mutation_audit_failure_rolls_back_completion_and_retains_recovery
           --skip rejected_repeated_lockdown_preserves_original_seed_and_unlock_failure_keeps_it
+          --skip unlock_preserves_live_privacy_changes_instead_of_restoring_a_snapshot
+          --skip unlock_send_bit_drift_aborts_without_consuming_the_recovery_seed
           --skip stale_channel_ticket_and_recovery_generation_cannot_finish_current_owner
           --skip ambiguous_permission_responses_retain_request_channel_and_recovery_fences
           --skip recovery_read_failures_release_both_fences_and_preserve_original_seed
