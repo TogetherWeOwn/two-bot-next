@@ -466,7 +466,7 @@ fn settings_strategy() -> impl Strategy<Value = GuildSettings> {
         prop::sample::select(vec!["Europe/London", "UTC"]),
         proptest::option::of(prop::sample::select(vec!["201", GUILD])),
         proptest::collection::btree_map(
-            prop::sample::select(vec!["kick", "lock"]),
+            prop::sample::select(vec!["kick", "limit"]),
             role_ids(),
             0..3,
         ),
