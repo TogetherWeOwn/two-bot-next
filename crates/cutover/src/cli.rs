@@ -58,6 +58,15 @@ pub struct Args {
 impl Args {
     #[must_use]
     pub fn parse(argv: &[String]) -> Self {
+        Self::try_parse(argv).unwrap_or_else(|error| {
+            eprintln!("input error: {error}");
+            std::process::exit(2);
+        })
+    }
+
+    /// Safety opt-ins may appear only once, bare and without a value.
+    /// Validate while parsing so refusal precedes every consumer's file/DB access.
+    fn try_parse(argv: &[String]) -> Result<Self, String> {
         let mut out = Self::default();
         let mut i = 0;
         while i < argv.len() {
@@ -65,6 +74,11 @@ impl Args {
             if let Some(eq) = a.find('=') {
                 let (k, v) = a.split_at(eq);
                 if let Some(key) = k.strip_prefix("--") {
+                    if is_safety_opt_in(key) {
+                        return Err(format!(
+                            "--{key} is a bare opt-in and does not accept a value"
+                        ));
+                    }
                     out.values.insert(key.to_owned(), v[1..].to_owned());
                     i += 1;
                     continue;
@@ -72,6 +86,16 @@ impl Args {
             }
             if let Some(stripped) = a.strip_prefix("--") {
                 let name = stripped.to_owned();
+                if is_safety_opt_in(&name) {
+                    if out.has(&name) {
+                        return Err(format!("--{name} must not be repeated"));
+                    }
+                    if i + 1 < argv.len() && !argv[i + 1].starts_with("--") {
+                        return Err(format!(
+                            "--{name} is a bare opt-in and does not accept a value"
+                        ));
+                    }
+                }
                 if i + 1 < argv.len() && !argv[i + 1].starts_with("--") {
                     out.values.insert(name, argv[i + 1].clone());
                     i += 2;
@@ -84,7 +108,10 @@ impl Args {
                 i += 1;
             }
         }
-        out
+        if out.has("apply") && out.has("dry-run") {
+            return Err("--apply conflicts with --dry-run".to_owned());
+        }
+        Ok(out)
     }
 
     #[must_use]
@@ -102,6 +129,10 @@ impl Args {
         }
         None
     }
+}
+
+fn is_safety_opt_in(name: &str) -> bool {
+    matches!(name, "apply" | "allow-lower" | "allow-live-guild")
 }
 
 /// Refuse the live guild unless `--allow-live-guild` is present. Returns the
@@ -184,4 +215,110 @@ pub fn now_iso() -> String {
         time_part.second(),
         millis
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+
+    fn parse(argv: &[&str]) -> Result<Args, String> {
+        Args::try_parse(&argv.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn safety_opt_ins_reject_all_equals_and_space_values_in_any_order() {
+        for flag in ["apply", "allow-lower", "allow-live-guild"] {
+            for value in ["false", "true", "0", "1", "no", "", "fixture.json"] {
+                let equals = format!("--{flag}={value}");
+                let bare = format!("--{flag}");
+                for invalid in [vec![equals.as_str()], vec![bare.as_str(), value]] {
+                    for before in [false, true] {
+                        let mut argv = vec!["--guild-id", "111111111111111111"];
+                        if before {
+                            argv.splice(0..0, invalid.clone());
+                        } else {
+                            argv.extend_from_slice(&invalid);
+                        }
+                        let error = parse(&argv).unwrap_err();
+                        assert!(error.contains(&bare), "{argv:?}: {error}");
+                        assert!(error.contains("does not accept a value"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn safety_opt_ins_reject_duplicates_and_conflicting_forms() {
+        for flag in ["apply", "allow-lower", "allow-live-guild"] {
+            let bare = format!("--{flag}");
+            let false_value = format!("--{flag}=false");
+            for argv in [
+                vec![bare.as_str(), bare.as_str()],
+                vec![
+                    bare.as_str(),
+                    "--guild-id=111111111111111111",
+                    bare.as_str(),
+                ],
+                vec![bare.as_str(), false_value.as_str()],
+                vec![false_value.as_str(), bare.as_str()],
+                vec![bare.as_str(), "false", bare.as_str()],
+                vec![bare.as_str(), bare.as_str(), "false"],
+            ] {
+                assert!(parse(&argv).is_err(), "accepted {argv:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn apply_and_dry_run_are_conflicting_in_either_order() {
+        for argv in [
+            vec!["--apply", "--dry-run"],
+            vec!["--dry-run", "--apply"],
+            vec!["--apply", "--dry-run=false"],
+            vec!["--dry-run", "false", "--apply"],
+        ] {
+            assert!(parse(&argv).unwrap_err().contains("conflicts"));
+        }
+        assert!(parse(&["--dry-run"]).is_ok());
+    }
+
+    #[test]
+    fn bare_opt_ins_preserve_values_positionals_and_option_order() {
+        for argv in [
+            vec![
+                "inventory",
+                "--apply",
+                "--guild-id",
+                "111111111111111111",
+                "--allow-lower",
+                "--input=fixture.json",
+                "--allow-live-guild",
+            ],
+            vec![
+                "inventory",
+                "--allow-live-guild",
+                "--input",
+                "fixture.json",
+                "--guild-id=111111111111111111",
+                "--allow-lower",
+                "--apply",
+            ],
+        ] {
+            let args = parse(&argv).unwrap();
+            assert_eq!(args.positionals, ["inventory"]);
+            for flag in ["apply", "allow-lower", "allow-live-guild"] {
+                assert!(args.has(flag));
+                assert!(args.flags.contains(flag));
+                assert!(!args.values.contains_key(flag));
+                assert_eq!(args.get(flag), Some(""));
+            }
+            assert_eq!(args.get("guild-id"), Some("111111111111111111"));
+            assert_eq!(args.get("input"), Some("fixture.json"));
+        }
+        let args = parse(&["--input=first", "--input", "second", "--json"]).unwrap();
+        assert_eq!(args.get("input"), Some("second"));
+        assert!(args.has("json"));
+        assert!(!args.has("apply"));
+    }
 }
