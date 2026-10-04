@@ -17,8 +17,8 @@ Consumes without repeating:
 
 - Query panels and warn/page thresholds:
   [cutover dashboard queries](cutover-dashboard-queries.md).
-- Rollback pins, backout order, and verify/acknowledge:
-  [container rollback one-pager](cutover-rollback-onepager.md).
+- Rollback decider, triggers, ordered steps, and time bounds:
+  [cutover rollback runbook](cutover-rollback-runbook.md).
 - Window signals, freeze/drain, and rollback procedure:
   [cutover](cutover.md) (§48-hour watch, rollback section).
 - Watch header, rows, and budgets:
@@ -87,7 +87,7 @@ outgoing watcher stands down. No line may say "same as last time".
   session-start budget remaining.
 - [ ] Ownership fence state: which revision holds the active record, and
   confirmation no takeover/fence change is in flight.
-- [ ] Rollback readiness: pointer to the rollback one-pager and
+- [ ] Rollback readiness: pointer to the rollback runbook and
   confirmation the previous version ID is still in the watch header.
 - [ ] Next actor and next action: who does what, by when, if the next
   checkpoint or the next finding arrives first.
@@ -115,7 +115,7 @@ budgets; this path only says who acts.
 4. **L3 — Decide rollback or extend (cutover lead with the Director of
    Engineering).** If no recovery path is identified by the checkpoint,
    the lead declares rollback with UTC time and reason and works the
-   rollback one-pager in document order. Any proposed loss or
+   rollback runbook in document order. Any proposed loss or
    irreversible recovery needs its separate authority; the lead cannot
    waive the zero-loss gate. If the window stays held, record EXTEND
    with the new deadline.
@@ -128,8 +128,8 @@ reconciliation.
 - No monitor, webhook, scrape job, or dashboard is added or configured.
 - No threshold is set or changed; warn/page values live in the dashboard
   queries and the deploy watch budgets.
-- No rollback step is included; backout order and verification live in
-  the rollback one-pager and cutover procedure.
+- No rollback step is included; decider, triggers, ordered steps, and
+  time bounds live in the rollback runbook and cutover procedure.
 - No database probe is authorized against staging or production.
 - No retry, breaker-reset, takeover, rollback, or credential step is
   included; those live in the runbook and cutover docs.
