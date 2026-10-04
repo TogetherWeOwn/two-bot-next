@@ -216,6 +216,42 @@ pages. Storage failures of the admission SQL page once via the DB-error rule
 above, not here. When this sketch disagrees with the runbook or the budgets
 in [production-deploy](production-deploy.md#signal-thresholds-budgets-and-rollback-triggers),
 those win. Runbook: [runbook](runbook.md) (send admission blocked section).
+## 8. Gateway disconnects and missed events
+
+Source: `two_bot_gateway_disconnects_total` (every transport loss the
+shard supervisor observed: reconnect failures, close frames, invalid
+sessions, cold-resume IDENTIFY) and
+`two_bot_gateway_missed_events_total` (dispatches Discord assigned but
+this process never received: sequence gaps inside one session). Series
+contract: [metrics](metrics.md). This section measures transport and
+sequence continuity only. Database health stays with the DB error
+counter, and off-container reachability stays with the external uptime
+check; neither is repeated here.
+
+```promql
+sum(increase(two_bot_gateway_disconnects_total[48h]))
+sum(increase(two_bot_gateway_missed_events_total[48h]))
+sum(increase(two_bot_gateway_disconnects_total[48h])) > 0
+  and sum(increase(two_bot_gateway_resumes_total[48h]))
+    + sum(increase(two_bot_gateway_events_total{event="READY"}[48h])) == 0
+```
+
+Read the two counters as a pair. The missed-events threshold is zero:
+any nonzero increase over the 48h window fails the zero-missed-events
+acceptance and is a stop condition under the "Event continuity" row of
+the signal-thresholds table in [production-deploy](production-deploy.md)
+(zero unexplained gaps). Disconnects are informational on their own —
+deploys and host moves cause them — but each one must pair with a later
+RESUME or fresh READY in the same window; the third query above fires
+when disconnects have no matching session recovery. A rising `READY`
+count next to disconnects means fresh IDENTIFYs (checkpoints older than
+15 minutes or rejected sessions); a rising `RESUMED` count means the
+session continued with no gap. Cross-check with one log filter over the
+same window: count `gateway reconnect failed; Twilight will retry` and
+`gateway ready; checkpoint committed` lines. A missed-events increase
+with no disconnect means the gap predates this instrumentation or the
+process restarted mid-window (counters reset to zero on restart, so a
+reset is not a quiet window — re-baseline both scrapes after it).
 
 ## What this pack does not do
 
