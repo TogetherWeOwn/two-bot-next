@@ -51,7 +51,7 @@ use a directory under `PAPERCLIP_RUN_SCRATCH_DIR`). The immutable bootstrap
 changelog fixture is separate from the live `CHANGELOG.md`, which automation
 changes after release. The fixture covers tagged and untagged seeds, features
 in the root/four crates/Worker, breaking changes, fixes (including security-only
-commits), Common Changelog headings, the card footer, synchronized manifest and
+commits), Common Changelog headings, the absence of any tracker footer, synchronized manifest and
 lock updates, and exactly one componentless release candidate. Each generated
 snapshot, including every manifest/dependency/lock update and the migrated
 changelog, then feeds a second native release to verify the post-release state.
