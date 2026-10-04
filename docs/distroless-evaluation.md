@@ -79,3 +79,70 @@ else (14 packages, no shell or package manager).
 2. CISO acknowledgement of the 14-package inventory and pin-refresh runbook.
 3. Keep the shell-free smoke probes (`docker cp`, `docker top`, binary
    `--healthcheck`); never ship `debug-nonroot`.
+
+## Runtime profile: cold start, RSS and readiness timings
+
+Trial-image profiling for the cutover guard. The default `Dockerfile` now builds
+the same pinned `cc-debian13:nonroot` base digest as this trial variant — only
+build-provenance labels differ, and labels do not execute — so this profile
+covers both images. No guard logic changes here; thresholds stay where the
+cutover guard reads them in the
+[production signal thresholds](production-deploy.md#signal-thresholds-budgets-and-rollback-triggers).
+
+### Repeatable procedure
+
+Run on a Docker-capable host (self-hosted runner or dev machine), never the
+controller. No secrets, database or Discord traffic are used at any step.
+
+```sh
+docker buildx build --load --platform linux/amd64 \
+  -t two-bot:distroless-profile -f Dockerfile.distroless .
+python3 scripts/container-smoke.py two-bot:distroless-profile
+```
+
+Cold start, RSS peak and shutdown (parked mode, same 256 MiB cap as smoke):
+
+```sh
+docker run -d --name prof --memory 256m \
+  --publish 127.0.0.1::8080 two-bot:distroless-profile
+# Poll GET /health until 200 {"status":"ok"}; record start-to-200 as T_health.
+# Poll GET /readyz until the parked 503 breakdown; record start-to-503 as T_readyz.
+# Every second until healthy, sample RSS with:
+docker stats --no-stream --format '{{.MemUsage}}' prof
+# Record the maximum sample as the RSS peak, then:
+docker kill --signal TERM prof
+time docker wait prof
+# Expect exit 0; record the elapsed time as T_shutdown.
+docker rm --force prof
+```
+
+Poll with a hand-rolled client or `curl --max-time` and never follow redirects,
+so one healthy endpoint cannot masquerade as another (same contract as
+`scripts/container-smoke.py`).
+
+### Measured numbers
+
+Every row below is CI-anchored; this slice ran no Docker build (no Docker in the
+authoring workspace) and records no fresh measurement. Rerun the procedure
+above for exact seconds on a new head.
+
+| Signal | Trial measurement | Source | Cutover reading |
+|---|---|---|---|
+| Image size | 42,807,296 B (40.82 MiB); binary 10,518,416 B (10.03 MiB); −53,301,248 B (−55.5%) versus the bookworm default at that time | Trial check run `36948616604`, attempt 2 | Fits the 112 MiB image / 15 MiB binary ceilings with headroom |
+| Cold start to `/health` 200 | Bounded by the 30 s smoke deadline; exact seconds not in reachable logs | Smoke contract | Well inside the 60 s first-200 staging budget |
+| `/readyz` parked answer | 503 with process ready and gateway down (6-job parked map at the trial head; 10-job map on current heads) | Smoke contract | Truthful parked, never acceptance |
+| Docker HEALTHCHECK | Healthy within 30 s of start | Smoke contract | Same deadline as `/health` |
+| SIGTERM shutdown | Exit 0 in 0.236 s (trial); 0.095 s historical default image | Trial log; baseline doc | Inside the 10 s smoke and 35 s drain budgets |
+| Parked-mode RSS peak | Not sampled by smoke. Proxies: synthetic pipeline peak ≈ 24 MiB (debug, mock workload); B1 floor ≈ 140 MiB; `lite` gate signal ≈ 200 MiB on the shipped `basic` placement; no OOM at the 256 MiB cap | Baseline and benchmark docs | Placement unchanged; loaded-guild RSS still needs the staging soak |
+| Gateway-connected first 200 | Never measured on the trial (no secrets by design) | Staging soak acceptance | 60 s budget stands |
+
+### SLO thresholds
+
+No threshold changes. The existing budgets already bound this runtime: first
+200 within 60 s of a restart or deploy event, SIGTERM drain inside 35 s, RSS
+against the B1 floor on the shipped placement, and the image/binary size
+ceilings. The cutover guard keeps reading those values; this section is the
+distroless evidence behind them.
+
+Not claimed here: a live Discord TLS handshake, backup/guild-config upload-hook
+paths, or loaded-guild RSS — those stay on the cutover preconditions above.

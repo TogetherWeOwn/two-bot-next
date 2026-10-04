@@ -1,0 +1,106 @@
+{
+  "_comment": "Denied-path copy pack for voice room commands (create/join/move when denied). Each case is one observable denied outcome with the exact surface text the harness must surface distinctly, never as a generic failure. Sources are pinned in scripts/voice_denied_copy.py; this file carries shapes only. Offline only: no network, no tokens, no guild touch.",
+  "version": 1,
+  "pack": "voice-room denied-path copy: create/join/move permission denials",
+  "cases": [
+    {
+      "name": "create_member_denied",
+      "path": "create",
+      "command": "create",
+      "observation": {
+        "reply": "You need Manage Channels to use /create.",
+        "reason": "harness identity lacks Manage Channels; the bot itself is healthy"
+      },
+      "expected_outcome": "create_member_denied",
+      "meaning": "Fix the harness identity's Discord permissions or test with an authorized identity; never a bot bug, never a watch-log error. Never retry with another credential."
+    },
+    {
+      "name": "create_bot_denied",
+      "path": "create",
+      "command": "create",
+      "observation": {
+        "reply": "I cannot create channels here: I need Manage Channels. Tell an admin to fix my permissions.",
+        "reason": "Discord refused the channel create with 403; the bot role lacks Manage Channels"
+      },
+      "expected_outcome": "create_bot_denied",
+      "meaning": "Grant the staging bot Manage Channels on the guild or category, then rerun. Distinct from create_member_denied: the member was authorized, the bot was not."
+    },
+    {
+      "name": "create_required_role",
+      "path": "create",
+      "command": "create",
+      "observation": {
+        "reply": "You need the server's required role to use voice-room commands.",
+        "reason": "guild access controls name a required role the harness identity lacks"
+      },
+      "expected_outcome": "create_required_role",
+      "meaning": "Guild-level gate, evaluated before any per-command restriction. Fix the harness identity's roles or lift the gate on the staging guild; not a Discord permission problem."
+    },
+    {
+      "name": "create_command_restricted",
+      "path": "create",
+      "command": "create",
+      "observation": {
+        "reply": "You do not have a role that may use this command here.",
+        "reason": "guild access controls restrict the create command to roles the harness identity lacks"
+      },
+      "expected_outcome": "create_command_restricted",
+      "meaning": "Per-command gate. Distinct from create_required_role: the guild-wide role passed but this command's allow-list did not."
+    },
+    {
+      "name": "join_not_occupant",
+      "path": "join",
+      "command": "kick",
+      "observation": {
+        "reply": "Only room occupants can start a vote.",
+        "reason": "vote-kick initiator has not joined the temporary room"
+      },
+      "expected_outcome": "join_not_occupant",
+      "meaning": "Join-state denial on the kick path: the initiator must join the room first. Not a permission misconfiguration."
+    },
+    {
+      "name": "join_not_a_room",
+      "path": "join",
+      "command": "kick",
+      "observation": {
+        "reply": "That member is not in a temporary voice room.",
+        "reason": "vote-kick target is not in a tracked temporary room"
+      },
+      "expected_outcome": "join_not_a_room",
+      "meaning": "Join-state denial on the kick path: there is no room to act on. Check the target joined a creator channel first."
+    },
+    {
+      "name": "join_not_in_room",
+      "path": "join",
+      "command": "reclaim",
+      "observation": {
+        "reply": "You need to be in the room to use this command.",
+        "reason": "ownership command invoked by a member outside the room"
+      },
+      "expected_outcome": "join_not_in_room",
+      "meaning": "Join-state denial on the ownership path (reclaim/transfer): the actor must be in the room. Have the harness identity join first, then rerun."
+    },
+    {
+      "name": "move_bot_denied",
+      "path": "move",
+      "command": null,
+      "observation": {
+        "reply": "channel <#500>: Discord access denied; suspend until permissions change",
+        "reason": "Discord refused the member move with 403; the bot lacks Move Members on the room"
+      },
+      "expected_outcome": "move_bot_denied",
+      "meaning": "The move is a background queue action with no interaction reply: the denial surfaces as this /setup failure line and the matching logging notice. Grant the bot Move Members, then reconcile. The member stays in the creator channel; nothing is retried in a storm."
+    },
+    {
+      "name": "generic_failure_contrast",
+      "path": null,
+      "command": "create",
+      "observation": {
+        "reply": "Something went wrong (ref 1a2b3c4d). Please try again — if it keeps happening, share this reference with a server admin.",
+        "reason": "handler error with a correlation reference; the only text that ever carries a failure outward"
+      },
+      "expected_outcome": "generic_failure",
+      "meaning": "Contrast case: the one shape that IS a bot-side failure. None of the eight denied cases above may classify here, or a red smoke line becomes untriagable by shape."
+    }
+  ]
+}

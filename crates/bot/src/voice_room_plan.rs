@@ -56,6 +56,34 @@ pub(crate) struct RoomPlanInput<'a> {
     pub bot: &'a BotAccess,
     /// The bot's effective permissions on the creator channel.
     pub bot_permissions: Option<Permissions>,
+    /// That creator's `/group` flag: shared numbering and a contiguous room
+    /// block per category. False keeps creator-adjacent placement.
+    pub grouped: bool,
+    /// Existing rooms in the same group (the creator's category). Must be
+    /// empty when `grouped` is false.
+    pub group_room_ids: &'a [Snowflake],
+}
+
+/// Tracked rooms still in the creator's category: the `/group` room set for
+/// [`plan_placement`]. Rooms whose channel is gone (hand-deleted) or moved to
+/// another category are left out, so every id here is a `Room` entry in the
+/// category order [`placement`] builds.
+pub(crate) fn category_room_ids(
+    creator: &Channel,
+    channels: &HashMap<Snowflake, Channel>,
+    rooms: &HashMap<Snowflake, VoiceRoom>,
+) -> Vec<Snowflake> {
+    let mut ids: Vec<Snowflake> = rooms
+        .keys()
+        .filter(|id| {
+            channels
+                .get(*id)
+                .is_some_and(|channel| channel.parent_id == creator.parent_id)
+        })
+        .copied()
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
 fn to_core(overwrites: &[PermissionOverwrite]) -> Result<Vec<ChannelOverride>, RoomHttpError> {
@@ -159,8 +187,8 @@ fn placement(input: &RoomPlanInput<'_>) -> Option<u64> {
     let index = plan_placement(PlacementRequest {
         creator_id: input.creator.id.get(),
         side,
-        grouped: false,
-        group_room_ids: &[],
+        grouped: input.grouped,
+        group_room_ids: input.group_room_ids,
         category_order: &order,
     })
     .ok()?;
@@ -173,10 +201,9 @@ fn placement(input: &RoomPlanInput<'_>) -> Option<u64> {
 /// snapshot data that cannot be honoured.
 pub(crate) fn plan_room(input: &RoomPlanInput<'_>) -> Result<RoomChannelAttributes, RoomHttpError> {
     let settings = input.settings;
-    // Companion text channels are V9; never create a room that ignores them.
-    if settings.text_channels {
-        return Err(RoomHttpError::InvalidRequest);
-    }
+    // The companion text channel (`settings.text_channels`) is not part of the
+    // voice-channel attributes: the worker creates it through the same
+    // per-guild queue (V9c), so the toggle never blocks room planning.
     let base_limit = match settings.default_limit {
         Some(limit) => u16::try_from(limit).map_err(|_| RoomHttpError::InvalidRequest)?,
         None => u16::try_from(input.creator.user_limit.unwrap_or(0))

@@ -2246,6 +2246,42 @@
       "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
+      "id": "s12-28",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Read-only `report voice-ghosts` ghost-channel count (tracked-present, tracked-gone, untracked-present plus clean flag)",
+          "`crates/cutover/src/voice_ghosts.rs` GhostCounts diff, `report voice-ghosts` live plus `--seed` demo, seed/mock-listing integration tests and rehearsal runbook section 4 (#437)"
+        ]
+      },
+      "owner": [
+        "TOG-10119",
+        "TOG-13123"
+      ],
+      "status": "manual",
+      "action": "Run `report voice-ghosts --seed` for the demo counts, then poll the live command against the disposable staging guild during a cutover rehearsal until both gaps read empty; confirm the clean flag.",
+      "expected": "Seed demo reports the fixture gaps; live staging polling shows tracked-present, tracked-gone and untracked-present counts with no deletes or writes; the clean flag is set only when both gaps are empty.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel IDs (no tokens), sanitized command output and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s12-29",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Actionable denied-path interaction copy with next steps",
+          "Router/dispatch denied, disabled-feature, unknown-command, expired-control and generic-failure copy plus `docs/interaction-replies.md` and pinned test expectations (#425)"
+        ]
+      },
+      "owner": [
+        "TOG-13123"
+      ],
+      "status": "manual",
+      "action": "On the disposable staging guild as a non-privileged member, trigger each denial path: a permission-gated command, a disabled-feature command, an unknown slash name, a stale button/control and a forced handler failure.",
+      "expected": "Every denial names the Discord permission and who grants it (or the admin-only enable path), unknown names and expired controls are distinguishable, and generic failures keep the ref correlation id with a retry hint; all replies stay ephemeral and under the 2000-character cap.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized reply text or screenshots and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
       "id": "s13-f114c44",
       "parity": {
         "section": 13,

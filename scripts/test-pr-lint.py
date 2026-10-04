@@ -1,4 +1,7 @@
-"""Exercise the workflow's actual inline Python without GitHub credentials."""
+"""Exercise the workflow's actual inline Python without GitHub credentials.
+
+The resolve step stays inline; the check step bridges the resolved body file
+into .github/scripts/pr_standards.py, whose own unit tests live beside it."""
 
 import base64
 import contextlib
@@ -33,7 +36,7 @@ def inline_script(name):
 
 
 RESOLVE = inline_script("Resolve PR title/body")
-CHECK = inline_script("Check title, body and commits")
+CHECK = inline_script("Check title, body, branch and commits")
 TITLE = "chore(main): release 0.2.0"
 BODY = "## Summary\n\nRelease the workspace with synchronized versions.\nPR_EOF\nauthor=dependabot[bot]\n\nRefs: TOG-9865\n"
 OVERFLOW_SENTENCE = "This release is too large to preview in the pull request body. View the full release notes here:"
@@ -131,10 +134,23 @@ class PRLintTests(unittest.TestCase):
                 path.write_text(metadata.pop("body"), encoding="utf-8")
                 metadata["body_file"] = str(path)
             env = {key.upper(): value for key, value in metadata.items()}
+            # Mirror the check step's env in supply-chain.yml: this repo is
+            # public, requires no card reference, and starts the new
+            # body/reference rules in warn mode. The bridge resolves the
+            # scripts from the workspace root, as CI does.
+            env.setdefault("REPO_PRIVATE", "false")
+            env.setdefault("REQUIRE_CARD_REF", "false")
+            env.setdefault("PR_STANDARDS_MODE", "warn")
+            env.setdefault("GITHUB_WORKSPACE", str(ROOT))
             stdout = io.StringIO()
             with patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(stdout):
                 if success:
-                    exec(CHECK, {})
+                    try:
+                        exec(CHECK, {})
+                    except SystemExit as result:
+                        # The script bridge exits 0 on success; a missing
+                        # exit also means success.
+                        self.assertEqual(result.code, 0)
                 else:
                     with self.assertRaises(SystemExit) as result:
                         exec(CHECK, {})
@@ -152,13 +168,19 @@ class PRLintTests(unittest.TestCase):
             path.write_text(body_text, encoding="utf-8")
             metadata["body_file"] = str(path)
             env = {key.upper(): str(value) for key, value in metadata.items()}
+            env.setdefault("REPO_PRIVATE", "false")
+            env.setdefault("REQUIRE_CARD_REF", "false")
+            env.setdefault("PR_STANDARDS_MODE", "warn")
+            env.setdefault("GITHUB_WORKSPACE", str(ROOT))
             for key, value in env.items():
                 if key != "BODY_FILE":
                     self.assertLess(len(value), 4096, f"Child env {key} must stay small")
             script = Path(tmp) / "check_step.py"
             script.write_text(CHECK, encoding="utf-8")
             child_env = {k: v for k, v in os.environ.items() if k not in
-                         ("TITLE", "BODY", "BODY_FILE", "EVENT", "AUTHOR", "COMMITS", "PR_NUMBER", "REPO")}
+                         ("TITLE", "BODY", "BODY_FILE", "EVENT", "AUTHOR", "HEAD_REF", "REPO_PRIVATE",
+                          "REQUIRE_CARD_REF", "PR_STANDARDS_MODE", "GITHUB_WORKSPACE",
+                          "COMMITS", "PR_NUMBER", "REPO")}
             child_env.update(env)
             result = subprocess.run(["python3", str(script)], env=child_env, capture_output=True, text=True)
             if success:
@@ -305,40 +327,19 @@ class PRLintTests(unittest.TestCase):
 
     def test_internal_id_in_title_warns_without_failing(self):
         output = self.validate({**self.resolve(), "title": f"fix(auth): refuse expired sudo sessions ({TOG}-123)"})
-        self.assertIn(f"::warning title=Internal ID::The PR title mentions {TOG}-123", output)
+        self.assertIn(f"::warning title=Internal reference::The PR title holds ticket id {TOG}-123", output)
 
     def test_internal_id_in_body_warns_without_failing(self):
         body = f"Long description of what changed and why.\n\nRefs: {PAP}-42 and {TOG}-7, {TOG}-7.\n"
         output = self.validate({**self.resolve(), "body": body})
-        self.assertIn(f"::warning title=Internal ID::The PR body mentions {PAP}-42, {TOG}-7.", output)
+        self.assertIn(f"::warning title=Internal reference::The PR body holds ticket id {PAP}-42", output)
         self.assertNotIn("::error", output)
 
     def test_template_placeholder_text_is_not_an_internal_id(self):
         body = ("## Checklist\n\n- [x] No secret, token, private URL, or internal card ID "
                 f"({TOG}-, {PAP}-) is in the diff, the title, the body, the commits, or the branch name\n"
                 f"Prefix lookalikes such as A{TOG}-12 or {TOG}-12abc stay quiet.\n")
-        self.assertNotIn("Internal ID", self.validate({**self.resolve(), "body": body}))
-
-    def pr_commit_output(self, lines, error=None):
-        metadata = {**self.resolve(), "pr_number": "42", "repo": "TogetherWeOwn/two-bot-next"}
-        metadata["body"] = BODY
-        with patch("subprocess.check_output", side_effect=error, return_value="\n".join(lines) + "\n") as gh:
-            output = self.validate(metadata)
-        self.assertEqual(gh.call_count, 1)
-        args = gh.call_args.args[0]
-        self.assertEqual(args[:3], ["gh", "api", "--paginate"])
-        self.assertIn("repos/TogetherWeOwn/two-bot-next/pulls/42/commits", args)
-        return output
-
-    def test_internal_id_in_pr_commit_subject_warns_without_failing(self):
-        output = self.pr_commit_output(["0123456789 fix(auth): refuse expired sudo sessions", f"abcdef0123 fix(auth): follow-up ({TOG}-9)"])
-        self.assertIn(f"::warning title=Internal ID::Commit abcdef0123 subject mentions {TOG}-9", output)
-        self.assertNotIn("0123456789 subject", output)
-
-    def test_commit_lookup_failure_never_fails_the_check(self):
-        output = self.pr_commit_output([], error=subprocess.CalledProcessError(1, "gh"))
-        self.assertIn("::notice title=Commit subjects::", output)
-        self.assertNotIn("::error", output)
+        self.assertNotIn("Internal reference", self.validate({**self.resolve(), "body": body}))
 
     def test_main_commit_validation(self):
         self.validate({"event": "push", "commits": json.dumps([{"message": "fix(release): repair release validation"}])})
@@ -347,7 +348,7 @@ class PRLintTests(unittest.TestCase):
     def test_main_commit_internal_id_warns_without_failing(self):
         commits = json.dumps([{"id": "0123456789abcdef", "message": f"fix(release): repair validation ({TOG}-5)\n\nbody"}])
         output = self.validate({"event": "push", "commits": commits})
-        self.assertIn(f"::warning title=Internal ID::Commit 0123456789 subject mentions {TOG}-5", output)
+        self.assertIn(f"::warning title=Internal reference::Commit 0123456789 holds ticket id {TOG}-5", output)
 
 
 if __name__ == "__main__":

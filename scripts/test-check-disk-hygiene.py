@@ -103,7 +103,7 @@ class CheckDiskHygieneTests(unittest.TestCase):
 
     def test_integration_coverage_not_narrowed(self):
         integration = step_body(
-            self.check, "cargo test (integration, including website acceptance)"
+            self.check, "cargo test (integration, including website acceptance and backup round trip)"
         )
         self.assertIn(FULL_INTEGRATION_RUN, integration)
 
@@ -120,7 +120,7 @@ class CheckDiskHygieneTests(unittest.TestCase):
             "cargo fmt --check",
             "cargo clippy -D warnings",
             "cargo test (unit and binary, including RSVP store)",
-            "cargo test (integration, including website acceptance)",
+            "cargo test (integration, including website acceptance and backup round trip)",
         ):
             self.assertIn(heavy, names, f"expected step {heavy!r} in check job")
             self.assertLess(

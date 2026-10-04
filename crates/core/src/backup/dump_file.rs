@@ -109,6 +109,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "internal_action_log",
     "internal_discord_events",
     "moderation_channel_executions",
+    "moderation_member_bans",
     "invite_campaigns",
     "voice_creators",
     "voice_rooms",
@@ -129,13 +130,12 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_command_role_members",
 ];
 
-/// Frozen v3 tables no longer created by cutover migrations. Keep their data
-/// when they exist, but do not require nonexistent legacy subsystems on Rust.
-pub const OPTIONAL_LEGACY_TABLES: &[&str] = &[
-    "moderation_warnings",
-    "moderation_scheduled_unbans",
-    "automation_commands",
-];
+/// Covered tables not created by the current cutover migration set, if any.
+/// Keep legacy data when such tables exist, but do not require nonexistent
+/// legacy subsystems. A table created by migrations must leave this list
+/// (the coverage test enforces it): empty means every covered table is
+/// migrated here, including automation_commands (0130).
+pub const OPTIONAL_LEGACY_TABLES: &[&str] = &[];
 
 /// Explicit migrated-schema exclusions, checked by the schema coverage test.
 pub const EXCLUDED_TABLES: &[&str] = &[

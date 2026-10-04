@@ -6,6 +6,7 @@
 //! or by future transports. Slices S3+ build on these seams.
 
 pub mod action_outcomes;
+pub mod activation;
 pub mod anchor_event;
 pub mod audit;
 pub mod audit_mirror;
@@ -13,6 +14,7 @@ pub mod audit_mirror;
 pub mod audit_service;
 #[cfg(feature = "db")]
 pub mod audit_store;
+pub mod automation_transfer;
 pub mod automod;
 pub mod automod_runtime;
 #[cfg(feature = "db")]
@@ -35,9 +37,16 @@ pub mod containment;
 #[cfg(feature = "db")]
 pub mod containment_store;
 #[cfg(feature = "db")]
+pub mod custom_command_service;
+#[cfg(feature = "db")]
+pub mod custom_command_store;
+pub mod custom_commands;
+#[cfg(feature = "db")]
 pub mod database_roles;
 pub mod database_tls;
 pub mod database_url;
+pub mod disable_preflight;
+pub mod e2e_matrix;
 pub mod events;
 pub mod evidence;
 pub mod expected_joins;
@@ -70,7 +79,11 @@ pub mod lfg;
 #[cfg(feature = "db")]
 pub mod lfg_store;
 pub mod mac;
+pub mod mee6;
 pub mod member_leave_gap;
+pub mod member_moderation;
+#[cfg(feature = "db")]
+pub mod member_moderation_store;
 pub mod membership;
 pub mod message_safety;
 pub mod metrics;
@@ -104,6 +117,7 @@ pub mod voice_access;
 pub mod voice_alias;
 pub mod voice_alias_core;
 pub mod voice_assistant;
+pub mod voice_assistant_build;
 pub mod voice_assistant_cap;
 pub mod voice_assistant_request;
 pub mod voice_assistant_validate;
@@ -113,6 +127,7 @@ pub mod voice_config;
 pub mod voice_config_diff;
 pub mod voice_create_admission;
 pub mod voice_custom_id;
+pub mod voice_ghost_cleanup;
 pub mod voice_logging;
 pub mod voice_name_filter;
 pub mod voice_naming;
@@ -139,6 +154,11 @@ pub use action_outcomes::{
     parse_retry_after_secs, retry_after_ms, set_send_bit, unlock_overwrite, ActionOutcome,
     KickOutcome, KickResult, KickStatus, ModerationExecution, BACKOFF_BASE_MS, MAX_HTTP_TRIES,
     MAX_RETRY_AFTER_MS, RETRY_AFTER_PADDING_MS,
+};
+pub use automation_transfer::{
+    diff_import, export_document, max_import_entries, parse_import_document, ExportDocument,
+    ExportedCommand, ImportDiff, ImportOutcome, ImportParseError, ImportRejection, ParsedImport,
+    PendingSchedule, EXPORT_VERSION,
 };
 pub use automod::{
     match_automod, normalize_content, sanction_for, validate_automod_rules, AutomodConfig,
@@ -180,6 +200,20 @@ pub use containment::{
     ContainmentRole, ContainmentSignal, DestructiveAction, DestructiveAuditEvent,
     QuarantineFailure, QuarantinePlan, QuarantineRefusal, CONTAINMENT_ALERT_EVENT,
     CONTAINMENT_ALERT_MAX_IDS, CONTAINMENT_SUPPRESSED_EVENT,
+};
+#[cfg(feature = "db")]
+pub use custom_command_store::{
+    audit as audit_custom_command, delete_command, find_text_trigger, get_command,
+    get_command_by_text_trigger, list_commands, lock_command_capacity, put_command,
+};
+pub use custom_commands::{
+    accepted_text_trigger, adjudicate_delete, adjudicate_put, adjudicate_run,
+    builtin_command_names, check_capacity, deregister_set, error_code, format_command_list,
+    is_builtin_trigger, max_custom_commands, placeholders_in, registry_with_custom,
+    render_template, require_automations_enabled, trigger_word, validate_put_input,
+    validate_template, AuditRecord, CommandError, DeleteDecision, PutCommandInput, PutDecision,
+    RunOutcome, StoredCommand, TemplateContext, TemplateError, MAX_COMMAND_NAME_CHARS,
+    MAX_DESCRIPTION_CHARS, MAX_RENDERED_CHARS, MAX_TEMPLATE_CHARS, TEMPLATE_PLACEHOLDERS,
 };
 pub use events::{CoreEvent, VoiceSessionDelta};
 pub use evidence::{
@@ -250,6 +284,10 @@ pub use lfg::{
     LfgSelectAction, LfgSelectOption, LfgSignup, LfgStatus, RoleSpecError, SignupOutcome,
     StartsAtError, TitleError, LFG_LEAVE_VALUE, LFG_SELECT_PREFIX, MAX_LFG_ROLES,
     MAX_OPTION_LABEL_CHARS, MAX_ROLE_SLOTS, MAX_TITLE_CHARS,
+};
+pub use mee6::{
+    clean_mee6_name, parse_mee6_entry, translate_export, translate_mee6_template, Mee6CommandInput,
+    TranslatedCommand, TranslatedExport,
 };
 pub use member_leave_gap::{
     classify_leave_gaps, leave_gap_feeds_from_rows, ClassifyResult, FillBound, GapJoin, GapKind,
@@ -370,6 +408,7 @@ pub use voice_access::{
     is_voice_command, may_create_room, may_use_command, validate_access_controls, AccessControls,
     AccessDecision, AccessDenyReason, AccessError, AccessMember, RoleId, VOICE_COMMANDS,
 };
+pub use voice_ghost_cleanup::{plan_ghost_cleanup, GhostCleanupPlan};
 pub use voice_permission_health::{
     evaluate_permissions, notice_target, resolve_effective_permissions, NoticeCandidates,
     NoticeTarget, NoticeThrottle, OverwriteMasks, OverwriteTarget, PermissionFinding,

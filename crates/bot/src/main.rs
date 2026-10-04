@@ -5,17 +5,26 @@
 //! `GUILD_ID` the shard stays parked and `/readyz` reports `gateway: down`
 //! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
+mod activation;
 #[cfg(test)]
 mod admission_test_support;
 mod audit_gateway;
 mod audit_runtime;
 mod automod_gateway;
 mod backup_cli;
+// Pure burn math: no runtime caller yet, the offline pin test is the consumer.
+#[allow(dead_code)]
+mod burn_rate;
+#[cfg(test)]
+mod burn_rate_tests;
 mod command_runtime;
 #[cfg(test)]
 mod command_runtime_tests;
 mod commands_cli;
 mod community_jobs;
+mod containment_runtime;
+#[cfg(test)]
+mod containment_runtime_tests;
 mod database_roles_cli;
 #[cfg(test)]
 #[allow(dead_code)]
@@ -23,16 +32,26 @@ mod database_roles_cli;
 mod discord_test_common;
 mod dispatch;
 mod erasure_cli;
+mod feed_jobs;
 mod gateway;
+mod gateway_commands;
 mod gateway_failure;
 mod gateway_metrics;
 #[cfg(test)]
 mod gateway_tests;
 mod internal_action_http;
 mod jobs;
+mod join_risk_runtime;
+#[cfg(test)]
+mod join_risk_runtime_tests;
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod log_volume_guard_tests;
 mod metrics_http;
+mod moderation_cli;
+#[cfg(test)]
+mod observability_event_conformance_tests;
 mod onboarding;
 #[cfg(test)]
 mod onboarding_tests;
@@ -40,6 +59,7 @@ mod preflight;
 mod raid_runtime;
 #[cfg(test)]
 mod raid_runtime_tests;
+mod restore_drill;
 mod schedule_runtime;
 mod scheduled_jobs;
 mod server;
@@ -50,6 +70,8 @@ mod self_role_handlers;
 #[allow(dead_code)]
 mod self_role_runtime;
 mod shutdown;
+#[cfg(test)]
+mod smoke_error_contract_tests;
 mod ticket_runtime;
 #[cfg(test)]
 #[path = "../../core/tests/support/tracing_capture.rs"]
@@ -77,6 +99,9 @@ async fn main() {
     let cli_args: Vec<String> = std::env::args().skip(1).collect();
     if cli_args.first().is_some_and(|arg| arg == "preflight") {
         std::process::exit(preflight::dispatch(&cli_args[1..]).await);
+    }
+    if cli_args.first().is_some_and(|arg| arg == "moderation") {
+        std::process::exit(moderation_cli::dispatch(&cli_args[1..]).await);
     }
     // Docker HEALTHCHECK probe: GET /health on the configured port and exit
     // 0/1. Kept dependency-free (std + tokio only) so the check path cannot
@@ -135,6 +160,10 @@ async fn main() {
         }
     });
 
+    // Evaluate all five capabilities once, before any handler registration.
+    // Refusals narrow the command surface, not liveness or analytics jobs.
+    let activation = activation::BootActivation::from_config(&config);
+    activation.log_refusals();
     if receiver_config.is_some() && internal_receiver_prerequisites(&config).is_err() {
         tracing::error!(
             error_class = "receiver_prerequisites_invalid",
@@ -215,6 +244,42 @@ async fn main() {
         store.as_ref().map(|s| s.pool().clone()),
     );
 
+    // Disable guard: refuse to boot with moderation/automation disabled
+    // while releases are still owed (pending tempban unbans, active
+    // lockdowns, enabled scheduled messages). Enabled gates short-circuit without a
+    // database read; the explicit override proceeds and is logged loudly.
+    // Without a database there is no owed state to read.
+    if let Some(pool) = store.as_ref().map(|s| s.pool().clone()) {
+        let vars: std::collections::HashMap<String, String> = std::env::vars().collect();
+        let gates = two_bot_core::disable_preflight::DisableGates::from_map(&vars);
+        if !gates.moderation || !gates.automations {
+            let overridden = two_bot_core::disable_preflight::override_active(&vars, &cli_args);
+            match two_bot_core::disable_preflight::boot_check(&pool, &gates, overridden).await {
+                Ok(two_bot_core::disable_preflight::BootVerdict::Proceed) => {}
+                Ok(two_bot_core::disable_preflight::BootVerdict::Refused(owed)) => {
+                    tracing::error!(
+                        owed = %owed.report(),
+                        "moderation_disable_refused: boot refused with moderation/automation disabled while releases are owed; complete or cancel them, or set TWO_ALLOW_OWED_RELEASES=1 to override"
+                    );
+                    std::process::exit(1);
+                }
+                Ok(two_bot_core::disable_preflight::BootVerdict::Overridden(owed)) => {
+                    tracing::warn!(
+                        owed = %owed.report(),
+                        "moderation_disable_override: booting with moderation/automation disabled while releases are owed; members may stay banned and channels locked"
+                    );
+                }
+                Err(_) => {
+                    tracing::error!(
+                        error_class = "moderation_disable_unknown",
+                        "moderation_disable_refused: owed-release state unreadable while moderation/automation is disabled; refusing boot"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
     // Capture the authoritative pool before the gateway's async move owns it.
     // Bind privately before starting tasks; enabled failures never fall back.
     let receiver = match receiver_config {
@@ -244,8 +309,12 @@ async fn main() {
     // ONE optional self-role service: gateway dispatch and the supervised
     // recovery job share this Arc. Empty/invalid catalogues, non-staging guilds
     // and failed identity reads leave the surface and the job unregistered.
+    // The activation fence is evaluated first: a refused self_roles capability
+    // composes no service, so neither dispatch nor the recovery job can run.
     let self_roles = match (gateway_prerequisites(&config), store.as_ref()) {
-        (Ok((token, _, guild_id)), Some(db)) => {
+        (Ok((token, _, guild_id)), Some(db))
+            if activation.permitted(two_bot_core::activation::LiveCapability::SelfRoles) =>
+        {
             self_role_handlers::SelfRoleService::from_env(db.pool().clone(), token, guild_id).await
         }
         _ => None,
@@ -315,7 +384,23 @@ async fn main() {
                         guild_id,
                         self_roles,
                         gates,
+                        &activation,
                     );
+                    if let Some(runtime) = &runtime {
+                        let config = gateway_commands::GatewayCommandConfig::from_map(
+                            guild_id,
+                            &std::env::vars().collect(),
+                        )
+                        .map_err(|error| {
+                            step_failure(FailureClass::CustomCommandsInitFailed, error)
+                        })?;
+                        runtime
+                            .initialize_custom_commands(config)
+                            .await
+                            .map_err(|error| {
+                                step_failure(FailureClass::CustomCommandsInitFailed, error)
+                            })?;
+                    }
                     // Onboarding renders through that same executor: one shared
                     // admission lane and pacing, never a private Discord client.
                     // Its identity probe honors the mock REST seam through the
@@ -369,51 +454,90 @@ async fn main() {
                             )
                         })?,
                     };
-                    pipeline.set_join_observer(raid_runtime::start_from_env(
+                    let raid =
+                        raid_runtime::start_from_env(pool.clone(), raid_executor.clone(), guild_id);
+                    // Join-risk delivery (R2) shares the raid observer slot:
+                    // the pipeline takes one observer, so risk chains behind
+                    // the raid watch and both stay behind the funnel's join
+                    // row. Without exact TWO_ANTI_NUKE=1 on the staging guild
+                    // the chain is the raid watch alone.
+                    pipeline.set_join_observer(join_risk_runtime::chain_from_env(
                         pool.clone(),
-                        raid_executor,
+                        raid_executor.clone(),
                         guild_id,
+                        raid,
                     ));
+                    // Containment (R3) watches the audit-log entry slot, a
+                    // separate observer from the join slot above. Without
+                    // exact TWO_ANTI_NUKE=1 on the staging guild there is no
+                    // observer at all; dry-run is the default and only an
+                    // armed worker executes removals.
+                    if let Some(containment) =
+                        containment_runtime::start_from_env(pool.clone(), raid_executor, guild_id)
+                    {
+                        pipeline.set_audit_entry_observer(containment);
+                    }
                     // Automod shares the command runtime's REST executor; it never
                     // builds a private client, router or timer.
                     let vars: std::collections::HashMap<String, String> =
                         std::env::vars().collect();
-                    let automod =
-                        match automod_gateway::resolve(&vars, guild_id).map_err(|reason| {
+                    // A refused automod capability is never resolved or validated:
+                    // stale env on a live identity can neither start the engine
+                    // nor fail the gateway. The refusal was already logged once.
+                    let automod_config = if activation
+                        .permitted(two_bot_core::activation::LiveCapability::Automod)
+                    {
+                        automod_gateway::resolve(&vars, guild_id).map_err(|reason| {
                             tracing::error!(reason, "automod configuration rejected");
                             step_failure(
                                 FailureClass::AutomodConfigInvalid,
                                 sqlx::Error::InvalidArgument(reason.into()),
                             )
-                        })? {
-                            Some(resolved) => {
-                                let executor = match runtime.as_ref() {
-                                    Some(runtime) => runtime.executor(),
-                                    None => two_bot_discord::ActionExecutor::with_proxy(
-                                        token.clone(),
-                                        std::env::var("DISCORD_API_BASE")
-                                            .ok()
-                                            .filter(|value| !value.is_empty()),
+                        })?
+                    } else {
+                        None
+                    };
+                    let automod = match automod_config {
+                        Some(resolved) => {
+                            let executor = match runtime.as_ref() {
+                                Some(runtime) => runtime.executor(),
+                                None => two_bot_discord::ActionExecutor::with_proxy(
+                                    token.clone(),
+                                    std::env::var("DISCORD_API_BASE")
+                                        .ok()
+                                        .filter(|value| !value.is_empty()),
+                                )
+                                .map_err(|_| {
+                                    step_failure(
+                                        FailureClass::AutomodExecutorFailed,
+                                        sqlx::Error::InvalidArgument(
+                                            "automod REST executor failed".into(),
+                                        ),
                                     )
-                                    .map_err(|_| {
-                                        step_failure(
-                                            FailureClass::AutomodExecutorFailed,
-                                            sqlx::Error::InvalidArgument(
-                                                "automod REST executor failed".into(),
-                                            ),
-                                        )
-                                    })?,
-                                };
-                                let automod = automod_gateway::build(resolved, pool, executor);
-                                let _ = slot.set(Arc::clone(&automod));
-                                info!("automod activation wired into the gateway loop");
-                                Some(automod)
-                            }
-                            None => None,
-                        };
+                                })?,
+                            };
+                            let automod = automod_gateway::build(resolved, pool, executor);
+                            let _ = slot.set(Arc::clone(&automod));
+                            info!("automod activation wired into the gateway loop");
+                            Some(automod)
+                        }
+                        None => None,
+                    };
+                    // V4 `kick` collision: when the voice sink owns a kick
+                    // target (tracked room), the router yields so the vote
+                    // is answered exactly once. Both runtimes exist only
+                    // inside this task, so the claim wires here.
+                    if let (Some(runtime), Some(voice)) = (runtime.as_ref(), voice.as_ref()) {
+                        let voice = Arc::clone(voice);
+                        runtime.set_voice_kick_claim(Arc::new(move |guild, member| {
+                            let voice = Arc::clone(&voice);
+                            Box::pin(async move { voice.kick_claim_room(guild, member).await })
+                        }));
+                    }
+
                     let shard = build_shard(
                         token,
-                        intents_from_env(),
+                        intents_from_env(&activation),
                         saved.as_ref(),
                         gateway_url.as_deref(),
                     );

@@ -1,4 +1,5 @@
 use super::*;
+use crate::metrics;
 use sqlx::{PgPool, Row};
 
 /// Every consumer of a credential must use the same authoritative database.
@@ -33,7 +34,10 @@ impl PgSendAdmission {
         .bind(delay)
         .execute(&self.pool)
         .await
-        .map_err(|_| AdmissionError::Storage)?;
+        .map_err(|_| {
+            metrics::global().db_error("admission");
+            AdmissionError::Storage
+        })?;
         Ok(())
     }
 }
@@ -70,11 +74,21 @@ impl SendAdmission for PgSendAdmission {
             .bind(&self.key.0)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|_| AdmissionError::Storage)?
-            .ok_or(AdmissionError::Blocked)?;
-            let generation: i64 = row
-                .try_get("generation")
-                .map_err(|_| AdmissionError::Storage)?;
+            .map_err(|_| {
+                metrics::global().db_error("admission");
+                metrics::global().send_admission("storage_error");
+                AdmissionError::Storage
+            })?;
+            let Some(row) = row else {
+                metrics::global().send_admission("blocked");
+                return Err(AdmissionError::Blocked);
+            };
+            let generation: i64 = row.try_get("generation").map_err(|_| {
+                metrics::global().db_error("admission");
+                metrics::global().send_admission("storage_error");
+                AdmissionError::Storage
+            })?;
+            metrics::global().send_admission("admitted");
             Ok(AdmissionPermit::new(Box::new(PgCompletion {
                 gate: self.clone(),
                 generation,
@@ -110,7 +124,10 @@ impl SendCompletion for PgCompletion {
             .bind(delay)
             .execute(&self.gate.pool)
             .await
-            .map_err(|_| AdmissionError::Storage)?;
+            .map_err(|_| {
+                metrics::global().db_error("admission");
+                AdmissionError::Storage
+            })?;
             if updated.rows_affected() != 1 {
                 return Err(AdmissionError::StaleClaim);
             }

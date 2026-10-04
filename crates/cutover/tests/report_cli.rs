@@ -1,5 +1,6 @@
 //! Read-only integrity-report acceptance on disposable agent-testdb
-//! databases plus a loopback mock roster (TOG-11152).
+//! databases plus a loopback mock roster (TOG-11152) and the voice
+//! ghost-channel count (TOG-13548).
 //!
 //! `report voice-reconcile` pairs `voice_session_start` / `voice_session_end`
 //! halves per (guild, member) and recovers durations where the stored rows
@@ -7,6 +8,9 @@
 //! from the roster. Both print JSON; neither writes report data. The roster
 //! read is one bounded GET (20 pages / 20,000 members max); a ceiling hit or
 //! an unreadable page refuses loudly instead of counting a partial roster.
+//! `report voice-ghosts` diffs tracked `voice_rooms` rows against the live
+//! voice channels from one channel-listing GET: tracked-present,
+//! tracked-gone and untracked-present. Existence only, never a write.
 //!
 //! Fixtures are the legacy seeds (`buildSeedHalves` / `buildSeedGapData` in
 //! legacy two-bot `src/analytics/`), rewritten as SQL plus a mock roster.
@@ -532,6 +536,7 @@ async fn usage_scenario(db: std::sync::Arc<TestDb>) -> TestResult {
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("voice-reconcile"));
     assert!(String::from_utf8_lossy(&help.stdout).contains("leave-gap"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("voice-ghosts"));
 
     let unknown = db.run(&["bogus-report"], &[]);
     assert_eq!(unknown.status.code(), Some(2));
@@ -561,6 +566,133 @@ async fn usage_scenario(db: std::sync::Arc<TestDb>) -> TestResult {
     assert_eq!(seed_gap_report["mode"], "seeded-demo");
     assert_eq!(seed_gap_report["gaps"].as_array().unwrap().len(), 4);
     assert_eq!(seed_gap_report["fillsProposed"], 5);
+
+    // The ghost seed needs no database and no Discord: pure existence diff.
+    let seed_ghosts = successful_stdout(&db.run(&["voice-ghosts", "--seed"], &[]));
+    let seed_ghost_report: serde_json::Value = serde_json::from_str(&seed_ghosts)?;
+    assert_eq!(seed_ghost_report["tool"], "voice-ghosts");
+    assert_eq!(seed_ghost_report["mode"], "seeded-demo");
+    assert_eq!(seed_ghost_report["tracked_rooms"], 3);
+    assert_eq!(
+        seed_ghost_report["tracked_present"],
+        serde_json::json!(["101", "102"])
+    );
+    assert_eq!(
+        seed_ghost_report["tracked_gone"],
+        serde_json::json!(["103"])
+    );
+    assert_eq!(
+        seed_ghost_report["untracked_present"],
+        serde_json::json!(["201"])
+    );
+    assert_eq!(seed_ghost_report["clean"], false);
+    assert_eq!(seed_ghost_report["discordRequests"], 0);
+    Ok(())
+}
+
+/// Two tracked rooms plus one live listing: 101 still exists, 102 was
+/// deleted by hand, 201 was never tracked. Voice (type 2) and stage (13)
+/// count as live; the text channel (0) and category (4) do not.
+fn mock_channels() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    let count = Arc::new(AtomicUsize::new(0));
+    let c = count.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            let mut buf = [0u8; 8192];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let path = req.lines().next().unwrap_or_default().to_owned();
+            assert!(
+                path.contains("/api/v10/guilds/"),
+                "unexpected channel request: {path}"
+            );
+            c.fetch_add(1, Ordering::SeqCst);
+            let body = r#"[
+                {"id": "101", "type": 2, "name": "room-101"},
+                {"id": "201", "type": 2, "name": "lounge"},
+                {"id": "202", "type": 13, "name": "stage"},
+                {"id": "301", "type": 0, "name": "general"},
+                {"id": "302", "type": 4, "name": "voice rooms"}
+            ]"#;
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (base, count)
+}
+
+fn room_row(channel: &str) -> String {
+    format!(
+        "('{GUILD}', '{channel}', '700', '410000000000000001', '410000000000000001', \
+         '7', '2026-09-20T12:00:00Z'::timestamptz)"
+    )
+}
+
+async fn seed_rooms(db: &std::sync::Arc<TestDb>) -> TestResult {
+    db.seed(
+        "CREATE TABLE IF NOT EXISTS voice_rooms (guild_id TEXT NOT NULL, \
+         channel_id TEXT NOT NULL, creator_channel_id TEXT NOT NULL, \
+         owner_id TEXT NOT NULL, original_creator_id TEXT NOT NULL, \
+         name_seed TEXT NOT NULL, created_at timestamptz NOT NULL, \
+         PRIMARY KEY (guild_id, channel_id))"
+            .to_owned(),
+    )
+    .await?;
+    db.seed(format!(
+        "INSERT INTO voice_rooms (guild_id, channel_id, creator_channel_id, \
+         owner_id, original_creator_id, name_seed, created_at) VALUES {}, {}",
+        room_row("101"),
+        room_row("102"),
+    ))
+    .await
+}
+
+async fn ghost_scenario(db: std::sync::Arc<TestDb>) -> TestResult {
+    seed_rooms(&db).await?;
+    let seeded = db.snapshot().await?;
+    let (base, count) = mock_channels();
+
+    let out = successful_stdout(&db.run(
+        &[
+            "voice-ghosts",
+            "--guild",
+            GUILD,
+            "--discord-base",
+            base.as_str(),
+        ],
+        &[],
+    ));
+    let report: serde_json::Value = serde_json::from_str(&out)?;
+    assert_eq!(report["tool"], "voice-ghosts");
+    assert_eq!(report["guild"], GUILD);
+    assert_eq!(report["tracked_rooms"], 2);
+    // Live voice is 101, 201 and the stage channel 202: text and category
+    // never count.
+    assert_eq!(report["live_voice_channels"], 3);
+    assert_eq!(report["tracked_present"], serde_json::json!(["101"]));
+    assert_eq!(report["tracked_gone"], serde_json::json!(["102"]));
+    assert_eq!(
+        report["untracked_present"],
+        serde_json::json!(["201", "202"])
+    );
+    assert_eq!(report["clean"], false);
+    assert_eq!(report["discordRequests"], 1);
+    assert_eq!(count.load(Ordering::SeqCst), 1, "exactly one channel GET");
+
+    // Read-only: the report never migrates (no ledger) and never changes a row.
+    let migrated: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = '_sqlx_migrations')",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(!migrated, "report ran migrations");
+    assert_eq!(db.snapshot().await?, seeded, "report wrote rows");
     Ok(())
 }
 
@@ -620,6 +752,15 @@ async fn leave_gap_matches_legacy_fixtures_read_only() -> TestResult {
         return Ok(());
     }
     with_db("two_bot_test_report_gap", gap_scenario).await
+}
+
+#[tokio::test]
+async fn voice_ghosts_counts_tracked_vs_live_read_only() -> TestResult {
+    if std::env::var_os("TWO_TEST_DATABASE_URL").is_none() {
+        eprintln!("skipped: TWO_TEST_DATABASE_URL opt-in required for agent-testdb");
+        return Ok(());
+    }
+    with_db("two_bot_test_report_ghosts", ghost_scenario).await
 }
 
 #[tokio::test]

@@ -31,6 +31,8 @@ const WORKER_ENV = {
   DISCORD_TOKEN: "synthetic-discord-token",
   DATABASE_URL: "synthetic-database-value",
   GUILD_ID: "111222333444555666",
+  TWO_AUTOMATIONS: "1",
+  TWO_TEXT_COMMANDS: "1",
   KEEPALIVE_SECONDS: "60",
   REDIRECT_FALLBACK_CODE: "not-a-container-var",
   REDIRECT_MAPPINGS_JSON: "[]",
@@ -41,6 +43,8 @@ const EXPECTED_ENV = {
   DISCORD_TOKEN: WORKER_ENV.DISCORD_TOKEN,
   DATABASE_URL: WORKER_ENV.DATABASE_URL,
   GUILD_ID: WORKER_ENV.GUILD_ID,
+  TWO_AUTOMATIONS: WORKER_ENV.TWO_AUTOMATIONS,
+  TWO_TEXT_COMMANDS: WORKER_ENV.TWO_TEXT_COMMANDS,
   LISTEN_ADDR: "0.0.0.0:8080",
 };
 
@@ -619,6 +623,51 @@ test("missing optionals are omitted; token and guild work without DATABASE_URL",
     LISTEN_ADDR: "0.0.0.0:8080",
   });
 });
+
+for (const [automations, textCommands] of [
+  [undefined, undefined],
+  ["1", undefined],
+  [undefined, "1"],
+  ["0", "0"],
+  ["1", "0"],
+  ["0", "1"],
+  ["", ""],
+  ["true", "01"],
+  [" 1", "1 "],
+] as const) {
+  test(`custom-command gates pass through unchanged (${JSON.stringify([automations, textCommands])})`, async (t) => {
+    const h = await harness(t, {
+      ...WORKER_ENV,
+      TWO_AUTOMATIONS: automations,
+      TWO_TEXT_COMMANDS: textCommands,
+    });
+    await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+    const expected: Record<string, string> = { ...EXPECTED_ENV };
+    delete expected.TWO_AUTOMATIONS;
+    delete expected.TWO_TEXT_COMMANDS;
+    if (automations !== undefined) expected.TWO_AUTOMATIONS = automations;
+    if (textCommands !== undefined) expected.TWO_TEXT_COMMANDS = textCommands;
+    assert.equal(h.starts.length, 1);
+    assert.deepEqual(h.starts[0]?.env, expected);
+  });
+}
+
+for (const automod of [undefined, "0", "1", "", "false", " 0", "00"] as const) {
+  for (const path of ["/health", "keepalive"]) {
+    test(`moderation availability passes through unchanged (${JSON.stringify(automod)}, ${path})`, async (t) => {
+      const h = await harness(t, { ...WORKER_ENV, TWO_AUTOMOD: automod });
+      if (path === "keepalive") {
+        await tickKeepalive(h.bot);
+      } else {
+        await h.bot.fetch(probeRequest(`https://worker.invalid${path}`));
+      }
+      const expected: Record<string, string> = { ...EXPECTED_ENV };
+      if (automod !== undefined) expected.TWO_AUTOMOD = automod;
+      assert.equal(h.starts.length, 1);
+      assert.deepEqual(h.starts[0]?.env, expected);
+    });
+  }
+}
 
 test("health-only config never fabricates credentials or gateway readiness", async (t) => {
   const h = await harness(t, { DISCORD_TOKEN: "", DATABASE_URL: "", GUILD_ID: "" });

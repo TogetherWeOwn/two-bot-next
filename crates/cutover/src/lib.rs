@@ -19,6 +19,7 @@ pub mod cli;
 pub mod db;
 pub mod dedupe;
 pub mod gateway_session;
+pub mod ghost_cleanup;
 pub mod internal_settings;
 pub mod invite;
 pub mod invite_store;
@@ -41,6 +42,7 @@ pub mod settings;
 pub mod staging_migrate;
 pub mod tickets;
 pub mod voice_config_store;
+pub mod voice_ghosts;
 pub mod voice_reconcile;
 pub mod voice_rooms;
 

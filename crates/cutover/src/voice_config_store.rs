@@ -25,7 +25,7 @@
 //! 0 over an existing NULL keeps the NULL, so a plain export/import round trip
 //! never turns "inherit" into "unlimited".
 //!
-//! Parameter binding: https://docs.rs/sqlx/0.9.0/sqlx/fn.query.html
+//! Parameter binding: <https://docs.rs/sqlx/0.9.0/sqlx/fn.query.html>
 
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -561,4 +561,38 @@ fn decode_creator(row: &PgRow) -> Result<CreatorConfiguration, sqlx::Error> {
         group_by_category: row.try_get("group_by_category")?,
         permission_source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_ids_pass_through_unchanged() {
+        for id in ["1", "101", "999", "18446744073709551615"] {
+            assert_eq!(snowflake(id).unwrap(), id);
+        }
+    }
+
+    #[test]
+    fn noncanonical_zero_and_out_of_range_ids_are_refused() {
+        // Retirement import guard: a template carrying any of these IDs must
+        // fail the apply before a single row is written, so a bad interim
+        // export can never create ghost channels or cross-guild references.
+        for id in [
+            "",
+            "0",
+            "00",
+            "01",
+            "-1",
+            "+1",
+            "1.0",
+            " 101",
+            "101 ",
+            "abc",
+            "18446744073709551616",
+        ] {
+            assert!(snowflake(id).is_err(), "must refuse {id:?}");
+        }
+    }
 }

@@ -18,6 +18,9 @@
 //! - feed relays (`/feed-add`, `/feed-remove`, `/feed-list`; TOG-10085 domain
 //!   and store): plan → guild-scoped CRUD → `announcements_audit_log` row → ephemeral
 //!   completion. The generated relay/audit ids replace legacy `randomUUID()`.
+//! - channel moderation (`/purge`, `/slowmode`, `/lockdown`, `/unlock`): shared
+//!   router authorization → ephemeral defer → durable claim/lane → REST effect →
+//!   atomic result/audit → original-response edit. Ambiguity retains the lane.
 //! - schedules (`/schedule`, `/schedule-remove`, `/schedule-list`; TOG-12237
 //!   over the TOG-10081 domain and store): validate → guild-scoped CRUD →
 //!   `automation_audit_log` row → ephemeral completion. The handlers live in
@@ -30,12 +33,18 @@
 //! router's ONE merged publish set (`set_guild_commands` is idempotent, so a
 //! duplicate READY is a harmless repeat). A resumed process also synchronizes
 //! once: a persisted gateway session does not preserve this process's gates
-//! or command definitions. Until the custom-command store supplies authoritative
-//! rows, publication is deferred when automations enable dynamic commands.
+//! or command definitions. Custom-command publication loads persisted rows
+//! through the same router and executor with one serialized full-set
+//! publisher. Until the custom-command store is bootstrapped, publication
+//! is deferred when automations enable dynamic commands.
 
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use crate::self_role_handlers::SelfRoleService;
@@ -62,13 +71,16 @@ use two_bot_core::{
         RemoveOutcome, StickyAudit, StickyAuditAction, StickyAuditOutcome,
     },
     tickets::TicketAction,
-    ComponentHandler, ComponentOutcome, FeatureGates, HandlerId, InteractionHandler,
-    InteractionRouter, ModerationGates, RouterGates, SlashOutcome, SurfaceFlags,
+    ChannelModerationStore, ComponentHandler, ComponentOutcome, FeatureGates, HandlerId,
+    InteractionHandler, InteractionRouter, ModerationGates, RouterGates, SlashOutcome, Snowflake,
+    SurfaceFlags,
 };
 use two_bot_discord::{
-    publish_commands, response_for_slash, route_interaction, ActionExecutor, LevelingRuntime,
-    RoutedInteraction,
+    publish_commands, register_channel_handlers, response_for_slash, route_interaction,
+    ActionExecutor, ChannelModerationRuntime, LevelingRuntime, RoutedInteraction,
 };
+
+use crate::activation::BootActivation;
 
 /// Audit-log reason for retiring the previous sticky (legacy audits carry a
 /// free-text reason; kept short — `audit_reason` caps at 512 chars).
@@ -109,16 +121,77 @@ impl InteractionHandler for SliceHandler {
     }
 }
 
+/// Voice vote-kick claim check: resolves the tracked room a member is
+/// currently in, if any. Wired from the voice sink in `main`; `None` until
+/// then, which keeps every `/kick` on the pre-existing router path.
+pub type VoiceKickClaim = Arc<
+    dyn Fn(
+            Snowflake,
+            Snowflake,
+        ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + 'static>>
+        + Send
+        + Sync,
+>;
+
+/// The vote target of a `/kick` slash interaction, if the published shape
+/// carries one. Accepts both the voice `member` option and the moderation
+/// `target` option; `None` keeps the existing router path untouched.
+fn kick_target_user(interaction: &Interaction) -> Option<Snowflake> {
+    let twilight_model::application::interaction::InteractionData::ApplicationCommand(data) =
+        interaction.data.as_ref()?
+    else {
+        return None;
+    };
+    data.options.iter().find_map(|option| match &option.value {
+        CommandOptionValue::User(id) if option.name == "member" || option.name == "target" => {
+            Some(id.get())
+        }
+        _ => None,
+    })
+}
+
+/// Separate admission budgets prevent message bursts or registry pacing from
+/// consuming interaction acknowledgement capacity. No queued/spawned waiters.
+const DISPATCH_LIMITS: [usize; 3] = [16, 16, 1];
+
+#[derive(Default)]
+struct DispatchTasks {
+    stopped: bool,
+    lanes: [Vec<tokio::task::AbortHandle>; 3],
+}
+
+/// Cancels admitted work on gateway exit, including supervisor cancellation.
+/// Interrupted channel effects retain their durable claims for reconciliation.
+pub(crate) struct CommandDispatchGuard(Arc<CommandRuntime>);
+
+impl Drop for CommandDispatchGuard {
+    fn drop(&mut self) {
+        let mut tasks = self.0.tasks.lock().expect("command task scope");
+        tasks.stopped = true;
+        for lane in &mut tasks.lanes {
+            for handle in lane.drain(..) {
+                handle.abort();
+            }
+        }
+    }
+}
+
 /// The shared command runtime: one router + one REST executor + the sqlx
-/// stores, driven by detached gateway tasks. Cheap to clone behind `Arc`; no
-/// REST or feature-store work is awaited while polling the shard. Dispatch
-/// itself is unbounded; LFG caps its own pool use (`LFG_MAX_IN_FLIGHT`).
+/// stores, driven by gateway dispatches. Bounded asynchronous work leaves
+/// twilight free to poll heartbeats, and is cancelled when its shard exits.
+/// LFG caps its own pool use (`LFG_MAX_IN_FLIGHT`).
 pub struct CommandRuntime {
     pool: Pool<Postgres>,
     executor: ActionExecutor,
     interactions: two_bot_discord::interactions::InteractionRuntime,
     custom_commands: Option<Vec<two_bot_core::CustomCommand>>,
     application_id: AtomicU64,
+    /// Bootstrapped custom-command execution seam (dynamic dispatch, prefix
+    /// triggers, serialized republication). Shares the interaction runtime's
+    /// router, whose registrations are complete once built.
+    gateway_commands: tokio::sync::OnceCell<crate::gateway_commands::GatewayCommands>,
+    channel: ChannelModerationRuntime,
+    tasks: Mutex<DispatchTasks>,
     /// Shared self-role surface; production boot stays parked pending acceptance.
     self_roles: Option<Arc<SelfRoleService>>,
     leveling: LevelingRuntime,
@@ -134,6 +207,10 @@ pub struct CommandRuntime {
     /// Monotonic attempt ids: one value mints both the DB claim token
     /// (`s{n:x}`, ≤25 chars) and the numeric post nonce for dedupe.
     attempts: AtomicU64,
+    /// Voice vote-kick claim (V4 `kick` collision): when set and the target
+    /// sits in a tracked room, the voice sink owns the interaction and the
+    /// router must stay silent so the vote is answered exactly once.
+    voice_kick_claim: Mutex<Option<VoiceKickClaim>>,
 }
 
 // Each in-flight LFG execution holds up to two connections of the shared pool;
@@ -174,12 +251,19 @@ impl CommandRuntime {
             executor.clone(),
             0,
         );
+        let channel = ChannelModerationRuntime::new(
+            ChannelModerationStore::from_pool(pool.clone()),
+            executor.clone(),
+        );
         Arc::new(Self {
             pool,
             executor,
             interactions,
             custom_commands,
             application_id: AtomicU64::new(0),
+            gateway_commands: tokio::sync::OnceCell::new(),
+            channel,
+            tasks: Mutex::new(DispatchTasks::default()),
             self_roles,
             leveling,
             guild_id,
@@ -187,6 +271,7 @@ impl CommandRuntime {
             automations,
             registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
+            voice_kick_claim: Mutex::new(None),
         })
     }
 
@@ -208,6 +293,7 @@ impl CommandRuntime {
         guild_id: u64,
         self_roles: Option<Arc<SelfRoleService>>,
         onboarding: two_bot_core::OnboardingGates,
+        activation: &BootActivation,
     ) -> Option<Arc<Self>> {
         let features = match FeatureGates::from_env() {
             Ok(features) => features,
@@ -216,19 +302,32 @@ impl CommandRuntime {
                 return None;
             }
         };
-        let moderation = match ModerationGates::from_env() {
-            Ok(moderation) => moderation,
-            Err(err) => {
-                warn!(error = %err, "moderation gates invalid; command runtime disabled");
-                return None;
-            }
-        };
+        // A denied capability never reaches its feature-specific validation:
+        // live/unknown identities must retain unrelated commands even with
+        // stale moderation env. Permitted staging still validates every gate.
+        let moderation =
+            if activation.permitted(two_bot_core::activation::LiveCapability::Moderation) {
+                match ModerationGates::from_env() {
+                    Ok(moderation) => moderation,
+                    Err(err) => {
+                        warn!(error = %err, "moderation gates invalid; command runtime disabled");
+                        return None;
+                    }
+                }
+            } else {
+                ModerationGates {
+                    enabled: false,
+                    owen_user_id: String::new(),
+                    protected_role_ids: Default::default(),
+                }
+            };
         let ticket_config = crate::ticket_runtime::TicketConfig::from_env(guild_id);
         let gates = RouterGates::from_slices(
             Some(guild_id),
             &features,
             &moderation,
             SurfaceFlags {
+                scorecard: std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|value| value == "1"),
                 session_picker: onboarding.mode == two_bot_core::OnboardingMode::Session,
                 tickets: ticket_config.is_some(),
                 self_roles: self_roles.is_some(),
@@ -253,26 +352,59 @@ impl CommandRuntime {
                 return None;
             }
         };
+        // A refused tickets capability never constructs its runtime, so a
+        // live identity gets no supervisor, no component execution, and a
+        // narrowed router gate; unrelated commands keep working.
+        let tickets = if activation.permitted(two_bot_core::activation::LiveCapability::Tickets) {
+            match ticket_config {
+                Some(config) => match crate::ticket_runtime::TicketRuntime::new(
+                    pool.clone(),
+                    executor.clone(),
+                    config,
+                ) {
+                    Ok(runtime) => Some(Arc::new(runtime)),
+                    Err(_) => return None,
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        Some(Self::from_gates(
+            pool, executor, gates, self_roles, tickets, onboarding, activation,
+        ))
+    }
+
+    /// Composition seam shared by boot and mock-Discord tests. Only narrowed
+    /// gates reach registration, publication and the accepted-message hook.
+    pub(crate) fn from_gates(
+        pool: Pool<Postgres>,
+        executor: ActionExecutor,
+        gates: RouterGates,
+        self_roles: Option<Arc<SelfRoleService>>,
+        tickets: Option<Arc<crate::ticket_runtime::TicketRuntime>>,
+        onboarding: two_bot_core::OnboardingGates,
+        activation: &BootActivation,
+    ) -> Arc<Self> {
+        let gates = activation.constrain_router(gates);
+        // The service only serves an open, permitted surface.
+        let self_roles = self_roles.filter(|_| gates.self_roles);
+        // A refused tickets capability keeps no runtime even when the caller
+        // composed one: no supervisor, no component execution, narrowed gate.
+        let tickets = tickets.filter(|_| gates.tickets);
+        let guild_id = gates
+            .configured_guild
+            .expect("boot supplies configured guild");
+        // The ordered leveling path shares this runtime's executor/pacing.
         let leveling = LevelingRuntime::new(
             pool.clone(),
             Arc::new(executor.clone()),
             guild_id,
             onboarding,
         );
-        let tickets = match ticket_config {
-            Some(config) => match crate::ticket_runtime::TicketRuntime::new(
-                pool.clone(),
-                executor.clone(),
-                config,
-            ) {
-                Ok(runtime) => Some(Arc::new(runtime)),
-                Err(_) => return None,
-            },
-            None => None,
-        };
         // No custom-command store exists on main yet: an empty slice is the
         // authoritative baseline (same as before LFG).
-        Some(Self::build(
+        let runtime = Self::build(
             pool,
             executor,
             router_with_commands(gates),
@@ -281,7 +413,42 @@ impl CommandRuntime {
             guild_id,
             Some(Vec::new()),
             tickets,
-        ))
+        );
+        // Pin the token-derived application identity before any READY arming:
+        // a READY-supplied id stays untrusted until this boot pin confirms it
+        // in `publish_registry_checked`. Zero means unpinned (unparseable
+        // token); such a runtime never publishes on faith.
+        if let Some(application_id) = activation.application_id() {
+            runtime.interactions.set_application_id(application_id);
+            runtime
+                .application_id
+                .store(application_id, Ordering::Relaxed);
+        }
+        runtime
+    }
+
+    #[cfg(test)]
+    pub(crate) fn router(&self) -> &InteractionRouter {
+        &self.interactions.router
+    }
+
+    /// Bootstrap before constructing the shard, reusing this runtime's router,
+    /// pool and executor (including its proxy and shared pacing state).
+    pub(crate) async fn initialize_custom_commands(
+        &self,
+        config: crate::gateway_commands::GatewayCommandConfig,
+    ) -> Result<(), sqlx::Error> {
+        self.gateway_commands
+            .get_or_try_init(|| {
+                crate::gateway_commands::GatewayCommands::bootstrap_with_router(
+                    self.pool.clone(),
+                    self.executor.clone(),
+                    config,
+                    Arc::clone(&self.interactions.router),
+                )
+            })
+            .await
+            .map(|_| ())
     }
 
     /// Test constructor: skips env gate reads so tests inject their own
@@ -305,7 +472,7 @@ impl CommandRuntime {
             },
         );
         // Tests provide an authoritative empty custom-command fixture.
-        Self::build(
+        let runtime = Self::build(
             pool,
             executor,
             router,
@@ -314,7 +481,18 @@ impl CommandRuntime {
             guild_id,
             Some(Vec::new()),
             None,
-        )
+        );
+        // Tests pin the mock-Discord application identity (1111), like a boot
+        // whose token parses to it, so READY/RESUMED trust flows exercise
+        // the pin. The bot user stays unknown (0), so nonce recovery still
+        // resolves it through the executor exactly as on main.
+        runtime.interactions.set_application_id(1111);
+        runtime.application_id.store(1111, Ordering::Relaxed);
+        runtime
+    }
+
+    pub(crate) fn dispatch_guard(self: &Arc<Self>) -> CommandDispatchGuard {
+        CommandDispatchGuard(Arc::clone(self))
     }
 
     /// The one process executor (admission lane and pacing included); other
@@ -324,10 +502,36 @@ impl CommandRuntime {
         self.executor.clone()
     }
 
+    fn spawn(
+        &self,
+        lane: usize,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        let mut tasks = self.tasks.lock().expect("command task scope");
+        if tasks.stopped {
+            return false;
+        }
+        let handles = &mut tasks.lanes[lane];
+        handles.retain(|handle| !handle.is_finished());
+        if handles.len() >= DISPATCH_LIMITS[lane] {
+            warn!(lane, "command dispatch saturated; event not admitted");
+            return false;
+        }
+        let task = tokio::spawn(work);
+        handles.push(task.abort_handle());
+        true
+    }
+
     /// Shares this runtime's pool, executor/pacing and onboarding gates with
     /// the ordered award path; only this runtime dispatches interactions.
     pub fn leveling(&self) -> LevelingRuntime {
         self.leveling.clone()
+    }
+
+    /// Wire the voice vote-kick claim after boot composes both runtimes.
+    /// Called once from `main`; the `None` default keeps router behavior.
+    pub fn set_voice_kick_claim(&self, claim: VoiceKickClaim) {
+        *self.voice_kick_claim.lock().expect("voice claim lock") = Some(claim);
     }
 
     #[cfg(test)]
@@ -364,9 +568,14 @@ impl CommandRuntime {
             session_picker: false,
         });
         let mut runtime = Self::new(pool, executor, router, 100, false);
-        Arc::get_mut(&mut runtime)
-            .expect("unshared test runtime")
-            .tickets = Some(tickets);
+        {
+            let unshared = Arc::get_mut(&mut runtime).expect("unshared test runtime");
+            unshared.tickets = Some(tickets);
+            // No boot token pins this constructor: registry publication may
+            // resolve the application id through the token-authenticated
+            // lookup, exactly like a boot whose token never parses.
+            unshared.application_id.store(0, Ordering::Relaxed);
+        }
         runtime
     }
 
@@ -380,22 +589,29 @@ impl CommandRuntime {
         self.tickets.as_ref().and_then(|tickets| tickets.start())
     }
 
-    /// Detached dispatch for one gateway event. Clones the payload and spawns
-    /// so the shard loop never awaits runtime work; the DB claims tolerate
-    /// the reorder/crash windows spawning opens.
-    ///
-    /// READY replaces the full merged set; a first RESUMED also synchronizes
-    /// this process's definitions/gates, even without a preceding READY.
-    pub fn dispatch(self: &Arc<Self>, event: &Event) {
+    /// Admit before spawning, without waiting on SQL/REST in the shard loop.
+    /// Saturated lanes drop events without effects, queued waiters or tokens in
+    /// logs. READY/RESUMED publication has independent capacity; overlapping
+    /// connection events coalesce while the full registry is being synchronized.
+    /// Custom commands answer first and report ownership, so sticky/feed
+    /// routing never sends a second response after an acknowledgement.
+    pub fn dispatch(self: &Arc<Self>, event: &Event) -> bool {
+        if let Some(custom) = self.gateway_commands.get() {
+            custom.observe(event);
+        }
         match event {
             Event::MessageCreate(message) => {
+                if !self.automations {
+                    return false;
+                }
                 let runtime = Arc::clone(self);
                 let message = message.0.clone();
-                // Dropping the JoinHandle detaches the task — exactly what the
-                // shard loop needs (never await runtime work while polling).
-                drop(tokio::spawn(async move {
+                self.spawn(0, async move {
+                    if let Some(custom) = runtime.gateway_commands.get() {
+                        custom.handle_message(&message).await;
+                    }
                     runtime.on_message(&message).await;
-                }));
+                })
             }
             Event::InteractionCreate(interaction) => {
                 let runtime = Arc::clone(self);
@@ -409,24 +625,50 @@ impl CommandRuntime {
                     tickets.spawn(async move {
                         runtime.on_interaction(&interaction).await;
                     });
+                    true
                 } else {
-                    drop(tokio::spawn(async move {
-                        runtime.on_interaction(&interaction).await;
-                    }));
+                    self.spawn(1, async move {
+                        let handled = match runtime.gateway_commands.get() {
+                            Some(custom) => custom.handle_interaction(&interaction).await,
+                            None => false,
+                        };
+                        if !handled {
+                            runtime.on_interaction(&interaction).await;
+                        }
+                    })
                 }
             }
-            Event::ReactionAdd(reaction) => self.dispatch_self_role_reaction(&reaction.0, false),
-            Event::ReactionRemove(reaction) => self.dispatch_self_role_reaction(&reaction.0, true),
+            Event::ReactionAdd(reaction) => {
+                self.dispatch_self_role_reaction(&reaction.0, false);
+                true
+            }
+            Event::ReactionRemove(reaction) => {
+                self.dispatch_self_role_reaction(&reaction.0, true);
+                true
+            }
             Event::Ready(ready) => {
-                self.set_identity(ready.user.id.get(), ready.application.id.get());
+                // A READY-supplied application id never overwrites the boot
+                // pin on faith: arm identity only when the token-derived pin
+                // confirms it (or no pin exists). Publication re-checks this
+                // in `publish_registry_checked`.
+                let ready_application = ready.application.id.get();
+                let pinned = self.application_id.load(Ordering::Relaxed);
+                if pinned == 0 || pinned == ready_application {
+                    self.set_identity(ready.user.id.get(), ready_application);
+                } else {
+                    warn!(
+                        application_id = ready_application,
+                        "READY identity differs from boot token; identity not armed"
+                    );
+                }
                 if let Some(tickets) = &self.tickets {
                     tickets.on_ready(ready.user.id.get());
                 }
                 let runtime = Arc::clone(self);
                 let application_id = ready.application.id.get();
-                drop(tokio::spawn(async move {
+                self.spawn(2, async move {
                     runtime.publish_registry(Some(application_id)).await;
-                }));
+                })
             }
             Event::Resumed => {
                 if let Some(tickets) = &self.tickets {
@@ -441,11 +683,11 @@ impl CommandRuntime {
                     });
                 }
                 let runtime = Arc::clone(self);
-                drop(tokio::spawn(async move {
+                self.spawn(2, async move {
                     runtime.publish_registry(None).await;
-                }));
+                })
             }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -519,6 +761,29 @@ impl CommandRuntime {
         if application_id.is_none() && *synced {
             return Ok(());
         }
+        // Once bootstrapped, custom commands own the full-set publisher: it
+        // loads persisted rows and serializes add/remove republication.
+        if let Some(custom) = self.gateway_commands.get() {
+            let application_id = match application_id {
+                Some(id) => id,
+                None => match self.executor.current_application_id().await {
+                    Ok(id) => {
+                        // RESUMED carries no application: arm the interaction
+                        // fence from this registry lookup, as below.
+                        self.interactions.set_application_id(id);
+                        self.application_id.store(id, Ordering::Relaxed);
+                        id
+                    }
+                    Err(_) => return Err(RegistrySyncError::ApplicationLookup),
+                },
+            };
+            custom
+                .sync_registry(application_id)
+                .await
+                .map_err(|_| RegistrySyncError::Publish)?;
+            *synced = true;
+            return Ok(());
+        }
         let Some(defs) = publication_definitions(
             &self.interactions.router,
             self.interactions.router.gates(),
@@ -528,13 +793,37 @@ impl CommandRuntime {
             return Ok(());
         };
         let application_id = match application_id {
-            Some(id) => id,
+            // A READY-supplied id is untrusted: the boot token's own identity
+            // must confirm it before anything is published. A runtime with no
+            // boot pin (zero) never publishes on faith.
+            Some(id) => {
+                let pinned = self.application_id.load(Ordering::Relaxed);
+                if pinned == 0 || pinned != id {
+                    warn!(
+                        application_id = id,
+                        "application identity differs from boot token; publish skipped"
+                    );
+                    return Ok(());
+                }
+                id
+            }
             None => {
                 let id = self
                     .executor
                     .current_application_id()
                     .await
                     .map_err(|_| RegistrySyncError::ApplicationLookup)?;
+                // The token-authenticated lookup answers for this very token;
+                // a boot pin (always present for a parseable token) must still
+                // agree before anything is published.
+                let pinned = self.application_id.load(Ordering::Relaxed);
+                if pinned != 0 && pinned != id {
+                    warn!(
+                        application_id = id,
+                        "application lookup differs from boot token; publish skipped"
+                    );
+                    return Ok(());
+                }
                 // RESUMED carries no application: arm the interaction fence from
                 // this registry lookup instead of a separate identity read.
                 self.interactions.set_application_id(id);
@@ -554,11 +843,22 @@ impl CommandRuntime {
     /// Route slash commands and LFG selects once through the shared router. An
     /// injected self-role service handles only its owned component surface.
     /// Refusals get the existing ephemeral text; LFG/sticky/feed/schedule defer
-    /// before I/O; leveling sends its own immediate callback. Unwired builtins
+    /// before I/O; leveling sends its own immediate callback. Channel commands
+    /// own their defer/audit lifecycle. Unwired builtins
     /// get an unavailable reply; router Ignore (unknown/guild) stays silent.
     pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
         let application_id = self.application_id.load(Ordering::Relaxed);
         if application_id != 0 && interaction.application_id.get() != application_id {
+            return;
+        }
+        if ChannelModerationRuntime::accepts(interaction) {
+            if let Err(error) = self
+                .channel
+                .respond(&self.interactions.router, interaction)
+                .await
+            {
+                warn!(interaction_id = %interaction.id.get(), error = %error, "channel response failed; no effect retry");
+            }
             return;
         }
         let routed = route_interaction(&self.interactions.router, interaction, None);
@@ -614,6 +914,26 @@ impl CommandRuntime {
         let RoutedInteraction::Slash { name, outcome } = routed else {
             return;
         };
+        // V4 `kick` collision: the voice sink owns interactions whose target
+        // sits in a tracked room (it answers the vote exactly once). Yield
+        // those here so the router never double-answers; every other `kick`
+        // keeps the pre-existing moderation path bit-for-bit.
+        if name == "kick" {
+            if let Some(target) = kick_target_user(interaction) {
+                if let Some(guild) = interaction.guild_id.map(|id| id.get()) {
+                    let claim = self
+                        .voice_kick_claim
+                        .lock()
+                        .expect("voice claim lock")
+                        .clone();
+                    if let Some(claim) = claim {
+                        if claim(guild, target).await.is_some() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         if let Some(response) = response_for_slash(&outcome) {
             self.answer(interaction, response).await;
             return;
@@ -1335,18 +1655,35 @@ pub(crate) fn feed_remove_option(interaction: &Interaction) -> Option<String> {
         })
 }
 
-/// Shared sticky/feed/leveling registrations; LFG is composed by
-/// `InteractionRuntime`.
+/// Shared sticky/feed/channel/leveling registrations over the narrowed boot
+/// gates; LFG is composed by `InteractionRuntime`. Tests that bypass
+/// `from_env`'s env reads use this same router, matching `from_env`'s
+/// registrations.
 pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     let mut router = InteractionRouter::new(gates);
-    router.register(Box::new(StickyHandler));
-    for id in [
-        HandlerId::FeedAdd,
-        HandlerId::FeedRemove,
-        HandlerId::FeedList,
-        HandlerId::Rank,
-        HandlerId::Leaderboard,
-    ] {
+    if gates.moderation {
+        register_channel_handlers(&mut router);
+    }
+    if gates.automations {
+        router.register(Box::new(StickyHandler));
+        // Custom commands are an automations capability: a refused identity
+        // must not even resolve their handlers (4014 isolation depends on the
+        // narrowed intent too). Dispatch refuses and publish withholds when
+        // off, but registration alone would advertise the surface.
+        two_bot_discord::custom_commands::CustomCommandRuntime::register(&mut router);
+    }
+    if gates.announcements {
+        for id in [
+            HandlerId::FeedAdd,
+            HandlerId::FeedRemove,
+            HandlerId::FeedList,
+        ] {
+            router.register(Box::new(SliceHandler(id)));
+        }
+    }
+    // Leveling is not an activation-fenced capability: the core rank and
+    // leaderboard commands stay available to every permitted identity.
+    for id in [HandlerId::Rank, HandlerId::Leaderboard] {
         router.register(Box::new(SliceHandler(id)));
     }
     router

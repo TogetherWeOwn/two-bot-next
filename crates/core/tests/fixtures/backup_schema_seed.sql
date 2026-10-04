@@ -59,6 +59,24 @@ VALUES ('100000000000000001', 'backup:moderation:key', 'lockdown', 'backup-reque
         '2026-08-01T10:00:00.000Z', '2026-08-01T10:00:01.000Z', 'backup-moderation-claim');
 INSERT INTO moderation_channel_executions (channel_id, guild_id, idempotency_key, claim_token)
 VALUES ('100000000000000003', '100000000000000001', 'backup:moderation:key', 'backup-channel-claim');
+INSERT INTO moderation_warnings (id, guild_id, user_id, actor_id, reason, request_id, created_at)
+VALUES ('backup:warning', '100000000000000001', '100000000000000005', '100000000000000002',
+        'backup warning', 'backup:warning:request', '2026-08-01T10:00:00.000Z');
+-- Gapped generations, and a retry ticket past both: restore must resume the
+-- shared ownership sequence beyond every restored allocation from it.
+INSERT INTO moderation_member_bans
+    (request_id, guild_id, user_id, generation, state, created_at, completed_at)
+VALUES ('backup:ban:temp', '100000000000000001', '100000000000000005', 4, 'accepted',
+        '2026-08-01T10:00:00.000Z', '2026-08-01T10:00:01.000Z'),
+       ('backup:ban:refused', '100000000000000001', '100000000000000006', 7, 'rejected',
+        '2026-08-01T10:00:02.000Z', '2026-08-01T10:00:03.000Z');
+-- Terminal: restore quarantines only staged/pending/running expiries.
+INSERT INTO moderation_scheduled_unbans
+    (request_id, guild_id, user_id, execute_at, reason, state, created_at, completed_at,
+     claimed_at, claim_token, dispatch_uncertain, retry_generation)
+VALUES ('backup:ban:temp', '100000000000000001', '100000000000000005',
+        '2026-08-02T10:00:00.000Z', 'backup tempban', 'done', '2026-08-01T10:00:00.000Z',
+        '2026-08-02T10:00:02.000Z', '2026-08-02T10:00:01.000Z', 'backup-unban-claim', FALSE, 12);
 
 INSERT INTO containment_events
     (audit_entry_id, guild_id, executor_id, action, target_id, weight, occurred_at, state, reason,
@@ -95,6 +113,13 @@ VALUES ('100000000000000001', '100000000000000003', E'Backup sticky | NULL\n雪 
         17, FALSE, '100000000000000006', '2026-08-01T10:00:00.123456Z',
         '100000000000000002', '2026-08-01T09:00:00Z', '100000000000000004',
         '2026-08-01T10:00:00Z', 'backup-sticky-claim', '2026-08-01T10:00:01Z');
+INSERT INTO automation_commands
+    (guild_id, name, description, template, text_trigger, enabled,
+     created_by, created_at, updated_by, updated_at)
+VALUES ('100000000000000001', 'backup-custom', 'Backup custom',
+        E'Backup custom {user} | NULL\n雪 "quote"', '!backup', TRUE,
+        '100000000000000002', '2026-08-01T09:00:00Z', '100000000000000004',
+        '2026-08-01T10:00:00Z');
 INSERT INTO automation_audit_log (id, guild_id, actor_id, action, target_key, outcome, reason, created_at)
 VALUES ('backup:automation:audit', '100000000000000001', NULL, 'sticky.run',
         '100000000000000003', 'post_failed', 'transient', '2026-08-01T10:00:00Z');

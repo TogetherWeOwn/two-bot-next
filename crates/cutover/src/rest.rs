@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use twilight_http::error::Error as TwilightError;
-use twilight_http::request::{Request, TryIntoRequest};
+use twilight_http::request::{AuditLogReason, Request, TryIntoRequest};
 use twilight_http::Client;
 use twilight_model::channel::message::Message;
 use twilight_model::channel::Channel;
@@ -53,6 +53,15 @@ pub enum RestError {
 pub const MAX_MEMBER_PAGES: u32 = 500;
 /// Default ceiling on accumulated members per traversal.
 pub const MAX_MEMBERS: usize = 500_000;
+
+/// What a channel delete proved about the channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// 2xx: this call deleted the channel.
+    Deleted,
+    /// 404: the channel was already gone; nothing was deleted.
+    AlreadyGone,
+}
 
 /// Paced twilight client with legacy retry semantics.
 #[derive(Debug, Clone)]
@@ -322,6 +331,52 @@ impl RestClient {
         .map(ListPage::into_option)
     }
 
+    /// Delete one channel (ghost-cleanup execute path), carrying the
+    /// operator's `reason` in the Discord audit-log header. Same governed
+    /// retry semantics as the readers, minus body decode (DELETE answers
+    /// 204 with no body): 2xx is deleted, 404 is already-gone success (a
+    /// duplicate delete is success), 429 backs off on the response's own
+    /// retry-after, 5xx retries with backoff. A 403 is a hard failure —
+    /// never proof of deletion, so the row stays tracked for the next run.
+    pub async fn delete_channel(
+        &self,
+        channel_id: Id<ChannelMarker>,
+        reason: &str,
+    ) -> Result<DeleteOutcome, RestError> {
+        let transport = self
+            .inner
+            .transport
+            .as_ref()
+            .map_err(|e| RestError::Wire(e.clone()))?;
+        for attempt in 0..=4 {
+            self.pace().await;
+            let request = self
+                .inner
+                .client
+                .delete_channel(channel_id)
+                .reason(reason)
+                .try_into_request()?;
+            self.inner.requests.fetch_add(1, Ordering::Relaxed);
+            let (res, _) =
+                tokio::time::timeout(Duration::from_secs(30), transport.send_request(&request))
+                    .await
+                    .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
+                    .map_err(RestError::Wire)?;
+            match res.status {
+                200..=299 => return Ok(DeleteOutcome::Deleted),
+                404 => return Ok(DeleteOutcome::AlreadyGone),
+                403 => return Err(RestError::Wire("HTTP 403".to_owned())),
+                429 if attempt < 4 => {
+                    tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                }
+                500..=599 if attempt < 4 => tokio::time::sleep(backoff_duration(attempt)).await,
+                500..=599 => return Err(RestError::Wire("HTTP 5xx retry exhausted".to_owned())),
+                _ => return Err(RestError::Wire(format!("HTTP {}", res.status))),
+            }
+        }
+        unreachable!("last attempt always returns")
+    }
+
     /// Guild fetch (vanity-URL presence for attribution).
     pub async fn guild(&self, guild_id: Id<GuildMarker>) -> Result<Option<Guild>, RestError> {
         self.exec_one(|| {
@@ -365,7 +420,7 @@ impl RestClient {
     }
 
     /// Bounded archived-thread walk with explicit completion evidence.
-    /// `max_pages` is the same hard cost ceiling `scan_channel` uses:
+    /// `max_pages` is the same hard cost ceiling [`Self::scan_channel`] uses:
     /// hitting it reports `incomplete` rather than dropping older threads
     /// silently. Reports `Ok(None)` when the first page is unreadable, so
     /// the compat helper keeps the legacy no-listing contract; a later

@@ -87,6 +87,8 @@ mod tests {
             "two_bot_gateway_latency_seconds",
             "two_bot_gateway_reconnects_total",
             "two_bot_gateway_resumes_total",
+            "two_bot_gateway_disconnects_total",
+            "two_bot_gateway_missed_events_total",
             "two_bot_gateway_events_total",
             "two_bot_handler_duration_seconds",
             "two_bot_rest_requests_total",
@@ -145,6 +147,10 @@ mod tests {
             "two_bot_db_pool_configured ",
             "two_bot_db_pool_idle_connections ",
             "two_bot_db_pool_max_connections ",
+            "two_bot_db_errors_total{op=\"admission\"} ",
+            "two_bot_db_errors_total{op=\"other\"} ",
+            "two_bot_send_admissions_total{outcome=\"admitted\"} ",
+            "two_bot_send_admissions_total{outcome=\"blocked\"} ",
         ] {
             assert!(text.contains(sample), "missing sample {sample}");
         }

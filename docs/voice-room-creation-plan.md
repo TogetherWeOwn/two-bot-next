@@ -28,8 +28,9 @@ included in that request and never patched afterwards.
   that still is not enough (an explicit deny on the bot), the create is refused.
 - **Per-creator defaults.** `default_limit` (else the creator channel's limit)
   and `private_default` set only the new room's starting state; existing rooms
-  keep theirs. Companion text channels (`text_channels`) stay unsupported until
-  V9 and still refuse the create.
+  keep theirs. The companion text channel (`text_channels`) does not change the
+  voice room's plan: the worker creates it through the same per-guild queue
+  (V9c), after the room exists.
 
 ## Assumptions to verify on staging
 
@@ -40,8 +41,7 @@ room lands next to its creator; if not, only that function changes.
 
 ## Not in this slice
 
-`/group` (shared numbering and a contiguous block) needs a stored per-creator
-flag and a migration; the settings commands (`/position`, `/inheritpermissions`,
-`/defaultlimit`, `/alwaysprivate`) and the required-role setting are not wired.
-Until then the stored defaults come from `/create` (spec defaults) or the V11
-import.
+The per-creator settings commands (`/position`, `/group`,
+`/inheritpermissions`, `/defaultlimit`, `/alwaysprivate`) are wired as
+admin-gated slash commands with single-field writes; the required-role
+setting is not. Until that lands, role gating stays on the V11 import.

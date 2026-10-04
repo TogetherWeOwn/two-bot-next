@@ -105,6 +105,12 @@ impl World {
             &self.bot.roles,
             creator.permission_overwrites.as_deref().unwrap_or_default(),
         );
+        let grouped = self.settings.group_by_category;
+        let group_room_ids = if grouped {
+            category_room_ids(creator, &self.channels, &self.rooms)
+        } else {
+            Vec::new()
+        };
         plan_room(&RoomPlanInput {
             guild_id: GUILD,
             owner_id: OWNER,
@@ -115,7 +121,27 @@ impl World {
             rooms: &self.rooms,
             bot: &self.bot,
             bot_permissions,
+            grouped,
+            group_room_ids: &group_room_ids,
         })
+    }
+
+    /// Track one room already in the creator's category.
+    fn add_room(&mut self, id: u64, position: i32) {
+        self.channels
+            .insert(id, channel(id, 2, Some(CATEGORY), position, &[]));
+        self.rooms.insert(
+            id,
+            VoiceRoom {
+                guild_id: GUILD,
+                channel_id: id,
+                creator_channel_id: CREATOR,
+                owner_id: 301,
+                original_creator_id: 301,
+                name_seed: 1,
+                created_at: "2026-10-02T00:00:00.000000+00:00".to_owned(),
+            },
+        );
     }
 }
 
@@ -221,10 +247,13 @@ fn a_missing_chosen_source_channel_fails_closed() {
 }
 
 #[test]
-fn text_channels_remain_unsupported_until_v9() {
+fn the_text_channel_toggle_does_not_change_the_voice_room_plan() {
+    // The companion is created by the worker (V9c); the voice room itself is
+    // planned identically whether or not the creator enables the toggle.
     let mut world = World::new(full());
+    let without = world.plan().unwrap();
     world.settings.text_channels = true;
-    assert_eq!(world.plan(), Err(RoomHttpError::InvalidRequest));
+    assert_eq!(world.plan().unwrap(), without);
 }
 
 #[test]
@@ -282,4 +311,130 @@ fn rooms_and_other_categories_do_not_change_the_creators_slot() {
     // Existing rooms are never moved: the new room sits directly below the
     // creator and pushes room 510 (position 3) down.
     assert_eq!(world.plan().unwrap().position, Some(3));
+}
+
+#[test]
+fn grouped_rooms_keep_a_contiguous_block_at_the_block_edge() {
+    let mut world = World::new(full());
+    world.settings.group_by_category = true;
+    world.add_room(510, 3);
+    world.add_room(511, 4);
+    // Below: after the last group room, taking channel 500's slot (5) and
+    // leaving [creator, 510, 511, new] contiguous.
+    world.settings.position = RoomPosition::Below;
+    assert_eq!(world.plan().unwrap().position, Some(5));
+    // Above: before the first group room, taking room 510's slot (3).
+    world.settings.position = RoomPosition::Above;
+    assert_eq!(world.plan().unwrap().position, Some(3));
+}
+
+#[test]
+fn grouped_without_rooms_starts_the_block_next_to_the_creator() {
+    let mut world = World::new(full());
+    world.settings.group_by_category = true;
+    assert_eq!(world.plan().unwrap().position, Some(2));
+    world.settings.position = RoomPosition::Below;
+    assert_eq!(world.plan().unwrap().position, Some(5));
+}
+
+#[test]
+fn the_group_set_covers_only_live_rooms_in_the_category() {
+    let mut world = World::new(full());
+    world.settings.group_by_category = true;
+    world.add_room(510, 3);
+    // Another category: not in the group.
+    world
+        .channels
+        .insert(900, channel(900, 2, Some(901), 0, &[]));
+    world.rooms.insert(
+        900,
+        VoiceRoom {
+            guild_id: GUILD,
+            channel_id: 900,
+            creator_channel_id: CREATOR,
+            owner_id: 301,
+            original_creator_id: 301,
+            name_seed: 1,
+            created_at: "2026-10-02T00:00:00.000000+00:00".to_owned(),
+        },
+    );
+    // Tracked but hand-deleted (no live channel): not in the group.
+    world.rooms.insert(
+        911,
+        VoiceRoom {
+            guild_id: GUILD,
+            channel_id: 911,
+            creator_channel_id: CREATOR,
+            owner_id: 301,
+            original_creator_id: 301,
+            name_seed: 1,
+            created_at: "2026-10-02T00:00:00.000000+00:00".to_owned(),
+        },
+    );
+    let creator = world.channels[&CREATOR].clone();
+    assert_eq!(
+        category_room_ids(&creator, &world.channels, &world.rooms),
+        vec![510]
+    );
+    // ... so planning still lands at the block edge, not past the strangers.
+    world.settings.position = RoomPosition::Below;
+    assert_eq!(world.plan().unwrap().position, Some(5));
+}
+
+#[test]
+fn a_bot_member_deny_surviving_the_grant_is_refused_not_weakened() {
+    // A source deny on the bot still wins after `grant_bot` adds the minimum
+    // room access, so the room is refused instead of created unmanageable.
+    let mut world = World::new(full());
+    world.set_overwrites(
+        CREATOR,
+        &[PermissionOverwrite {
+            id: Id::new(BOT),
+            kind: PermissionOverwriteType::Member,
+            allow: Permissions::empty(),
+            deny: Permissions::CONNECT,
+        }],
+    );
+    assert_eq!(world.plan(), Err(RoomHttpError::AccessDenied));
+}
+
+#[test]
+fn an_unknown_source_overwrite_kind_is_refused() {
+    // An overwrite kind with no core mapping cannot be honoured: fail
+    // closed instead of silently dropping the rule.
+    let mut world = World::new(full());
+    world.set_overwrites(
+        CREATOR,
+        &[PermissionOverwrite {
+            id: Id::new(601),
+            kind: PermissionOverwriteType::from(99u8),
+            allow: Permissions::empty(),
+            deny: Permissions::empty(),
+        }],
+    );
+    assert_eq!(world.plan(), Err(RoomHttpError::InvalidRequest));
+}
+
+#[test]
+fn without_manage_roles_an_unmanageable_category_is_refused_not_synced() {
+    // Syncing would leave a room the bot cannot manage; refuse instead.
+    let mut world = World::new(full() & !Permissions::MANAGE_ROLES);
+    world.set_overwrites(
+        CATEGORY,
+        &[overwrite(GUILD, Permissions::empty(), Permissions::CONNECT)],
+    );
+    assert_eq!(world.plan(), Err(RoomHttpError::AccessDenied));
+}
+
+#[test]
+fn a_zero_id_override_is_refused_at_conversion() {
+    assert_eq!(
+        to_twilight(&[ChannelOverride {
+            id: 0,
+            kind: OverrideKind::Member,
+            allow: 1,
+            deny: 0,
+        }]),
+        Err(RoomHttpError::InvalidRequest)
+    );
 }

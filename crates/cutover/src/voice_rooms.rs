@@ -4,7 +4,7 @@
 //! errors to the caller. Callers must persist a created channel before moving
 //! its owner and compensate a failed write by deleting that new channel.
 //!
-//! Parameter binding: https://docs.rs/sqlx/0.9.0/sqlx/fn.query.html
+//! Parameter binding: <https://docs.rs/sqlx/0.9.0/sqlx/fn.query.html>
 
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
@@ -17,6 +17,8 @@ use two_bot_core::voice_rooms::{
 };
 use two_bot_core::{format_iso_millis, parse_iso_millis, Snowflake};
 
+use super::voice_config_store::PgVoiceConfigStore;
+
 #[derive(Debug, Clone)]
 pub struct PgRoomStore {
     pool: PgPool,
@@ -26,6 +28,14 @@ impl PgRoomStore {
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// V11 configuration persistence (`/export` reads, `/import` writes)
+    /// over this store's pool. Snapshot and apply each run in one
+    /// transaction; apply never touches live rooms or companions.
+    #[must_use]
+    pub fn voice_configs(&self) -> PgVoiceConfigStore {
+        PgVoiceConfigStore::new(self.pool.clone())
     }
 
     pub async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), sqlx::Error> {
@@ -44,8 +54,8 @@ impl PgRoomStore {
              (guild_id, channel_id, name_template, permission_source,
               permission_channel_id, default_limit, private_default,
               text_channels, text_channel_name, text_viewer_role_id,
-              position, first_room_number)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+              position, first_room_number, group_by_category)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
              ON CONFLICT (guild_id, channel_id) DO UPDATE SET
               name_template = EXCLUDED.name_template,
               permission_source = EXCLUDED.permission_source,
@@ -56,7 +66,8 @@ impl PgRoomStore {
               text_channel_name = EXCLUDED.text_channel_name,
               text_viewer_role_id = EXCLUDED.text_viewer_role_id,
               position = EXCLUDED.position,
-              first_room_number = EXCLUDED.first_room_number",
+              first_room_number = EXCLUDED.first_room_number,
+              group_by_category = EXCLUDED.group_by_category",
         )
         .bind(creator.guild_id.to_string())
         .bind(creator.channel_id.to_string())
@@ -70,6 +81,7 @@ impl PgRoomStore {
         .bind(creator.text_viewer_role_id.map(|id| id.to_string()))
         .bind(position)
         .bind(creator.first_room_number)
+        .bind(creator.group_by_category)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -137,6 +149,31 @@ impl PgRoomStore {
         .bind(room.original_creator_id.to_string())
         .bind(room.name_seed.to_string())
         .bind(timestamp)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            != 0)
+    }
+
+    /// Persist a V2 ownership handoff on an already-tracked room. Only the
+    /// owner fields move: seed, creator channel and timestamp stay insert-once
+    /// like [`PgRoomStore::add_room`]. Returns false when no row exists.
+    pub async fn update_ownership(
+        &self,
+        guild_id: Snowflake,
+        channel_id: Snowflake,
+        owner_id: Snowflake,
+        original_creator_id: Snowflake,
+    ) -> Result<bool, sqlx::Error> {
+        Ok(sqlx::query(
+            "UPDATE voice_rooms
+             SET owner_id = $3, original_creator_id = $4, owner_touched_at = now()
+             WHERE guild_id = $1 AND channel_id = $2",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(owner_id.to_string())
+        .bind(original_creator_id.to_string())
         .execute(&self.pool)
         .await?
         .rows_affected()
@@ -227,6 +264,24 @@ impl PgRoomStore {
         .await?
         .rows_affected()
             != 0)
+    }
+
+    /// Every companion tracked in a guild, for worker load and startup
+    /// reconciliation (V9c): each row carries its creation-time settings
+    /// snapshot, so later `/textchannels` changes never alter it.
+    pub async fn companions_in_guild(
+        &self,
+        guild_id: Snowflake,
+    ) -> Result<Vec<TextCompanion>, sqlx::Error> {
+        sqlx::query(
+            "SELECT * FROM voice_text_companions WHERE guild_id = $1 ORDER BY room_channel_id",
+        )
+        .bind(guild_id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(decode_companion)
+        .collect()
     }
 
     pub async fn companion_for(
@@ -470,6 +525,7 @@ fn decode_creator(row: &PgRow) -> Result<CreatorChannel, sqlx::Error> {
         text_viewer_role_id,
         position,
         first_room_number: row.try_get("first_room_number")?,
+        group_by_category: row.try_get("group_by_category")?,
     };
     creator.validate().map_err(invalid_argument)?;
     Ok(creator)
