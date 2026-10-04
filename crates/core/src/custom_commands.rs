@@ -858,7 +858,7 @@ mod tests {
             adjudicate_run(false, Some(&stored("faq"))),
             RunOutcome::RefusedDisabled
         );
-        // Refusal message is the actionable reply text (host-setting enable path).
+        // Refusal message is the post-425 actionable reply text.
         assert_eq!(
             AUTOMATIONS_DISABLED_REPLY,
             "Automations are disabled on this server. Ask a server admin to enable them in the bot configuration — this is a host setting, not a Discord role."
