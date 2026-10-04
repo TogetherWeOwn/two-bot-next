@@ -22,6 +22,12 @@ Guards:
   cancel-in-progress, so superseded pushes cancel the stale scan instead
   of stacking duplicates; push-to-main falls back to the commit SHA, so
   back-to-back merges never cancel each other's scan.
+- the gitleaks archive is verified against a pinned SHA-256 before it is
+  extracted or run, and a PR is scanned with the base branch's policy
+  (.github/scripts/gitleaks-scan.sh) after an offline self-test, so a PR
+  cannot allowlist its own leak. The behaviour is exercised by
+  .github/scripts/test-gitleaks-scan.sh inside the gitleaks job, where the
+  verified binary exists; this file pins that the wiring stays in place.
 """
 
 import re
@@ -30,6 +36,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/supply-chain.yml"
+SCAN_SCRIPT = ROOT / ".github/scripts/gitleaks-scan.sh"
+SELF_TEST_SCRIPT = ROOT / ".github/scripts/test-gitleaks-scan.sh"
 
 REQUIRED_PR_TYPES = ["opened", "edited", "synchronize", "reopened", "ready_for_review"]
 
@@ -111,6 +119,60 @@ class SecretScanSurfaceTests(unittest.TestCase):
 
     def test_job_still_named_gitleaks_required_check(self):
         self.assertRegex(self.text, r"(?m)^\s*name:\s*gitleaks\s*$")
+
+    def gitleaks_step(self, name):
+        """Return the text of one `gitleaks` job step, header line included."""
+        job_block, _ = section_lines(self.text, "gitleaks:", 2)
+        starts = [i for i, line in enumerate(job_block) if line.strip().startswith("- name:")]
+        for n, start in enumerate(starts):
+            if job_block[start].strip() == f"- name: {name}":
+                end = starts[n + 1] if n + 1 < len(starts) else len(job_block)
+                return "\n".join(job_block[start:end])
+        self.fail(f"gitleaks job has no step named {name!r}")
+
+    def test_gitleaks_archive_verified_before_it_is_extracted(self):
+        step = self.gitleaks_step("Install gitleaks")
+        pinned = re.search(r"(?m)^\s*GITLEAKS_SHA256:\s*([0-9a-f]{64})\s*$", step)
+        self.assertIsNotNone(pinned, "GITLEAKS_SHA256 must be a pinned 64-hex SHA-256")
+        check = step.index("sha256sum --check")
+        self.assertLess(check, step.index("tar -xzf"), "verify the archive before extracting it")
+        self.assertLess(check, step.index('"$RUNNER_TEMP/gitleaks" version'))
+        self.assertIn("${GITLEAKS_SHA256}", step[check - 80:check + 80])
+
+    def test_pr_scan_uses_base_branch_policy_after_self_test(self):
+        self.assertNotRegex(self.text, r"gitleaks\"? git ", "scan only through gitleaks-scan.sh")
+        scan = self.gitleaks_step("Scan the full history")
+        self.assertIn("run: bash .github/scripts/gitleaks-scan.sh", scan)
+        # Context values reach the shell as env vars, never interpolated into `run:`.
+        self.assertIn("EVENT_NAME: ${{ github.event_name }}", scan)
+        self.assertIn("BASE_REF: ${{ github.base_ref }}", scan)
+        run_lines = [line for line in scan.splitlines() if line.strip().startswith("run:")]
+        self.assertFalse(any("${{" in line for line in run_lines))
+        self_test = self.gitleaks_step("Self-test the PR scan policy")
+        self.assertIn("run: bash .github/scripts/test-gitleaks-scan.sh", self_test)
+        self.assertLess(self.text.index(self_test), self.text.index(scan))
+
+    def test_scan_wrapper_keeps_history_scan_and_ignores_pr_policy(self):
+        script = SCAN_SCRIPT.read_text()
+        for flag in ("--redact", "--exit-code 1", "--log-opts=HEAD", "--ignore-gitleaks-allow",
+                     "--config", "--gitleaks-ignore-path"):
+            self.assertIn(flag, script)
+        self.assertNotIn("--no-git", script)
+        self.assertIn('== "pull_request"', script)
+        self.assertIn("refs/remotes/origin/${BASE_REF}", script)
+        self.assertIn(':.gitleaks.toml"', script)
+        self.assertIn(':.gitleaksignore"', script)
+        self.assertNotIn("continue-on-error", script)
+
+    def test_self_test_covers_every_pr_bypass(self):
+        script = SELF_TEST_SCRIPT.read_text()
+        for case in ("allowlist added in .gitleaks.toml", "fingerprint added in .gitleaksignore",
+                     "inline gitleaks:allow", "allowlist already on the base branch is honoured",
+                     "unfetched base branch fails"):
+            self.assertIn(case, script)
+        # The planted token is derived at run time, never written as a literal.
+        self.assertRegex(script, r'token="ghp_\$\(printf [^\n]*sha256sum')
+        self.assertNotRegex(script, r"ghp_[0-9A-Za-z]{36}")
 
 
 if __name__ == "__main__":
