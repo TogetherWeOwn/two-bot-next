@@ -1645,8 +1645,8 @@ async fn lacking_manage_roles_refuses_a_private_default_before_any_create() {
         .any(|call| call == "create" || call.starts_with("persist:") || call.starts_with("move:")));
     assert!(matches!(
         worker.failures().back(),
-        Some(LifecycleFailure::Discord {
-            error: RoomHttpError::AccessDenied,
+        Some(LifecycleFailure::MissingPermission {
+            write: RefusedWrite::Create,
             ..
         })
     ));
