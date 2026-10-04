@@ -4,7 +4,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, readdirSync, mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -180,6 +180,62 @@ test("Wrangler runbook examples exist in npm scripts and pinned CLI help", () =>
     assert.throws(() => checkWranglerCommands(runbook, { ...scripts, logs: "node logger.js" }, helpFor), /must invoke pinned Wrangler/);
   } finally {
     rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+function checkLocalLinks(markdown: string): number {
+  let checked = 0;
+  for (const match of markdown.matchAll(/\[[^\]]*\]\(([^)\s]+)\)/g)) {
+    const href = match[1];
+    if (/^(?:https?:\/\/|\/TOG\/)/.test(href)) continue; // Offline check; not remote availability.
+    const [path, anchor] = href.split("#");
+    const target = new URL(path || "runbook.md", new URL("docs/", root));
+    assert.ok(existsSync(target), `missing local runbook link: ${href}`);
+    if (anchor && target.pathname.endsWith(".md")) {
+      const headings = [...readFileSync(target, "utf8").matchAll(/^#{1,6} (.+)$/gm)]
+        .map((heading) => heading[1].toLowerCase().replace(/[^\w\s-]/g, "").replace(/\s/g, "-"));
+      assert.ok(headings.includes(anchor), `missing runbook heading: ${href}`);
+    }
+    checked++;
+  }
+  return checked;
+}
+
+test("runbook local file links and Markdown heading anchors resolve", () => {
+  assert.ok(checkLocalLinks(runbook) > 20);
+  assert.ok(checkLocalLinks(read("docs/incident-tabletop-2026-10-01.md")) > 0);
+  assert.throws(() => checkLocalLinks("[missing](does-not-exist.md)"), /missing local/);
+  assert.throws(() => checkLocalLinks("[missing](#does-not-exist)"), /missing runbook heading/);
+});
+
+test("public tabletop evidence contains no private tracker references", () => {
+  assert.doesNotMatch(read("docs/incident-tabletop-2026-10-01.md"),
+    /\b(?:TOG|PAP)-\d+\b|\/(?:TOG|PAP)\/(?:issues|agents|projects|approvals|runs)\//);
+});
+
+test("incident playbooks cite emitted metrics and selected literal log messages", () => {
+  const incidents = runbook.split("## Incident playbooks\n")[1]?.split("## Secret inventory:")[0];
+  assert.ok(incidents, "missing incident playbooks");
+  const metrics = read("crates/core/src/metrics.rs");
+  const names = new Set([...incidents.matchAll(/\btwo_bot_[a-z_]+\b/g)].map((match) => match[0]));
+  assert.ok(names.size >= 8, "incident signals must name their existing metric families");
+  for (const name of names) {
+    assert.ok(metrics.includes(`"${name}"`), `metric not emitted by the registry: ${name}`);
+  }
+  const logs: [string, string][] = [
+    ["crates/bot/src/gateway.rs", "gateway reconnect failed; Twilight will retry"],
+    ["crates/bot/src/gateway.rs", "gateway ready; checkpoint committed"],
+    ["crates/bot/src/main.rs", "durable gateway initialized; shard connecting"],
+    ["crates/bot/src/main.rs", "durable gateway failed; checkpoint unchanged, readiness unavailable"],
+    ["crates/bot/src/jobs.rs", "periodic job failed"],
+    ["crates/bot/src/command_runtime.rs", "sticky lookup failed; skipping activity"],
+    ["crates/bot/src/command_runtime.rs", "sticky claim failed; skipping activity"],
+    ["wrangler/src/index.ts", "two-bot container stopped"],
+    ["crates/bot/src/server.rs", "SIGTERM received; draining"],
+  ];
+  for (const [path, message] of logs) {
+    assert.ok(incidents.includes(message), `missing incident signal: ${message}`);
+    assert.ok(read(path).includes(`"${message}"`), `log no longer emitted in ${path}: ${message}`);
   }
 });
 
