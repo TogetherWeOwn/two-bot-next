@@ -157,7 +157,8 @@ impl EventReadEffect for MockEventRead {
 
 /// The receiver reads its enabled set from the process environment, so
 /// flag-dependent tests serialize on this lock and always restore the var.
-static EVENT_READ_FLAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Async-aware: the guard is held across `.await` points by design.
+static EVENT_READ_FLAG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn set_event_read_flag(on: bool) {
     if on {
@@ -763,7 +764,7 @@ async fn event_read_forged_signature_is_unauthorized_before_any_effect() {
     let effect = Arc::new(MockEffect::new(MockOutcome::Success));
     let reads = Arc::new(MockEventRead::default());
     let state = state_with_reads(lazy_pool(), effect.clone(), reads.clone());
-    let _flag = EVENT_READ_FLAG_LOCK.lock().unwrap();
+    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
     set_event_read_flag(true);
     let mut request = signed_read(&read_payload("launch"), "old");
     request.headers_mut().insert(
@@ -782,7 +783,7 @@ async fn event_read_forged_signature_is_unauthorized_before_any_effect() {
 #[tokio::test]
 async fn event_read_mapped_key_returns_the_seven_fields_keyless() {
     let Some(db) = database().await else { return };
-    let _flag = EVENT_READ_FLAG_LOCK.lock().unwrap();
+    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
     set_event_read_flag(true);
     map_launch(db.pool()).await;
     let api = MockEventApi::start().await;
@@ -832,7 +833,7 @@ async fn event_read_mapped_key_returns_the_seven_fields_keyless() {
 #[tokio::test]
 async fn event_read_unmapped_key_is_refused_before_any_discord_call() {
     let Some(db) = database().await else { return };
-    let _flag = EVENT_READ_FLAG_LOCK.lock().unwrap();
+    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
     set_event_read_flag(true);
     let api = MockEventApi::start().await;
     let (status, _, body) = answer(
@@ -851,7 +852,7 @@ async fn event_read_unmapped_key_is_refused_before_any_discord_call() {
 #[tokio::test]
 async fn event_read_flag_off_is_refused_before_any_discord_call() {
     let Some(db) = database().await else { return };
-    let _flag = EVENT_READ_FLAG_LOCK.lock().unwrap();
+    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
     set_event_read_flag(false);
     map_launch(db.pool()).await;
     let api = MockEventApi::start().await;
@@ -869,7 +870,7 @@ async fn event_read_flag_off_is_refused_before_any_discord_call() {
 #[tokio::test]
 async fn event_read_malformed_key_is_refused_before_any_discord_call() {
     let Some(db) = database().await else { return };
-    let _flag = EVENT_READ_FLAG_LOCK.lock().unwrap();
+    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
     set_event_read_flag(true);
     let api = MockEventApi::start().await;
     let app = read_app(db.pool().clone(), &api);
@@ -890,7 +891,7 @@ async fn event_read_malformed_key_is_refused_before_any_discord_call() {
 #[tokio::test]
 async fn event_read_replayed_nonce_is_refused_without_a_second_discord_call() {
     let Some(db) = database().await else { return };
-    let _flag = EVENT_READ_FLAG_LOCK.lock().unwrap();
+    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
     set_event_read_flag(true);
     map_launch(db.pool()).await;
     let api = MockEventApi::start().await;
