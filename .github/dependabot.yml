@@ -4,6 +4,20 @@
 # PR per ecosystem per week replaces up to N single-bump PRs. Security
 # updates are NOT grouped (applies-to: version-updates on every group), so
 # they keep arriving as separate, prioritized PRs.
+#
+# Deliberately not covered:
+#   /fuzz (cargo): a separate `cargo-fuzz` workspace (`exclude = ["fuzz"]`,
+#   `publish = false`). It is dev-only and never built into the bot image or
+#   release, it has no committed Cargo.lock, and no workflow compiles it, so a
+#   bump PR here would be unverifiable and would not exercise the pinned
+#   `libfuzzer-sys`. Its path dependencies (`two-bot-core`, `two-bot-cutover`)
+#   and `serde_json` are already tracked through the root `/` entry. Bump the
+#   fuzz pins by hand in the PR that next runs a fuzz campaign. Add a `cargo`
+#   entry for `/fuzz` if a workflow starts compiling it or a lockfile is
+#   committed.
+#   Workflow service/job-container images (postgres, rust): the `docker`
+#   ecosystem reads Dockerfiles only. They are digest-pinned and bumped by
+#   hand; see the note above `jobs:` in .github/workflows/check.yml.
 version: 2
 updates:
   - package-ecosystem: cargo
