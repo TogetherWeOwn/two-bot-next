@@ -60,7 +60,6 @@ fn all_on() -> RouterGates {
         automations: true,
         announcements: true,
         moderation: true,
-        voice: true,
         tickets: true,
         self_roles: true,
         onboarding_picker: true,
@@ -436,13 +435,9 @@ fn every_section1_row_routes_to_its_registered_handler() {
             "/{name} has its registered stub",
         );
     }
-    // `/votekick` is voice-sink-owned: the core router yields silently so the
-    // shared runtime never answers with an unknown-command reply.
-    assert_eq!(
-        slash_outcome(&router, "votekick"),
-        SlashOutcome::Ignore,
-        "/votekick yields to the voice sink"
-    );
+    // The voice vote-kick shares the `/kick` name and is reached through
+    // the voice sink (occupancy claim); the core router always serves the
+    // moderation path above.
 }
 
 #[test]
@@ -477,7 +472,6 @@ fn disabled_and_ungated_wire_interactions_take_the_refusal_path() {
         automations: false,
         announcements: false,
         moderation: false,
-        voice: false,
         ..all_on()
     });
     for (name, refusal, text) in [

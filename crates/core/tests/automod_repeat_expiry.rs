@@ -340,3 +340,23 @@ fn bad_word_hits_return_before_the_repeat_observation() {
         );
     }
 }
+
+#[test]
+fn repeat_counting_folds_case_and_whitespace_variants() {
+    // The repeat digest hashes the normalized text (NFKC + lowercase +
+    // whitespace collapse), so visual copies with different casing or spacing
+    // are the same message for counting purposes.
+    let config = automod_config(&[]);
+    let policy = &config.policy;
+    let mut repeats = RepeatTracker::default();
+    for (id, content) in [(1, "Buy Cheap Gold"), (2, "buy  cheap   gold")] {
+        let copy = message(GUILD, AUTHOR, id, content, T0 + id * 1_000);
+        assert_eq!(normalize_content(content), "buy cheap gold", "{content:?}");
+        assert_eq!(match_automod(&copy, policy, &mut repeats), None);
+    }
+    let third = message(GUILD, AUTHOR, 3, "BUY CHEAP GOLD", T0 + 3_000);
+    assert_eq!(
+        match_automod(&third, policy, &mut repeats),
+        Some(AutomodFilter::RepeatedMessage)
+    );
+}

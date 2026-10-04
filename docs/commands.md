@@ -14,7 +14,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 29.
+Built-in commands: 28.
 
 ## `/attendance`
 
@@ -117,7 +117,7 @@ No options.
 
 ## `/kick`
 
-Kick a member from the server (moderators only)
+Kick a member
 
 - Default permissions: KickMembers (`2`)
 - Available in DMs: false
@@ -319,18 +319,6 @@ Allow @everyone to send messages
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
-
-## `/votekick`
-
-Start a member vote to disconnect someone from your voice room (they stay on the server)
-
-- Default permissions: Everyone (no default permission gate)
-- Available in DMs: false
-
-| Option | Type | Required | Min | Max | Max length | Choices | Description |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `member` | user | true | — | — | — | — | Room occupant to put to a vote, e.g. @Sam |
-| `reason` | string | false | — | — | 512 | — | Why the vote was started (shown on the ballot, optional) |
 
 ## `/warn`
 

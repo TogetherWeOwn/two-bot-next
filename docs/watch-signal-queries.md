@@ -152,6 +152,107 @@ container (for example a fatal gateway task); a `container started`
 without new `READY`/`RESUMED` events means the gateway never connected
 after the restart.
 
+## 6. DB-error counter
+
+Source: `two_bot_db_errors_total{op}` (storage-layer failures, not pool
+pressure). The `op` label is `admission` (send-admission SQL:
+admit/extend/complete) or `other` (every other store until its operation
+joins the allowlist; stays zero until then). Fixed cardinality: two series.
+Unknown operations collapse to `other`; no error text, query, or identifier
+is retained. Series contract: [metrics](metrics.md).
+
+```promql
+sum(increase(two_bot_db_errors_total[48h]))
+sum by (op) (increase(two_bot_db_errors_total[48h]))
+sum(increase(two_bot_db_errors_total{op="admission"}[1h]))
+```
+
+Read the `op` label before acting: an `admission`-only burst points at the
+send-admission SQL path and its recent deploys, not at the database as a
+whole. Do not sum this counter together with
+`two_bot_send_admissions_total{outcome="storage_error"}`: the same failure
+is counted in both, so adding them double-counts one outage. A counter that
+reset to zero between scrapes means the process restarted; it does not mean
+the window was quiet.
+
+Alert-threshold sketch (not a threshold): the paging rule fires at 3 or more
+storage failures between two keepalive samples, and a restart reset skips
+the window rather than firing. A slow trickle below that burst stays silent
+here and surfaces instead through `two_bot_job_consecutive_failures`. When
+this sketch disagrees with the runbook or the budgets in
+[production-deploy](production-deploy.md#signal-thresholds-budgets-and-rollback-triggers),
+those win. Runbook: [runbook](runbook.md) (DB errors section).
+
+## 7. Send-admission decisions
+
+Source: `two_bot_send_admissions_total{outcome}` (one `admit()` decision per
+increment, not per retry or per completion). The `outcome` label is
+`admitted` (Ok), `blocked` (lane or cooldown refusal), `storage_error` (the
+admission SQL itself failed; also counted in
+`two_bot_db_errors_total{op="admission"}`), or `other` (anything else).
+Failed `complete()`/`extend()` storage writes count only in the DB-error
+counter above: the admit decision was already recorded. Fixed cardinality:
+four series. Series contract: [metrics](metrics.md).
+
+```promql
+sum by (outcome) (increase(two_bot_send_admissions_total[48h]))
+sum(increase(two_bot_send_admissions_total{outcome="blocked"}[1h]))
+sum(increase(two_bot_send_admissions_total{outcome="storage_error"}[48h]))
+sum(increase(two_bot_send_admissions_total{outcome="blocked"}[48h]))
+  / sum(increase(two_bot_send_admissions_total[48h]))
+```
+
+A rising `blocked` share means the token-wide lane in front of every Discord
+send is refusing work (held lane or active cooldown), not that Discord
+returned 429s; correlate with the container logs for cooldown and held-lane
+lines before acting. A rising `storage_error` count is the same outage as
+section 6, not a second outage. Do not replay uncertain writes, hammer
+Discord, or restart the container to "free" the lane.
+
+Alert-threshold sketch (not a threshold): the paging rule fires only when
+windows with *new* `blocked` refusals arrive in 3 consecutive keepalive
+samples; one busy tick stays silent, and an idle or self-clearing burst never
+pages. Storage failures of the admission SQL page once via the DB-error rule
+above, not here. When this sketch disagrees with the runbook or the budgets
+in [production-deploy](production-deploy.md#signal-thresholds-budgets-and-rollback-triggers),
+those win. Runbook: [runbook](runbook.md) (send admission blocked section).
+## 8. Gateway disconnects and missed events
+
+Source: `two_bot_gateway_disconnects_total` (every transport loss the
+shard supervisor observed: reconnect failures, close frames, invalid
+sessions, cold-resume IDENTIFY) and
+`two_bot_gateway_missed_events_total` (dispatches Discord assigned but
+this process never received: sequence gaps inside one session). Series
+contract: [metrics](metrics.md). This section measures transport and
+sequence continuity only. Database health stays with the DB error
+counter, and off-container reachability stays with the external uptime
+check; neither is repeated here.
+
+```promql
+sum(increase(two_bot_gateway_disconnects_total[48h]))
+sum(increase(two_bot_gateway_missed_events_total[48h]))
+sum(increase(two_bot_gateway_disconnects_total[48h])) > 0
+  and sum(increase(two_bot_gateway_resumes_total[48h]))
+    + sum(increase(two_bot_gateway_events_total{event="READY"}[48h])) == 0
+```
+
+Read the two counters as a pair. The missed-events threshold is zero:
+any nonzero increase over the 48h window fails the zero-missed-events
+acceptance and is a stop condition under the "Event continuity" row of
+the signal-thresholds table in [production-deploy](production-deploy.md)
+(zero unexplained gaps). Disconnects are informational on their own —
+deploys and host moves cause them — but each one must pair with a later
+RESUME or fresh READY in the same window; the third query above fires
+when disconnects have no matching session recovery. A rising `READY`
+count next to disconnects means fresh IDENTIFYs (checkpoints older than
+15 minutes or rejected sessions); a rising `RESUMED` count means the
+session continued with no gap. Cross-check with one log filter over the
+same window: count `gateway reconnect failed; Twilight will retry` and
+`gateway ready; checkpoint committed` lines. A missed-events increase
+with no disconnect means the gap predates this instrumentation or the
+process restarted mid-window (counters reset to zero on restart, so a
+reset is not a quiet window — re-baseline both scrapes after it).
+
 ## What this pack does not do
 
 - No threshold is set or changed here.
@@ -159,3 +260,6 @@ after the restart.
 - No database probe is authorized against staging or production.
 - No retry, breaker-reset, takeover, rollback, or credential step is
   included; those live in the runbook and cutover docs.
+- Dry-run record for the DB-error and send-admission queries (staging
+  read-only, offline rehearsal, threshold comparison):
+  [watch-signal-dry-run.md](watch-signal-dry-run.md).

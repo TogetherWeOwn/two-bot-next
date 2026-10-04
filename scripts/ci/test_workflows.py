@@ -12,7 +12,10 @@ JOB_INVENTORY = {
     # Branch keeps the moderation-db job; main #84 added the supply-chain job.
     # The pin must be the union of both sides.
     "check.yml": {"check", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
-                  "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain"},
+                  "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "required-checks",
+                  # TOG-14881: CI standard aggregator; required-checks stays
+                  # until the protect-main ruleset flips to ci-ok.
+                  "ci-ok"},
     "deploy-production.yml": {"guard", "production"},
     "deploy-staging.yml": {"deploy"},
     "nightly.yml": {"pipeline-benchmark", "advisories", "sweep"},

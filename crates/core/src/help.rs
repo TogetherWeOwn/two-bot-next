@@ -1,4 +1,4 @@
-//! `/help` discovery reply (TOG-13622).
+//! `/help` discovery reply.
 //!
 //! The staging-guild UX walk found 27 builtins publishing with no discovery
 //! surface: typing `/help` answered with the stale-interaction reply because
@@ -81,13 +81,8 @@ const HELP_GROUPS: &[HelpGroup] = &[
     },
     HelpGroup {
         title: "Kick",
-        requires: Some("Kick Members"),
+        requires: Some("Kick Members, or a tracked voice room for a vote"),
         commands: &["kick"],
-    },
-    HelpGroup {
-        title: "Voice vote",
-        requires: None,
-        commands: &["votekick"],
     },
     HelpGroup {
         title: "Timeouts and warnings",
@@ -186,7 +181,6 @@ mod tests {
             automations: true,
             announcements: true,
             moderation: true,
-            voice: true,
             tickets: true,
             self_roles: true,
             onboarding_picker: true,
@@ -215,7 +209,7 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        assert!(text.contains("**Server commands** (29 live)"));
+        assert!(text.contains("**Server commands** (28 live)"));
         assert!(text.len() < 2000, "fits Discord's content ceiling");
     }
 
@@ -248,7 +242,6 @@ mod tests {
             automations: false,
             announcements: false,
             moderation: false,
-            voice: false,
             ..all_on()
         });
         let defs = off.publish_set(&[]).expect("core-only set");
@@ -292,8 +285,8 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 27 legacy builtins plus the Next-only help command and vote-kick.
-        assert_eq!(grouped.len(), 29);
+        // 27 legacy builtins plus the Next-only help command.
+        assert_eq!(grouped.len(), 28);
         for name in [
             "rank",
             "leaderboard",
@@ -310,7 +303,6 @@ mod tests {
             "ban",
             "tempban",
             "kick",
-            "votekick",
             "timeout",
             "warn",
             "purge",

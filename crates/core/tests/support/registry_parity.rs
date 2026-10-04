@@ -2,14 +2,12 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use two_bot_core::commands::{CommandDefinition, HELP_DESCRIPTION, OCCURRENCE_ID_MAX_CHARS};
 use two_bot_core::router::{InteractionRouter, RouterGates};
-use two_bot_core::voice_rooms::vote_kick_command;
 
 pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("rsvp-attendance", "docs/parity.md §1 #12 / #25"),
     ("rota-acknowledge", "docs/parity.md §1 #13 / §9 drop 1"),
     ("attendance", "docs/parity.md §1 #12 bound"),
     ("help", "docs/parity.md §1 help"),
-    ("votekick", "docs/parity.md §1 voice vote-kick"),
     ("kick", "docs/parity.md §1 #5 copy"),
     ("attendance", "docs/parity.md §1 #12 copy"),
     ("rsvp", "docs/parity.md §1 #24 copy"),
@@ -25,7 +23,6 @@ pub fn all_on_router() -> InteractionRouter {
         automations: true,
         announcements: true,
         moderation: true,
-        voice: true,
         tickets: true,
         self_roles: true,
         onboarding_picker: true,
@@ -81,20 +78,10 @@ pub fn expected_registry() -> Value {
     let help = serde_json::to_value(CommandDefinition::new("help", HELP_DESCRIPTION))
         .expect("help serializes");
     commands.insert(2, help);
-    // Next-only `/votekick` voice vote-kick: no legacy counterpart (legacy
-    // has no vote-kick slash). Appended at the publish position (last among
-    // builtins) as the exact published definition.
-    let votekick = serde_json::to_value(vote_kick_command()).expect("votekick serializes");
-    commands.push(votekick);
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.
     for (name, pointer, value) in [
-        (
-            "kick",
-            "/description",
-            "Kick a member from the server (moderators only)",
-        ),
         (
             "attendance",
             "/description",

@@ -17,10 +17,11 @@
 //! - export validation: `src/automod/rulesExport.ts` (`validateAutomodRules`,
 //!   TOG-5700) — pure and offline.
 //!
-//! Staging gate: automod runs only while `TWO_AUTOMOD=1`, dry-run by default,
-//! and stays staging-only until the soak passes (card acceptance). The live
-//! activation fence (`assertActivationPermitted`) is enforced by the boot
-//! adapter, same posture as slices 2–3 — this module carries no guild id.
+//! Automod needs both `TWO_AUTOMOD=1` (dry-run by default) and permission from
+//! [`crate::activation::evaluate_activation`]. Bot boot evaluates this in
+//! `activation::BootActivation`; a future automod runtime must consult its
+//! `permitted(Automod)` before registering. No automod handler is wired in the
+//! current bot composition, and automod is not cleared live.
 //!
 //! Deliberately out of scope: the inspect pipeline (claim/release/audit via
 //! S6 stores), Discord deletion + sanction execution (twilight adapter),
@@ -941,6 +942,26 @@ mod tests {
         );
         // Clean text passes all filters.
         assert_eq!(check("hello world, good game tonight", &policy), None);
+    }
+
+    #[test]
+    fn bad_words_reject_punctuation_separators() {
+        // Legacy only allows whitespace and zero-width characters between
+        // word letters (`is_word_gap`): punctuation breaks the word, so these
+        // must not match even though the spaced variant above does.
+        let policy = policy();
+        for content in [
+            "s.p.a.m.w.o.r.d",
+            "s-p-a-m-w-o-r-d",
+            "s/p/a/m/w/o/r/d",
+            "buy s,p,a,m,w,o,r,d now",
+        ] {
+            assert_eq!(check(content, &policy), None, "{content:?}");
+        }
+        // Non-ASCII letters are word characters too (`is_word_char` is
+        // Unicode-aware), so they close the boundary on either side.
+        assert_eq!(check("éspamword", &policy), None);
+        assert_eq!(check("spamwordé", &policy), None);
     }
 
     #[test]

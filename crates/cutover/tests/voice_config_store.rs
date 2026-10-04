@@ -7,7 +7,7 @@ use sqlx::{postgres::PgConnectOptions, postgres::PgPoolOptions, PgPool, Postgres
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use two_bot_core::voice_config::{
-    export_configuration, import_configuration, ChannelKind, ChannelReference,
+    export_configuration, import_configuration, ChannelKind, ChannelReference, ChannelTemplates,
     CreatorConfiguration, GuildInventory, PermissionSource, RoomPosition, VoiceConfiguration,
 };
 use two_bot_core::voice_rooms::{CreatorChannel, TextCompanion, VoiceRoom};
@@ -282,7 +282,10 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
 
     // A failing row rolls back every section. Each rejected document differs
     // from the stored one in every section; the failure lands in a different
-    // section each time (creators, logging, settings).
+    // section each time (creators, templates, aliases, lists, logging,
+    // settings). The templates/aliases/lists rows fail after the creators
+    // section is already written, so they prove a late-section failure still
+    // rolls back the whole apply.
     store.apply(GUILD, &config).await?;
     let before = store.snapshot(GUILD).await?;
     assert_eq!(before, config);
@@ -291,6 +294,28 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     bad_creator.creators[0].first_number = 0; // CHECK first_room_number >= 1
     let mut bad_limit = alternate(&config);
     bad_limit.creators[0].default_limit = 100; // CHECK default_limit 0..=99
+
+    // Duplicate (guild_id, channel_id): the second INSERT violates the primary
+    // key after the creators section and the first template row are written.
+    let mut bad_template = alternate(&config);
+    bad_template.templates = vec![
+        ChannelTemplates {
+            channel_id: "102".to_owned(),
+            name_template: "dup".to_owned(),
+            status_template: None,
+        },
+        ChannelTemplates {
+            channel_id: "102".to_owned(),
+            name_template: "dup again".to_owned(),
+            status_template: None,
+        },
+    ];
+    // CHECK char_length(btrim(alias)) >= 1 on voice_game_aliases.
+    let mut bad_alias = alternate(&config);
+    bad_alias.aliases[0].alias = "   ".to_owned();
+    // CHECK char_length(btrim(choice)) >= 1 on voice_random_list_choices.
+    let mut bad_list = alternate(&config);
+    bad_list.lists[0].choices.push("  ".to_owned());
     let mut bad_logging = alternate(&config);
     bad_logging.logging = config.logging.clone();
     bad_logging
@@ -307,6 +332,9 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     for (label, document) in [
         ("creator first number", &bad_creator),
         ("creator limit", &bad_limit),
+        ("template duplicate", &bad_template),
+        ("alias blank", &bad_alias),
+        ("list blank choice", &bad_list),
         ("logging snowflake", &bad_logging),
         ("settings time zone", &bad_settings),
         ("guild mismatch", &wrong_guild),

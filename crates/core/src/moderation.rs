@@ -19,10 +19,10 @@
 //!   (`requireModerationReason`, action/actor/target shapes).
 //! - gates: `src/moderation/config.ts` (`loadModerationConfig`).
 //!
-//! Staging gate: these definitions publish only while `TWO_MODERATION=1`, and
-//! stay staging-only until the soak passes (card acceptance). The guild
-//! allowlist fence (`assertActivationPermitted`, TOG-3186) is enforced by the
-//! boot adapter, same posture as slice 2 — this module carries no guild id.
+//! These definitions publish only while `TWO_MODERATION=1` and the identity
+//! passes [`crate::activation::evaluate_activation`]. Bot boot applies that
+//! fence in `activation::BootActivation` before the shared command runtime
+//! registers handlers or publishes commands. Moderation is not cleared live.
 //!
 //! Deliberately out of scope: automod filters/matcher (slice 4),
 //! containment/anti-nuke heat scoring (slice 5), the moderation service +
@@ -157,7 +157,7 @@ pub fn moderation_commands() -> Vec<CommandDefinition> {
                 .min_value(TEMPBAN_DURATION_MIN_SECONDS),
                 CommandOption::reason(),
             ]),
-        CommandDefinition::new("kick", "Kick a member from the server (moderators only)")
+        CommandDefinition::new("kick", "Kick a member")
             .permissions(PERM_KICK_MEMBERS)
             .options(vec![CommandOption::target(), CommandOption::reason()]),
         CommandDefinition::new("timeout", "Timeout a member")

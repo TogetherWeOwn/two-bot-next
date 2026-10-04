@@ -27,7 +27,6 @@ fn gates(enabled: bool) -> RouterGates {
         scorecard: false,
         automations: false,
         moderation: false,
-        voice: false,
         tickets: false,
         self_roles: false,
         onboarding_picker: false,
