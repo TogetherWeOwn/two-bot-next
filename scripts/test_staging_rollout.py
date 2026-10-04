@@ -1645,5 +1645,31 @@ class OrchestrationTests(OfflineTestCase):
                 self.assert_no_evidence()
 
 
+class UserAgentTests(unittest.TestCase):
+    def test_requests_send_an_explicit_user_agent(self):
+        seen = []
+
+        class Response(io.BytesIO):
+            status = 200
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class Opener:
+            def open(self, request, timeout):
+                seen.append(request.get_header("User-agent"))
+                return Response(b"ok")
+
+        client = rollout.Client("0" * 32, "token")
+        client.opener = Opener()
+        client.request("https://example.invalid/readyz")
+        self.assertEqual(seen, [rollout.USER_AGENT])
+        self.assertFalse(seen[0].startswith("Python-urllib"))
+
+
 if __name__ == "__main__":
     unittest.main()
