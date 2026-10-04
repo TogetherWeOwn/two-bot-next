@@ -370,12 +370,6 @@ impl InteractionRouter {
         if let Some(outcome) = self.route_builtin(ctx.name, ctx.guild_id, ctx.actor_permissions) {
             return outcome;
         }
-        // Voice-room names belong to the voice sink, which acknowledges the
-        // interaction itself. Answering "unknown command" here (or running a
-        // custom row) would be a second acknowledgement Discord rejects.
-        if Self::voice_command_names().contains(ctx.name) {
-            return SlashOutcome::Ignore;
-        }
         // Dynamic DB-backed custom commands (#22): everyone while automations
         // are on; explicit refusal while off. Missing/disabled rows in the
         // configured guild get the same reply as other stale interactions.
@@ -613,21 +607,8 @@ impl InteractionRouter {
             .chain(automation_commands().iter())
             .chain(announcement_commands().iter())
             .chain(super::moderation::moderation_commands().iter())
-            .chain(super::voice_rooms::voice_commands().iter())
             .map(|def| def.name.clone())
             .collect()
-    }
-
-    /// Every voice-room slash name, independent of `TWO_VOICE`: a custom row
-    /// under one of these names could never publish or execute.
-    fn voice_command_names() -> &'static HashSet<String> {
-        static NAMES: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
-        NAMES.get_or_init(|| {
-            super::voice_rooms::voice_commands()
-                .iter()
-                .map(|def| def.name.clone())
-                .collect()
-        })
     }
 
     /// Assemble the ONE complete guild command set for publish-on-ready
@@ -1224,75 +1205,6 @@ mod tests {
             r.route_component("two:lfg:x", Some(9999)),
             ComponentOutcome::Ignore
         );
-    }
-
-    #[test]
-    fn voice_names_belong_to_the_voice_sink_not_the_router() {
-        // The router stays silent for voice-room names so only the voice sink
-        // acknowledges them; a custom row can neither shadow nor double-answer.
-        let names: Vec<String> = crate::voice_rooms::voice_commands()
-            .iter()
-            .map(|def| def.name.clone())
-            .collect();
-        assert!(names.iter().any(|name| name == "setup"));
-        let builtin: HashSet<String> = InteractionRouter::all_builtin_names();
-        for gates in [
-            all_on(),
-            RouterGates {
-                automations: false,
-                ..all_on()
-            },
-        ] {
-            let r = InteractionRouter::new(gates);
-            for name in names.iter().filter(|name| {
-                // Names a pre-existing builtin owns keep their builtin route.
-                r.route_builtin(name, Some(GUILD), None).is_none()
-            }) {
-                for custom_row in [None, Some(false), Some(true)] {
-                    let ctx = SlashContext {
-                        name,
-                        custom_row,
-                        ..ctx(name, Some(GUILD), None)
-                    };
-                    assert_eq!(r.route_slash(&ctx), SlashOutcome::Ignore, "{name}");
-                }
-            }
-        }
-        for name in &names {
-            assert!(builtin.contains(name), "{name} is reserved at publish");
-        }
-        // A non-voice, non-builtin name still gets the uniform unknown reply.
-        assert_eq!(
-            router().route_slash(&ctx("not-a-command", Some(GUILD), None)),
-            SlashOutcome::Unknown
-        );
-    }
-
-    #[test]
-    fn publish_set_withholds_custom_rows_named_like_voice_commands() {
-        let r = router();
-        let rows: Vec<CustomCommand> = crate::voice_rooms::voice_commands()
-            .iter()
-            .map(|def| CustomCommand {
-                name: def.name.clone(),
-                description: "shadow".to_owned(),
-                enabled: true,
-            })
-            .collect();
-        assert!(!rows.is_empty());
-        let set = r.publish_set(&rows).expect("assembles");
-        let voice_only: Vec<&str> = rows
-            .iter()
-            .map(|row| row.name.as_str())
-            .filter(|name| r.route_builtin(name, Some(GUILD), None).is_none())
-            .collect();
-        assert!(!voice_only.is_empty());
-        for name in voice_only {
-            assert!(
-                !set.iter().any(|c| c.name == name),
-                "custom row {name} must not publish"
-            );
-        }
     }
 
     #[test]

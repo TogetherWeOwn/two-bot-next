@@ -283,21 +283,34 @@ pub fn check_capacity(
 
 /// Every name Owen owns, derived from the command definitions so a new
 /// builtin can never become shadowable because somebody forgot a second
-/// handwritten list (legacy `BUILTIN_COMMAND_NAMES`). Voice-room names are
-/// reserved even while `TWO_VOICE` is off: the voice sink matches by name, so
-/// a custom command named `setup` or `export` would otherwise reach the voice
-/// handlers the moment voice turns on. Rota is absent: the staging-only
-/// `/rota-acknowledge` was dropped with the rota stack (matrix §9 drop 1), so
-/// its name is NOT reserved in the port.
+/// handwritten list (legacy `BUILTIN_COMMAND_NAMES`). Rota is absent: the
+/// staging-only `/rota-acknowledge` was dropped with the rota stack (matrix
+/// §9 drop 1), so its name is NOT reserved in the port.
 #[must_use]
 pub fn builtin_command_names() -> HashSet<String> {
     super::commands::core_commands()
         .iter()
         .chain(super::feature_commands::feature_commands().iter())
         .chain(super::moderation::moderation_commands().iter())
-        .chain(super::voice_rooms::voice_commands().iter())
         .map(|d| d.name.clone())
         .collect()
+}
+
+/// Names a custom command may not be *written* under: every builtin plus the
+/// voice-room set. The voice sink dispatches by name, so a custom command named
+/// `setup` or `export` would reach the voice handlers the moment `TWO_VOICE`
+/// turns on, even if it was created while voice was off. This guards writes
+/// only (`/command`, imports). Dispatch keeps [`builtin_command_names`], so a
+/// stored row that predates the reservation keeps running while voice is off.
+#[must_use]
+pub fn reserved_command_names() -> HashSet<String> {
+    let mut names = builtin_command_names();
+    names.extend(
+        super::voice_rooms::voice_commands()
+            .into_iter()
+            .map(|def| def.name),
+    );
+    names
 }
 
 /// Refuse unless automations are on. Registered with `false`, the handler
@@ -795,10 +808,22 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_reservation_stays_free_of_voice_names() {
+        // Only writes reserve voice names. A stored row under one keeps running
+        // while voice is off, so dispatch must not treat the name as builtin.
+        let dispatch = builtin_command_names();
+        let reserved = reserved_command_names();
+        let voice = crate::voice_rooms::voice_commands();
+        assert!(dispatch.is_subset(&reserved));
+        assert!(!dispatch.contains("setup"));
+        assert!(voice.iter().all(|def| reserved.contains(&def.name)));
+    }
+
+    #[test]
     fn put_validation_refuses_every_voice_room_name() {
         // The voice sink matches by name, so a custom command named after a
         // voice command would reach the voice handlers.
-        let builtins = builtin_command_names();
+        let builtins = reserved_command_names();
         let voice = crate::voice_rooms::voice_commands();
         assert!(voice.iter().any(|def| def.name == "setup"));
         for def in &voice {
