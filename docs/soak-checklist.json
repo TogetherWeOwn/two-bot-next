@@ -2751,19 +2751,17 @@
           "[7f90492](https://github.com/TogetherWeOwn/two-bot/commit/7f904926891c2d97fd3f0765a2b2c34993c69f67)",
           "`src/core/`, `src/internal/`",
           "feat(events): add gated event.read mapped-event verifier (#266)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
-        "TOG-10862",
-        "TOG-10603"
+        "TOG-15757"
       ],
-      "status": "waived",
-      "action": "Send signed `event.read` calls for mapped and unmapped event keys through TOG-10862’s executor and TOG-10603’s receiver fixtures.",
-      "expected": "The gated verifier returns the mapped event and refuses unmapped keys without Discord writes.",
-      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "automated",
+      "action": "Send signed keyless `event.read` calls for mapped and unmapped event keys, with the flag on and off, through the receiver fixtures with a loopback Discord double.",
+      "expected": "The gated verifier returns the mapped event with the 7-field read result and refuses unmapped keys, a disabled flag, replayed nonces and forged signatures without Discord writes.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib event_key_names_a_key_never_a_snowflake && python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test internal_action_store event_key_map && python3 scripts/cargo_cache.py run -- test -p two-bot --lib event_read"
     },
     {
       "id": "s13-dc2b507",

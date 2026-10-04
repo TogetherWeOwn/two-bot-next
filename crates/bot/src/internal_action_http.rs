@@ -21,19 +21,21 @@ use serde_json::{json, Map, Value};
 use tokio::{net::TcpListener, sync::Semaphore};
 use two_bot_core::{
     clock_guard::ClockGuard,
+    format_iso_millis,
     internal_action_config::InternalActionConfig,
     internal_action_store::{
         AuditSubject, DiscordId, InternalActionStore, InternalClaim, RequestIdentity,
         TerminalFailure, TerminalResponse,
     },
     internal_actions::{
-        new_request_id, validate_announcement, validate_idempotency_key, ActionError, AuthHeaders,
-        AuthenticatedRequest, ErrorCode, InternalFlags, TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES,
-        SKEW_SECONDS,
+        new_request_id, unmapped_event_key, validate_announcement, validate_event_key,
+        validate_idempotency_key, ActionError, AuthDecision, AuthHeaders, AuthenticatedRequest,
+        ErrorCode, InternalFlags, TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES, SKEW_SECONDS,
     },
     rejection_telemetry::{ActionLabel, KeyLabel, Rejection, RejectionRecord, RejectionTelemetry},
 };
 use two_bot_discord::internal_actions::{AnnouncementExecutor, ExecutionOutcome, Refusal};
+use two_bot_discord::{ActionExecutor, EventActionError, EventCall};
 
 const MAX_HEADER_BYTES: usize = 8192;
 const MAX_HEADERS: usize = 64;
@@ -86,10 +88,61 @@ impl ActionEffect for AnnouncementExecutor {
     }
 }
 
+/// Keyless read-only effect: a resolved `event.read` performs one Discord GET
+/// through [`ActionExecutor::execute_event`] and refreshes the Postgres mirror.
+/// Reads carry no `Idempotency-Key` and take no durable idempotency claim; the
+/// committed nonce is their replay guard.
+trait EventReadEffect: Send + Sync {
+    fn execute_read<'a>(
+        &'a self,
+        guild_id: &'a str,
+        event_id: &'a str,
+        observed_at: &'a str,
+    ) -> BoxFuture<'a, Result<Value, EventActionError>>;
+}
+
+/// Production read effect: the shared event executor against the Postgres
+/// mirror. The mirror write is part of the read (legacy refreshes it too); a
+/// failed mirror write after a Discord success is `internal`, never a retry.
+pub struct EventReadExecutor {
+    executor: ActionExecutor,
+    mirror: sqlx::PgPool,
+}
+
+impl EventReadExecutor {
+    #[must_use]
+    pub fn new(executor: ActionExecutor, mirror: sqlx::PgPool) -> Self {
+        Self { executor, mirror }
+    }
+}
+
+impl EventReadEffect for EventReadExecutor {
+    fn execute_read<'a>(
+        &'a self,
+        guild_id: &'a str,
+        event_id: &'a str,
+        observed_at: &'a str,
+    ) -> BoxFuture<'a, Result<Value, EventActionError>> {
+        Box::pin(async move {
+            self.executor
+                .execute_event(
+                    guild_id,
+                    &EventCall::Read {
+                        event_id: event_id.to_owned(),
+                    },
+                    &self.mirror,
+                    observed_at,
+                )
+                .await
+        })
+    }
+}
+
 struct ReceiverState {
     config: InternalActionConfig,
     store: InternalActionStore,
     effect: Arc<dyn ActionEffect>,
+    event_read: Arc<dyn EventReadEffect>,
     clock: Mutex<ClockGuard>,
     buckets: Mutex<TokenBuckets>,
     telemetry: Mutex<RejectionTelemetry>,
@@ -101,11 +154,13 @@ impl ReceiverState {
         config: InternalActionConfig,
         pool: sqlx::PgPool,
         effect: Arc<dyn ActionEffect>,
+        event_read: Arc<dyn EventReadEffect>,
     ) -> Self {
         Self {
             config,
             store: InternalActionStore::new(pool),
             effect,
+            event_read,
             clock: Mutex::new(ClockGuard::new()),
             buckets: Mutex::new(TokenBuckets::new()),
             telemetry: Mutex::new(RejectionTelemetry::default()),
@@ -174,19 +229,32 @@ pub async fn bind(
     use two_bot_core::send_admission::PgSendAdmission;
     use two_bot_discord::internal_actions::CooldownGovernor;
 
-    let admission = PgSendAdmission::new(pool.clone(), token)
-        .map_err(|_| std::io::Error::other("internal-action admission configuration invalid"))?;
+    // One shared send-admission lane for both executors: every Discord send,
+    // announcement or event read, holds the same token-wide lane.
+    let admission =
+        Arc::new(PgSendAdmission::new(pool.clone(), token).map_err(|_| {
+            std::io::Error::other("internal-action admission configuration invalid")
+        })?);
     let executor = AnnouncementExecutor::with_admission(
         Arc::new(twilight_http::Client::new(token.to_owned())),
         config.channel_keys().clone(),
         CooldownGovernor::new(),
-        Arc::new(admission),
+        Arc::clone(&admission),
     )
     .map_err(|_| std::io::Error::other("internal-action executor configuration invalid"))?;
+    let events =
+        ActionExecutor::with_admission(token.to_owned(), None, admission).map_err(|_| {
+            std::io::Error::other("internal-action event executor configuration invalid")
+        })?;
     let listener = TcpListener::bind(config.listen_addr()).await?;
     Ok(BoundReceiver {
         listener,
-        state: Arc::new(ReceiverState::new(config, pool, Arc::new(executor))),
+        state: Arc::new(ReceiverState::new(
+            config,
+            pool.clone(),
+            Arc::new(executor),
+            Arc::new(EventReadExecutor::new(events, pool)),
+        )),
     })
 }
 
@@ -337,12 +405,10 @@ async fn receive(state: &ReceiverState, request: Request, id: &str) -> Response 
         Ok(burned) => burned,
         Err(error) => return reject(Failure::from_action(error), ActionLabel::Unknown),
     };
-    // The enabled set is intentionally the executor intersection, not runtime
-    // flags that could accidentally advertise a different effect adapter.
-    let flags = InternalFlags {
-        enabled: ["announcement.post".to_owned()].into_iter().collect(),
-        allow_automation_overwrite: false,
-    };
+    // The enabled set is the env-only flag gate, never the settings store: the
+    // website must not be able to grant itself verbs. Verbs without a wired
+    // effect adapter stay refused by the per-effect fences below.
+    let flags = InternalFlags::from_env();
     let decision = {
         let mut buckets = state.buckets.lock().expect("buckets lock");
         burned.authorize(&flags, true, false, &mut buckets)
@@ -359,6 +425,11 @@ async fn receive(state: &ReceiverState, request: Request, id: &str) -> Response 
         }
     };
     let action = ActionLabel::new(Some(&decision.action));
+    // Read-only verbs are keyless: no Idempotency-Key header and no durable
+    // idempotency claim. The committed nonce above is their replay guard.
+    if decision.action == "event.read" {
+        return read_event(state, &decision, id, key, action).await;
+    }
     // This second fence is explicit: core phase-1 defaults are not capabilities.
     if !AnnouncementExecutor::supports(&decision.action) {
         return reject(Failure::code(ErrorCode::ActionNotAllowed), action);
@@ -413,6 +484,55 @@ async fn receive(state: &ReceiverState, request: Request, id: &str) -> Response 
             reject(Failure::reconciliation(), action)
         }
     }
+}
+
+/// Keyless `event.read`: resolve the caller's `event_key` in the staging guild
+/// through the Postgres mirror map, then run the single Discord GET. An
+/// unmapped key, a disabled flag (refused earlier in `authorize`), a replayed
+/// nonce and a forged signature all refuse before any Discord call — the only
+/// wire effect below is the mapped GET itself.
+async fn read_event(
+    state: &ReceiverState,
+    decision: &AuthDecision,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let event_key = match validate_event_key(&decision.body) {
+        Ok(key) => key.to_owned(),
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let event_id = match state.store.event_id_for_key(guild_id, &event_key).await {
+        Ok(Some(event_id)) => event_id,
+        // The key map is the whole address space: no mapping, no Discord read.
+        Ok(None) => return reject(Failure::from_action(unmapped_event_key(&event_key))),
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let observed_at = format_iso_millis(now_ms() as i64);
+    match state
+        .event_read
+        .execute_read(guild_id, &event_id, &observed_at)
+        .await
+    {
+        Ok(result) => event_read_response(result, id),
+        Err(error) => reject(Failure::from_action(error.action_error())),
+    }
+}
+
+/// The 7-field read result (`outcome`, `event_id`, `name`, `starts_at`,
+/// `location`, `status`, `observed_at`) is the response, not a stored
+/// idempotency receipt: reads take no claim, so there is nothing to replay.
+fn event_read_response(result: Value, id: &str) -> Response {
+    let mut wire = (
+        StatusCode::OK,
+        Json(json!({"ok": true, "result": result, "request_id": id})),
+    )
+        .into_response();
+    wire.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    wire
 }
 
 struct WireHeaders<'a> {

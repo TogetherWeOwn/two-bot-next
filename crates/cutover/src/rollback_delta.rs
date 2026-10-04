@@ -109,6 +109,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // DB instant that advanced the mark, so its maximum is the row's last write.
     TableSpec { table: "internal_clock_high_water", measure: TableMeasure::Columns(&["observed_at"]) },
     TableSpec { table: "internal_discord_events", measure: TableMeasure::Columns(&["claimed_at"]) },
+    // Re-mapped keys rewrite updated_at without touching created_at, so the
+    // maximum across both is the row's last write (same shape as tickets).
+    TableSpec { table: "internal_event_keys", measure: TableMeasure::Columns(&["created_at", "updated_at"]) },
     TableSpec { table: "internal_idempotency", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "internal_nonces", measure: TableMeasure::Columns(&["burned_at"]) },
     // Retirements rewrite disabled_at without touching created_at, so the

@@ -108,6 +108,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "internal_idempotency",
     "internal_action_log",
     "internal_discord_events",
+    "internal_event_keys",
     "moderation_channel_executions",
     "moderation_member_bans",
     "invite_campaigns",
