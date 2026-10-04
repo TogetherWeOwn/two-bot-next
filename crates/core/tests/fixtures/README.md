@@ -46,7 +46,15 @@ raw result cells without text casts. Unsupported native composite cells refuse
 at restore rather than silently becoming SQL NULL. Legacy JSON `null` cannot
 distinguish JSON null from SQL NULL; the legacy contract maps it to SQL NULL.
 
-`backup_schema_seed.sql` is the separate migration-backed v4 fixture for
+`pre-reservation-v4.ndjson` is a synthetic text-encoded compatibility archive
+with the exact 80-table inventory from the pre-0413 Rust writer, plus one voice
+room row. Empty entries have no columns. It is not a production dump or an
+execution of that historical binary: it pins the previous format/inventory
+independently of the current `DUMP_TABLES`. Unit inspection and a migrated-schema
+restore test prove that v4 recovery points still work, while v5 requires the new
+reservation table and unrelated missing v4 tables still refuse.
+
+`backup_schema_seed.sql` is the separate migration-backed complete-schema fixture for
 `backup_schema_roundtrip.rs`. It seeds every active covered table, including
 FK chains, durable dedupe/lease state, settings revision/audit history, gapped
 serial IDs and difficult text/null/JSON/timestamp values. Those tests create

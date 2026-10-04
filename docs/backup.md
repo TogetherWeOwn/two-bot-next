@@ -17,7 +17,8 @@ require `--force`. This confirmation is not authorization to target production.
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v4**; the reader also accepts frozen **v3**. Other versions refuse.
+write **v5** (including durable voice-create reservations); the reader also
+accepts frozen **v3** and pre-reservation **v4**. Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
 source's applied migrations and `sequenceMarks`: for every serial, identity and
@@ -61,8 +62,11 @@ boot directives, the member-erasure audit and the internal clock high-water
 mark, plus **3 optional retired legacy tables**. A dump from a fresh Rust
 schema has 65 table entries; a compatible legacy-extended schema may have up to
 68. A missing current table refuses a dump/restore: migrate the target first.
-A v4 archive written before a table joined the inventory is refused at inspect
-("manifest is missing tables"); take a fresh dump after upgrading.
+V4 requires its frozen 80-table inventory, so recovery points written before
+migration 0413 remain inspectable and restorable. V5 requires the full current
+inventory, including `voice_create_reservations`; an incomplete new archive
+refuses at inspection. Restoring a pre-reservation archive clears the destination's
+reservation table, as with other tables absent from an older version.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.

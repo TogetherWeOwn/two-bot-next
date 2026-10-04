@@ -95,6 +95,7 @@ impl TestDb {
             include_str!("../migrations/0224_voice_rooms.sql"),
             include_str!("../migrations/0330_guild_settings.sql"),
             include_str!("../migrations/0412_voice_rooms_ownership_touched.sql"),
+            include_str!("../migrations/0413_voice_create_reservations.sql"),
         ] {
             sqlx::raw_sql(migration).execute(&pool).await?;
         }
@@ -131,7 +132,11 @@ impl TestDb {
              ('g', 'ROLLBACK_DELTA_PROBE', '\"probe\"', 1, 'test');
              INSERT INTO voice_rooms (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at, owner_touched_at) VALUES
              ('g', 'room-before', 'creator-1', 'owner-1', 'owner-1', '7', '2026-09-29T12:00:00Z', '2026-09-29T12:00:00Z'),
-             ('g', 'room-handoff', 'creator-1', 'owner-2', 'owner-1', '8', '2026-09-29T12:00:00Z', '2026-10-01T12:00:00Z');",
+             ('g', 'room-handoff', 'creator-1', 'owner-2', 'owner-1', '8', '2026-09-29T12:00:00Z', '2026-10-01T12:00:00Z');
+             INSERT INTO voice_create_reservations (id, guild_id, user_id, created_at, channel_id, settled_at) VALUES
+             ('claim-before', '100', '300', '2026-09-29T12:00:00Z', NULL, '2026-09-29T12:00:00Z'),
+             ('claim-bound', '100', '301', '2026-09-29T12:00:00Z', '500', '2026-10-01T12:00:00Z'),
+             ('claim-rollback', '100', '302', '2026-09-29T12:00:00Z', NULL, '2026-10-01T12:00:00Z');",
         )
         .execute(pool)
         .await?;
@@ -199,6 +204,12 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
         assert_eq!(
             count_of(&summary, "voice_rooms"),
             Some(("measured".to_owned(), Some(1)))
+        );
+        // Both pre-baseline claims settled after T_f count, whether bound to
+        // a room or rolled back. Creation-only recency would miss both.
+        assert_eq!(
+            count_of(&summary, "voice_create_reservations"),
+            Some(("measured".to_owned(), Some(2)))
         );
         // Unmeasurable tables carry a reason, never a silent skip.
         for table in [
@@ -274,15 +285,26 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
         tx.rollback().await?;
 
         // Export emits one NDJSON line per post-T_f row:
-        // 1 + 1 + 2 + 1 + 1 + 1 (voice_rooms handoff).
+        // 1 + 1 + 2 + 1 + 1 + 1 (room handoff) + 2 (claim settlements).
         let mut lines = Vec::new();
         let exported = export_delta(&db.pool, SINCE, &mut |line: String| {
             lines.push(line);
             Ok::<(), std::io::Error>(())
         })
         .await?;
-        assert_eq!(exported, 7);
-        assert_eq!(lines.len(), 7);
+        assert_eq!(exported, 9);
+        assert_eq!(lines.len(), 9);
+        let settlements: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|value: &serde_json::Value| value["table"] == "voice_create_reservations")
+            .collect();
+        let mut ids: Vec<&str> = settlements
+            .iter()
+            .map(|value| value["row"]["id"].as_str().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["claim-bound", "claim-rollback"]);
         for line in &lines {
             let value: serde_json::Value = serde_json::from_str(line)?;
             assert!(value.get("table").and_then(|t| t.as_str()).is_some());

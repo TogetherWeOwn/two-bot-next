@@ -1,4 +1,4 @@
-//! The v4 backup envelope (also reads v3): manifest / rows / end marker, gzipped NDJSON.
+//! The v5 backup envelope (also reads v3/v4): manifest / rows / end marker, gzipped NDJSON.
 //!
 //! Port of the file half of legacy `src/store/dump.ts`. The writer side lives
 //! in [`super::dump`]; everything here touches no database, so every refusal
@@ -113,7 +113,6 @@ pub const DUMP_TABLES: &[&str] = &[
     "invite_campaigns",
     "voice_creators",
     "voice_rooms",
-    "voice_create_reservations",
     "voice_text_companions",
     "voice_access_controls",
     "voice_logging_settings",
@@ -129,7 +128,13 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_guild_settings",
     "voice_command_roles",
     "voice_command_role_members",
+    // V5 adds accepted-create history after the frozen 80-table v4 inventory.
+    "voice_create_reservations",
 ];
+
+/// Frozen coverage emitted before create-reservation persistence. Pin this
+/// prefix rather than accepting arbitrary missing tables from older archives.
+pub const V4_TABLE_COUNT: usize = 80;
 
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
@@ -179,8 +184,8 @@ pub fn is_destination_owned(table: &str, column: &str) -> bool {
         .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
 }
 
-/// Write the complete-schema envelope; the reader also accepts frozen v3.
-pub const DUMP_VERSION: u32 = 4;
+/// Write complete v5 coverage; the reader also accepts frozen v3/v4 coverage.
+pub const DUMP_VERSION: u32 = 5;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
 pub type DumpTable = String;
@@ -698,9 +703,9 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     .get("version")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| refuse("manifest has an invalid version"))?;
-                if version != 3 && version != u64::from(DUMP_VERSION) {
+                if version != 3 && version != 4 && version != u64::from(DUMP_VERSION) {
                     return Err(refuse(format!(
-                        "dump version {version}, this build reads 3 and {DUMP_VERSION}"
+                        "dump version {version}, this build reads 3, 4 and {DUMP_VERSION}"
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
@@ -902,12 +907,12 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
-    // The first 22 entries are frozen v3 coverage, pinned by the checked-in
-    // legacy fixture. V3 may omit later additions; v4 must declare them all.
-    let required = if obj.get("version").and_then(Value::as_u64) == Some(3) {
-        22
-    } else {
-        DUMP_TABLES.len()
+    // Historical inventories are fixed prefixes, pinned by fixtures. New v5
+    // archives must cover reservations too; v4 recovery points remain readable.
+    let required = match obj.get("version").and_then(Value::as_u64) {
+        Some(3) => 22,
+        Some(4) => V4_TABLE_COUNT,
+        _ => DUMP_TABLES.len(),
     };
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
@@ -1645,7 +1650,44 @@ mod tests {
     }
 
     #[test]
-    fn v3_requires_its_original_tables_but_v4_requires_complete_coverage() {
+    fn inspects_pre_reservation_v4_but_new_archives_require_reservations() {
+        let mut enc = new_encoder();
+        enc.write_all(include_bytes!(
+            "../../tests/fixtures/pre-reservation-v4.ndjson"
+        ))
+        .unwrap();
+        let contents = inspect_bytes(&finish_gzip(enc).unwrap()).unwrap();
+        assert_eq!(contents.manifest.version, 4);
+        assert_eq!(contents.rows, 1);
+        let names: Vec<&str> = contents
+            .manifest
+            .tables
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(names, &DUMP_TABLES[..V4_TABLE_COUNT]);
+        assert_eq!(
+            contents.manifest.missing_tables(),
+            ["voice_create_reservations"]
+        );
+        assert_eq!(contents.buffers["voice_rooms"][0]["channel_id"], "500");
+        let mut manifest = serde_json::to_value(&contents.manifest).unwrap();
+        manifest["version"] = serde_json::json!(DUMP_VERSION);
+        assert!(validate_manifest(&manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("voice_create_reservations"));
+        // V4 has a fixed complete inventory, not a blanket missing-table waiver.
+        manifest["version"] = serde_json::json!(4);
+        manifest["tables"].as_array_mut().unwrap().remove(0);
+        assert!(validate_manifest(&manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("missing tables: events"));
+    }
+
+    #[test]
+    fn v3_requires_its_original_tables_but_v4_requires_its_frozen_coverage() {
         let legacy: Value = serde_json::from_str(
             include_str!("../../tests/fixtures/legacy-v3-native.ndjson")
                 .lines()
