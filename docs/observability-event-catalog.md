@@ -31,6 +31,7 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `invite counter read unavailable; retaining snapshot` | `crates/bot/src/gateway.rs:899` | REST invite read failed; persisted baseline kept instead of an empty listing |
 | `interaction acknowledgement blocked; checkpoint unchanged` | `crates/bot/src/gateway.rs:286` | Ordered RSVP acknowledgement hit send-admission Blocked; cursor holds instead of passing a never-acknowledged command |
 | `interaction response failed; not replaying command` | `crates/bot/src/gateway.rs:290`, `:294`, `:300` | Ordered RSVP preparation or completion failed without admission blockage; command advances without replaying uncertain effects |
+| `READY identity differs from boot token; ordered identity not armed` | `crates/bot/src/gateway.rs:682` | READY application id differs from the boot/REST pin; ordered identity stays disarmed and its fence keeps refusing |
 | `gateway prerequisites missing; gateway parked, /readyz reports down` | `crates/bot/src/main.rs:564` | Token, database URL or guild ID missing; shard never starts |
 | `feature gates invalid; ordered interaction surface parked` | `crates/bot/src/main.rs:639` | Feature-gate parsing failed; gateway still boots, only the ordered interaction surface stays off |
 | `moderation gates invalid; ordered interaction surface parked` | `crates/bot/src/main.rs:646` | Moderation-gate parsing failed; gateway still boots, only the ordered interaction surface stays off |
