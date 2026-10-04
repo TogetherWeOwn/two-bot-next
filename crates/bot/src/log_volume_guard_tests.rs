@@ -397,6 +397,7 @@ fn job_caps_cover_every_job_label_and_presence_sheds_first() {
                         | "counter"
                         | "rank"
                         | "scheduled_events"
+                        | "settings"
                         | "other"
                 ),
                 "{} never sheds; shed it only through its feature flag, not the log guard",
