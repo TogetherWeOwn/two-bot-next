@@ -98,13 +98,16 @@ No deployed reader, scrape job or target name is created by this spec.
 For a manual watch, use the same metric contract and adjacent observations
 in §4; fetching only two window-edge files cannot prove consecutive coverage.
 
-**Required evaluation alignment:** evaluate each template as an instant query
-at a completed scrape's **stored timestamp**, after all four current samples
-are present at that same timestamp. Do not use the dashboard's wall-clock
-"now" or assume a 60-second evaluation step shares the scrape phase. A reader
-that cannot select or verify this timestamp has **unknown/unsupported query
-coverage**; use the complete manual adjacent-observation path in §4 instead.
-Do not change a scrape job or dashboard to satisfy this offline proposal.
+**Required alignment for the two inactivity screens:** evaluate the five-minute
+and two-minute screens below as instant queries at a completed scrape's
+**stored timestamp**, after all four current samples are present at that same
+timestamp. Do not use the dashboard's wall-clock "now" for these screens or
+assume a 60-second evaluation step shares the scrape phase. A reader that cannot
+select or verify this timestamp has **unknown/unsupported screen coverage**;
+use the complete manual adjacent-observation path in §4 instead. The separate
+scrape-age query below must use current evaluation time, not this stored-time
+alignment. Do not change a scrape job or dashboard to satisfy this offline
+proposal.
 
 Prometheus ranges are left-open/right-closed. At that aligned evaluation time,
 the one-second padding below includes the baseline at the exact 120/300-second
@@ -168,10 +171,19 @@ available under the reader's lookback/staleness rules:
 time() - timestamp(two_bot_gateway_events_total{event="HEARTBEAT_ACK"})
 ```
 
+**Evaluate scrape age at current time:** use an instant query with the reader's
+current evaluation timestamp ("now"), independently of the two inactivity
+screens' historical scrape-aligned evaluation. Prometheus `time()` returns
+**evaluation time**, not the physical wall clock. If the latest stored sample
+is at `t=0` and the current evaluation is at `t=240`, the age is 240 seconds
+while that sample remains selectable. Evaluating the same expression at `t=0`
+returns zero; that historical result cannot measure current scrape age.
+
 A freshly scraped but unchanged ACK counter has scrape age near zero, even
 if the last ACK was ten minutes ago. An absent/stale instant series returns
 no value, not a large age. Show that as unknown/missing, never coalesce it to
-zero or healthy. This query supplies neither last-ACK age nor last-tick age.
+zero or healthy. This query supplies neither last-ACK age nor last-tick age,
+and does not establish the inactivity screens' coverage or eligibility.
 
 Correlate container stdout for the watched process (Worker tail is not Rust
 stdout): `gateway ready; checkpoint committed`, session recovery, and
@@ -190,8 +202,9 @@ revision), record an initial observation alongside the
 - latency value (NaN means no current RTT measurement, not no HELLO/ACK);
 - gateway readiness and positive session evidence, or explicitly unknown;
 - observation cadence and DO keepalive cadence **separately**;
-- if a query screen is used, its evaluation timestamp and the matching four
-  stored sample timestamps, or query coverage unknown with the manual path used;
+- if an inactivity screen is used, its aligned evaluation timestamp and the
+  matching four stored sample timestamps, or screen coverage unknown with the
+  manual path used; record scrape age separately at current evaluation time;
 - metric/log evidence pointers; tick liveness unknown unless positively shown.
 
 Preserve T0 for audit context only. Each later observation compares against
@@ -242,10 +255,12 @@ fixtures for all three literal query blocks, plus offline cases for the manual
 eligibility/baseline gates. Alignment cases cover both thresholds at offsets
 0, 1, 2, 30 and 59 seconds across consecutive cycles: aligned complete quiet
 windows screen positive; tested off-phase windows return empty and require
-manual adjudication, not a healthy classification. They use no live scrape,
-Prometheus server, database, staging or production system. Syntax/fixture
-evaluation is not evidence that a live reader, target, cadence, eligibility
-integration or tick signal exists.
+manual adjudication, not a healthy classification. Separate scrape-age fixtures
+contrast the same stored `t=0` sample evaluated at `t=0` (age zero) and current
+`t=240` (age 240), and require no result for missing, stale or expired instant
+samples. They use no live scrape, Prometheus server, database, staging or
+production system. Syntax/fixture evaluation is not evidence that a live reader,
+target, cadence, eligibility integration or tick signal exists.
 See the PR verification section for the exact validator version and results.
 
 - Metric semantics: `crates/bot/src/gateway_metrics.rs`,
@@ -261,5 +276,6 @@ See the PR verification section for the exact validator version and results.
 - Prometheus [increase](https://prometheus.io/docs/prometheus/latest/querying/functions/#increase),
   [resets](https://prometheus.io/docs/prometheus/latest/querying/functions/#resets),
   [sample counts](https://prometheus.io/docs/prometheus/latest/querying/functions/#aggregation_over_time)
-  and [timestamp](https://prometheus.io/docs/prometheus/latest/querying/functions/#timestamp).
+  [timestamp](https://prometheus.io/docs/prometheus/latest/querying/functions/#timestamp)
+  and [evaluation time](https://prometheus.io/docs/prometheus/latest/querying/functions/#time).
 - Prometheus [offline expression tests](https://prometheus.io/docs/prometheus/latest/configuration/unit_testing_rules/).
