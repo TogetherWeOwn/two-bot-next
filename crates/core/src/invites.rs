@@ -219,6 +219,55 @@ pub fn count_downtime_unknown_joins(
 }
 
 // --- live tracker ------------------------------------------------------------
+//
+// Snapshot freshness (TOG-11716): counters only move on joins, creates and
+// deletes, so a recent baseline diffs honestly — but after a long quiet
+// stretch (bot down, missed `InviteDelete`, deleted-and-recreated codes)
+// the next diff cannot tell genuine growth from drift. A baseline older
+// than `INVITE_SNAPSHOT_STALENESS_BOUND_MS` is therefore re-seeded, not
+// diffed: the read stores the fresh counters, credits NOTHING, and the
+// join in that window files `vanity`/`unknown`. The NEXT join measures
+// against the fresh baseline.
+//
+// Freshness lives in the tracker, not the store: the `InviteSnapshotStore`
+// seam stays timeless so the S6 sqlx implementation and the transactional
+// commit path (`gateway_session`) need no changes.
+
+/// Maximum age of a successful full invite snapshot before its counters stop
+/// being trusted for attribution.
+///
+/// One hour: presence probes on the same cadence, well under the 2h voice
+/// blind-window bound, and long enough that an active guild (snapshotted on
+/// every join) never trips it — only genuinely quiet/stale baselines do.
+pub const INVITE_SNAPSHOT_STALENESS_BOUND_MS: i64 = 3_600_000;
+
+/// True when the baseline observed at `last_observed_ms` is too old to trust
+/// for attribution at `now_ms`.
+///
+/// * No baseline (`None`) is NOT stale: the window diff already treats every
+///   code as new (no credit) except codes witnessed at creation via
+///   [`InviteTracker::seed`], which is exactly the seeding path.
+/// * A backwards clock (negative age) is a glitch, not evidence of drift.
+/// * An overflowing subtraction is unmeasurable — call it stale.
+#[must_use]
+pub fn is_snapshot_stale(last_observed_ms: Option<i64>, now_ms: i64) -> bool {
+    match last_observed_ms {
+        None => false,
+        Some(last) => match now_ms.checked_sub(last) {
+            Some(age) => age > INVITE_SNAPSHOT_STALENESS_BOUND_MS,
+            None => true,
+        },
+    }
+}
+
+/// Wall clock in epoch millis (mirrors `funnel::now_millis` without pulling
+/// that module in; this file stays dependency-free).
+fn wall_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
 
 /// Snapshot persistence seam. S6 implements this with sqlx over
 /// `invite_snapshots`; the tracker logic above it is storage-free.
@@ -229,24 +278,55 @@ pub trait InviteSnapshotStore {
 }
 
 /// Live invite tracker: snapshot diffing + attribution strings.
+///
+/// Owns the per-guild freshness clock behind
+/// [`INVITE_SNAPSHOT_STALENESS_BOUND_MS`]. Only successful FULL reads refresh
+/// it: single-code [`InviteTracker::seed`] upserts say nothing about the
+/// other codes' counters, and failed reads never reach the tracker.
 pub struct InviteTracker<S> {
     store: S,
+    last_observed_ms: std::sync::Mutex<HashMap<Snowflake, i64>>,
 }
 
 impl<S: InviteSnapshotStore> InviteTracker<S> {
     pub fn new(store: S) -> Self {
-        Self { store }
-    }
-
-    /// Seed a created invite without discarding unrelated live codes.
-    pub fn seed(&self, guild_id: Snowflake, state: InviteState) {
-        self.store.store_all(guild_id, &[state]);
+        Self {
+            store,
+            last_observed_ms: std::sync::Mutex::default(),
+        }
     }
 
     /// Replace the stored snapshot; return the codes that grew. New codes are
     /// stored but never count as growth live (only the window path,
     /// [`invite_growth`], credits those).
+    ///
+    /// Wall-clock shorthand for [`InviteTracker::diff_and_store_at`].
     pub fn diff_and_store(&self, guild_id: Snowflake, current: &[InviteState]) -> Vec<String> {
+        self.diff_and_store_at(guild_id, current, None)
+    }
+
+    /// Replace the stored snapshot as observed at `now_ms` (epoch millis;
+    /// `None` falls back to the wall clock); return the codes that grew.
+    ///
+    /// When the guild's last successful full read is older than
+    /// [`INVITE_SNAPSHOT_STALENESS_BOUND_MS`], the baseline is untrusted:
+    /// the fresh counters are STORED (re-seed) but nothing is credited, so
+    /// this window's join files `vanity`/`unknown` and the next join diffs
+    /// against the fresh baseline.
+    pub fn diff_and_store_at(
+        &self,
+        guild_id: Snowflake,
+        current: &[InviteState],
+        now_ms: Option<i64>,
+    ) -> Vec<String> {
+        let now = now_ms.unwrap_or_else(wall_millis);
+        let last = self
+            .last_observed_ms
+            .lock()
+            .expect("freshness lock")
+            .get(&guild_id)
+            .copied();
+        let stale = is_snapshot_stale(last, now);
         let prev: HashMap<String, u64> = self
             .store
             .load(guild_id)
@@ -254,17 +334,30 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
             .map(|s| (s.code, s.uses))
             .collect();
         let mut grew = Vec::new();
-        for inv in current {
-            if let Some(before) = prev.get(&inv.code) {
-                if inv.uses > *before {
-                    grew.push(inv.code.clone());
+        if !stale {
+            for inv in current {
+                if let Some(before) = prev.get(&inv.code) {
+                    if inv.uses > *before {
+                        grew.push(inv.code.clone());
+                    }
                 }
             }
         }
         self.store.store_all(guild_id, current);
         let live: HashSet<String> = current.iter().map(|s| s.code.clone()).collect();
         self.store.delete_missing(guild_id, &live);
+        // The re-seed IS the new baseline — including on the stale path.
+        self.last_observed_ms
+            .lock()
+            .expect("freshness lock")
+            .insert(guild_id, now);
         grew
+    }
+
+    /// Seed a newly created code without treating it as a complete guild
+    /// listing. Pruning belongs only to a successful full snapshot.
+    pub fn seed(&self, guild_id: Snowflake, state: InviteState) {
+        self.store.store_all(guild_id, &[state]);
     }
 
     /// Attribution string for a join, given the codes that grew.
@@ -437,6 +530,77 @@ mod tests {
             AttributionCategory::Ambiguous
         );
         assert_eq!(attribution_category("vanity"), AttributionCategory::Other);
+    }
+
+    #[test]
+    fn staleness_bound_is_one_hour() {
+        assert_eq!(INVITE_SNAPSHOT_STALENESS_BOUND_MS, 3_600_000);
+    }
+
+    #[test]
+    fn stale_predicate_rules() {
+        // No baseline yet: the window diff already treats every code as new
+        // (no live credit), so there is nothing stale to distrust.
+        assert!(!is_snapshot_stale(None, 1_000_000));
+        // Fresh: within the bound.
+        assert!(!is_snapshot_stale(Some(1_000_000), 1_000_000));
+        assert!(!is_snapshot_stale(
+            Some(1_000_000),
+            1_000_000 + INVITE_SNAPSHOT_STALENESS_BOUND_MS
+        ));
+        // Beyond the bound: re-seed, do not diff.
+        assert!(is_snapshot_stale(
+            Some(1_000_000),
+            1_000_000 + INVITE_SNAPSHOT_STALENESS_BOUND_MS + 1
+        ));
+        // Backwards clock: a glitch, not evidence of drift.
+        assert!(!is_snapshot_stale(Some(2_000_000), 1_000_000));
+    }
+
+    #[test]
+    fn stale_snapshot_reseeds_without_credit_and_next_join_attributes() {
+        let t = InviteTracker::new(MemSnapshots::new());
+        let t0 = 1_700_000_000_000_i64;
+        // Baseline at t0.
+        assert!(t
+            .diff_and_store_at(1, &[state("a", 5)], Some(t0))
+            .is_empty());
+        // Fresh read shortly after: growth credits normally.
+        let grew = t.diff_and_store_at(1, &[state("a", 6)], Some(t0 + 60_000));
+        assert_eq!(grew, vec!["a".to_owned()]);
+        // Stale read past the bound: counters stored, nothing credited —
+        // this window files vanity/unknown, never drift.
+        let grew = t.diff_and_store_at(
+            1,
+            &[state("a", 9)],
+            Some(t0 + 60_000 + INVITE_SNAPSHOT_STALENESS_BOUND_MS + 1),
+        );
+        assert!(grew.is_empty());
+        assert_eq!(t.attribute(&grew, false), "unknown");
+        // Next fresh read measures against the re-seeded baseline (9 → 10).
+        let grew = t.diff_and_store_at(
+            1,
+            &[state("a", 10)],
+            Some(t0 + 120_000 + INVITE_SNAPSHOT_STALENESS_BOUND_MS + 1),
+        );
+        assert_eq!(grew, vec!["a".to_owned()]);
+    }
+
+    #[test]
+    fn seed_baseline_attributes_next_join_without_refreshing_clock() {
+        let t = InviteTracker::new(MemSnapshots::new());
+        // InviteCreate witness: code seeded at its live uses (0).
+        t.seed(1, state("fresh", 0));
+        // The next full read shows uses=1: growth of 1, not of the whole
+        // counter — even far in the future, because a witnessed
+        // creation-time baseline is trusted (nothing stale to distrust).
+        let grew = t.diff_and_store_at(
+            1,
+            &[state("fresh", 1)],
+            Some(1_700_000_000_000 + 10 * INVITE_SNAPSHOT_STALENESS_BOUND_MS),
+        );
+        assert_eq!(grew, vec!["fresh".to_owned()]);
+        assert_eq!(t.attribute(&grew, false), "invite:fresh");
     }
 
     #[test]

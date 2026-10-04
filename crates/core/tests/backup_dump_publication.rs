@@ -49,6 +49,7 @@ os.execv(sys.argv[1], [sys.argv[1], 'backup'])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("TWO_DATABASE_URL", url)
+        .env("TWO_DATABASE_TLS", "local-only")
         .env("TWO_BACKUP_DIR", dir)
         .env("TWO_BACKUP_KEEP", "2")
         // A local marker, not a bucket/network command. The CLI appends the
@@ -124,7 +125,7 @@ async fn cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dum
         "actual-cli-dump-publication-{}",
         std::process::id()
     ));
-    std::fs::create_dir(&dir).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
     let backups = dir.join("backups");
     std::fs::create_dir(&backups).unwrap();
     let marker = dir.join("upload-invoked");
@@ -149,7 +150,7 @@ async fn cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dum
              code TEXT, entry_id TEXT, created_at TIMESTAMPTZ, execute_at TIMESTAMPTZ, \
              request_id TEXT, channel_id TEXT, idempotency_key TEXT, occurred_at TIMESTAMPTZ, \
              audit_entry_id TEXT, started_at TIMESTAMPTZ, event_id TEXT, joined_at TIMESTAMPTZ, \
-             name TEXT, ticket_id TEXT, user_id TEXT, message_id TEXT, panel_id TEXT, body TEXT)"
+             name TEXT, ticket_id TEXT, user_id TEXT, message_id TEXT, panel_id TEXT, generation BIGSERIAL, body TEXT)"
         )))
         .execute(&pool)
         .await
@@ -261,6 +262,62 @@ async fn cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dum
     for path in orphaned {
         assert!(path.exists(), "retention must ignore crash temporaries");
     }
+    // Empty events still refuse semantic acceptance, retaining every previous
+    // archive and never reaching upload, even though the envelope is valid v4.
+    let empty_backups = dir.join("empty-events");
+    std::fs::create_dir(&empty_backups).unwrap();
+    for name in ["first", "second", "third"] {
+        std::fs::write(
+            empty_backups.join(format!("two-funnel-{name}.ndjson.gz")),
+            &saved,
+        )
+        .unwrap();
+    }
+    let empty_baseline = candidates(&empty_backups);
+    let empty_marker = dir.join("empty-upload-invoked");
+    sqlx::query("TRUNCATE events").execute(&pool).await.unwrap();
+    let empty = cli(&binary, &url, &empty_backups, &empty_marker, "none");
+    save_output(&dir, "empty-events", &empty);
+    assert_eq!(empty.status.code(), Some(1), "{empty:?}");
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("event log is empty"));
+    assert!(!empty_marker.exists(), "empty events cannot reach upload");
+    for path in empty_baseline {
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            saved,
+            "no retention on refusal"
+        );
+    }
+    assert_eq!(candidates(&empty_backups).len(), 4);
+    std::fs::remove_dir_all(empty_backups).unwrap();
+
+    // The actual CLI must warn about v3's absent newer tables even in a
+    // file-only dry run. No restore URL, credentials or database probe supplied.
+    let legacy = dir.join("legacy-v3.ndjson.gz");
+    let mut encoder = dump_file::new_encoder();
+    for line in include_str!("fixtures/legacy-v3-native.ndjson").lines() {
+        dump_file::write_line(&mut encoder, &serde_json::from_str(line).unwrap()).unwrap();
+    }
+    std::fs::write(&legacy, dump_file::finish_gzip(encoder).unwrap()).unwrap();
+    let dry_run = Command::new(&binary)
+        .arg("restore")
+        .arg(&legacy)
+        .arg("--dry-run")
+        .current_dir(&dir)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    save_output(&dir, "legacy-v3-dry-run", &dry_run);
+    assert!(dry_run.status.success(), "{dry_run:?}");
+    let stdout = String::from_utf8_lossy(&dry_run.stdout);
+    let stderr = String::from_utf8_lossy(&dry_run.stderr);
+    assert!(stdout.contains("DRY RUN VERIFIED"));
+    assert!(stdout.contains("Nothing was written"));
+    assert!(stderr.contains("WARNING: v3 dump lacks tables that will be cleared"));
+    assert!(stderr.contains("guild_settings_revision"));
+    assert!(stderr.contains("singleton resets to zero"));
+    std::fs::remove_file(legacy).unwrap();
     pool.close().await;
     // Keep the bounded textual evidence above; remove only test backup files.
     std::fs::remove_dir_all(backups).unwrap();

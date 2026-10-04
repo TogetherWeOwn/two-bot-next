@@ -1,0 +1,315 @@
+name: deploy-production
+
+# Production deploy and rollback for the B4 cutover (TOG-9699). Dispatch only:
+# never runs on push, pull_request, schedule or another workflow's completion.
+# The guard job refuses a SHA that is not on main with green `check` and
+# `worker check` runs and a successful deploy-staging run. It also refuses
+# when the `production` Environment is missing or unprotected: a job that
+# names a missing Environment makes GitHub create it with no reviewers, which
+# would remove the human gate. Runbook: docs/production-deploy.md.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full 40-hex commit on main with green check and deploy-staging"
+        required: true
+        type: string
+      rollback:
+        description: "Worker version ID to roll back to; empty deploys the SHA"
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: sha guard
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'guard') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    permissions:
+      contents: read # compare API: ancestry of the SHA on main
+      actions: read # deploy-staging runs and the Environment's protection
+      checks: read # `check` and `worker check` runs on the SHA
+    outputs:
+      sha: ${{ steps.guard.outputs.sha }}
+      mode: ${{ steps.guard.outputs.mode }}
+      version: ${{ steps.guard.outputs.version }}
+    steps:
+      - name: Refuse unverified SHA or unprotected Environment
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Inputs travel through env, never into the script text.
+          SHA: ${{ inputs.sha }}
+          ROLLBACK: ${{ inputs.rollback }}
+        shell: python3 {0}
+        run: |
+          import json, os, re, subprocess, sys
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          sha = os.environ.get("SHA", "").strip().lower()
+          version = os.environ.get("ROLLBACK", "").strip().lower()
+          mode = "rollback" if version else "deploy"
+          # Only GitHub Actions may vouch for a check run: another app with
+          # checks:write could otherwise post a green run named `check`.
+          ACTIONS_APP_ID = "15368"
+          REQUIRED_CHECKS = ("check", "worker check")
+
+          def refuse(reason):
+              print(f"::error::Refusing production {mode}: {reason}")
+              sys.exit(1)
+
+          def api(path, what, **query):
+              args = ["gh", "api", "--method", "GET", path]
+              for key, value in query.items():
+                  args += ["-f", f"{key}={value}"]
+              try:
+                  return json.loads(subprocess.check_output(args, text=True))
+              except (subprocess.CalledProcessError, ValueError):
+                  refuse(f"could not read {what} from the GitHub API; failing closed")
+
+          if not re.fullmatch(r"[0-9a-f]{40}", sha):
+              refuse("sha must be a full 40-character hex commit SHA")
+          if version and not re.fullmatch(
+              r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", version
+          ):
+              refuse("rollback must be a Worker version ID (UUID)")
+          if os.environ.get("GITHUB_REF") != "refs/heads/main":
+              refuse("dispatch this workflow from main only")
+
+          # compare/{sha}...main is `ahead` or `identical` exactly when main
+          # contains the SHA, i.e. the SHA is an ancestor of origin/main.
+          compare = api(f"repos/{repo}/compare/{sha}...main", "the SHA's ancestry", per_page="1")
+          if compare.get("status") not in ("ahead", "identical"):
+              refuse(f"{sha} is not an ancestor of origin/main ({compare.get('status')})")
+
+          for name in REQUIRED_CHECKS:
+              runs = api(
+                  f"repos/{repo}/commits/{sha}/check-runs", f"the `{name}` check runs",
+                  check_name=name, app_id=ACTIONS_APP_ID, filter="latest", per_page="100",
+              ).get("check_runs", [])
+              if not runs or any(run.get("conclusion") != "success" for run in runs):
+                  refuse(f"`{name}` has no successful run on {sha}")
+
+          staged = api(
+              f"repos/{repo}/actions/workflows/deploy-staging.yml/runs", "deploy-staging runs",
+              head_sha=sha, branch="main", status="success", per_page="1",
+          )
+          if not staged.get("total_count"):
+              refuse(f"deploy-staging has no successful run on {sha}")
+
+          env = api(f"repos/{repo}/environments/production", "the production Environment")
+          reviewers = sum(
+              len(rule.get("reviewers") or [])
+              for rule in env.get("protection_rules") or []
+              if rule.get("type") == "required_reviewers"
+          )
+          if not reviewers:
+              refuse("the production Environment has no required reviewers")
+          policy = env.get("deployment_branch_policy") or {}
+          if not policy.get("custom_branch_policies"):
+              refuse("the production Environment must restrict deployments to main")
+          branches = api(
+              f"repos/{repo}/environments/production/deployment-branch-policies",
+              "the production deployment branch policies",
+          ).get("branch_policies", [])
+          if [(b.get("type", "branch"), b.get("name")) for b in branches] != [("branch", "main")]:
+              refuse("the production Environment must allow deployments from main only")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"sha={sha}\nmode={mode}\nversion={version}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(
+                  f"### Production {mode} guard passed\n\n"
+                  f"- SHA: `{sha}` (on main; `check`, `worker check` and deploy-staging green)\n"
+                  f"- Environment: `production`, {reviewers} required reviewer(s), main only\n"
+                  + (f"- Rollback target: `{version}`\n" if version else "")
+              )
+          print(f"guard passed: {mode} {sha}")
+
+  production:
+    name: wrangler ${{ needs.guard.outputs.mode }} + readyz gate
+    needs: guard
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'production') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 30
+    # The human gate: this job waits for the Environment's required
+    # reviewers. The guard job refused to get here without them.
+    environment: production
+    permissions:
+      contents: read
+    env:
+      SHA: ${{ needs.guard.outputs.sha }}
+      MODE: ${{ needs.guard.outputs.mode }}
+      TARGET_VERSION: ${{ needs.guard.outputs.version }}
+    defaults:
+      run:
+        working-directory: wrangler
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Deploy exactly the guarded SHA, not a newer main head.
+          ref: ${{ needs.guard.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recheck the SHA is on origin/main after approval
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SHA"
+          git merge-base --is-ancestor "$SHA" origin/main
+      - name: Require a production Worker URL distinct from staging
+        env:
+          PRODUCTION_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          STAGING_URL: ${{ vars.STAGING_WORKER_URL }}
+        run: |
+          set -euo pipefail
+          case "$PRODUCTION_URL" in
+            https://*) ;;
+            *) echo "::error::PRODUCTION_WORKER_URL must be set to the https:// production Worker URL (see docs/production-deploy.md)"; exit 1 ;;
+          esac
+          if [ "${PRODUCTION_URL%/}" = "${STAGING_URL%/}" ]; then
+            echo "::error::PRODUCTION_WORKER_URL equals STAGING_WORKER_URL; refusing to gate production on staging"
+            exit 1
+          fi
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          # Deploys must not consume caches populated by untrusted PR checks.
+          package-manager-cache: false
+      - run: npm ci
+      # The version serving before the change is the rollback target. The
+      # first production deploy has none, so this step may fail.
+      - name: Read the active production version
+        id: before
+        continue-on-error: true
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
+        with:
+          workingDirectory: wrangler
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          environment: production
+          quiet: true
+          command: deployments status --json
+      - name: Deploy to production
+        if: env.MODE == 'deploy'
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
+        with:
+          workingDirectory: wrangler
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          environment: production
+          # The guard proved this output is 40 hex; the message ties the
+          # Worker version to its commit in `wrangler versions list`.
+          command: deploy --message ${{ needs.guard.outputs.sha }}
+      - name: Roll back production
+        if: env.MODE == 'rollback'
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
+        with:
+          workingDirectory: wrangler
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          environment: production
+          # The guard proved the version is a UUID and the SHA is 40 hex.
+          command: rollback ${{ needs.guard.outputs.version }} --message ${{ needs.guard.outputs.sha }} --yes
+      - name: Read the new active production version
+        id: after
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
+        with:
+          workingDirectory: wrangler
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          environment: production
+          quiet: true
+          command: deployments status --json
+      # Recorded before the gate, so a failed gate still leaves the version
+      # IDs needed to roll back.
+      - name: Record the Worker version and SHA
+        env:
+          BEFORE: ${{ steps.before.outputs.command-output }}
+          AFTER: ${{ steps.after.outputs.command-output }}
+        shell: python3 {0}
+        run: |
+          import json, os, sys
+
+          def versions(raw):
+              # quiet `deployments status --json` prints one JSON object.
+              try:
+                  deployment = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
+                  return [(v["version_id"], v["percentage"]) for v in deployment["versions"]]
+              except (ValueError, KeyError, TypeError):
+                  return []
+
+          def show(found):
+              return ", ".join(f"`{vid}` ({pct}%)" for vid, pct in found) or "none"
+
+          sha, mode, target = os.environ["SHA"], os.environ["MODE"], os.environ["TARGET_VERSION"]
+          before = versions(os.environ.get("BEFORE", ""))
+          after = versions(os.environ.get("AFTER", ""))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(
+                  f"\n### Production {mode}\n\n"
+                  f"- SHA: `{sha}`\n"
+                  f"- Worker version ID now active: {show(after)}\n"
+                  f"- Previously active: {show(before)}\n"
+              )
+              if len(before) == 1:
+                  summary.write(f"- Roll back by dispatching with `rollback={before[0][0]}`\n")
+          if not after:
+              print("::error::could not read the active production version after the change")
+              sys.exit(1)
+          if mode == "rollback" and after != [(target, 100)]:
+              print(f"::error::rollback did not make {target} the only active version")
+              sys.exit(1)
+          if mode == "deploy" and after == before:
+              print("::error::the active production version did not change")
+              sys.exit(1)
+      # Same contract as staging (S1, TOG-9907): /health must be 200, which
+      # proves the Container/DO bindings are wired. /readyz must answer with
+      # its component breakdown: 200 once the gateway is ready, a truthful 503
+      # while it is parked (for example behind the B4 ownership fence).
+      # Anything else means the deploy is broken. Never fake readyz success.
+      - name: Gate on /health + truthful /readyz
+        env:
+          PRODUCTION_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+        run: |
+          set -euo pipefail
+          url="${PRODUCTION_URL%/}"
+          health="$RUNNER_TEMP/production-health.json"
+          readyz="$RUNNER_TEMP/production-readyz.json"
+          # Container cold start can take a minute; poll /health up to ~5 min.
+          for i in $(seq 1 30); do
+            code=$(curl -s --max-time 10 -o "$health" -w '%{http_code}' "$url/health" || true)
+            if [ "$code" = "200" ]; then
+              echo "health 200 after ~$((i * 10))s"
+              cat "$health"
+              break
+            fi
+            echo "attempt $i: /health -> $code; waiting 10s"
+            if [ "$i" = "30" ]; then
+              echo "health never returned 200 (bindings still broken?)"
+              cat "$health" || true
+              echo "- /health: never 200; roll back" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            sleep 10
+          done
+          code=$(curl -s --max-time 10 -o "$readyz" -w '%{http_code}' "$url/readyz" || true)
+          echo "readyz -> $code"
+          cat "$readyz" || true
+          case "$code" in
+            200) state="gateway ready" ;;
+            503) state="gateway parked; deploy is healthy" ;;
+            *)
+              echo "unexpected readyz status $code"
+              echo "- /health 200, /readyz $code (unexpected); roll back" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+          esac
+          echo "$state"
+          echo "- /health 200, /readyz $code ($state)" >> "$GITHUB_STEP_SUMMARY"

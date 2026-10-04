@@ -49,9 +49,11 @@ releases it. Scheduled events remain independent. Publication timestamps reuse
 core `now_iso`, the fixed `YYYY-MM-DDTHH:mm:ss.sssZ` website contract.
 
 The jobs park when `DISCORD_TOKEN`, `DATABASE_URL` or nonzero `GUILD_ID` is
-missing. They share a paced REST executor and a lazily initialized pool; the
-existing cutover migrations and `web_v1` contract are applied before the first
-publication. Initialization errors are retried on the next attempt, never
+missing. They share a paced, durably governed REST executor and lazily initialized
+pools using the gateway's `DATABASE_URL` authority. The operator must provision
+cutover migrations, `web_v1` and the reviewed role plan before runtime starts;
+jobs never execute migration/view DDL using the DML-only runtime credential.
+Admission refusal sends no HTTP. Initialization errors are retried on the next attempt, never
 logged with a database URL. Guild members are fully paginated; rank-role names
 come from the guild object's `roles` array. Domain/store semantics are unchanged:
 
@@ -118,8 +120,9 @@ the env gates below.
   re-list rule (`bot_floor_due`, 24 h), and the TOG-469 reopen trigger
   (`evaluate_trigger`: 45-peak threshold, 3 days in 14, 7-day minimum).
 - `core::community` — classifier (`classify`, legacy precedence), weekly
-  builder (`build_scorecard`), Monday 06:15 UTC schedule (`scorecard_tick`,
-  60 s tick, exactly-once per Monday), env gates (`ScorecardGates`).
+  builder (`build_scorecard`), Monday 06:15 UTC window (`scorecard_tick`), env
+  gates (`ScorecardGates`). The runtime uses the bounded retry planner below
+  rather than the older process-only once-per-Monday marker.
 - `core::inactivity` — hourly quiet-member selection (`flag_inactive`,
   `TWO_INACTIVITY_DAYS ?? 14`). Read-only by construction: the outcome type
   carries no channel/message/DM field, so it cannot feed a send path.
@@ -137,11 +140,29 @@ the env gates below.
   read writes nothing — not a null row, not a zero. Rescan the bot floor only
   when `bot_floor_due`; a failed listing keeps the presence row with a NULL
   floor. Drive the probe every `PRESENCE_PROBE_INTERVAL_MS` (1 h), unref'd,
-  with one reading at startup.
-- Drive the scorecard every `SCORECARD_TICK_INTERVAL_MS` (60 s); fire at most
-  once per Monday via `scorecard_tick`. Before scoring, persist full-week
-  stream coverage (`mark_stream_coverage` for all six streams); a mid-week
-  start fails closed (`INGESTION_INCOMPLETE`, human numerators null).
+  with one reading at startup. A per-process overlap lease
+  (`PRESENCE_PROBE_LEASE_MS`, 30 min) makes a concurrent trigger skip with
+  `presence_probe_overlap_skipped` before any REST call; a holder older than
+  the lease is presumed dead and taken over.
+- Drive the scorecard every `SCORECARD_TICK_INTERVAL_MS` (60 s). The pure
+  `bot::community_jobs::scorecard_retry::decide(state, now)` returns attempt,
+  wait or skip: at most three reservations, five minutes apart, only Monday
+  06:15–06:59 UTC. The adapter commits count/backoff before work and completes
+  the week only after success. A cancelled/crashed attempt still spends a slot.
+  `community_scorecard_attempts` (additive migration 0312) stores the per-guild,
+  per-Monday budget in the same Postgres database as the output ledger; the
+  former process-only marker could not satisfy a restart limit. A row lock
+  serializes competing reservations. The five-minute backoff exceeds the
+  supervisor's two-minute attempt timeout; the process lane also skips overlap.
+  On retry, any existing output for the closed week is terminal, even if its
+  watermark/classifier changed or the completion write was lost. A successfully
+  persisted incomplete scorecard is terminal, not a transient failure.
+  Before scoring, mark honest stream coverage from capture start through the
+  closed week end; a mid-week start fails closed (`INGESTION_INCOMPLETE`, human
+  numerators null). A Monday boot cannot claim closed-week coverage: leave
+  missing heartbeats missing rather than inserting an inverted interval.
+  Apply the reviewed database-role plan after migration 0312; the object matrix
+  includes the private scheduler table, with no website reader grant.
 - Drive the inactivity sweep every `INACTIVITY_SWEEP_INTERVAL_MS` (1 h) via
   `run_sweep`. Never DM, ping, or message from this outcome — any outbound
   contact needs CEO sign-off first.
@@ -157,10 +178,23 @@ the env gates below.
   or misconfigured job logs `job_disabled` (warn on `invalid_config`), produces
   no supervised job, and is marked parked in the `/readyz` status map alongside
   the website jobs and settings poll. The supervisor's status map therefore
-  always lists all seven job names.
+  always lists all eleven job names (the six website/community jobs plus the
+  audit-retry job, the scheduled-messages job, the self-role recovery job, the
+  gated `feeds` job and the DB-only settings poll, each parked when its service
+  is unregistered), even when announcements are off.
 
 ## Verification
 
+- The six legacy retry cases are ported in `community_jobs_tests.rs`: transient
+  coverage/scoring failures, exhaustion/new week, exact window boundaries,
+  in-flight exclusion and supervisor stop. Additional tests cover reloaded crash
+  reservations, database failures/restarts, concurrent claims, commit/completion
+  reconciliation with a changed classifier and honest Monday-boot coverage.
+  Run the smallest controller target through the bounded wrapper:
+  `python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot community_jobs::`.
+  Database cases require `TWO_TEST_DATABASE_URL` on agent-testdb/CI services;
+  absent configuration skips locally and fails in CI. Existing hosted CI's
+  unit/binary step runs them without changing the workflow.
 - Run `cargo test -p two-bot-core --features db --locked --lib <filter>`
   separately for `community::tests`, `presence::tests`, `inactivity::tests`,
   `funnel::tests`, `community_store`, `presence_store`, and `inactivity_store`,

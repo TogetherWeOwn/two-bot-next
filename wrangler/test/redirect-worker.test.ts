@@ -1,0 +1,176 @@
+/** Production fetch wiring, with local store and caller-budget fixtures only. */
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import worker, { type Env } from "../src/index.ts";
+import { RedirectStore } from "../src/redirect-store.ts";
+import { TokenBuckets, type RedirectClick } from "../src/redirect.ts";
+
+const env = { GUILD_ID: "synthetic-guild" } as Env;
+
+async function fetch(path: string, headers: Record<string, string> = {}) {
+  const writes: Promise<unknown>[] = [];
+  const ctx = { waitUntil: (promise: Promise<unknown>) => { writes.push(promise); } };
+  const response = await worker.fetch(new Request(`https://worker.invalid${path}`, { headers }),
+    env, ctx as ExecutionContext);
+  await Promise.all(writes);
+  return response;
+}
+
+test("Worker shares misses across request-scoped store instances", async (t) => {
+  const lookups: string[] = [];
+  t.mock.method(RedirectStore.prototype, "lookup", async (slug: string) => {
+    lookups.push(slug);
+    return null;
+  });
+  for (const path of ["/worker-missing", "/WORKER-MISSING/", "/%77orker-missing"]) {
+    assert.equal((await fetch(path, { "CF-Connecting-IP": "192.0.2.1" })).status, 404);
+  }
+  assert.deepEqual(lookups, ["worker-missing"]);
+});
+
+test("Worker drops misses when the mapping configuration changes", async (t) => {
+  // Count store lookups while keeping the real snapshot behavior: a mocked
+  // lookup would bypass the snapshot and could never produce a miss.
+  const realLookup = RedirectStore.prototype.lookup;
+  const lookups: string[] = [];
+  t.mock.method(RedirectStore.prototype, "lookup", async function (
+    this: RedirectStore, slug: string,
+  ) {
+    lookups.push(slug);
+    return realLookup.call(this, slug);
+  });
+  const empty = { ...env, REDIRECT_MAPPINGS_JSON: "[]" } as Env;
+  const writes: Promise<unknown>[] = [];
+  const ctx = { waitUntil: (p: Promise<unknown>) => { writes.push(p); } } as unknown as ExecutionContext;
+  const miss = (e: Env) => worker.fetch(new Request("https://worker.invalid/worker-rotated"), e, ctx);
+  assert.equal((await miss(empty)).status, 404);
+  assert.equal((await miss(empty)).status, 404);
+  assert.deepEqual(lookups, ["worker-rotated"], "same config shares one lookup");
+  const populated = {
+    ...env,
+    REDIRECT_MAPPINGS_JSON: JSON.stringify([{ slug: "worker-rotated", invite_code: "freshCode" }]),
+  } as Env;
+  const res = await miss(populated);
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.get("location"), "https://discord.gg/freshCode");
+  assert.equal(lookups.length, 2, "changed config must re-lookup, not serve a stale miss");
+  await Promise.all(writes);
+});
+
+test("spoofed X-Forwarded-For cannot change the edge IP bucket or stored click", async (t) => {
+  const callerKeys: string[] = [];
+  const clicks: RedirectClick[] = [];
+  const buckets = new TokenBuckets({ capacity: 2, refillPerSecond: 1 }, () => 0);
+  const take = TokenBuckets.prototype.take;
+  t.mock.method(TokenBuckets.prototype, "take", (key: string) => {
+    callerKeys.push(key);
+    return take.call(buckets, key);
+  });
+  t.mock.method(RedirectStore.prototype, "lookup", async (slug: string) => ({
+    slug, inviteCode: "freshCode",
+  }));
+  t.mock.method(RedirectStore.prototype, "recordClick", async (click: RedirectClick) => {
+    clicks.push(click);
+  });
+  const edge = "203.0.113.44";
+  const statuses: number[] = [];
+  for (const spoof of ["198.51.100.1", "198.51.100.2, 127.0.0.1", "198.51.100.3"]) {
+    statuses.push((await fetch("/worker-live", {
+      "CF-Connecting-IP": edge, "X-Forwarded-For": spoof,
+    })).status);
+  }
+  assert.deepEqual(statuses, [302, 302, 429]);
+  assert.deepEqual(callerKeys, [edge, edge, edge]);
+  assert.equal(clicks.length, 2);
+  for (const click of clicks) {
+    assert.deepEqual(Object.keys(click).sort(), [
+      "campaign", "code", "dedupeToken", "guildId", "occurredAt", "source",
+    ]);
+    assert.ok(!JSON.stringify(click).includes(edge), "visitor IP must never be stored");
+    assert.ok(!JSON.stringify(click).includes("198.51.100"));
+  }
+
+  statuses.length = 0;
+  for (const spoof of ["198.51.100.4", "198.51.100.5", "198.51.100.6"]) {
+    statuses.push((await fetch("/worker-live", { "X-Forwarded-For": spoof })).status);
+  }
+  assert.deepEqual(statuses, [302, 302, 429]);
+  assert.deepEqual(callerKeys.slice(3), ["unknown", "unknown", "unknown"],
+    "no edge header must not fall back to client-supplied forwarding headers");
+});
+
+test("Worker serves repeated misses across requests with one store lookup", async (t) => {
+  const lookups: string[] = [];
+  t.mock.method(RedirectStore.prototype, "lookup", async (slug: string) => {
+    lookups.push(slug);
+    return null;
+  });
+  t.mock.method(RedirectStore.prototype, "recordClick", async () => {});
+  // Within the short negative TTLs (handler 2s, store 2s) the second request
+  // for the same slug must not reach the store again — even though each
+  // request builds its own RedirectStore, the isolate-level caches hold.
+  for (const path of ["/store-missing", "/STORE-MISSING/"]) {
+    assert.equal((await fetch(path, { "CF-Connecting-IP": "192.0.2.9" })).status, 404);
+  }
+  assert.deepEqual(lookups, ["store-missing"]);
+});
+
+test("spoofed X-Forwarded-For cannot smuggle identity into the store path", async (t) => {
+  const lookups: string[] = [];
+  const clicks: RedirectClick[] = [];
+  t.mock.method(RedirectStore.prototype, "lookup", async (slug: string) => {
+    lookups.push(slug);
+    return { slug, inviteCode: "freshCode" };
+  });
+  t.mock.method(RedirectStore.prototype, "recordClick", async (click: RedirectClick) => {
+    clicks.push(click);
+  });
+  // Hostile header even carries a slug-looking token: the store must still
+  // see exactly the path slug, and the click must carry no header content.
+  // Caller identity comes only from CF-Connecting-IP (index.ts); no Node
+  // hop-walking over X-Forwarded-For exists on this path.
+  const res = await fetch("/store-clean", {
+    "CF-Connecting-IP": "203.0.113.77",
+    "X-Forwarded-For": "198.51.100.99, evil-slug, 10.0.0.1",
+  });
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.get("location"), "https://discord.gg/freshCode");
+  assert.deepEqual(lookups, ["store-clean"]);
+  assert.equal(clicks.length, 1);
+  for (const click of clicks) {
+    assert.ok(!JSON.stringify(click).includes("198.51.100.99"));
+    assert.ok(!JSON.stringify(click).includes("evil-slug"));
+  }
+});
+
+test("Worker forwards the bucket's real hold on a redirect 429", async (t) => {
+  let now = 0;
+  const buckets = new TokenBuckets({ capacity: 1, refillPerSecond: 1 }, () => now, {
+    maxConsecutiveDenials: 2, terminalCooldownMs: 60_000,
+  });
+  const take = TokenBuckets.prototype.take;
+  t.mock.method(TokenBuckets.prototype, "take", (key: string) => take.call(buckets, key));
+  let lookups = 0;
+  t.mock.method(RedirectStore.prototype, "lookup", async (slug: string) => {
+    lookups += 1;
+    return { slug, inviteCode: "freshCode" };
+  });
+  t.mock.method(RedirectStore.prototype, "recordClick", async () => {});
+  const edge = "203.0.113.45";
+  const caller = { "CF-Connecting-IP": edge };
+  assert.equal((await fetch("/worker-held", caller)).status, 302);
+  const refill = await fetch("/worker-held", caller);
+  assert.equal(refill.status, 429);
+  assert.equal(refill.headers.get("retry-after"), "1", "refill denial stays short");
+  const held = await fetch("/worker-held", caller);
+  assert.equal(held.status, 429);
+  assert.equal(held.headers.get("retry-after"), "60");
+  now += 20_000;
+  const later = await fetch("/worker-held", caller);
+  assert.equal(later.status, 429);
+  assert.equal(later.headers.get("retry-after"), "40");
+  assert.equal(lookups, 1, "held retries never reach the store");
+  // Only the wait leaves the handler, never the caller key.
+  for (const [, value] of later.headers) assert.ok(!value.includes(edge));
+  assert.ok(!(await later.text()).includes(edge));
+});

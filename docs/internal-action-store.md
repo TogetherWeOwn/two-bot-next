@@ -54,6 +54,17 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
   `Claimed(ExecutionClaim)`, `InFlight`, `NeedsReconciliation`, `Replay(response)`
   or `Mismatch`. All except `Claimed` prohibit execution. An `ExecutionClaim` has
   private fields and is only produced after intent and audit commit.
+- `release_proven_not_sent(ExecutionClaim)` requires owning-executor proof that
+  the mutation was never dispatched. It consumes the opaque, non-Clone claim on
+  every return path, atomically records a `released`/`proven_not_sent` audit and
+  transitions a fresh `in_flight` intent to `not_sent` (migration `0352`). Only
+  that explicit state permits same-key reclaim, under a row lock with exact
+  action/payload **and all original subject scalars** unchanged. Claim refreshes
+  its diagnostic timestamps before commit. The original intent/audits and nonce
+  burn remain; old ownership cannot be used after consuming release. Audit rows
+  are per intent/phase, not per execution attempt: `released` proves at least one
+  no-dispatch release, not an attempt count. Reconciliation refuses `not_sent`
+  even when aged. Unknown, completed or stale ordinary claims cannot be released.
 - `finish(&ExecutionClaim, &TerminalResponse)` commits completion and its audit.
 - `mark_unknown(&ExecutionClaim)` preserves the slot and deduplicates the unknown
   audit. It never releases the claim.
@@ -63,7 +74,11 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
   global event digest. Use a namespaced identity stable across redelivery; do not
   generate an ID per delivery. This is a dedup guard, not a retryable event queue.
 
-`AuditSubject` accepts optional `DiscordId` values for guild, actor and target.
+`AuditSubject` accepts optional `DiscordId` values for guild, actor, target and
+`resolved_role_id`. Role executors pin the allowlist-resolved role in the same
+committed intent/audit transaction before REST. Every later audit copies that
+original scalar, not a newly evaluated role map. Migration `0351` adds nullable
+columns; older intents remain NULL and must not be guessed from current config.
 `TerminalResponse` is `Success { resource_id: Option<DiscordId>, affected: u32 }`
 (HTTP 200) or `Failure(TerminalFailure)` with fixed codes/statuses:
 `Malformed`/400, `ActionNotAllowed`/403, `DiscordRejected`/422, `NoEffect`/502.

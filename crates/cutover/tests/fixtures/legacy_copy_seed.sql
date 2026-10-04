@@ -32,3 +32,5 @@ INSERT INTO operational_audit_log (entry_id,event_kind,guild_id,occurred_at,acto
  ('audit1','member_join','g1','2026-01-03T00:00:00Z',NULL,'m2',NULL,NULL,NULL,NULL,'{}','2026-01-03T00:00:01Z','channel1','delivered',1,'2026-01-03T00:00:02Z',NULL,NULL,'2026-01-03T00:00:03Z','nonce1','message1',NULL,'claim1','2026-01-03T00:00:04Z'),
  ('audit2','member_join','g1','2026-01-03T00:00:00Z',NULL,'m10',NULL,NULL,NULL,NULL,'{}','2026-01-03T00:00:01Z',NULL,'none',0,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
 INSERT INTO audit_kill_switch VALUES (1,'2026-01-03T00:00:00Z','fixture');
+INSERT INTO invite_campaigns VALUES ('fixture-link','fixtureCode','Fixture sidebar',NULL,'2026-01-03T00:00:00Z'),
+ ('retired-link','retiredCode','Retired placement','2026-01-04T00:00:00Z','2026-01-03T00:00:00Z');

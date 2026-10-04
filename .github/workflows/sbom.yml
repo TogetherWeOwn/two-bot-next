@@ -1,0 +1,217 @@
+name: sbom
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact source SHA or published release tag to inventory
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  image:
+    name: image scan and SBOM
+    permissions:
+      contents: read
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'image') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 40
+    env:
+      # Runners share a Docker daemon; never scan or remove a sibling's tag.
+      IMAGE: two-bot-next:scan-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Fixtures run from the trusted root checkout BEFORE the untrusted
+      # inputs.ref checkout below. CodeQL's cache-poisoning query flags any
+      # local-script step after an untrusted checkout in the same job, so no
+      # `python3 scripts/...` step may appear after the `source` checkout in
+      # this job; validation/evidence/preflight run in `verify`, which never
+      # checks out inputs.ref.
+      - name: Verify supply-chain fixtures
+        run: |
+          python3 scripts/test-supply-chain.py
+          python3 scripts/test-runtime-image-evidence.py
+          python3 scripts/test-vulnerability-preflight.py
+      # Keep the workflow's validation tools while inventorying a historical
+      # release tag that may predate those tools.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          path: source
+          persist-credentials: false
+      - name: Set up BuildKit
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build runtime image (no registry push)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: source/
+          file: source/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}
+      - name: Prepare Rust lockfile inventory and image provenance
+        run: |
+          mkdir -p sbom "$RUNNER_TEMP/rust-workspace"
+          cp source/Cargo.lock sbom/Cargo.lock
+          cp source/Cargo.lock "$RUNNER_TEMP/rust-workspace/Cargo.lock"
+          git -C source rev-parse HEAD > sbom/source-sha.txt
+          docker image inspect "$IMAGE" --format '{{.Id}}' > sbom/image-id.txt
+      - name: Rust workspace CycloneDX SBOM
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          version: v0.69.3
+          cache: false
+          cache-dir: ${{ runner.temp }}/trivy-cache
+          scan-type: fs
+          scan-ref: ${{ runner.temp }}/rust-workspace
+          scanners: vuln
+          format: cyclonedx
+          output: sbom/rust-workspace.cdx.json
+          exit-code: '0'
+      - name: Runtime image CycloneDX SBOM
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          version: v0.69.3
+          cache: false
+          cache-dir: ${{ runner.temp }}/trivy-cache
+          skip-setup-trivy: true
+          scan-type: image
+          image-ref: ${{ env.IMAGE }}
+          format: cyclonedx
+          output: sbom/container-image.cdx.json
+          exit-code: '0'
+      # A Rust executable is not necessarily recoverable by an image analyzer.
+      # Scan the lockfile as well; do not mistake an OS-only image BOM for a
+      # complete inventory of the bot's statically linked Rust dependencies.
+      - name: Gate Rust dependencies (HIGH/CRITICAL, including unfixed)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          version: v0.69.3
+          cache: false
+          cache-dir: ${{ runner.temp }}/trivy-cache
+          skip-setup-trivy: true
+          scan-type: fs
+          scan-ref: ${{ runner.temp }}/rust-workspace
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          trivyignores: .trivyignore.yaml
+          format: json
+          output: sbom/rust-vulnerabilities.json
+          exit-code: '1'
+      # No inventory guard here: inventory validation runs in `verify`. Both
+      # gates are still attempted even if the first fails (`!cancelled()`),
+      # and `verify` still validates/retains even when a gate fails.
+      - name: Gate runtime image (HIGH/CRITICAL, including unfixed)
+        if: ${{ !cancelled() }}
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          version: v0.69.3
+          cache: false
+          cache-dir: ${{ runner.temp }}/trivy-cache
+          skip-setup-trivy: true
+          scan-type: image
+          image-ref: ${{ env.IMAGE }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          trivyignores: .trivyignore.yaml
+          format: json
+          output: sbom/image-vulnerabilities.json
+          exit-code: '1'
+      - name: Save image for the verification job
+        if: ${{ !cancelled() }}
+        run: |
+          docker save "$IMAGE" -o sbom/image.tar
+      - name: Hand off SBOMs and image to verification
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          # Per-attempt name (same run_id/run_attempt scheme as IMAGE):
+          # v4 artifacts are immutable and same-named uploads coexist, so a
+          # bare `sbom-partial` download on a `rerun failed jobs` retry can
+          # hand `verify` the previous attempt's BOMs/image. The suffixed
+          # name can only match this attempt's upload.
+          name: sbom-partial-${{ github.run_id }}-${{ github.run_attempt }}
+          path: sbom/
+          if-no-files-found: error
+          retention-days: 1
+      - name: Remove only this run's local image
+        if: ${{ always() }}
+        run: |
+          if docker image inspect "$IMAGE" > /dev/null 2>&1; then
+            docker image rm "$IMAGE"
+          fi
+
+  # Validation, evidence and preflight never check out inputs.ref: they run
+  # the trusted root scripts against the sbom-partial artifact (Cargo.lock,
+  # source SHA, image ID, BOMs, findings and the saved image tar). This keeps
+  # the CodeQL cache-poisoning query green: no job both checks out an
+  # untrusted ref and executes a local script afterwards.
+  verify:
+    name: verify SBOM inventories and evidence
+    permissions:
+      contents: read
+    needs: image
+    # Run when the build/scan job succeeds OR fails so inventories are still
+    # validated and the SBOMs/findings are still retained after a failed gate
+    # (a `needs` without a needs-referencing `if` would skip on failure);
+    # fail closed on cancellation.
+    if: ${{ !cancelled() && (needs.image.result == 'success' || needs.image.result == 'failure') }}
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'verify') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 10
+    env:
+      IMAGE: two-bot-next:scan-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          # Must match the per-attempt upload name in `image` above: a bare
+          # `sbom-partial` download on a retry can resolve to a previous
+          # attempt's same-named artifact instead of this attempt's.
+          name: sbom-partial-${{ github.run_id }}-${{ github.run_attempt }}
+          path: sbom
+      - name: Load image under verification
+        run: |
+          docker load -i sbom/image.tar
+          rm sbom/image.tar
+      - name: Validate SBOM inventories and record checksums
+        id: inventory
+        run: |
+          python3 scripts/validate-sbom.py sbom/Cargo.lock sbom
+          rm sbom/Cargo.lock
+          (cd sbom && sha256sum *.cdx.json source-sha.txt image-id.txt > SHA256SUMS)
+      - name: Collect exact-image applicability evidence
+        if: ${{ !cancelled() && steps.inventory.outcome == 'success' }}
+        run: |
+          status=0
+          python3 scripts/runtime-image-evidence.py "$IMAGE" sbom || status=$?
+          (cd sbom && sha256sum runtime-image-evidence.json > runtime-image-evidence.sha256)
+          exit "$status"
+      - name: Bind findings to exact installed tuples (no acceptance, no suppression)
+        if: ${{ !cancelled() && steps.inventory.outcome == 'success' }}
+        run: |
+          python3 scripts/vulnerability-preflight.py sbom
+          (cd sbom && sha256sum vulnerability-preflight.json > vulnerability-preflight.sha256)
+      - name: Retain SBOMs and findings even when the gate fails
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: supply-chain
+          path: sbom/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove only this run's local image
+        if: ${{ always() }}
+        run: |
+          if docker image inspect "$IMAGE" > /dev/null 2>&1; then
+            docker image rm "$IMAGE"
+          fi

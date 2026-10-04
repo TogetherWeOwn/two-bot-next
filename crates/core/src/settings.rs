@@ -98,6 +98,11 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_REDIRECT_PORT", SettingClass::EnvOnly),
     ("TWO_REDIRECT_TRUSTED_PROXIES", SettingClass::EnvOnly),
     ("DISCORD_API_BASE", SettingClass::EnvOnly),
+    // --- template-assistant endpoint (V12): an OpenAI-compatible base URL
+    // --- plus model name. Env-only like DISCORD_API_BASE: a web form must
+    // --- never redirect the assistant to another address or model. ---
+    ("TWO_ASSISTANT_ENDPOINT", SettingClass::EnvOnly),
+    ("TWO_ASSISTANT_MODEL", SettingClass::EnvOnly),
     // --- capability gates: the TWO_INTERNAL_* namespace (prefix-covered too,
     // --- so the census stays complete and the drift test can see them) ---
     ("TWO_INTERNAL_ACTIONS", SettingClass::EnvOnly),
@@ -111,7 +116,10 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_INTERNAL_ALLOW_EVENT_READ", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ALLOW_MODERATION", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ALLOW_SETTINGS", SettingClass::EnvOnly),
+    // Combined `IP:port` socket; the split HOST/PORT pair below is legacy.
+    ("TWO_INTERNAL_BIND", SettingClass::EnvOnly),
     ("TWO_INTERNAL_BIND_HOST", SettingClass::EnvOnly),
+    ("TWO_INTERNAL_CALLERS", SettingClass::EnvOnly),
     ("TWO_INTERNAL_CHANNEL_KEYS", SettingClass::EnvOnly),
     ("TWO_INTERNAL_PORT", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ROLE_KEYS", SettingClass::EnvOnly),
@@ -709,6 +717,22 @@ pub enum WriteRefusal {
     Unknown(String),
     #[error("refused: settings writes must name an actor")]
     MissingActor,
+    #[error("refused: setting values cannot contain U+0000")]
+    NullCharacter,
+}
+
+/// Postgres JSONB cannot represent decoded NUL in strings or object keys.
+/// Inspect the domain value, not its encoding (literal `\\u0000` is valid).
+#[must_use]
+pub(crate) fn contains_json_nul(value: &Value) -> bool {
+    match value {
+        Value::String(value) => value.contains('\0'),
+        Value::Array(values) => values.iter().any(contains_json_nul),
+        Value::Object(values) => values
+            .iter()
+            .any(|(key, value)| key.contains('\0') || contains_json_nul(value)),
+        _ => false,
+    }
 }
 
 /// Validate a write: key guard first (env-only and unknown never reach SQL),
@@ -737,6 +761,9 @@ pub fn validate_write(
     }
     if actor.is_empty() {
         return Err(WriteRefusal::MissingActor);
+    }
+    if value.as_ref().is_some_and(contains_json_nul) {
+        return Err(WriteRefusal::NullCharacter);
     }
     Ok(ValidatedWrite {
         guild_id: guild_id.to_owned(),
@@ -846,6 +873,8 @@ mod tests {
         "TWO_ANTI_NUKE_PROTECTED_USER_IDS",
         "TWO_ANTI_NUKE_SNAPSHOT_PATH",
         "TWO_ANTI_NUKE_TRUSTED_USER_IDS",
+        "TWO_ASSISTANT_ENDPOINT",
+        "TWO_ASSISTANT_MODEL",
         "TWO_BACKUP_S3_ACCESS_KEY_ID",
         "TWO_BACKUP_S3_BUCKET",
         "TWO_BACKUP_S3_ENDPOINT",
@@ -864,7 +893,9 @@ mod tests {
         "TWO_INTERNAL_ALLOW_EVENT_READ",
         "TWO_INTERNAL_ALLOW_MODERATION",
         "TWO_INTERNAL_ALLOW_SETTINGS",
+        "TWO_INTERNAL_BIND",
         "TWO_INTERNAL_BIND_HOST",
+        "TWO_INTERNAL_CALLERS",
         "TWO_INTERNAL_CHANNEL_KEYS",
         "TWO_INTERNAL_PORT",
         "TWO_INTERNAL_ROLE_KEYS",
@@ -898,7 +929,7 @@ mod tests {
             assert_eq!(classify_key(key), Some(SettingClass::EnvOnly), "{key}");
         }
         let expected_total = EXPECTED_HOT.len() + EXPECTED_COLD.len() + EXPECTED_ENV_ONLY.len();
-        assert_eq!(expected_total, 117, "tripwire lists must stay complete");
+        assert_eq!(expected_total, 121, "tripwire lists must stay complete");
         assert_eq!(
             SETTING_CLASSES.len(),
             expected_total,

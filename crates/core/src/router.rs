@@ -32,10 +32,11 @@
 //! 3. Permission bits — the handler-level check legacy performs even though
 //!    `default_member_permissions` hides the command from non-admin pickers.
 //!
-//! Unknown slash names (no builtin, no custom row) and unknown `custom_id`s
-//! are `Ignore`: some other application's command, not ours to answer —
-//! exactly the legacy fall-through. Legacy has no modal submits; modals route
-//! through the same component-id table so future slices have a place to land.
+//! Unknown slash names and `custom_id`s in the configured guild get a uniform
+//! ephemeral reply (a deliberate improvement on legacy's silent fall-through).
+//! Foreign/missing guilds remain fenced. Legacy has no modal submits; modals
+//! route through the component-id table. [`replies`] owns async reply timing,
+//! error redaction and panic isolation; the adapter supplies the transport.
 //!
 //! Publish: [`InteractionRouter::publish_set`] assembles the ONE complete
 //! guild set (core + enabled features in legacy order + custom) via
@@ -48,6 +49,8 @@
 //! (gateway `automationMessageAccepted`, not interactions), reaction-role
 //! grant/revoke (`MessageReactionAdd/Remove`), and `/rota-acknowledge`
 //! (dropped with the rota stack, matrix §9).
+
+pub mod replies;
 
 use std::collections::{HashMap, HashSet};
 
@@ -75,22 +78,26 @@ pub const LFG_PREFIX: &str = "two:lfg:";
 pub const SELF_ROLE_PREFIX: &str = "two:self-role:";
 
 // --- refusal texts ------------------------------------------------------------
+// Actionable denials: every refusal names the Discord permission, who to ask,
+// or the admin-only enable path. Legacy one-liners live in git history; these
+// are what Discord shows.
 
-/// Legacy-exact (`src/automations/discord.ts` `AUTOMATIONS_DISABLED_REPLY`).
-pub const AUTOMATIONS_DISABLED_REPLY: &str = "Automations are disabled on this server.";
-/// Legacy-exact (automation + feed handlers).
-pub const MANAGE_SERVER_REQUIRED: &str = "Manage Server permission is required.";
-/// Legacy-exact (LFG handlers).
-pub const MANAGE_EVENTS_REQUIRED: &str = "Manage Events permission is required.";
+/// Automations gate: env-gated, not a Discord role — say who enables it.
+pub const AUTOMATIONS_DISABLED_REPLY: &str = "Automations are disabled on this server. Ask a server admin to enable them in the bot configuration — this is a host setting, not a Discord role.";
+/// Automation + feed handlers: Discord permission name plus who grants it.
+pub const MANAGE_SERVER_REQUIRED: &str =
+    "You need the Manage Server permission to use this command. Ask a server admin to grant it.";
+/// LFG / attendance handlers: Discord permission name plus who grants it.
+pub const MANAGE_EVENTS_REQUIRED: &str =
+    "You need the Manage Events permission to use this command. Ask a server admin to grant it.";
 /// Legacy-exact (`src/moderation/commands.ts` guild fence).
 pub const GUILD_RESTRICTED_REPLY: &str = "This command is restricted to the configured guild.";
-/// Port shape for the unified router (legacy never registered the handler, so
-/// it stayed silent; the router refuses explicitly instead).
-pub const ANNOUNCEMENTS_DISABLED_REPLY: &str = "Announcements are disabled on this server.";
-/// Port shape, same rationale as above.
-pub const MODERATION_DISABLED_REPLY: &str = "Moderation is not enabled on this server.";
-/// Port shape, same rationale as above.
-pub const SCORECARD_DISABLED_REPLY: &str = "Attendance capture is not enabled on this server.";
+/// Announcement gate: env-gated, not a Discord role — say who enables it.
+pub const ANNOUNCEMENTS_DISABLED_REPLY: &str = "Announcements are disabled on this server. Ask a server admin to enable them in the bot configuration — this is a host setting, not a Discord role.";
+/// Moderation gate: env-gated, not a Discord role — say who enables it.
+pub const MODERATION_DISABLED_REPLY: &str = "Moderation is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.";
+/// Scorecard gate: env-gated, not a Discord role — say who enables it.
+pub const SCORECARD_DISABLED_REPLY: &str = "Attendance capture is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.";
 
 // --- handler identity ----------------------------------------------------------
 
@@ -238,7 +245,8 @@ pub enum RouterRefusal {
 }
 
 impl RouterRefusal {
-    /// Legacy reply text for this refusal.
+    /// User-facing denial text: Discord permission names and a next step, never
+    /// an internal action id.
     #[must_use]
     pub fn message(self) -> String {
         match self {
@@ -249,10 +257,14 @@ impl RouterRefusal {
             Self::ManageServerRequired => MANAGE_SERVER_REQUIRED.to_owned(),
             Self::ManageEventsRequired => MANAGE_EVENTS_REQUIRED.to_owned(),
             Self::GuildRestricted => GUILD_RESTRICTED_REPLY.to_owned(),
-            // Legacy `src/moderation/policy.ts`: `Missing required permission
-            // for ${request.action}` where the action is `moderation.ban`, ….
+            // Names the Discord permission (Ban Members, …) and the slash
+            // command, not the internal `moderation.ban` action id.
             Self::ModerationPermission(action) => {
-                format!("Missing required permission for {}", action.action_name())
+                format!(
+                    "You need the {} permission to use /{}. Ask a server moderator or admin to grant it.",
+                    action.discord_permission_name(),
+                    action.command_name()
+                )
             }
         }
     }
@@ -263,6 +275,7 @@ impl RouterRefusal {
 pub enum SlashOutcome {
     Handled { handler: HandlerId },
     Refuse { refusal: RouterRefusal },
+    Unknown,
     Ignore,
 }
 
@@ -270,6 +283,7 @@ pub enum SlashOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentOutcome {
     Handled { handler: ComponentHandler },
+    Unknown,
     Ignore,
 }
 
@@ -357,8 +371,8 @@ impl InteractionRouter {
             return outcome;
         }
         // Dynamic DB-backed custom commands (#22): everyone while automations
-        // are on; explicit refusal while off; silence otherwise (legacy
-        // `registerAutomationCommands`: unknown names are another app's).
+        // are on; explicit refusal while off. Missing/disabled rows in the
+        // configured guild get the same reply as other stale interactions.
         match ctx.custom_row {
             Some(true) => {
                 if !self.guild_ok(ctx.guild_id) {
@@ -373,6 +387,7 @@ impl InteractionRouter {
                     handler: HandlerId::AutomationCustom,
                 }
             }
+            Some(false) | None if self.guild_ok(ctx.guild_id) => SlashOutcome::Unknown,
             Some(false) | None => SlashOutcome::Ignore,
         }
     }
@@ -564,13 +579,17 @@ impl InteractionRouter {
             }
             ComponentHandler::SelfRole
         } else {
-            return ComponentOutcome::Ignore;
+            return if self.guild_ok(guild_id) {
+                ComponentOutcome::Unknown
+            } else {
+                ComponentOutcome::Ignore
+            };
         };
         ComponentOutcome::Handled { handler }
     }
 
     /// Route one modal submit by `custom_id` through the same table as
-    /// components. Legacy has no modals; unknown ids are `Ignore`.
+    /// components. Unknown ids reply only inside the configured guild.
     #[must_use]
     pub fn route_modal(&self, custom_id: &str, guild_id: Option<u64>) -> ComponentOutcome {
         self.route_component(custom_id, guild_id)
@@ -831,18 +850,30 @@ mod tests {
     }
 
     #[test]
-    fn refusal_texts_match_legacy() {
-        assert_eq!(
-            RouterRefusal::AutomationsDisabled.message(),
-            "Automations are disabled on this server."
-        );
+    fn refusal_texts_are_actionable() {
+        // Disabled features name the admin-only enable path (host setting, not
+        // a Discord role).
+        for refusal in [
+            RouterRefusal::AutomationsDisabled,
+            RouterRefusal::AnnouncementsDisabled,
+            RouterRefusal::ModerationDisabled,
+            RouterRefusal::ScorecardDisabled,
+        ] {
+            let text = refusal.message();
+            assert!(
+                text.contains("server admin") && text.contains("host setting, not a Discord role"),
+                "{refusal:?} names the enable path: {text}"
+            );
+        }
+        // Permission denials name the Discord permission and who grants it —
+        // never an internal action id.
         assert_eq!(
             RouterRefusal::ManageServerRequired.message(),
-            "Manage Server permission is required."
+            "You need the Manage Server permission to use this command. Ask a server admin to grant it."
         );
         assert_eq!(
             RouterRefusal::ManageEventsRequired.message(),
-            "Manage Events permission is required."
+            "You need the Manage Events permission to use this command. Ask a server admin to grant it."
         );
         assert_eq!(
             RouterRefusal::GuildRestricted.message(),
@@ -850,8 +881,31 @@ mod tests {
         );
         assert_eq!(
             RouterRefusal::ModerationPermission(ModerationAction::Ban).message(),
-            "Missing required permission for moderation.ban"
+            "You need the Ban Members permission to use /ban. Ask a server moderator or admin to grant it."
         );
+        assert_eq!(
+            RouterRefusal::ModerationPermission(ModerationAction::Kick).message(),
+            "You need the Kick Members permission to use /kick. Ask a server moderator or admin to grant it."
+        );
+        assert_eq!(
+            RouterRefusal::ModerationPermission(ModerationAction::Timeout).message(),
+            "You need the Moderate Members permission to use /timeout. Ask a server moderator or admin to grant it."
+        );
+        assert_eq!(
+            RouterRefusal::ModerationPermission(ModerationAction::Purge).message(),
+            "You need the Manage Messages permission to use /purge. Ask a server moderator or admin to grant it."
+        );
+        assert_eq!(
+            RouterRefusal::ModerationPermission(ModerationAction::Slowmode).message(),
+            "You need the Manage Channels permission to use /slowmode. Ask a server moderator or admin to grant it."
+        );
+        for action in ModerationAction::ALL {
+            let text = RouterRefusal::ModerationPermission(action).message();
+            assert!(
+                !text.contains("moderation."),
+                "{action:?} must not leak the internal id: {text}"
+            );
+        }
     }
 
     #[test]
@@ -1006,10 +1060,9 @@ mod tests {
                 handler: HandlerId::AutomationCustom
             }
         );
-        // Disabled row: silence (legacy `if (!custom.enabled) return`).
-        assert_eq!(r.route_slash(&custom(Some(false))), SlashOutcome::Ignore);
-        // No row: another app's command, not ours.
-        assert_eq!(r.route_slash(&custom(None)), SlashOutcome::Ignore);
+        // Disabled/missing rows now get the uniform stale-interaction reply.
+        assert_eq!(r.route_slash(&custom(Some(false))), SlashOutcome::Unknown);
+        assert_eq!(r.route_slash(&custom(None)), SlashOutcome::Unknown);
         // Builtin names shadow custom rows (publish merge does the same).
         let shadow = SlashContext {
             name: "rank",
@@ -1036,21 +1089,19 @@ mod tests {
     }
 
     #[test]
-    fn unknown_slash_names_are_ignored() {
+    fn unknown_slash_names_reply_only_inside_the_guild_fence() {
         let r = router();
-        assert_eq!(
-            r.route_slash(&ctx("rota-acknowledge", Some(GUILD), Some(u64::MAX))),
-            SlashOutcome::Ignore,
-            "dropped rota command is not ours"
-        );
-        assert_eq!(
-            r.route_slash(&ctx(
-                "definitely-not-a-command",
-                Some(GUILD),
-                Some(u64::MAX)
-            )),
-            SlashOutcome::Ignore
-        );
+        for name in ["rota-acknowledge", "definitely-not-a-command"] {
+            assert_eq!(
+                r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
+                SlashOutcome::Unknown
+            );
+            assert_eq!(
+                r.route_slash(&ctx(name, Some(9999), Some(u64::MAX))),
+                SlashOutcome::Ignore
+            );
+            assert_eq!(r.route_slash(&ctx(name, None, None)), SlashOutcome::Ignore);
+        }
     }
 
     #[test]
@@ -1095,15 +1146,15 @@ mod tests {
                 handler: ComponentHandler::SelfRole
             }
         );
-        // Unknown ids are not ours.
-        assert_eq!(
-            r.route_component("two:unknown:thing", Some(GUILD)),
-            ComponentOutcome::Ignore
-        );
-        assert_eq!(
-            r.route_component("other", Some(GUILD)),
-            ComponentOutcome::Ignore
-        );
+        // Unknown ids reply consistently without escaping the guild fence.
+        for id in ["two:unknown:thing", "other"] {
+            assert_eq!(
+                r.route_component(id, Some(GUILD)),
+                ComponentOutcome::Unknown
+            );
+            assert_eq!(r.route_component(id, Some(9999)), ComponentOutcome::Ignore);
+            assert_eq!(r.route_component(id, None), ComponentOutcome::Ignore);
+        }
         // Modal submits share the table.
         assert_eq!(
             r.route_modal("two:lfg:abc123", Some(GUILD)),
@@ -1113,7 +1164,7 @@ mod tests {
         );
         assert_eq!(
             r.route_modal("two:unknown:thing", Some(GUILD)),
-            ComponentOutcome::Ignore
+            ComponentOutcome::Unknown
         );
     }
 

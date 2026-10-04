@@ -168,7 +168,10 @@ fn settings_log_capture_excludes_unrelated_numeric_trace_events() {
     let log = capture.contents();
     assert!(log.contains("settings_restart_required"), "{log}");
     assert!(log.contains("TWO_FEED_POLL_SECONDS"), "{log}");
-    assert!(!log.contains("elapsed_secs"), "unrelated event captured: {log}");
+    assert!(
+        !log.contains("elapsed_secs"),
+        "unrelated event captured: {log}"
+    );
     assert!(!log.contains("600"), "cold value leaked: {log}");
     assert!(!log.contains("900"), "updated cold value leaked: {log}");
 }

@@ -3,6 +3,7 @@
 //! The caller must authorize and commit its durable execution claim first.
 //! Only `announcement.post` is implemented here; core feature flags are not
 //! executor capabilities. No runtime flags, stores or listeners are installed.
+//! Every 429 feeds the caller-supplied per-token [`CooldownGovernor`].
 
 use bytes::Bytes;
 use http::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER, USER_AGENT};
@@ -19,6 +20,12 @@ use twilight_model::{
     id::{marker::ChannelMarker, marker::MessageMarker, Id},
 };
 use two_bot_core::internal_actions::{is_snowflake, validate_announcement, ErrorCode};
+use two_bot_core::send_admission::{
+    is_loopback_http, AdmissionError, SendAdmission, SendCooldown, TokenKey,
+};
+
+mod governor;
+pub use governor::{Clock, CooldownGovernor, MAX_CHANNEL_HOLDS};
 
 pub const SUPPORTED_ACTIONS: &[&str] = &["announcement.post"];
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
@@ -38,10 +45,13 @@ pub enum Refusal {
     ActionNotAllowed,
     InvalidChannelConfiguration,
     LocalConfiguration,
+    SendAdmissionBlocked,
     DiscordRejected,
+    /// The shared governor holds this channel or the token; nothing was sent.
+    CoolingDown,
 }
 
-/// Apply before any new intent in the caller's shared token governor. Channel
+/// Fed into the shared token governor before any new intent. Channel
 /// scope deliberately covers all buckets on this major resource; bucket strings
 /// and provider text never escape. Missing/ambiguous scope is token-wide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -104,17 +114,27 @@ pub enum ExecutionOutcome {
 /// its ResponseFuture: Twilight retries 429/5xx internally. This transport has
 /// no status retries, redirects, or cancelled pooled-connection retries.
 /// Construction assumes the application's rustls provider is already installed.
+/// Clones share the governor; pass the token's one governor to every executor.
+#[derive(Clone)]
 pub struct AnnouncementExecutor {
     twilight: Arc<TwilightClient>,
     http: HttpClient,
     channel_keys: HashMap<String, String>,
     timeout: Duration,
     api_origin: String,
+    #[cfg(test)]
+    response_received: Option<Arc<tokio::sync::Notify>>,
+    admission: Option<Arc<dyn SendAdmission>>,
+    governor: CooldownGovernor,
 }
 
 impl AnnouncementExecutor {
     #[must_use]
-    pub fn new(twilight: Arc<TwilightClient>, channel_keys: HashMap<String, String>) -> Self {
+    pub fn new(
+        twilight: Arc<TwilightClient>,
+        channel_keys: HashMap<String, String>,
+        governor: CooldownGovernor,
+    ) -> Self {
         let https = HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
@@ -129,7 +149,40 @@ impl AnnouncementExecutor {
             channel_keys,
             timeout: Duration::from_secs(10),
             api_origin: "https://discord.com".to_owned(),
+            #[cfg(test)]
+            response_received: None,
+            admission: None,
+            governor,
         }
+    }
+
+    /// Production bootstrap: bind this executor to the credential's shared
+    /// database lane. `new` without admission refuses all non-loopback sends.
+    pub fn with_admission(
+        twilight: Arc<TwilightClient>,
+        channel_keys: HashMap<String, String>,
+        governor: CooldownGovernor,
+        admission: Arc<dyn SendAdmission>,
+    ) -> Result<Self, AdmissionError> {
+        let token = twilight.token().ok_or(AdmissionError::Configuration)?;
+        if admission.token_key() != &TokenKey::for_bot_token(token)? {
+            return Err(AdmissionError::Configuration);
+        }
+        let mut executor = Self::new(twilight, channel_keys, governor);
+        executor.admission = Some(admission);
+        Ok(executor)
+    }
+
+    /// Downstream tests exercise the real transport without live Discord or a
+    /// runtime origin override. Preserve the admitted lane and refuse anything
+    /// except a loopback HTTP origin. This feature is a dev-dependency only.
+    #[cfg(feature = "test-support")]
+    pub fn with_loopback_test_origin(mut self, origin: &str) -> Result<Self, AdmissionError> {
+        if self.admission.is_none() || !is_loopback_http(origin) {
+            return Err(AdmissionError::Configuration);
+        }
+        self.api_origin = origin.trim_end_matches('/').to_owned();
+        Ok(self)
     }
 
     #[must_use]
@@ -145,6 +198,10 @@ impl AnnouncementExecutor {
             return ExecutionOutcome::NoEffect(Refusal::ActionNotAllowed);
         }
         let outcome = self.post(body).await;
+        if let ExecutionOutcome::RateLimited(cooldown) = outcome {
+            // Installed before returning, so no later intent can outrun it.
+            self.governor.record(cooldown);
+        }
         // Only closed enums: no channel key, input, request, token or error source.
         tracing::info!(action = "announcement.post", outcome = ?outcome, "internal action completed");
         outcome
@@ -169,12 +226,17 @@ impl AnnouncementExecutor {
             Some(id) => id,
             None => return ExecutionOutcome::NoEffect(Refusal::InvalidChannelConfiguration),
         };
-        let content = body["body"].as_str().expect("core validated body");
+        let content = two_bot_core::message_safety::content(
+            body["body"].as_str().expect("core validated body"),
+        );
+        if !two_bot_core::message_safety::has_message_text(&content) {
+            return ExecutionOutcome::NoEffect(Refusal::Malformed);
+        }
         let mentions = AllowedMentions::default();
         let request = match self
             .twilight
             .create_message(channel_id)
-            .content(content)
+            .content(&content)
             .allowed_mentions(Some(&mentions))
             .try_into_request()
         {
@@ -201,13 +263,59 @@ impl AnnouncementExecutor {
             Ok(request) => request,
             Err(_) => return ExecutionOutcome::NoEffect(Refusal::LocalConfiguration),
         };
+        // Refuse, never wait: a held intent is terminal, not queued.
+        if !self.governor.admits(channel_id) {
+            return ExecutionOutcome::NoEffect(Refusal::CoolingDown);
+        }
 
         let deadline = tokio::time::Instant::now() + self.timeout;
+        let permit = match &self.admission {
+            Some(admission) => match tokio::time::timeout_at(deadline, admission.admit()).await {
+                Ok(Ok(permit)) => Some(permit),
+                _ => return ExecutionOutcome::NoEffect(Refusal::SendAdmissionBlocked),
+            },
+            None if is_loopback_http(&self.api_origin) => None,
+            None => return ExecutionOutcome::NoEffect(Refusal::LocalConfiguration),
+        };
+        let outcome = self.post_admitted(outbound, channel_id, deadline).await;
+        if let Some(permit) = permit {
+            let cooldown = match outcome {
+                ExecutionOutcome::RateLimited(cooldown) => Some(match cooldown.retry_after_ms {
+                    Some(ms) => SendCooldown::FiniteMs(ms),
+                    None => SendCooldown::Indefinite,
+                }),
+                _ => None,
+            };
+            // Unknown/cancelled effects retain the admission row, not just the
+            // receiver claim. A definitive 429 stays no-effect even if storage
+            // fails: the already-committed occupied row blocks other sends.
+            if !matches!(outcome, ExecutionOutcome::Unknown(_))
+                && !matches!(
+                    tokio::time::timeout_at(deadline, permit.complete(cooldown)).await,
+                    Ok(Ok(()))
+                )
+            {
+                tracing::warn!("internal-action admission completion unavailable; lane held");
+            }
+        }
+        outcome
+    }
+
+    async fn post_admitted(
+        &self,
+        outbound: http::Request<Full<Bytes>>,
+        channel_id: Id<ChannelMarker>,
+        deadline: tokio::time::Instant,
+    ) -> ExecutionOutcome {
         let response = match tokio::time::timeout_at(deadline, self.http.request(outbound)).await {
             Ok(Ok(response)) => response,
             Ok(Err(_)) => return ExecutionOutcome::Unknown(UnknownReason::Transport),
             Err(_) => return ExecutionOutcome::Unknown(UnknownReason::Timeout),
         };
+        #[cfg(test)]
+        if let Some(ready) = &self.response_received {
+            ready.notify_one();
+        }
         match response.status().as_u16() {
             // Narrow confirmed-rejection allowlist. 408, other statuses,
             // redirects and 5xx are NOT proof of no message being created.

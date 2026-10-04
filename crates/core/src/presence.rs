@@ -42,6 +42,14 @@ pub const PRESENCE_PROBE_INTERVAL_MS: u64 = 60 * 60 * 1000;
 /// move. Once a day is far more often than the floor actually drifts.
 pub const BOT_FLOOR_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// Overlap-lease expiry for one probe cycle (TOG-12142).
+///
+/// A cycle slower than this is presumed dead: a later trigger takes over the
+/// lease instead of queueing behind a stuck run. Set well above the 120 s job
+/// supervisor timeout (no legitimate cycle lives that long) and well below
+/// the hourly cadence, so a wedged holder self-heals within one tick.
+pub const PRESENCE_PROBE_LEASE_MS: u64 = 30 * 60 * 1000;
+
 /// Reopen threshold (legacy `REOPEN_PEAK_THRESHOLD`): raw
 /// `approximate_presence_count` peaks at or above this argue roughly 20+
 /// humans online at once against a ~23 bot floor. Compare to a raw reading,
@@ -70,6 +78,13 @@ pub struct PresenceReading {
     pub bot_floor: Option<i64>,
 }
 
+/// A completed bot-floor scan never exposes a partial count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotFloorScan {
+    Complete(i64),
+    Truncated,
+}
+
 /// A failed presence read writes NOTHING — not a row with a null count, not a
 /// zero. The series must read as "the times we successfully looked", or a gap
 /// in the collector becomes indistinguishable from a quiet night (legacy
@@ -84,6 +99,8 @@ pub enum ProbeDecision {
         /// A failed member listing must not lose the presence reading, so a
         /// rescan failure also lands here as `None`.
         bot_floor: Option<i64>,
+        /// A bounded scan exhausted its page budget; the 24 h cadence still applies.
+        bot_floor_scan_truncated: bool,
     },
     /// Discord did not answer with a usable number: persist nothing.
     Skip,
@@ -97,11 +114,11 @@ pub fn sanitize_presence_count(raw: Option<i64>) -> Option<i64> {
 }
 
 /// Decide whether the bot floor needs a re-list (legacy `runProbeCycle`):
-/// rescan when no floor was ever observed, or the newest one has aged out
-/// (`now - last >= max_age`, the `>=` boundary included).
+/// rescan when no complete or truncated scan was ever recorded, or the newest
+/// outcome has aged out (`now - last >= max_age`, the `>=` boundary included).
 #[must_use]
-pub fn bot_floor_due(last_floor_at_ms: Option<i64>, now_ms: i64, max_age_ms: u64) -> bool {
-    match last_floor_at_ms {
+pub fn bot_floor_due(last_scan_at_ms: Option<i64>, now_ms: i64, max_age_ms: u64) -> bool {
+    match last_scan_at_ms {
         None => true,
         Some(last) => now_ms.saturating_sub(last) >= max_age_ms as i64,
     }
@@ -111,29 +128,89 @@ pub fn bot_floor_due(last_floor_at_ms: Option<i64>, now_ms: i64, max_age_ms: u64
 /// REST/DB seams): failed presence → [`ProbeDecision::Skip`]; otherwise
 /// record, rescanning the floor only when [`bot_floor_due`].
 ///
-/// `fresh_bot_floor` is the just-completed member-list count, or `None` when
+/// `fresh_bot_floor` is the just-completed scan outcome, or `None` when
 /// no rescan was attempted or the listing failed. It is consulted only when a
-/// rescan is due, so a stale `Some` from an earlier cycle can never leak into
-/// a "not rescanned" row.
+/// rescan is due, so a stale outcome from an earlier cycle can never leak into
+/// a "not rescanned" row. Truncation records no floor but consumes the cadence.
 #[must_use]
 pub fn decide_probe_cycle(
     presence: Option<i64>,
-    last_floor_at_ms: Option<i64>,
-    fresh_bot_floor: Option<i64>,
+    last_scan_at_ms: Option<i64>,
+    fresh_bot_floor: Option<BotFloorScan>,
     now_ms: i64,
 ) -> ProbeDecision {
     let count = match sanitize_presence_count(presence) {
         Some(n) => n,
         None => return ProbeDecision::Skip,
     };
-    let bot_floor = if bot_floor_due(last_floor_at_ms, now_ms, BOT_FLOOR_MAX_AGE_MS) {
-        fresh_bot_floor.filter(|n| *n >= 0)
-    } else {
-        None
-    };
+    let (bot_floor, bot_floor_scan_truncated) =
+        if bot_floor_due(last_scan_at_ms, now_ms, BOT_FLOOR_MAX_AGE_MS) {
+            match fresh_bot_floor {
+                Some(BotFloorScan::Complete(n)) if n >= 0 => (Some(n), false),
+                Some(BotFloorScan::Truncated) => (None, true),
+                _ => (None, false),
+            }
+        } else {
+            (None, false)
+        };
     ProbeDecision::Record {
         presence: count,
         bot_floor,
+        bot_floor_scan_truncated,
+    }
+}
+
+/// One probe cycle's overlap lease (TOG-12142): the `started_at_ms` of the
+/// cycle currently holding the probe, or `None` when no cycle is in flight.
+/// The caller holds this in memory; a restart starts unleased, never inheriting
+/// a dead process's claim.
+pub type ProbeLease = Option<i64>;
+
+/// Overlap verdict for one trigger: run this cycle, skip it, or take over a
+/// stale holder's lease. Pure in `now_ms` so tests drive it with a fake clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeLeaseDecision {
+    /// No cycle in flight: take the lease (`started_at_ms = now_ms`) and run.
+    Run,
+    /// A recent cycle is still in flight: skip this trigger, log and return.
+    Skip,
+    /// The holder started at or before `now - lease_ms` and is presumed dead:
+    /// take over the lease (`started_at_ms = now_ms`) and run.
+    Takeover,
+}
+
+/// Decide whether this trigger runs (TOG-12142).
+///
+/// `None` is always runnable — a finished cycle clears the lease, so the next
+/// trigger starts clean. `Some(started)` skips while the holder is fresh
+/// (`now - started < lease_ms`, the `>=` boundary takes over), which keeps a
+/// slow run from duplicating the daily roster scan while letting a wedged
+/// holder self-heal without operator action.
+#[must_use]
+pub fn decide_probe_lease(lease: ProbeLease, now_ms: i64, lease_ms: u64) -> ProbeLeaseDecision {
+    match lease {
+        None => ProbeLeaseDecision::Run,
+        Some(started) => {
+            if now_ms.saturating_sub(started) >= lease_ms as i64 {
+                ProbeLeaseDecision::Takeover
+            } else {
+                ProbeLeaseDecision::Skip
+            }
+        }
+    }
+}
+
+/// Release one cycle's claim (TOG-12142): clear the lease only while the cycle
+/// that started at `started_at_ms` still holds it. A holder that was taken over
+/// and finishes late leaves its successor's lease in place, so it cannot reopen
+/// the overlap window. Takeover needs a full lease period, so two holders never
+/// share a start.
+#[must_use]
+pub fn release_probe_lease(lease: ProbeLease, started_at_ms: i64) -> ProbeLease {
+    if lease == Some(started_at_ms) {
+        None
+    } else {
+        lease
     }
 }
 
@@ -409,12 +486,12 @@ mod tests {
     fn failed_presence_read_writes_nothing() {
         // Null count: skip, no row, no floor side effects.
         assert_eq!(
-            decide_probe_cycle(None, None, Some(23), 1_000),
+            decide_probe_cycle(None, None, Some(BotFloorScan::Complete(23)), 1_000),
             ProbeDecision::Skip
         );
         // Negative count: same as unreadable.
         assert_eq!(
-            decide_probe_cycle(Some(-1), None, Some(23), 1_000),
+            decide_probe_cycle(Some(-1), None, Some(BotFloorScan::Complete(23)), 1_000),
             ProbeDecision::Skip
         );
     }
@@ -424,10 +501,11 @@ mod tests {
         let now = ms("2026-09-07T06:15:00.000Z");
         // Due: fresh floor lands on the row.
         assert_eq!(
-            decide_probe_cycle(Some(42), None, Some(23), now),
+            decide_probe_cycle(Some(42), None, Some(BotFloorScan::Complete(23)), now),
             ProbeDecision::Record {
                 presence: 42,
                 bot_floor: Some(23),
+                bot_floor_scan_truncated: false,
             }
         );
         // Due but the listing failed: presence is kept, floor stays NULL
@@ -437,14 +515,61 @@ mod tests {
             ProbeDecision::Record {
                 presence: 42,
                 bot_floor: None,
+                bot_floor_scan_truncated: false,
             }
         );
         // Not due: a stale fresh count must never leak into the row.
         assert_eq!(
-            decide_probe_cycle(Some(42), Some(now - H), Some(99), now),
+            decide_probe_cycle(
+                Some(42),
+                Some(now - H),
+                Some(BotFloorScan::Complete(99)),
+                now
+            ),
             ProbeDecision::Record {
                 presence: 42,
                 bot_floor: None,
+                bot_floor_scan_truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn truncated_cycle_records_no_floor_and_obeys_scan_cadence() {
+        let now = ms("2026-09-07T06:15:00.000Z");
+        assert_eq!(
+            decide_probe_cycle(Some(42), None, Some(BotFloorScan::Truncated), now),
+            ProbeDecision::Record {
+                presence: 42,
+                bot_floor: None,
+                bot_floor_scan_truncated: true,
+            }
+        );
+        // An unattempted hourly tick cannot repeat the truncation evidence.
+        assert_eq!(
+            decide_probe_cycle(Some(43), Some(now), Some(BotFloorScan::Truncated), now + H),
+            ProbeDecision::Record {
+                presence: 43,
+                bot_floor: None,
+                bot_floor_scan_truncated: false,
+            }
+        );
+        assert!(!bot_floor_due(
+            Some(now),
+            now + 24 * H - 1,
+            BOT_FLOOR_MAX_AGE_MS
+        ));
+        assert!(bot_floor_due(Some(now), now + 24 * H, BOT_FLOOR_MAX_AGE_MS));
+        assert_eq!(
+            decide_probe_cycle(None, None, Some(BotFloorScan::Truncated), now),
+            ProbeDecision::Skip
+        );
+        assert_eq!(
+            decide_probe_cycle(Some(42), None, Some(BotFloorScan::Complete(-1)), now),
+            ProbeDecision::Record {
+                presence: 42,
+                bot_floor: None,
+                bot_floor_scan_truncated: false,
             }
         );
     }
@@ -505,6 +630,60 @@ mod tests {
         );
         assert_eq!(fires.status, TriggerStatus::Fires);
         assert!(fires.reason.contains("Both halves hold"));
+    }
+
+    #[test]
+    fn overlap_lease_skips_concurrent_cycle_and_heals_stale_holder() {
+        let now = ms("2026-09-07T06:15:00.000Z");
+        let lease_ms = PRESENCE_PROBE_LEASE_MS;
+        // No cycle in flight: take the lease and run.
+        assert_eq!(
+            decide_probe_lease(None, now, lease_ms),
+            ProbeLeaseDecision::Run
+        );
+        // A fresh holder blocks the next trigger: skip, no roster rescan.
+        assert_eq!(
+            decide_probe_lease(Some(now), now, lease_ms),
+            ProbeLeaseDecision::Skip
+        );
+        assert_eq!(
+            decide_probe_lease(Some(now), now + lease_ms as i64 - 1, lease_ms),
+            ProbeLeaseDecision::Skip
+        );
+        // `>=` boundary takes over: a cycle slower than the lease is dead.
+        assert_eq!(
+            decide_probe_lease(Some(now), now + lease_ms as i64, lease_ms),
+            ProbeLeaseDecision::Takeover
+        );
+        assert_eq!(
+            decide_probe_lease(Some(now), now + lease_ms as i64 + 1, lease_ms),
+            ProbeLeaseDecision::Takeover
+        );
+        // A stale holder's lease never leaks into the next decision: after
+        // takeover the new holder's own start governs the following trigger,
+        // so a prompt next trigger skips while a holder that never finishes
+        // is taken over again once its own lease expires.
+        let taken_over = now + lease_ms as i64;
+        assert_eq!(
+            decide_probe_lease(Some(taken_over), taken_over + 60_000, lease_ms),
+            ProbeLeaseDecision::Skip
+        );
+        assert_eq!(
+            decide_probe_lease(Some(taken_over), taken_over + lease_ms as i64, lease_ms),
+            ProbeLeaseDecision::Takeover
+        );
+    }
+
+    #[test]
+    fn release_clears_only_own_lease() {
+        let now = ms("2026-09-07T06:15:00.000Z");
+        let successor = now + PRESENCE_PROBE_LEASE_MS as i64;
+        // The finishing holder clears its own claim.
+        assert_eq!(release_probe_lease(Some(now), now), None);
+        // A taken-over holder finishing late keeps its successor's lease.
+        assert_eq!(release_probe_lease(Some(successor), now), Some(successor));
+        // Releasing an already-free lease stays free.
+        assert_eq!(release_probe_lease(None, now), None);
     }
 
     #[test]

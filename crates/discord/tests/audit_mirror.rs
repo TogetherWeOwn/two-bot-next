@@ -25,99 +25,9 @@ fn executor_for(mock: &MockRest) -> ActionExecutor {
         .expect("executor builds against the mock")
 }
 
-#[tokio::test]
-async fn mirror_posts_share_the_executor_read_pacing_lane() {
-    let mock = MockRest::start(vec![], ScriptedResponse::json(200, serde_json::json!([]))).await;
-    let exec = executor_for(&mock);
-    exec.channel_history(CHANNEL, None, 100).await.unwrap();
-    for _ in 0..10 {
-        exec.post_mirror(CHANNEL, "x", &delivery_nonce(&mock.origin()))
-            .await
-            .unwrap();
-    }
-    let requests = mock.requests();
-    assert_eq!(requests.len(), 11);
-    // Allow timer/loopback dispatch jitter, but reject an unpaced burst.
-    assert!(
-        requests
-            .last()
-            .unwrap()
-            .received_at
-            .duration_since(requests[0].received_at)
-            >= Duration::from_millis(1050)
-    );
-    for pair in requests.windows(2) {
-        assert!(
-            pair[1].received_at.duration_since(pair[0].received_at) >= Duration::from_millis(100)
-        );
-    }
-    mock.shutdown().await;
-}
-
-#[tokio::test]
-async fn checked_post_authorizes_after_pacing_and_refusal_sends_nothing() {
-    let mock = MockRest::start(vec![], ScriptedResponse::json(200, serde_json::json!([]))).await;
-    let exec = executor_for(&mock);
-    exec.channel_history(CHANNEL, None, 100).await.unwrap();
-    let start = std::time::Instant::now();
-    let result = exec
-        .post_mirror_checked(CHANNEL, "x", &delivery_nonce(&mock.origin()), async {
-            assert!(
-                start.elapsed() >= Duration::from_millis(100),
-                "authorization must follow pacing"
-            );
-            Err::<(), _>("claim lost while waiting")
-        })
-        .await;
-    assert_eq!(result, Err("claim lost while waiting"));
-    assert_eq!(
-        mock.requests().len(),
-        1,
-        "only the earlier history GET reached the wire"
-    );
-    mock.shutdown().await;
-}
-
-#[tokio::test]
-async fn slow_authorization_cannot_be_overtaken_by_another_mirror_post() {
-    let mock = MockRest::start(
-        vec![],
-        ScriptedResponse::json(200, serde_json::json!({"id": "640"})),
-    )
-    .await;
-    let exec = executor_for(&mock);
-    let other = exec.clone();
-    let nonce = delivery_nonce(&mock.origin());
-    let other_nonce = nonce.clone();
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-    let first = tokio::spawn(async move {
-        exec.post_mirror_checked(CHANNEL, "first", &nonce, async {
-            entered_tx.send(()).unwrap();
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            Ok::<(), ()>(())
-        })
-        .await
-        .unwrap()
-        .unwrap();
-    });
-    entered_rx.await.unwrap();
-    other
-        .post_mirror(CHANNEL, "second", &other_nonce)
-        .await
-        .unwrap();
-    first.await.unwrap();
-    let requests = mock.requests();
-    assert_eq!(requests.len(), 2);
-    let first_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert_eq!(first_body["content"], "first");
-    assert!(
-        requests[1]
-            .received_at
-            .duration_since(requests[0].received_at)
-            >= Duration::from_millis(100)
-    );
-    mock.shutdown().await;
-}
+// Shared-lane floor/order and late-authorization tests live in the adapter's
+// unit suite so the admission probe stays cfg(test), with no release API or
+// opt-in feature that could silently skip them in the unchanged CI test graph.
 
 fn message_row(id: &str, author: &str, content: &str) -> serde_json::Value {
     serde_json::json!({"id": id, "author": {"id": author}, "content": content})
@@ -150,9 +60,13 @@ async fn post_mirror_sends_content_with_enforced_string_nonce() {
     assert_eq!(body["content"], "audit-event:42; · something happened");
     assert_eq!(body["nonce"], nonce, "nonce stays a string");
     assert_eq!(body["enforce_nonce"], true);
+    assert_eq!(body["allowed_mentions"]["parse"], serde_json::json!([]));
+    // Empty allowlists and false replied_user may be explicit or omitted.
+    let mentions: twilight_model::channel::message::AllowedMentions =
+        serde_json::from_value(body["allowed_mentions"].clone()).unwrap();
     assert_eq!(
-        body["allowed_mentions"],
-        serde_json::json!({"parse": []}),
+        mentions,
+        twilight_model::channel::message::AllowedMentions::default(),
         "mentions are disabled on the wire"
     );
     mock.shutdown().await;
@@ -182,6 +96,32 @@ async fn post_mirror_classifies_each_discord_failure() {
             | ("uncertain", Err(MirrorError::Uncertain(_))) => {}
             (_, other) => panic!("status {status} produced {other:?}"),
         }
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn post_mirror_malformed_success_receipt_is_uncertain_without_retry() {
+    for receipt in [
+        serde_json::json!([]),
+        serde_json::json!({}),
+        serde_json::json!({"id": "0"}),
+        serde_json::json!({"id": "not-an-id"}),
+    ] {
+        let mock = MockRest::start(
+            vec![ScriptedResponse::json(200, receipt)],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let exec = executor_for(&mock);
+        let outcome = exec
+            .post_mirror(CHANNEL, "x", &delivery_nonce(&mock.origin()))
+            .await;
+        assert!(
+            matches!(outcome, Err(MirrorError::Uncertain(_))),
+            "malformed mutation receipt remains uncertain, got {outcome:?}"
+        );
+        assert_eq!(mock.requests().len(), 1, "uncertain post is not retried");
         mock.shutdown().await;
     }
 }

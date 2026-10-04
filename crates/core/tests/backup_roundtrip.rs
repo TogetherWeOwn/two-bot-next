@@ -19,7 +19,7 @@
 use sqlx::{PgPool, Row};
 use std::path::PathBuf;
 
-/// All 22 bot-owned tables, with the real legacy type surface represented:
+/// The frozen v3 tables plus member-ban ownership, with the real legacy type surface represented:
 /// bigserial ids, text, timestamptz, booleans, integers, jsonb, bytea, and
 /// nullable columns. Column names per table match the legacy dump's stable
 /// read order (`orderFor`), so the test exercises the real ORDER BY paths.
@@ -29,7 +29,8 @@ const SCHEMA: &[(&str, &str)] = &[
     ("invite_snapshots", "guild_id TEXT NOT NULL, code TEXT NOT NULL, uses INTEGER NOT NULL DEFAULT 0, captured_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (guild_id, code)"),
     ("operational_audit_log", "entry_id TEXT PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL, delivered BOOLEAN NOT NULL DEFAULT FALSE, detail JSONB"),
     ("moderation_warnings", "id BIGSERIAL PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, reason TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL"),
-    ("moderation_scheduled_unbans", "request_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, execute_at TIMESTAMPTZ NOT NULL"),
+    ("moderation_scheduled_unbans", "request_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, execute_at TIMESTAMPTZ NOT NULL, state TEXT NOT NULL DEFAULT 'pending', claim_token TEXT, claimed_at TIMESTAMPTZ, dispatch_uncertain BOOLEAN NOT NULL DEFAULT FALSE, retry_generation BIGINT CHECK (retry_generation > 0)"),
+    ("moderation_member_bans", "request_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, generation BIGSERIAL NOT NULL UNIQUE, state TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ"),
     ("moderation_audit", "request_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, action TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL"),
     ("moderation_lockdowns", "guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, locked_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (guild_id, channel_id)"),
     ("moderation_idempotency", "guild_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (guild_id, idempotency_key)"),
@@ -49,11 +50,16 @@ const SCHEMA: &[(&str, &str)] = &[
 ];
 
 async fn test_url() -> Option<String> {
-    let url = std::env::var("TWO_BOT_TEST_DATABASE_URL").ok()?;
-    let url = url.trim().to_owned();
-    if url.is_empty() {
-        return None;
+    let url = std::env::var("TWO_BOT_TEST_DATABASE_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty());
+    if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+        assert!(
+            url.is_some(),
+            "CI must execute the backup round trip, not skip it"
+        );
     }
+    let url = url?.trim().to_owned();
     let parsed = url::Url::parse(&url).expect("test database URL");
     assert_eq!(
         parsed.host_str(),
@@ -104,6 +110,18 @@ async fn build_schema(pool: &PgPool) {
             .await
             .unwrap();
     }
+    // This fixture intentionally exercises the legacy type surface rather than
+    // migrations. Complete-schema/FK coverage lives in backup_schema_roundtrip.
+    for table in two_bot_core::backup::dump_file::DUMP_TABLES {
+        if !SCHEMA.iter().any(|(name, _)| name == table) {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE TABLE IF NOT EXISTS {table} (id BIGINT PRIMARY KEY)"
+            )))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
     sqlx::query("CREATE TABLE schema_migrations (id TEXT PRIMARY KEY)")
         .execute(pool)
         .await
@@ -149,6 +167,8 @@ async fn seed(pool: &PgPool) {
     .execute(pool)
     .await
     .unwrap();
+    sqlx::query("INSERT INTO moderation_member_bans (request_id, guild_id, user_id, state, created_at, completed_at) VALUES ('r1', 'g1', 'm9', 'accepted', '2026-08-03T12:00:00Z', '2026-08-03T12:00:00Z')")
+        .execute(pool).await.unwrap();
     sqlx::query(
         "INSERT INTO moderation_scheduled_unbans (request_id, guild_id, user_id, execute_at) VALUES ('r1', 'g1', 'm9', '2026-08-10T12:00:00Z')",
     )
@@ -185,6 +205,7 @@ async fn snapshot_all(pool: &PgPool) -> Vec<(String, Vec<String>)> {
             "operational_audit_log" => "entry_id",
             "moderation_warnings" => "created_at, id",
             "moderation_scheduled_unbans" => "execute_at, request_id",
+            "moderation_member_bans" => "guild_id, user_id, generation",
             "moderation_audit" => "created_at, request_id",
             "moderation_lockdowns" => "guild_id, channel_id",
             "moderation_idempotency" => "guild_id, idempotency_key",
@@ -261,7 +282,11 @@ async fn dump_inspect_restore_round_trip() {
     let manifest = two_bot_core::backup::dump::dump(&pool, &dump_path)
         .await
         .expect("dump");
-    assert_eq!(manifest.tables.len(), 22, "all bot-owned tables dumped");
+    assert_eq!(
+        manifest.tables.len(),
+        two_bot_core::backup::dump_file::DUMP_TABLES.len(),
+        "all covered tables dumped"
+    );
     let events = manifest.tables.iter().find(|t| t.name == "events").unwrap();
     assert_eq!(events.count, 3);
     assert!(dump_path.exists());
@@ -300,9 +325,22 @@ async fn dump_inspect_restore_round_trip() {
         "no dropped columns on identical schema"
     );
 
-    // Contents identical.
-    let after = snapshot_all(&pool).await;
-    assert_eq!(before, after, "restored contents equal the dumped contents");
+    // Every cell remains faithful except executable moderation state, which
+    // must be quarantined even with matching snapshot acceptance evidence.
+    assert_eq!(report.quarantined_unbans, 1);
+    let restored_state: String =
+        sqlx::query_scalar("SELECT state FROM moderation_scheduled_unbans WHERE request_id = 'r1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(restored_state, "quarantined");
+    let mut after = snapshot_all(&pool).await;
+    let schedules = after
+        .iter_mut()
+        .find(|(table, _)| table == "moderation_scheduled_unbans")
+        .unwrap();
+    schedules.1[0] = schedules.1[0].replace("|quarantined|", "|pending|");
+    assert_eq!(before, after, "all other cells retain dump fidelity");
 
     // The events id sequence is past the restored high-water mark: the next
     // write must not collide with a row we just put back.
@@ -409,6 +447,9 @@ async fn dump_inspect_restore_round_trip() {
 
     // The actual frozen writer fixture uses the legacy events/risk-flag columns.
     // Other tables stay present but empty, as declared in this minimal fixture.
+    // This independent fixture starts with a fresh test target, not an
+    // in-place overwrite of the moderation evidence from the previous drill.
+    build_schema(&pool).await;
     sqlx::query("DROP TABLE events")
         .execute(&pool)
         .await

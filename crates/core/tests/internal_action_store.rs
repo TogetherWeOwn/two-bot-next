@@ -3,10 +3,12 @@
 #![cfg(feature = "db")]
 
 use sqlx::{PgPool, Row};
+use two_bot_core::clock_guard::ClockGuard;
 use two_bot_core::internal_action_store::{
     AuditSubject, DiscordId, ExecutionClaim, InternalActionStore, InternalClaim,
     InternalStoreError, ReconciliationEvidence, RequestIdentity, TerminalFailure, TerminalResponse,
 };
+use two_bot_core::secret::Secret;
 use two_bot_core::{body_hash, CLAIM_STALE_SECONDS, NONCE_TTL_SECONDS, SKEW_SECONDS};
 use two_bot_testsupport::TestDatabase;
 
@@ -47,6 +49,310 @@ async fn db_now_secs(pool: &PgPool) -> i64 {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+// Public cross-implementation signing fixture, never runtime key material.
+fn signing_key() -> two_bot_core::internal_actions::SigningKey {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/internal-action-signing.json");
+    let fixture: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    two_bot_core::internal_actions::SigningKey {
+        id: "fixture-caller".to_owned(),
+        secret: Secret::new(
+            fixture["vectors"][0]["secret"]
+                .as_str()
+                .unwrap()
+                .as_bytes()
+                .to_vec(),
+        ),
+    }
+}
+
+#[tokio::test]
+async fn authenticated_malformed_body_burns_before_parsing_and_survives_restart() {
+    use two_bot_core::internal_actions::{
+        sign, AuthHeaders, AuthenticatedRequest, ErrorCode, InternalFlags, KeyRing, TokenBuckets,
+    };
+
+    let db = TestDb::new().await;
+    let key = signing_key();
+    let keys = KeyRing::new(vec![key.clone()]);
+    let now = db_now_secs(&db.pool).await as u64;
+    let timestamp = now.to_string();
+    let nonce = body_hash(db.fixture.name().as_bytes())[..32].to_owned();
+    let raw = b"not json";
+    let signature = sign(key.secret.expose(), &timestamp, &nonce, raw);
+    let headers = AuthHeaders {
+        key_id: &key.id,
+        timestamp: &timestamp,
+        nonce: &nonce,
+        signature: &signature,
+    };
+    let verified = AuthenticatedRequest::verify(
+        &headers,
+        raw,
+        &keys,
+        SKEW_SECONDS,
+        now * 1000,
+        &mut ClockGuard::new(),
+    )
+    .unwrap();
+    let burned = verified.burn_durably(&db.store()).await.unwrap();
+    let flags = InternalFlags::from_map(&std::collections::HashMap::new());
+    let error = burned
+        .authorize(&flags, true, false, &mut TokenBuckets::new())
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Malformed);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM internal_nonces")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let restarted = db.independent_pool().await;
+    let verified = AuthenticatedRequest::verify(
+        &headers,
+        raw,
+        &keys,
+        SKEW_SECONDS,
+        now * 1000,
+        &mut ClockGuard::new(),
+    )
+    .unwrap();
+    let error = verified
+        .burn_durably(&InternalActionStore::new(restarted.clone()))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, ErrorCode::Replayed);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM internal_idempotency")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    restarted.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn invalid_authentication_cannot_burn_or_drain_buckets() {
+    use two_bot_core::internal_actions::{
+        sign, AuthHeaders, AuthenticatedRequest, ErrorCode, InternalFlags, KeyRing, TokenBuckets,
+    };
+
+    let db = TestDb::new().await;
+    let key = signing_key();
+    let keys = KeyRing::new(vec![key.clone()]);
+    let now = db_now_secs(&db.pool).await as u64;
+    let timestamp = now.to_string();
+    let stale = (now - SKEW_SECONDS - 1).to_string();
+    let nonce = body_hash(db.fixture.name().as_bytes())[..32].to_owned();
+    let raw = br#"{"action":"role.assign"}"#;
+    let good = sign(key.secret.expose(), &timestamp, &nonce, raw);
+    let old = sign(key.secret.expose(), &stale, &nonce, raw);
+    let mut buckets = TokenBuckets::new();
+    for (id, timestamp, signature, expected) in [
+        (
+            key.id.as_str(),
+            timestamp.as_str(),
+            "sha256=invalid",
+            ErrorCode::Unauthorized,
+        ),
+        (
+            "unknown",
+            timestamp.as_str(),
+            good.as_str(),
+            ErrorCode::Unauthorized,
+        ),
+        (
+            key.id.as_str(),
+            stale.as_str(),
+            old.as_str(),
+            ErrorCode::StaleRequest,
+        ),
+    ] {
+        for _ in 0..25 {
+            let headers = AuthHeaders {
+                key_id: id,
+                timestamp,
+                nonce: &nonce,
+                signature,
+            };
+            let error = AuthenticatedRequest::verify(
+                &headers,
+                raw,
+                &keys,
+                SKEW_SECONDS,
+                now * 1000,
+                &mut ClockGuard::new(),
+            )
+            .err()
+            .unwrap();
+            assert_eq!(error.code, expected);
+        }
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM internal_nonces")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    let headers = AuthHeaders {
+        key_id: &key.id,
+        timestamp: &timestamp,
+        nonce: &nonce,
+        signature: &good,
+    };
+    let burned = AuthenticatedRequest::verify(
+        &headers,
+        raw,
+        &keys,
+        SKEW_SECONDS,
+        now * 1000,
+        &mut ClockGuard::new(),
+    )
+    .unwrap()
+    .burn_durably(&db.store())
+    .await
+    .unwrap();
+    let flags = InternalFlags::from_map(&std::collections::HashMap::new());
+    let decision = burned.authorize(&flags, true, false, &mut buckets).unwrap();
+    assert_eq!(decision.action, "role.assign");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn failed_nonce_storage_and_incompatible_skew_cannot_grant_authorization() {
+    use two_bot_core::internal_actions::{
+        sign, AuthHeaders, AuthenticatedRequest, ErrorCode, KeyRing,
+    };
+
+    let db = TestDb::new().await;
+    let key = signing_key();
+    let keys = KeyRing::new(vec![key.clone()]);
+    let now = db_now_secs(&db.pool).await as u64;
+    let timestamp = now.to_string();
+    let nonce = body_hash(db.fixture.name().as_bytes())[..32].to_owned();
+    let raw = br#"{"action":"role.assign"}"#;
+    let signature = sign(key.secret.expose(), &timestamp, &nonce, raw);
+    let headers = AuthHeaders {
+        key_id: &key.id,
+        timestamp: &timestamp,
+        nonce: &nonce,
+        signature: &signature,
+    };
+    for skew in [SKEW_SECONDS - 1, SKEW_SECONDS + 1] {
+        let error = AuthenticatedRequest::verify(
+            &headers,
+            raw,
+            &keys,
+            skew,
+            now * 1000,
+            &mut ClockGuard::new(),
+        )
+        .unwrap()
+        .burn_durably(&db.store())
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert_eq!(error.log_reason, "nonce_skew_mismatch");
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM internal_nonces")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+
+    let closed = db.independent_pool().await;
+    closed.close().await;
+    let error = AuthenticatedRequest::verify(
+        &headers,
+        raw,
+        &keys,
+        SKEW_SECONDS,
+        now * 1000,
+        &mut ClockGuard::new(),
+    )
+    .unwrap()
+    .burn_durably(&InternalActionStore::new(closed))
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(error.log_reason, "nonce_store_unavailable");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM internal_nonces")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn staged_authentication_refuses_persisted_db_clock_rollback_after_restart() {
+    use two_bot_core::internal_actions::{
+        sign, AuthHeaders, AuthenticatedRequest, ErrorCode, KeyRing,
+    };
+
+    let db = TestDb::new().await;
+    let store = db.store();
+    let seed_nonce = body_hash(db.fixture.name().as_bytes())[..32].to_owned();
+    let seed_timestamp = db_now_secs(&db.pool).await.to_string();
+    assert!(store
+        .burn_nonce(&seed_nonce, &seed_timestamp)
+        .await
+        .unwrap());
+    let future_ms = store.nonce_high_water_ms().await.unwrap().unwrap() + 300_000;
+    sqlx::query(
+        "UPDATE internal_clock_high_water SET high_water_ms = $1, \
+         observed_at = TO_TIMESTAMP($1::double precision / 1000.0) \
+         WHERE domain = 'internal_nonce_db'",
+    )
+    .bind(future_ms as i64)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let key = signing_key();
+    let keys = KeyRing::new(vec![key.clone()]);
+    let now = db_now_secs(&db.pool).await as u64;
+    let timestamp = now.to_string();
+    let nonce = body_hash(format!("{}-fresh", db.fixture.name()).as_bytes())[..32].to_owned();
+    let raw = br#"{"action":"role.assign"}"#;
+    let signature = sign(key.secret.expose(), &timestamp, &nonce, raw);
+    let headers = AuthHeaders {
+        key_id: &key.id,
+        timestamp: &timestamp,
+        nonce: &nonce,
+        signature: &signature,
+    };
+    let restarted = db.independent_pool().await;
+    // A new process clock must not be seeded from the independent DB domain.
+    // A locally fresh MAC still cannot pass the persisted DB rollback guard.
+    let error = AuthenticatedRequest::verify(
+        &headers,
+        raw,
+        &keys,
+        SKEW_SECONDS,
+        now * 1000,
+        &mut ClockGuard::new(),
+    )
+    .unwrap()
+    .burn_durably(&InternalActionStore::new(restarted.clone()))
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(error.code, ErrorCode::StaleRequest);
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM internal_nonces WHERE nonce_hash = $1")
+            .bind(body_hash(nonce.as_bytes()))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(store.nonce_high_water_ms().await.unwrap(), Some(future_ms));
+    restarted.close().await;
+    db.cleanup().await;
 }
 
 async fn wait_for_uniqueness_lock(db: &TestDb, table: &str) {
@@ -156,6 +462,7 @@ fn subject() -> AuditSubject {
         guild_id: Some(DiscordId::new("123456789012345678").unwrap()),
         actor_id: Some(DiscordId::new("234567890123456789").unwrap()),
         target_id: None,
+        resolved_role_id: None,
     }
 }
 
@@ -164,6 +471,129 @@ fn claimed(result: InternalClaim) -> ExecutionClaim {
         InternalClaim::Claimed(claim) => claim,
         other => panic!("expected committed execution claim, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn proven_unsent_release_retains_binding_and_allows_one_new_owner() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    let id = identity("unsent-key:123", "role.assign", b"payload");
+    let subject = subject();
+    let nonce = "0123456789abcdef0123456789abcdef";
+    let timestamp = db_now_secs(&db.pool).await.to_string();
+    assert!(store.burn_nonce(nonce, &timestamp).await.unwrap());
+    let first = claimed(store.claim(&id, &subject).await.unwrap());
+    let intent_id = first.intent_id();
+    store.release_proven_not_sent(first).await.unwrap();
+    assert!(!store.burn_nonce(nonce, &timestamp).await.unwrap());
+    for changed in [
+        identity("unsent-key:123", "role.assign", b"changed"),
+        identity("unsent-key:123", "guild.add_member", b"payload"),
+    ] {
+        assert!(matches!(
+            store.claim(&changed, &subject).await.unwrap(),
+            InternalClaim::Mismatch
+        ));
+    }
+    let mut remapped = subject.clone();
+    remapped.resolved_role_id = Some(DiscordId::new("345678901234567890").unwrap());
+    assert!(matches!(
+        store.claim(&id, &remapped).await.unwrap(),
+        InternalClaim::Mismatch
+    ));
+    sqlx::query(
+        "UPDATE internal_idempotency SET created_at = clock_timestamp() - interval '1 hour'",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .reconcile(
+                &id,
+                &TerminalResponse::Failure(TerminalFailure::NoEffect),
+                ReconciliationEvidence::ProvenNotSent
+            )
+            .await
+            .unwrap_err(),
+        InternalStoreError::TransitionRefused
+    );
+    let (a, b) = tokio::join!(store.claim(&id, &subject), store.claim(&id, &subject));
+    let winner = match (a.unwrap(), b.unwrap()) {
+        (InternalClaim::Claimed(claim), InternalClaim::InFlight)
+        | (InternalClaim::InFlight, InternalClaim::Claimed(claim)) => claim,
+        other => panic!("expected exactly one new owner: {other:?}"),
+    };
+    assert_eq!(winner.intent_id(), intent_id);
+    // A second no-dispatch release still keeps one audit per intent/phase.
+    store.release_proven_not_sent(winner).await.unwrap();
+    let final_claim = claimed(store.claim(&id, &subject).await.unwrap());
+    store.finish(&final_claim, &success()).await.unwrap();
+    assert!(matches!(
+        store.claim(&id, &subject).await.unwrap(),
+        InternalClaim::Replay(_)
+    ));
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT phase, evidence_code FROM internal_action_log ORDER BY audit_id")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("intent".into(), None),
+            ("released".into(), Some("proven_not_sent".into())),
+            ("terminal".into(), Some("executor".into())),
+        ]
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn unsent_release_refuses_uncertainty_and_rolls_back_with_its_audit() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    let subject = subject();
+    for state in ["unknown", "completed", "stale"] {
+        let id = identity(&format!("unsent-{state}:123"), "role.assign", b"payload");
+        let claim = claimed(store.claim(&id, &subject).await.unwrap());
+        match state {
+            "unknown" => store.mark_unknown(&claim).await.unwrap(),
+            "completed" => store.finish(&claim, &success()).await.unwrap(),
+            "stale" => {
+                sqlx::query("UPDATE internal_idempotency SET created_at = clock_timestamp() - interval '1 hour' WHERE intent_id = $1")
+                    .bind(claim.intent_id()).execute(&db.pool).await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            store.release_proven_not_sent(claim).await.unwrap_err(),
+            InternalStoreError::TransitionRefused
+        );
+        assert!(!matches!(
+            store.claim(&id, &subject).await.unwrap(),
+            InternalClaim::Claimed(_)
+        ));
+    }
+    let id = identity("unsent-rollback:123", "role.assign", b"payload");
+    let claim = claimed(store.claim(&id, &subject).await.unwrap());
+    sqlx::query("ALTER TABLE internal_action_log ADD CONSTRAINT injected_release_failure CHECK (phase <> 'released')")
+        .execute(&db.pool).await.unwrap();
+    assert_eq!(
+        store.release_proven_not_sent(claim).await.unwrap_err(),
+        InternalStoreError::Unavailable
+    );
+    assert!(matches!(
+        store.claim(&id, &subject).await.unwrap(),
+        InternalClaim::InFlight
+    ));
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM internal_action_log WHERE phase = 'released'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+    db.cleanup().await;
 }
 
 fn success() -> TerminalResponse {
@@ -293,6 +723,129 @@ async fn nonce_race_restart_and_expiry_window() {
         Err(InternalStoreError::InvalidInput)
     );
     restarted.close().await;
+    db.cleanup().await;
+}
+
+/// F8 durable fail-closed: accept a capture, expire and replace its nonce,
+/// then regress the DB clock into its signed window. The persisted high-water
+/// mark refuses the rolled-back capture even though the old row is gone — on
+/// the live store and on a fresh store (restart/failover) that re-derives the
+/// mark from the table. Time is injected only through rows the test owns and
+/// the mark table; the server clock is never changed.
+///
+/// DB-time regression is injected by moving the mark row INTO THE FUTURE:
+/// `burn_nonce` reads its commit instant from the real `clock_timestamp()`,
+/// so a mark ~300 s ahead makes the genuine commit instant read as regressed
+/// past the 5 s tolerance — exercising the real in-transaction rollback
+/// branch. Backdating rows alone could never move `clock_timestamp()`.
+#[tokio::test]
+async fn nonce_db_rollback_after_expiry_refuses_capture() {
+    use two_bot_core::clock_guard::{ClockGuard, CLOCK_SKEW_TOLERANCE_MS};
+
+    let db = TestDb::new().await;
+    let store = db.store();
+    let nonce = body_hash(db.fixture.name().as_bytes())[..32].to_owned();
+    let attempt = db_now_secs(&db.pool).await.to_string();
+    assert!(
+        store.burn_nonce(&nonce, &attempt).await.unwrap(),
+        "first burn accepted"
+    );
+    let mark = store
+        .nonce_high_water_ms()
+        .await
+        .unwrap()
+        .expect("first burn persists the high-water mark");
+    // The mark matches DB time to the second (whole-second commit instant).
+    let db_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(
+        (db_ms - mark as i64).abs() <= 2_000,
+        "mark tracks the DB clock: mark={mark} db={db_ms}"
+    );
+
+    // Expire and replace the nonce row so the old capture's only guard is the
+    // mark; a fresh store (new process) sees the same persisted mark.
+    let now = db_now_secs(&db.pool).await.to_string();
+    sqlx::query(
+        "UPDATE internal_nonces SET burned_at = clock_timestamp() - INTERVAL '242 seconds', \
+         expires_at = clock_timestamp() - INTERVAL '1 second'",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let replacement =
+        body_hash(format!("{}-replacement", db.fixture.name()).as_bytes())[..32].to_owned();
+    assert!(
+        store.burn_nonce(&replacement, &now).await.unwrap(),
+        "expired row is replaceable before rollback"
+    );
+
+    // Inject a DB-time regression: advance the mark ~300 s into the future
+    // (keeping `observed_at` consistent with the CHECK) so the next genuine
+    // commit instant reads as regressed past the tolerance. The rolled-back
+    // capture is a FRESH nonce with a FRESH timestamp — only the clock policy
+    // refuses it, proving the rollback branch rather than expiry or staleness.
+    let future_ms: i64 = db_ms + 300_000;
+    sqlx::query(
+        "UPDATE internal_clock_high_water SET high_water_ms = $1, \
+         observed_at = TO_TIMESTAMP($1::double precision / 1000.0) \
+         WHERE domain = 'internal_nonce_db'",
+    )
+    .bind(future_ms)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let regressed_nonce =
+        body_hash(format!("{}-regressed", db.fixture.name()).as_bytes())[..32].to_owned();
+    let regressed_attempt = db_now_secs(&db.pool).await.to_string();
+    assert_eq!(
+        store.burn_nonce(&regressed_nonce, &regressed_attempt).await,
+        Err(InternalStoreError::InvalidInput),
+        "regressed DB clock must refuse even a fresh capture"
+    );
+    // The refused burn left no trace: neither a nonce row nor a mark advance.
+    let nonce_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM internal_nonces WHERE nonce_hash = $1")
+            .bind(body_hash(regressed_nonce.as_bytes()))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(nonce_rows, 0, "refused burn must not insert a nonce row");
+    let mark_after = store.nonce_high_water_ms().await.unwrap();
+    assert_eq!(
+        mark_after,
+        Some(u64::try_from(future_ms).unwrap()),
+        "refused burn must not advance the mark"
+    );
+
+    // A fresh store with an earlier clock and the persisted mark also refuses:
+    // restore the guard from the table exactly as a restarted process would.
+    // The "earlier clock" is real DB time, ~300 s below the injected mark.
+    let persisted = mark_after.expect("mark survives for a restarted process");
+    let mut guard = ClockGuard::restore(persisted);
+    let earlier = u64::try_from(db_ms).unwrap();
+    assert!(earlier + CLOCK_SKEW_TOLERANCE_MS < persisted);
+    let err = guard.evaluate(earlier).expect_err(
+        "new process with an earlier clock and the persisted mark refuses old captures",
+    );
+    assert_eq!(err.high_water_ms, persisted);
+
+    // Forward DB time still behaves as before: clear the injected future mark
+    // and a fresh capture burns.
+    sqlx::query("DELETE FROM internal_nonces")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM internal_clock_high_water WHERE domain = 'internal_nonce_db'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let fresh_nonce = body_hash(format!("{}-fresh", db.fixture.name()).as_bytes())[..32].to_owned();
+    let fresh = db_now_secs(&db.pool).await.to_string();
+    assert!(store.burn_nonce(&fresh_nonce, &fresh).await.unwrap());
     db.cleanup().await;
 }
 
