@@ -2581,18 +2581,18 @@
           "[edaf2dd](https://github.com/TogetherWeOwn/two-bot/commit/edaf2dd930c7bcb22b4f02e5f9f112b5ab420577)",
           "`src/analytics/`, `src/core/`",
           "TOG-5684: enforce startKnown:false exclusion from duration averages",
-          "carded"
+          "gap"
         ]
       },
       "owner": [
-        "TOG-11152"
+        "TOG-15338"
       ],
-      "status": "waived",
-      "action": "Run the duration averages in TOG-11152’s report on a fixture mixing known and startKnown:false sessions.",
-      "expected": "Averages exclude startKnown:false sessions; those sessions are still counted as unknown.",
-      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "manual",
+      "action": "Run the offline core duration fixtures in crates/core/src/voice.rs; keep the full-row report-consumer verification manual until [TOG-15338](/TOG/issues/TOG-15338) supplies its integration receipt, not proven by these fixtures.",
+      "expected": "Known 60 / unknown 600 averages to 60 (removing the start-known filter yields 330). Mixed numeric/numeric-string metadata averages to 60 with measured=2 and excluded_unknown_starts=4. Invalid-only metadata yields no average and measured=0, not fabricated zeroes. Finite decimal numeric strings are supported; legacy JavaScript coercions of empty strings, booleans, containers and radix-prefixed strings are explicitly rejected.",
+      "evidence": "Attach exact-head CI/local results for averages_filter_on_flag_not_null, metadata_average_excludes_unknown_numbers_and_numeric_strings, metadata_numbers_and_numeric_strings_enter_known_average and metadata_invalid_durations_never_become_measured_zeroes. Independent review must accept the documented strict parsing boundary. Core-only evidence does not promote this gap while its report consumer is absent from main; no staging/production access or acceptance claim.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib voice::tests::",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — preserve the separate exact-SHA voice receipt gate; offline duration fixtures are not staging acceptance."
     },
     {
       "id": "s13-59965d0",

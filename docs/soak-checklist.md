@@ -1298,13 +1298,13 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-edaf2dd: edaf2dd — TOG-5684: enforce startKnown:false exclusion from duration averages
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Run the duration averages in TOG-11152’s report on a fixture mixing known and startKnown:false sessions.
-- **Expected:** Averages exclude startKnown:false sessions; those sessions are still counted as unknown.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
-- **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Method:** `manual` (not an execution verdict).
+- **Action:** Run the offline core duration fixtures in crates/core/src/voice.rs; keep the full-row report-consumer verification manual until [TOG-15338](/TOG/issues/TOG-15338) supplies its integration receipt, not proven by these fixtures.
+- **Expected:** Known 60 / unknown 600 averages to 60 (removing the start-known filter yields 330). Mixed numeric/numeric-string metadata averages to 60 with measured=2 and excluded_unknown_starts=4. Invalid-only metadata yields no average and measured=0, not fabricated zeroes. Finite decimal numeric strings are supported; legacy JavaScript coercions of empty strings, booleans, containers and radix-prefixed strings are explicitly rejected.
+- **Evidence:** Attach exact-head CI/local results for averages_filter_on_flag_not_null, metadata_average_excludes_unknown_numbers_and_numeric_strings, metadata_numbers_and_numeric_strings_enter_known_average and metadata_invalid_durations_never_become_measured_zeroes. Independent review must accept the documented strict parsing boundary. Core-only evidence does not promote this gap while its report consumer is absent from main; no staging/production access or acceptance claim.
+- **Owner:** [TOG-15338](/TOG/issues/TOG-15338)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib voice::tests::
+- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — preserve the separate exact-SHA voice receipt gate; offline duration fixtures are not staging acceptance.
 
 ### s13-59965d0: 59965d0 — TOG-5981: serialize same-member voice frames, scope voice idempotency keys by channel
 
