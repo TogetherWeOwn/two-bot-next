@@ -730,7 +730,7 @@ async fn joining_a_channel_that_is_not_a_creator_never_creates_a_room() {
         .voice_update(MEMBER, Some(LOBBY), Some(false))
         .expect("ticket for a joined channel");
     assert_eq!(ticket.creator_id, LOBBY);
-    assert!(!worker.accept_join(ticket, "lobby room".to_owned(), 7, NOW.to_owned()));
+    assert!(!worker.accept_join(ticket, "lobby room", 7, NOW.to_owned()));
     assert!(!worker.dispatch_one(0).await);
     assert!(worker.creations.is_empty());
     assert!(worker.tracked().is_empty());
@@ -754,7 +754,7 @@ async fn a_guild_without_creator_channels_never_creates_a_room() {
         .live
         .voice_update(MEMBER, Some(CREATOR), Some(false))
         .expect("ticket for a joined channel");
-    assert!(!worker.accept_join(ticket, "new room".to_owned(), 7, NOW.to_owned()));
+    assert!(!worker.accept_join(ticket, "new room", 7, NOW.to_owned()));
     assert!(!worker.dispatch_one(0).await);
     assert!(worker.tracked().is_empty());
     assert!(worker.failures().is_empty());
