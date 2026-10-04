@@ -1084,6 +1084,35 @@ mod tests {
     }
 
     #[test]
+    fn vote_kick_enforcement_needs_view_manage_roles_and_move() {
+        use twilight_model::guild::Permissions;
+        const REQUIRED: Permissions = Permissions::VIEW_CHANNEL
+            .union(Permissions::MANAGE_ROLES)
+            .union(Permissions::MOVE_MEMBERS);
+        // All three bits present allows; extra bits do not deny.
+        assert!(can_enforce_kick(Some(REQUIRED)));
+        assert!(can_enforce_kick(Some(REQUIRED.union(Permissions::CONNECT))));
+        assert!(can_enforce_kick(Some(Permissions::all())));
+        // Fail closed on missing snapshots or empty permissions.
+        assert!(!can_enforce_kick(None));
+        assert!(!can_enforce_kick(Some(Permissions::empty())));
+        // Each missing bit denies.
+        assert!(!can_enforce_kick(Some(
+            Permissions::MANAGE_ROLES.union(Permissions::MOVE_MEMBERS)
+        )));
+        assert!(!can_enforce_kick(Some(
+            Permissions::VIEW_CHANNEL.union(Permissions::MOVE_MEMBERS)
+        )));
+        assert!(!can_enforce_kick(Some(
+            Permissions::VIEW_CHANNEL.union(Permissions::MANAGE_ROLES)
+        )));
+        // Single bits alone deny.
+        assert!(!can_enforce_kick(Some(Permissions::VIEW_CHANNEL)));
+        assert!(!can_enforce_kick(Some(Permissions::MANAGE_ROLES)));
+        assert!(!can_enforce_kick(Some(Permissions::MOVE_MEMBERS)));
+    }
+
+    #[test]
     fn rate_limits_preserve_fractional_retry_after_and_global_scope() {
         assert_eq!(
             classify_response(429, br#"{"retry_after":1.2345,"global":true}"#),

@@ -30,6 +30,9 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `job_consecutive_failures:<job>` | 3 failed completions in a row | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-failures) |
 | `rest_429_rate` | 429s above 10% of REST requests between samples (min 10 requests; restarts skip the window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-429) |
 | `db_pool_saturated` | pool at max with zero idle for 3 consecutive samples | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-db-pool) |
+| `db_errors` | 3 or more storage-layer errors between samples (restarts skip the window; currently counts send-admission SQL) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-db-errors) |
+| `send_admission_blocked` | new send-admission refusals in 3 consecutive windows | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-send-admission-blocked) |
+| `voice_failures` | room-op failures > 5% of >= 10 ops between samples, or any new dead-letter/orphan | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-failures) |
 
 Out of scope for paging (log-only findings, still recorded on the watch log):
 gateway session starts, handler-latency quantiles, unban-queue depth via
@@ -134,9 +137,11 @@ cutover execution thread, not blockers on this sheet.
   the live page needs the governed operator path.
 - No external uptime check covers a missing Worker/alarm or a total
   monitoring outage; the keepalive only watches a running loop.
-- No database error counter exists (the pool rule is a proxy) and no
-  send-admission series is alerted; both need the metric series first,
-  then a rule.
+- The DB-error counter and send-admission series now page (`db_errors`,
+  `send_admission_blocked`); residual: only send-admission SQL reports
+  `db_errors` so far, other stores adopt the counter incrementally, and a
+  slow error trickle below threshold stays silent by design (job-failure
+  rules cover it).
 - Webhook delivery is at most once per transition with no retry; a
   crash between persistence and notification loses that page.
 - Voice room-operation budgets consume lifecycle outcome signals that
