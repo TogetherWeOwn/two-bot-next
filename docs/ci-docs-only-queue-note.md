@@ -6,7 +6,7 @@ No workflow changed in this note.
 Status: the SBOM gate this note first pointed at shipped as #522 while
 the note was in review. Sections marked "pre-#522" describe the sampled
 runs; "post-#522" is one later observation. The recommended slice below
-is the next one, not the shipped one.
+shipped with the `check` lane split; see "Update: lane split" at the end.
 
 ## Method
 
@@ -141,3 +141,45 @@ Run `check` in parallel with the DB and SBOM jobs.
 Not recommended as its own slice: the remaining docs-only `check`
 set-up (about 1 min of container and service start). It is real but
 small next to the code-PR serialization above.
+
+## Update: lane split
+
+The slice above shipped together with a split of the `check` job. `check`
+is now the lint lane (offline guards, cargo-deny, fmt, both clippy runs)
+and three more jobs run beside it: `rust-tests` (unit, binary,
+integration, property and doc tests), `ignored-db-stores` and
+`ignored-db-runtime` (the `--ignored` database suites, and the two backup
+CLI regressions in the stores lane). Every lane needs only `job-inputs`;
+`ci-ok` and `required-checks` gate all of them, and
+`scripts/ci/test_required_checks.py` runs both aggregators for every job,
+result and selector combination.
+
+Median over the runs below, queue wait excluded (job `started_at` to
+`completed_at`; run wall clock is the first job start to `ci-ok` done):
+
+| | Before | After |
+|---|---|---|
+| `check` job | 20.4 min (27 code runs, 08:20Z to 09:40Z on 2026-10-04) | 3.6 min |
+| Longest job on the critical path | 20.4 min (`check`) | 9.4 min (`rust tests`) |
+| Other lanes | | `ignored db (runtime)` 8.1 min, `ignored db (stores)` 5.8 min |
+| Run wall clock | 27.6 min | 9.6 min |
+| Docs-only run wall clock | about 2 min | about 1.5 min |
+
+After: three runs of the split on one head (a pull-request run, its re-run,
+and a manual dispatch): `rust tests` 9.4, 9.4 and 9.3 min; run wall clock
+9.7, 9.6 and 9.5 min. The cargo cache key of the test lanes is the one the
+old `check` job used, so those lanes started warm. The lint lane has a new
+cache entry that main pushes will fill; its 3.1 to 4.0 min is a cold-cache
+figure.
+
+Probes on the split workflow: a docs-only change gets a green `ci-ok` with
+the three test lanes skipped at the job level, and forcing a lane to fail
+turns `ci-ok` and `required checks` red with the lane named in the log.
+
+Costs and limits: total runner time per code run rises from about 20.4 to
+about 27 min because each lane sets up its own container, service and
+toolchain (hosted minutes for this public repo are free). The critical path
+is now `rust tests`, where compiling and linking the integration binaries is
+about 355 s; sharding those binaries is the next lever. Reconciling the
+`REQUIRED` set in `test_required_checks.py` with the ruleset (`ci-ok`) is not
+part of this change.

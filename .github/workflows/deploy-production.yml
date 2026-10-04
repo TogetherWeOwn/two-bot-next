@@ -2,8 +2,8 @@ name: deploy-production
 
 # Production deploy and rollback for the B4 cutover (TOG-9699). Dispatch only:
 # never runs on push, pull_request, schedule or another workflow's completion.
-# The guard job refuses a SHA that is not on main with green `check` and
-# `worker check` runs and a successful deploy-staging run. It also refuses
+# The guard job refuses a SHA that is not on main with a successful full
+# `ci-ok` verdict, `worker check` and a successful deploy-staging run. It also refuses
 # when the `production` Environment is missing or unprotected: a job that
 # names a missing Environment makes GitHub create it with no reviewers, which
 # would remove the human gate. Runbook: docs/production-deploy.md.
@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: "Full 40-hex commit on main with green check and deploy-staging"
+        description: "Full 40-hex commit on main with green ci-ok, worker check and deploy-staging"
         required: true
         type: string
       rollback:
@@ -35,7 +35,7 @@ jobs:
     permissions:
       contents: read # compare API: ancestry of the SHA on main
       actions: read # deploy-staging runs and the Environment's protection
-      checks: read # `check` and `worker check` runs on the SHA
+      checks: read # full `ci-ok` verdict and `worker check` runs on the SHA
     outputs:
       sha: ${{ steps.guard.outputs.sha }}
       mode: ${{ steps.guard.outputs.mode }}
@@ -57,9 +57,10 @@ jobs:
           version = os.environ.get("ROLLBACK", "").strip().lower()
           mode = "rollback" if version else "deploy"
           # Only GitHub Actions may vouch for a check run: another app with
-          # checks:write could otherwise post a green run named `check`.
+          # checks:write could otherwise post a green run named `ci-ok`.
+          # `check` is lint-only; `ci-ok` gates all selected test lanes too.
           ACTIONS_APP_ID = "15368"
-          REQUIRED_CHECKS = ("check", "worker check")
+          REQUIRED_CHECKS = ("ci-ok", "worker check")
 
           def refuse(reason):
               print(f"::error::Refusing production {mode}: {reason}")
@@ -94,8 +95,11 @@ jobs:
                   f"repos/{repo}/commits/{sha}/check-runs", f"the `{name}` check runs",
                   check_name=name, app_id=ACTIONS_APP_ID, filter="latest", per_page="100",
               ).get("check_runs", [])
-              if not runs or any(run.get("conclusion") != "success" for run in runs):
-                  refuse(f"`{name}` has no successful run on {sha}")
+              if not runs or any(
+                  run.get("status") != "completed" or run.get("conclusion") != "success"
+                  for run in runs
+              ):
+                  refuse(f"`{name}` has no successful completed run on {sha}")
 
           staged = api(
               f"repos/{repo}/actions/workflows/deploy-staging.yml/runs", "deploy-staging runs",
@@ -127,7 +131,7 @@ jobs:
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write(
                   f"### Production {mode} guard passed\n\n"
-                  f"- SHA: `{sha}` (on main; `check`, `worker check` and deploy-staging green)\n"
+                  f"- SHA: `{sha}` (on main; full `ci-ok` verdict, `worker check` and deploy-staging green)\n"
                   f"- Environment: `production`, {reviewers} required reviewer(s), main only\n"
                   + (f"- Rollback target: `{version}`\n" if version else "")
               )

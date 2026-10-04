@@ -298,30 +298,34 @@ class SupplyChainTests(unittest.TestCase):
 
     def test_required_check_rejects_every_non_success_scan_result(self):
         workflow = (ROOT / ".github/workflows/check.yml").read_text()
-        job = workflow.split("\n  check:\n", 1)[1]
-        # CI standard rule 6 (TOG-14881): the supply-chain gate is
-        # selector-aware like the self-role/parity gates -- it rejects a
+        job = workflow.split("\n  ci-ok:\n", 1)[1]
+        # CI standard rule 6: the supply-chain gate is selector-aware like the
+        # self-role/parity gates -- the required `ci-ok` aggregator rejects a
         # failed, skipped or cancelled scan when `supply` was selected, and
         # only tolerates the skip the selector itself produced (a `skipped`
         # result with `supply == 'false'`). No other exception may hide a
-        # scan result.
-        self.assertIn("needs: [self-role-store, supply-chain, parity-docs, job-inputs]", job)
+        # scan result. (The lint lane `check` no longer waits on the scan, so
+        # the aggregators own this gate.)
+        self.assertIn("supply-chain", job.split("steps:", 1)[0])
         self.assertIn("if: ${{ always() }}", job)
-        guard = re.search(r"- name: require supply-chain gate to pass\n\s+if: ([^\n]*)\n\s+run: exit 1", job)
-        self.assertIsNotNone(guard)
-        self.assertEqual(guard[1], "needs.supply-chain.result != 'success' "
-                                   "&& needs.job-inputs.outputs.supply != 'false'")
+        self.assertIn("SUPPLY_CHAIN_RESULT: ${{ needs.supply-chain.result }}", job)
+        self.assertIn("SUPPLY_SELECTED: ${{ needs.job-inputs.outputs.supply }}", job)
+        script = job.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
+        script = "\n".join(line[10:] for line in script.splitlines())
         for scan, selected, fail in [
                 ("success", "true", False), ("failure", "true", True),
                 ("skipped", "true", True), ("cancelled", "true", True),
-                ("success", "false", False), ("failure", "false", False),
-                ("skipped", "false", False), ("cancelled", "false", False)]:
+                ("success", "false", False), ("failure", "false", True),
+                ("skipped", "false", False), ("cancelled", "false", True)]:
             with self.subTest(scan=scan, selected=selected):
-                condition = guard[1].replace(
-                    "needs.supply-chain.result", f"'{scan}'").replace(
-                    "needs.job-inputs.outputs.supply", f"'{selected}'")
-                result = subprocess.run(["bash", "-c", f"if [[ {condition} ]]; then exit 1; fi"])
-                self.assertEqual(result.returncode, 1 if fail else 0)
+                env = {"PATH": os.environ["PATH"], "JOB_INPUTS_RESULT": "success",
+                       "SUPPLY_CHAIN_RESULT": scan, "SUPPLY_SELECTED": selected,
+                       # Every other gate is green and selected, or skipped and deselected.
+                       "CHECK_RESULT": "success"}
+                for var in re.findall(r"^\s+(\w+_RESULT): \$\{\{", job, re.M):
+                    env.setdefault(var, "success")
+                result = subprocess.run(["python3", "-c", script], env=env, capture_output=True)
+                self.assertEqual(result.returncode, 1 if fail else 0, result.stdout.decode())
 
     def test_shared_gate_and_dry_run_publication_guards(self):
         supply = (ROOT / ".github/workflows/sbom.yml").read_text()

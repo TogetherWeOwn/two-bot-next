@@ -29,8 +29,12 @@ deploy job can run. This repository is public, so required reviewers work on
 every plan; no Enterprise plan is needed.
 
 **Deploy.** Dispatch with `sha` set to a full 40-character commit that is on
-`main`. That commit needs green `check` and `worker check` runs (from GitHub
-Actions) and a successful `deploy-staging` run. Staging runs queue in a single
+`main`. That commit needs successful, completed `ci-ok` and `worker check`
+runs from GitHub Actions and a successful `deploy-staging` run. `ci-ok` is the
+full verdict over lint, worker checks and every selected Rust/DB test lane;
+a green lint-only `check` job is not enough. The guard reads the latest runs
+for that exact SHA with the GitHub Actions App filter and refuses missing,
+pending, failed, cancelled or skipped verdicts. Staging runs queue in a single
 concurrency group, so an intermediate commit may never stage. Pick one that did.
 After the reviewer approves, the job:
 

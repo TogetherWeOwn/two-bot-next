@@ -795,5 +795,5 @@ and malformed-alias fixtures verify refusal.
 It runs in `worker check` without credentials or deployed services. It verifies
 command existence, **not authorization, successful deployment, backup custody,
 Discord effects, or a live rollback**. Required exact-head merge gates remain
-`check` (fmt, clippy -D warnings, tests, cargo-deny), `worker check`, `pr-lint`,
-and `gitleaks`; a docs test is not a waiver.
+`ci-ok` (the full verdict over lint, worker checks and all selected Rust/DB test
+lanes), `worker check`, `pr-lint`, and `gitleaks`; a docs test is not a waiver.

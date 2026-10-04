@@ -15,7 +15,10 @@ JOB_INVENTORY = {
                   "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "required-checks",
                   # TOG-14881: CI standard aggregator; required-checks stays
                   # until the protect-main ruleset flips to ci-ok.
-                  "ci-ok"},
+                  "ci-ok",
+                  # `check` is now the lint lane; the test steps it used to
+                  # carry run in these three parallel lanes, all gated by ci-ok.
+                  "rust-tests", "ignored-db-stores", "ignored-db-runtime"},
     "deploy-production.yml": {"guard", "production"},
     "deploy-staging.yml": {"deploy"},
     "nightly.yml": {"pipeline-benchmark", "advisories", "sweep"},

@@ -52,6 +52,15 @@ Never bypass or weaken a check.
 
 `check`, `worker check`, `gitleaks` and `pr-lint` are required checks on `main`.
 
+`check.yml` runs its Rust work as parallel lanes that all start once `job-inputs`
+finishes: `check` (lint: offline guards, cargo-deny, fmt, clippy), `rust tests`
+(unit, integration and doc tests) and two database lanes, `ignored db (stores)`
+and `ignored db (runtime)`. The `ci-ok` aggregate waits on every lane, on
+`worker check`, on the SBOM dry-run and on the standalone database jobs. A job
+added to `check.yml` must also go into the `needs:` list, the result env and the
+gated list of both `ci-ok` and `required-checks`, or it becomes a false gate;
+`scripts/ci/test_required_checks.py` fails when one is missing.
+
 ### Issues
 
 Use an issue form: bug report, feature request, enhancement or documentation

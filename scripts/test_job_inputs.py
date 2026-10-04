@@ -460,8 +460,10 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertIn("test_job_inputs.py", self.selector)
 
     def test_consumer_jobs_wait_on_selector(self):
-        for job in ("check", "community-db", "feeds-db", "tickets-postgres",
-                    "worker", "required-checks", "supply-chain", "ci-ok"):
+        for job in ("check", "rust-tests", "ignored-db-stores",
+                    "ignored-db-runtime", "community-db", "feeds-db",
+                    "tickets-postgres", "worker", "required-checks",
+                    "supply-chain", "ci-ok"):
             head = self.text.split(f"\n  {job}:")[1].split("steps:", 1)[0]
             with self.subTest(job=job):
                 self.assertIn("job-inputs", head)
@@ -472,14 +474,16 @@ class WorkflowSurfaceTests(unittest.TestCase):
         head = self.text.split("\n  supply-chain:")[1].split("steps:", 1)[0]
         self.assertIn("needs.job-inputs.outputs.supply != 'false'", head)
 
-    def test_check_job_supply_guard_is_conditional(self):
-        # A skipped supply-chain job must not fail the always-run `check`
-        # job; the guard only enforces the gate when supply was selected.
-        body = self.text.split("\n  check:", 1)[1].split(
-            "\n  parity-docs:", 1)[0]
+    def test_ci_ok_supply_gate_is_conditional(self):
+        # A skipped supply-chain job must not fail the aggregator; the gate
+        # only tolerates the skip the selector itself produced. (The old
+        # per-job guard in `check` was dropped when `check` stopped waiting
+        # on the slow jobs; scripts/ci/test_required_checks.py executes the
+        # aggregator for every result/selector combination.)
+        body = self.text.split("\n  ci-ok:")[1]
         self.assertIn(
-            "needs.supply-chain.result != 'success' "
-            "&& needs.job-inputs.outputs.supply != 'false'", body)
+            '("supply-chain", "SUPPLY_CHAIN_RESULT", "SUPPLY_SELECTED")', body)
+        self.assertIn('result == "skipped" and not selected(sel_var)', body)
 
     def test_ci_ok_aggregator_exists_and_is_always_run(self):
         # CI standard rule 3 (TOG-14881): one required aggregator named
@@ -487,7 +491,8 @@ class WorkflowSurfaceTests(unittest.TestCase):
         # job succeeded or was legitimately skipped.
         head = self.text.split("\n  ci-ok:")[1].split("steps:", 1)[0]
         self.assertIn("always()", head)
-        for job in ("job-inputs", "supply-chain", "check", "worker",
+        for job in ("job-inputs", "supply-chain", "check", "rust-tests",
+                    "ignored-db-stores", "ignored-db-runtime", "worker",
                     "parity-docs", "self-role-store", "community-db",
                     "feeds-db", "tickets-postgres", "moderation-db"):
             self.assertIn(job, head)
@@ -545,16 +550,26 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertGreaterEqual(len(gated), 10)
 
     @staticmethod
-    def check_job_steps(text):
-        """Yield (name, body) for each `check` job step; comments dropped."""
-        body = text.split("\n  check:", 1)[1].split("\n  parity-docs:", 1)[0]
-        body = body.split("\n    steps:\n", 1)[1]
+    def job_text(text, job):
+        """One top-level job block: its header line down to the next job."""
+        body = text.split(f"\n  {job}:\n", 1)[1]
+        return re.split(r"(?m)^  [A-Za-z0-9_-]+:\s*$", body, maxsplit=1)[0]
+
+    @classmethod
+    def job_steps(cls, text, job):
+        """Yield (name, body) for each step of one job; comments dropped."""
+        body = cls.job_text(text, job).split("\n    steps:\n", 1)[1]
         for block in re.split(r"(?m)^      - (?=\S)", body)[1:]:
             lines = [line for line in block.splitlines()
                      if not line.lstrip().startswith("#")]
             name = re.search(r"name:\s*(.+)", "\n".join(lines))
             yield (name.group(1).strip() if name else lines[0].strip(),
                    "\n".join(lines))
+
+    # The `check` lane always runs, so its Rust/DB steps carry the selector
+    # guard per step; the three Rust test lanes skip at the job level instead.
+    RUST_LANES = ("rust-tests", "ignored-db-stores", "ignored-db-runtime")
+    LANE_GUARD = "if: needs.job-inputs.outputs.rust != 'false'"
 
     # What a step must not do on a rust=false PR: that run never installs the
     # toolchain (no `cargo`) and never creates `two_bot_test_ci`, so any step
@@ -569,42 +584,52 @@ class WorkflowSurfaceTests(unittest.TestCase):
     # service; they never need the toolchain or the CI database.
     ALWAYS_ON = ("Job-container prerequisites",)
 
+    def unguarded(self, text, job):
+        return [name for name, body in self.job_steps(text, job)
+                if not name.startswith(self.ALWAYS_ON)
+                and self.NEEDS_RUST.search(body)
+                and not re.search(r"(?m)^\s+if:.*needs\.job-inputs\.outputs\.rust != 'false'", body)]
+
     def test_every_rust_or_db_step_in_check_job_is_gated(self):
-        steps = list(self.check_job_steps(self.text))
-        self.assertGreater(len(steps), 40, "step parser lost the check job")
-        for name, body in steps:
-            if name.startswith(self.ALWAYS_ON) or not self.NEEDS_RUST.search(body):
-                continue
-            with self.subTest(step=name):
-                self.assertRegex(
-                    body,
-                    r"(?m)^\s+if:.*needs\.job-inputs\.outputs\.rust != 'false'",
-                    f"{name!r} needs the Rust toolchain or the CI database "
-                    "but is not guarded by the rust selector")
+        steps = list(self.job_steps(self.text, "check"))
+        self.assertGreater(len(steps), 20, "step parser lost the check job")
+        self.assertEqual(self.unguarded(self.text, "check"), [],
+                         "needs the Rust toolchain or the CI database but is not "
+                         "guarded by the rust selector")
+
+    def test_rust_test_lanes_skip_at_the_job_level(self):
+        # No Rust inputs (docs-only, worker-UI-only): the lanes never start,
+        # so no runner, container or service is spent; ci-ok accepts the skip
+        # only because the selector deselected them.
+        for job in self.RUST_LANES:
+            with self.subTest(job=job):
+                head = self.job_text(self.text, job).split("\n    steps:\n", 1)[0]
+                self.assertIn(f"\n    {self.LANE_GUARD}\n", head)
+                self.assertGreater(len(list(self.job_steps(self.text, job))), 10)
+                for name, body in self.job_steps(self.text, job):
+                    self.assertNotRegex(
+                        body, r"(?m)^\s+if:.*outputs\.rust",
+                        f"{name!r}: the lane is already gated at the job level")
 
     def test_guard_scan_flags_an_unguarded_db_step(self):
-        # Self-test of the scan: dropping the guard on the step that failed
-        # PR #346 must be caught, and the real step must satisfy it.
-        needle = "      - name: Durable Discord send admission"
-        head, tail = self.text.split(needle, 1)
-        step, rest = tail.split("\n      - name:", 1)
+        # Self-test of the scan: dropping the guard on a step that needs the
+        # toolchain must be caught, and the real step must satisfy it.
+        step = "      - name: channel moderation store clippy\n"
         guard = "        if: needs.job-inputs.outputs.rust != 'false'\n"
-        self.assertIn(guard, step)
-        weakened = head + needle + step.replace(guard, "") + "\n      - name:" + rest
-        flagged = [name for name, body in self.check_job_steps(weakened)
-                   if self.NEEDS_RUST.search(body)
-                   and not re.search(r"(?m)^\s+if:.*outputs\.rust != 'false'", body)]
-        self.assertEqual(
-            flagged, ["Durable Discord send admission (isolated DBs and mock HTTP only)"])
+        self.assertIn(step + guard, self.text)
+        weakened = self.text.replace(step + guard, step)
+        self.assertEqual(self.unguarded(weakened, "check"),
+                         ["channel moderation store clippy"])
 
-    def test_check_job_needs_parity_docs(self):
-        head = self.text.split("\n  check:")[1].split("steps:", 1)[0]
-        self.assertIn("parity-docs", head)
-        self.assertIn("always()", head)
-
-    def test_check_job_still_needs_self_role_store(self):
-        head = self.text.split("\n  check:")[1].split("steps:", 1)[0]
-        self.assertIn("self-role-store", head)
+    def test_check_lanes_start_with_the_selector_not_behind_slow_jobs(self):
+        # The lint lane and the three test lanes run in parallel: each waits
+        # on the selector only, never on the SBOM scan or the DB jobs (the old
+        # `check` started a median ~7.8 min after the run began because it
+        # waited on them). The aggregators carry those gates instead.
+        for job in ("check", *self.RUST_LANES):
+            with self.subTest(job=job):
+                head = self.job_text(self.text, job)
+                self.assertRegex(head, r"(?m)^    needs: \[job-inputs\]$")
 
     def test_push_to_main_selects_everything(self):
         self.assertIn("pull_request", self.selector)
