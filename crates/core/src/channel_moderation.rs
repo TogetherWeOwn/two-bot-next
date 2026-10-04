@@ -112,8 +112,9 @@ pub struct LockdownRecord {
     pub prior_exists: bool,
     pub reason: String,
     /// Opaque recovery generation assigned by the store at insert time.
-    /// Repeated lockdowns preserve the original generation alongside the
-    /// original seed; cleanup must present it so a delayed unlock cannot
+    /// Repeated lockdowns preserve the generation while the live send deny
+    /// remains set; a new lock cycle refreshes it alongside the seed.
+    /// Cleanup must present it so a delayed unlock cannot
     /// delete a later lockdown cycle's recovery state. The runtime caller is
     /// responsible for serializing channel-scoped mutations (claim tokens
     /// fence only the request ledger, not this recovery row); this token
@@ -127,7 +128,8 @@ pub struct LockdownPlan {
     pub write: EveryoneOverwrite,
 }
 
-/// Insert-only recovery state: repeated lockdowns must preserve the first seed.
+/// Live pre-lock recovery state. Preserve the first seed while the send deny
+/// remains set; refresh it if an external edit has ended that lock cycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockdownSeed {
     pub prior_allow: String,
@@ -167,20 +169,35 @@ pub enum UnlockError {
     NotLocked,
     #[error(transparent)]
     InvalidMask(#[from] MaskError),
+    #[error("The channel overwrite changed since lockdown; no mutation attempted. Reconcile its SEND_MESSAGES permissions before unlocking.")]
+    Drift,
 }
 
-/// Restore only recorded state. An unlocked/untracked channel refuses without
-/// changing permissions; do not guess at or clear an unrelated moderator deny.
-pub fn plan_unlock(recorded: Option<&LockdownRecord>) -> Result<UnlockPlan, UnlockError> {
+/// Undo only the recorded SEND_MESSAGES change in a freshly read overwrite.
+/// Preserve all other live bits, including denies added since lockdown. Refuse
+/// if the live send bits no longer match our lock, rather than guessing who owns
+/// the edit. Delete an originally absent entry only if no other bits remain.
+pub fn plan_unlock(
+    recorded: Option<&LockdownRecord>,
+    current: Option<&EveryoneOverwrite>,
+) -> Result<UnlockPlan, UnlockError> {
     let rec = recorded.ok_or(UnlockError::NotLocked)?;
-    if !rec.prior_exists {
+    let prior_allow = parse_mask(&rec.prior_allow)?;
+    let prior_deny = parse_mask(&rec.prior_deny)?;
+    let current = current.ok_or(UnlockError::Drift)?;
+    let allow = parse_mask(&current.allow)?;
+    let deny = parse_mask(&current.deny)?;
+    if allow & SEND_MESSAGES_BIT != 0 || deny & SEND_MESSAGES_BIT == 0 {
+        return Err(UnlockError::Drift);
+    }
+    let allow = (allow & !SEND_MESSAGES_BIT) | (prior_allow & SEND_MESSAGES_BIT);
+    let deny = (deny & !SEND_MESSAGES_BIT) | (prior_deny & SEND_MESSAGES_BIT);
+    if !rec.prior_exists && allow == 0 && deny == 0 {
         return Ok(UnlockPlan::DeleteOverwrite);
     }
-    parse_mask(&rec.prior_allow)?;
-    parse_mask(&rec.prior_deny)?;
     Ok(UnlockPlan::Restore {
-        allow: rec.prior_allow.clone(),
-        deny: rec.prior_deny.clone(),
+        allow: allow.to_string(),
+        deny: deny.to_string(),
     })
 }
 
@@ -295,7 +312,7 @@ mod tests {
             );
             let rec = recorded(&plan.seed.prior_allow, &plan.seed.prior_deny, true);
             assert_eq!(
-                plan_unlock(Some(&rec)),
+                plan_unlock(Some(&rec), Some(&plan.write)),
                 Ok(UnlockPlan::Restore {
                     allow: original.allow,
                     deny: original.deny,
@@ -317,7 +334,7 @@ mod tests {
         );
         assert_eq!(plan.write, overwrite("0", "2048"));
         assert_eq!(
-            plan_unlock(Some(&recorded("0", "0", false))),
+            plan_unlock(Some(&recorded("0", "0", false)), Some(&plan.write)),
             Ok(UnlockPlan::DeleteOverwrite)
         );
     }
@@ -332,17 +349,23 @@ mod tests {
 
     #[test]
     fn unlock_of_unlocked_channel_refuses_without_permission_changes() {
-        assert_eq!(plan_unlock(None), Err(UnlockError::NotLocked));
+        assert_eq!(plan_unlock(None, None), Err(UnlockError::NotLocked));
     }
 
     #[test]
     fn unlock_rejects_corrupt_recorded_masks() {
         assert_eq!(
-            plan_unlock(Some(&recorded("bad", "0", true))),
+            plan_unlock(
+                Some(&recorded("bad", "0", true)),
+                Some(&overwrite("0", "2048"))
+            ),
             Err(UnlockError::InvalidMask(MaskError))
         );
         assert_eq!(
-            plan_unlock(Some(&recorded("0", "bad", true))),
+            plan_unlock(
+                Some(&recorded("0", "bad", true)),
+                Some(&overwrite("0", "2048"))
+            ),
             Err(UnlockError::InvalidMask(MaskError))
         );
     }

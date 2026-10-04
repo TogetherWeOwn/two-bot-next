@@ -1151,22 +1151,33 @@ async fn one_rooms_refused_delete_does_not_stop_the_sweep_of_other_empty_rooms()
     dispatch(&mut worker, 0).await;
     dispatch(&mut worker, 1).await;
     let calls = trace.lock().unwrap().clone();
-    assert!(calls.contains(&"delete:500".to_owned()), "{calls:?}");
-    assert!(calls.contains(&"delete:501".to_owned()), "{calls:?}");
-    let forgotten: Vec<_> = calls
+    // The mock records `delete:<id>` before it consumes the queued error, so
+    // the first delete attempt is the injected 403: the refused room comes from
+    // the injection, never from which room happened to survive.
+    let deletes: Vec<&String> = calls
+        .iter()
+        .filter(|call| call.starts_with("delete:"))
+        .collect();
+    assert_eq!(deletes.len(), 2, "each room gets one delete: {calls:?}");
+    let refused: u64 = deletes[0]
+        .trim_start_matches("delete:")
+        .parse()
+        .expect("delete trace carries a channel id");
+    let swept = if refused == 500 { 501 } else { 500 };
+    assert_eq!(*deletes[1], format!("delete:{swept}"), "{calls:?}");
+    let forgotten: Vec<&String> = calls
         .iter()
         .filter(|call| call.starts_with("forget:"))
         .collect();
-    assert_eq!(forgotten.len(), 1, "exactly one room is swept: {calls:?}");
-    let refused = if forgotten[0] == "forget:500" {
-        501
-    } else {
-        500
-    };
+    assert_eq!(
+        forgotten,
+        [&format!("forget:{swept}")],
+        "only the room whose delete succeeded is forgotten: {calls:?}"
+    );
     assert_eq!(
         worker.tracked().keys().copied().collect::<Vec<_>>(),
         [refused],
-        "only the refused room stays tracked: {calls:?}"
+        "the refused room keeps its provenance: {calls:?}"
     );
     assert_eq!(worker.failures().len(), 1);
     assert!(matches!(

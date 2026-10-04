@@ -4,6 +4,9 @@
 //! `report voice-reconcile` pairs `voice_session_start` / `voice_session_end`
 //! halves per (guild, member) and recovers durations where the stored rows
 //! allow it (port of legacy `scripts/voice-reconcile.ts` + `src/analytics/voiceReconcile.ts`).
+//! It also names the blind windows (gaps in the `events.recorded_at` write
+//! series) with a per-window count of `startKnown:false` sessions, and
+//! averages known-start durations only (TOG-5683 / TOG-5684).
 //! `report leave-gap` classifies members with a `member_join` row, no
 //! `member_leave` row, and gone from the roster (port of legacy
 //! `scripts/leave-gap.ts` + `src/analytics/memberLeaveGap.ts`).
@@ -13,8 +16,10 @@
 //! Discord REST lists channels but not their voice occupants, so occupancy
 //! classes belong to a gateway-derived snapshot, not to this report.
 //!
-//! Read-only by construction: the only SQL is SELECT (the pool opens with
-//! migrations off, so the tool cannot build schema by accident), the single
+//! Report data is read with SELECT (the pool opens with migrations off, so
+//! the tool cannot build schema by accident). `voice-reconcile` reads every
+//! feed in one `REPEATABLE READ, READ ONLY` transaction: a concurrent commit
+//! enters the next sweep, never just its heartbeats or session counts. The
 //! roster read is a bounded GET, and the fill rule in the leave-gap report is
 //! a proposal, executed nowhere. There is no repair path. On the
 //! `--discord-base` loopback path the roster uses the ungoverned transport and
@@ -25,7 +30,7 @@
 //! Usage:
 //!
 //! ```text
-//! report voice-reconcile --guild <snowflake> [--days <N>] [--seed]
+//! report voice-reconcile --guild <snowflake> [--days <N>] [--max-gap-minutes <N>] [--seed]
 //! report leave-gap --guild <snowflake> [--days <N>] [--floor <ISO>]
 //!   [--discord-base <url>] [--seed]
 //! report voice-ghosts --guild <snowflake> [--discord-base <url>] [--seed]
@@ -35,6 +40,23 @@
 //! DISCORD_BOT_TOKEN); voice-ghosts live mode needs it too (one channel-list
 //! GET). Exit 0 on a report (gaps are findings, not failure),
 //! 1 on database/roster failure, 2 on usage errors, 3 on a bad --floor.
+//!
+//! `voice-reconcile` JSON (camelCase): `tool`, `mode` (seeded demo only),
+//! `guild`, `window` (`days`, `since`), `resolved`, `unresolvable`,
+//! `complete`, `skipped`, `discordRequests`, plus two read-only summaries:
+//!
+//! - `blindWindows`: `heartbeatSource` (`events.recorded_at`: the bot's own
+//!   write series, every event type, never the presence-probe table),
+//!   `heartbeats` (distinct write instants read), `maxGapMs` (a gap wider than
+//!   this is a window; default 2h, `--max-gap-minutes` overrides),
+//!   `windows[]` (`start` = last write before the gap, `end` = first write
+//!   after, `gapMs`, `unknownStarts` = `voice_session_end` rows with
+//!   `startKnown:false` attributed to the window: the latest one starting at
+//!   or before the end), `unattributedUnknownStarts` (unknown-start ends older
+//!   than every window) and a `note` on the inference limits.
+//! - `durations`: `averageSeconds` (known-start sessions with a measured
+//!   duration only; null when none), `measured` (sessions in the mean) and
+//!   `excludedUnknownStarts` (`startKnown:false` ends left out).
 
 // Operator CLI reports intentionally use stdout; runtime/library modules do not.
 #![allow(clippy::print_stdout)]
@@ -42,6 +64,7 @@
 use twilight_model::id::marker::GuildMarker;
 use twilight_model::id::Id;
 use two_bot_core::funnel::{format_iso_millis, parse_iso_millis};
+use two_bot_core::voice::DEFAULT_BLIND_WINDOW_MAX_GAP_MS;
 use two_bot_cutover::cli::{now_iso, open_db, require_guild_read, Args};
 use two_bot_cutover::leave_gap::{
     build_seed_gap_data, classify_leave_gaps, fetch_leave_gap_feeds, RosterMember,
@@ -49,7 +72,8 @@ use two_bot_cutover::leave_gap::{
 use two_bot_cutover::rest::RestClient;
 use two_bot_cutover::voice_ghosts::{build_seed_ghost_data, count_ghosts, is_live_voice_kind};
 use two_bot_cutover::voice_reconcile::{
-    build_seed_halves, fetch_voice_halves, reconcile_voice_halves,
+    blind_window_report, build_seed_halves, duration_summary_report, fetch_voice_halves,
+    reconcile_voice_halves, VoiceHalves,
 };
 use two_bot_cutover::voice_rooms::PgRoomStore;
 
@@ -59,7 +83,7 @@ const ROSTER_MAX_PAGES: u32 = 20;
 const ROSTER_MAX_MEMBERS: usize = 20_000;
 
 const USAGE: &str = "Usage:\n  \
-    report voice-reconcile --guild <snowflake> [--days <N>] [--seed]\n  \
+    report voice-reconcile --guild <snowflake> [--days <N>] [--max-gap-minutes <N>] [--seed]\n  \
     report leave-gap --guild <snowflake> [--days <N>] [--floor <ISO>] [--discord-base <url>] [--seed]\n  \
     report voice-ghosts --guild <snowflake> [--discord-base <url>] [--seed]\n  \
     (a bare `report voice-reconcile 30` means the last 30 days, as in legacy)\n\
@@ -105,9 +129,51 @@ fn window_json(days: Option<i64>, since: Option<&str>) -> serde_json::Value {
     serde_json::json!({"days": days, "since": since})
 }
 
+/// `--max-gap-minutes N` as milliseconds; the core default (2h, suited to an
+/// hourly series) when absent. A zero or non-numeric value is a usage error.
+fn max_gap_ms(args: &Args) -> i64 {
+    let Some(raw) = args.values.get("max-gap-minutes") else {
+        return DEFAULT_BLIND_WINDOW_MAX_GAP_MS;
+    };
+    match raw.parse::<i64>() {
+        Ok(n) if n >= 1 => n.saturating_mul(60_000),
+        _ => usage_error(&format!(
+            "Bad --max-gap-minutes \"{raw}\". Use a positive number of minutes, e.g. 120."
+        )),
+    }
+}
+
+/// The voice-reconcile JSON: the pairing result plus the blind-window and
+/// duration summaries over the same feeds. `seeded` marks the fixture demo.
+fn voice_report(
+    seeded: bool,
+    guild: &str,
+    window: serde_json::Value,
+    halves: &VoiceHalves,
+    max_gap_ms: i64,
+) -> serde_json::Value {
+    let result = reconcile_voice_halves(&halves.starts, &halves.ends, &halves.leaves);
+    let mut report = serde_json::json!({
+        "tool": "voice-reconcile",
+        "guild": guild,
+        "window": window,
+        "resolved": result.resolved,
+        "unresolvable": result.unresolvable,
+        "complete": result.complete,
+        "skipped": result.skipped,
+        "blindWindows": blind_window_report(&halves.heartbeats, &halves.ends, max_gap_ms),
+        "durations": duration_summary_report(&halves.duration_rows),
+        "discordRequests": 0,
+    });
+    if seeded {
+        report["mode"] = serde_json::Value::String("seeded-demo".to_owned());
+    }
+    report
+}
+
 async fn voice_reconcile(args: Args) -> i32 {
     for key in args.values.keys() {
-        if !matches!(key.as_str(), "guild" | "days") {
+        if !matches!(key.as_str(), "guild" | "days" | "max-gap-minutes") {
             usage_error(&format!("unknown argument --{key}"));
         }
     }
@@ -119,22 +185,18 @@ async fn voice_reconcile(args: Args) -> i32 {
     // window_days validates the positionals (subcommand plus optional days).
     let seeded = args.has("seed");
     let (days, since) = window_days(&args);
+    let gap_ms = max_gap_ms(&args);
 
     if seeded {
         let now_ms = parse_iso_millis(&now_iso()).unwrap_or(0);
         let halves = build_seed_halves(now_ms);
-        let result = reconcile_voice_halves(&halves.starts, &halves.ends, &halves.leaves);
-        let report = serde_json::json!({
-            "tool": "voice-reconcile",
-            "mode": "seeded-demo",
-            "guild": "seed-guild",
-            "window": window_json(days, since.as_deref()),
-            "resolved": result.resolved,
-            "unresolvable": result.unresolvable,
-            "complete": result.complete,
-            "skipped": result.skipped,
-            "discordRequests": 0,
-        });
+        let report = voice_report(
+            true,
+            "seed-guild",
+            window_json(days, since.as_deref()),
+            &halves,
+            gap_ms,
+        );
         println!(
             "{}",
             serde_json::to_string_pretty(&report).unwrap_or_default()
@@ -151,17 +213,13 @@ async fn voice_reconcile(args: Args) -> i32 {
             std::process::exit(1);
         });
     db.close().await;
-    let result = reconcile_voice_halves(&halves.starts, &halves.ends, &halves.leaves);
-    let report = serde_json::json!({
-        "tool": "voice-reconcile",
-        "guild": guild,
-        "window": window_json(days, since.as_deref()),
-        "resolved": result.resolved,
-        "unresolvable": result.unresolvable,
-        "complete": result.complete,
-        "skipped": result.skipped,
-        "discordRequests": 0,
-    });
+    let report = voice_report(
+        false,
+        &guild,
+        window_json(days, since.as_deref()),
+        &halves,
+        gap_ms,
+    );
     println!(
         "{}",
         serde_json::to_string_pretty(&report).unwrap_or_default()

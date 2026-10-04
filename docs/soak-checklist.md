@@ -1277,35 +1277,31 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-720419b: 720419b — TOG-5683: voice blind-window reconcile report (count startKnown:false per gap)
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Run the TOG-15338 voice reconcile report scenario on a test-container fixture with startKnown:false sessions across a blind window.
-- **Expected:** Per-gap startKnown:false counts match the fixture; the report writes nothing.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
-- **Owner:** [TOG-15338](/TOG/issues/TOG-15338)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the voice blind-window unit fixtures and the DB-backed `report_cli` scenario (events-write gaps with startKnown:false ends across two blind windows).
+- **Expected:** Per-gap startKnown:false counts match the fixture (2 and 1, one end unattributed); known-start sessions are not counted; the report writes nothing and no `_sqlx_migrations` table appears.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Fixture proof only, not a deployed-network soak receipt.
+- **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-40e266e: 40e266e — TOG-5683: reconcile heartbeat from events write series, not the contained probe table
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Seed a test-container fixture with an events-write gap and a healthy probe table; run the reconcile report.
-- **Expected:** The heartbeat comes from the events write series, so the gap is reported despite healthy probes.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
-- **Owner:** [TOG-15338](/TOG/issues/TOG-15338)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the DB-backed `report_cli` scenario: an events-write gap with a healthy probe table seeded through it.
+- **Expected:** The heartbeat comes from `events.recorded_at`, so the gap is reported despite healthy probes; a backfilled row (old `occurred_at`) does not close it.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Fixture proof only, not a deployed-network soak receipt.
+- **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only
 
 ### s13-edaf2dd: edaf2dd — TOG-5684: enforce startKnown:false exclusion from duration averages
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Run the TOG-15675 duration-average fixture with unequal known/unknown durations and metadata numeric-string/malformed inputs; consumer ownership remains TOG-15338.
-- **Expected:** The average excludes unknown starts even when their numeric duration differs from known rows; counts remain correct. Pin numeric-string metadata parity or an independently accepted parsing divergence. The existing equal-duration primitive fixture does not distinguish average exclusion, and no report consumer is merged yet.
-- **Evidence:** Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
-- **Owner:** [TOG-15675](/TOG/issues/TOG-15675), [TOG-15338](/TOG/issues/TOG-15338)
-- **Reason:** Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
-- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the duration summary fixtures and the DB-backed `report_cli` scenario mixing known and startKnown:false sessions.
+- **Expected:** `durations` averages known-start sessions only (the unknown start carrying a number is excluded) and counts the excluded unknown starts.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Fixture proof only, not a deployed-network soak receipt.
+- **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests
 
 ### s13-59965d0: 59965d0 — TOG-5981: serialize same-member voice frames, scope voice idempotency keys by channel
 
@@ -1388,12 +1384,13 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-dc2b507: dc2b507 — feat(voice): reconcile open-half sessions with explicit reasons (#273)
 
-- **Method:** `automated` (not an execution verdict).
-- **Action:** Run the open-half reconcile pins in `crates/core/tests` and the cutover reconcile unit tests. Require exported TWO_TEST_DATABASE_URL for the authorized disposable agent-testdb/CI target before the CLI step; its test guard validates the target. No application, staging or production database.
-- **Expected:** Every open-half session is reported with its explicit reason or resolution; nothing is repaired. The read-only CLI check is DB-backed and runs in CI. The verification chain fails if the CLI opt-in is absent or not exported; a silently skipped CLI test is not PASS.
-- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.
-- **Owner:** [TOG-15338](/TOG/issues/TOG-15338)
-- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_integrity_acceptance --test voice_reconcile_retirement && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib -- voice_reconcile::tests::second_start_supersedes_the_first && python3 -c 'import os,sys; sys.exit(0 if os.environ.get("TWO_TEST_DATABASE_URL") else "export TWO_TEST_DATABASE_URL for the authorized disposable test database")' && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli -- voice_reconcile_matches_legacy_fixtures_read_only
+- **Method:** `waived` (not an execution verdict).
+- **Action:** Run the TOG-15675 reconcile metadata fixtures on a test-container database: an end whose `startedAt` has a multi-byte UTC offset and an end with a hex or other `Number()`-coercible string duration. The existing open-half fixtures stay green.
+- **Expected:** Every open-half session is reported with an explicit reason or resolution without aborting the report: a malformed offset falls through to the bad-end-row or earlier-start path (no panic) and string durations follow legacy `Number()` coercion, or the card records an accepted divergence with fixtures. Nothing is repaired. The read-only CLI check is DB-backed and runs in CI.
+- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
+- **Owner:** [TOG-15675](/TOG/issues/TOG-15675)
+- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-860557f: 860557f — test(backfill): refuse malformed export rows without throwing (#289)
@@ -1592,11 +1589,11 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s13-3400bb2: 3400bb2 — feat(analytics): add member_leave backfill gap sweep (#343)
 
 - **Method:** `automated` (not an execution verdict).
-- **Action:** Run the leave-gap sweep pins in `crates/cutover/src/leave_gap.rs` and `crates/core/tests/voice_integrity_acceptance.rs`. Require exported TWO_TEST_DATABASE_URL for the authorized disposable agent-testdb/CI target before the CLI step; its test guard validates the target. No application, staging or production database.
-- **Expected:** Each gap is classified and reported with proposed fills only; nothing is backfilled. The read-only CLI check is DB-backed and runs in CI. The verification chain fails if the CLI opt-in is absent or not exported; a silently skipped CLI test is not PASS.
+- **Action:** Run the leave-gap sweep pins in `crates/cutover/src/leave_gap.rs` and `crates/core/tests/voice_integrity_acceptance.rs`. The read-only CLI check `crates/cutover/tests/report_cli.rs::leave_gap_matches_legacy_fixtures_read_only` is DB-backed and is not part of this chain: it skips without the exported `TWO_TEST_DATABASE_URL` and runs in CI on a disposable agent-testdb database. No application, staging or production database.
+- **Expected:** Each gap is classified and reported with proposed fills only; nothing is backfilled. A skipped DB-backed CLI test is never counted as PASS here; its table-snapshot read-only assertion is CI evidence only.
 - **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.
-- **Owner:** [TOG-15338](/TOG/issues/TOG-15338)
-- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib -- leave_gap::tests::seeded_gaps_cover_every_path && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_integrity_acceptance && python3 -c 'import os,sys; sys.exit(0 if os.environ.get("TWO_TEST_DATABASE_URL") else "export TWO_TEST_DATABASE_URL for the authorized disposable test database")' && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli -- leave_gap_matches_legacy_fixtures_read_only
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib -- leave_gap::tests::seeded_gaps_cover_every_path && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_integrity_acceptance
 
 ### s13-f5e62b7: f5e62b7 — fix(redirect): resolve throttle bucket through trusted-proxy chain (#342)
 
@@ -1695,7 +1692,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Action:** Run the offset-spelling pins in `crates/cutover/src/leave_gap.rs` and `crates/core/src/member_leave_gap.rs`.
 - **Expected:** Timestamps that spell one instant with different UTC offsets classify, order and fill identically; comparison is by instant, not text.
 - **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.
-- **Owner:** [TOG-15338](/TOG/issues/TOG-15338)
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119)
 - **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib -- leave_gap::tests::coverage_uses_instants_for_equivalent_spellings leave_gap::tests::raid_uses_instants_for_equivalent_spellings leave_gap::tests::offset_joins_with_reversed_string_order_yield_chronological_fills leave_gap::tests::gap_members_sort_by_last_join_instant_with_member_tiebreak && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib -- member_leave_gap::tests::offset_timestamps_compare_by_instant_not_string
 
 ### s13-8b5d1e1: 8b5d1e1 — fix(lfg): reject reserved leave-action role keys (#414)
