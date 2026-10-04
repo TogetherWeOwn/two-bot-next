@@ -462,8 +462,7 @@ class WorkflowSurfaceTests(unittest.TestCase):
     def test_consumer_jobs_wait_on_selector(self):
         for job in ("check", "rust-tests", "ignored-db-stores",
                     "ignored-db-runtime", "community-db", "feeds-db",
-                    "tickets-postgres", "worker", "required-checks",
-                    "supply-chain", "ci-ok"):
+                    "tickets-postgres", "worker", "supply-chain", "ci-ok"):
             head = self.text.split(f"\n  {job}:")[1].split("steps:", 1)[0]
             with self.subTest(job=job):
                 self.assertIn("job-inputs", head)
@@ -491,7 +490,7 @@ class WorkflowSurfaceTests(unittest.TestCase):
         # job succeeded or was legitimately skipped.
         head = self.text.split("\n  ci-ok:")[1].split("steps:", 1)[0]
         self.assertIn("always()", head)
-        for job in ("job-inputs", "supply-chain", "check", "rust-tests",
+        for job in ("job-inputs", "container-inputs", "supply-chain", "check", "rust-tests",
                     "ignored-db-stores", "ignored-db-runtime", "worker",
                     "parity-docs", "self-role-store", "community-db",
                     "feeds-db", "tickets-postgres", "moderation-db"):

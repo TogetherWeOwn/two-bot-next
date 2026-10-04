@@ -121,13 +121,12 @@ Run `check` in parallel with the DB and SBOM jobs.
 - Change `check` to `needs: [job-inputs]` and drop its three "require
   ... to pass" steps for `parity-docs`, `self-role-store` and
   `supply-chain` (`check.yml` lines 166–176 on `8f119e1c`); `ci-ok`
-  carries them. `scripts/ci/test_required_checks.py` pins the
-  `required-checks` aggregator's `needs` (lines 64–70) and `check`'s
-  `job-inputs` need (line 57), and nothing asserts that `check` needs
-  the other three. Add the same `needs` pin for `ci-ok` so it cannot
-  lose a dependency. The test's `REQUIRED` set (line 17) still lists
-  `check` and `worker check`, which no longer matches the ruleset:
-  reconcile it in the same slice.
+  carries them. `scripts/ci/test_required_checks.py` pins the single
+  `ci-ok` aggregator's needs, result mapping and verdict evaluation,
+  and `check`'s `job-inputs` need. Its `REQUIRED` set now matches the
+  live rules (`ci-ok`, `pr-lint`, `gitleaks`), and the legacy duplicate
+  aggregate is removed. The always-run `container-inputs` regressions
+  are also part of `ci-ok`; only advisory container smoke is exempt.
 - Expected effect: code-PR wall clock falls from about 26.6 min to
   about 19–20 min (bounded by `check` itself), roughly 7 min saved per
   code PR. Docs-only PRs are unchanged at about 2 min.
@@ -150,9 +149,10 @@ and three more jobs run beside it: `rust-tests` (unit, binary,
 integration, property and doc tests), `ignored-db-stores` and
 `ignored-db-runtime` (the `--ignored` database suites, and the two backup
 CLI regressions in the stores lane). Every lane needs only `job-inputs`;
-`ci-ok` and `required-checks` gate all of them, and
-`scripts/ci/test_required_checks.py` runs both aggregators for every job,
-result and selector combination.
+the single `ci-ok` aggregate gates all of them, including the always-run
+`container-inputs` selector. `scripts/ci/test_required_checks.py` runs the
+aggregate for every job, result and selector combination and pins the
+explicit exemption for advisory image smoke.
 
 Median over the runs below, queue wait excluded (job `started_at` to
 `completed_at`; run wall clock is the first job start to `ci-ok` done):
@@ -172,14 +172,17 @@ old `check` job used, so those lanes started warm. The lint lane has a new
 cache entry that main pushes will fill; its 3.1 to 4.0 min is a cold-cache
 figure.
 
-Probes on the split workflow: a docs-only change gets a green `ci-ok` with
-the three test lanes skipped at the job level, and forcing a lane to fail
-turns `ci-ok` and `required checks` red with the lane named in the log.
+Initial probes on the split workflow: a docs-only change got a green `ci-ok`
+with the three test lanes skipped at the job level, and forcing a lane to
+fail turned `ci-ok` and the then-present `required checks` red with the lane
+named in the log. The legacy duplicate was subsequently removed after
+confirming the live rules require `ci-ok`. These timings and probe results
+precede the gate-completeness repair.
 
 Costs and limits: total runner time per code run rises from about 20.4 to
 about 27 min because each lane sets up its own container, service and
 toolchain (hosted minutes for this public repo are free). The critical path
 is now `rust tests`, where compiling and linking the integration binaries is
-about 355 s; sharding those binaries is the next lever. Reconciling the
-`REQUIRED` set in `test_required_checks.py` with the ruleset (`ci-ok`) is not
-part of this change.
+about 355 s; sharding those binaries is the next lever. The gate-completeness
+repair reconciles `REQUIRED` with the live rules and removes the obsolete
+aggregate without changing the test lanes or these historical measurements.

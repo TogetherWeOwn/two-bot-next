@@ -2,9 +2,9 @@
 
 GitHub leaves a required check pending forever when the workflow that owns it
 never starts (a `paths`/`branches` filter on the trigger), and counts a skipped
-job as passing. So each required context must be exactly one job, sit in a
-workflow whose pull_request trigger is unfiltered, and the `check` aggregator
-must still run, and fail, when job selection or its dependencies fail.
+job as passing. Each required context must be exactly one job in an unfiltered
+pull_request workflow. The single `ci-ok` aggregate must run, and fail, when
+job selection or a required dependency fails.
 """
 
 import os
@@ -18,14 +18,12 @@ import unittest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-REQUIRED = {"check", "worker check", "gitleaks", "pr-lint"}
+REQUIRED = {"ci-ok", "gitleaks", "pr-lint"}
 TRIGGER_FILTERS = {"paths", "paths-ignore", "branches", "branches-ignore"}
-# Jobs in check.yml that deliberately sit outside the aggregators: `job-inputs`
-# is the selector the aggregators read, the two container jobs are the image
-# smoke (not a correctness gate, up to 30 minutes), and the aggregators
-# themselves.
-NOT_AGGREGATED = {"job-inputs", "container-inputs", "container", "required-checks", "ci-ok"}
-AGGREGATORS = ("required-checks", "ci-ok")
+# Only the advisory image smoke and the aggregate itself sit outside ci-ok.
+# The smoke's source-level exemption carries the reason; both selectors gate.
+NOT_AGGREGATED = {"container", "ci-ok"}
+AGGREGATORS = ("ci-ok",)
 
 
 def load_workflows():
@@ -61,7 +59,7 @@ class RequiredChecksReportTests(unittest.TestCase):
                 self.assertFalse(filters & TRIGGER_FILTERS,
                                  f"{workflow_name}: a filtered trigger leaves {context} pending")
 
-    def test_aggregator_runs_and_fails_when_job_selection_fails(self):
+    def test_lint_runs_and_fails_when_job_selection_fails(self):
         check = self.workflows["check.yml"]["jobs"]["check"]
         self.assertIn("always()", check["if"])
         self.assertIn("job-inputs", check["needs"])
@@ -70,28 +68,34 @@ class RequiredChecksReportTests(unittest.TestCase):
         self.assertEqual(guard["if"], "needs.job-inputs.result != 'success'")
         self.assertEqual(guard["run"], "exit 1")
 
-    def test_required_checks_aggregator_covers_path_filtered_jobs(self):
-        agg = self.workflows["check.yml"]["jobs"]["required-checks"]
-        self.assertEqual(agg["name"], "required checks")
+    def test_ci_ok_covers_selectors_and_path_filtered_jobs(self):
+        agg = self.workflows["check.yml"]["jobs"]["ci-ok"]
+        self.assertEqual(agg["name"], "ci-ok")
         self.assertIn("always()", agg["if"])
-        for job in ("job-inputs", "supply-chain", "check", "rust-tests",
+        for job in ("job-inputs", "container-inputs", "supply-chain", "check", "rust-tests",
                     "ignored-db-stores", "ignored-db-runtime", "worker",
                     "parity-docs", "self-role-store", "community-db",
                     "feeds-db", "tickets-postgres", "moderation-db"):
             self.assertIn(job, agg["needs"], job)
-        # The container image smoke is not a correctness gate; keeping it out
-        # of `needs` keeps this signal off the image-build critical path.
+        # Advisory image smoke remains off the image-build critical path.
         self.assertNotIn("container", agg["needs"])
-        self.assertNotIn("container-inputs", agg["needs"])
-        self.assertIn("required-checks", agg["runs-on"])
+        self.assertIn("ci-ok", agg["runs-on"])
         body = "\n".join(step.get("run", "") for step in agg["steps"])
-        for marker in ("JOB_INPUTS_RESULT", "SUPPLY_CHAIN_RESULT",
+        for marker in ("JOB_INPUTS_RESULT", "CONTAINER_INPUTS_RESULT", "SUPPLY_CHAIN_RESULT",
                        "CHECK_RESULT", "WORKER_RESULT", "PARITY_DOCS_RESULT",
                        "SELF_ROLE_RESULT", "COMMUNITY_DB_RESULT",
                        "FEEDS_DB_RESULT", "TICKETS_RESULT",
                        "MODERATION_DB_RESULT", "RUST_TESTS_RESULT",
                        "IGNORED_DB_STORES_RESULT", "IGNORED_DB_RUNTIME_RESULT"):
             self.assertIn(marker, body, marker)
+
+    def test_legacy_duplicate_aggregate_is_removed(self):
+        self.assertNotIn("required-checks", self.workflows["check.yml"]["jobs"])
+
+    def test_advisory_container_smoke_has_an_exemption_reason(self):
+        source = (ROOT / ".github/workflows/check.yml").read_text()
+        block = re.search(r"(?ms)^  container:\n(.*?)(?=^  [a-z][a-z-]*:|\Z)", source)[1]
+        self.assertRegex(block, r"(?m)^    # ci-ok: exempt \S.+")
 
     def aggregator(self, name):
         job = self.workflows["check.yml"]["jobs"][name]
@@ -100,15 +104,15 @@ class RequiredChecksReportTests(unittest.TestCase):
         return job, step["env"], script
 
     def test_every_job_is_aggregated_or_explicitly_exempt(self):
-        # A job added to check.yml but missing from the aggregators is a false
-        # gate: its failure would never turn the required `ci-ok` red.
+        # A job missing from ci-ok is a false gate: its failure would never
+        # turn the required verdict red.
         jobs = set(self.workflows["check.yml"]["jobs"])
         for name in AGGREGATORS:
             job, env, script = self.aggregator(name)
             with self.subTest(aggregator=name):
                 missing = jobs - set(job["needs"]) - NOT_AGGREGATED
                 self.assertEqual(missing, set(), f"{name} does not need {sorted(missing)}")
-                for needed in set(job["needs"]) - {"job-inputs"}:
+                for needed in set(job["needs"]):
                     consumed = [key for key, value in env.items()
                                 if value == "${{ needs.%s.result }}" % needed]
                     self.assertEqual(len(consumed), 1, f"{name}: {needed} result is not mapped into the gate")
@@ -139,9 +143,19 @@ class RequiredChecksReportTests(unittest.TestCase):
             with self.subTest(aggregator=name, job="job-inputs"):
                 self.assertEqual(self.run_aggregator(name, {"job-inputs": "failure"}), 1)
 
+    def test_container_inputs_is_an_always_run_gate_even_on_docs_only_changes(self):
+        selector = self.workflows["check.yml"]["jobs"]["container-inputs"]
+        self.assertNotIn("if", selector)
+        for selected in ("true", "false"):
+            for result in ("failure", "cancelled", "skipped", "", "pending", "queued", "in_progress"):
+                with self.subTest(selected=selected, result=result):
+                    self.assertEqual(
+                        self.run_aggregator("ci-ok", {"container-inputs": result}, selected=selected), 1
+                    )
+
     def test_aggregators_accept_a_skip_only_when_the_selector_deselected_the_job(self):
-        # Docs-only PRs: the selector reports rust/worker/parity/supply = false,
-        # the selector-gated jobs skip and the always-run ones still pass.
+        # Docs-only PRs: selector-gated jobs skip, always-run selectors and
+        # lint still pass. Docs changes continue to select the worker lane.
         gated = {"rust-tests", "ignored-db-stores", "ignored-db-runtime", "self-role-store",
                  "community-db", "feeds-db", "tickets-postgres", "moderation-db",
                  "parity-docs", "supply-chain"}
@@ -149,8 +163,11 @@ class RequiredChecksReportTests(unittest.TestCase):
             with self.subTest(aggregator=name):
                 skipped = {job: "skipped" for job in gated}
                 self.assertEqual(self.run_aggregator(name, skipped, selected="false"), 0)
-                self.assertEqual(self.run_aggregator(name, {**skipped, "check": "skipped"}, selected="false"), 1,
-                                 "the lint lane is an always-run gate and may never skip")
+                for always_run in ("check", "container-inputs"):
+                    self.assertEqual(
+                        self.run_aggregator(name, {**skipped, always_run: "skipped"}, selected="false"), 1,
+                        f"{always_run} is an always-run gate and may never skip",
+                    )
 
     def test_gitleaks_runs_whatever_pr_lint_concluded(self):
         self.assertIn("!cancelled()", self.workflows["supply-chain.yml"]["jobs"]["gitleaks"]["if"])

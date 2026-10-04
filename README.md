@@ -89,10 +89,10 @@ these tests in its existing integration-test step.
 Squash-merge only; PR titles follow Conventional Commits and the body follows the
 [PR template](.github/pull_request_template.md). This repo is public, so keep
 internal tracker IDs out of titles, bodies, commits and branch names. The rulesets
-require `gitleaks` and `pr-lint`; a PR also needs a green `check` (lint: fmt,
-clippy -D warnings, cargo-deny), the `rust tests` and `ignored db` lanes (tests)
-and `worker check` (including the runbook command-drift test) on the exact head
-commit, all gathered by the `ci-ok` aggregate. The approving non-author reviewer
+require `ci-ok`, `gitleaks` and `pr-lint` on the exact head commit. The single
+`ci-ok` aggregate gates both selectors, lint (`check`: fmt, clippy -D warnings,
+cargo-deny), all selected `rust tests` and `ignored db` lanes, and `worker check`
+(including the runbook command-drift test). The approving non-author reviewer
 squash-merges. See [Contributing](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). The
 workspace toolchain is pinned in `rust-toolchain.toml`.
 

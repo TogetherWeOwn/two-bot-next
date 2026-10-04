@@ -12,10 +12,7 @@ JOB_INVENTORY = {
     # Branch keeps the moderation-db job; main #84 added the supply-chain job.
     # The pin must be the union of both sides.
     "check.yml": {"check", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
-                  "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "required-checks",
-                  # TOG-14881: CI standard aggregator; required-checks stays
-                  # until the protect-main ruleset flips to ci-ok.
-                  "ci-ok",
+                  "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "ci-ok",
                   # `check` is now the lint lane; the test steps it used to
                   # carry run in these three parallel lanes, all gated by ci-ok.
                   "rust-tests", "ignored-db-stores", "ignored-db-runtime"},
