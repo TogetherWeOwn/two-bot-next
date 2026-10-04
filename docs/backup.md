@@ -72,16 +72,22 @@ Three application tables are excluded, each with its reason inline in
 `EXCLUDED_TABLES`: `xp_cooldowns` (short-lived award throttles; restore clears
 target cooldowns), `discord_send_admission` (per-credential lane state that a
 recovered process re-learns) and `gateway_onboarding_jobs` (a restart-recovery
-queue bound to a gateway session). Migration ledgers (`_sqlx_migrations` and
-`schema_migrations`) describe target DDL and are never restored. Replay guards,
-idempotency records, gateway sessions, lease-bearing durable tables and audit
-history are **not** ephemeral exclusions. Derived `web_v1` views contain no
-independent table data; the website service's own separate database is out of
-scope. The migration-backed coverage test compares real tables against these
-classifications, so adding an unclassified table to the cutover chain fails CI.
-That test migrates only `crates/cutover/migrations`: the store chain's
-`rollback_journal` and `rollback_watermarks` tables and its `_two_bot_migrations`
-ledger are not yet classified or dumped (known hole, tracked as TOG-15760).
+queue bound to a gateway session). The store chain's `rollback_journal` and
+`rollback_watermarks` are excluded too: the journal is unwired append-only
+cutover evidence (no writer calls `record` yet, and its rows are re-capturable
+during the watch window), and restoring pre-backup watermarks could mark
+post-backup writes as already journaled, silently breaking rollback coverage.
+Migration ledgers (`_sqlx_migrations`, `schema_migrations` and the store
+chain's `_two_bot_migrations`) describe target DDL and are never restored.
+Replay guards, idempotency records, gateway sessions, lease-bearing durable
+tables and audit history are **not** ephemeral exclusions. Derived `web_v1`
+views contain no independent table data; the website service's own separate
+database is out of scope. The migration-backed coverage test compares real
+tables against these classifications, so adding an unclassified table to
+either chain fails CI: the cutover chain is migrated for real, and the store
+chain (`crates/store/migrations`) is text-scanned for `CREATE TABLE`, so a
+new store table without a dump/exclude decision is refused rather than
+silently omitted from the backup.
 
 v3 must contain its original 22 table entries. It can lack later tables, but
 restore clears their old target rows and emits a warning in both dry-run and
