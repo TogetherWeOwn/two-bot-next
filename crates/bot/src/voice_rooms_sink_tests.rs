@@ -62,7 +62,7 @@ impl RoomPersistence for Arc<Store> {
     }
     async fn settle_create(
         &self,
-        reservation_id: i64,
+        reservation_id: &str,
         channel: Option<u64>,
     ) -> Result<bool, StoreError> {
         self.as_ref().settle_create(reservation_id, channel).await

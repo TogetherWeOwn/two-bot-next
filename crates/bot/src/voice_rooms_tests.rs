@@ -104,7 +104,7 @@ struct Store {
     /// Every claim as `(user, now_secs)`, and every settle as
     /// `(reservation, bound channel)`.
     claims: Mutex<Vec<(u64, i64)>>,
-    settled: Mutex<Vec<(i64, Option<u64>)>>,
+    settled: Mutex<Vec<(String, Option<u64>)>>,
     /// Also push `claim` / `settle` markers onto the shared trace, for tests
     /// that pin ordering against the Discord and persist calls.
     trace_claims: bool,
@@ -260,19 +260,22 @@ impl RoomPersistence for Store {
         match self.claim_script.lock().unwrap().pop_front() {
             Some(verdict) => verdict,
             None => Ok(CreateClaim::Admitted {
-                reservation_id: i64::try_from(claims.len()).unwrap(),
+                reservation_id: format!("r{}", claims.len()),
             }),
         }
     }
     async fn settle_create(
         &self,
-        reservation_id: i64,
+        reservation_id: &str,
         channel: Option<u64>,
     ) -> Result<bool, StoreError> {
         if self.trace_claims {
             self.trace.lock().unwrap().push("settle".to_owned());
         }
-        self.settled.lock().unwrap().push((reservation_id, channel));
+        self.settled
+            .lock()
+            .unwrap()
+            .push((reservation_id.to_owned(), channel));
         Ok(true)
     }
     async fn config_snapshot(&self, _: u64) -> Result<VoiceConfiguration, StoreError> {
@@ -1239,7 +1242,10 @@ async fn admission_claims_before_discord_and_binds_the_created_room() {
     )
     .unwrap();
     assert!((wall - claims[0].1).abs() < 60);
-    assert_eq!(*worker.store.settled.lock().unwrap(), [(1, Some(500))]);
+    assert_eq!(
+        *worker.store.settled.lock().unwrap(),
+        [("r1".to_owned(), Some(500))]
+    );
     assert!(worker.failures().is_empty());
 }
 
@@ -1342,7 +1348,10 @@ async fn a_429_requeue_keeps_one_claim_and_settles_it_once() {
     dispatch(&mut worker, 1600).await;
     assert_eq!(*trace.lock().unwrap(), ["create", "create", "persist:500"]);
     assert_eq!(worker.store.claims.lock().unwrap().len(), 1);
-    assert_eq!(*worker.store.settled.lock().unwrap(), [(1, Some(500))]);
+    assert_eq!(
+        *worker.store.settled.lock().unwrap(),
+        [("r1".to_owned(), Some(500))]
+    );
 }
 
 #[tokio::test]
@@ -1356,7 +1365,10 @@ async fn a_create_that_ends_without_a_room_rolls_its_reservation_back() {
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
-    assert_eq!(*worker.store.settled.lock().unwrap(), [(1, None)]);
+    assert_eq!(
+        *worker.store.settled.lock().unwrap(),
+        [("r1".to_owned(), None)]
+    );
 
     // The room was created but could not be persisted: compensation deletes it.
     let (live, mut store, http, _) = fixture();
@@ -1364,7 +1376,10 @@ async fn a_create_that_ends_without_a_room_rolls_its_reservation_back() {
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
-    assert_eq!(*worker.store.settled.lock().unwrap(), [(1, None)]);
+    assert_eq!(
+        *worker.store.settled.lock().unwrap(),
+        [("r1".to_owned(), None)]
+    );
 
     // A 429 requeue whose join went stale before the retry releases its claim.
     let (live, store, http, trace) = fixture();
@@ -1381,7 +1396,10 @@ async fn a_create_that_ends_without_a_room_rolls_its_reservation_back() {
     worker.live.voice_update(MEMBER, None, Some(false));
     dispatch(&mut worker, 1600).await;
     assert_eq!(*trace.lock().unwrap(), ["create"]);
-    assert_eq!(*worker.store.settled.lock().unwrap(), [(1, None)]);
+    assert_eq!(
+        *worker.store.settled.lock().unwrap(),
+        [("r1".to_owned(), None)]
+    );
     assert_eq!(worker.store.claims.lock().unwrap().len(), 1);
 }
 

@@ -195,7 +195,7 @@ pub trait RoomPersistence: Send + Sync {
     /// burst window and cooldown keep counting it.
     fn settle_create(
         &self,
-        reservation_id: i64,
+        reservation_id: &str,
         channel: Option<Snowflake>,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
     /// Every companion tracked in the guild, for worker load and startup
@@ -314,7 +314,7 @@ impl RoomPersistence for PgRoomStore {
 
     async fn settle_create(
         &self,
-        reservation_id: i64,
+        reservation_id: &str,
         channel: Option<Snowflake>,
     ) -> Result<bool, StoreError> {
         self.settle_create(reservation_id, channel)
@@ -1113,7 +1113,7 @@ struct Creation {
     spec: NewRoomSpec,
     /// The durable admission reservation, once claimed. Kept across a 429
     /// requeue so the retry never claims (and counts) a second slot.
-    reservation: Option<i64>,
+    reservation: Option<String>,
 }
 
 /// One mutable worker per guild. `load` must succeed before use. `reconcile`
@@ -2086,7 +2086,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// back. Best effort: a failed settle only keeps the cap slot held until
     /// the reservation's in-flight TTL, so it never blocks the lifecycle. The
     /// reservation row stays either way, so burst and cooldown history hold.
-    async fn settle_reservation(&self, reservation: i64, channel: Option<Snowflake>) {
+    async fn settle_reservation(&self, reservation: &str, channel: Option<Snowflake>) {
         if let Err(error) = self.store.settle_create(reservation, channel).await {
             warn!(
                 guild = self.live.guild_id,
@@ -2197,7 +2197,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             });
                             observe_voice_operation("create", outcome);
                         }
-                        if let Some(held) = creation.reservation {
+                        if let Some(held) = &creation.reservation {
                             self.settle_reservation(held, None).await;
                         }
                         self.creations.remove(&action.id);
@@ -2208,7 +2208,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 // Durable admission (caps, cooldown, rolling burst) runs after
                 // the cheap checks and before the only Discord create call. A
                 // refusal never reaches Discord; a 429 requeue keeps its claim.
-                let reservation = match creation.reservation {
+                let reservation = match creation.reservation.clone() {
                     Some(held) => held,
                     None => match self
                         .store
@@ -2222,7 +2222,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     {
                         Ok(CreateClaim::Admitted { reservation_id }) => {
                             if let Some(entry) = self.creations.get_mut(&action.id) {
-                                entry.reservation = Some(reservation_id);
+                                entry.reservation = Some(reservation_id.clone());
                             }
                             reservation_id
                         }
@@ -2271,7 +2271,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         self.rooms.insert(channel_id, room.clone());
                         let persisted = self.store.persist(&room).await;
                         let bound = persisted.is_ok().then_some(channel_id);
-                        self.settle_reservation(reservation, bound).await;
+                        self.settle_reservation(&reservation, bound).await;
                         match persisted {
                             Ok(()) => {
                                 // V9c: companion first (same ordered lane), then
@@ -2326,7 +2326,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     Err(error) => {
                         // Unknown create outcomes must never produce another POST.
                         self.creations.remove(&action.id);
-                        self.settle_reservation(reservation, None).await;
+                        self.settle_reservation(&reservation, None).await;
                         if error != RoomHttpError::Cancelled {
                             observe_voice_operation("create", voice_outcome_from_http(&error));
                         }

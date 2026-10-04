@@ -17,7 +17,8 @@
 -- Bot schema range: 0001-0999. Database tests use test containers only.
 
 CREATE TABLE IF NOT EXISTS voice_create_reservations (
-  id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  -- Text UUID, as 0205: no sequence to restore, and one id never repeats.
+  id         TEXT        PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid()::text,
   guild_id   TEXT        NOT NULL
     CHECK (guild_id ~ '^[0-9]{1,20}$' AND guild_id <> '0' AND guild_id NOT LIKE '0%'),
   user_id    TEXT        NOT NULL

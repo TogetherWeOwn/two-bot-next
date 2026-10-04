@@ -47,7 +47,7 @@ async fn admitted(
     user: u64,
     config: &CreateAdmissionConfig,
     now: i64,
-) -> Result<i64, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error>> {
     match store.claim_create(GUILD, user, config, now).await? {
         CreateClaim::Admitted { reservation_id } => Ok(reservation_id),
         CreateClaim::Refused(reason) => {
@@ -81,7 +81,7 @@ async fn create_then_delete(
 ) -> TestResult {
     let id = admitted(store, user, config, now).await?;
     assert!(store.add_room(&room(user, channel)).await?);
-    assert!(store.settle_create(id, Some(channel)).await?);
+    assert!(store.settle_create(&id, Some(channel)).await?);
     assert!(store.remove_room(GUILD, channel).await?.is_some());
     Ok(())
 }
@@ -191,9 +191,9 @@ async fn caps_count_live_and_in_flight_rooms_and_cooldown_counts_rollbacks() -> 
     // Binding one to a tracked room hands its slot to `voice_rooms` without
     // counting it twice: a settled reservation plus its room is one slot.
     assert!(store.add_room(&room(300, 510)).await?);
-    assert!(store.settle_create(in_flight, Some(510)).await?);
+    assert!(store.settle_create(&in_flight, Some(510)).await?);
     assert!(
-        !store.settle_create(in_flight, Some(510)).await?,
+        !store.settle_create(&in_flight, Some(510)).await?,
         "settling twice is a no-op"
     );
     assert_eq!(
@@ -201,7 +201,7 @@ async fn caps_count_live_and_in_flight_rooms_and_cooldown_counts_rollbacks() -> 
         RefusalReason::UserCap
     );
     // Rolling the other create back frees its slot, but not its cooldown.
-    assert!(store.settle_create(second, None).await?);
+    assert!(store.settle_create(&second, None).await?);
     let three = config(3, 40, 30);
     assert_eq!(
         refused(&store, 300, &three, T0 + 40).await?,

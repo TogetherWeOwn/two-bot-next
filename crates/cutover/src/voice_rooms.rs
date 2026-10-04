@@ -30,10 +30,10 @@ use super::voice_config_store::PgVoiceConfigStore;
 pub const IN_FLIGHT_RESERVATION_TTL_SECS: i64 = 300;
 
 /// The verdict of [`PgRoomStore::claim_create`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateClaim {
     /// Recorded durably; settle it with [`PgRoomStore::settle_create`].
-    Admitted { reservation_id: i64 },
+    Admitted { reservation_id: String },
     /// Refused before any write; the first tripped limit.
     Refused(RefusalReason),
 }
@@ -337,7 +337,7 @@ impl PgRoomStore {
         match decide_admission(config, &request, now_secs).map_err(invalid_argument)? {
             AdmissionDecision::Deny { reason } => Ok(CreateClaim::Refused(reason)),
             AdmissionDecision::Allow => {
-                let reservation_id: i64 = sqlx::query_scalar(
+                let reservation_id: String = sqlx::query_scalar(
                     "INSERT INTO voice_create_reservations (guild_id, user_id, created_at)
                      VALUES ($1, $2, to_timestamp($3::double precision))
                      RETURNING id",
@@ -360,7 +360,7 @@ impl PgRoomStore {
     /// Returns false when the reservation was already settled.
     pub async fn settle_create(
         &self,
-        reservation_id: i64,
+        reservation_id: &str,
         channel_id: Option<Snowflake>,
     ) -> Result<bool, sqlx::Error> {
         Ok(sqlx::query(
