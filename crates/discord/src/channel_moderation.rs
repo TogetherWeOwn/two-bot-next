@@ -95,6 +95,29 @@ struct Request {
     validation: Result<(), String>,
 }
 
+/// A failed channel call, classified for the claim and lane fences.
+struct CallFailure {
+    error: DiscordError,
+    /// The failure proves no mutation was accepted, so the lane is released.
+    no_effect: bool,
+}
+
+impl CallFailure {
+    fn of(error: DiscordError) -> Self {
+        let no_effect = error.proves_no_effect();
+        Self { error, no_effect }
+    }
+
+    fn refusal(&self) -> ChannelReply {
+        ChannelReply::refused(if self.error.is_safe_pre_mutation() {
+            "Discord refused the channel action; no mutation was accepted."
+        } else {
+            "Discord could not complete the channel action right now; no mutation was accepted. \
+             Try again shortly."
+        })
+    }
+}
+
 struct Prepared {
     call: ChannelCall,
     /// Consumed only after confirmed restoration, or a proven rejected first lock.
@@ -257,7 +280,7 @@ impl ChannelModerationRuntime {
                 return Ok(Some(reply));
             }
         };
-        let (reply, cleanup) = match self.executor.execute_channel(&prepared.call).await {
+        let (reply, cleanup) = match self.dispatch(&prepared.call).await {
             Ok(result) => {
                 let outcome = match result {
                     ChannelCallOutcome::Purged { affected } => {
@@ -289,27 +312,18 @@ impl ChannelModerationRuntime {
                     prepared.restore,
                 )
             }
-            Err(error) if error.is_safe_pre_mutation() => {
-                // A rejected first PUT never changed the pre-lock overwrite, so
+            Err(failure) if failure.no_effect => {
+                // A refused first PUT never changed the pre-lock overwrite, so
                 // its new seed is safe to retire. A prior lockdown seed survives.
-                (
-                    ChannelReply::refused(
-                        "Discord refused the channel action; no mutation was accepted.",
-                    ),
-                    prepared.rejected_seed,
-                )
+                // Finishing releases the lane, so /unlock stays reachable.
+                (failure.refusal(), prepared.rejected_seed)
             }
-            Err(
-                DiscordError::Timeout | DiscordError::Unavailable(_) | DiscordError::RateLimited,
-            ) => {
+            Err(_) => {
                 // Do not complete or release either claim. Audit uncertainty;
                 // neither a same-key retry nor a different key may mutate this lane.
                 request.row.outcome = "in_progress".to_owned();
                 self.store.record_audit(&request.row).await?;
                 return Ok(Some(ChannelReply::uncertain()));
-            }
-            Err(DiscordError::Rejected(_) | DiscordError::Guard(_)) => {
-                unreachable!("safe rejection handled above")
             }
         };
         if !self
@@ -319,6 +333,37 @@ impl ChannelModerationRuntime {
             return Ok(Some(ChannelReply::uncertain()));
         }
         Ok(Some(reply))
+    }
+
+    /// Run one prepared call. Purge is split into its two phases: a failed
+    /// history read, even a timeout, proves no delete was sent, so it must not
+    /// keep the lane. Every other failure follows [`DiscordError::proves_no_effect`].
+    async fn dispatch(&self, call: &ChannelCall) -> Result<ChannelCallOutcome, CallFailure> {
+        let ChannelCall::Purge {
+            channel_id,
+            count,
+            reason,
+        } = call
+        else {
+            return self
+                .executor
+                .execute_channel(call)
+                .await
+                .map_err(CallFailure::of);
+        };
+        let ids = self
+            .executor
+            .list_purge_messages(channel_id, *count)
+            .await
+            .map_err(|error| CallFailure {
+                error,
+                no_effect: true,
+            })?;
+        self.executor
+            .purge_messages(channel_id, &ids, reason)
+            .await
+            .map(|affected| ChannelCallOutcome::Purged { affected })
+            .map_err(CallFailure::of)
     }
 
     async fn prepare(
@@ -375,7 +420,8 @@ impl ChannelModerationRuntime {
                     Ok(plan) => plan,
                     Err(_) => return Ok(Err("Invalid channel permission masks.".to_owned())),
                 };
-                // Persist before PUT; repeated locks never replace the first seed.
+                // Persist before PUT. Keep the first seed while locked; a live
+                // overwrite without the send deny starts a new recovery cycle.
                 let rec = self
                     .store
                     .record_lockdown(
@@ -395,7 +441,10 @@ impl ChannelModerationRuntime {
                         reason,
                     },
                     restore: None,
-                    rejected_seed: if prior_record.is_none() {
+                    rejected_seed: if prior_record
+                        .as_ref()
+                        .is_none_or(|old| old.recovery_generation != rec.recovery_generation)
+                    {
                         Some(rec)
                     } else {
                         None
@@ -407,7 +456,24 @@ impl ChannelModerationRuntime {
                 if rec.as_ref().is_some_and(|r| r.guild_id != guild_id) {
                     return Ok(Err("Recovery guild does not match this channel.".to_owned()));
                 }
-                let call = match domain::plan_unlock(rec.as_ref()) {
+                if rec.is_none() {
+                    return Ok(Err(domain::UnlockError::NotLocked.to_string()));
+                }
+                let current = match self
+                    .executor
+                    .get_everyone_overwrite(&channel_id, &guild_id)
+                    .await
+                {
+                    Ok(current) => current.map(|ow| EveryoneOverwrite {
+                        allow: ow.allow,
+                        deny: ow.deny,
+                    }),
+                    Err(_) => return Ok(Err(
+                        "Could not verify the current channel overwrite; no mutation attempted."
+                            .to_owned(),
+                    )),
+                };
+                let call = match domain::plan_unlock(rec.as_ref(), current.as_ref()) {
                     Ok(UnlockPlan::Restore { allow, deny }) => ChannelCall::PutOverwrite {
                         channel_id,
                         guild_id,

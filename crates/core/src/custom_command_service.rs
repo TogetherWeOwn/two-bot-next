@@ -10,8 +10,8 @@ use sqlx::PgPool;
 use crate::automation_transfer::{diff_import, ImportOutcome, ParsedImport};
 use crate::custom_command_store as store;
 use crate::custom_commands::{
-    adjudicate_delete, adjudicate_put, builtin_command_names, check_capacity, error_code,
-    require_automations_enabled, validate_put_input, AuditRecord, CommandError, DeleteDecision,
+    adjudicate_delete, adjudicate_put, check_capacity, error_code, require_automations_enabled,
+    reserved_command_names, validate_put_input, AuditRecord, CommandError, DeleteDecision,
     PutCommandInput, PutDecision, StoredCommand,
 };
 
@@ -38,7 +38,7 @@ pub async fn put(
     at: &str,
 ) -> Result<PutDecision, ServiceError> {
     require_automations_enabled(enabled)?;
-    let builtins = builtin_command_names();
+    let builtins = reserved_command_names();
     let mut tx = pool.begin().await?;
     store::lock_command_capacity(&mut tx, guild).await?;
     let existing = store::get_command(&mut *tx, guild, &input.name).await?;
@@ -146,7 +146,7 @@ pub async fn import(
     if parsed.overwrite && !overwrite_allowed {
         return Err(ImportServiceError::OverwriteNotAllowed);
     }
-    let builtins = builtin_command_names();
+    let builtins = reserved_command_names();
     let mut tx = pool.begin().await?;
     store::lock_command_capacity(&mut tx, guild).await?;
     let existing = store::list_commands(&mut *tx, guild).await?;

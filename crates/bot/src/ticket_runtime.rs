@@ -609,7 +609,7 @@ impl TicketRuntime {
                     Ok((id, message))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            page.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            page.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
             let mut floor = before.as_deref().map(valid_id).transpose()?;
             for (id, message) in page {
                 if floor.is_some_and(|cursor| id >= cursor) {

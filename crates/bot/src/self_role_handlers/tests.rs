@@ -147,6 +147,42 @@ async fn empty_or_denied_catalogue_never_registers_a_surface() {
     assert!(SelfRoleService::new(runtime(), gates(PanelMode::Button), &HashSet::new()).is_none());
 }
 
+#[tokio::test]
+async fn invalid_catalogue_parks_service_at_boot() {
+    // A catalogue the strict parser refuses (21 reactions exceeds Discord's
+    // 20-reaction bound) must park `from_env` before any REST or store use.
+    let key = "TWO_SELF_ROLE_PANELS";
+    let prior = std::env::var(key).ok();
+    let options = (0..21)
+        .map(|i| {
+            format!(
+                "{{\"key\":\"k{i:02}\",\"label\":\"Chess\",\"roleId\":\"10000000000000{:04}\",\"permissions\":\"0\",\"emoji\":\"e{i:02}\"}}",
+                100 + i,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    std::env::set_var(
+        key,
+        format!(
+            "[{{\"id\":\"react\",\"channelId\":\"{CHANNEL}\",\"messageId\":\"{MESSAGE}\",\"mode\":\"reaction\",\"options\":[{options}]}}]"
+        ),
+    );
+    let options = PgConnectOptions::new()
+        .host("agent-testdb")
+        .port(5432)
+        .username("agent_test")
+        .password("")
+        .database("agent_test");
+    let pool = PgPoolOptions::new().connect_lazy_with(options);
+    let parked = SelfRoleService::from_env(pool, "fixture-token", GUILD).await;
+    assert!(parked.is_none());
+    match prior {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+}
+
 #[test]
 fn boot_allowlist_is_only_the_pinned_staging_guild() {
     let allowlist = staging_allowlist();

@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use super::custom_commands::{
-    builtin_command_names, error_code, max_custom_commands, validate_put_input, CommandError,
+    error_code, max_custom_commands, reserved_command_names, validate_put_input, CommandError,
     PutCommandInput, StoredCommand,
 };
 use super::mee6::{parse_mee6_entry, translate_export, Mee6CommandInput};
@@ -250,7 +250,7 @@ pub fn parse_import_document(
 /// command budget are refused before planning.
 #[must_use]
 pub fn max_import_entries() -> usize {
-    max_custom_commands(builtin_command_names().len())
+    max_custom_commands(reserved_command_names().len())
 }
 
 /// One dry-run rejection: the definition plus its stable reason code
@@ -389,7 +389,7 @@ mod tests {
     use serde_json::json;
 
     fn builtins() -> HashSet<String> {
-        builtin_command_names()
+        reserved_command_names()
     }
 
     fn stored(name: &str, template: &str, trigger: Option<&str>) -> StoredCommand {

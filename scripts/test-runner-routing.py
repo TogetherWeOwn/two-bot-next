@@ -88,7 +88,7 @@ class RepositoryWorkflowTests(unittest.TestCase):
     def test_required_check_jobs_and_their_needs_are_routed(self):
         check = jobs((WORKFLOWS / "check.yml").read_text())
         supply = jobs((WORKFLOWS / "supply-chain.yml").read_text())
-        for job, lines in [*((j, check[j]) for j in ("check", "self-role-store", "parity-docs", "required-checks")),
+        for job, lines in [*((j, check[j]) for j in ("check", "self-role-store", "parity-docs", "container-inputs", "ci-ok")),
                            *((j, supply[j]) for j in ("pr-lint", "gitleaks"))]:
             self.assertIn(f"    runs-on: {routed(job)}", lines, job)
 

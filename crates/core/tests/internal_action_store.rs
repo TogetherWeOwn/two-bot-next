@@ -1171,3 +1171,85 @@ async fn completion_and_reconciliation_race_cannot_overwrite_terminal() {
     second.close().await;
     db.cleanup().await;
 }
+
+const EVENT_GUILD: &str = "100000000000000001";
+const OTHER_GUILD: &str = "100000000000000099";
+const MAPPED_EVENT: &str = "100000000000000002";
+
+#[tokio::test]
+async fn event_key_map_is_guild_fenced_and_repointable() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    // Unmapped keys resolve to None: the receiver refuses them before Discord.
+    assert_eq!(
+        store.event_id_for_key(EVENT_GUILD, "launch").await.unwrap(),
+        None
+    );
+    store
+        .put_event_key(EVENT_GUILD, "launch", MAPPED_EVENT)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.event_id_for_key(EVENT_GUILD, "launch").await.unwrap(),
+        Some(MAPPED_EVENT.to_owned())
+    );
+    // The fence is the guild: the same key elsewhere stays unmapped.
+    assert_eq!(
+        store.event_id_for_key(OTHER_GUILD, "launch").await.unwrap(),
+        None
+    );
+    store
+        .put_event_key(OTHER_GUILD, "launch", "100000000000000003")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.event_id_for_key(OTHER_GUILD, "launch").await.unwrap(),
+        Some("100000000000000003".to_owned())
+    );
+    // Re-pointing one guild leaves the other alone.
+    store
+        .put_event_key(EVENT_GUILD, "launch", "100000000000000004")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.event_id_for_key(EVENT_GUILD, "launch").await.unwrap(),
+        Some("100000000000000004".to_owned())
+    );
+    assert_eq!(
+        store.event_id_for_key(OTHER_GUILD, "launch").await.unwrap(),
+        Some("100000000000000003".to_owned())
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn event_key_map_refuses_misshapen_inputs() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    let long = "k".repeat(201);
+    for (guild, key, event) in [
+        ("not-a-snowflake", "launch", MAPPED_EVENT),
+        (EVENT_GUILD, "", MAPPED_EVENT),
+        (EVENT_GUILD, "has space", MAPPED_EVENT),
+        (EVENT_GUILD, long.as_str(), MAPPED_EVENT),
+        (EVENT_GUILD, "launch", "not-a-snowflake"),
+    ] {
+        assert_eq!(
+            store.put_event_key(guild, key, event).await,
+            Err(InternalStoreError::InvalidInput),
+            "{guild}/{key}/{event}"
+        );
+    }
+    for (guild, key) in [
+        ("not-a-snowflake", "launch"),
+        (EVENT_GUILD, ""),
+        (EVENT_GUILD, "has space"),
+    ] {
+        assert_eq!(
+            store.event_id_for_key(guild, key).await,
+            Err(InternalStoreError::InvalidInput),
+            "{guild}/{key}"
+        );
+    }
+    db.cleanup().await;
+}
