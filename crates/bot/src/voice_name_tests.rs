@@ -796,12 +796,12 @@ async fn the_full_flow_runs_through_the_runtime() {
 #[tokio::test]
 async fn the_guild_role_gate_covers_every_name_step() {
     let trace = Trace::default();
-    let runtime = ownership_room_runtime(trace.clone()).await;
-    // Restrict `/name` to a role the owner does not hold.
-    let (store, _) = runtime.make_pair();
-    let mut controls = AccessControls::default();
-    controls.command_roles.insert("name".to_owned(), vec![777]);
-    store.save_access_controls(GUILD, &controls).await.unwrap();
+    // `/name` is restricted to a role the owner does not hold.
+    let controls = AccessControls {
+        command_roles: [("name".to_owned(), vec![777])].into(),
+        ..AccessControls::default()
+    };
+    let runtime = gated_runtime(trace.clone(), controls, None);
     let names = directory();
     for interaction in [
         with_user(
@@ -814,17 +814,23 @@ async fn the_guild_role_gate_covers_every_name_step() {
     ] {
         let (owned, response) = name_capture_full(&runtime, &interaction, &names).await;
         assert!(owned);
-        let text = response_text(&response.expect("reply"));
-        assert!(!text.contains("Renaming"), "{text}");
-        assert!(
-            !trace
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|entry| entry.starts_with("save_custom_name")),
-            "a gated step writes nothing"
+        assert_eq!(
+            response_text(&response.expect("denial")),
+            access_denied_text(AccessDenyReason::CommandRestricted)
         );
     }
+    assert!(
+        trace.lock().unwrap().is_empty(),
+        "a gated step writes nothing"
+    );
+    // The role holder passes the gate; this runtime has no live guild actor,
+    // so the worker step answers that it is not warmed up.
+    let allowed = with_roles(
+        component_interaction(&name_restore_custom_id(500), None, OWNER),
+        &[777],
+    );
+    let (_, response) = name_capture_full(&runtime, &allowed, &names).await;
+    assert!(response_text(&response.expect("reply")).contains("warmed up"));
 }
 
 #[tokio::test]
