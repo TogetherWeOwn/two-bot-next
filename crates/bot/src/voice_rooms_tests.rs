@@ -85,6 +85,8 @@ struct Store {
     trace: Trace,
     creators: Mutex<Vec<CreatorChannel>>,
     rooms: Mutex<HashMap<u64, VoiceRoom>>,
+    rooms_errors: Mutex<VecDeque<StoreError>>,
+    after_rooms: Option<Hook>,
     companions: Mutex<HashMap<(u64, u64), TextCompanion>>,
     persist_error: Option<StoreError>,
     access: Arc<Mutex<AccessControls>>,
@@ -108,6 +110,8 @@ impl Store {
             trace,
             creators: Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)]),
             rooms: Mutex::new(HashMap::new()),
+            rooms_errors: Mutex::new(VecDeque::new()),
+            after_rooms: None,
             companions: Mutex::new(HashMap::new()),
             persist_error: None,
             access: Arc::new(Mutex::new(AccessControls::default())),
@@ -166,7 +170,14 @@ impl RoomPersistence for Store {
         Ok(())
     }
     async fn rooms(&self, _: u64) -> Result<Vec<VoiceRoom>, StoreError> {
-        Ok(self.rooms.lock().unwrap().values().cloned().collect())
+        if let Some(error) = self.rooms_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        let rooms = self.rooms.lock().unwrap().values().cloned().collect();
+        if let Some(hook) = &self.after_rooms {
+            hook();
+        }
+        Ok(rooms)
     }
     async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), StoreError> {
         if let Some(error) = *self.add_creator_error.lock().unwrap() {

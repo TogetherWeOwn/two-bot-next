@@ -22,8 +22,8 @@ Next uses worker fixtures, not the legacy TypeScript mutation runner.
 | Legacy obligation | Worker fixture in `crates/bot/src/voice_delete_guard_tests.rs` (unless noted) |
 | --- | --- |
 | M1: Lobby, generator and category excluded by ID, even with claimed provenance | `protected_infrastructure_with_claimed_provenance_never_deletes`; `companion_provenance_cannot_delete_infrastructure`; `queued_delete_observes_new_protection_at_send_time` |
-| M2: Never trust a caller's no-row delete request | `direct_untracked_delete_cannot_trust_queued_provenance` |
-| M3: Absent provenance must fail closed, not invert into a delete | Same direct untracked fixture; `untracked_live_channels_enqueue_zero_deletes` in `voice_rooms_tests.rs` pins reconcile independently |
+| M2: Never trust a caller's no-row delete request | `direct_untracked_delete_cannot_trust_queued_provenance`; `stale_loaded_provenance_never_authorizes_an_ordinary_delete` removes the durable row before reconcile and after enqueue |
+| M3: Absent provenance must fail closed, not invert into a delete | Same direct/stale provenance fixtures; `unavailable_provenance_fails_closed_and_honors_backoff_or_credential_halt` pins failed reads; `untracked_live_channels_enqueue_zero_deletes` in `voice_rooms_tests.rs` pins reconcile independently |
 | M4: No ordinary delete before the grace deadline | `ordinary_empty_room_survives_until_exact_grace_deadline`; `human_join_and_leave_between_ticks_restart_queued_delete_grace` |
 | M5: Re-read occupancy instead of trusting an old empty marker | `delayed_delete_rechecks_grace_after_transient_human_occupancy`; `occupants_arriving_during_delete_backoff_cancel_the_write` in `voice_rooms_tests.rs` |
 | M6: Re-adopt occupied tracked rooms on reconnect | `reconnect_only_prunes_tracked_empty_channels_and_counts_unknown_members_as_human` in `voice_rooms_tests.rs` covers human/unknown occupancy, bot-only cleanup, missing tracked channels and untouched untracked channels |
@@ -31,9 +31,15 @@ Next uses worker fixtures, not the legacy TypeScript mutation runner.
 The existing readiness/disconnect, failed-move compensation, permission-loss,
 403 suspension/no-retry-storm and SQL-only forget retry fixtures remain in the
 same worker suite. Boot-ID parsing and Worker-to-Container forwarding have
-separate synthetic fixtures. Ordinary provenance is the worker's loaded
-`voice_rooms` set; compensation has the exact successful create response. These
-fixtures do not claim a per-delete database lookup or cross-process ownership.
+separate synthetic fixtures. Ordinary deletes require both worker tracking and
+an authoritative `RoomPersistence::rooms` read before deletion. If its durable
+row disappeared, the worker stops managing that channel without deleting it or
+its companion. Failed reads back off, and credential refusal halts writes. This
+adds one room-inventory query per ordinary delete; compensation instead has the
+exact successful create response. The live guard is built and evaluated after
+the query (`delete_rechecks_live_grace_after_the_provenance_read`) and again at
+send time. This is not a cross-process ownership lock or a transaction spanning
+SQL and Discord.
 
 ## Verification and evidence boundary
 

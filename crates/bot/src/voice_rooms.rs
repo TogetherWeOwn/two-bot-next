@@ -2355,6 +2355,46 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 }
                 let live = self.live.clone();
                 let compensate = self.compensation.contains(&channel_id);
+                if !compensate {
+                    // Ordinary deletes need current durable provenance, not a
+                    // stale loaded row or a caller's queued channel ID. A lost
+                    // row leaks the live channel rather than guessing ownership.
+                    match self.store.rooms(self.live.guild_id).await {
+                        Ok(rooms) => {
+                            if !rooms.iter().any(|room| {
+                                room.guild_id == self.live.guild_id && room.channel_id == channel_id
+                            }) {
+                                self.queue.mark_succeeded(&action);
+                                self.queue.drop_for_channel(self.live.guild_id, channel_id);
+                                self.rooms.remove(&channel_id);
+                                self.deletes.remove(&channel_id);
+                                self.renames.forget(channel_id);
+                                self.moves.remove(&channel_id);
+                                self.uncertain_moves.remove(&channel_id);
+                                self.desired_names.remove(&channel_id);
+                                self.observe_voice_state();
+                                return true;
+                            }
+                        }
+                        Err(error) => {
+                            self.record(LifecycleFailure::Persistence {
+                                channel_id: Some(channel_id),
+                                error,
+                            });
+                            if error == StoreError::CredentialRefused {
+                                self.halted = true;
+                                self.queue.mark_succeeded(&action);
+                            } else {
+                                self.mark_failed_observed(
+                                    action,
+                                    "voice-room provenance unavailable".to_owned(),
+                                    elapsed_ms(now_ms, started),
+                                );
+                            }
+                            return true;
+                        }
+                    }
+                }
                 let guard: WriteGuard = Arc::new(move || {
                     let state = live.inner.read().expect("live voice lock");
                     state.ready

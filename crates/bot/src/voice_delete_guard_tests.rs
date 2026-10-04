@@ -49,6 +49,80 @@ fn malformed_protected_id_configuration_fails_closed() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn stale_loaded_provenance_never_authorizes_an_ordinary_delete() {
+    for remove_before_reconcile in [false, true] {
+        let (live, store, http, trace) = fixture();
+        live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+        store.rooms.lock().unwrap().insert(500, room(500));
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        tokio::time::advance(EMPTY_ROOM_GRACE).await;
+        if remove_before_reconcile {
+            worker.store.rooms.lock().unwrap().remove(&500);
+        }
+        worker.reconcile();
+        worker.store.rooms.lock().unwrap().remove(&500);
+        dispatch(&mut worker, 60_000).await;
+        assert!(trace.lock().unwrap().is_empty());
+        assert!(worker
+            .live
+            .inner
+            .read()
+            .unwrap()
+            .channels
+            .contains_key(&500));
+        assert!(!worker.tracked().contains_key(&500));
+        worker.reconcile();
+        assert!(!worker.dispatch_one(120_000).await);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unavailable_provenance_fails_closed_and_honors_backoff_or_credential_halt() {
+    for error in [StoreError::Unavailable, StoreError::CredentialRefused] {
+        let (live, store, http, trace) = fixture();
+        live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+        store.rooms.lock().unwrap().insert(500, room(500));
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        worker.store.rooms_errors.lock().unwrap().push_back(error);
+        tokio::time::advance(EMPTY_ROOM_GRACE).await;
+        worker.reconcile();
+        dispatch(&mut worker, 60_000).await;
+        assert!(trace.lock().unwrap().is_empty());
+        assert!(worker.tracked().contains_key(&500));
+        assert!(!worker.dispatch_one(60_001).await);
+        if error == StoreError::CredentialRefused {
+            assert!(worker.halted());
+            assert!(!worker.dispatch_one(120_000).await);
+        } else {
+            dispatch(&mut worker, 63_000).await;
+            assert_eq!(*trace.lock().unwrap(), ["delete:500", "forget:500"]);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn delete_rechecks_live_grace_after_the_provenance_read() {
+    let (live, store, http, trace) = fixture();
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    store.rooms.lock().unwrap().insert(500, room(500));
+    let shared = live.clone();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.store.after_rooms = Some(Arc::new(move || {
+        shared.voice_update(MEMBER, Some(500), Some(false));
+        shared.voice_update(MEMBER, None, Some(false));
+    }));
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
+    worker.reconcile();
+    dispatch(&mut worker, 60_000).await;
+    assert!(trace.lock().unwrap().is_empty());
+    worker.store.after_rooms = None;
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
+    worker.reconcile();
+    dispatch(&mut worker, 120_000).await;
+    assert_eq!(*trace.lock().unwrap(), ["delete:500", "forget:500"]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn newly_added_creator_cancels_a_preexisting_delete() {
     let (live, store, http, trace) = fixture();
     live.upsert_channel(channel(500, 2, Some(CATEGORY)));
