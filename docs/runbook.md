@@ -631,6 +631,18 @@ permissions/hierarchy; require converged hash and exit 0, not just `DID` lines.
 The credential-file loader refuses empty/invalid/unreadable input without
 substitution; the documented environment fallback is only for an absent file.
 
+The mock-only staging-guild E2E prep skeleton
+(`scripts/staging_guild_e2e_prep.py`, stdlib only, no network, no credentials)
+drives the guild interactions-endpoint shape against local fixtures: identity,
+the guild command list, then one per-command resource read per surface. A live
+guild id aborts before anything is built or sent; without `--mock` there is no
+transport at all. The offline regressions (`scripts/test_staging_guild_e2e_prep.py`)
+prove the live-guild refusal and run in CI on standard runners. The live
+Discord run against the staging guild arrives with the full staging suite;
+this skeleton never touches staging. Run the mock-only prep with
+`scripts/staging_guild_e2e_prep.py --mock` (local fixtures, no network); a
+live guild id exits 2 with nothing sent.
+
 The three shipped service/timer pairs are **operator-host templates**, not
 installed Cloudflare schedules: nightly DB backup 04:17, guild-config backup
 04:31 UTC, monthly scratch restore drill on the 1st at 05:30. Local-container
