@@ -654,7 +654,8 @@ jobs:
           cargo test -p two-bot-core --features db --test backup_schema_roundtrip --locked shipped_backup_and_restore_drill -- --nocapture --test-threads=1
 
       - name: audit database regressions (CI service only)
-        run: cargo test -p two-bot-core --features db --test audit_store --test audit_service --test containment_store --test join_risk_store --locked -- --ignored
+        run: exit 1 # probe: forced failure to show ci-ok goes red
+        #  cargo test -p two-bot-core --features db --test audit_store --test audit_service --test containment_store --test join_risk_store --locked -- --ignored
 
       - name: LFG store regressions (CI service container only)
         run: >-
