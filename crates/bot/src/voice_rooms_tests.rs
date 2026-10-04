@@ -98,6 +98,16 @@ struct Store {
     config: Arc<Mutex<VoiceConfiguration>>,
     config_error: Option<StoreError>,
     save_config_error: Option<StoreError>,
+    /// Scripted durable-admission verdicts, consumed per claim; an empty
+    /// script admits with an incrementing reservation id.
+    claim_script: Mutex<VecDeque<Result<CreateClaim, StoreError>>>,
+    /// Every claim as `(user, now_secs)`, and every settle as
+    /// `(reservation, bound channel)`.
+    claims: Mutex<Vec<(u64, i64)>>,
+    settled: Mutex<Vec<(i64, Option<u64>)>>,
+    /// Also push `claim` / `settle` markers onto the shared trace, for tests
+    /// that pin ordering against the Discord and persist calls.
+    trace_claims: bool,
 }
 
 impl Store {
@@ -121,6 +131,10 @@ impl Store {
             config: Arc::new(Mutex::new(empty_config())),
             config_error: None,
             save_config_error: None,
+            claim_script: Mutex::new(VecDeque::new()),
+            claims: Mutex::new(Vec::new()),
+            settled: Mutex::new(Vec::new()),
+            trace_claims: false,
         }
     }
 }
@@ -230,6 +244,36 @@ impl RoomPersistence for Store {
         }
         self.rooms.lock().unwrap().remove(&channel);
         Ok(())
+    }
+    async fn claim_create(
+        &self,
+        _: u64,
+        user: u64,
+        _: &CreateAdmissionConfig,
+        now_secs: i64,
+    ) -> Result<CreateClaim, StoreError> {
+        if self.trace_claims {
+            self.trace.lock().unwrap().push("claim".to_owned());
+        }
+        let mut claims = self.claims.lock().unwrap();
+        claims.push((user, now_secs));
+        match self.claim_script.lock().unwrap().pop_front() {
+            Some(verdict) => verdict,
+            None => Ok(CreateClaim::Admitted {
+                reservation_id: i64::try_from(claims.len()).unwrap(),
+            }),
+        }
+    }
+    async fn settle_create(
+        &self,
+        reservation_id: i64,
+        channel: Option<u64>,
+    ) -> Result<bool, StoreError> {
+        if self.trace_claims {
+            self.trace.lock().unwrap().push("settle".to_owned());
+        }
+        self.settled.lock().unwrap().push((reservation_id, channel));
+        Ok(true)
     }
     async fn config_snapshot(&self, _: u64) -> Result<VoiceConfiguration, StoreError> {
         match self.config_error {
@@ -1169,6 +1213,176 @@ async fn unknown_create_is_never_retried_or_inferred_from_untracked_channels() {
     assert!(!worker.dispatch_one(60000).await);
     assert_eq!(*trace.lock().unwrap(), ["create"]);
     assert!(worker.tracked().is_empty());
+}
+
+#[tokio::test]
+async fn admission_claims_before_discord_and_binds_the_created_room() {
+    let (live, mut store, http, trace) = fixture();
+    store.trace_claims = true;
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["claim", "create", "persist:500", "settle", "move:300:500"]
+    );
+    let claims = worker.store.claims.lock().unwrap().clone();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].0, MEMBER);
+    // The claim is stamped with the wall clock, not the actor's monotonic one.
+    let wall = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    assert!((wall - claims[0].1).abs() < 60);
+    assert_eq!(*worker.store.settled.lock().unwrap(), [(1, Some(500))]);
+    assert!(worker.failures().is_empty());
+}
+
+#[tokio::test]
+async fn admission_refusal_records_the_stable_code_and_never_calls_discord() {
+    for (reason, code, text) in [
+        (
+            RefusalReason::UserCap,
+            "user_cap",
+            "You already have a temporary voice channel.",
+        ),
+        (
+            RefusalReason::GuildCap,
+            "guild_cap",
+            "This server has reached its temporary voice channel limit. Try again shortly.",
+        ),
+        (
+            RefusalReason::Cooldown,
+            "cooldown",
+            "Please wait 30 seconds between creating channels.",
+        ),
+        (
+            RefusalReason::UserBurst,
+            "user_burst",
+            "Temporary voice rate limit: 3 creates per 60 seconds. Please try again shortly.",
+        ),
+        (
+            RefusalReason::GuildBurst,
+            "guild_burst",
+            "This server's temporary voice rate limit is 10 creates per 60 seconds. Please try again shortly.",
+        ),
+    ] {
+        let (live, store, http, trace) = fixture();
+        store
+            .claim_script
+            .lock()
+            .unwrap()
+            .push_back(Ok(CreateClaim::Refused(reason)));
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        join(&mut worker, MEMBER);
+        dispatch(&mut worker, 0).await;
+        assert!(trace.lock().unwrap().is_empty(), "{code}: no Discord call");
+        assert!(worker.tracked().is_empty());
+        assert!(worker.store.settled.lock().unwrap().is_empty());
+        let failure = worker.failures().back().cloned();
+        assert_eq!(
+            failure,
+            Some(LifecycleFailure::CreateRefused {
+                creator_id: CREATOR,
+                reason,
+                message: text.to_owned(),
+            })
+        );
+        let line = failure_line(&failure.unwrap());
+        assert!(line.contains(&format!("({code})")) && line.contains(text), "{line}");
+        // The refused create is gone: nothing retries it.
+        assert!(!worker.dispatch_one(60_000).await);
+        assert_eq!(worker.store.claims.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn admission_store_failure_never_calls_discord_and_credential_refusal_halts() {
+    for (error, halted) in [
+        (StoreError::Unavailable, false),
+        (StoreError::CredentialRefused, true),
+    ] {
+        let (live, store, http, trace) = fixture();
+        store.claim_script.lock().unwrap().push_back(Err(error));
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        join(&mut worker, MEMBER);
+        dispatch(&mut worker, 0).await;
+        assert!(trace.lock().unwrap().is_empty());
+        assert_eq!(worker.halted(), halted);
+        assert_eq!(
+            worker.failures().back(),
+            Some(&LifecycleFailure::Persistence {
+                channel_id: None,
+                error
+            })
+        );
+        assert!(worker.store.settled.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_429_requeue_keeps_one_claim_and_settles_it_once() {
+    let (live, store, http, trace) = fixture();
+    http.create_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::RateLimited {
+            retry_after_ms: 1500,
+            global: false,
+        });
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 100).await;
+    assert!(worker.store.settled.lock().unwrap().is_empty());
+    dispatch(&mut worker, 1600).await;
+    assert_eq!(*trace.lock().unwrap(), ["create", "create", "persist:500"]);
+    assert_eq!(worker.store.claims.lock().unwrap().len(), 1);
+    assert_eq!(*worker.store.settled.lock().unwrap(), [(1, Some(500))]);
+}
+
+#[tokio::test]
+async fn a_create_that_ends_without_a_room_rolls_its_reservation_back() {
+    // Unknown Discord outcome.
+    let (live, store, http, _) = fixture();
+    http.create_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::UnknownOutcome);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(*worker.store.settled.lock().unwrap(), [(1, None)]);
+
+    // The room was created but could not be persisted: compensation deletes it.
+    let (live, mut store, http, _) = fixture();
+    store.persist_error = Some(StoreError::Unavailable);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(*worker.store.settled.lock().unwrap(), [(1, None)]);
+
+    // A 429 requeue whose join went stale before the retry releases its claim.
+    let (live, store, http, trace) = fixture();
+    http.create_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::RateLimited {
+            retry_after_ms: 1500,
+            global: false,
+        });
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 100).await;
+    worker.live.voice_update(MEMBER, None, Some(false));
+    dispatch(&mut worker, 1600).await;
+    assert_eq!(*trace.lock().unwrap(), ["create"]);
+    assert_eq!(*worker.store.settled.lock().unwrap(), [(1, None)]);
+    assert_eq!(worker.store.claims.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

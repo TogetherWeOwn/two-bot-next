@@ -49,6 +49,24 @@ impl RoomPersistence for Arc<Store> {
     async fn forget(&self, guild: u64, channel: u64) -> Result<(), StoreError> {
         self.as_ref().forget(guild, channel).await
     }
+    async fn claim_create(
+        &self,
+        guild: u64,
+        user: u64,
+        config: &CreateAdmissionConfig,
+        now_secs: i64,
+    ) -> Result<CreateClaim, StoreError> {
+        self.as_ref()
+            .claim_create(guild, user, config, now_secs)
+            .await
+    }
+    async fn settle_create(
+        &self,
+        reservation_id: i64,
+        channel: Option<u64>,
+    ) -> Result<bool, StoreError> {
+        self.as_ref().settle_create(reservation_id, channel).await
+    }
     async fn config_snapshot(&self, guild: u64) -> Result<VoiceConfiguration, StoreError> {
         self.as_ref().config_snapshot(guild).await
     }

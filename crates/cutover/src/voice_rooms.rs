@@ -11,6 +11,10 @@ use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
 use two_bot_core::voice_access::{validate_access_controls, AccessControls};
+use two_bot_core::voice_create_admission::{
+    decide_admission, AcceptedReservation, AdmissionDecision, AdmissionRequest,
+    CreateAdmissionConfig, RefusalReason, CREATE_BURST_WINDOW_SECS,
+};
 use two_bot_core::voice_logging::{parse_detail_level, LoggingSettings};
 use two_bot_core::voice_rooms::{
     CreatorChannel, PermissionSource, RoomPosition, TextCompanion, VoiceRoom,
@@ -18,6 +22,21 @@ use two_bot_core::voice_rooms::{
 use two_bot_core::{format_iso_millis, parse_iso_millis, Snowflake};
 
 use super::voice_config_store::PgVoiceConfigStore;
+
+/// How long an unsettled create reservation holds a cap slot. A reservation
+/// older than this was abandoned (a crash between the claim and the settle)
+/// and no longer counts toward the user or guild cap; it still counts toward
+/// the burst window and cooldown, which only read `created_at`.
+pub const IN_FLIGHT_RESERVATION_TTL_SECS: i64 = 300;
+
+/// The verdict of [`PgRoomStore::claim_create`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateClaim {
+    /// Recorded durably; settle it with [`PgRoomStore::settle_create`].
+    Admitted { reservation_id: i64 },
+    /// Refused before any write; the first tripped limit.
+    Refused(RefusalReason),
+}
 
 #[derive(Debug, Clone)]
 pub struct PgRoomStore {
@@ -235,6 +254,126 @@ impl PgRoomStore {
             .as_ref()
             .map(decode_room)
             .transpose()
+    }
+
+    /// Claim one room create: serialize per guild, read the persisted history,
+    /// run [`decide_admission`] and, when allowed, durably record the accepted
+    /// reservation, all in one transaction. Nothing is written on a refusal.
+    ///
+    /// The per-guild advisory lock makes concurrent claims (two joins, two
+    /// processes) see each other's reservation, so they cannot both pass the
+    /// guild cap. `now_secs` is the caller's Unix-seconds clock; it stamps the
+    /// reservation and anchors the window, cooldown and in-flight TTL, so the
+    /// decision never depends on the database clock.
+    ///
+    /// Cap counts are live rooms (`voice_rooms`) plus in-flight reservations
+    /// (not yet settled, younger than [`IN_FLIGHT_RESERVATION_TTL_SECS`]).
+    /// Burst and cooldown history comes from every reservation ever accepted,
+    /// including rooms since deleted and rolled-back creates, so neither a
+    /// deletion nor a restart frees a slot.
+    pub async fn claim_create(
+        &self,
+        guild_id: Snowflake,
+        user_id: Snowflake,
+        config: &CreateAdmissionConfig,
+        now_secs: i64,
+    ) -> Result<CreateClaim, sqlx::Error> {
+        if guild_id == 0 {
+            return Err(invalid_argument("guild id must be nonzero"));
+        }
+        let guild = guild_id.to_string();
+        let user = user_id.to_string();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("voice_create:{guild}"))
+            .execute(&mut *tx)
+            .await?;
+        let counts = sqlx::query(
+            "SELECT
+               (SELECT COUNT(*) FROM voice_rooms WHERE guild_id = $1)
+                 + (SELECT COUNT(*) FROM voice_create_reservations
+                     WHERE guild_id = $1 AND settled_at IS NULL
+                       AND created_at > to_timestamp($3::double precision)) AS rooms_in_guild,
+               (SELECT COUNT(*) FROM voice_rooms WHERE guild_id = $1 AND owner_id = $2)
+                 + (SELECT COUNT(*) FROM voice_create_reservations
+                     WHERE guild_id = $1 AND user_id = $2 AND settled_at IS NULL
+                       AND created_at > to_timestamp($3::double precision)) AS owned_by_user,
+               (SELECT floor(extract(epoch FROM max(created_at)))::bigint
+                  FROM voice_create_reservations
+                 WHERE guild_id = $1 AND user_id = $2) AS last_created_secs",
+        )
+        .bind(&guild)
+        .bind(&user)
+        .bind(now_secs.saturating_sub(IN_FLIGHT_RESERVATION_TTL_SECS))
+        .fetch_one(&mut *tx)
+        .await?;
+        let history = sqlx::query(
+            "SELECT user_id, floor(extract(epoch FROM created_at))::bigint AS created_at_secs
+             FROM voice_create_reservations
+             WHERE guild_id = $1 AND created_at > to_timestamp($2::double precision)",
+        )
+        .bind(&guild)
+        .bind(now_secs.saturating_sub(CREATE_BURST_WINDOW_SECS))
+        .fetch_all(&mut *tx)
+        .await?
+        .iter()
+        .map(|row| {
+            Ok(AcceptedReservation {
+                user_id: decode_id(row, "user_id")?,
+                created_at_secs: row.try_get("created_at_secs")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        let count = |column: &str| -> Result<u32, sqlx::Error> {
+            Ok(u32::try_from(counts.try_get::<i64, _>(column)?).unwrap_or(u32::MAX))
+        };
+        let request = AdmissionRequest {
+            user_id,
+            owned_by_user: count("owned_by_user")?,
+            rooms_in_guild: count("rooms_in_guild")?,
+            last_created_at_secs: counts.try_get("last_created_secs")?,
+            accepted_reservations: &history,
+        };
+        match decide_admission(config, &request, now_secs).map_err(invalid_argument)? {
+            AdmissionDecision::Deny { reason } => Ok(CreateClaim::Refused(reason)),
+            AdmissionDecision::Allow => {
+                let reservation_id: i64 = sqlx::query_scalar(
+                    "INSERT INTO voice_create_reservations (guild_id, user_id, created_at)
+                     VALUES ($1, $2, to_timestamp($3::double precision))
+                     RETURNING id",
+                )
+                .bind(&guild)
+                .bind(&user)
+                .bind(now_secs)
+                .fetch_one(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok(CreateClaim::Admitted { reservation_id })
+            }
+        }
+    }
+
+    /// Settle an in-flight reservation: bind it to the created room
+    /// (`Some(channel)`) or roll the create back (`None`). Either way the row
+    /// stays, so the burst window and cooldown keep counting it; only its cap
+    /// slot is released to `voice_rooms` (bound) or freed (rolled back).
+    /// Returns false when the reservation was already settled.
+    pub async fn settle_create(
+        &self,
+        reservation_id: i64,
+        channel_id: Option<Snowflake>,
+    ) -> Result<bool, sqlx::Error> {
+        Ok(sqlx::query(
+            "UPDATE voice_create_reservations
+             SET channel_id = $2, settled_at = now()
+             WHERE id = $1 AND settled_at IS NULL",
+        )
+        .bind(reservation_id)
+        .bind(channel_id.map(|id| id.to_string()))
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            != 0)
     }
 
     /// Record a companion created alongside its room, with the settings

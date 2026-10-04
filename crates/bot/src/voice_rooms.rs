@@ -62,6 +62,7 @@ use two_bot_core::{
         diff_configuration, diff_content_hash, render_preview, skip_unknown_channels,
         DIFF_HASH_CHARS,
     },
+    voice_create_admission::{CreateAdmissionConfig, RefusalReason},
     voice_custom_id::{
         import_cancel_custom_id, import_confirm_custom_id, parse_voice_custom_id, VoiceAction,
         IMPORT_HASH_CHARS,
@@ -93,7 +94,7 @@ use two_bot_core::{
     CommandDefinition, OverwriteTarget, PermissionFinding, PermissionOverwrite as HealthOverwrite,
     Snowflake, VoicePermission, VoicePermissionScope,
 };
-use two_bot_cutover::voice_rooms::PgRoomStore;
+use two_bot_cutover::voice_rooms::{CreateClaim, PgRoomStore};
 use two_bot_discord::voice_rooms::{
     can_enforce_kick, can_manage_room, effective_permissions, RoomChannelAttributes, RoomHttp,
     RoomHttpError,
@@ -178,6 +179,25 @@ pub trait RoomPersistence: Send + Sync {
         guild: Snowflake,
         channel: Snowflake,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// Claim one room create under the durable admission limits (caps,
+    /// cooldown, rolling burst), serialized per guild. An admitted claim is
+    /// persisted before this returns; a refusal writes nothing. `now_secs` is
+    /// the worker's Unix-seconds wall clock.
+    fn claim_create(
+        &self,
+        guild: Snowflake,
+        user: Snowflake,
+        config: &CreateAdmissionConfig,
+        now_secs: i64,
+    ) -> impl Future<Output = Result<CreateClaim, StoreError>> + Send;
+    /// Settle an admitted claim: bind it to the created room (`Some`) or roll
+    /// the create back (`None`). The reservation row stays either way, so the
+    /// burst window and cooldown keep counting it.
+    fn settle_create(
+        &self,
+        reservation_id: i64,
+        channel: Option<Snowflake>,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
     /// Every companion tracked in the guild, for worker load and startup
     /// reconciliation. Each row carries its creation-time settings snapshot.
     fn companions(
@@ -280,6 +300,28 @@ impl RoomPersistence for PgRoomStore {
         Ok(())
     }
 
+    async fn claim_create(
+        &self,
+        guild: Snowflake,
+        user: Snowflake,
+        config: &CreateAdmissionConfig,
+        now_secs: i64,
+    ) -> Result<CreateClaim, StoreError> {
+        self.claim_create(guild, user, config, now_secs)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn settle_create(
+        &self,
+        reservation_id: i64,
+        channel: Option<Snowflake>,
+    ) -> Result<bool, StoreError> {
+        self.settle_create(reservation_id, channel)
+            .await
+            .map_err(store_error)
+    }
+
     async fn config_snapshot(&self, guild: Snowflake) -> Result<VoiceConfiguration, StoreError> {
         self.voice_configs()
             .snapshot(guild)
@@ -315,6 +357,16 @@ impl RoomPersistence for PgRoomStore {
             .await
             .map_err(store_error)
     }
+}
+
+/// Wall clock in Unix seconds for the durable create admission; a clock
+/// before the epoch reads as 0.
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
 }
 
 fn store_error(error: sqlx::Error) -> StoreError {
@@ -1037,6 +1089,14 @@ pub enum LifecycleFailure {
         creator_id: Snowflake,
         message: String,
     },
+    /// The durable admission limits (caps, cooldown, rolling burst) refused a
+    /// create before any Discord call. `reason.code()` is the stable legacy
+    /// code; `message` is the legacy user-facing text for it.
+    CreateRefused {
+        creator_id: Snowflake,
+        reason: RefusalReason,
+        message: String,
+    },
     Discord {
         channel_id: Snowflake,
         error: RoomHttpError,
@@ -1051,6 +1111,9 @@ pub enum LifecycleFailure {
 struct Creation {
     ticket: JoinTicket,
     spec: NewRoomSpec,
+    /// The durable admission reservation, once claimed. Kept across a 429
+    /// requeue so the retry never claims (and counts) a second slot.
+    reservation: Option<i64>,
 }
 
 /// One mutable worker per guild. `load` must succeed before use. `reconcile`
@@ -1062,6 +1125,9 @@ pub struct GuildRoomWorker<S, H> {
     http: H,
     creators: HashMap<Snowflake, CreatorChannel>,
     access: AccessControls,
+    /// Caps and cooldown for the durable create admission; the rolling burst
+    /// limits are fixed legacy constants.
+    admission: CreateAdmissionConfig,
     rooms: HashMap<Snowflake, VoiceRoom>,
     /// Companion records by room (V9c), loaded from the store. The row is
     /// the durable intent: its settings snapshot rebuilds the plan after a
@@ -1160,6 +1226,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             http,
             creators,
             access,
+            admission: CreateAdmissionConfig::default(),
             rooms,
             companions,
             companion_channels: HashMap::new(),
@@ -1229,9 +1296,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     seed,
                     created_at,
                 },
+                reservation: None,
             },
         );
         true
+    }
+
+    /// Replace the caps and cooldown used by the durable create admission
+    /// (legacy defaults: 1 room per member, 40 per guild, 30 s cooldown).
+    pub fn set_admission_config(&mut self, config: CreateAdmissionConfig) {
+        self.admission = config;
     }
 
     fn queue_delete(&mut self, channel: Snowflake, compensate: bool) {
@@ -2008,6 +2082,20 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         released
     }
 
+    /// Settle a create's admission reservation: bound to its room, or rolled
+    /// back. Best effort: a failed settle only keeps the cap slot held until
+    /// the reservation's in-flight TTL, so it never blocks the lifecycle. The
+    /// reservation row stays either way, so burst and cooldown history hold.
+    async fn settle_reservation(&self, reservation: i64, channel: Option<Snowflake>) {
+        if let Err(error) = self.store.settle_create(reservation, channel).await {
+            warn!(
+                guild = self.live.guild_id,
+                ?error,
+                "voice create reservation settle failed"
+            );
+        }
+    }
+
     fn prepare(&self, ticket: JoinTicket) -> Result<RoomChannelAttributes, RoomHttpError> {
         let live = self.live.inner.read().expect("live voice lock");
         if !live.ticket_valid(ticket) {
@@ -2109,10 +2197,59 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             });
                             observe_voice_operation("create", outcome);
                         }
+                        if let Some(held) = creation.reservation {
+                            self.settle_reservation(held, None).await;
+                        }
                         self.creations.remove(&action.id);
                         self.queue.mark_succeeded(&action);
                         return true;
                     }
+                };
+                // Durable admission (caps, cooldown, rolling burst) runs after
+                // the cheap checks and before the only Discord create call. A
+                // refusal never reaches Discord; a 429 requeue keeps its claim.
+                let reservation = match creation.reservation {
+                    Some(held) => held,
+                    None => match self
+                        .store
+                        .claim_create(
+                            self.live.guild_id,
+                            creation.ticket.member_id,
+                            &self.admission,
+                            unix_now_secs(),
+                        )
+                        .await
+                    {
+                        Ok(CreateClaim::Admitted { reservation_id }) => {
+                            if let Some(entry) = self.creations.get_mut(&action.id) {
+                                entry.reservation = Some(reservation_id);
+                            }
+                            reservation_id
+                        }
+                        Ok(CreateClaim::Refused(reason)) => {
+                            self.record(LifecycleFailure::CreateRefused {
+                                creator_id: creator_channel_id,
+                                reason,
+                                message: reason.user_message(&self.admission),
+                            });
+                            self.creations.remove(&action.id);
+                            self.queue.mark_succeeded(&action);
+                            return true;
+                        }
+                        Err(error) => {
+                            observe_voice_operation("create", voice_outcome_from_store(&error));
+                            self.record(LifecycleFailure::Persistence {
+                                channel_id: None,
+                                error,
+                            });
+                            if error == StoreError::CredentialRefused {
+                                self.halted = true;
+                            }
+                            self.creations.remove(&action.id);
+                            self.queue.mark_succeeded(&action);
+                            return true;
+                        }
+                    },
                 };
                 match self
                     .http
@@ -2132,7 +2269,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         let room = VoiceRoom::from_spec(creation.spec, channel_id);
                         self.live.upsert_channel(channel);
                         self.rooms.insert(channel_id, room.clone());
-                        match self.store.persist(&room).await {
+                        let persisted = self.store.persist(&room).await;
+                        let bound = persisted.is_ok().then_some(channel_id);
+                        self.settle_reservation(reservation, bound).await;
+                        match persisted {
                             Ok(()) => {
                                 // V9c: companion first (same ordered lane), then
                                 // the move. The plan's settings snapshot is the
@@ -2186,6 +2326,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     Err(error) => {
                         // Unknown create outcomes must never produce another POST.
                         self.creations.remove(&action.id);
+                        self.settle_reservation(reservation, None).await;
                         if error != RoomHttpError::Cancelled {
                             observe_voice_operation("create", voice_outcome_from_http(&error));
                         }
@@ -5254,6 +5395,14 @@ fn failure_line(failure: &LifecycleFailure) -> String {
             creator_id,
             message,
         } => format!("create <#{creator_id}>: {message}"),
+        LifecycleFailure::CreateRefused {
+            creator_id,
+            reason,
+            message,
+        } => format!(
+            "create <#{creator_id}> refused ({}): {message}",
+            reason.code()
+        ),
         LifecycleFailure::Discord { channel_id, error } => {
             format!("channel <#{channel_id}>: {error}")
         }
