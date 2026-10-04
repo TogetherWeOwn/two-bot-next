@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 27,
+  "count": 28,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -37,6 +37,18 @@
       "smoke": "covered",
       "expected_response": "docs/smoke-expected-responses.md Expected-response table, `/leaderboard` happy-path shape; docs/smoke-run-record.md row 2",
       "deferral_reason": null
+    },
+    {
+      "name": "help",
+      "description": "Show this server's live commands, grouped by who can use them.",
+      "family": "core",
+      "gate": "always",
+      "default_member_permissions": null,
+      "dm_permission": false,
+      "options": [],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only discovery command with no legacy counterpart; answers from the live publish set with no store or network effect, so it is pinned offline by the router and help-renderer tests rather than the live smoke five."
     },
     {
       "name": "attendance",

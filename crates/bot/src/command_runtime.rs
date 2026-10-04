@@ -28,6 +28,9 @@
 //! - leveling (`/rank [member]`, `/leaderboard`): one immediate callback,
 //!   ephemeral rank and public mention-suppressed top ten. The ordered gateway
 //!   award path shares this runtime's pool, executor and onboarding gates.
+//! - discovery (`/help`): one immediate ephemeral callback rendered from the
+//!   live publish set, grouped with permission hints; never deferred, never
+//!   stored.
 //!
 //! Registry publication runs here too: every `Event::Ready` publishes the
 //! router's ONE merged publish set (`set_guild_commands` is idempotent, so a
@@ -65,6 +68,7 @@ use two_bot_core::{
     },
     feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit},
     funnel::now_millis_for_test,
+    help_text,
     sticky::{
         activity_eligible, decide_activity, normalize_debounce, sticky_removed_reply,
         sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
@@ -949,7 +953,21 @@ impl CommandRuntime {
             }
             return;
         }
+        if handler == HandlerId::Help {
+            // Discovery is a pure registry read: answer immediately with the
+            // live publish set (same definitions picker sees), never defer
+            // and never touch the store.
+            let custom = self.custom_commands.as_deref().unwrap_or(&[]);
+            let defs = self
+                .interactions
+                .router
+                .publish_set(custom)
+                .unwrap_or_default();
+            self.answer(interaction, ephemeral(help_text(&defs))).await;
+            return;
+        }
         let owner = match name.as_str() {
+            "help" => Some(HandlerId::Help),
             "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
                 Some(HandlerId::AutomationAdmin)
             }
@@ -1686,6 +1704,9 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     for id in [HandlerId::Rank, HandlerId::Leaderboard] {
         router.register(Box::new(SliceHandler(id)));
     }
+    // `/help` discovery is never activation-fenced either: it renders from
+    // the live publish set, so gated-off features simply do not appear.
+    router.register(Box::new(SliceHandler(HandlerId::Help)));
     router
 }
 

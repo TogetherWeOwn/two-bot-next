@@ -874,6 +874,39 @@ async fn refused_interaction_is_answered_ephemerally_via_executor() {
 }
 
 #[tokio::test]
+async fn help_answers_immediately_from_the_live_publish_set() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    // All feature gates on: the reply must equal the rendered live set.
+    let router_gates = RouterGates {
+        scorecard: true,
+        moderation: true,
+        ..gates(true, true)
+    };
+    let runtime = runtime_without_db(router_gates, true, origin);
+    runtime
+        .on_interaction(&slash("help", Some(CHANNEL), Vec::new()))
+        .await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1, "one immediate callback, no defer");
+    let reply: serde_json::Value =
+        serde_json::from_slice(&callbacks[0].body).expect("callback json");
+    assert_eq!(reply["type"], 4, "immediate response, not a defer");
+    assert_eq!(reply["data"]["flags"], 64, "ephemeral");
+    let content = reply["data"]["content"].as_str().expect("content");
+    let defs = router_with_commands(router_gates)
+        .publish_set(&[])
+        .expect("live set");
+    assert_eq!(content, two_bot_core::help_text(&defs));
+    assert!(content.contains("/help"), "lists itself");
+    assert!(content.contains("/ban"), "lists gated commands");
+    assert!(
+        content.contains("needs Ban Members"),
+        "marks the gate: {content}"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn published_unwired_commands_reply_without_defer_or_store_work() {
     for router_gates in [
         gates(false, false),
@@ -913,11 +946,13 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "schedule-list"
                         | "rank"
                         | "leaderboard"
+                        | "help"
                 )
             })
             .collect();
         assert!(!unwired.contains(&"rank"));
         assert!(!unwired.contains(&"leaderboard"));
+        assert!(!unwired.contains(&"help"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }
