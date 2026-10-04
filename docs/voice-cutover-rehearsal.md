@@ -166,7 +166,48 @@ no cleanup actions, no live guild queries.
 - Verdict: NEEDS WORK — the count is not at baseline (expected
   `clean=true` or a documented residual). Needs staging migrated and
   healthy plus a written residual baseline naming the permanent
-  channels.
+  channels. The baseline is now written below (2026-10-04); the staging
+  migration and health preconditions still stand.
+
+### Documented residual baseline: permanent staging voice channels
+
+Recorded 2026-10-04 from the staging gate-on plan. This is the written
+baseline the 2026-10-03 verdict asked for. Channel ids live on the private
+tracking card, not in this public repo.
+
+The staging guild (`TWO Staging`) keeps three permanent voice channels
+that the bot has never tracked:
+
+| Channel | Role |
+|---|---|
+| `Lobby` | Permanent staging voice, zero `voice_rooms` rows |
+| `Squad` | Permanent staging voice, zero `voice_rooms` rows |
+| `Voice 1` | Permanent staging voice, zero `voice_rooms` rows |
+
+- They are safe when `TWO_VOICE=1` ships. `reconcile` walks only the rooms
+  the store tracks (`self.rooms.keys()` in `VoiceRooms::reconcile`,
+  `crates/bot/src/voice_rooms.rs`), so a channel with no tracked row is
+  never visited, renamed or deleted. No code change is needed.
+- `report voice-ghosts` treats every live voice channel without a
+  `voice_rooms` row as `untracked_present`, creator channels included
+  (`count_ghosts` and `is_live_voice_kind` in
+  `crates/cutover/src/voice_ghosts.rs`). Marking a channel as a creator
+  with `/create` does not make it tracked; only rooms the bot spawns are.
+  So `clean=true` is unreachable on this guild by design.
+- Expected reading before any creator exists: `tracked_present=[]`,
+  `tracked_gone=[]`, `untracked_present=[3]`, `clean=false`. That is the
+  accepted residual, not a ghost.
+- Acceptance for a live rehearsal swap: `tracked_gone=[]`, and
+  `untracked_present` is exactly the three permanent channels plus the
+  staging creator channel(s) the rehearsal designates (count 3 + creators).
+  Spawned rooms appear in `tracked_present` while occupied and must leave
+  it once emptied and deleted. Any other untracked channel, or any
+  tracked-but-gone row, is a real ghost and fails the check. Record the
+  designated creator in the run record; if the creator is one of the three
+  permanent channels, the count stays 3.
+- Order of enablement: migrations 0413 and 0416 apply on staging first,
+  then the `TWO_VOICE=1` binding ships, then the voice commands publish.
+  The live smoke additionally needs a second human account.
 
 ## 6. Gaps
 
