@@ -356,6 +356,13 @@ async fn help_tracks_confirmed_ready_add_and_remove_publications() {
         packet["d"]["member"]["permissions"] = json!(permissions);
         serde_json::from_value(packet["d"].take()).expect("interaction fixture")
     }
+    fn manage_packet(sequence: u64, id: u64, name: &str, options: Value) -> Value {
+        let mut packet = slash(sequence, id);
+        packet["d"]["data"]["name"] = json!(name);
+        packet["d"]["data"]["options"] = options;
+        packet["d"]["member"]["permissions"] = json!("32");
+        packet
+    }
     fn help_content(rest: &MockRest, id: u64) -> String {
         let requests = rest.requests();
         let suffix = format!("/interactions/{id}/custom-command-fixture/callback");
@@ -409,17 +416,22 @@ async fn help_tracks_confirmed_ready_add_and_remove_publications() {
     let initial = help_content(&rest, 80);
     assert!(initial.contains("/faq"), "READY DB row is discoverable");
     assert!(!initial.contains("/newfaq"));
-    runtime
-        .on_interaction(&interaction(
+    // Management commands belong to the custom-command runtime, which only the
+    // gateway dispatch path reaches; `on_interaction` alone would refuse them.
+    gateway
+        .send(manage_packet(
+            2,
             81,
             "command",
-            "32",
             json!([
                 {"name": "name", "type": 3, "value": "newfaq"},
                 {"name": "template", "type": 3, "value": "New FAQ"}
             ]),
         ))
         .await;
+    wait_sequence(&db.store, 2).await;
+    // defer + PUT + completion edit: the completion follows the snapshot swap.
+    wait_requests(&rest, 7).await;
     assert!(runtime
         .published_commands()
         .unwrap()
@@ -430,16 +442,18 @@ async fn help_tracks_confirmed_ready_add_and_remove_publications() {
         .await;
     let added = help_content(&rest, 82);
     assert!(added.contains("/faq") && added.contains("/newfaq"));
-    runtime
-        .on_interaction(&interaction(
+    gateway
+        .send(manage_packet(
+            3,
             83,
             "command-remove",
-            "32",
             json!([
                 {"name": "name", "type": 3, "value": "newfaq"}
             ]),
         ))
         .await;
+    wait_sequence(&db.store, 3).await;
+    wait_requests(&rest, 11).await;
     assert!(!runtime
         .published_commands()
         .unwrap()
