@@ -208,15 +208,11 @@ fn is_name_byte(byte: u8) -> bool {
 /// identifiers that merely end with a macro name (e.g. `my_warn!`).
 fn macro_name_before(source: &str, bang: usize) -> Option<&'static str> {
     let prefix = &source[..bang];
-    for name in LOG_MACROS {
-        if prefix.ends_with(name)
+    LOG_MACROS.into_iter().find(|name| {
+        prefix.ends_with(*name)
             && (prefix.len() == name.len()
                 || !is_name_byte(prefix.as_bytes()[prefix.len() - name.len() - 1]))
-        {
-            return Some(name);
-        }
-    }
-    None
+    })
 }
 
 /// Byte index of the `)` closing the paren opened at `open`, skipping
