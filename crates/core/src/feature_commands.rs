@@ -404,9 +404,12 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 2 core + 1 scorecard + 8 automation + 7 announcement.
-        assert_eq!(merged.len(), 18);
-        assert_eq!(&names(&merged)[..3], ["rank", "leaderboard", "attendance"]);
+        // 3 core + 1 scorecard + 8 automation + 7 announcement.
+        assert_eq!(merged.len(), 19);
+        assert_eq!(
+            &names(&merged)[..4],
+            ["rank", "leaderboard", "help", "attendance"]
+        );
         assert!(!merged.iter().any(|d| d.dm_permission));
     }
 
