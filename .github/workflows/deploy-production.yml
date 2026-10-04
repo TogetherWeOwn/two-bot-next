@@ -49,6 +49,9 @@ jobs:
           # Inputs travel through env, never into the script text.
           SHA: ${{ inputs.sha }}
           ROLLBACK: ${{ inputs.rollback }}
+          # Exactly "true" replaces the human Environment reviewer with
+          # automated evidence (latest deploy-staging run on the SHA is green).
+          AUTO_APPROVE: ${{ vars.PRODUCTION_AUTO_APPROVE }}
         shell: python3 {0}
         run: |
           import json, os, re, subprocess, sys
@@ -57,6 +60,7 @@ jobs:
           sha = os.environ.get("SHA", "").strip().lower()
           version = os.environ.get("ROLLBACK", "").strip().lower()
           mode = "rollback" if version else "deploy"
+          auto_approve = os.environ.get("AUTO_APPROVE") == "true"
           # Only GitHub Actions may vouch for a check run: another app with
           # checks:write could otherwise post a green run named `ci-ok`.
           # `check` is lint-only; `ci-ok` gates all selected test lanes too.
@@ -172,6 +176,23 @@ jobs:
           )
           if not staged.get("total_count"):
               refuse(f"deploy-staging has no successful run on {sha}")
+          staging_run = None
+          if auto_approve:
+              # Automated approval needs the LATEST staging deploy of this SHA to be
+              # green: an older success cannot hide a newer failed or running deploy.
+              staging_runs = collection(
+                  f"repos/{repo}/actions/workflows/deploy-staging.yml/runs", "deploy-staging runs on the SHA",
+                  "workflow_runs", head_sha=sha, branch="main",
+              )
+              if not staging_runs or any(
+                  run.get("head_sha") != sha or any(
+                      type(run.get(key)) is not int or run[key] <= 0 for key in ("id", "run_number")
+                  ) for run in staging_runs
+              ):
+                  refuse(f"deploy-staging has no verifiable latest run on {sha}")
+              staging_run = max(staging_runs, key=lambda run: (run["run_number"], run["id"]))
+              if staging_run.get("status") != "completed" or staging_run.get("conclusion") != "success":
+                  refuse(f"the latest deploy-staging run on {sha} is not a completed success")
 
           env = api(f"repos/{repo}/environments/production", "the production Environment")
           reviewers = sum(
@@ -179,7 +200,7 @@ jobs:
               for rule in env.get("protection_rules") or []
               if rule.get("type") == "required_reviewers"
           )
-          if not reviewers:
+          if not reviewers and not auto_approve:
               refuse("the production Environment has no required reviewers")
           policy = env.get("deployment_branch_policy") or {}
           if not policy.get("custom_branch_policies"):
@@ -203,7 +224,11 @@ jobs:
                   f"### Production {mode} guard passed\n\n"
                   f"- SHA: `{sha}` (on main; full `ci-ok` verdict, `worker check` and deploy-staging green)\n"
                   f"- Full CI: check.yml run `{ci['id']}`, attempt `{ci['run_attempt']}` (latest, completed/success)\n"
-                  f"- Environment: `production`, {reviewers} required reviewer(s), main only\n"
+                  + (
+                      f"- Approval: automated (PRODUCTION_AUTO_APPROVE), latest deploy-staging run `{staging_run['id']}` green\n"
+                      if auto_approve else ""
+                  )
+                  + f"- Environment: `production`, {reviewers} required reviewer(s), main only\n"
                   + (f"- Rollback target: `{version}`\n" if version else "")
               )
           print(f"guard passed: {mode} {sha}")
@@ -215,7 +240,9 @@ jobs:
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'production') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 30
     # The human gate: this job waits for the Environment's required
-    # reviewers. The guard job refused to get here without them.
+    # reviewers. The guard job refused to get here without them, unless
+    # vars.PRODUCTION_AUTO_APPROVE is true and the latest staging deploy of
+    # this exact SHA is green.
     environment: production
     permissions:
       contents: read
