@@ -3821,10 +3821,10 @@ pub fn build_production_runtime(
     token: &str,
     pool: sqlx::PgPool,
 ) -> Result<VoiceResponder<PgRoomStore, RoomHttp, RoomHttp>, RoomHttpError> {
-    let protected = configured_protected_channels(|key| std::env::var(key).ok()).map_err(|_| {
-        warn!("invalid voice protected-channel configuration; voice rooms disabled");
-        RoomHttpError::Cancelled
-    })?;
+    // Malformed protection IDs refuse the whole runtime. The gateway reports it
+    // through its cataloged `voice HTTP setup failed` event.
+    let protected = configured_protected_channels(|key| std::env::var(key).ok())
+        .map_err(|_| RoomHttpError::InvalidRequest)?;
     let replies = RoomHttp::new(token.to_owned())?;
     let http = replies.clone();
     let store = PgRoomStore::new(pool);
