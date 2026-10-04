@@ -403,7 +403,7 @@ async fn permissions_gates_and_guild_fence_precede_store_access() {
     };
     let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
     run(&pool, &mock, &attendance(300, 0, USER, "weekly:2026-09-30")).await;
-    assert_reply(&mock, "Manage Events permission is required.", false);
+    assert_reply(&mock, "You need the Manage Events permission to use this command. Ask a server admin to grant it.", false);
     assert_eq!(mock.requests().len(), 1);
     let off = InteractionRouter::new(RouterGates {
         scorecard: false,
@@ -426,7 +426,7 @@ async fn permissions_gates_and_guild_fence_precede_store_access() {
     }
     assert_reply(
         &mock,
-        "Attendance capture is not enabled on this server.",
+        "Attendance capture is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.",
         false,
     );
     let mut foreign = rsvp(303, "going");
