@@ -85,7 +85,8 @@ not production authorization or a migration tool.
    `healthy` reads 1, `verify` accepts it only after two consecutive full passes:
    each pass still requires the exact Worker at 100% traffic, `/readyz` 200 with
    all components ready and the exact compiled revision/build ID, `/health` 200
-   with the exact Worker version, and a lag-tolerant control-plane recheck. Any
+   with the exact Worker version, and a control-plane recheck that accepts either
+   completed counter shape (converged or lag) with identity unchanged. Any
    non-passing poll resets the streak. The success evidence records
    `"active_lag": true` on this path. The application listing is read separately
    from the rollout record and can briefly trail it, so a completed rollout whose

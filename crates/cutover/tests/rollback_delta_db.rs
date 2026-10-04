@@ -95,8 +95,9 @@ impl TestDb {
             include_str!("../migrations/0224_voice_rooms.sql"),
             include_str!("../migrations/0330_guild_settings.sql"),
             include_str!("../migrations/0412_voice_rooms_ownership_touched.sql"),
-            include_str!("../migrations/0413_voice_create_reservations.sql"),
             include_str!("../migrations/0414_voice_rooms_custom_name.sql"),
+            include_str!("../migrations/0416_voice_room_privacy.sql"),
+            include_str!("../migrations/0417_voice_create_reservations.sql"),
         ] {
             sqlx::raw_sql(migration).execute(&pool).await?;
         }
@@ -111,11 +112,12 @@ impl TestDb {
     /// One row on each side of `T_f` per table. The `members` pair proves the
     /// multi-column GREATEST: `m-before` joins before `T_f` and never returns,
     /// while `m-after` joins before `T_f` but is active after it. The
-    /// `voice_rooms` rows prove the same for the V2 ownership handoff stamp
-    /// and the V3 custom-name stamp: `room-before` is created and last touched
-    /// before `T_f`, while `room-handoff` is created before `T_f` but handed
-    /// off after it and `room-renamed` is created before `T_f` but renamed
-    /// after it.
+    /// `voice_rooms` rows prove the same for the V2 ownership handoff stamp,
+    /// the V3 custom-name stamp and the V3 privacy stamp: `room-before` is
+    /// created and last touched before `T_f`, while `room-handoff` is created
+    /// before `T_f` but handed off after it, `room-renamed` is created before
+    /// `T_f` but renamed after it and `room-private` is created before `T_f`
+    /// but made private after it (`NULL` stamps stay out of the GREATEST).
     async fn seed(pool: &Pool<Postgres>) -> TestResult {
         sqlx::raw_sql(
             "INSERT INTO events (event_type, member_id, guild_id, occurred_at, recorded_at, source, idempotency_key) VALUES
@@ -133,10 +135,11 @@ impl TestDb {
              ('t-after', 'g', 'ch-after', 'o2', 'open', '2026-10-01T12:00:00Z');
              INSERT INTO guild_settings (guild_id, key, value, version, updated_by) VALUES
              ('g', 'ROLLBACK_DELTA_PROBE', '\"probe\"', 1, 'test');
-             INSERT INTO voice_rooms (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at, owner_touched_at, custom_name, name_touched_at) VALUES
-             ('g', 'room-before', 'creator-1', 'owner-1', 'owner-1', '7', '2026-09-29T12:00:00Z', '2026-09-29T12:00:00Z', 'Old name', '2026-09-29T12:00:00Z'),
-             ('g', 'room-handoff', 'creator-1', 'owner-2', 'owner-1', '8', '2026-09-29T12:00:00Z', '2026-10-01T12:00:00Z', NULL, NULL),
-             ('g', 'room-renamed', 'creator-1', 'owner-3', 'owner-3', '9', '2026-09-29T12:00:00Z', '2026-09-29T12:00:00Z', 'New name', '2026-10-01T12:00:00Z');
+             INSERT INTO voice_rooms (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at, owner_touched_at, custom_name, name_touched_at, privacy_touched_at) VALUES
+             ('g', 'room-before', 'creator-1', 'owner-1', 'owner-1', '7', '2026-09-29T12:00:00Z', '2026-09-29T12:00:00Z', 'Old name', '2026-09-29T12:00:00Z', NULL),
+             ('g', 'room-handoff', 'creator-1', 'owner-2', 'owner-1', '8', '2026-09-29T12:00:00Z', '2026-10-01T12:00:00Z', NULL, NULL, NULL),
+             ('g', 'room-renamed', 'creator-1', 'owner-3', 'owner-3', '9', '2026-09-29T12:00:00Z', '2026-09-29T12:00:00Z', 'New name', '2026-10-01T12:00:00Z', NULL),
+             ('g', 'room-private', 'creator-1', 'owner-1', 'owner-1', '10', '2026-09-29T12:00:00Z', '2026-09-29T12:00:00Z', NULL, NULL, '2026-10-01T12:00:00Z');
              INSERT INTO voice_create_reservations (id, guild_id, user_id, created_at, channel_id, settled_at) VALUES
              ('claim-before', '100', '300', '2026-09-29T12:00:00Z', NULL, '2026-09-29T12:00:00Z'),
              ('claim-bound', '100', '301', '2026-09-29T12:00:00Z', '500', '2026-10-01T12:00:00Z'),
@@ -182,7 +185,7 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
         // Exact post-T_f counts on both storage shapes: timestamptz
         // (events, member_levels, guild_settings), multi-column GREATEST
         // (members: only the row active after T_f; voice_rooms: only the
-        // rooms handed off or renamed after T_f), ISO-8601 TEXT (tickets).
+        // rooms handed off, renamed or made private after T_f), ISO-8601 TEXT (tickets).
         assert_eq!(
             count_of(&summary, "events"),
             Some(("measured".to_owned(), Some(1)))
@@ -203,12 +206,12 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
             count_of(&summary, "guild_settings"),
             Some(("measured".to_owned(), Some(1)))
         );
-        // Only the rooms handed off or renamed after T_f count: the room
+        // Only the rooms handed off, renamed or made private after T_f count: the room
         // created and last touched before T_f stays out via the GREATEST
         // projection.
         assert_eq!(
             count_of(&summary, "voice_rooms"),
-            Some(("measured".to_owned(), Some(2)))
+            Some(("measured".to_owned(), Some(3)))
         );
         // Both pre-baseline claims settled after T_f count, whether bound to
         // a room or rolled back. Creation-only recency would miss both.
@@ -290,15 +293,15 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
         tx.rollback().await?;
 
         // Export emits one NDJSON line per post-T_f row:
-        // 1 + 1 + 2 + 1 + 1 + 2 (voice_rooms handoff and rename) + 2 (claim settlements).
+        // 1 + 1 + 2 + 1 + 1 + 3 (voice_rooms handoff, rename and privacy) + 2 (claim settlements).
         let mut lines = Vec::new();
         let exported = export_delta(&db.pool, SINCE, &mut |line: String| {
             lines.push(line);
             Ok::<(), std::io::Error>(())
         })
         .await?;
-        assert_eq!(exported, 10);
-        assert_eq!(lines.len(), 10);
+        assert_eq!(exported, 11);
+        assert_eq!(lines.len(), 11);
         let settlements: Vec<serde_json::Value> = lines
             .iter()
             .map(|line| serde_json::from_str(line).unwrap())
