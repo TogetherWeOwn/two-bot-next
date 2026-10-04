@@ -18,7 +18,9 @@ fn keys() -> &'static KeyRing {
         KeyRing::new(vec![SigningKey {
             id: "fuzz".to_owned(),
             // Derived public test material, never an environment credential.
-            secret: body_hash(b"public internal-action fuzz fixture").into_bytes(),
+            secret: body_hash(b"public internal-action fuzz fixture")
+                .into_bytes()
+                .into(),
         }])
     })
 }
@@ -47,10 +49,10 @@ fn check_request(headers: &AuthHeaders<'_>, raw: &[u8]) {
         true,
         true,
         SKEW_SECONDS,
-        1_700_000_000,
         1_700_000_000_000,
         &mut NonceCache::new(NONCE_TTL_SECONDS),
         &mut TokenBuckets::new(),
+        &mut two_bot_core::ClockGuard::new(),
     );
 }
 
