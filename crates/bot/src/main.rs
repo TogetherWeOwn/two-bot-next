@@ -384,7 +384,13 @@ async fn main() {
                     // `None` whenever the command runtime is parked; the gateway
                     // and funnel still boot.
                     let interactions = runtime.as_ref().and_then(|runtime| {
-                        build_interaction_runtime(&pool, guild_id, &gates, runtime.executor())
+                        build_interaction_runtime(
+                            &pool,
+                            guild_id,
+                            &gates,
+                            runtime.executor(),
+                            &activation,
+                        )
                     });
                     if let Some(runtime) = &runtime {
                         let config = gateway_commands::GatewayCommandConfig::from_map(
@@ -632,6 +638,7 @@ fn build_interaction_runtime(
     guild_id: u64,
     onboarding: &two_bot_core::OnboardingGates,
     executor: two_bot_discord::ActionExecutor,
+    activation: &activation::BootActivation,
 ) -> Option<Arc<two_bot_discord::interactions::InteractionRuntime>> {
     let features = match two_bot_core::FeatureGates::from_env() {
         Ok(features) => features,
@@ -640,14 +647,25 @@ fn build_interaction_runtime(
             return None;
         }
     };
-    let moderation = match two_bot_core::ModerationGates::from_env() {
-        Ok(moderation) => moderation,
-        Err(err) => {
-            tracing::warn!(error = %err, "moderation gates invalid; ordered interaction surface parked");
-            return None;
+    // Mirror `CommandRuntime::from_env`: a denied capability never reaches its
+    // feature-specific validation, so stale moderation env cannot re-enable a
+    // refused surface on this path.
+    let moderation = if activation.permitted(two_bot_core::activation::LiveCapability::Moderation) {
+        match two_bot_core::ModerationGates::from_env() {
+            Ok(moderation) => moderation,
+            Err(err) => {
+                tracing::warn!(error = %err, "moderation gates invalid; ordered interaction surface parked");
+                return None;
+            }
+        }
+    } else {
+        two_bot_core::ModerationGates {
+            enabled: false,
+            owen_user_id: String::new(),
+            protected_role_ids: Default::default(),
         }
     };
-    let router = two_bot_core::InteractionRouter::new(two_bot_core::RouterGates::from_slices(
+    let gates = two_bot_core::RouterGates::from_slices(
         Some(guild_id),
         &features,
         &moderation,
@@ -657,7 +675,10 @@ fn build_interaction_runtime(
             scorecard: std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|v| v == "1"),
             ..Default::default()
         },
-    ));
+    );
+    // Apply the exact boot activation narrowing so the ordered router carries
+    // the same capability policy as the shared command runtime. Never widen.
+    let router = two_bot_core::InteractionRouter::new(activation.constrain_router(gates));
     Some(Arc::new(
         two_bot_discord::interactions::InteractionRuntime::with_router(
             router,

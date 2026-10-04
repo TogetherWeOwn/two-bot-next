@@ -569,8 +569,18 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             (interactions.as_ref(), dispatch.as_ref())
                         {
                             if let Event::Ready(ready) = &dispatch.event {
-                                interactions.set_bot_user_id(ready.user.id.get());
-                                interactions.set_application_id(ready.application.id.get());
+                                // A READY-supplied id never overwrites the
+                                // boot/REST pin on faith; a mismatch stays
+                                // disarmed and the fence keeps refusing.
+                                if !interactions.try_arm_ready_identity(
+                                    ready.user.id.get(),
+                                    ready.application.id.get(),
+                                ) {
+                                    tracing::warn!(
+                                        application_id = ready.application.id.get(),
+                                        "READY identity differs from boot token; ordered identity not armed"
+                                    );
+                                }
                             }
                         }
                         if let (Some(runtime), Some(sender), Some(dispatch)) = (interactions.as_ref(), rsvp_sender.as_ref(), dispatch.as_mut()) {

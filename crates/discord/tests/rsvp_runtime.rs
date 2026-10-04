@@ -6,15 +6,13 @@ mod common;
 
 use common::{MockRest, ScriptedResponse};
 use serde_json::{json, Value};
-use sqlx::{
-    postgres::{PgConnectOptions, PgPoolOptions},
-    Pool, Postgres,
-};
+use sqlx::{Pool, Postgres};
 use twilight_model::application::interaction::Interaction;
 use two_bot_core::{ClassifierConfig, InteractionRouter, RouterGates};
 use two_bot_discord::{
     interactions::InteractionRuntime, rsvp::handle_rsvp_interaction, ActionExecutor,
 };
+use two_bot_testsupport::TestDatabase;
 
 const GUILD: &str = "1545644954272137297";
 const EVENT: &str = "1546451670500642999";
@@ -92,7 +90,25 @@ fn executor(mock: &MockRest) -> ActionExecutor {
     .unwrap()
 }
 
-async fn pool() -> Option<(Pool<Postgres>, String)> {
+/// Guarded disposable fixture: the shared testsupport guard validates the
+/// bootstrap URL (explicit empty-password authority, disposable database name,
+/// no query/fragment, no ambient libpq overrides) before any connection is
+/// opened. Each test gets its own migrated database; `close` drops it.
+struct Fixture {
+    db: TestDatabase,
+}
+
+impl Fixture {
+    fn pool(&self) -> &Pool<Postgres> {
+        self.db.pool()
+    }
+
+    async fn close(self) {
+        self.db.close().await.expect("drop test database");
+    }
+}
+
+async fn pool() -> Option<Fixture> {
     let url = match std::env::var("TWO_RSVP_RUNTIME_TEST_DATABASE_URL") {
         Ok(value) => value,
         Err(std::env::VarError::NotPresent) => {
@@ -101,54 +117,44 @@ async fn pool() -> Option<(Pool<Postgres>, String)> {
         }
         Err(_) => panic!("test URL must be Unicode"),
     };
-    let options: PgConnectOptions = url.parse().expect("test options");
-    assert_eq!(options.get_host(), "agent-testdb");
-    assert_eq!(options.get_port(), 5432);
-    assert_eq!(options.get_username(), "agent_test");
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let schema = format!(
-        "rsvp_wire_{}_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos(),
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
-    assert!(
-        schema.len() < 63
-            && schema
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    );
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(options.clone())
+    let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
         .await
-        .expect("testdb");
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-        .execute(&admin)
-        .await
-        .unwrap();
-    admin.close().await;
-    let pool = PgPoolOptions::new()
-        .max_connections(3)
-        .connect_with(options.options([("search_path", schema.as_str())]))
-        .await
-        .unwrap();
-    sqlx::raw_sql(include_str!("../../cutover/migrations/0160_rsvp.sql"))
-        .execute(&pool)
-        .await
-        .unwrap();
-    Some((pool, schema))
+        .expect("create guarded disposable test database; no credential fallback");
+    Some(Fixture { db })
 }
 
-async fn cleanup(pool: Pool<Postgres>, schema: String) {
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-        .execute(&pool)
-        .await
-        .unwrap();
-    pool.close().await;
+#[test]
+fn fixture_refuses_unsafe_database_urls_without_connecting() {
+    // No connection or DDL happens here: the shared guard refuses before any
+    // pool is opened, covering unsafe authority, database, query/fragment,
+    // and percent-escape smuggling.
+    for raw in [
+        "not a URL",
+        "https://agent_test:@agent-testdb:5432/two_bot_test_guard",
+        "postgres://agent_test:@production:5432/two_bot_test_guard",
+        "postgres://agent_test:@agent-testdb:5433/two_bot_test_guard",
+        "postgres://agent_test:@agent-testdb/two_bot_test_guard",
+        "postgres://postgres:@agent-testdb:5432/two_bot_test_guard",
+        "postgres://agent_test:secret@agent-testdb:5432/two_bot_test_guard",
+        "postgres://agent_test@agent-testdb:5432/two_bot_test_guard",
+        "postgres://agent_test:@agent-testdb:5432/postgres",
+        "postgres://agent_test:@agent-testdb:5432/two_bot",
+        "postgres://agent_test:@agent-testdb:5432/two_bot_test_",
+        "postgres://agent_test:@agent-testdb:5432/two_bot_test_Guard",
+        "postgres://agent_test:@agent-testdb:5432/two_bot_test_guard/other",
+        "postgres://agent_test:@agent-testdb:5432/two_bot_test_%67uard",
+        "postgres://agent_test:@agent-testdb:5432/two_bot_test_guard?sslmode=disable",
+        "postgres://agent_test:@agent-testdb:5432/two_bot_test_guard#fragment",
+    ] {
+        assert!(
+            two_bot_testsupport::guard_database_url(raw).is_err(),
+            "accepted unsafe fixture: {raw}"
+        );
+    }
+    two_bot_testsupport::guard_database_url(
+        "postgres://agent_test:@agent-testdb:5432/two_bot_test_guard",
+    )
+    .expect("safe bootstrap URL");
 }
 
 async fn counts(pool: &Pool<Postgres>) -> (i64, i64, i64) {
@@ -196,7 +202,7 @@ async fn run(pool: &Pool<Postgres>, mock: &MockRest, interaction: &Interaction) 
 
 #[tokio::test]
 async fn transitions_totals_and_audits_round_trip_through_router() {
-    let Some((pool, schema)) = pool().await else {
+    let Some(fixture) = pool().await else {
         return;
     };
     let mock = MockRest::start(
@@ -224,7 +230,7 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
         .iter()
         .enumerate()
     {
-        run(&pool, &mock, &rsvp(100 + i as u64, status)).await;
+        run(fixture.pool(), &mock, &rsvp(100 + i as u64, status)).await;
         assert_reply(&mock, &format!("RSVP saved: {status}."), true);
         let stored: String = sqlx::query_scalar(
             "SELECT status FROM event_rsvps WHERE guild_id=$1 AND event_id=$2 AND user_id=$3",
@@ -232,13 +238,13 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
         .bind(GUILD)
         .bind(EVENT)
         .bind(USER)
-        .fetch_one(&pool)
+        .fetch_one(fixture.pool())
         .await
         .unwrap();
         assert_eq!(&stored, status);
     }
     run(
-        &pool,
+        fixture.pool(),
         &mock,
         &slash(
             110,
@@ -249,11 +255,11 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
     )
     .await;
     assert_reply(&mock, "Going: 0\nInterested: 0\nDeclined: 1", true);
-    assert_eq!(counts(&pool).await, (1, 4, 0));
+    assert_eq!(counts(fixture.pool()).await, (1, 4, 0));
     let audits: Vec<(String, String, String, String)> = sqlx::query_as(
         "SELECT actor_id, action, target_key, outcome FROM announcements_audit_log ORDER BY id",
     )
-    .fetch_all(&pool)
+    .fetch_all(fixture.pool())
     .await
     .unwrap();
     for (row, status) in audits
@@ -284,13 +290,13 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
             format!("/api/v10/guilds/{GUILD}/scheduled-events/{EVENT}")
         );
     }
-    cleanup(pool, schema).await;
+    fixture.close().await;
     mock.shutdown().await;
 }
 
 #[tokio::test]
 async fn missing_cancelled_and_malformed_events_refuse_without_writes() {
-    let Some((pool, schema)) = pool().await else {
+    let Some(fixture) = pool().await else {
         return;
     };
     for (lookup, reply) in [
@@ -337,22 +343,22 @@ async fn missing_cancelled_and_malformed_events_refuse_without_writes() {
             ScriptedResponse::status(500),
         )
         .await;
-        run(&pool, &mock, &rsvp(200, "going")).await;
+        run(fixture.pool(), &mock, &rsvp(200, "going")).await;
         assert_reply(&mock, reply, true);
         assert_eq!(mock.requests().len(), 3);
-        assert_eq!(counts(&pool).await, (0, 0, 0));
+        assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
         mock.shutdown().await;
     }
-    cleanup(pool, schema).await;
+    fixture.close().await;
 }
 
 #[tokio::test]
 async fn totals_remain_readable_without_live_event_access() {
-    let Some((pool, schema)) = pool().await else {
+    let Some(fixture) = pool().await else {
         return;
     };
     two_bot_core::put_rsvp(
-        &pool,
+        fixture.pool(),
         &two_bot_core::RsvpRecord {
             guild_id: GUILD.into(),
             event_id: EVENT.into(),
@@ -377,7 +383,7 @@ async fn totals_remain_readable_without_live_event_access() {
         )
         .await;
         run(
-            &pool,
+            fixture.pool(),
             &mock,
             &slash(
                 202,
@@ -390,19 +396,24 @@ async fn totals_remain_readable_without_live_event_access() {
         assert_reply(&mock, "Going: 1\nInterested: 0\nDeclined: 0", true);
         assert_eq!(mock.requests().len(), 2);
         assert!(mock.requests().iter().all(|r| r.method != "GET"));
-        assert_eq!(counts(&pool).await, (1, 0, 0));
+        assert_eq!(counts(fixture.pool()).await, (1, 0, 0));
         mock.shutdown().await;
     }
-    cleanup(pool, schema).await;
+    fixture.close().await;
 }
 
 #[tokio::test]
 async fn permissions_gates_and_guild_fence_precede_store_access() {
-    let Some((pool, schema)) = pool().await else {
+    let Some(fixture) = pool().await else {
         return;
     };
     let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
-    run(&pool, &mock, &attendance(300, 0, USER, "weekly:2026-09-30")).await;
+    run(
+        fixture.pool(),
+        &mock,
+        &attendance(300, 0, USER, "weekly:2026-09-30"),
+    )
+    .await;
     assert_reply(&mock, "You need the Manage Events permission to use this command. Ask a server admin to grant it.", false);
     assert_eq!(mock.requests().len(), 1);
     let off = InteractionRouter::new(RouterGates {
@@ -416,7 +427,7 @@ async fn permissions_gates_and_guild_fence_precede_store_access() {
     ] {
         handle_rsvp_interaction(
             &off,
-            &pool,
+            fixture.pool(),
             &executor(&mock),
             &ClassifierConfig::default(),
             &interaction,
@@ -433,7 +444,7 @@ async fn permissions_gates_and_guild_fence_precede_store_access() {
     foreign.guild_id = Some(twilight_model::id::Id::new(999));
     assert!(!handle_rsvp_interaction(
         &router(),
-        &pool,
+        fixture.pool(),
         &executor(&mock),
         &ClassifierConfig::default(),
         &foreign
@@ -443,7 +454,7 @@ async fn permissions_gates_and_guild_fence_precede_store_access() {
     foreign.guild_id = None;
     assert!(!handle_rsvp_interaction(
         &router(),
-        &pool,
+        fixture.pool(),
         &executor(&mock),
         &ClassifierConfig::default(),
         &foreign
@@ -451,14 +462,14 @@ async fn permissions_gates_and_guild_fence_precede_store_access() {
     .await
     .unwrap());
     assert_eq!(mock.requests().len(), 3);
-    assert_eq!(counts(&pool).await, (0, 0, 0));
-    cleanup(pool, schema).await;
+    assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
+    fixture.close().await;
     mock.shutdown().await;
 }
 
 #[tokio::test]
 async fn host_checkin_identity_duplicate_and_classifier_are_preserved() {
-    let Some((pool, schema)) = pool().await else {
+    let Some(fixture) = pool().await else {
         return;
     };
     // Four check-ins, each a 204 callback plus an ID-bearing 200 deferred edit.
@@ -478,7 +489,7 @@ async fn host_checkin_identity_duplicate_and_classifier_are_preserved() {
     .await;
     let occ = "weekly:2026-09-30";
     run(
-        &pool,
+        fixture.pool(),
         &mock,
         &attendance(400, MANAGE_EVENTS, USER, &format!(" {occ} ")),
     )
@@ -488,17 +499,27 @@ async fn host_checkin_identity_duplicate_and_classifier_are_preserved() {
         &format!("Recorded <@{USER}> for event occurrence `{occ}`."),
         true,
     );
-    run(&pool, &mock, &attendance(401, MANAGE_EVENTS, USER, occ)).await;
+    run(
+        fixture.pool(),
+        &mock,
+        &attendance(401, MANAGE_EVENTS, USER, occ),
+    )
+    .await;
     assert_reply(
         &mock,
         &format!("Attendance for <@{USER}> and event occurrence `{occ}` was already recorded."),
         true,
     );
-    run(&pool, &mock, &attendance(402, MANAGE_EVENTS, OTHER, occ)).await;
-    assert_eq!(counts(&pool).await, (0, 0, 2));
+    run(
+        fixture.pool(),
+        &mock,
+        &attendance(402, MANAGE_EVENTS, OTHER, occ),
+    )
+    .await;
+    assert_eq!(counts(fixture.pool()).await, (0, 0, 2));
     let rows: Vec<(String, String, String, String, String, String, String)> = sqlx::query_as(
         "SELECT event_type, source_event_id, actor_id, source, classification, metadata, idempotency_key FROM community_facts ORDER BY id")
-        .fetch_all(&pool).await.unwrap();
+        .fetch_all(fixture.pool()).await.unwrap();
     for (row, member, class) in [(&rows[0], USER, "eligible_human"), (&rows[1], OTHER, "bot")] {
         assert_eq!(row.0, "event_attended");
         assert_eq!(row.1, format!("{occ}:{member}"));
@@ -515,7 +536,7 @@ async fn host_checkin_identity_duplicate_and_classifier_are_preserved() {
     config.test_actor_ids.insert(USER.into());
     handle_rsvp_interaction(
         &router(),
-        &pool,
+        fixture.pool(),
         &executor(&mock),
         &config,
         &attendance(403, MANAGE_EVENTS, USER, "next-occurrence"),
@@ -523,7 +544,7 @@ async fn host_checkin_identity_duplicate_and_classifier_are_preserved() {
     .await
     .unwrap();
     let verdict: (String, String, String) = sqlx::query_as("SELECT classifier_version, classification, matched_rule FROM community_facts WHERE source_event_id = $1")
-        .bind(format!("next-occurrence:{USER}")).fetch_one(&pool).await.unwrap();
+        .bind(format!("next-occurrence:{USER}")).fetch_one(fixture.pool()).await.unwrap();
     assert_eq!(
         verdict,
         (
@@ -533,13 +554,13 @@ async fn host_checkin_identity_duplicate_and_classifier_are_preserved() {
         )
     );
     assert!(mock.requests().iter().all(|r| r.method != "GET"));
-    cleanup(pool, schema).await;
+    fixture.close().await;
     mock.shutdown().await;
 }
 
 #[tokio::test]
 async fn malformed_inputs_and_failed_ack_do_not_write() {
-    let Some((pool, schema)) = pool().await else {
+    let Some(fixture) = pool().await else {
         return;
     };
     // Three malformed inputs, each a 204 callback plus an ID-bearing 200 error edit.
@@ -555,22 +576,27 @@ async fn malformed_inputs_and_failed_ack_do_not_write() {
         ScriptedResponse::status(204),
     )
     .await;
-    run(&pool, &mock, &rsvp(500, "bogus")).await;
-    run(&pool, &mock, &attendance(501, MANAGE_EVENTS, USER, "  ")).await;
+    run(fixture.pool(), &mock, &rsvp(500, "bogus")).await;
+    run(
+        fixture.pool(),
+        &mock,
+        &attendance(501, MANAGE_EVENTS, USER, "  "),
+    )
+    .await;
     assert_reply(&mock, "event occurrence must not be empty.", true);
     run(
-        &pool,
+        fixture.pool(),
         &mock,
         &attendance(502, MANAGE_EVENTS, "1546451670500642111", "occ"),
     )
     .await;
     assert_reply(&mock, "Unable to resolve attendance member.", true);
-    assert_eq!(counts(&pool).await, (0, 0, 0));
+    assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
     assert_eq!(mock.requests().len(), 6);
     let denied = MockRest::start(vec![], ScriptedResponse::status(403)).await;
     assert!(handle_rsvp_interaction(
         &router(),
-        &pool,
+        fixture.pool(),
         &executor(&denied),
         &ClassifierConfig::default(),
         &rsvp(503, "going")
@@ -578,15 +604,15 @@ async fn malformed_inputs_and_failed_ack_do_not_write() {
     .await
     .is_err());
     assert_eq!(denied.requests().len(), 1);
-    assert_eq!(counts(&pool).await, (0, 0, 0));
-    cleanup(pool, schema).await;
+    assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
+    fixture.close().await;
     denied.shutdown().await;
     mock.shutdown().await;
 }
 
 #[tokio::test]
 async fn failed_final_reply_does_not_retry_committed_effects() {
-    let Some((pool, schema)) = pool().await else {
+    let Some(fixture) = pool().await else {
         return;
     };
     let mock = MockRest::start(
@@ -605,20 +631,20 @@ async fn failed_final_reply_does_not_retry_committed_effects() {
         ScriptedResponse::status(500),
     )
     .await;
-    let runtime = runtime(&pool, &mock);
+    let runtime = runtime(fixture.pool(), &mock);
     let interaction = rsvp(600, "going");
     assert!(runtime.handle(&interaction).await.is_err());
-    assert_eq!(counts(&pool).await, (1, 1, 0));
+    assert_eq!(counts(fixture.pool()).await, (1, 1, 0));
     assert_eq!(mock.requests().len(), 3);
     assert!(runtime.handle(&interaction).await.is_err());
-    assert_eq!(counts(&pool).await, (1, 1, 0));
+    assert_eq!(counts(fixture.pool()).await, (1, 1, 0));
     assert_eq!(mock.requests().len(), 4);
 
     assert!(runtime
         .handle(&attendance(601, MANAGE_EVENTS, USER, "weekly"))
         .await
         .is_err());
-    assert_eq!(counts(&pool).await, (1, 1, 1));
+    assert_eq!(counts(fixture.pool()).await, (1, 1, 1));
     assert_eq!(mock.requests().len(), 6);
     assert!(runtime
         .handle(&attendance(602, MANAGE_EVENTS, USER, "weekly"))
@@ -629,20 +655,20 @@ async fn failed_final_reply_does_not_retry_committed_effects() {
         &two_bot_core::checkin_duplicate_text(USER, "weekly"),
         true,
     );
-    assert_eq!(counts(&pool).await, (1, 1, 1));
-    cleanup(pool, schema).await;
+    assert_eq!(counts(fixture.pool()).await, (1, 1, 1));
+    fixture.close().await;
     mock.shutdown().await;
 }
 
 #[tokio::test]
 async fn shared_runtime_publishes_complete_registry_once() {
-    let Some((pool, schema)) = pool().await else {
+    let Some(fixture) = pool().await else {
         return;
     };
     // Bare 200 triggers the mock's guild-command PUT echo self-heal, returning the
     // complete submitted command list as the registry receipt.
     let mock = MockRest::start(vec![], ScriptedResponse::status(200)).await;
-    runtime(&pool, &mock).publish(1111).await.unwrap();
+    runtime(fixture.pool(), &mock).publish(1111).await.unwrap();
     let requests = mock.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].method, "PUT");
@@ -660,8 +686,8 @@ async fn shared_runtime_publishes_complete_registry_once() {
         attendance["default_member_permissions"],
         MANAGE_EVENTS.to_string()
     );
-    assert_eq!(counts(&pool).await, (0, 0, 0));
-    cleanup(pool, schema).await;
+    assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
+    fixture.close().await;
     mock.shutdown().await;
 }
 
@@ -675,11 +701,11 @@ fn published_names_remain_unique() {
 
 #[tokio::test]
 async fn mismatched_application_identity_is_refused_before_any_callback_or_store_work() {
-    let Some((pool, schema)) = pool().await else {
+    let Some(fixture) = pool().await else {
         return;
     };
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
-    let runtime = runtime(&pool, &mock);
+    let runtime = runtime(fixture.pool(), &mock);
     runtime.set_application_id(2222);
     let mut foreign = rsvp(700, "going");
     foreign.application_id = twilight_model::id::Id::new(9999);
@@ -688,7 +714,7 @@ async fn mismatched_application_identity_is_refused_before_any_callback_or_store
     let prepared = runtime.prepare(foreign).await.expect("prepare refusal");
     assert!(!runtime.complete(prepared).await.expect("complete refusal"));
     assert!(mock.requests().is_empty());
-    assert_eq!(counts(&pool).await, (0, 0, 0));
-    cleanup(pool, schema).await;
+    assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
+    fixture.close().await;
     mock.shutdown().await;
 }

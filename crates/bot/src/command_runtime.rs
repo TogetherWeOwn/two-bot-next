@@ -508,7 +508,17 @@ impl CommandRuntime {
             Event::Ready(ready) => {
                 // The ordered surface owns registry publication; identity still
                 // initializes here so LFG keeps READY's ids without a REST read.
-                self.set_identity(ready.user.id.get(), ready.application.id.get());
+                // A READY-supplied id never overwrites the boot pin on faith.
+                let ready_application = ready.application.id.get();
+                let pinned = self.application_id.load(Ordering::Relaxed);
+                if pinned == 0 || pinned == ready_application {
+                    self.set_identity(ready.user.id.get(), ready_application);
+                } else {
+                    warn!(
+                        application_id = ready_application,
+                        "READY identity differs from boot token; identity not armed"
+                    );
+                }
                 self.dispatch_ticket_connection(event);
                 return;
             }

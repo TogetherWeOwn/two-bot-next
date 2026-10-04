@@ -28,6 +28,16 @@ fn legacy_onboarding() -> two_bot_core::OnboardingGates {
         .expect("empty gates are legacy defaults")
 }
 
+/// Staging guild/application pair (synthetic token segment, not a credential):
+/// every capability permitted, so composition probes exercise env validation
+/// rather than activation narrowing.
+fn staging_activation() -> crate::activation::BootActivation {
+    crate::activation::BootActivation::from_token(
+        Some(1545644954272137297),
+        Some("MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature"),
+    )
+}
+
 fn governed_executor() -> two_bot_discord::ActionExecutor {
     crate::gateway::ensure_crypto_provider();
     let pool = lazy_pool();
@@ -96,6 +106,7 @@ async fn malformed_feed_poll_parks_ordered_surface_child() {
         100,
         &legacy_onboarding(),
         governed_executor(),
+        &staging_activation(),
     );
     assert!(
         parked.is_none(),
@@ -123,6 +134,7 @@ async fn malformed_protected_roles_park_ordered_surface_child() {
         100,
         &legacy_onboarding(),
         governed_executor(),
+        &staging_activation(),
     );
     assert!(
         parked.is_none(),
@@ -150,6 +162,7 @@ async fn valid_gates_build_ordered_surface_child() {
         100,
         &legacy_onboarding(),
         governed_executor(),
+        &staging_activation(),
     );
     assert!(
         built.is_some(),
@@ -163,4 +176,92 @@ fn valid_gates_build_ordered_surface() {
         "interaction_composition_tests::valid_gates_build_ordered_surface_child",
         &[],
     );
+}
+
+/// F1: boot activation narrows the ordered router, never widens it. Pure
+/// composition checks (no env, no I/O): the same all-on gates route `rsvp`
+/// only under an identity cleared for announcements.
+fn all_on_gates() -> two_bot_core::RouterGates {
+    two_bot_core::RouterGates {
+        configured_guild: Some(2222),
+        scorecard: true,
+        automations: true,
+        announcements: true,
+        moderation: true,
+        tickets: true,
+        self_roles: true,
+        onboarding_picker: true,
+        session_picker: true,
+    }
+}
+
+fn rsvp_outcome(gates: two_bot_core::RouterGates) -> two_bot_core::SlashOutcome {
+    let router = two_bot_core::InteractionRouter::new(gates);
+    let interaction = crate::command_runtime_tests::slash("rsvp", Some(1), Vec::new());
+    match two_bot_discord::route_interaction(&router, &interaction, None) {
+        two_bot_discord::RoutedInteraction::Slash { outcome, .. } => outcome,
+        routed => panic!("rsvp slash must route as slash, got {routed:?}"),
+    }
+}
+
+#[test]
+fn staging_activation_keeps_rsvp_routable() {
+    let narrowed = staging_activation().constrain_router(all_on_gates());
+    assert!(narrowed.announcements, "staging clears announcements");
+    assert!(
+        matches!(
+            rsvp_outcome(narrowed),
+            two_bot_core::SlashOutcome::Handled { .. }
+        ),
+        "staging composition must route rsvp to its handler"
+    );
+}
+
+#[test]
+fn live_activation_refuses_uncleared_rsvp() {
+    // Synthetic live pair (guild + token segment, not credentials): only the
+    // reviewed self-role clearance survives.
+    let live = crate::activation::BootActivation::from_token(
+        Some(326474832151838730),
+        Some("MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature"),
+    );
+    let narrowed = live.constrain_router(all_on_gates());
+    assert!(!narrowed.announcements, "live must narrow announcements");
+    assert!(!narrowed.automations, "live must narrow automations");
+    assert!(!narrowed.moderation, "live must narrow moderation");
+    assert!(!narrowed.tickets, "live must narrow tickets");
+    assert!(
+        narrowed.self_roles,
+        "live keeps the cleared self-role surface"
+    );
+    assert!(
+        matches!(
+            rsvp_outcome(narrowed),
+            two_bot_core::SlashOutcome::Refuse { .. }
+        ),
+        "live composition must refuse uncleared rsvp, never execute it"
+    );
+}
+
+#[test]
+fn unknown_activation_disables_every_surface() {
+    for activation in [
+        crate::activation::BootActivation::from_token(None, None),
+        crate::activation::BootActivation::from_token(Some(100), None),
+        crate::activation::BootActivation::from_token(Some(100), Some("not-a-token")),
+    ] {
+        let narrowed = activation.constrain_router(all_on_gates());
+        assert!(!narrowed.announcements, "unknown must narrow announcements");
+        assert!(!narrowed.automations, "unknown must narrow automations");
+        assert!(!narrowed.moderation, "unknown must narrow moderation");
+        assert!(!narrowed.tickets, "unknown must narrow tickets");
+        assert!(!narrowed.self_roles, "unknown must narrow self-roles");
+        assert!(
+            matches!(
+                rsvp_outcome(narrowed),
+                two_bot_core::SlashOutcome::Refuse { .. }
+            ),
+            "unknown composition must refuse rsvp, never execute it"
+        );
+    }
 }

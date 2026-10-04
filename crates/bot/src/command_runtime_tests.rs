@@ -1125,6 +1125,33 @@ async fn dispatch_remaining_ready_initializes_identity_without_registry_or_ticke
 }
 
 #[tokio::test]
+async fn dispatch_remaining_ready_mismatch_keeps_boot_pin_unarmed() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(false, false), false, origin);
+    // Boot token pins the application identity on both the runtime and the
+    // ordered surface; the bot user stays unknown until a matching READY.
+    // `ready()` carries a foreign application (1111).
+    runtime.set_identity(0, 2222);
+    runtime.dispatch_remaining(&ready());
+    // Mismatch: the old pin survives, the bot user never arms, and no
+    // registry or store work runs under the foreign identity.
+    assert_eq!(runtime.test_interactions().test_application_id(), 2222);
+    assert_eq!(runtime.test_interactions().test_bot_user_id(), 0);
+    assert!(mock.requests().is_empty(), "no registry or identity HTTP");
+    // A READY matching the boot pin still initializes the bot user.
+    let mut matching = ready();
+    if let Event::Ready(ref mut ready) = matching {
+        ready.application.id = Id::new(2222);
+        ready.user.id = Id::new(2222);
+    }
+    runtime.dispatch_remaining(&matching);
+    assert_eq!(runtime.test_interactions().test_application_id(), 2222);
+    assert_eq!(runtime.test_interactions().test_bot_user_id(), 2222);
+    assert!(mock.requests().is_empty(), "no registry or identity HTTP");
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn dispatch_remaining_ready_wakes_tickets_and_survives_failed_lookup() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let pool = PgPoolOptions::new()

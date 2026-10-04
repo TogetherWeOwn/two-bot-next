@@ -349,6 +349,25 @@ impl InteractionRuntime {
             .store(id, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Current application pin (0 = unpinned). READY callers check this before
+    /// arming identity so a mismatched payload cannot replace the boot pin.
+    pub fn application_pin(&self) -> u64 {
+        self.application_id
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Arm READY identity only when the boot pin confirms the payload (or no
+    /// pin exists). Returns false and changes nothing on mismatch.
+    pub fn try_arm_ready_identity(&self, bot_user_id: u64, application_id: u64) -> bool {
+        let pinned = self.application_pin();
+        if pinned != 0 && pinned != application_id {
+            return false;
+        }
+        self.set_bot_user_id(bot_user_id);
+        self.set_application_id(application_id);
+        true
+    }
+
     pub fn test_bot_user_id(&self) -> u64 {
         self.bot_user_id.load(std::sync::atomic::Ordering::Relaxed)
     }
