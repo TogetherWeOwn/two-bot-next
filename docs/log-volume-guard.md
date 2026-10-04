@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 274 samples
+## Cardinality budget: 278 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -33,7 +33,7 @@ table and the test are updated together.
 | `two_bot_gateway_latency_seconds` | 1 | gauge, `NaN` until measured |
 | `two_bot_handler_duration_seconds` | 11 | 8 buckets + `+Inf` + sum + count |
 | `two_bot_rest_requests_total{route,result}` | 156 | 26 route templates x 6 results |
-| job runs, timestamps, failure streaks | 44 | 11 jobs x (2 outcomes + timestamp + streak) |
+| job runs, timestamps, failure streaks | 48 | 12 jobs x (2 outcomes + timestamp + streak) |
 | voice ops, reconcile, dead-letters, state | 30 | 3x5 ops + 4 reconcile + 8 dead-letter + tracked + compensation + orphans |
 | pool gauges | 4 | configured, size, idle, max |
 | `two_bot_db_errors_total{op}` | 2 | `admission`, `other` |

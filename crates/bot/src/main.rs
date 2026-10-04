@@ -63,6 +63,7 @@ mod restore_drill;
 mod schedule_runtime;
 mod scheduled_jobs;
 mod server;
+mod settings_jobs;
 // TOG-10292: boot composes the gated service below; fixture-only seams keep
 // the module-level allowance.
 #[allow(dead_code)]
