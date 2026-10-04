@@ -4,6 +4,8 @@ use std::sync::Mutex;
 
 #[path = "voice_kick_tests.rs"]
 mod kick;
+#[path = "voice_rooms_limit_tests.rs"]
+mod limit_command;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
 
@@ -290,6 +292,7 @@ struct Http {
     move_errors: Mutex<VecDeque<RoomHttpError>>,
     delete_errors: Mutex<VecDeque<RoomHttpError>>,
     rename_errors: Mutex<VecDeque<RoomHttpError>>,
+    limit_errors: Mutex<VecDeque<RoomHttpError>>,
     companion_errors: Mutex<VecDeque<RoomHttpError>>,
     view_errors: Mutex<VecDeque<RoomHttpError>>,
     notices: Mutex<Vec<(NoticeTarget, String, Option<u64>)>>,
@@ -312,6 +315,7 @@ impl Http {
             move_errors: Mutex::new(VecDeque::new()),
             delete_errors: Mutex::new(VecDeque::new()),
             rename_errors: Mutex::new(VecDeque::new()),
+            limit_errors: Mutex::new(VecDeque::new()),
             companion_errors: Mutex::new(VecDeque::new()),
             view_errors: Mutex::new(VecDeque::new()),
             notices: Mutex::new(Vec::new()),
@@ -430,6 +434,24 @@ impl RoomWrites for Http {
             .unwrap()
             .push(format!("rename:{channel}:{name}"));
         match self.rename_errors.lock().unwrap().pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    async fn set_user_limit(
+        &self,
+        channel: u64,
+        user_limit: u32,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("limit:{channel}:{user_limit}"));
+        match self.limit_errors.lock().unwrap().pop_front() {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -1471,7 +1493,9 @@ fn voice_command_set_is_gated_on_two_voice() {
             "inheritpermissions",
             "defaultlimit",
             "alwaysprivate",
-            "kick"
+            "kick",
+            "limit",
+            "unlimit"
         ]
     );
     let off = VoiceGates::from_map(&Default::default());
@@ -5800,6 +5824,13 @@ fn dead_letter_families_cover_every_queue_action_shape() {
                 name: "den".to_owned(),
             },
             "rename",
+        ),
+        (
+            RoomAction::SetUserLimit {
+                channel_id: 500,
+                user_limit: 4,
+            },
+            "limit",
         ),
     ];
     for (action, family) in &cases {

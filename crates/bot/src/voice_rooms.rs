@@ -360,6 +360,7 @@ fn voice_dead_action(action: &RoomAction) -> &'static str {
         RoomAction::UpdateOwnership { .. } => "ownership",
         RoomAction::KickMember { .. } => "kick",
         RoomAction::RenameRoom { .. } => "rename",
+        RoomAction::SetUserLimit { .. } => "limit",
     }
 }
 
@@ -435,6 +436,14 @@ pub trait RoomWrites: Send + Sync {
         &self,
         channel: Snowflake,
         name: &str,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// V3 `/limit` and `/unlimit`: set the room channel's user limit (`0` is
+    /// unlimited, at most 99). Idempotent; a 429 returns to the queue.
+    fn set_user_limit(
+        &self,
+        channel: Snowflake,
+        user_limit: u32,
+        guard: WriteGuard,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
     /// Download a Discord-hosted `/import` file, capped at `max_bytes`
     /// (the caller checks the attachment size before asking).
@@ -532,6 +541,16 @@ impl RoomWrites for RoomHttp {
 
     async fn rename(&self, channel: Snowflake, name: &str) -> Result<(), RoomHttpError> {
         self.rename_room(channel, name).await
+    }
+
+    async fn set_user_limit(
+        &self,
+        channel: Snowflake,
+        user_limit: u32,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.set_room_user_limit(channel, user_limit, move || guard())
+            .await
     }
 
     async fn download_attachment(
@@ -1079,6 +1098,8 @@ pub struct GuildRoomWorker<S, H> {
     queue: ActionQueue,
     renames: RenameCoalescer,
     desired_names: HashMap<Snowflake, String>,
+    /// Callers waiting on a queued `/limit` write, by queue action id.
+    limit_acks: HashMap<u64, oneshot::Sender<limit::LimitAck>>,
     creations: HashMap<u64, Creation>,
     accepted: HashMap<Snowflake, (u64, u64)>,
     moves: HashMap<Snowflake, JoinTicket>,
@@ -1168,6 +1189,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             queue: ActionQueue::new(),
             renames: RenameCoalescer::new(),
             desired_names: HashMap::new(),
+            limit_acks: HashMap::new(),
             creations: HashMap::new(),
             accepted: HashMap::new(),
             moves: HashMap::new(),
@@ -2646,6 +2668,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     Err(error) => self.complete_error(action, channel_id, error),
                 }
             }
+            RoomAction::SetUserLimit {
+                channel_id,
+                user_limit,
+            } => {
+                self.dispatch_set_user_limit(action, channel_id, user_limit, now_ms, started)
+                    .await;
+            }
             RoomAction::RenameRoom { channel_id, name } => {
                 let valid = {
                     let live = self.live.inner.read().expect("live voice lock");
@@ -3026,6 +3055,15 @@ enum ActorCommand {
         is_admin: bool,
         command: OwnershipCommand,
         reply: oneshot::Sender<String>,
+    },
+    /// V3 `/limit` and `/unlimit`: the worker resolves the caller's room,
+    /// decides, queues the Discord write and replies with the text (or a
+    /// pending acknowledgement for the queued write).
+    Limit {
+        actor_id: Snowflake,
+        is_admin: bool,
+        command: LimitCommand,
+        reply: oneshot::Sender<limit::LimitReply>,
     },
     /// V4: start a vote-kick; the reply carries the vote state or the refusal.
     KickStart {
@@ -3609,6 +3647,14 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             reply,
         } => {
             let _ = reply.send(worker.apply_ownership(actor_id, is_admin, command));
+        }
+        ActorCommand::Limit {
+            actor_id,
+            is_admin,
+            command,
+            reply,
+        } => {
+            let _ = reply.send(worker.apply_limit(actor_id, is_admin, command));
         }
         ActorCommand::KickStart {
             vote_id,
@@ -4602,6 +4648,11 @@ pub enum VoiceCommand {
         vote_id: Snowflake,
         ballot: VoteBallot,
     },
+    /// V3 `/limit [count]`: set the room's user limit, or lock it at the
+    /// current headcount when no count is given.
+    Limit(LimitArg),
+    /// V3 `/unlimit`: remove the room's user limit.
+    Unlimit,
 }
 
 /// One `/logging` sub-command. `Invalid` is a malformed or unknown shape; it
@@ -4843,6 +4894,10 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
             target,
             reason: parse_kick_reason(&command.options),
         }),
+        "limit" => Some(VoiceCommand::Limit(limit::parse_limit_arg(
+            &command.options,
+        ))),
+        "unlimit" => Some(VoiceCommand::Unlimit),
         _ => None,
     }
 }
@@ -5003,6 +5058,8 @@ impl VoiceCommand {
             // Ballots share the `kick` restriction surface: one role gate
             // covers starting votes and casting them.
             Self::Kick { .. } | Self::Ballot { .. } => "kick",
+            Self::Limit(_) => "limit",
+            Self::Unlimit => "unlimit",
         }
     }
 }
@@ -5962,6 +6019,19 @@ where
             reply(ephemeral_response(&text)).await;
             true
         }
+        VoiceCommand::Limit(arg) => {
+            limit::handle_limit(
+                runtime,
+                interaction,
+                guild_id,
+                LimitCommand::Limit(arg),
+                reply,
+            )
+            .await
+        }
+        VoiceCommand::Unlimit => {
+            limit::handle_limit(runtime, interaction, guild_id, LimitCommand::Unlimit, reply).await
+        }
         VoiceCommand::Export => {
             let Some(inventory) = inventory else {
                 reply(ephemeral_response(
@@ -6498,6 +6568,10 @@ where
         Box::pin(async move { runtime.kick_room_of(guild, member).await })
     }
 }
+
+#[path = "voice_rooms_limit.rs"]
+mod limit;
+pub use limit::{LimitArg, LimitCommand};
 
 #[cfg(test)]
 #[path = "voice_rooms_tests.rs"]
