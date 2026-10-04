@@ -134,9 +134,12 @@ async fn cli_releases_a_503_wedge_then_unlock_restores_the_surviving_seed() {
     let db = database().await;
     let url = format!("postgres://agent_test:@agent-testdb:5432/{}", db.name());
     let store = ChannelModerationStore::from_pool(db.pool().clone());
+    let locked_deny = (8192 | two_bot_core::LOCKDOWN_BITS).to_string();
     let mock = MockRest::start(vec![
         ScriptedResponse::json(200, json!({"permission_overwrites": [{"id": GUILD, "type": 0, "allow": "3072", "deny": "8192"}]})),
         ScriptedResponse::status(503),
+        // The uncertain PUT applied; unlock must verify its live masks first.
+        ScriptedResponse::json(200, json!({"permission_overwrites": [{"id": GUILD, "type": 0, "allow": "1024", "deny": locked_deny}]})),
         ScriptedResponse::status(204),
     ], ScriptedResponse::status(500)).await;
     let runtime = ChannelModerationRuntime::new(
@@ -210,9 +213,15 @@ async fn cli_releases_a_503_wedge_then_unlock_restores_the_surviving_seed() {
         "unlocked"
     );
     let requests = mock.requests();
-    assert_eq!(requests.len(), 3);
-    assert_eq!(requests[2].method, "PUT");
-    let restored: Value = serde_json::from_slice(&requests[2].body).unwrap();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[2].method, "GET", "unlock must read the live masks");
+    assert_eq!(requests[2].path, format!("/api/v10/channels/{CHANNEL}"));
+    assert_eq!(requests[3].method, "PUT");
+    assert_eq!(
+        requests[3].path,
+        format!("/api/v10/channels/{CHANNEL}/permissions/{GUILD}")
+    );
+    let restored: Value = serde_json::from_slice(&requests[3].body).unwrap();
     assert_eq!(restored["allow"], "3072");
     assert_eq!(restored["deny"], "8192");
     assert!(store.get_lockdown(CHANNEL).await.unwrap().is_none());
