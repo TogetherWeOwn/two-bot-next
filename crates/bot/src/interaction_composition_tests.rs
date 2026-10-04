@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Hermetic P1/P2 regressions for the ordered interaction surface composition.
 //!
 //! P1: the ordered surface sends through the command runtime's governed REST

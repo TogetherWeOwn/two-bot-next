@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! F2 boot-registry ownership + F5 mixed RSVP/custom contention, governed.
 //!
 //! Real shard + real runtimes; loopback REST and the parent's guarded,
