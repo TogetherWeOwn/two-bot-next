@@ -50,6 +50,7 @@ mod lifecycle_tests;
 mod log_volume_guard_tests;
 mod metrics_http;
 mod moderation_cli;
+mod moderation_release_cli;
 #[cfg(test)]
 mod observability_event_conformance_tests;
 mod onboarding;

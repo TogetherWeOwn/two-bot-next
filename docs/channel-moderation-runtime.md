@@ -46,6 +46,15 @@ keys as well as duplicate retries. There is deliberately no expiry: ambiguous
 HTTP outcomes or process loss require reconciliation, not another mutation.
 The runtime DML role explicitly includes this table; the web-reader role does not.
 
+For a genuinely wedged lane, the local operator-only
+[`moderation release-channel` CLI](channel-lane-reconciliation.md) prints the
+matching rows before explicit confirmation, compares the inspected generation,
+audits the previous state and operator, and preserves the lockdown recovery seed.
+It retires the old key as `done/operator_released` rather than allowing redelivery
+to repeat an uncertain effect. Operators must quiesce original workers, establish
+old REST settlement, and read actual Discord overwrites and slowmode first; the
+CLI cannot cancel a delayed unlock or prove it safe.
+
 `finish` atomically performs generation-fenced completion, audit insertion,
 confirmed unlock recovery cleanup and lane release. False means no finalization
 occurred and must never trigger another effect. SQL failure retains the claim,

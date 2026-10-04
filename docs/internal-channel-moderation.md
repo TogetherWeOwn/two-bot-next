@@ -69,8 +69,13 @@ rather than repeating a possibly accepted effect.
 There is deliberately **no expiry or automatic reconciliation**: a delayed unlock
 must never overwrite a newer lockdown. Recovery requires separately authorized
 reconciliation that proves the old REST effect has settled and inspects the
-matching claim/channel/recovery generations. This slice supplies no force-release
-endpoint and does not deploy or exercise a live guild.
+matching claim/channel/recovery generations. The local operator-only
+[`moderation release-channel` CLI](channel-lane-reconciliation.md) provides
+inspection-first, explicitly confirmed release with generation fencing, atomic
+audit and a terminal replay tombstone. It preserves the recovery seed, never
+calls Discord, and requires the operator to quiesce old workers and reconcile
+actual overwrites/slowmode first. No force-release HTTP endpoint, automatic
+reconciliation or live-guild deployment is supplied.
 
 ## Verification
 
