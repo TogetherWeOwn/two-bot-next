@@ -2606,7 +2606,7 @@ impl ActionExecutor {
     /// with the shared 5 s abort and only 200 accepted. Missing or invalid
     /// metadata refuses with a fixed error, never response content; no
     /// alternate client or guessed id.
-    /// https://docs.rs/twilight-http/0.17.1/twilight_http/request/struct.GetUserApplicationInfo.html
+    /// <https://docs.rs/twilight-http/0.17.1/twilight_http/request/struct.GetUserApplicationInfo.html>
     pub async fn current_application_id(&self) -> Result<u64, DiscordError> {
         let req = Self::request_of(self.inner.factory.current_user_application())?;
         let doc = self.bootstrap_doc(req).await?;
@@ -2621,7 +2621,7 @@ impl ActionExecutor {
     /// Bootstrap guild context via `GET /guilds/{id}`: one attempt with the
     /// shared 5 s abort and only 200 accepted. Requires the requested nonzero
     /// identity and a nonblank name; malformed metadata never reaches errors.
-    /// https://docs.rs/twilight-http/0.17.1/twilight_http/request/guild/struct.GetGuild.html
+    /// <https://docs.rs/twilight-http/0.17.1/twilight_http/request/guild/struct.GetGuild.html>
     pub async fn guild_name(&self, guild_id: u64) -> Result<String, DiscordError> {
         let guild = Id::<GuildMarker>::new_checked(guild_id)
             .ok_or_else(|| DiscordError::Rejected("bad guild id".to_owned()))?;

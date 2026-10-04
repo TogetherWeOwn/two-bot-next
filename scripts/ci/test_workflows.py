@@ -98,6 +98,12 @@ def staging_dispatch_errors(workflow):
     return errors
 
 
+def job_env_text(job):
+    """Job-level `env` plus every step's `env`: everywhere a binding can be exported."""
+    return " ".join([str(job.get("env", ""))]
+                    + [str(step.get("env", "")) for step in job.get("steps", [])])
+
+
 def staging_migrate_errors(workflow):
     """Manual staging-only SQLx migration runner (TOG-11572).
 
@@ -193,18 +199,27 @@ def staging_migrate_errors(workflow):
             if step.get("shell") != "bash" or "set -o pipefail" not in str(step.get("run", "")):
                 errors.append(f"{name}:{job_id}: Run step must use a pipefail shell so a "
                               "migrator refusal/failure fails the job instead of reporting green")
-    plan_env = " ".join(str(step.get("env", "")) for step in plan.get("steps", []))
-    apply_env = " ".join(str(step.get("env", "")) for step in apply.get("steps", []))
+    # Whole-job scope (job `env` plus every step `env`): a secret exported at
+    # job level reaches every step, so a step-only scan would miss it.
+    plan_env = job_env_text(plan)
+    apply_env = job_env_text(apply)
     # Plan is physically read-only: it reads only the RO binding and must never
-    # see the migrator credential; apply reads only the migrator binding.
+    # see the migrator credential; apply reads only the migrator binding. The
+    # absence checks scan the entire job mapping (env, run, with, ...), since
+    # secret names are case-insensitive and any key can carry a `secrets.*`.
+    plan_job, apply_job = str(plan).lower(), str(apply).lower()
     if "TWO_BOT_STAGING_PLAN_DATABASE_URL" not in plan_env:
         errors.append(f"{name}:plan: must read only the TWO_BOT_STAGING_PLAN_DATABASE_URL binding")
-    if "TWO_BOT_STAGING_MIGRATOR_DATABASE_URL" in plan_env:
+    if "two_bot_staging_migrator_database_url" in plan_job:
         errors.append(f"{name}:plan: must never read the migrator TWO_BOT_STAGING_MIGRATOR_DATABASE_URL binding")
     if "TWO_BOT_STAGING_MIGRATOR_DATABASE_URL" not in apply_env:
         errors.append(f"{name}:apply: must read only the TWO_BOT_STAGING_MIGRATOR_DATABASE_URL binding")
-    if "TWO_BOT_STAGING_PLAN_DATABASE_URL" in apply_env:
+    if "two_bot_staging_plan_database_url" in apply_job:
         errors.append(f"{name}:apply: must never read the plan TWO_BOT_STAGING_PLAN_DATABASE_URL binding")
+    for job_id, text in (("plan", plan_job), ("apply", apply_job)):
+        if "tojson(secrets" in text.replace(" ", "") or "secrets[" in text.replace(" ", ""):
+            errors.append(f"{name}:{job_id}: must name each secret explicitly "
+                          "(no toJSON(secrets) or indexed secrets access)")
     plan_runs = " ".join(str(step.get("run", "")) for step in plan.get("steps", []))
     apply_runs = " ".join(str(step.get("run", "")) for step in apply.get("steps", []))
     # Match the standalone mode flag: the plan-binding flags
@@ -514,6 +529,51 @@ class WorkflowTests(unittest.TestCase):
                     def add(w, s=step, job_id=job_id):
                         w["jobs"][job_id]["steps"].append(s)
                     self.assertTrue(mutated(add))
+        # Credential split holds for the whole job mapping, not just step env:
+        # a binding exported at job level (or smuggled through any other key,
+        # in any case) reaches every step of the wrong job.
+        migrator_secret = "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"
+        plan_secret = "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}"
+        for job_id, wrong_binding, wrong_secret in (
+                ("plan", "TWO_BOT_STAGING_MIGRATOR_DATABASE_URL", migrator_secret),
+                ("apply", "TWO_BOT_STAGING_PLAN_DATABASE_URL", plan_secret)):
+            with self.subTest(job=job_id, wrong_binding="job-level-env"):
+                def leak(w, job_id=job_id, wrong_binding=wrong_binding, wrong_secret=wrong_secret):
+                    w["jobs"][job_id].setdefault("env", {})[wrong_binding] = wrong_secret
+                self.assertTrue(mutated(leak))
+            with self.subTest(job=job_id, wrong_binding="lowercase-job-level-env"):
+                def leak(w, job_id=job_id, wrong_binding=wrong_binding, wrong_secret=wrong_secret):
+                    w["jobs"][job_id].setdefault("env", {})["DB"] = wrong_secret.lower()
+                self.assertTrue(mutated(leak))
+            with self.subTest(job=job_id, wrong_binding="step-with"):
+                def leak(w, job_id=job_id, wrong_secret=wrong_secret):
+                    w["jobs"][job_id]["steps"].append(
+                        {"uses": "actions/cache@pinned", "with": {"key": wrong_secret}})
+                self.assertTrue(mutated(leak))
+            with self.subTest(job=job_id, wrong_binding="step-run"):
+                def leak(w, job_id=job_id, wrong_secret=wrong_secret):
+                    w["jobs"][job_id]["steps"].append({"run": f"echo {wrong_secret}"})
+                self.assertTrue(mutated(leak))
+            for blanket in ("${{ toJSON(secrets) }}", "${{ secrets['TWO_BOT_STAGING_X'] }}"):
+                with self.subTest(job=job_id, blanket=blanket):
+                    def leak(w, job_id=job_id, blanket=blanket):
+                        w["jobs"][job_id].setdefault("env", {})["ALL"] = blanket
+                    self.assertTrue(mutated(leak))
+        with self.subTest(plan="own-binding-at-job-level"):
+            # Positive control: relocating the job's own binding to job `env`
+            # is still that job reading only its own credential.
+            def relocate(w):
+                job = w["jobs"]["plan"]
+                job["env"] = {"TWO_BOT_STAGING_PLAN_DATABASE_URL": plan_secret}
+                for step in job["steps"]:
+                    step.get("env", {}).pop("TWO_BOT_STAGING_PLAN_DATABASE_URL", None)
+            self.assertEqual(mutated(relocate), [])
+        with self.subTest(plan="no-own-binding"):
+            def drop(w):
+                job = w["jobs"]["plan"]
+                for step in job["steps"]:
+                    step.get("env", {}).pop("TWO_BOT_STAGING_PLAN_DATABASE_URL", None)
+            self.assertTrue(mutated(drop))
         with self.subTest(apply="no-needs"):
             def drop(w):
                 del w["jobs"]["apply"]["needs"]

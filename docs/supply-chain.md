@@ -160,7 +160,7 @@ persisted in their checkout.
 
 ## Pins and maintenance
 
-The builder is `rust:1.94-trixie` and the runtime is
+The builder is `rust:1.98-trixie` and the runtime is
 `gcr.io/distroless/cc-debian13:nonroot`, both pinned by multi-platform index
 SHA-256. Both are Debian 13, so the binary links against the glibc it runs on.
 Dependabot's weekly `docker` updates follow both references. The distroless

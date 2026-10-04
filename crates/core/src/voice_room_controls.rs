@@ -179,13 +179,11 @@ pub fn room_bitrate(prefs: &[Option<u32>], creator_default: u32, tier_max: u32) 
         sum += u64::from(*pref);
         count += 1;
     }
-    let raw = if count == 0 {
-        creator_default
-    } else {
-        // Floor division; `sum` is the exact total of `u32` inputs, so the
-        // quotient always fits in `u32`.
-        (sum / count) as u32
-    };
+    // Floor division; `sum` is the exact total of `u32` inputs, so the
+    // quotient always fits in `u32`. No preferences (count == 0) falls back.
+    let raw = sum
+        .checked_div(count)
+        .map_or(creator_default, |mean| mean as u32);
     clamp_bitrate(raw, tier_max)
 }
 
