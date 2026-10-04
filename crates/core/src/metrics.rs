@@ -63,6 +63,7 @@ pub const JOBS: &[&str] = &[
     "counter",
     "rank",
     "scheduled_events",
+    "settings",
     "presence_probe",
     "community_scorecard",
     "inactivity",
@@ -171,6 +172,8 @@ struct Values {
     jobs: [JobMetrics; JOBS.len()],
     reconnects: u64,
     resumes: u64,
+    disconnects: u64,
+    missed_events: u64,
     latency_micros: Option<u64>,
     handler: Histogram,
     voice_ops: [[u64; 5]; 3],
@@ -213,6 +216,32 @@ impl Metrics {
         values.reconnects = values.reconnects.saturating_add(1);
         // A stale ACK must not look like latency on the new connection.
         values.latency_micros = None;
+    }
+
+    /// One observed transport loss: reconnect failure, close frame, invalid
+    /// session, or stream termination. The 48h watch pairs every disconnect
+    /// with the matching RESUME or fresh READY; an unpaired disconnect means
+    /// the gateway never came back.
+    pub fn gateway_disconnect(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.disconnects = values.disconnects.saturating_add(1);
+    }
+
+    /// Dispatches Discord assigned but this process never received (sequence
+    /// gaps inside one session). Zero is a no-op. Any nonzero increase over
+    /// the watch window fails the zero-missed-events acceptance.
+    pub fn gateway_missed_events(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.missed_events = values.missed_events.saturating_add(count);
     }
 
     pub fn gateway_latency(&self, latency: Duration) {
@@ -388,6 +417,18 @@ impl Metrics {
             "two_bot_gateway_resumes_total",
             "counter",
             values.resumes,
+        );
+        scalar(
+            &mut out,
+            "two_bot_gateway_disconnects_total",
+            "counter",
+            values.disconnects,
+        );
+        scalar(
+            &mut out,
+            "two_bot_gateway_missed_events_total",
+            "counter",
+            values.missed_events,
         );
         header(
             &mut out,
@@ -772,5 +813,32 @@ mod tests {
         }
         assert!(text.contains("two_bot_gateway_reconnects_total 1\n"));
         assert!(text.contains("two_bot_gateway_latency_seconds NaN\n"));
+    }
+
+    #[test]
+    fn disconnects_and_missed_events_start_at_zero_and_saturate() {
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_gateway_disconnects_total 0\n"));
+        assert!(text.contains("two_bot_gateway_missed_events_total 0\n"));
+        metrics.gateway_disconnect();
+        metrics.gateway_missed_events(0);
+        metrics.gateway_missed_events(3);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_gateway_disconnects_total 1\n"));
+        assert!(text.contains("two_bot_gateway_missed_events_total 3\n"));
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.disconnects = u64::MAX;
+            values.missed_events = u64::MAX;
+        }
+        metrics.gateway_disconnect();
+        metrics.gateway_missed_events(9);
+        let text = metrics.render(None);
+        assert!(text.contains(&format!("two_bot_gateway_disconnects_total {}\n", u64::MAX)));
+        assert!(text.contains(&format!(
+            "two_bot_gateway_missed_events_total {}\n",
+            u64::MAX
+        )));
     }
 }

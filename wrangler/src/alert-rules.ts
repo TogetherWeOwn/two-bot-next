@@ -43,6 +43,10 @@ export const POOL_SATURATED_SAMPLES = 3;
 export const DB_ERROR_MIN_ERRORS = 3;
 /** ...and send-admission refusals must appear in this many consecutive samples. */
 export const SEND_BLOCKED_SAMPLES = 3;
+/** Voice failures must exceed this share of room operations between two samples... */
+export const VOICE_FAILURE_RATIO = 0.05;
+/** ...and the window must hold at least this many operations. */
+export const VOICE_FAILURE_MIN_OPS = 10;
 
 export const RULES: readonly RuleDef[] = [
   { id: "job_stale", summary: `scheduled job has no success for more than ${STALE_INTERVALS} intervals`, runbook: "runbook.md#alert-job-stale" },
@@ -51,6 +55,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "db_pool_saturated", summary: `database pool exhausted for ${POOL_SATURATED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-db-pool" },
   { id: "db_errors", summary: `database errors reached ${DB_ERROR_MIN_ERRORS}+ between samples`, runbook: "runbook.md#alert-db-errors" },
   { id: "send_admission_blocked", summary: `Discord sends refused admission for ${SEND_BLOCKED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-send-admission-blocked" },
+  { id: "voice_failures", summary: `voice room lifecycle failures exceed ${VOICE_FAILURE_RATIO * 100}% of operations (min ${VOICE_FAILURE_MIN_OPS} ops), or new dead-letters/orphans`, runbook: "runbook.md#alert-voice-failures" },
 ];
 
 /**
@@ -74,9 +79,13 @@ export interface MetricsAlertState {
   dbErrors: number;
   sendBlocked: number;
   sendBlockedStreak: number;
+  voiceOps: number;
+  voiceFailures: number;
+  voiceDeadLetters: number;
+  voiceOrphans: number;
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0 };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0 };
 
 export function parseExposition(text: string): Sample[] {
   const samples: Sample[] = [];
@@ -154,7 +163,41 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   const sendBlockedStreak = sendReset || sendBlocked === prevSendBlocked ? 0 : (prev.sendBlockedStreak ?? 0) + 1;
   if (sendBlockedStreak >= SEND_BLOCKED_SAMPLES) firing.push("send_admission_blocked");
 
-  return { firing, state: { firing, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak } };
+  // Voice lifecycle failures (T3 room create/move/delete budget in
+  // docs/voice-cutover-rollback-triggers.md): any outcome other than
+  // `success` (`category_full`, `discord`, `persistence`, `cancelled`)
+  // counts as a failure — the join did not place a room, or the move/delete
+  // did not complete. A new dead-letter (a queue write that exhausted 10
+  // attempts) or orphan (an untracked creator-channel orphan needing manual
+  // deletion) fires on its own, so a low-volume stranded-member failure
+  // still pages when the operation window is too small for the ratio.
+  let voiceOps = 0;
+  let voiceFailures = 0;
+  for (const s of gauge("two_bot_voice_operations_total")) {
+    voiceOps += s.value;
+    if (s.labels["outcome"] !== "success") voiceFailures += s.value;
+  }
+  let voiceDeadLetters = 0;
+  for (const s of gauge("two_bot_voice_dead_letters_total")) voiceDeadLetters += s.value;
+  let voiceOrphans = 0;
+  for (const s of gauge("two_bot_voice_orphans_total")) voiceOrphans += s.value;
+  // `?? 0` covers DO storage written before these fields existed.
+  const prevVoiceOps = prev.voiceOps ?? 0;
+  const prevVoiceFailures = prev.voiceFailures ?? 0;
+  const prevVoiceDeadLetters = prev.voiceDeadLetters ?? 0;
+  const prevVoiceOrphans = prev.voiceOrphans ?? 0;
+  // A counter that went backwards means the process restarted: no window.
+  const voiceReset = voiceOps < prevVoiceOps || voiceFailures < prevVoiceFailures
+    || voiceDeadLetters < prevVoiceDeadLetters || voiceOrphans < prevVoiceOrphans;
+  const dVoiceOps = voiceOps - prevVoiceOps;
+  const dVoiceFailures = voiceFailures - prevVoiceFailures;
+  const dVoiceDead = voiceDeadLetters - prevVoiceDeadLetters;
+  const dVoiceOrphans = voiceOrphans - prevVoiceOrphans;
+  if (!voiceReset && ((dVoiceOps >= VOICE_FAILURE_MIN_OPS && dVoiceFailures / dVoiceOps > VOICE_FAILURE_RATIO) || dVoiceDead >= 1 || dVoiceOrphans >= 1)) {
+    firing.push("voice_failures");
+  }
+
+  return { firing, state: { firing, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

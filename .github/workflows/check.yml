@@ -7,6 +7,14 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Weekly full run (CI standard rule 6, TOG-14881): the supply-chain
+  # SBOM/vulnerability scan runs on dependency-affecting PRs, every push to
+  # main, and here weekly. Non-PR events fail closed to full jobs in the
+  # selectors below, so this run covers the whole matrix. Off the hour to
+  # avoid the busiest scheduled-run window (UTC); Mondays to sit apart from
+  # the release workflow's own weekly schedule.
+  schedule:
+    - cron: '9 4 * * 1'
   # Dispatched by the release workflow (TOG-10035) on release-please branches:
   # PRs opened with GITHUB_TOKEN trigger no workflows, so the required `check`
   # / `worker check` would never run on the release PR without this path.
@@ -32,8 +40,16 @@ jobs:
     # workflow_call trigger, so it cannot be called with `uses:`.
     # A called workflow can only narrow the caller grant; with the default-deny
     # top level it would otherwise check out this private repo with no token.
+    # Gated on the `supply` selector (CI standard rule 6, TOG-14881): the
+    # ~40-minute image build + vulnerability scan runs when Rust code,
+    # dependency manifests, image inputs, `.github/**` or the selectors
+    # change -- plus every push to main and the weekly schedule. Docs-only
+    # and worker-UI-only PRs skip it; the `check` and `ci-ok` aggregators
+    # only enforce it when selected.
     permissions:
       contents: read
+    needs: [job-inputs]
+    if: needs.job-inputs.outputs.supply != 'false'
     uses: ./.github/workflows/sbom.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
     with:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -66,6 +82,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       TWO_CUSTOM_COMMAND_TEST_CI: "1"
+      TWO_AUTOMATION_TRANSFER_TEST_CI: "1"
       # Disk hygiene for hosted overflow runners (TOG-12134): the integration
       # link step (`cargo test --workspace --test '*'`) links ~70 test
       # binaries and exhausted the job-container overlay (98 MB left, rust-lld
@@ -132,9 +149,11 @@ jobs:
           SEL_RUST: ${{ needs.job-inputs.outputs.rust }}
           SEL_WORKER: ${{ needs.job-inputs.outputs.worker }}
           SEL_PARITY: ${{ needs.job-inputs.outputs.parity }}
+          SEL_SUPPLY: ${{ needs.job-inputs.outputs.supply }}
+          SEL_DOCS: ${{ needs.job-inputs.outputs.docs }}
         run: |
-          printf 'job-inputs: rust=%s worker=%s parity=%s\n' \
-            "$SEL_RUST" "$SEL_WORKER" "$SEL_PARITY"
+          printf 'job-inputs: rust=%s worker=%s parity=%s supply=%s docs=%s\n' \
+            "$SEL_RUST" "$SEL_WORKER" "$SEL_PARITY" "$SEL_SUPPLY" "$SEL_DOCS"
 
       # The database jobs skip when `job inputs changed` fails (they are not
       # required checks); `worker check` always runs and fails closed on a
@@ -153,7 +172,7 @@ jobs:
         run: exit 1
 
       - name: require supply-chain gate to pass
-        if: needs.supply-chain.result != 'success'
+        if: needs.supply-chain.result != 'success' && needs.job-inputs.outputs.supply != 'false'
         run: exit 1
 
       - name: Check migration numbering and immutability
@@ -196,6 +215,16 @@ jobs:
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_probe.py' -v
+
+      - name: soak evidence parser (offline, fixtures only)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_evidence.py' -v
+
+      - name: staging E2E run-record template (offline)
+        run: |
+          python3 scripts/check_run_record.py --record scripts/fixtures/staging_e2e_run_record_mock.json --allow-mock
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record.py' -v
 
       - name: Validate voice template fixtures (hermetic, no renderer)
         run: |
@@ -215,7 +244,7 @@ jobs:
 
       - name: Install Rust toolchain
         if: needs.job-inputs.outputs.rust != 'false'
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -518,6 +547,23 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-cutover --test staging_migrate_db --locked -- --ignored
 
+      # Ignored-DB audit: every #[ignore]d store test file is routed to a step
+      # in this job. These three had no step, so they silently never ran. The
+      # doc-regeneration test in reference_docs.rs stays unrouted on purpose:
+      # it rewrites committed files and must only run as an explicit manual
+      # regen, never in CI.
+      - name: invite store atomicity (CI service container only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-cutover --locked --test invite_store -- --ignored
+
+      - name: cutover reward ladder lib regression (CI service container only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-cutover --locked --lib -- --ignored
+
+      - name: sticky live store regressions (CI service container only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-core --features db --locked --test sticky_store_live -- --ignored
+
       - name: channel moderation store clippy
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
@@ -568,6 +614,10 @@ jobs:
       - name: custom-command Postgres proof
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-core --features db --locked --test custom_command_store -- --ignored
+
+      - name: automations import/export Postgres proof
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-core --features db --locked --test automation_transfer -- --ignored
 
       - name: custom-command routed runtime proof (mock Discord and CI Postgres only)
         if: needs.job-inputs.outputs.rust != 'false'
@@ -634,14 +684,22 @@ jobs:
     env:
       MEMBER_TESTDB: agent-testdb
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         if: needs.job-inputs.outputs.rust != 'false'
         with:
           toolchain: stable
           components: clippy
+      # Per-job dependency cache: the key includes the job id (no
+      # shared-key), so this job keeps its own entry; saved on pushes only.
+      - name: Restore cargo cache
+        if: needs.job-inputs.outputs.rust != 'false'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: ${{ runner.os }}-cargo
+          save-if: ${{ github.event_name == 'push' }}
       - name: Check feature-gated moderation store
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
@@ -706,27 +764,38 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
           toolchain: stable
+      # Per-job dependency cache: the key includes the job id (no
+      # shared-key), so this job keeps its own entry; saved on pushes only.
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: ${{ runner.os }}-cargo
+          save-if: ${{ github.event_name == 'push' }}
       - name: self-role claim, renewal, recovery and fencing tests
         run: cargo test -p two-bot-cutover --test self_role_store --locked -- --ignored
       - name: self-role runtime admission and immutable snapshots (mock REST and isolated schema)
         run: >-
           cargo test -p two-bot --locked self_role_runtime:: -- --include-ignored --test-threads=1
 
-  # Dependency-aware selector for the test jobs (TOG-12057): generalizes the
-  # TOG-12056 container-inputs pattern to the whole matrix. PRs that touch
+  # Dependency-aware selector for the test jobs (TOG-12057, extended by
+  # TOG-14881 for the CI standard): generalizes the TOG-12056
+  # container-inputs pattern to the whole matrix. PRs that touch
   # only worker UI or unrelated docs skip the ~30-minute Rust suite; Rust-only
-  # PRs skip the worker job. No `paths:` filter on the workflow: that would
-  # skip the whole workflow including the always-reporting `check`
-  # aggregator. Needs nothing so it starts immediately and never blocks on
-  # the test jobs. Fail-closed end to end: the shell step defaults to
-  # rust/worker/parity=true, so an undecidable diff, missing SHAs, a
-  # classifier error or any non-PR event selects full jobs, and every gated
-  # step uses `!= 'false'` so missing outputs run rather than skip. Push to
-  # main always selects everything, so release-candidate and staging
-  # validation never lose coverage.
+  # PRs skip the worker job; docs-only and worker-UI-only PRs additionally
+  # skip the supply-chain SBOM scan via the `supply` output. No `paths:`
+  # filter on the workflow: that would skip the whole workflow including the
+  # always-reporting `check` / `ci-ok` aggregators. Needs nothing so it starts
+  # immediately and never blocks on the test jobs. Fail-closed end to end:
+  # the shell step defaults to rust/worker/parity/supply=true (docs defaults
+  # to false: it is informational only and gates nothing), so an undecidable
+  # diff, missing SHAs, a classifier error or any non-PR event selects full
+  # jobs, and every gated step uses `!= 'false'` so missing outputs run
+  # rather than skip. Push to main, the weekly schedule and dispatch always
+  # select everything, so release-candidate and staging validation never
+  # lose coverage.
   job-inputs:
     name: job inputs changed
     permissions:
@@ -738,6 +807,8 @@ jobs:
       rust: ${{ steps.select.outputs.rust }}
       worker: ${{ steps.select.outputs.worker }}
       parity: ${{ steps.select.outputs.parity }}
+      supply: ${{ steps.select.outputs.supply }}
+      docs: ${{ steps.select.outputs.docs }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -753,7 +824,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          rust=true worker=true parity=true
+          rust=true worker=true parity=true supply=true docs=false
           if [ "${{ github.event_name }}" = "pull_request" ] \
             && [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ] \
             && result=$(python3 scripts/job-inputs.py \
@@ -761,12 +832,15 @@ jobs:
             rust=$(printf '%s' "$result" | sed -n 's/^rust=//p')
             worker=$(printf '%s' "$result" | sed -n 's/^worker=//p')
             parity=$(printf '%s' "$result" | sed -n 's/^parity=//p')
+            supply=$(printf '%s' "$result" | sed -n 's/^supply=//p')
+            docs=$(printf '%s' "$result" | sed -n 's/^docs=//p')
             rust=${rust:-true} worker=${worker:-true} parity=${parity:-true}
+            supply=${supply:-true} docs=${docs:-false}
           fi
-          printf 'job-inputs: rust=%s worker=%s parity=%s (event=%s)\n' \
-            "$rust" "$worker" "$parity" "${{ github.event_name }}"
-          printf 'rust=%s\nworker=%s\nparity=%s\n' \
-            "$rust" "$worker" "$parity" >>"$GITHUB_OUTPUT"
+          printf 'job-inputs: rust=%s worker=%s parity=%s supply=%s docs=%s (event=%s)\n' \
+            "$rust" "$worker" "$parity" "$supply" "$docs" "${{ github.event_name }}"
+          printf 'rust=%s\nworker=%s\nparity=%s\nsupply=%s\ndocs=%s\n' \
+            "$rust" "$worker" "$parity" "$supply" "$docs" >>"$GITHUB_OUTPUT"
 
   # Dependency-aware selector for the container job (TOG-12056): PRs that
   # touch only docs, worker UI or unrelated CI tooling skip the ~15-minute
@@ -842,11 +916,11 @@ jobs:
           printf 'Selector output: build=%s\n' "$BUILD_SELECTION"
       - name: Set up BuildKit
         if: needs.container-inputs.outputs.build == 'true'
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build runtime image (local only)
         id: build
         if: needs.container-inputs.outputs.build == 'true'
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile
@@ -911,13 +985,20 @@ jobs:
     env:
       TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/postgres
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: stable
           components: clippy
+      # Per-job dependency cache: the key includes the job id (no
+      # shared-key), so this job keeps its own entry; saved on pushes only.
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: ${{ runner.os }}-cargo
+          save-if: ${{ github.event_name == 'push' }}
       - name: Check feature-gated community stores
         run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - name: Test presence, scorecard and inactivity ledgers on ephemeral Postgres
@@ -957,10 +1038,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
           toolchain: stable
           components: clippy
+      # Per-job dependency cache: the key includes the job id (no
+      # shared-key), so this job keeps its own entry; saved on pushes only.
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: ${{ runner.os }}-cargo
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - run: cargo test -p two-bot-core --features db --test feeds --locked
       - run: cargo test -p two-bot-core --features db --test feeds_store --locked -- --ignored
@@ -993,10 +1081,10 @@ jobs:
     env:
       TICKET_TEST_DB_HOST: agent-testdb
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
           toolchain: stable
       # TOG-11810: dependency build cache, as in the `check` job. The key
@@ -1078,13 +1166,21 @@ jobs:
       # pins this step with no `if:` (test_required_worker_ci_runs_this_offline_suite).
       - name: Verify staging rollout provenance (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollout.py -v
+      - name: Verify staging ownership-takeover retry (offline fixtures)
+        run: node --test scripts/test-ownership-control.mjs
       - name: Verify staging redirect smoke (offline fixtures)
         if: needs.job-inputs.outputs.worker != 'false'
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_redirect_smoke.py -v
       - name: Verify staging automation read smoke (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_automation_read_smoke.py -v
+      - name: Verify voice denied-copy fixtures (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_voice_denied_copy.py -v
+      - name: Verify staging-guild E2E prep skeleton (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_guild_e2e_prep.py -v
       - name: Verify staging smoke edge-case fixtures (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_edge_cases.py -v
+      - name: Verify cutover acceptance probes (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_qa_cutover_probes.py -v
       - name: Verify runner routing for every workflow job
         if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-runner-routing.py
@@ -1096,3 +1192,179 @@ jobs:
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release.cjs
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release-publication.cjs
+
+  # Always-run aggregator for the path-filtered matrix. GitHub counts a
+  # skipped job as passing for required checks, and leaves a required context
+  # pending forever when its workflow never starts (a `paths:`/`branches:`
+  # filter on the trigger). Every selector-gated job reports through this
+  # job: it runs on every PR (no selector `if:`, only `always()`), and fails
+  # when any needed conclusion is failure or cancelled, or when the selector
+  # itself did not succeed (fail-closed, so a broken selector cannot turn
+  # skipped jobs into a false green). `skipped` is accepted only when the
+  # selector explicitly deselected that job. The container image smoke is
+  # intentionally not in `needs:`: it is not a correctness gate and builds up
+  # to 30 minutes; it stays independently visible. Ruleset enforcement still
+  # points at `check` and `worker check` in this slice; the operator flips the
+  # required context to `ci-ok` (the CI standard name, TOG-14881) separately,
+  # after which this legacy `required-checks` job is removed.
+  required-checks:
+    name: required checks
+    permissions:
+      contents: read
+    needs: [job-inputs, supply-chain, check, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db]
+    # A skipped or cancelled dependency must not read as green.
+    if: ${{ always() }}
+    # Runner routing: see the note on the first job above.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'required-checks') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    steps:
+      - name: Aggregate required conclusions
+        env:
+          JOB_INPUTS_RESULT: ${{ needs.job-inputs.result }}
+          RUST_SELECTED: ${{ needs.job-inputs.outputs.rust }}
+          WORKER_SELECTED: ${{ needs.job-inputs.outputs.worker }}
+          PARITY_SELECTED: ${{ needs.job-inputs.outputs.parity }}
+          SUPPLY_SELECTED: ${{ needs.job-inputs.outputs.supply }}
+          SUPPLY_CHAIN_RESULT: ${{ needs.supply-chain.result }}
+          CHECK_RESULT: ${{ needs.check.result }}
+          WORKER_RESULT: ${{ needs.worker.result }}
+          PARITY_DOCS_RESULT: ${{ needs.parity-docs.result }}
+          SELF_ROLE_RESULT: ${{ needs.self-role-store.result }}
+          COMMUNITY_DB_RESULT: ${{ needs.community-db.result }}
+          FEEDS_DB_RESULT: ${{ needs.feeds-db.result }}
+          TICKETS_RESULT: ${{ needs.tickets-postgres.result }}
+          MODERATION_DB_RESULT: ${{ needs.moderation-db.result }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+
+          failures = []
+
+          def selected(name):
+              # The selector shell defaults undecidable diffs to true and the
+              # outputs fall back to true, so a missing output with a
+              # successful selector is treated as selected (fail-closed).
+              return os.environ.get(name, "") != "false"
+
+          if os.environ.get("JOB_INPUTS_RESULT") != "success":
+              failures.append(
+                  "job-inputs did not succeed "
+                  f"(result={os.environ.get('JOB_INPUTS_RESULT')!r}); "
+                  "refusing to trust skips")
+          else:
+              gated = [
+                  ("worker", "WORKER_RESULT", "WORKER_SELECTED"),
+                  ("parity-docs", "PARITY_DOCS_RESULT", "PARITY_SELECTED"),
+                  ("supply-chain", "SUPPLY_CHAIN_RESULT", "SUPPLY_SELECTED"),
+                  ("self-role-store", "SELF_ROLE_RESULT", "RUST_SELECTED"),
+                  ("community-db", "COMMUNITY_DB_RESULT", "RUST_SELECTED"),
+                  ("feeds-db", "FEEDS_DB_RESULT", "RUST_SELECTED"),
+                  ("tickets-postgres", "TICKETS_RESULT", "RUST_SELECTED"),
+                  ("moderation-db", "MODERATION_DB_RESULT", "RUST_SELECTED"),
+              ]
+              for job, result_var, sel_var in gated:
+                  result = os.environ.get(result_var, "")
+                  if result == "success":
+                      continue
+                  if result == "skipped" and not selected(sel_var):
+                      continue
+                  failures.append(f"{job}: result={result!r} selected={selected(sel_var)}")
+              for job, var in (("check", "CHECK_RESULT"),):
+                  result = os.environ.get(var, "")
+                  if result != "success":
+                      failures.append(f"{job}: result={result!r} (always-run gate)")
+
+          if failures:
+              print("required checks FAILED:")
+              for failure in failures:
+                  print(f"  - {failure}")
+              sys.exit(1)
+          print("required checks passed")
+          PY
+
+  # CI standard aggregator (TOG-14877 rule 3, adopted TOG-14881): the single
+  # required check. Passes when every needed job succeeded or was skipped
+  # (`if: always()` so gating can never leave the PR without a verdict).
+  # Identical needs/logic to `required-checks`, which stays until the
+  # `protect-main` ruleset flips from `check`/`worker check` to `ci-ok`
+  # (ruleset writes are human-admin-only; see the Operator follow-up). The
+  # container image smoke stays out of `needs:` on purpose: it is not a
+  # correctness gate and takes up to 30 minutes; it stays independently
+  # visible. Branch protection will require only `ci-ok` (plus `pr-lint`
+  # and `gitleaks` from supply-chain.yml), so gating can never block merges.
+  ci-ok:
+    name: ci-ok
+    permissions:
+      contents: read
+    needs: [job-inputs, supply-chain, check, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db]
+    # A skipped or cancelled dependency must not read as green.
+    if: ${{ always() }}
+    # Runner routing: see the note on the first job above.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'ci-ok') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    steps:
+      - name: Aggregate CI verdict
+        env:
+          JOB_INPUTS_RESULT: ${{ needs.job-inputs.result }}
+          RUST_SELECTED: ${{ needs.job-inputs.outputs.rust }}
+          WORKER_SELECTED: ${{ needs.job-inputs.outputs.worker }}
+          PARITY_SELECTED: ${{ needs.job-inputs.outputs.parity }}
+          SUPPLY_SELECTED: ${{ needs.job-inputs.outputs.supply }}
+          SUPPLY_CHAIN_RESULT: ${{ needs.supply-chain.result }}
+          CHECK_RESULT: ${{ needs.check.result }}
+          WORKER_RESULT: ${{ needs.worker.result }}
+          PARITY_DOCS_RESULT: ${{ needs.parity-docs.result }}
+          SELF_ROLE_RESULT: ${{ needs.self-role-store.result }}
+          COMMUNITY_DB_RESULT: ${{ needs.community-db.result }}
+          FEEDS_DB_RESULT: ${{ needs.feeds-db.result }}
+          TICKETS_RESULT: ${{ needs.tickets-postgres.result }}
+          MODERATION_DB_RESULT: ${{ needs.moderation-db.result }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+
+          failures = []
+
+          def selected(name):
+              # The selector shell defaults undecidable diffs to true and the
+              # outputs fall back to true, so a missing output with a
+              # successful selector is treated as selected (fail-closed).
+              return os.environ.get(name, "") != "false"
+
+          if os.environ.get("JOB_INPUTS_RESULT") != "success":
+              failures.append(
+                  "job-inputs did not succeed "
+                  f"(result={os.environ.get('JOB_INPUTS_RESULT')!r}); "
+                  "refusing to trust skips")
+          else:
+              gated = [
+                  ("worker", "WORKER_RESULT", "WORKER_SELECTED"),
+                  ("parity-docs", "PARITY_DOCS_RESULT", "PARITY_SELECTED"),
+                  ("supply-chain", "SUPPLY_CHAIN_RESULT", "SUPPLY_SELECTED"),
+                  ("self-role-store", "SELF_ROLE_RESULT", "RUST_SELECTED"),
+                  ("community-db", "COMMUNITY_DB_RESULT", "RUST_SELECTED"),
+                  ("feeds-db", "FEEDS_DB_RESULT", "RUST_SELECTED"),
+                  ("tickets-postgres", "TICKETS_RESULT", "RUST_SELECTED"),
+                  ("moderation-db", "MODERATION_DB_RESULT", "RUST_SELECTED"),
+              ]
+              for job, result_var, sel_var in gated:
+                  result = os.environ.get(result_var, "")
+                  if result == "success":
+                      continue
+                  if result == "skipped" and not selected(sel_var):
+                      continue
+                  failures.append(f"{job}: result={result!r} selected={selected(sel_var)}")
+              for job, var in (("check", "CHECK_RESULT"),):
+                  result = os.environ.get(var, "")
+                  if result != "success":
+                      failures.append(f"{job}: result={result!r} (always-run gate)")
+
+          if failures:
+              print("ci-ok FAILED:")
+              for failure in failures:
+                  print(f"  - {failure}")
+              sys.exit(1)
+          print("ci-ok passed")
+          PY

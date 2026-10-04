@@ -96,26 +96,57 @@ pub fn session_snapshot(shard: &Shard) -> Option<Session> {
     shard.session().cloned()
 }
 
-/// Resolve the gateway intents from the environment: privileged
-/// `MESSAGE_CONTENT` only when enabled automod inspects public messages
-/// (`TWO_AUTOMOD=1`), tickets are configured, or custom text commands are
-/// explicitly enabled (`TWO_AUTOMATIONS=1` and `TWO_TEXT_COMMANDS=1`).
-pub fn intents_from_env() -> Intents {
+/// Resolve the gateway intents after boot activation: privileged
+/// `MESSAGE_CONTENT` only when permitted automod is enabled, tickets
+/// are independently configured (legacy `needsMessageContent`), or
+/// permitted automations enable custom text commands
+/// (`TWO_AUTOMATIONS=1` and `TWO_TEXT_COMMANDS=1`). A refused capability
+/// never contributes its condition: requesting a privileged intent without
+/// the grant closes the gateway with 4014 instead of isolated refusal.
+pub fn intents_from_env(activation: &crate::activation::BootActivation) -> Intents {
     fn var(name: &str) -> String {
         std::env::var(name).unwrap_or_default()
     }
-    let message_content = needs_message_content(
+    let base = intents_for_settings(
+        activation,
         &var("TWO_AUTOMOD"),
         [
             var("DISCORD_TICKET_CATEGORY_ID").as_str(),
             var("DISCORD_TICKET_STAFF_ROLE_ID").as_str(),
             var("DISCORD_TICKET_PANEL_CHANNEL_ID").as_str(),
         ],
-    ) || two_bot_discord::intents::needs_text_command_message_content(
-        &var("TWO_AUTOMATIONS"),
-        &var("TWO_TEXT_COMMANDS"),
     );
-    gateway_intents(message_content)
+    // Custom text commands ride the automations surface: a refused Automations
+    // capability must not request privileged MESSAGE_CONTENT, which the live
+    // app may not hold (a 4014 close would take every cleared capability
+    // down with it).
+    let text_commands = activation.permitted(two_bot_core::activation::LiveCapability::Automations)
+        && two_bot_discord::intents::needs_text_command_message_content(
+            &var("TWO_AUTOMATIONS"),
+            &var("TWO_TEXT_COMMANDS"),
+        );
+    base | gateway_intents(text_commands)
+}
+
+fn intents_for_settings(
+    activation: &crate::activation::BootActivation,
+    automod: &str,
+    ticket_vars: [&str; 3],
+) -> Intents {
+    let automod = if activation.permitted(two_bot_core::activation::LiveCapability::Automod) {
+        automod
+    } else {
+        "0"
+    };
+    // Refused tickets must not request a privileged intent the live app may
+    // not hold: a 4014 close would take every cleared capability down with
+    // it. The three ticket requirements stay independent of each other.
+    let ticket_vars = if activation.permitted(two_bot_core::activation::LiveCapability::Tickets) {
+        ticket_vars
+    } else {
+        ["", "", ""]
+    };
+    gateway_intents(needs_message_content(automod, ticket_vars))
 }
 
 /// Gateway pipeline: ordered leveling awards over the persistent funnel
@@ -222,6 +253,11 @@ async fn checkpoint_io<T>(
 async fn transport_disconnected(state: &RwLock<GatewayState>, generation: &AtomicU64) {
     // Share the lock with checkpoint restoration and READY publication so a
     // disconnect cannot land between their generation check and state write.
+    // The counter below is the 48h-watch disconnect series: every transport
+    // loss funnels through here (reconnect failures, close frames, invalid
+    // sessions, cold-resume IDENTIFY), so each one must later pair with a
+    // RESUME or fresh READY in the same window.
+    two_bot_core::metrics::global().gateway_disconnect();
     let mut state = state.write().await;
     generation.fetch_add(1, Ordering::AcqRel);
     if *state != GatewayState::Draining {
@@ -399,6 +435,18 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing resume URL".into()))?;
                         let checkpoint = GatewaySession { session_id: session.id().to_owned(), sequence, resume_url: resume_url.to_owned(), updated_at_ms: two_bot_core::funnel::now_millis_for_test() };
                         if dispatch_action(received.as_ref(), &checkpoint.session_id, sequence) == DispatchAction::Duplicate { continue; }
+                        // Sequence jumps inside one session are dispatches
+                        // Discord assigned but this process never received
+                        // (transport loss across a RESUME). Count them toward
+                        // the 48h-watch zero-missed-events acceptance.
+                        let missed = two_bot_core::gateway_session::missed_gap(
+                            received.as_ref(),
+                            &checkpoint.session_id,
+                            sequence,
+                        );
+                        if missed > 0 {
+                            two_bot_core::metrics::global().gateway_missed_events(missed);
+                        }
                         // A partial MESSAGE_UPDATE omits fields a full Twilight
                         // Message needs: decode its raw IDs before parsing.
                         let edit = if automod_enabled {
@@ -537,6 +585,12 @@ pub async fn run_shard<I: InviteSource + 'static>(
                     };
                     Some(handle.block_on(crate::automod_gateway::process(automod, delivery, &at)))
                 });
+                // Staff audit rows: translated pre-update (member deltas and
+                // voice boundaries need the rows the funnel is about to
+                // mutate), stored before the checkpoint commits. The store
+                // write is idempotent, so a crash between the two replays
+                // safely; a failed write never stalls this worker.
+                let mut audit_events = Vec::new();
                 if let Some(dispatch) = dispatch {
                     // A cold voice RESUME is followed by IDENTIFY; READY connects.
                     connected = matches!(dispatch.event, Event::Ready(_) | Event::Resumed)
@@ -545,6 +599,12 @@ pub async fn run_shard<I: InviteSource + 'static>(
                     onboarding_job = writer_onboarding
                         .as_ref()
                         .and_then(|runtime| runtime.capture(&dispatch.event, &pipeline));
+                    audit_events = crate::audit_gateway::translate(
+                        &dispatch.event,
+                        pipeline.cache(),
+                        &dispatch.observed_at,
+                        checkpoint.sequence,
+                    );
                     // Exactly one funnel call per dispatch, then drain deferred
                     // XP awards through the leveling runtime under the
                     // checkpoint deadline before the cursor commits. Without a
@@ -600,6 +660,10 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                 panic!("gateway leveling dispatch failed; checkpoint unchanged")
                             });
                     }
+                }
+                if !audit_events.is_empty() {
+                    let pending = std::mem::take(&mut audit_events);
+                    handle.block_on(crate::audit_gateway::record_all(&pending));
                 }
                 let durable_job = onboarding_job
                     .as_ref()
@@ -988,6 +1052,40 @@ pub async fn build_voice_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activation_intents_refuse_uncleared_automod_and_tickets() {
+        const STAGING: u64 = 1545644954272137297;
+        const LIVE: u64 = 326474832151838730;
+        const STAGING_TOKEN: &str = "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature";
+        const LIVE_TOKEN: &str = "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature";
+        for (guild, token, permitted) in [
+            (STAGING, Some(STAGING_TOKEN), true),
+            (LIVE, Some(LIVE_TOKEN), false),
+            (LIVE, Some(STAGING_TOKEN), false),
+            (STAGING, Some(LIVE_TOKEN), false),
+            (STAGING, Some("not-a-token"), false),
+            (STAGING, None, false),
+        ] {
+            let activation = crate::activation::BootActivation::from_token(Some(guild), token);
+            for automod in ["1", "0", "true", ""] {
+                for tickets in [
+                    ["", "", ""],
+                    ["cat", "", "panel"],
+                    ["cat", "staff", "panel"],
+                ] {
+                    // Either uncleared surface independently justifies the
+                    // privileged intent, but never on a refused identity.
+                    let expected =
+                        permitted && (automod == "1" || tickets.iter().all(|v| !v.is_empty()));
+                    assert_eq!(
+                        intents_for_settings(&activation, automod, tickets),
+                        gateway_intents(expected)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn mock_gateway_override_accepts_literal_loopback_only() {
