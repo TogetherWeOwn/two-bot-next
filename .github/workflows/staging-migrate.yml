@@ -38,6 +38,14 @@ on:
         description: Ascending comma-separated versions the reviewed plan listed (apply refuses unless it matches; empty when none pending)
         required: false
         default: ''
+      plan_manifest_sha256:
+        description: SHA-256 of the reviewed plan run's staging-migrate-manifest.json (apply refuses unless it matches the recomputed manifest on the same source_sha; empty for plan)
+        required: false
+        default: ''
+      plan_run_id:
+        description: Run id of the reviewed plan dispatch whose manifest the hash binds to (apply refuses unless present; empty for plan)
+        required: false
+        default: ''
 
 permissions: {}
 
@@ -102,6 +110,16 @@ jobs:
             --recovery-evidence-ref "$RECOVERY_REF" --acl-plan-ref "$ACL_REF" \
             --expected-pending "$EXPECTED_PENDING" \
             | tee staging-migrate-manifest.json
+      - name: Upload plan manifest
+        # The apply dispatch binds to this artifact by hash: the reviewer
+        # reads plan_manifest_sha256/plan_run_id off this run, and the apply
+        # runner refuses unless the hash matches on the same source_sha.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: staging-migrate-manifest
+          path: staging-migrate-manifest.json
+          if-no-files-found: error
+          retention-days: 14
   apply:
     name: staging-migrate (apply)
     permissions:
@@ -146,6 +164,8 @@ jobs:
           RECOVERY_REF: ${{ inputs.recovery_evidence_ref }}
           ACL_REF: ${{ inputs.acl_plan_ref }}
           EXPECTED_PENDING: ${{ inputs.expected_pending }}
+          PLAN_MANIFEST_SHA256: ${{ inputs.plan_manifest_sha256 }}
+          PLAN_RUN_ID: ${{ inputs.plan_run_id }}
         # `shell: bash` runs with `-eo pipefail`. The container's default `sh`
         # has no pipefail, so a refusal (exit 2) or failure (exit 1) piped into
         # `tee` left the job green with nothing migrated. `set -o pipefail`
@@ -158,4 +178,5 @@ jobs:
             --staging-host "$STAGING_HOST" --staging-database "$STAGING_DATABASE" \
             --recovery-evidence-ref "$RECOVERY_REF" --acl-plan-ref "$ACL_REF" \
             --expected-pending "$EXPECTED_PENDING" \
+            --plan-manifest-sha256 "$PLAN_MANIFEST_SHA256" --plan-run-id "$PLAN_RUN_ID" \
             | tee staging-migrate-manifest.json

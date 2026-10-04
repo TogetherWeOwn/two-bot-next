@@ -29,7 +29,10 @@ Coupling notes (verified 2026-10-02, enforced by test_job_inputs.py):
   ``TWO_*`` name in crates/ and src/, so Rust changes select ``worker``.
 - The corpus test (crates/core/tests/voice_template_corpus.rs) includes
   tests/voice_templates/corpus.json, and validate.py pins docs/voice-rooms.md:
-  both select ``rust``.
+  both select ``rust``. Coverage and validator assets under
+  tests/voice_templates/ (coverage.json, test_validator.py, README.md) are
+  validated by the check job's hermetic offline step, which always runs, so
+  an asset-only change there selects no job and skips the heavy matrix.
 - Worker verification steps execute scripts/test-*.py against the checkout, so
   scripts/ changes select ``rust`` + ``worker`` (parity scripts add parity).
 - No workflow-level ``paths:`` filter: that would skip the whole workflow
@@ -72,6 +75,17 @@ RUST_WORKER_PREFIXES = (
     "src/",
 )
 TESTS_PREFIX = "tests/"
+
+# Voice-template fixtures: only the corpus is compiled into Rust tests via
+# include_str! (voice_template_corpus.rs, voice_conditions.rs,
+# voice_conditions_golden.rs). The validator pins docs/voice-rooms.md and
+# runs hermetically in the check job's always-on offline step, so validator
+# and coverage assets need no heavy job.
+VOICE_TEMPLATES_PREFIX = "tests/voice_templates/"
+VOICE_TEMPLATE_RUST_INPUTS = frozenset({
+    "tests/voice_templates/corpus.json",
+    "tests/voice_templates/validate.py",
+})
 
 # scripts/ verifications run in both the check and worker jobs; parity
 # scripts additionally gate the parity-docs job.
@@ -175,6 +189,14 @@ def classify(path):
         if path == "crates/core/tests/fixtures/legacy_registry.json":
             jobs.add(PARITY)
         return frozenset(jobs)
+    if path.startswith(VOICE_TEMPLATES_PREFIX):
+        # Asset-only fast pass: coverage/test/readme assets are validated by
+        # the check job's hermetic offline step, which always runs. Only the
+        # corpus (include_str! in Rust tests) and the validator itself can
+        # break the Rust matrix.
+        if path in VOICE_TEMPLATE_RUST_INPUTS:
+            return frozenset({RUST})
+        return NO_JOBS
     if path.startswith(RUST_PREFIXES) or path.startswith(TESTS_PREFIX):
         return frozenset({RUST})
     if path.startswith(SCRIPTS_PREFIX):
