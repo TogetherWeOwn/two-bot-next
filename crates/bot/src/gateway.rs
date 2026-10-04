@@ -309,11 +309,16 @@ struct AcceptedRsvp {
 
 /// Reception acknowledges immediately; completion stays serial and supervised
 /// even if the funnel writer fails. The dispatch backlog bounds admission.
+///
+/// The returned acknowledgement scope tracks every spawned prepare task so
+/// the bounded completion policy can cancel/join all owned drain/ack work on
+/// timeout or shard cancellation. Aborting never replays uncertain effects.
 fn start_rsvp_drain(
     runtime: Arc<two_bot_discord::interactions::InteractionRuntime>,
 ) -> (
     tokio::sync::mpsc::UnboundedSender<AcceptedRsvp>,
     tokio::task::JoinHandle<()>,
+    Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
 ) {
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<AcceptedRsvp>();
     let task = tokio::spawn(async move {
@@ -322,7 +327,66 @@ fn start_rsvp_drain(
             let _ = accepted.completed.send(acknowledged);
         }
     });
-    (sender, task)
+    (sender, task, Arc::new(std::sync::Mutex::new(Vec::new())))
+}
+
+/// Cancellation fallback for the RSVP drain: aborts the owned drain and
+/// acknowledgement tasks when the shard future is cancelled. Normal shutdown
+/// joins through the bounded timeout path; this [`Drop`] only fires on
+/// cancellation (or before the join), where awaiting is impossible. Abort
+/// never replays uncertain effects or releases ambiguous admission.
+struct RsvpCancelGuard {
+    drain: Option<tokio::task::AbortHandle>,
+    acks: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+}
+
+impl Drop for RsvpCancelGuard {
+    fn drop(&mut self) {
+        if let Some(drain) = self.drain.as_ref() {
+            drain.abort();
+        }
+        abort_rsvp_acks(&self.acks);
+    }
+}
+
+fn abort_rsvp_acks(acks: &Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>) {
+    if let Ok(owned) = acks.lock() {
+        for handle in owned.iter() {
+            handle.abort();
+        }
+    }
+}
+
+/// Bounded completion policy with supervised ownership: the timeout owns the
+/// drain task across the wait (expiry never detaches it), admission is
+/// already stopped by the dropped sender, and expiry aborts the drain plus
+/// every tracked acknowledgement before joining the drain. Aborting never
+/// replays uncertain effects or retries committed work; it only stops new
+/// effects/replies after the deadline. A healthy drain still completes and
+/// returns its own outcome.
+async fn join_rsvp_drain(
+    mut task: tokio::task::JoinHandle<()>,
+    acks: &Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+    max: std::time::Duration,
+) -> Result<(), sqlx::Error> {
+    match tokio::time::timeout(max, &mut task).await {
+        Ok(result) => {
+            // The drain returned, so every accepted acknowledgement already
+            // completed through it. Abort the scope anyway: a prepare whose
+            // queue send failed never entered the drain, and must not
+            // outlive the runner's return either.
+            abort_rsvp_acks(acks);
+            result.map_err(|_| sqlx::Error::InvalidArgument("interaction drain failed".into()))
+        }
+        Err(_) => {
+            task.abort();
+            abort_rsvp_acks(acks);
+            let _ = (&mut task).await;
+            Err(sqlx::Error::InvalidArgument(
+                "interaction drain deadline exceeded".into(),
+            ))
+        }
+    }
 }
 
 struct ReceivedDispatch {
@@ -411,19 +475,55 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let _voice_connection = VoiceConnectionGuard(voice.clone());
     let generation = Arc::new(AtomicU64::new(0));
     let saved = checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, store.load()).await?;
-    if let Some(runtime) = interactions.as_ref() {
-        runtime.publish_current().await.map_err(|_| {
-            sqlx::Error::InvalidArgument("interaction registry boot sync failed".into())
-        })?;
-    }
-    let (rsvp_sender, rsvp_drain) = match interactions.as_ref() {
-        Some(runtime) => {
-            let (sender, task) = start_rsvp_drain(Arc::clone(runtime));
-            (Some(sender), Some(task))
+    // ONE complete serialized registry owner at boot. The detached command
+    // runtime's publisher merges persisted enabled custom rows with the
+    // constrained builtin surface; the ordered `publish_current` path would
+    // PUT a builtins-only replacement (`publish_set(&[])`) that drops custom
+    // slash rows until a later management republish. Resolve the token
+    // identity once through the shared executor, arm the ordered fence from
+    // the same lookup, then publish the merged set. READY/RESUMED dispatch
+    // stays publication-free, so this boot sync is the single writer.
+    // Without the command runtime, keep the ordered builtins-only sync.
+    match (interactions.as_ref(), runtime.as_ref()) {
+        (Some(ordered), Some(commands)) => {
+            let application_id =
+                commands
+                    .executor()
+                    .current_application_id()
+                    .await
+                    .map_err(|_| {
+                        sqlx::Error::InvalidArgument("interaction registry boot sync failed".into())
+                    })?;
+            ordered.set_application_id(application_id);
+            commands
+                .publish_registry_checked(Some(application_id))
+                .await
+                .map_err(|_| {
+                    sqlx::Error::InvalidArgument("interaction registry boot sync failed".into())
+                })?;
         }
-        None => (None, None),
+        (Some(ordered), None) => {
+            ordered.publish_current().await.map_err(|_| {
+                sqlx::Error::InvalidArgument("interaction registry boot sync failed".into())
+            })?;
+        }
+        _ => {}
+    }
+    let (rsvp_sender, rsvp_drain, rsvp_acks) = match interactions.as_ref() {
+        Some(runtime) => {
+            let (sender, task, acks) = start_rsvp_drain(Arc::clone(runtime));
+            (Some(sender), Some(task), acks)
+        }
+        None => (None, None, Arc::new(std::sync::Mutex::new(Vec::new()))),
+    };
+    // Caller-cancellation fallback: dropping the shard future aborts the
+    // owned drain and acknowledgement tasks instead of detaching them.
+    let _rsvp_cancel = RsvpCancelGuard {
+        drain: rsvp_drain.as_ref().map(|task| task.abort_handle()),
+        acks: Arc::clone(&rsvp_acks),
     };
     let receive_rsvp = rsvp_sender.clone();
+    let receive_acks = Arc::clone(&rsvp_acks);
     // Tickets run beside reception and are cancelled/joined before return.
     let tickets = runtime.as_ref().and_then(|runtime| runtime.start_tickets());
     let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -456,6 +556,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             let runtime = runtime.clone();
             let interactions = interactions.clone();
             let rsvp_sender = receive_rsvp.clone();
+            let ack_tracker = Arc::clone(&receive_acks);
             let onboarding = receive_onboarding.clone();
             let in_flight_acks = Arc::clone(&in_flight_acks);
             let pipeline = Arc::clone(&receive_pipeline);
@@ -588,9 +689,18 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                 let interaction = interaction.0.clone();
                                 let runtime = Arc::clone(runtime);
                                 let acknowledgement = tokio::spawn(async move { runtime.prepare(interaction).await });
+                                // Track owned acknowledgement work so the bounded
+                                // completion policy can cancel it on timeout or
+                                // shard cancellation instead of detaching it.
+                                if let Ok(mut owned) = ack_tracker.lock() {
+                                    owned.retain(|handle| !handle.is_finished());
+                                    owned.push(acknowledgement.abort_handle());
+                                }
                                 let (completed, completion) = tokio::sync::oneshot::channel();
                                 sender.send(AcceptedRsvp { acknowledgement, completed })
-                                    .map_err(|_| sqlx::Error::InvalidArgument("interaction drain stopped".into()))?;
+                                    .map_err(|_| {
+                                        sqlx::Error::InvalidArgument("interaction drain stopped".into())
+                                    })?;
                                 dispatch.completion = Some(completion);
                             }
                         }
@@ -946,12 +1056,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
     // both successful shutdown and fatal exit, including any remaining writer.
     drop(rsvp_sender);
     let drained = match rsvp_drain {
-        Some(task) => tokio::time::timeout(crate::dispatch::DISPATCH_DRAIN_MAX, task)
-            .await
-            .map_err(|_| sqlx::Error::InvalidArgument("interaction drain deadline exceeded".into()))
-            .and_then(|result| {
-                result.map_err(|_| sqlx::Error::InvalidArgument("interaction drain failed".into()))
-            }),
+        Some(task) => join_rsvp_drain(task, &rsvp_acks, crate::dispatch::DISPATCH_DRAIN_MAX).await,
         None => Ok(()),
     };
     if let Some(tickets) = tickets {
@@ -1676,5 +1781,104 @@ mod tests {
         ] {
             assert!(!output.contains(secret));
         }
+    }
+
+    /// Wedged acknowledgement stand-in: records its effect only after the
+    /// test lock is released, like store work waiting past the drain
+    /// deadline. Returns the effect flag, its release, and the task.
+    fn wedged_acknowledgement() -> (
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let effect = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let waiter = tokio::spawn({
+            let effect = std::sync::Arc::clone(&effect);
+            let release = std::sync::Arc::clone(&release);
+            async move {
+                release.notified().await;
+                effect.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
+        (effect, release, waiter)
+    }
+
+    /// Draining supervision owns the drain across the bounded wait: expiry
+    /// aborts (never detaches) and joins, so releasing the test lock after
+    /// the policy returns starts no new effect or reply.
+    #[tokio::test]
+    async fn rsvp_drain_timeout_cancels_owned_work_before_join() {
+        let (effect, release, waiter) = wedged_acknowledgement();
+        let scope: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(vec![waiter.abort_handle()]));
+        // The drain itself never finishes, like a drain wedged behind the
+        // acknowledgement above after admission has stopped.
+        let drain = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        let outcome = join_rsvp_drain(drain, &scope, std::time::Duration::from_millis(50)).await;
+        assert!(
+            outcome
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("interaction drain deadline exceeded"),
+            "{outcome:?}"
+        );
+        // Release the lock only after the policy has returned, exactly like
+        // the detached-task scenario. The aborted waiter must record
+        // nothing and be cancelled, not left running.
+        release.notify_waiters();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(
+            !effect.load(std::sync::atomic::Ordering::Acquire),
+            "released lock must not start new effects after drain timeout"
+        );
+    }
+
+    /// The healthy accepted-work drain still completes with its own outcome:
+    /// aborting the (already finished) scope is a no-op, never a failure.
+    #[tokio::test]
+    async fn rsvp_drain_healthy_completion_preserved() {
+        let scope: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let quick = tokio::spawn(async {});
+        scope
+            .lock()
+            .expect("ack scope lock")
+            .push(quick.abort_handle());
+        assert!(quick.await.is_ok());
+        let drain = tokio::spawn(async {});
+        assert!(
+            join_rsvp_drain(drain, &scope, std::time::Duration::from_secs(5))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// Shard-future cancellation drops the guard, which aborts the owned
+    /// drain and acknowledgement tasks instead of detaching them.
+    #[tokio::test]
+    async fn rsvp_cancel_guard_aborts_owned_work_on_drop() {
+        let (effect, release, waiter) = wedged_acknowledgement();
+        let scope: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(vec![waiter.abort_handle()]));
+        let drain = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        {
+            let _guard = RsvpCancelGuard {
+                drain: Some(drain.abort_handle()),
+                acks: std::sync::Arc::clone(&scope),
+            };
+        }
+        release.notify_waiters();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(drain.await.unwrap_err().is_cancelled());
+        assert!(
+            !effect.load(std::sync::atomic::Ordering::Acquire),
+            "released lock must not start new effects after cancellation"
+        );
     }
 }

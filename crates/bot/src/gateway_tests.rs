@@ -28,6 +28,7 @@ use crate::gateway::{
 };
 
 mod commands;
+mod custom_composition;
 mod deadline;
 mod force_identify;
 mod member_journey;
