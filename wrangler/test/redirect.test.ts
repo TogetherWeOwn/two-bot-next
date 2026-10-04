@@ -1014,6 +1014,22 @@ describe("F7 residual: canonical quota, unknown budget, terminal 429s (TOG-12469
   });
 });
 
+describe("handler miss cache default (legacy negative TTL)", () => {
+  test("production default expires a miss at 2s so a new campaign appears", async () => {
+    // index.ts builds `new RedirectMissCache()`, so this default is the
+    // deployed handler-layer negative TTL (the store layer clamps separately).
+    // Imported here so the line numbers cited from docs/threat-model.md hold.
+    const { RedirectMissCache } = await import("../src/redirect.ts");
+    let now = 1_000_000;
+    const misses = new RedirectMissCache(undefined, () => now);
+    misses.add("new-link");
+    now += 1_999;
+    assert.equal(misses.has("new-link"), true, "still cached inside the bound");
+    now += 1;
+    assert.equal(misses.has("new-link"), false, "a miss never outlives 2s");
+  });
+});
+
 describe("validators agree with the shapes we accept", () => {
   test("slugs and codes", () => {
     for (const good of ["reddit", "r-mmorpg", "twitch-panel-2", "ab"]) {
