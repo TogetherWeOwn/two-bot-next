@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use two_bot_core::automod::AutomodConfig;
 use two_bot_core::commands::{
-    CommandDefinition, CommandOptionType, PERM_BAN_MEMBERS, PERM_KICK_MEMBERS,
+    CommandDefinition, CommandOption, CommandOptionType, PERM_BAN_MEMBERS, PERM_KICK_MEMBERS,
     PERM_MANAGE_CHANNELS, PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD, PERM_MANAGE_MESSAGES,
     PERM_MODERATE_MEMBERS,
 };
@@ -154,6 +154,56 @@ fn permissions(command: &CommandDefinition) -> String {
     format!("{} (`{raw}`)", names.join(" + "))
 }
 
+/// One table row per option; a sub-command's nested options follow it with the
+/// sub-command name as a path prefix (`restrict command`).
+fn write_option_rows(output: &mut String, prefix: &str, options: &[CommandOption]) {
+    for option in options {
+        let kind = match option.kind {
+            n if n == CommandOptionType::SubCommand.as_u8() => "subcommand",
+            n if n == CommandOptionType::String.as_u8() => "string",
+            n if n == CommandOptionType::Integer.as_u8() => "integer",
+            n if n == CommandOptionType::Boolean.as_u8() => "boolean",
+            n if n == CommandOptionType::User.as_u8() => "user",
+            n if n == CommandOptionType::Channel.as_u8() => "channel",
+            n if n == CommandOptionType::Role.as_u8() => "role",
+            n if n == CommandOptionType::Attachment.as_u8() => "attachment",
+            n => panic!("document new command option type {n}"),
+        };
+        let choices = if option.choices.is_empty() {
+            "—".to_owned()
+        } else {
+            option
+                .choices
+                .iter()
+                .map(|choice| {
+                    format!(
+                        "{} = {}",
+                        markdown_cell(&choice.name),
+                        json_cell(&json!(choice.value))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        writeln!(
+            output,
+            "| `{}` | {kind} | {} | {} | {} | {} | {choices} | {} |",
+            markdown_cell(&format!("{prefix}{}", option.name)),
+            option.required.unwrap_or(false),
+            option.min_value.map_or("—".to_owned(), |v| v.to_string()),
+            option.max_value.map_or("—".to_owned(), |v| v.to_string()),
+            option.max_length.map_or("—".to_owned(), |v| v.to_string()),
+            markdown_cell(&option.description),
+        )
+        .unwrap();
+        write_option_rows(
+            output,
+            &format!("{prefix}{} ", option.name),
+            &option.options,
+        );
+    }
+}
+
 fn render_commands() -> String {
     let mut commands = InteractionRouter::new(RouterGates {
         configured_guild: None,
@@ -186,45 +236,7 @@ fn render_commands() -> String {
             "| Option | Type | Required | Min | Max | Max length | Choices | Description |\n\
                          | --- | --- | --- | --- | --- | --- | --- | --- |\n",
         );
-        for option in command.options {
-            let kind = match option.kind {
-                n if n == CommandOptionType::String.as_u8() => "string",
-                n if n == CommandOptionType::Integer.as_u8() => "integer",
-                n if n == CommandOptionType::Boolean.as_u8() => "boolean",
-                n if n == CommandOptionType::User.as_u8() => "user",
-                n if n == CommandOptionType::Channel.as_u8() => "channel",
-                n if n == CommandOptionType::Role.as_u8() => "role",
-                n if n == CommandOptionType::Attachment.as_u8() => "attachment",
-                n => panic!("document new command option type {n}"),
-            };
-            let choices = if option.choices.is_empty() {
-                "—".to_owned()
-            } else {
-                option
-                    .choices
-                    .iter()
-                    .map(|choice| {
-                        format!(
-                            "{} = {}",
-                            markdown_cell(&choice.name),
-                            json_cell(&json!(choice.value))
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            };
-            writeln!(
-                output,
-                "| `{}` | {kind} | {} | {} | {} | {} | {choices} | {} |",
-                markdown_cell(&option.name),
-                option.required.unwrap_or(false),
-                option.min_value.map_or("—".to_owned(), |v| v.to_string()),
-                option.max_value.map_or("—".to_owned(), |v| v.to_string()),
-                option.max_length.map_or("—".to_owned(), |v| v.to_string()),
-                markdown_cell(&option.description),
-            )
-            .unwrap();
-        }
+        write_option_rows(&mut output, "", &command.options);
         output.push('\n');
     }
     output.trim_end_matches('\n').to_owned() + "\n"
