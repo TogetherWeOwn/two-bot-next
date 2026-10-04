@@ -18,6 +18,13 @@ Guards (TOG-12134):
   must run while the disk is at its freest (CHANGES on PR #232, 07:31Z).
 - the integration step still runs the full `--workspace --test '*'` graph:
   coverage must not be narrowed as a substitute for freeing disk.
+
+Toolchain ordering guard: pip 23 probes `rustc --version` from the workspace
+with a 0.5 s timeout for its user agent. If the pinned toolchain still lacks
+the components named in rust-toolchain.toml, the rustup proxy starts
+installing them and the timeout kills it half-way, leaving untracked
+`bin/cargo-fmt`; the later `cargo fmt` then fails with a file conflict in
+roughly half the runs. The components are installed before the first pip run.
 """
 
 import re
@@ -127,6 +134,27 @@ class CheckDiskHygieneTests(unittest.TestCase):
                 deny_at, names.index(heavy),
                 f"cargo-deny must run before {heavy!r} (disk is freest early)",
             )
+
+    def test_toolchain_components_installed_before_first_pip_run(self):
+        install = "Install pinned Rust toolchain components"
+        install_at = next(
+            (i for i, line in enumerate(self.check) if line.strip() == f"- name: {install}"),
+            None,
+        )
+        self.assertIsNotNone(install_at, f"missing step {install!r}")
+        first_pip = next(
+            (i for i, line in enumerate(self.check)
+             if re.search(r"(?:-m pip\b|^\s*pip3? )", line)),
+            None,
+        )
+        self.assertIsNotNone(first_pip, "pip step moved or renamed; update this guard")
+        self.assertLess(
+            install_at, first_pip,
+            "pip probes `rustc --version`; finish the toolchain install first",
+        )
+        body = step_body(self.check, install)
+        self.assertRegex(body, r"(?m)^\s+run: rustup toolchain install --no-self-update$")
+        self.assertRegex(body, r"(?m)^\s+if: needs\.job-inputs\.outputs\.rust != 'false'$")
 
 
 if __name__ == "__main__":
