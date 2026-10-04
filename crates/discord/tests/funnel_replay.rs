@@ -21,7 +21,7 @@
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Barrier, Mutex};
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use twilight_model::{
@@ -1067,32 +1067,85 @@ fn pipeline_same_instant_voice_return_to_origin_dedupes_only_the_repeat_start() 
 
 /// Facts double that freezes the first voice end mid-move (the tracker has
 /// closed A, start(B) has not run) until another frame reaches the same hook
-/// or `GRACE` lapses. It carries no assertions of its own: it only makes the
-/// interleaving window deterministic.
+/// or `GRACE` lapses. Rendezvous waits are bounded and cancelled when either
+/// frame exits, including a panic before the hook.
 struct MoveGate {
     ends: AtomicUsize,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
-    /// The frozen move and the competing frame's thread.
-    barrier: Barrier,
-    overlap_tx: Mutex<mpsc::Sender<()>>,
-    overlap_rx: Mutex<mpsc::Receiver<()>>,
+    state: Mutex<MoveGateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct MoveGateState {
+    arrivals: usize,
+    cancelled: bool,
+    overlap: bool,
+}
+
+struct CancelMoveOnExit<'a>(&'a MoveGate);
+
+impl Drop for CancelMoveOnExit<'_> {
+    fn drop(&mut self) {
+        // Cleanup must also wake the peer when a panic poisoned the mutex.
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.cancelled = true;
+        self.0.changed.notify_all();
+    }
 }
 
 impl MoveGate {
+    const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(5);
     /// Long enough for a runnable thread to reach the hook; the lock-held path
-    /// waits it out in full.
+    /// waits it out in full. This is not a timing-free mutation proof.
     const GRACE: Duration = Duration::from_millis(400);
 
     fn new() -> Self {
-        let (tx, rx) = mpsc::channel();
         Self {
             ends: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
-            barrier: Barrier::new(2),
-            overlap_tx: Mutex::new(tx),
-            overlap_rx: Mutex::new(rx),
+            state: Mutex::new(MoveGateState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn cancel_on_exit(&self) -> CancelMoveOnExit<'_> {
+        CancelMoveOnExit(self)
+    }
+
+    fn wait_for_waiting_peer(&self) {
+        let state = self.state.lock().expect("move gate");
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, Self::RENDEZVOUS_TIMEOUT, |s| {
+                s.arrivals == 0 && !s.cancelled
+            })
+            .expect("move gate");
+        assert_eq!(state.arrivals, 1, "peer reached its rendezvous wait");
+    }
+
+    fn rendezvous(&self, timeout: Duration) -> Result<(), &'static str> {
+        let mut state = self.state.lock().expect("move gate");
+        if state.cancelled {
+            return Err("voice move rendezvous cancelled");
+        }
+        state.arrivals += 1;
+        self.changed.notify_all();
+        let (mut state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |s| s.arrivals < 2 && !s.cancelled)
+            .expect("move gate");
+        if state.arrivals == 2 {
+            // Once both arrived, a later frame exit does not undo the handshake.
+            Ok(())
+        } else if state.cancelled {
+            Err("voice move rendezvous cancelled")
+        } else {
+            state.cancelled = true;
+            self.changed.notify_all();
+            Err("voice move rendezvous timed out")
         }
     }
 }
@@ -1110,17 +1163,95 @@ impl FactsSink for &MoveGate {
         self.max_in_flight.fetch_max(now, Ordering::SeqCst);
         if nth == 0 {
             // Mid-move: release the competing frame, then hold the window open.
-            self.barrier.wait();
-            let _ = self
-                .overlap_rx
-                .lock()
-                .expect("rx")
-                .recv_timeout(MoveGate::GRACE);
+            self.rendezvous(MoveGate::RENDEZVOUS_TIMEOUT)
+                .expect("first move rendezvous");
+            let state = self.state.lock().expect("move gate");
+            drop(
+                self.changed
+                    .wait_timeout_while(state, MoveGate::GRACE, |s| !s.overlap && !s.cancelled)
+                    .expect("move gate"),
+            );
         } else {
-            let _ = self.overlap_tx.lock().expect("tx").send(());
+            let mut state = self.state.lock().expect("move gate");
+            state.overlap = true;
+            self.changed.notify_all();
         }
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+#[test]
+fn move_gate_cancels_when_first_frame_exits_before_the_hook() {
+    for panic_before_hook in [false, true] {
+        let gate = MoveGate::new();
+        let pipeline = Pipeline::new(
+            MemStore::new(),
+            Some(NoopLeveling),
+            Some(&gate),
+            ScriptedInvites::new(),
+            NoClassification,
+        );
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let _cancel = gate.cancel_on_exit();
+                gate.wait_for_waiting_peer();
+                if panic_before_hook {
+                    panic!("first frame exited before its voice-end hook");
+                }
+            });
+            let second = scope.spawn(|| {
+                let _cancel = gate.cancel_on_exit();
+                gate.rendezvous(MoveGate::RENDEZVOUS_TIMEOUT)?;
+                pipeline.handle_at(&voice_event(A, Some(CH_VOICE_C)), &stamp("12:00:20"));
+                Ok(())
+            });
+            assert_eq!(first.join().is_err(), panic_before_hook);
+            assert_eq!(
+                second.join().expect("competing frame joins"),
+                Err("voice move rendezvous cancelled")
+            );
+        });
+        assert!(pipeline.handlers().store().rows().is_empty());
+        assert_eq!(gate.ends.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn move_gate_cancels_when_competing_frame_exits_before_rendezvous() {
+    for panic_before_rendezvous in [false, true] {
+        let gate = MoveGate::new();
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let _cancel = gate.cancel_on_exit();
+                gate.rendezvous(MoveGate::RENDEZVOUS_TIMEOUT)
+            });
+            let second = scope.spawn(|| {
+                let _cancel = gate.cancel_on_exit();
+                gate.wait_for_waiting_peer();
+                if panic_before_rendezvous {
+                    panic!("competing frame exited before rendezvous");
+                }
+            });
+            assert_eq!(second.join().is_err(), panic_before_rendezvous);
+            assert_eq!(
+                first.join().expect("first frame joins"),
+                Err("voice move rendezvous cancelled")
+            );
+        });
+    }
+}
+
+#[test]
+fn move_gate_times_out_without_a_peer_and_cancels_late_arrivals() {
+    let gate = MoveGate::new();
+    assert_eq!(
+        gate.rendezvous(Duration::from_millis(20)),
+        Err("voice move rendezvous timed out")
+    );
+    assert_eq!(
+        gate.rendezvous(MoveGate::RENDEZVOUS_TIMEOUT),
+        Err("voice move rendezvous cancelled")
+    );
 }
 
 /// Legacy `59965d0`, the per-member serial chain (`VoiceChains`). Frame 1
@@ -1142,10 +1273,15 @@ fn pipeline_serializes_same_member_voice_frames() {
     pipeline.handle_at(&voice_event(A, Some(CH_VOICE_A)), &stamp("12:00:00"));
 
     std::thread::scope(|scope| {
-        scope.spawn(|| pipeline.handle_at(&voice_event(A, Some(CH_VOICE_B)), &stamp("12:00:10")));
         scope.spawn(|| {
+            let _cancel = gate.cancel_on_exit();
+            pipeline.handle_at(&voice_event(A, Some(CH_VOICE_B)), &stamp("12:00:10"));
+        });
+        scope.spawn(|| {
+            let _cancel = gate.cancel_on_exit();
             // Released from inside frame 1's hook: frame 1 is provably mid-move.
-            gate.barrier.wait();
+            gate.rendezvous(MoveGate::RENDEZVOUS_TIMEOUT)
+                .expect("competing frame rendezvous");
             pipeline.handle_at(&voice_event(A, Some(CH_VOICE_C)), &stamp("12:00:20"));
         });
     });
