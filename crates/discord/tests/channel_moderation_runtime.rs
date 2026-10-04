@@ -903,6 +903,7 @@ async fn assert_unlock_proceeds_after_failed_history_read(history: ScriptedRespo
             overwrite("3072", "8192"),
             ScriptedResponse::status(204),
             history,
+            overwrite("1024", "10240"),
             ScriptedResponse::status(204),
         ],
         ScriptedResponse::status(500),
@@ -930,9 +931,16 @@ async fn assert_unlock_proceeds_after_failed_history_read(history: ScriptedRespo
     assert_eq!(mock.requests().len(), 3, "no delete after a failed read");
     assert_eq!(outcome(62, "unlock", None).await, "unlocked");
     let requests = mock.requests();
-    assert_eq!(requests.len(), 4);
-    assert_eq!(requests[3].method, "PUT");
-    assert!(requests[3].path.contains("/permissions/"));
+    assert_eq!(requests.len(), 5);
+    assert_eq!(requests[3].method, "GET", "unlock reads the live masks");
+    assert_eq!(requests[4].method, "PUT");
+    assert!(requests[4].path.contains("/permissions/"));
+    let restored: Value = serde_json::from_slice(&requests[4].body).unwrap();
+    assert_eq!(
+        (restored["allow"].as_str(), restored["deny"].as_str()),
+        (Some("3072"), Some("8192")),
+        "unlock restores the original send bits"
+    );
     assert_eq!(db.count("moderation_channel_executions").await, 0);
     assert!(db.store.get_lockdown(CHANNEL).await.unwrap().is_none());
     mock.shutdown().await;
@@ -1020,7 +1028,9 @@ async fn rate_limited_mutation_proves_no_effect_and_frees_the_lane() {
         vec![
             overwrite("3072", "8192"),
             ScriptedResponse::status(204),
+            overwrite("1024", "10240"),
             ScriptedResponse::rate_limited(0.0, "0"),
+            overwrite("1024", "10240"),
             ScriptedResponse::status(204),
         ],
         ScriptedResponse::status(500),
