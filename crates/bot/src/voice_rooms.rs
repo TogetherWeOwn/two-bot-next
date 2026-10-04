@@ -95,7 +95,11 @@ use two_bot_core::{
     voice_utilities::{invite_render, ping_render},
     voice_vote_kick::{
         VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError, VoteKickRef,
-        VoteKickStatus, VoteKickUpdate, VoteRoomFacts,
+        VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts,
+    },
+    voice_vote_kick_audit::{
+        refusal_outcome, result_outcome, EnforcementOutcome, KickAuditEvent, KickAuditRow,
+        OUTCOME_EVIDENCE_UNAVAILABLE, OUTCOME_NOT_A_ROOM, OUTCOME_STARTED,
     },
     AutomodPolicy, CommandDefinition, OverwriteTarget, PermissionFinding,
     PermissionOverwrite as HealthOverwrite, Snowflake, VoicePermission, VoicePermissionScope,
@@ -250,6 +254,13 @@ pub trait RoomPersistence: Send + Sync {
         guild: Snowflake,
         room: Snowflake,
     ) -> impl Future<Output = Result<Option<TextCompanion>, StoreError>> + Send;
+    /// Append V4 vote-kick audit rows in one transaction. Idempotent per
+    /// (guild, vote, event): a replayed row is dropped, never overwritten, so
+    /// the worker may retry a flush whose outcome it did not see.
+    fn record_kick_audit(
+        &self,
+        rows: &[KickAuditRow],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
 impl RoomPersistence for PgRoomStore {
@@ -387,6 +398,10 @@ impl RoomPersistence for PgRoomStore {
         self.remove_companion(guild, room)
             .await
             .map_err(store_error)
+    }
+
+    async fn record_kick_audit(&self, rows: &[KickAuditRow]) -> Result<(), StoreError> {
+        self.add_kick_audit(rows).await.map_err(store_error)
     }
 }
 
@@ -1268,6 +1283,16 @@ pub struct GuildRoomWorker<S, H> {
     /// from the payload.
     vote_refs: HashMap<Snowflake, VoteKickRef>,
     active_votes: Vec<VoteKickRef>,
+    /// Who started each vote this session, by vote ID. The vote core binds the
+    /// target but not the initiator, and every audit row names both.
+    vote_initiators: HashMap<Snowflake, Snowflake>,
+    /// V4 audit rows not yet appended, oldest first. Appended off the actor's
+    /// synchronous vote path by [`GuildRoomWorker::flush_kick_audit`]; a failed
+    /// flush keeps them (the append is idempotent) up to
+    /// `KICK_AUDIT_BUFFER_MAX`.
+    kick_audit: VecDeque<KickAuditRow>,
+    /// Earliest actor time the next flush may run after a failed one.
+    kick_audit_retry_ms: u64,
     /// Automod policy the create-path name filter runs under. The default
     /// policy still blocks invite and external links; the runtime installs the
     /// configured word list through [`GuildRoomWorker::with_name_policy`].
@@ -1285,6 +1310,37 @@ pub enum KickRefusal {
     Vote(VoteKickError),
 }
 
+/// Audit code for a refused `/kick` start.
+fn kick_refusal_outcome(refusal: KickRefusal) -> &'static str {
+    match refusal {
+        KickRefusal::Unavailable => OUTCOME_EVIDENCE_UNAVAILABLE,
+        KickRefusal::NotARoom => OUTCOME_NOT_A_ROOM,
+        KickRefusal::Vote(error) => refusal_outcome(error),
+    }
+}
+
+/// One V4 audit row, stamped with the worker's wall clock. Snowflakes and
+/// fixed codes only: never an interaction token, a name or free text.
+fn kick_audit_row(
+    event: KickAuditEvent,
+    vote: VoteKickRef,
+    initiator_id: Snowflake,
+    outcome: &'static str,
+    progress: Option<VoteProgress>,
+) -> KickAuditRow {
+    KickAuditRow {
+        guild_id: vote.guild_id,
+        room_id: vote.room_id,
+        vote_id: vote.id,
+        initiator_id,
+        target_id: vote.target_id,
+        event,
+        outcome,
+        progress,
+        occurred_at: now_iso(),
+    }
+}
+
 /// Monotonic actor time handed to the vote core.
 struct ActorClock(u64);
 
@@ -1300,6 +1356,17 @@ const NOTICE_REPEAT_INTERVAL_MS: u64 = 15 * 60 * 1000;
 
 /// Longest notice body; Discord's message limit is 2000 characters.
 const NOTICE_MAX_CHARS: usize = 1500;
+
+/// Audit rows held while the store is unreachable. Past this the oldest row is
+/// dropped and a persistence failure is recorded, so a long outage cannot grow
+/// the worker without bound.
+const KICK_AUDIT_BUFFER_MAX: usize = 256;
+
+/// Rows appended per flush (one transaction).
+const KICK_AUDIT_BATCH: usize = 32;
+
+/// Pause after a failed flush before the next attempt.
+const KICK_AUDIT_RETRY_MS: u64 = 5_000;
 
 /// Repeat bookkeeping for one tracked failure. `last_attempt_ms` is the
 /// actor's monotonic clock, so a restart begins a fresh budget.
@@ -1364,6 +1431,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             votes: VoteKickCore::new(),
             vote_refs: HashMap::new(),
             active_votes: Vec::new(),
+            vote_initiators: HashMap::new(),
+            kick_audit: VecDeque::new(),
+            kick_audit_retry_ms: 0,
             name_policy: Arc::new(AutomodPolicy::default()),
         })
     }
@@ -1923,12 +1993,28 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         ))
     }
 
-    /// Fold a vote update into worker state: forget finished votes and queue the
-    /// room-scoped enforcement exactly once (the core emits the decision only on
-    /// the first transition to passed).
+    /// Fold a vote update into worker state: forget finished votes, audit the
+    /// result once, and queue the room-scoped enforcement exactly once (the
+    /// core emits the decision only on the first transition to passed).
     fn settle_vote(&mut self, update: VoteKickUpdate) -> VoteKickUpdate {
         if update.status != VoteKickStatus::Active {
+            // A finished vote answers later ballots with its terminal status;
+            // only the pass that still held it active records the result.
+            let was_active = self
+                .active_votes
+                .iter()
+                .any(|vote| vote.id == update.vote.id);
             self.active_votes.retain(|vote| vote.id != update.vote.id);
+            if let (true, Some(outcome)) = (was_active, result_outcome(update.status)) {
+                let initiator_id = self.vote_initiator(update.vote.id);
+                self.push_kick_audit(kick_audit_row(
+                    KickAuditEvent::VoteResult,
+                    update.vote,
+                    initiator_id,
+                    outcome,
+                    Some(update.progress),
+                ));
+            }
         }
         if let Some(kick) = update.kick {
             self.queue.enqueue(
@@ -1936,15 +2022,126 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 RoomAction::KickMember {
                     channel_id: kick.room_id,
                     member_id: kick.target_id,
+                    vote_id: update.vote.id,
                 },
             );
         }
         update
     }
 
+    /// Who started a vote this session. Every vote the core knows began in
+    /// [`Self::kick_start`], so the fallback is unreachable.
+    fn vote_initiator(&self, vote_id: Snowflake) -> Snowflake {
+        self.vote_initiators.get(&vote_id).copied().unwrap_or(0)
+    }
+
+    /// Queue one audit row for the next flush. A full buffer drops its oldest
+    /// row and records the loss on `/setup` instead of growing.
+    fn push_kick_audit(&mut self, row: KickAuditRow) {
+        if self.kick_audit.len() >= KICK_AUDIT_BUFFER_MAX {
+            self.kick_audit.pop_front();
+            self.record(LifecycleFailure::Persistence {
+                channel_id: None,
+                error: StoreError::Unavailable,
+            });
+        }
+        self.kick_audit.push_back(row);
+    }
+
+    /// Audit the terminal outcome of a passed vote's room-scoped enforcement.
+    fn audit_enforcement(
+        &mut self,
+        vote_id: Snowflake,
+        channel_id: Snowflake,
+        member_id: Snowflake,
+        outcome: EnforcementOutcome,
+    ) {
+        let vote = VoteKickRef {
+            id: vote_id,
+            guild_id: self.live.guild_id,
+            room_id: channel_id,
+            target_id: member_id,
+        };
+        let initiator_id = self.vote_initiator(vote_id);
+        self.push_kick_audit(kick_audit_row(
+            KickAuditEvent::Enforcement,
+            vote,
+            initiator_id,
+            outcome.as_str(),
+            None,
+        ));
+    }
+
+    /// Append buffered audit rows, one batch per call. Driven by the actor's
+    /// timer, off the synchronous vote path. A failure keeps the rows and
+    /// waits `KICK_AUDIT_RETRY_MS`; it never halts the worker, because a
+    /// refused credential on this table (a grant not yet applied) must not
+    /// stop room management. Returns whether a batch was appended.
+    pub async fn flush_kick_audit(&mut self, now_ms: u64) -> bool {
+        if self.kick_audit.is_empty() || now_ms < self.kick_audit_retry_ms {
+            return false;
+        }
+        let batch: Vec<KickAuditRow> = self
+            .kick_audit
+            .iter()
+            .take(KICK_AUDIT_BATCH)
+            .cloned()
+            .collect();
+        match self.store.record_kick_audit(&batch).await {
+            Ok(()) => {
+                self.kick_audit.drain(..batch.len());
+                true
+            }
+            Err(error) => {
+                self.kick_audit_retry_ms = now_ms.saturating_add(KICK_AUDIT_RETRY_MS);
+                self.record(LifecycleFailure::Persistence {
+                    channel_id: None,
+                    error,
+                });
+                false
+            }
+        }
+    }
+
     /// Start a vote in `room_id`. `vote_id` must be the unique initiating
-    /// interaction ID. Starting casts no ballot.
+    /// interaction ID. Starting casts no ballot. Every start that reaches the
+    /// worker leaves one audit row: `vote_started`, or `vote_refused` with the
+    /// refusal code.
     pub fn kick_start(
+        &mut self,
+        vote_id: Snowflake,
+        room_id: Snowflake,
+        initiator_id: Snowflake,
+        target_id: Snowflake,
+        now_ms: u64,
+    ) -> Result<VoteKickUpdate, KickRefusal> {
+        let started = self.begin_vote(vote_id, room_id, initiator_id, target_id, now_ms);
+        let row = match &started {
+            Ok(update) => kick_audit_row(
+                KickAuditEvent::VoteStarted,
+                update.vote,
+                initiator_id,
+                OUTCOME_STARTED,
+                Some(update.progress),
+            ),
+            Err(refusal) => kick_audit_row(
+                KickAuditEvent::VoteRefused,
+                VoteKickRef {
+                    id: vote_id,
+                    guild_id: self.live.guild_id,
+                    room_id,
+                    target_id,
+                },
+                initiator_id,
+                kick_refusal_outcome(*refusal),
+                None,
+            ),
+        };
+        self.push_kick_audit(row);
+        started
+    }
+
+    fn begin_vote(
         &mut self,
         vote_id: Snowflake,
         room_id: Snowflake,
@@ -1965,6 +2162,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .start(vote_id, facts, initiator_id, target_id, &ActorClock(now_ms))
             .map_err(KickRefusal::Vote)?;
         self.vote_refs.insert(vote_id, update.vote);
+        self.vote_initiators.insert(vote_id, initiator_id);
         self.active_votes.push(update.vote);
         Ok(self.settle_vote(update))
     }
@@ -2833,6 +3031,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             RoomAction::KickMember {
                 channel_id,
                 member_id,
+                vote_id,
             } => {
                 let permissions = self
                     .live
@@ -2840,12 +3039,20 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     .read()
                     .expect("live voice lock")
                     .permissions(self.live.guild_id, channel_id);
+                // What a clean `Ok` below means; each skip or partial write
+                // overrides it so the audit row says what Discord was asked.
+                let mut applied = EnforcementOutcome::ConnectDeniedAndDisconnected;
                 let result = if self.rooms.get(&channel_id).is_none_or(|room| {
                     member_id == room.owner_id || member_id == room.original_creator_id
                 }) {
                     // Either the room is gone and its overwrites went with it, or
                     // ownership changed after the vote passed and the target is now
                     // the owner or original creator: write nothing.
+                    applied = if self.rooms.contains_key(&channel_id) {
+                        EnforcementOutcome::SkippedTargetProtected
+                    } else {
+                        EnforcementOutcome::SkippedRoomGone
+                    };
                     Ok(())
                 } else if !can_enforce_kick(permissions) {
                     Err(RoomHttpError::AccessDenied)
@@ -2869,7 +3076,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         {
                             // The target left or moved on since the deny landed:
                             // nothing to disconnect.
-                            Err(RoomHttpError::Cancelled) => Ok(()),
+                            Err(RoomHttpError::Cancelled) => {
+                                applied = EnforcementOutcome::ConnectDeniedTargetAbsent;
+                                Ok(())
+                            }
                             other => other,
                         },
                         Err(error) => Err(error),
@@ -2878,6 +3088,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 match result {
                     Ok(()) => {
                         self.queue.mark_succeeded(&action);
+                        self.audit_enforcement(vote_id, channel_id, member_id, applied);
                     }
                     Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
                         self.queue.mark_rate_limited(
@@ -2888,14 +3099,32 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         );
                     }
                     Err(RoomHttpError::UnknownOutcome) => {
-                        // Both writes are idempotent, so a retry is safe.
-                        self.mark_failed_observed(
+                        // Both writes are idempotent, so a retry is safe. Only
+                        // the attempt that exhausts the budget is terminal.
+                        let exhausted = action.attempts.saturating_add(1) >= QUEUE_MAX_ATTEMPTS;
+                        let released = self.mark_failed_observed(
                             action,
                             "Discord kick outcome unknown".to_owned(),
                             elapsed_ms(now_ms, started),
                         );
+                        if exhausted && released {
+                            self.audit_enforcement(
+                                vote_id,
+                                channel_id,
+                                member_id,
+                                EnforcementOutcome::GaveUp,
+                            );
+                        }
                     }
-                    Err(error) => self.complete_error(action, channel_id, error),
+                    Err(error) => {
+                        let outcome = match error {
+                            RoomHttpError::AccessDenied => EnforcementOutcome::PermissionMissing,
+                            RoomHttpError::Cancelled => EnforcementOutcome::SkippedRoomGone,
+                            _ => EnforcementOutcome::DiscordError,
+                        };
+                        self.complete_error(action, channel_id, error);
+                        self.audit_enforcement(vote_id, channel_id, member_id, outcome);
+                    }
                 }
             }
             RoomAction::SetCustomName {
@@ -3926,9 +4155,13 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
                 // behind a 64-write burst either.
                 worker.dispatch_one(now_ms).await;
                 worker.send_notices(now_ms).await;
+                worker.flush_kick_audit(now_ms).await;
             }
         }
     }
+    // Inbox closed: append what is left (one failed batch ends it) so a clean
+    // shutdown keeps the trail.
+    while worker.flush_kick_audit(u64::MAX).await {}
 }
 
 fn apply_command<S: RoomPersistence, H: RoomWrites>(

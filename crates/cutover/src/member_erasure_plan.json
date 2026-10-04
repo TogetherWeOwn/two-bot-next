@@ -196,6 +196,11 @@
       "predicate": "guild_id = $1 AND (owner_id = $2 OR original_creator_id = $2)"
     },
     {
+      "table": "voice_vote_kick_audit",
+      "columns": ["initiator_id", "target_id"],
+      "predicate": "guild_id = $1 AND (initiator_id = $2 OR target_id = $2)"
+    },
+    {
       "table": "voice_logging_mention_members",
       "columns": ["member_id"],
       "predicate": "guild_id = $1 AND member_id = $2"

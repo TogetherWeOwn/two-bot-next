@@ -31,6 +31,11 @@ are outside this implementation's scope.
   (`voice_access_controls`: creation switch, required role ID, per-command role
   IDs) and room logging settings (`voice_logging_settings`: detail level, notice
   channel ID, mention role ID) hold channel and role IDs only and no member IDs.
+  The room vote-kick audit trail (`voice_vote_kick_audit`: one row each for a
+  vote's start or refusal, its result and its enforcement outcome, with fixed
+  outcome codes and no names, text or interaction tokens) stores the initiator
+  and target member IDs, so erasure removes every row where the member is
+  either one. It records a room-scoped disconnect, never a guild kick.
 - Event RSVPs and attendance/community facts, including attribution and compound
   voice-session/event keys (`event_rsvps`, `community_facts`). Scorecards normally
   store aggregates; the erasure plan also checks their serialized payloads.

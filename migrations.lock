@@ -257,6 +257,10 @@
       "sha256": "9f205bf43ab1fd5069baf32b1db8d53a5e0a7cf2ac98c5199af093ded7c667f0",
       "justification": "Guild-fenced website event-key to Discord scheduled-event ID map for the signed event.read verifier (TOG-15757); unmapped keys refuse before any Discord call."
     },
+    "crates/cutover/migrations/0417_voice_vote_kick_audit.sql": {
+      "sha256": "ce40e510fe70b0435c519bb4dd578a8d832395c732f5800c12ec716a1c9a7500",
+      "justification": "Voice V4 vote-kick audit trail: append-only voice_vote_kick_audit rows for vote start, refusal, result and room-scoped enforcement; kept apart from moderation_audit so a voice disconnect is never read as a member kick."
+    },
     "crates/store/migrations/0400_initial.sql": {
       "sha256": "49c7136827484e0625cad889208a03e48026acb854282de3a0a9c5aa4d951b00",
       "justification": "Add unpublished S6 funnel foundation for TOG-9811 under an unused workspace number; preserve proposed SQL bytes."

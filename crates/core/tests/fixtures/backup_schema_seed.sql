@@ -449,3 +449,19 @@ INSERT INTO voice_command_roles (guild_id, command)
 VALUES ('100000000000000001', 'kick'), ('100000000000000001', 'limit');
 INSERT INTO voice_command_role_members (guild_id, command, role_id)
 VALUES ('100000000000000001', 'kick', '100000000000000043');
+-- Vote-kick audit trail (0417): a started and a finished vote with progress,
+-- plus a refusal and an enforcement row that carry none.
+INSERT INTO voice_vote_kick_audit (guild_id, vote_id, event, room_id, initiator_id,
+  target_id, outcome, yes_votes, votes_required, voters_total, occurred_at)
+VALUES ('100000000000000001', '100000000000000050', 'vote_started', '100000000000000033',
+        '100000000000000003', '100000000000000004', 'started', 0, 3, 4,
+        '2026-08-03T10:00:00.123456Z'),
+       ('100000000000000001', '100000000000000050', 'vote_result', '100000000000000033',
+        '100000000000000003', '100000000000000004', 'passed', 3, 3, 4,
+        '2026-08-03T10:00:30Z'),
+       ('100000000000000001', '100000000000000050', 'enforcement', '100000000000000033',
+        '100000000000000003', '100000000000000004', 'connect_denied_and_disconnected',
+        NULL, NULL, NULL, '2026-08-03T10:00:31Z'),
+       ('100000000000000001', '100000000000000051', 'vote_refused', '100000000000000033',
+        '100000000000000003', '100000000000000002', 'protected_target',
+        NULL, NULL, NULL, '2026-08-03T10:05:00Z');

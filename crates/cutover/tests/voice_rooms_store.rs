@@ -276,7 +276,8 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
             .is_err()
     );
     verify_access_controls(&store, pool).await?;
-    verify_logging_settings(&store, pool).await
+    verify_logging_settings(&store, pool).await?;
+    verify_kick_audit(&store, pool).await
 }
 
 async fn verify_access_controls(store: &PgRoomStore, pool: &PgPool) -> TestResult {
@@ -395,6 +396,142 @@ async fn verify_logging_settings(store: &PgRoomStore, pool: &PgPool) -> TestResu
         assert!(
             sqlx::query(statement).execute(pool).await.is_err(),
             "{statement}"
+        );
+    }
+    Ok(())
+}
+
+async fn verify_kick_audit(store: &PgRoomStore, pool: &PgPool) -> TestResult {
+    use two_bot_core::voice_vote_kick::VoteProgress;
+    use two_bot_core::voice_vote_kick_audit::{KickAuditEvent, KickAuditRow};
+
+    let at = "2026-10-04T12:00:00.123Z".to_owned();
+    let row = |vote_id: u64,
+               event: KickAuditEvent,
+               outcome: &'static str,
+               progress: Option<(usize, usize, usize)>| KickAuditRow {
+        guild_id: 100,
+        room_id: 500,
+        vote_id,
+        initiator_id: 301,
+        target_id: 303,
+        event,
+        outcome,
+        progress: progress.map(|(yes, required, total)| VoteProgress {
+            yes,
+            required,
+            total,
+        }),
+        occurred_at: at.clone(),
+    };
+    let count = |vote: &'static str| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM voice_vote_kick_audit WHERE guild_id = '100' AND vote_id = $1",
+        )
+        .bind(vote)
+        .fetch_one(pool)
+        .await
+    };
+
+    store.add_kick_audit(&[]).await?;
+    store
+        .add_kick_audit(&[
+            row(
+                7_000,
+                KickAuditEvent::VoteStarted,
+                "started",
+                Some((0, 3, 4)),
+            ),
+            row(7_000, KickAuditEvent::VoteResult, "passed", Some((3, 3, 4))),
+            row(
+                7_000,
+                KickAuditEvent::Enforcement,
+                "connect_denied_and_disconnected",
+                None,
+            ),
+            row(7_001, KickAuditEvent::VoteRefused, "protected_target", None),
+        ])
+        .await?;
+    // A replayed (guild, vote, event) is dropped, never overwritten.
+    store
+        .add_kick_audit(&[row(7_000, KickAuditEvent::VoteResult, "expired", None)])
+        .await?;
+    assert_eq!(count("7000").await?, 3);
+    assert_eq!(count("7001").await?, 1);
+    let fetch = |vote: &'static str, event: &'static str| async move {
+        sqlx::query_as::<_, (String, Option<i32>, Option<i32>, Option<i32>)>(
+            "SELECT outcome, yes_votes, votes_required, voters_total
+             FROM voice_vote_kick_audit
+             WHERE guild_id = '100' AND vote_id = $1 AND event = $2",
+        )
+        .bind(vote)
+        .bind(event)
+        .fetch_one(pool)
+        .await
+    };
+    assert_eq!(
+        fetch("7000", "vote_result").await?,
+        ("passed".to_owned(), Some(3), Some(3), Some(4))
+    );
+    assert_eq!(
+        fetch("7001", "vote_refused").await?,
+        ("protected_target".to_owned(), None, None, None)
+    );
+    let millis: i64 = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM occurred_at) * 1000)::bigint
+         FROM voice_vote_kick_audit WHERE vote_id = '7000' AND event = 'vote_started'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(Some(millis), two_bot_core::parse_iso_millis(&at));
+
+    // One bad row rolls the whole batch back.
+    assert!(store
+        .add_kick_audit(&[
+            row(
+                7_002,
+                KickAuditEvent::VoteStarted,
+                "started",
+                Some((0, 3, 4))
+            ),
+            row(7_003, KickAuditEvent::VoteRefused, "Not A Code", None),
+        ])
+        .await
+        .is_err());
+    assert_eq!(count("7002").await?, 0);
+
+    // An unparseable timestamp falls back to the database clock.
+    let mut unstamped = row(7_004, KickAuditEvent::VoteRefused, "not_a_room", None);
+    unstamped.occurred_at = "not a time".to_owned();
+    store.add_kick_audit(&[unstamped]).await?;
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT occurred_at > now() - interval '5 minutes'
+         FROM voice_vote_kick_audit WHERE vote_id = '7004'",
+        )
+        .fetch_one(pool)
+        .await?
+    );
+
+    // The table's own checks hold when SQL bypasses the adapter: a voice
+    // disconnect can never be recorded as a member kick.
+    for (event, outcome, yes) in [
+        ("kick", "started", "NULL"),
+        ("vote_started", "Started", "NULL"),
+        ("vote_started", "", "NULL"),
+        ("vote_started", "started", "-1"),
+    ] {
+        let statement = format!(
+            "INSERT INTO voice_vote_kick_audit
+             (guild_id, vote_id, event, room_id, initiator_id, target_id, outcome, yes_votes, occurred_at)
+             VALUES ('100', '8000', '{event}', '500', '301', '303', '{outcome}', {yes}, now())"
+        );
+        assert!(
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(pool)
+                .await
+                .is_err(),
+            "{event}/{outcome}/{yes}"
         );
     }
     Ok(())

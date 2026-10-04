@@ -129,6 +129,8 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_guild_settings",
     "voice_command_roles",
     "voice_command_role_members",
+    // V4 vote-kick audit trail (0417): append-only, guild-keyed, no foreign keys.
+    "voice_vote_kick_audit",
 ];
 
 /// Covered tables not created by the current cutover migration set, if any.
