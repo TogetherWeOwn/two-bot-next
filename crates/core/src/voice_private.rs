@@ -68,7 +68,7 @@ pub struct PrivateRoom {
 /// `voice_room_blocks` hold it: the private flag, the Join channel once it
 /// exists, and the block list. Grants, pending requests and request ids stay
 /// runtime-only: a restart forgets requests (the runtime keeps a pre-restart
-/// button from matching a new request by starting its ids from a per-worker
+/// button from matching a new request by binding buttons to a fresh worker
 /// epoch) and which members were approved, but never the blocks or the Join
 /// channel, and Discord keeps the approved members' Connect allow.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -164,10 +164,12 @@ the Join channel. The join-request flow is in
   waiting. `/public` takes approved members' Connect allow back and retires
   open prompts. A room delete forgets the state; its prompts go with the
   channel.
-- **Request ids.** Pending requests, grants and prompts are runtime-only. An id
-  is `epoch << 20 | n`, where the epoch is the worker's start time in
-  milliseconds and never lower than an earlier worker's in the same process, so
-  an id minted before a restart cannot equal one raised after it.
+- **Request ids.** Pending requests, grants and prompts are runtime-only. Each
+  button appends the worker's fresh 128-bit CSPRNG epoch to the numeric core
+  request id. The worker refuses a different or missing epoch before deciding,
+  so a reset counter or a repeated/backward wall clock cannot revive an old
+  button. Epochs are collision-resistant, not clock-based; ids remain within
+  Discord's 100-character limit even with maximum-width numeric fields.
 - **Not yet.** Grants are not durable: a restart forgets which members were
   approved, so a later `/public` cannot take back their Connect allow (Discord
   keeps it). Persisting grants needs a table of its own.

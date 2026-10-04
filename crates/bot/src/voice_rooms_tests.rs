@@ -7606,47 +7606,61 @@ fn voice_member_in(member_id: u64, channel_id: u64) -> VoiceMember {
     }
 }
 
-#[tokio::test]
-async fn sink_claimed_kick_answers_public_ballot_without_defer() {
-    const VOTER: u64 = 301;
-    const TARGET: u64 = 303;
-    const KICK_ROOM: u64 = 500;
-    let trace = Trace::default();
+const KICK_VOTER: u64 = 301;
+const KICK_TARGET: u64 = 303;
+const KICK_ROOM: u64 = 500;
+const OTHER_ROOM: u64 = 501;
+
+/// A runtime tracking `KICK_ROOM` and `OTHER_ROOM` with the given occupants.
+fn kick_room_runtime(
+    trace: &Trace,
+    enabled: bool,
+    members: Vec<VoiceMember>,
+) -> VoiceRuntime<Store, Http> {
     let runtime = VoiceRuntime::new(
         {
             let trace = trace.clone();
             move || {
                 let store = Store::new(trace.clone());
-                store
-                    .rooms
-                    .lock()
-                    .unwrap()
-                    .insert(KICK_ROOM, room(KICK_ROOM));
+                for channel in [KICK_ROOM, OTHER_ROOM] {
+                    store.rooms.lock().unwrap().insert(channel, room(channel));
+                }
                 (store, Http::new(trace.clone()))
             }
         },
         Duration::from_millis(10),
-        true,
+        enabled,
     );
-    assert!(runtime.publish_snapshot(
-        GUILD,
-        snapshot(
-            &[KICK_ROOM],
-            vec![
-                voice_member_in(VOTER, KICK_ROOM),
-                voice_member_in(TARGET, KICK_ROOM),
-            ],
-        )
-    ));
+    // A disabled runtime spawns no actor, so nothing is published.
+    assert_eq!(
+        runtime.publish_snapshot(GUILD, snapshot(&[KICK_ROOM, OTHER_ROOM], members)),
+        enabled
+    );
+    runtime
+}
+
+#[tokio::test]
+async fn kick_vote_in_a_shared_room_answers_the_public_ballot_without_defer() {
+    let trace = Trace::default();
+    let runtime = kick_room_runtime(
+        &trace,
+        true,
+        vec![
+            voice_member_in(KICK_VOTER, KICK_ROOM),
+            voice_member_in(KICK_TARGET, KICK_ROOM),
+        ],
+    );
     let replies = Replies::new(trace.clone());
-    VoiceResponder::respond_with(
+    let answered = VoiceResponder::start_kick_vote(
         &runtime,
         &replies,
-        &kick_sink_interaction(TARGET, VOTER),
-        None,
-        None,
+        &kick_sink_interaction(KICK_TARGET, KICK_VOTER),
     )
     .await;
+    assert!(
+        answered,
+        "voice owns the callback, so the router stays silent"
+    );
     // No defer: the ballot goes out as the initial public callback, so every
     // occupant can see the buttons and reach quorum.
     assert_eq!(*trace.lock().unwrap(), ["respond"]);
@@ -7664,22 +7678,90 @@ async fn sink_claimed_kick_answers_public_ballot_without_defer() {
     assert_eq!(data.components.as_ref().map_or(0, Vec::len), 1);
 }
 
+// Every decline sends no callback at all: the router answers instead, so a
+// callback here would be a second answer to the same interaction.
 #[tokio::test]
-async fn sink_unclaimed_kick_stays_fully_silent_for_the_router() {
+async fn kick_vote_declines_without_a_callback_unless_the_invoker_shares_the_room() {
+    let occupied = vec![
+        voice_member_in(KICK_VOTER, KICK_ROOM),
+        voice_member_in(KICK_TARGET, KICK_ROOM),
+    ];
+    let cases = [
+        // (case, enabled, occupants)
+        ("no tracked room at all", true, Vec::new()),
+        (
+            "target outside any room",
+            true,
+            vec![voice_member_in(KICK_VOTER, KICK_ROOM)],
+        ),
+        (
+            "invoker outside any room",
+            true,
+            vec![voice_member_in(KICK_TARGET, KICK_ROOM)],
+        ),
+        (
+            "invoker in a different tracked room",
+            true,
+            vec![
+                voice_member_in(KICK_VOTER, OTHER_ROOM),
+                voice_member_in(KICK_TARGET, KICK_ROOM),
+            ],
+        ),
+        ("voice disabled", false, occupied),
+    ];
+    for (case, enabled, members) in cases {
+        let trace = Trace::default();
+        let runtime = kick_room_runtime(&trace, enabled, members);
+        let replies = Replies::new(trace.clone());
+        let answered = VoiceResponder::start_kick_vote(
+            &runtime,
+            &replies,
+            &kick_sink_interaction(KICK_TARGET, KICK_VOTER),
+        )
+        .await;
+        assert!(!answered, "{case}: the router must answer");
+        // Reconcile may still prune an empty tracked room, so look only for
+        // interaction callbacks rather than an empty trace.
+        let calls = trace.lock().unwrap().clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("respond") || call.starts_with("defer")),
+            "{case}: no callback, got {calls:?}"
+        );
+        assert!(replies.completed.lock().unwrap().is_empty(), "{case}");
+    }
+}
+
+// The sink never answers `/kick` on its own account, even for a room
+// occupant: the router decides first (moderation gate, then `kick_vote`).
+#[tokio::test]
+async fn sink_never_answers_kick_without_the_router() {
     let trace = Trace::default();
-    let runtime = test_runtime(trace.clone());
+    let runtime = kick_room_runtime(
+        &trace,
+        true,
+        vec![
+            voice_member_in(KICK_VOTER, KICK_ROOM),
+            voice_member_in(KICK_TARGET, KICK_ROOM),
+        ],
+    );
     let replies = Replies::new(trace.clone());
-    // No actor, no rooms: a moderation-shaped target must produce no ack at
-    // all here, otherwise the defer races (and loses to) the router answer.
     VoiceResponder::respond_with(
         &runtime,
         &replies,
-        &kick_sink_interaction(303, 301),
+        &kick_sink_interaction(KICK_TARGET, KICK_VOTER),
         None,
         None,
     )
     .await;
-    assert!(trace.lock().unwrap().is_empty());
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.starts_with("respond") || call.starts_with("defer")),
+        "no callback, got {calls:?}"
+    );
     assert!(replies.completed.lock().unwrap().is_empty());
 }
 

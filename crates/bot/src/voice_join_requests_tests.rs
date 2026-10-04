@@ -87,6 +87,7 @@ fn press(worker: &mut Worker, actor: u64, decision: JoinDecision, request_id: u6
             decision,
             room_id: ROOM,
             request_id,
+            epoch: Some(worker.join.epoch),
         },
     })
 }
@@ -162,7 +163,7 @@ async fn entering_the_join_channel_asks_the_owner_once() {
     // The request is pending at once; nothing is sent until the queue runs.
     let request = request_of(&worker, OUTSIDER);
     assert_eq!(request.owner_id, MemberId(OWNER));
-    assert!(request.id.0 >= worker.join.epoch_base);
+    assert_ne!(request.id.0, 0);
     assert!(calls(&trace).is_empty());
     drain(&mut worker).await;
     let sent = prompts(&worker);
@@ -175,9 +176,24 @@ async fn entering_the_join_channel_asks_the_owner_once() {
     assert_eq!(
         button_ids(&sent[0].components),
         [
-            join_custom_id(JoinDecision::Approve, ROOM, request.id.0),
-            join_custom_id(JoinDecision::Deny, ROOM, request.id.0),
-            join_custom_id(JoinDecision::Block, ROOM, request.id.0),
+            join_requests::runtime_join_custom_id(
+                JoinDecision::Approve,
+                ROOM,
+                request.id.0,
+                worker.join.epoch,
+            ),
+            join_requests::runtime_join_custom_id(
+                JoinDecision::Deny,
+                ROOM,
+                request.id.0,
+                worker.join.epoch,
+            ),
+            join_requests::runtime_join_custom_id(
+                JoinDecision::Block,
+                ROOM,
+                request.id.0,
+                worker.join.epoch,
+            ),
         ]
     );
     // The same stay, however many ticks, raises nothing more.
@@ -532,15 +548,27 @@ async fn a_button_from_before_a_restart_never_matches_a_request_raised_after() {
     // Restart: requests are runtime-only, so the worker forgets this one. The
     // member is still waiting, so the new worker asks the owner again.
     let mut after = restarted(&worker).await;
-    assert!(after.join.epoch_base > worker.join.epoch_base);
+    assert_ne!(after.join.epoch, worker.join.epoch);
     after.reconcile();
     let fresh = request_of(&after, OUTSIDER);
-    assert_ne!(fresh.id, before.id);
-    assert!(fresh.id.0 > before.id.0);
-    // The pre-restart button is refused even though the member has a live
-    // request again, and it changes nothing.
-    let stale = press(&mut after, OWNER, JoinDecision::Approve, before.id.0);
-    assert!(refused(&stale).contains("no longer pending"), "{stale:?}");
+    // The numeric counter restarted at the SAME id. Replay prevention must
+    // come from the epoch, not a clock gap or process-global counter.
+    assert_eq!(fresh.id, before.id);
+    for decision in [
+        JoinDecision::Approve,
+        JoinDecision::Deny,
+        JoinDecision::Block,
+    ] {
+        let old_id =
+            join_requests::runtime_join_custom_id(decision, ROOM, before.id.0, worker.join.epoch);
+        let click = join_component_action(&component_interaction(&old_id, None, OWNER))
+            .expect("old button still routed");
+        let stale = after.apply_join_decision(JoinDecisionCommand {
+            actor_id: OWNER,
+            click,
+        });
+        assert!(refused(&stale).contains("no longer pending"), "{stale:?}");
+    }
     assert_eq!(pending(&after), [fresh]);
     assert!(after.privacy[&ROOM].granted.is_empty());
     // The new button works.
@@ -549,15 +577,53 @@ async fn a_button_from_before_a_restart_never_matches_a_request_raised_after() {
 }
 
 #[test]
-fn request_ids_never_repeat_across_workers_started_in_the_same_millisecond() {
-    let first = join_requests::JoinRequests::new(1_700_000_000_000);
-    let second = join_requests::JoinRequests::new(1_700_000_000_000);
-    let earlier = join_requests::JoinRequests::new(1_600_000_000_000);
-    assert!(second.epoch_base > first.epoch_base);
-    assert!(earlier.epoch_base > second.epoch_base);
-    // A broken clock reading zero still gets a nonzero, later range.
-    let zero = join_requests::JoinRequests::new(0);
-    assert!(zero.epoch_base > earlier.epoch_base);
+fn worker_epochs_do_not_depend_on_wall_clock_or_a_process_global_counter() {
+    let first = join_requests::JoinRequests::new();
+    let second = join_requests::JoinRequests::new();
+    assert_ne!(first.epoch, second.epoch);
+}
+
+#[tokio::test]
+async fn legacy_buttons_without_a_worker_epoch_are_answered_with_a_refusal() {
+    let (mut worker, trace) = private_room().await;
+    enter(&worker, OUTSIDER, 2_000);
+    worker.reconcile();
+    let request = request_of(&worker, OUTSIDER);
+    for decision in [
+        JoinDecision::Approve,
+        JoinDecision::Deny,
+        JoinDecision::Block,
+    ] {
+        let legacy = join_custom_id(decision, ROOM, request.id.0);
+        let click = join_component_action(&component_interaction(&legacy, None, OWNER))
+            .expect("legacy button still routed");
+        assert_eq!(click.epoch, None);
+        let reply = worker.apply_join_decision(JoinDecisionCommand {
+            actor_id: OWNER,
+            click,
+        });
+        assert!(refused(&reply).contains("no longer pending"), "{reply:?}");
+    }
+    assert_eq!(pending(&worker), [request]);
+    assert!(worker.privacy[&ROOM].granted.is_empty());
+    assert!(worker.privacy[&ROOM].blocked.is_empty());
+    assert!(calls(&trace).is_empty());
+}
+
+#[test]
+fn runtime_button_ids_fit_discord_even_at_maximum_numeric_width() {
+    for decision in [
+        JoinDecision::Approve,
+        JoinDecision::Deny,
+        JoinDecision::Block,
+    ] {
+        let id = join_requests::runtime_join_custom_id(decision, u64::MAX, u64::MAX, [255; 16]);
+        assert!(id.len() <= two_bot_core::voice_custom_id::MAX_VOICE_CUSTOM_ID_CHARS);
+        let click = join_component_action(&component_interaction(&id, None, OWNER)).unwrap();
+        assert_eq!(click.request_id, u64::MAX);
+        assert_eq!(click.room_id, u64::MAX);
+        assert_eq!(click.epoch, Some([255; 16]));
+    }
 }
 
 #[tokio::test]
@@ -672,7 +738,7 @@ async fn a_failed_move_keeps_the_grant_that_landed() {
 // --- the interaction surface --------------------------------------------------
 
 fn join_id(decision: JoinDecision, room: u64, request: u64) -> String {
-    join_custom_id(decision, room, request)
+    join_requests::runtime_join_custom_id(decision, room, request, [1; 16])
 }
 
 #[test]
@@ -688,7 +754,8 @@ fn only_join_buttons_are_claimed_and_other_voice_ids_stay_silent() {
             Some(JoinClick {
                 decision,
                 room_id: ROOM,
-                request_id: 7
+                request_id: 7,
+                epoch: Some([1; 16]),
             })
         );
     }
@@ -699,6 +766,9 @@ fn only_join_buttons_are_claimed_and_other_voice_ids_stay_silent() {
         "two:voice:join-approve:abc:1",
         "two:voice:join-approve:500",
         "two:voice:join-approve:500:1:extra",
+        "two:voice:join-approve:500:1:0101010101010101010101010101010101:extra",
+        "two:voice:join-approve:500:1:ABCDEF0123456789abcdef0123456789",
+        "two:voice:join-approve:500:1:gggggggggggggggggggggggggggggggg",
         "two:voice:join-approve:0:1",
         "two:voice:join-approve:500:0",
         "two:voice:join-unknown:500:1",

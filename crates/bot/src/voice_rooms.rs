@@ -1609,7 +1609,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             privacy,
             privacy_dirty: HashSet::new(),
             join_deletable,
-            join: join_requests::JoinRequests::new(wall_ms()),
+            join: join_requests::JoinRequests::new(),
             failures: VecDeque::new(),
             notices: Vec::new(),
             halted: false,
@@ -3803,18 +3803,20 @@ pub trait VoiceEventSink: Send + Sync {
     /// A cold RESUME has replayed durably but cannot populate a fresh cache.
     /// The supervisor must IDENTIFY after committing RESUMED, not before replay.
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool;
-    /// Resolve the tracked room a member is currently in, if any. The shared
-    /// router asks this for `/kick`: a tracked-room target means the voice
-    /// sink owns the interaction (vote-kick) and the router must stay silent;
-    /// anything else keeps the existing moderation path. Boxed (not `impl
-    /// Future`) so the trait stays object-safe behind `Arc<dyn _>`.
-    fn kick_claim_room(
+    /// Start a room vote-kick for a `/kick` the shared router has already
+    /// refused for moderation (moderation off, or the invoker lacks Kick
+    /// Members). The router is the only answerer of `/kick`; this is its
+    /// delegate for room occupants. `true` means this sink answered the
+    /// interaction itself (sent or failed, never retried), so the router must
+    /// not; `false` means no callback was attempted and the router answers.
+    /// Boxed (not `impl Future`) so the trait stays object-safe behind
+    /// `Arc<dyn _>`.
+    fn kick_vote(
         &self,
-        guild: Snowflake,
-        member: Snowflake,
-    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
-        let _ = (guild, member);
-        Box::pin(async { None })
+        interaction: Interaction,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        let _ = interaction;
+        Box::pin(async { false })
     }
 }
 
@@ -4451,14 +4453,6 @@ where
 
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
         self.enabled && cache.current_user().is_none()
-    }
-
-    fn kick_claim_room(
-        &self,
-        guild: Snowflake,
-        member: Snowflake,
-    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
-        Box::pin(self.kick_room_of(guild, member))
     }
 }
 
@@ -7623,35 +7617,13 @@ where
         inventory: Option<GuildInventory>,
         names: NameDirectory,
     ) {
-        // Vote-kick owns its transport. A non-room `/kick` belongs to the
-        // moderation path, so return before any acknowledgement and let the
-        // router answer: deferring here would race it and hang on "thinking".
-        if let Some(VoiceCommand::Kick { target, .. }) = parse_voice_command(interaction) {
-            let Some(guild) = interaction_guild(interaction) else {
-                return;
-            };
-            if runtime.kick_room_of(guild, target).await.is_none() {
-                return;
-            }
-            let answered: Arc<Mutex<Option<InteractionResponse>>> = Arc::new(Mutex::new(None));
-            let writer = Arc::clone(&answered);
-            handle_voice_interaction_with(
-                runtime,
-                interaction,
-                invite_code,
-                inventory.as_ref(),
-                move |response| async move {
-                    *writer.lock().unwrap() = Some(response);
-                },
-            )
-            .await;
-            let response = answered.lock().unwrap().take();
-            if let Some(response) = response {
-                if let Err(error) = replies.respond(interaction, response).await {
-                    warn!(interaction_id = interaction.id.get(), %error,
-                        "voice vote response failed; not retried");
-                }
-            }
+        // `/kick` is answered by the shared router alone (moderation first,
+        // then `kick_vote` for the occupants it refused). Acknowledging here
+        // would race it and could answer twice.
+        if matches!(
+            parse_voice_command(interaction),
+            Some(VoiceCommand::Kick { .. })
+        ) {
             return;
         }
         if matches!(
@@ -7663,19 +7635,8 @@ where
             // place (type 7). The defer + PATCH path would edit each
             // presser's own ephemeral followup instead, so answer with the
             // initial callback.
-            let answered: Arc<Mutex<Option<InteractionResponse>>> = Arc::new(Mutex::new(None));
-            let writer = Arc::clone(&answered);
-            handle_voice_interaction_with(
-                runtime,
-                interaction,
-                invite_code,
-                inventory.as_ref(),
-                move |response| async move {
-                    *writer.lock().unwrap() = Some(response);
-                },
-            )
-            .await;
-            let response = answered.lock().unwrap().take();
+            let response =
+                Self::capture_response(runtime, interaction, invite_code, inventory.as_ref()).await;
             if let Some(response) = response {
                 if let Err(error) = replies.respond(interaction, response).await {
                     warn!(interaction_id = interaction.id.get(), %error,
@@ -7732,6 +7693,69 @@ where
         )
         .await;
     }
+
+    /// Start the V4 room vote for a `/kick` the router refused for moderation.
+    /// The vote exists only for an invoker who shares a tracked room with the
+    /// target; anyone else gets the router's refusal, which also keeps a
+    /// stranger from learning that the target sits in a room. Returns `true`
+    /// once this sink owns the callback (a failed send is logged, never
+    /// retried) and `false` when no callback was attempted.
+    async fn start_kick_vote(
+        runtime: &VoiceRuntime<S, H>,
+        replies: &R,
+        interaction: &Interaction,
+    ) -> bool {
+        if !runtime.enabled {
+            return false;
+        }
+        let Some(VoiceCommand::Kick { target, .. }) = parse_voice_command(interaction) else {
+            return false;
+        };
+        let (Some(guild), Some(initiator)) = (
+            interaction_guild(interaction),
+            interaction.author_id().map(|id| id.get()),
+        ) else {
+            return false;
+        };
+        let Some(room) = runtime.kick_room_of(guild, target).await else {
+            return false;
+        };
+        if runtime.kick_room_of(guild, initiator).await != Some(room) {
+            return false;
+        }
+        let Some(response) = Self::capture_response(runtime, interaction, None, None).await else {
+            return false;
+        };
+        if let Err(error) = replies.respond(interaction, response).await {
+            warn!(interaction_id = interaction.id.get(), %error,
+                "voice vote response failed; not retried");
+        }
+        true
+    }
+
+    /// Run the voice handler and keep its single response instead of sending
+    /// it, for commands that answer through the initial callback.
+    async fn capture_response(
+        runtime: &VoiceRuntime<S, H>,
+        interaction: &Interaction,
+        invite_code: Option<&str>,
+        inventory: Option<&GuildInventory>,
+    ) -> Option<InteractionResponse> {
+        let answered: Arc<Mutex<Option<InteractionResponse>>> = Arc::new(Mutex::new(None));
+        let writer = Arc::clone(&answered);
+        handle_voice_interaction_with(
+            runtime,
+            interaction,
+            invite_code,
+            inventory,
+            move |response| async move {
+                *writer.lock().unwrap() = Some(response);
+            },
+        )
+        .await;
+        let mut slot = answered.lock().unwrap();
+        slot.take()
+    }
 }
 
 impl<S, H, R> VoiceEventSink for VoiceResponder<S, H, R>
@@ -7746,7 +7770,12 @@ where
             return;
         }
         if let Event::InteractionCreate(created) = event {
-            if parse_voice_command(&created.0).is_none()
+            let command = parse_voice_command(&created.0);
+            // The shared router answers `/kick`; see `kick_vote`.
+            if matches!(command, Some(VoiceCommand::Kick { .. })) {
+                return;
+            }
+            if command.is_none()
                 && voice_import_action(&created.0).is_none()
                 && name_component_action(&created.0).is_none()
                 && join_component_action(&created.0).is_none()
@@ -7782,13 +7811,13 @@ where
         self.runtime.needs_bootstrap(cache)
     }
 
-    fn kick_claim_room(
+    fn kick_vote(
         &self,
-        guild: Snowflake,
-        member: Snowflake,
-    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
+        interaction: Interaction,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
         let runtime = Arc::clone(&self.runtime);
-        Box::pin(async move { runtime.kick_room_of(guild, member).await })
+        let replies = Arc::clone(&self.replies);
+        Box::pin(async move { Self::start_kick_vote(&runtime, &replies, &interaction).await })
     }
 }
 

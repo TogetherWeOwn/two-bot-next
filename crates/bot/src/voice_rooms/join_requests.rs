@@ -26,10 +26,10 @@
 //! Block persists through the privacy record; Deny writes nothing.
 //!
 //! **Restarts.** Pending requests, grants and the posted prompts are runtime
-//! only. A request id is `epoch << 20 | n`, where the epoch is the worker's
-//! start time in milliseconds (never lower than any earlier worker's in this
-//! process), so a button minted before a restart can never match a request
-//! raised after it.
+//! only. Each button binds the numeric core request id to a fresh 128-bit
+//! CSPRNG worker epoch. The worker checks that epoch before deciding, so
+//! resetting the counter or rolling the wall clock back does not revive an
+//! earlier worker's buttons. Legacy buttons without an epoch are refused.
 //!
 //! The grant is a member overwrite that nothing records durably. A restart
 //! forgets which members were approved, so a later `/public` cannot take their
@@ -45,17 +45,9 @@ use two_bot_core::{
 
 use super::{private_runtime::can_edit_overwrites, *};
 
-/// Request ids sit above the epoch's low bits, leaving a million ids per
-/// millisecond of epoch before one worker could reach the next one's range.
-const EPOCH_SHIFT: u32 = 20;
-
-/// Highest epoch a worker may use before the shift would overflow `u64`.
-const MAX_EPOCH_MS: u64 = (1 << 43) - 1;
-
-/// The base every worker in this process has handed out so far: a respawned
-/// worker (same millisecond, or a clock that stepped back) still gets a
-/// strictly later range.
-static LAST_EPOCH_BASE: AtomicU64 = AtomicU64::new(0);
+/// A public correlation nonce, not an authorization token. Ownership and the
+/// command gate are still checked on every click.
+type WorkerEpoch = [u8; 16];
 
 const PAUSED: &str = "Voice rooms are paused: Discord refused the bot credential. \
                       Fix the token, then restart the bot.";
@@ -70,8 +62,8 @@ const NEEDS_MANAGE_ROLES: &str = "I can't let anyone in: I need the Manage Roles
 /// The worker's join-request bookkeeping. All of it is runtime-only.
 #[derive(Debug)]
 pub(super) struct JoinRequests {
-    /// First request id this worker may hand out.
-    pub(super) epoch_base: u64,
+    /// Fresh on every worker load, including a process restart.
+    pub(super) epoch: WorkerEpoch,
     /// `(Join channel, member)` entries already handled, with the gateway
     /// transition they were handled at.
     pub(super) entries: HashMap<(Snowflake, Snowflake), u64>,
@@ -80,17 +72,9 @@ pub(super) struct JoinRequests {
 }
 
 impl JoinRequests {
-    /// `epoch_ms` is the worker's start time in wall-clock milliseconds.
-    pub(super) fn new(epoch_ms: u64) -> Self {
-        let clock_base = epoch_ms.min(MAX_EPOCH_MS) << EPOCH_SHIFT;
-        let step = 1u64 << EPOCH_SHIFT;
-        let previous = LAST_EPOCH_BASE
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |previous| {
-                Some(clock_base.max(previous.saturating_add(step)))
-            })
-            .unwrap_or(0);
+    pub(super) fn new() -> Self {
         Self {
-            epoch_base: clock_base.max(previous.saturating_add(step)),
+            epoch: rand::random(),
             entries: HashMap::new(),
             prompts: HashMap::new(),
         }
@@ -103,6 +87,23 @@ pub(super) struct JoinClick {
     pub decision: JoinDecision,
     pub room_id: Snowflake,
     pub request_id: u64,
+    /// `None` on a legacy button: claimed, but never executable.
+    pub epoch: Option<WorkerEpoch>,
+}
+
+/// Keep the pure codec's request binding and add the worker's restart epoch.
+/// Even maximum-width room/request ids fit Discord's 100-character limit.
+pub(super) fn runtime_join_custom_id(
+    decision: JoinDecision,
+    room: Snowflake,
+    request_id: u64,
+    epoch: WorkerEpoch,
+) -> String {
+    format!(
+        "{}:{}",
+        join_custom_id(decision, room, request_id),
+        hex::encode(epoch)
+    )
 }
 
 /// A press handed to the guild worker.
@@ -131,7 +132,25 @@ pub(super) fn join_component_action(interaction: &Interaction) -> Option<JoinCli
     let InteractionData::MessageComponent(data) = interaction.data.as_ref()? else {
         return None;
     };
-    let (decision, room_id, request_id) = match parse_voice_custom_id(&data.custom_id)? {
+    if data.custom_id.len() > two_bot_core::voice_custom_id::MAX_VOICE_CUSTOM_ID_CHARS {
+        return None;
+    }
+    let (core_id, epoch) = if data.custom_id.matches(':').count() == 5 {
+        let (core_id, encoded) = data.custom_id.rsplit_once(':')?;
+        if encoded.len() != 32
+            || !encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        let mut epoch = [0; 16];
+        hex::decode_to_slice(encoded, &mut epoch).ok()?;
+        (core_id, Some(epoch))
+    } else {
+        (data.custom_id.as_str(), None)
+    };
+    let (decision, room_id, request_id) = match parse_voice_custom_id(core_id)? {
         VoiceAction::JoinApprove {
             room_id,
             request_id,
@@ -150,6 +169,7 @@ pub(super) fn join_component_action(interaction: &Interaction) -> Option<JoinCli
         decision,
         room_id,
         request_id,
+        epoch,
     })
 }
 
@@ -160,11 +180,12 @@ fn prompt_message(
     member: Snowflake,
     room: Snowflake,
     request_id: u64,
+    epoch: WorkerEpoch,
 ) -> (String, Vec<Component>) {
     let button = |label: &str, style: ButtonStyle, decision: JoinDecision| {
         Component::Button(Button {
             id: None,
-            custom_id: Some(join_custom_id(decision, room, request_id)),
+            custom_id: Some(runtime_join_custom_id(decision, room, request_id, epoch)),
             disabled: false,
             emoji: None,
             label: Some(label.to_owned()),
@@ -325,7 +346,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// prompt when it raised a request.
     fn raise_join_request(&mut self, room: Snowflake, join: Snowflake, member: Snowflake) {
         self.join_owner_changed(room);
-        let Some(mut state) = self.privacy.get(&room).cloned() else {
+        let Some(state) = self.privacy.get(&room).cloned() else {
             return;
         };
         let occupants: Vec<MemberId> = self
@@ -337,8 +358,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .into_iter()
             .map(MemberId)
             .collect();
-        // Never hand out an id a previous worker could have minted.
-        state.next_request_id = state.next_request_id.max(self.join.epoch_base);
         match state.enter_join_channel(ChannelId(join), MemberId(member), &occupants) {
             Ok(entry) => {
                 self.privacy.insert(room, entry.plan.room);
@@ -375,6 +394,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         };
         if !self.rooms.contains_key(&click.room_id) {
             return JoinReply::Refused(ROOM_GONE.to_owned());
+        }
+        if click.epoch != Some(self.join.epoch) {
+            return JoinReply::Refused(NOT_PENDING.to_owned());
         }
         self.join_owner_changed(click.room_id);
         let Some(state) = self.privacy.get(&click.room_id).cloned() else {
@@ -618,7 +640,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.queue.mark_succeeded(&action);
             return;
         }
-        let (content, components) = prompt_message(owner, member, room, request_id);
+        let (content, components) =
+            prompt_message(owner, member, room, request_id, self.join.epoch);
         let result = self
             .http
             .send_component_message(room, &content, Some(owner), &components)
