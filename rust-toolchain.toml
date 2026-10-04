@@ -1,6 +1,9 @@
-# Pinned toolchain: 1.98 (floor: stable >= 1.94, the sqlx 0.9 MSRV, ADR 0001).
-# rustup and CI both honour this file; the Dockerfile builder image must match.
+# Pinned toolchain: 1.98.1 (floor: stable >= 1.94, the sqlx 0.9 MSRV, ADR 0001).
+# rustup and CI both honour this file. The Dockerfile builder image copies it
+# in, so this must equal the image's installed toolchain (RUST_VERSION of the
+# digest-pinned rust:1.98-trixie image): a looser channel such as "1.98" makes
+# rustup download a second toolchain inside the builder. Bump both together.
 [toolchain]
-channel = "1.98"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
