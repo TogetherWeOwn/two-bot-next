@@ -1,0 +1,15 @@
+{
+  "id": "100", "name": "test guild", "owner_id": "998",
+  "afk_timeout": 300, "default_message_notifications": 0,
+  "explicit_content_filter": 0, "features": [], "emojis": [],
+  "large": false, "mfa_level": 0, "nsfw_level": 0,
+  "preferred_locale": "en-US", "premium_progress_bar_enabled": false,
+  "system_channel_flags": 0, "verification_level": 0,
+  "stage_instances": [], "stickers": [], "voice_states": [],
+  "channels": [
+    {"id": "200", "guild_id": "100", "type": 2, "name": "creator", "parent_id": "400", "bitrate": 64000, "user_limit": 0, "permission_overwrites": []},
+    {"id": "400", "guild_id": "100", "type": 4, "name": "rooms", "permission_overwrites": []}
+  ],
+  "roles": [{"id": "100", "name": "everyone", "color": 0, "hoist": false, "managed": false, "mentionable": false, "position": 0, "colors": {"primary_color": 0, "secondary_color": null, "tertiary_color": null}, "permissions": "0", "flags": 0}],
+  "members": [{"user": {"id": "999", "username": "mock-bot", "discriminator": "0", "bot": true}, "roles": [], "deaf": false, "mute": false, "joined_at": "2026-09-30T00:00:00.000000+00:00", "flags": 0}]
+}

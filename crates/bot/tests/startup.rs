@@ -1,5 +1,5 @@
 //! Exercise the real entrypoint and TCP listener with synthetic configuration.
-//! Invalid gateway config must park the shard without moving the HTTP listener.
+//! Missing gateway prerequisites park; configured database failures exit safely.
 
 use std::{
     io::{Read, Write},
@@ -101,8 +101,13 @@ fn configured_gateway_initialization_failure_exits_nonzero() {
     // A malformed synthetic URL fails locally; no database or Discord is contacted.
     let mut bot = Bot(command("127.0.0.1:0")
         .env("DISCORD_TOKEN", "INVALID")
-        .env("DATABASE_URL", "synthetic-database-must-not-connect")
+        .env(
+            "DATABASE_URL",
+            "postgres://fixture-user:fixture-db-secret@agent-testdb/db?api_key=fixture-query-secret",
+        )
         .env("GUILD_ID", "123")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("start test bot"));
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -116,6 +121,63 @@ fn configured_gateway_initialization_failure_exits_nonzero() {
             "configured failed gateway stayed alive"
         );
         thread::sleep(Duration::from_millis(20));
+    }
+    let mut logs = String::new();
+    bot.0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut logs)
+        .unwrap();
+    bot.0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut logs)
+        .unwrap();
+    assert!(
+        logs.contains("database initialization failed"),
+        "child logs: {logs}"
+    );
+    // No `container service failed` here: a database_init failure exits before
+    // the service_supervisor phase, which is the only place that logs it.
+    for secret in ["fixture-user", "fixture-db-secret", "fixture-query-secret"] {
+        assert!(!logs.contains(secret), "startup diagnostic leaked: {logs}");
+    }
+}
+
+#[test]
+fn configured_database_initialization_failure_exits_nonzero_without_logging_url() {
+    for url in [
+        "not-postgres://fixture-secret",
+        "postgresql://[fixture-secret",
+    ] {
+        let mut child = command("127.0.0.1:0")
+            .env("DISCORD_TOKEN", "INVALID")
+            .env("GUILD_ID", "123")
+            .env("DATABASE_URL", url)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("configured DB failure parked instead of exiting");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(logs.contains("database initialization failed"));
+        assert!(!logs.contains("fixture-secret"));
     }
 }
 
@@ -208,7 +270,12 @@ fn assert_parked_gateway(vars: &[(&str, &str)]) {
     let report: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(
         report["components"],
-        serde_json::json!([["process", "ready"], ["gateway", "down"]])
+        serde_json::json!([
+            ["process", "ready"],
+            ["gateway", "down"],
+            ["database", "down"],
+            ["token_invalid", "ready"]
+        ])
     );
 
     for name in ["counter", "rank", "scheduled_events"] {
@@ -230,4 +297,63 @@ fn assert_parked_gateway(vars: &[(&str, &str)]) {
         assert!(Instant::now() < deadline, "healthcheck did not exit");
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn signal_term(child: &Child) {
+    // Bash's builtin works in slim test containers without /bin/kill; the PID is
+    // an inert positional argument, never interpolated into shell code.
+    let status = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "kill -TERM \"$1\"",
+            "signal-child",
+            &child.id().to_string(),
+        ])
+        .status()
+        .expect("SIGTERM command");
+    assert!(status.success());
+}
+
+#[test]
+fn second_signal_abandons_a_stalled_drain() {
+    let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
+    let addr = reserved.local_addr().unwrap();
+    drop(reserved);
+    let mut bot = Bot(command(&format!("127.0.0.1:{}", addr.port()))
+        .env("SHUTDOWN_TIMEOUT_SECONDS", "600")
+        .spawn()
+        .expect("start test bot"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while get(addr, "/health").is_err() {
+        assert!(Instant::now() < deadline, "bot did not serve health");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // A request whose headers never finish keeps graceful HTTP shutdown waiting.
+    let mut stalled = TcpStream::connect(addr).expect("stalled connection");
+    stalled
+        .write_all(b"GET /health HTTP/1.1\r\nHost: l")
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+
+    signal_term(&bot.0);
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        bot.0.try_wait().unwrap().is_none(),
+        "first signal must start a bounded drain, not exit"
+    );
+
+    signal_term(&bot.0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = bot.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "second signal must exit immediately"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(1));
 }

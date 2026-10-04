@@ -6,7 +6,7 @@
 //! Discord failures, and clear recovery state only after restoration succeeds.
 
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 
 use super::channel_moderation::LockdownRecord;
 
@@ -25,7 +25,8 @@ pub struct ChannelAuditRow {
     pub idempotency_key: String,
     /// Bounded numbers only (count/seconds/affected), serialised as JSON.
     pub metadata_json: String,
-    /// ISO-8601 UTC millis (legacy TEXT timestamps; see migration 0120).
+    /// ISO-8601 UTC millis, bound with an explicit shared-ledger timestamptz cast;
+    /// migration 0112 types the shared ledger as timestamptz.
     pub created_at: String,
 }
 
@@ -66,6 +67,14 @@ pub const DB_POOL_MAX_DEFAULT: u32 = 5;
 /// Legacy statement timeout (`statementTimeoutMillis ?? 15_000`).
 pub const STATEMENT_TIMEOUT_MS: u64 = 15_000;
 
+/// Read the one TLS policy setting; an unset value is `Required`.
+fn tls_policy_from_env() -> Result<crate::database_tls::TlsPolicy, sqlx::Error> {
+    let value = std::env::var_os(crate::database_tls::POLICY_SETTING);
+    // A non-UTF-8 value parses as "" and is refused like any unknown value.
+    crate::database_tls::TlsPolicy::from_setting(value.as_ref().map(|v| v.to_str().unwrap_or("")))
+        .map_err(|message| sqlx::Error::InvalidArgument(message.to_owned()))
+}
+
 impl ChannelModerationStore {
     /// Reuse the runtime's pool instead of opening a separate pool per handler.
     #[must_use]
@@ -73,8 +82,19 @@ impl ChannelModerationStore {
         Self { pool }
     }
 
-    /// Open a pool against `url` (Postgres only).
+    /// Open a pool against `url` (Postgres only), under the
+    /// `TWO_DATABASE_TLS` policy: unset means `required` (see
+    /// `docs/database-tls.md`).
     pub async fn connect(url: &str, pool_max: u32) -> Result<Self, sqlx::Error> {
+        Self::connect_with_tls(url, pool_max, tls_policy_from_env()?).await
+    }
+
+    /// [`Self::connect`] with an explicit TLS policy (tests pass `LocalOnly`).
+    pub async fn connect_with_tls(
+        url: &str,
+        pool_max: u32,
+        tls: crate::database_tls::TlsPolicy,
+    ) -> Result<Self, sqlx::Error> {
         if url.trim().is_empty() {
             return Err(sqlx::Error::InvalidArgument(
                 "database URL is required".to_owned(),
@@ -87,9 +107,14 @@ impl ChannelModerationStore {
         }
         crate::database_url::validate(url)
             .map_err(|message| sqlx::Error::InvalidArgument(message.to_owned()))?;
+        // Threat-model F6: refuse plaintext/unverified modes and the wrong host
+        // class before SQLx parses the URL (see `docs/database-tls.md`).
+        crate::database_tls::enforce(url, tls)
+            .map_err(|message| sqlx::Error::InvalidArgument(message.to_owned()))?;
         // Passfile diagnostics stay suppressed during the synchronous parse, but a
         // well-formed entry still supplies the password (see `database_url`).
-        let mut options = crate::database_url::connect_options(url)?;
+        let mut options =
+            crate::database_tls::apply(crate::database_url::connect_options(url)?, tls);
         options = options.options([("statement_timeout", format!("{}ms", STATEMENT_TIMEOUT_MS))]);
         let pool = PgPoolOptions::new()
             .max_connections(pool_max)
@@ -219,7 +244,7 @@ impl ChannelModerationStore {
         let won = sqlx::query(
             "INSERT INTO moderation_idempotency
                (guild_id, idempotency_key, action, request_hash, state, claimed_at)
-             VALUES ($1, $2, $3, $4, 'in_flight', $5)
+             VALUES ($1, $2, $3, $4, 'in_flight', $5::text::timestamptz)
              ON CONFLICT (guild_id, idempotency_key) DO NOTHING
              RETURNING claim_token",
         )
@@ -270,60 +295,79 @@ impl ChannelModerationStore {
         Ok(ChannelClaim::InFlight)
     }
 
-    /// Record the result so a retry replays it instead of acting again.
-    /// Returns false if the ticket is stale or already completed; never
-    /// overwrites a newer generation or an immutable completed result.
-    pub async fn complete(
+    /// Take the channel lane only while this request still owns its claim.
+    /// The lane is durable and has no timeout: a lost process or ambiguous
+    /// Discord result cannot let another key race an unfinished restoration.
+    pub async fn claim_channel(
         &self,
         ticket: &ChannelClaimTicket,
-        outcome: &str,
-        result_json: &str,
-        completed_at: &str,
+        channel_id: &str,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
+            "INSERT INTO moderation_channel_executions
+               (guild_id, channel_id, idempotency_key, claim_token)
+             SELECT guild_id, $1, idempotency_key, claim_token
+               FROM moderation_idempotency
+              WHERE guild_id = $2 AND idempotency_key = $3
+                AND claim_token = $4 AND state = 'in_flight'
+             ON CONFLICT (channel_id) DO NOTHING",
+        )
+        .bind(channel_id)
+        .bind(&ticket.guild_id)
+        .bind(&ticket.idempotency_key)
+        .bind(ticket.claim_token.expose())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Finish without a gap between completion, audit, recovery cleanup and
+    /// releasing the channel lane. On DB failure the claim/lane stay in flight;
+    /// the caller may retry this write with the same ticket, never Discord.
+    /// `restored` is supplied only after confirmed exact unlock restoration.
+    pub async fn finish(
+        &self,
+        ticket: &ChannelClaimTicket,
+        row: &ChannelAuditRow,
+        result_json: &str,
+        restored: Option<&LockdownRecord>,
+    ) -> Result<bool, sqlx::Error> {
+        if row.guild_id != ticket.guild_id || row.idempotency_key != ticket.idempotency_key {
+            return Err(sqlx::Error::InvalidArgument(
+                "audit does not match claim".to_owned(),
+            ));
+        }
+        if restored.is_some_and(|rec| {
+            rec.guild_id != ticket.guild_id || row.channel_id.as_deref() != Some(&rec.channel_id)
+        }) {
+            return Err(sqlx::Error::InvalidArgument(
+                "recovery does not match claim".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query(
             "UPDATE moderation_idempotency
-                SET state = 'done', outcome = $1, result_json = $2, completed_at = $3
+                SET state = 'done', outcome = $1, result_json = $2, completed_at = $3::text::timestamptz
               WHERE guild_id = $4 AND idempotency_key = $5
-                AND claim_token = $6 AND state = 'in_flight'",
+                AND claim_token = $6 AND state = 'in_flight' AND action = $7",
         )
-        .bind(outcome)
+        .bind(&row.outcome)
         .bind(result_json)
-        .bind(completed_at)
+        .bind(&row.created_at)
         .bind(&ticket.guild_id)
         .bind(&ticket.idempotency_key)
         .bind(ticket.claim_token.expose())
-        .execute(&self.pool)
+        .bind(&row.action)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() == 1)
-    }
-
-    /// Release only when the executor can prove no Discord mutation occurred.
-    /// A timeout or ambiguous failure must retain the claim to prevent replay.
-    /// Returns false for stale tickets or completed claims.
-    pub async fn release(&self, ticket: &ChannelClaimTicket) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            "DELETE FROM moderation_idempotency
-              WHERE guild_id = $1 AND idempotency_key = $2
-                AND claim_token = $3 AND state = 'in_flight'",
-        )
-        .bind(&ticket.guild_id)
-        .bind(&ticket.idempotency_key)
-        .bind(ticket.claim_token.expose())
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() == 1)
-    }
-
-    /// One audit row per executed (or refused) channel action. Insert is
-    /// `ON CONFLICT (request_id) DO NOTHING`: Discord already accepted the
-    /// action, so a retry must never duplicate the mutation over an audit
-    /// write failure (legacy `recordAudit`).
-    pub async fn record_audit(&self, row: &ChannelAuditRow) -> Result<(), sqlx::Error> {
+        if changed.rows_affected() != 1 {
+            return Ok(false);
+        }
         sqlx::query(
             "INSERT INTO moderation_audit
                (request_id, guild_id, actor_id, action, target_id, channel_id, reason,
                 outcome, idempotency_key, metadata_json, created_at)
-             VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10)
+             VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10::text::timestamptz)
              ON CONFLICT (request_id) DO NOTHING",
         )
         .bind(&row.request_id)
@@ -336,7 +380,269 @@ impl ChannelModerationStore {
         .bind(&row.idempotency_key)
         .bind(&row.metadata_json)
         .bind(&row.created_at)
+        .execute(&mut *tx)
+        .await?;
+        if let Some(rec) = restored {
+            let cleared = sqlx::query(
+                "DELETE FROM moderation_lockdowns
+                  WHERE channel_id = $1 AND guild_id = $2 AND recovery_generation = $3",
+            )
+            .bind(&rec.channel_id)
+            .bind(&rec.guild_id)
+            .bind(&rec.recovery_generation)
+            .execute(&mut *tx)
+            .await?;
+            if cleared.rows_affected() != 1 {
+                return Ok(false);
+            }
+        }
+        sqlx::query(
+            "DELETE FROM moderation_channel_executions
+              WHERE guild_id = $1 AND idempotency_key = $2 AND claim_token = $3",
+        )
+        .bind(&ticket.guild_id)
+        .bind(&ticket.idempotency_key)
+        .bind(ticket.claim_token.expose())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Record the result so a retry replays it instead of acting again.
+    /// Returns false if the ticket is stale or already completed; never
+    /// overwrites a newer generation or an immutable completed result.
+    pub async fn complete(
+        &self,
+        ticket: &ChannelClaimTicket,
+        outcome: &str,
+        result_json: &str,
+        completed_at: &str,
+    ) -> Result<bool, sqlx::Error> {
+        Self::complete_on(
+            &mut *self.pool.acquire().await?,
+            ticket,
+            outcome,
+            result_json,
+            completed_at,
+        )
+        .await
+    }
+
+    async fn complete_on(
+        connection: &mut PgConnection,
+        ticket: &ChannelClaimTicket,
+        outcome: &str,
+        result_json: &str,
+        completed_at: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE moderation_idempotency
+                SET state = 'done', outcome = $1, result_json = $2, completed_at = $3::text::timestamptz
+              WHERE guild_id = $4 AND idempotency_key = $5
+                AND claim_token = $6 AND state = 'in_flight'",
+        )
+        .bind(outcome)
+        .bind(result_json)
+        .bind(completed_at)
+        .bind(&ticket.guild_id)
+        .bind(&ticket.idempotency_key)
+        .bind(ticket.claim_token.expose())
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Reserve a channel before reading recovery state or making any Discord
+    /// call. Shared by slash and website executors; distinct request keys do not
+    /// bypass it. Busy callers release their unused request claim and retry later.
+    /// A cancelled/uncertain mutation keeps the fence until explicit reconciliation.
+    pub async fn reserve_channel(
+        &self,
+        ticket: &ChannelClaimTicket,
+        channel_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "INSERT INTO moderation_channel_executions
+               (channel_id, guild_id, idempotency_key, claim_token)
+             SELECT $1, guild_id, idempotency_key, claim_token
+               FROM moderation_idempotency
+              WHERE guild_id = $2 AND idempotency_key = $3
+                AND claim_token = $4 AND state = 'in_flight'
+             ON CONFLICT (channel_id) DO NOTHING",
+        )
+        .bind(channel_id)
+        .bind(&ticket.guild_id)
+        .bind(&ticket.idempotency_key)
+        .bind(ticket.claim_token.expose())
         .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Atomically record the audit/result and free the channel. Optional recovery
+    /// cleanup is fenced to the exact generation restored (or a newly recorded
+    /// seed whose write was provably rejected). Any stale ticket/generation or
+    /// database failure rolls back everything and retains the execution fence.
+    pub async fn finish_channel(
+        &self,
+        ticket: &ChannelClaimTicket,
+        audit: &ChannelAuditRow,
+        result_json: &str,
+        clear_generation: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        self.settle_channel(ticket, audit, Some(result_json), clear_generation)
+            .await
+    }
+
+    /// Proven no-mutation failure: audit the refusal and release both fences
+    /// atomically so the same key can be retried after the cause is fixed.
+    pub async fn abort_channel(
+        &self,
+        ticket: &ChannelClaimTicket,
+        audit: &ChannelAuditRow,
+        clear_generation: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        self.settle_channel(ticket, audit, None, clear_generation)
+            .await
+    }
+
+    async fn settle_channel(
+        &self,
+        ticket: &ChannelClaimTicket,
+        audit: &ChannelAuditRow,
+        result_json: Option<&str>,
+        clear_generation: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let channel_id = audit.channel_id.as_deref().ok_or_else(|| {
+            sqlx::Error::InvalidArgument("channel audit requires channel_id".to_owned())
+        })?;
+        if audit.guild_id != ticket.guild_id || audit.idempotency_key != ticket.idempotency_key {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await?;
+        let held = sqlx::query(
+            "DELETE FROM moderation_channel_executions
+              WHERE channel_id = $1 AND guild_id = $2
+                AND idempotency_key = $3 AND claim_token = $4",
+        )
+        .bind(channel_id)
+        .bind(&ticket.guild_id)
+        .bind(&ticket.idempotency_key)
+        .bind(ticket.claim_token.expose())
+        .execute(&mut *tx)
+        .await?;
+        if held.rows_affected() != 1 {
+            return Ok(false);
+        }
+        if let Some(generation) = clear_generation {
+            let cleared = sqlx::query(
+                "DELETE FROM moderation_lockdowns
+                  WHERE channel_id = $1 AND guild_id = $2 AND recovery_generation = $3",
+            )
+            .bind(channel_id)
+            .bind(&ticket.guild_id)
+            .bind(generation)
+            .execute(&mut *tx)
+            .await?;
+            if cleared.rows_affected() != 1 {
+                return Ok(false);
+            }
+        }
+        let settled = if let Some(result_json) = result_json {
+            Self::complete_on(
+                &mut tx,
+                ticket,
+                &audit.outcome,
+                result_json,
+                &audit.created_at,
+            )
+            .await?
+        } else {
+            sqlx::query(
+                "DELETE FROM moderation_idempotency
+                  WHERE guild_id = $1 AND idempotency_key = $2
+                    AND claim_token = $3 AND state = 'in_flight'",
+            )
+            .bind(&ticket.guild_id)
+            .bind(&ticket.idempotency_key)
+            .bind(ticket.claim_token.expose())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+                == 1
+        };
+        if !settled {
+            return Ok(false);
+        }
+        Self::record_audit_on(&mut tx, audit).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Release only when the executor can prove no Discord mutation occurred.
+    /// A timeout or ambiguous failure must retain the claim to prevent replay.
+    /// Returns false for stale tickets or completed claims.
+    pub async fn release(&self, ticket: &ChannelClaimTicket) -> Result<bool, sqlx::Error> {
+        // The shared execution fence references the idempotency ledger, so a
+        // proven-safe release must retire the lane before its ledger row.
+        // Deleting the ledger first violates
+        // moderation_channel_executions_guild_id_idempotency_key_fkey and
+        // would orphan the lane, blocking a same-channel retry.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM moderation_channel_executions
+              WHERE guild_id = $1 AND idempotency_key = $2 AND claim_token = $3",
+        )
+        .bind(&ticket.guild_id)
+        .bind(&ticket.idempotency_key)
+        .bind(ticket.claim_token.expose())
+        .execute(&mut *tx)
+        .await?;
+        let result = sqlx::query(
+            "DELETE FROM moderation_idempotency
+              WHERE guild_id = $1 AND idempotency_key = $2
+                AND claim_token = $3 AND state = 'in_flight'",
+        )
+        .bind(&ticket.guild_id)
+        .bind(&ticket.idempotency_key)
+        .bind(ticket.claim_token.expose())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// One audit row per executed (or refused) channel action. Insert is
+    /// `ON CONFLICT (request_id) DO NOTHING`: Discord already accepted the
+    /// action, so a retry must never duplicate the mutation over an audit
+    /// write failure (legacy `recordAudit`).
+    pub async fn record_audit(&self, row: &ChannelAuditRow) -> Result<(), sqlx::Error> {
+        Self::record_audit_on(&mut *self.pool.acquire().await?, row).await
+    }
+
+    async fn record_audit_on(
+        connection: &mut PgConnection,
+        row: &ChannelAuditRow,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO moderation_audit
+               (request_id, guild_id, actor_id, action, target_id, channel_id, reason,
+                outcome, idempotency_key, metadata_json, created_at)
+             VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10::text::timestamptz)
+             ON CONFLICT (request_id) DO NOTHING",
+        )
+        .bind(&row.request_id)
+        .bind(&row.guild_id)
+        .bind(&row.actor_id)
+        .bind(&row.action)
+        .bind(&row.channel_id)
+        .bind(&row.reason)
+        .bind(&row.outcome)
+        .bind(&row.idempotency_key)
+        .bind(&row.metadata_json)
+        .bind(&row.created_at)
+        .execute(connection)
         .await?;
         Ok(())
     }
@@ -481,6 +787,180 @@ mod tests {
         ] {
             assert!(!test_database_url_allowed(url, false));
         }
+    }
+
+    async fn ticket(store: &ChannelModerationStore, key: &str) -> ChannelClaimTicket {
+        ticket_for_action(store, key, "moderation.lockdown").await
+    }
+
+    async fn ticket_for_action(
+        store: &ChannelModerationStore,
+        key: &str,
+        action: &str,
+    ) -> ChannelClaimTicket {
+        match store.claim("g1", key, action, "hash", "now").await.unwrap() {
+            ChannelClaim::Claimed { ticket } => ticket,
+            other => panic!("expected winning claim, got {other:?}"),
+        }
+    }
+
+    fn finish_row(key: &str, outcome: &str) -> ChannelAuditRow {
+        let mut row = audit_row(key, "moderation.lockdown", outcome);
+        row.guild_id = "g1".to_owned();
+        row.idempotency_key = key.to_owned();
+        row.channel_id = Some("c1".to_owned());
+        row
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn channel_lane_blocks_distinct_keys_until_safe_release_or_finish() {
+        let store = test_store().await;
+        let first = ticket(&store, "first").await;
+        let second = ticket(&store, "second").await;
+        assert!(store.claim_channel(&first, "c1").await.unwrap());
+        assert!(!store.claim_channel(&second, "c1").await.unwrap());
+        assert!(store.claim_channel(&second, "c2").await.unwrap());
+        // Ambiguity simply retains first's claim/lane: a new key cannot act.
+        assert!(!store.claim_channel(&second, "c1").await.unwrap());
+        assert!(store.release(&first).await.unwrap());
+        assert!(!store.claim_channel(&first, "c1").await.unwrap());
+        assert!(store.claim_channel(&second, "c1").await.unwrap());
+        let row = finish_row("second", "locked_down");
+        assert!(store
+            .finish(&second, &row, "{\"text\":\"done\"}", None)
+            .await
+            .unwrap());
+        assert!(!store
+            .finish(&second, &row, "overwrite", None)
+            .await
+            .unwrap());
+        assert!(!store.release(&second).await.unwrap());
+        assert!(!store.claim_channel(&second, "c1").await.unwrap());
+        let third = ticket(&store, "third").await;
+        assert!(store.claim_channel(&third, "c1").await.unwrap());
+        let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_audit")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(audits, 1);
+        assert_eq!(
+            store
+                .claim("g1", "second", "moderation.lockdown", "hash", "now")
+                .await
+                .unwrap(),
+            ChannelClaim::Replayed {
+                outcome: "locked_down".to_owned(),
+                result_json: "{\"text\":\"done\"}".to_owned()
+            }
+        );
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn finish_rolls_back_completion_and_lane_release_when_audit_fails() {
+        let store = test_store().await;
+        let winner = ticket(&store, "finish").await;
+        assert!(store.claim_channel(&winner, "c1").await.unwrap());
+        sqlx::query("ALTER TABLE moderation_audit ADD CONSTRAINT fail_audit CHECK (outcome <> 'locked_down')")
+            .execute(store.pool()).await.unwrap();
+        let row = finish_row("finish", "locked_down");
+        assert!(store.finish(&winner, &row, "saved", None).await.is_err());
+        assert_eq!(
+            store
+                .claim("g1", "finish", "moderation.lockdown", "hash", "now")
+                .await
+                .unwrap(),
+            ChannelClaim::InFlight
+        );
+        let rival = ticket(&store, "rival").await;
+        assert!(!store.claim_channel(&rival, "c1").await.unwrap());
+        sqlx::query("ALTER TABLE moderation_audit DROP CONSTRAINT fail_audit")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        // Retry only finalization with the original ticket, not the effect.
+        assert!(store.finish(&winner, &row, "saved", None).await.unwrap());
+        assert!(store.claim_channel(&rival, "c1").await.unwrap());
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn finish_restoration_cleanup_is_atomic_and_generation_fenced() {
+        let store = test_store().await;
+        let winner = ticket_for_action(&store, "unlock", "moderation.unlock").await;
+        assert!(store.claim_channel(&winner, "c1").await.unwrap());
+        let rec = store
+            .record_lockdown(
+                "c1",
+                "g1",
+                &crate::LockdownSeed {
+                    prior_allow: "1024".to_owned(),
+                    prior_deny: "8192".to_owned(),
+                    prior_exists: true,
+                },
+                "raid",
+                "now",
+            )
+            .await
+            .unwrap();
+        let mut stale = rec.clone();
+        stale.recovery_generation = "stale".to_owned();
+        let mut row = finish_row("unlock", "unlocked");
+        row.action = "moderation.unlock".to_owned();
+        assert!(!store
+            .finish(&winner, &row, "saved", Some(&stale))
+            .await
+            .unwrap());
+        assert_eq!(store.get_lockdown("c1").await.unwrap(), Some(rec.clone()));
+        assert_eq!(
+            store
+                .claim("g1", "unlock", "moderation.unlock", "hash", "now")
+                .await
+                .unwrap(),
+            ChannelClaim::InFlight
+        );
+        let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_audit")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(audits, 0);
+        assert!(store
+            .finish(&winner, &row, "saved", Some(&rec))
+            .await
+            .unwrap());
+        assert_eq!(store.get_lockdown("c1").await.unwrap(), None);
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn stale_finish_cannot_audit_or_release_a_new_claim_generation() {
+        let store = test_store().await;
+        let old = ticket(&store, "renewed").await;
+        assert!(store.claim_channel(&old, "c1").await.unwrap());
+        assert!(store.release(&old).await.unwrap());
+        let new = ticket(&store, "renewed").await;
+        assert!(store.claim_channel(&new, "c1").await.unwrap());
+        let row = finish_row("renewed", "locked_down");
+        let mut wrong_action = row.clone();
+        wrong_action.action = "moderation.unlock".to_owned();
+        assert!(!store
+            .finish(&new, &wrong_action, "wrong", None)
+            .await
+            .unwrap());
+        assert!(!store.finish(&old, &row, "old", None).await.unwrap());
+        let rival = ticket(&store, "rival").await;
+        assert!(!store.claim_channel(&rival, "c1").await.unwrap());
+        let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_audit")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(audits, 0);
+        assert!(store.finish(&new, &row, "new", None).await.unwrap());
+        store.cleanup().await;
     }
 
     fn audit_row(tag: &str, action: &str, outcome: &str) -> ChannelAuditRow {
@@ -822,6 +1302,78 @@ mod tests {
         store.cleanup().await;
     }
 
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn shared_timestamp_schema_preserves_channel_claim_and_audit_instants() {
+        let store = test_store().await;
+        let typed_columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = current_schema() AND data_type = 'timestamp with time zone'
+               AND ((table_name = 'moderation_idempotency'
+                     AND column_name IN ('claimed_at', 'completed_at'))
+                    OR (table_name = 'moderation_audit' AND column_name = 'created_at'))",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("reads shared timestamp types");
+        assert_eq!(typed_columns, 3);
+        let time = "2026-09-30T02:00:00.123+02:00";
+        let ticket = winning_ticket(
+            store
+                .claim(
+                    "g-timestamps",
+                    "key-timestamps",
+                    "moderation.purge",
+                    "hash",
+                    time,
+                )
+                .await
+                .expect("claims against the member-upgraded schema"),
+        );
+        assert!(store
+            .complete(&ticket, "purged", "{}", time)
+            .await
+            .expect("completes"));
+        let instant_preserved: bool = sqlx::query_scalar(
+            "SELECT claimed_at = '2026-09-30T00:00:00.123Z'::timestamptz
+                    AND completed_at = claimed_at
+             FROM moderation_idempotency
+             WHERE guild_id = 'g-timestamps' AND idempotency_key = 'key-timestamps'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("reads persisted claim instants");
+        assert!(instant_preserved);
+        assert!(matches!(
+            store
+                .claim(
+                    "g-timestamps",
+                    "key-timestamps",
+                    "moderation.purge",
+                    "hash",
+                    time
+                )
+                .await
+                .expect("replays"),
+            ChannelClaim::Replayed { .. }
+        ));
+        let mut row = audit_row("timestamps", "moderation.purge", "purged");
+        row.created_at = time.to_owned();
+        store
+            .record_audit(&row)
+            .await
+            .expect("audits against the shared schema");
+        let audit_instant_preserved: bool = sqlx::query_scalar(
+            "SELECT created_at = '2026-09-30T00:00:00.123Z'::timestamptz
+             FROM moderation_audit WHERE request_id = 'req-timestamps'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("reads persisted audit instant");
+        assert!(audit_instant_preserved);
+        store.cleanup().await;
+    }
+
     fn winning_ticket(claim: ChannelClaim) -> ChannelClaimTicket {
         let ChannelClaim::Claimed { ticket } = claim else {
             panic!("expected a winning claim, got {claim:?}");
@@ -934,6 +1486,96 @@ mod tests {
                 );
             }
         }
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn timestamp_upgrade_preserves_legacy_rows_and_claim_generations() {
+        let store = test_store().await;
+        let claim = ticket(&store, "upgrade").await;
+        let row = finish_row("upgrade", "locked_down");
+        assert!(store.finish(&claim, &row, "saved", None).await.unwrap());
+        // Reconstruct the original 0120 column types only in this isolated schema.
+        sqlx::raw_sql(
+            "ALTER TABLE moderation_audit ALTER COLUMN created_at TYPE TEXT USING created_at::text;
+             ALTER TABLE moderation_idempotency ALTER COLUMN claimed_at TYPE TEXT USING claimed_at::text;
+             ALTER TABLE moderation_idempotency ALTER COLUMN completed_at TYPE TEXT USING completed_at::text;",
+        ).execute(store.pool()).await.unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../cutover/migrations/0124_channel_shared_timestamps.sql"
+        ))
+        .execute(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .claim("g1", "upgrade", "moderation.lockdown", "hash", "now")
+                .await
+                .unwrap(),
+            ChannelClaim::Replayed {
+                outcome: "locked_down".to_owned(),
+                result_json: "saved".to_owned()
+            }
+        );
+        assert!(!store.release(&claim).await.unwrap());
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM moderation_audit WHERE request_id = 'req-upgrade'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn shared_ledger_accepts_channel_and_member_timestamp_bindings() {
+        let store = test_store().await;
+        // The member slice uses these exact shared timestamp types and SQL
+        // shapes (0110/0112). This is a schema contract, not a member-runtime test.
+        let types: Vec<String> = sqlx::query_scalar(
+            "SELECT data_type FROM information_schema.columns
+             WHERE table_schema = current_schema() AND
+               ((table_name = 'moderation_audit' AND column_name = 'created_at') OR
+                (table_name = 'moderation_idempotency' AND column_name IN ('claimed_at', 'completed_at')))",
+        ).fetch_all(store.pool()).await.unwrap();
+        assert_eq!(types.len(), 3);
+        assert!(types.iter().all(|t| t == "timestamp with time zone"));
+        let time = "2026-09-30T00:00:00.000Z";
+        sqlx::query(
+            "INSERT INTO moderation_idempotency
+             (guild_id, idempotency_key, action, request_hash, state, claimed_at)
+             VALUES ('g1', 'member', 'moderation.warn', 'hash', 'in_flight', $1::text::timestamptz)",
+        ).bind(time).execute(store.pool()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO moderation_audit
+             (request_id, guild_id, actor_id, action, target_id, channel_id, reason,
+              outcome, idempotency_key, metadata_json, created_at)
+             VALUES ('member', 'g1', 'actor', 'moderation.warn', 'target', NULL,
+                     'test', 'warned', 'member', '{}', NOW())",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let claim = ticket(&store, "channel").await;
+        assert!(store
+            .finish(&claim, &finish_row("channel", "locked_down"), "{}", None)
+            .await
+            .unwrap());
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_audit")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        // Repeat-safe when member migration has already converted the shared columns.
+        sqlx::raw_sql(include_str!(
+            "../../cutover/migrations/0124_channel_shared_timestamps.sql"
+        ))
+        .execute(store.pool())
+        .await
+        .unwrap();
         store.cleanup().await;
     }
 

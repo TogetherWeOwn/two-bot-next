@@ -6,13 +6,22 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-db = ["two-bot-core/db"]
+default = []
+db = ["two-bot-core/db", "dep:sqlx", "dep:time"]
+# Explicit service-DB acceptance lane; no credentialed Discord traffic.
+db-tests = ["db"]
+# Loopback-only origin seam for downstream acceptance tests; never enabled by runtime.
+test-support = []
+
+[lints]
+workspace = true
 
 # Explicit version on the intra-workspace dep (see crates/bot/Cargo.toml):
 # cargo-deny `wildcards = "deny"` rejects version-less deps.
 [dependencies]
 two-bot-core = { version = "0.2.0", path = "../core" }
 bytes = { workspace = true }
+hex = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { version = "1", default-features = false }
@@ -21,21 +30,29 @@ hyper-util = { workspace = true, features = ["http2"] }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+sqlx = { workspace = true, optional = true }
 twilight-cache-inmemory = { workspace = true }
 twilight-gateway = { workspace = true }
 twilight-http = { workspace = true }
 twilight-model = { workspace = true }
 
+time = { workspace = true, optional = true }
+
 # Local Discord doubles and measurement drivers only; none ship in release.
 [dev-dependencies]
+axum = { workspace = true }
+anyhow = { workspace = true }
+two-bot-cutover = { version = "0.2.0", path = "../cutover" }
 sqlx = { workspace = true }
 two-bot-testsupport = { path = "../testsupport", version = "0.2.0" }
 futures-util = { workspace = true, features = ["sink"] }
 rustls = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-websockets = { workspace = true }
 tracing-subscriber = { workspace = true }
 twilight-gateway = { workspace = true }

@@ -119,8 +119,46 @@ They cover migration coexistence/re-execution, CRUD/guild fencing, timestamp
 round-trip, 16 simultaneous claimants, lease expiry/stale-owner fencing, reopened
 pools, mocked Discord crash reconciliation, and 20+5 overflow across two passes.
 
-Remaining on the runtime slice: register shared-router handlers, consume these
-plans through the shared REST executor, wire `fetch_feed` into the poll adapter
-behind its delivery-store orchestration, start/stop the poll timer, attach
-bounded audit/failure recovery, and run the connector/mock-Discord end-to-end
-acceptance tests. Keep activation default-off.
+## Managed runtime integration
+
+Feed commands are delivered by PR #116. The managed poller slice registers a
+`feeds` job in the existing website/community job supervisor and uses that
+context's executor/pool. It does not introduce a dispatcher, client, detached
+interval, gateway REST/DB work, migration, or activation. `TWO_ANNOUNCEMENTS=1`
+is required; absent/off parks the job. The validated 60–86400-second interval
+still defaults to 300, with no startup jitter. `FeedPollSchedule` is guarded so
+normal return, panic, timeout or cancellation finishes the pass. Existing job
+ownership skips busy deadlines and cancels/joins active work during shutdown;
+gateway reconnects do not construct another feed job.
+
+The adapter passes the production source only to `fetch_feed`, checks the final
+HTTP status before parsing, and applies the POST budget after ledger arbitration.
+Every send uses the exact 24-character string nonce through the shared executor's
+`post_message_with_nonce` method (even decimal-looking/zero-prefixed strings),
+with enforced nonce and empty allowed mentions. At most 20 POST attempts, not
+just successes, are allowed per feed/pass. Invalid items and feed failures do
+not stop later items/feeds. Audit reasons are fixed classes or bounded count
+summaries; raw HTTP, source and database errors are not logged.
+
+Recovery separately discovers up to 20 expired ledger rows per feed/pass, even
+when HTTP fails or the item disappeared from XML. Oldest leases are selected
+first; reclaiming unresolved rows rotates their lease to avoid starving the
+rest of the recovery queue. XML candidates use fresh-only arbitration: existing
+pending rows are left to that queue, never reclaimed without a history read
+because the pass's recovery budget ran out. New items retain their independent
+20-attempt POST budget. Each reconciliation uses the shared executor for
+one authenticated-user read and one bounded 100-message history read. Exact
+string nonce, channel, authenticated author and nonzero snowflake message ID
+must all match uniquely. A miss, malformed/ambiguous evidence, failed send or
+completion error retains the pending claim and writes `recovery_required`.
+The job exposes fixed error classes and poll count summaries through the
+existing status/log surface. Only a proven pre-mutation rejection or a fresh
+over-budget/never-sent placeholder can release a claim.
+
+Integration fixtures live in `crates/bot/src/feed_jobs_tests.rs`: injected feed
+HTTP still traverses `fetch_feed_with`'s pinned-request/body policy, Discord uses
+the existing scripted REST double, and ignored DB journeys reuse the shared
+strict `TestDatabase` fixture with independent pools. CI explicitly runs these
+against its disposable service. Runtime acceptance is **not certified by source
+or fixtures alone**: record the exact tested head, hosted results and independent
+review in the poller card before declaring it delivered. Default-off remains.

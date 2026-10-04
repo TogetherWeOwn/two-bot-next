@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source": "docs/parity.md §§1–8 (legacy frozen d5d11793)",
+  "source": "docs/parity.md §§1–8 (original surfaces, re-baselined to bffccf3), §12 additions and §13 non-dropped post-freeze ledger rows",
   "sections": {
     "1": "Slash / prefix commands",
     "2": "Non-command interactions",
@@ -9,7 +9,9 @@
     "5": "DB tables & queries",
     "6": "External integrations",
     "7": "Config / env",
-    "8": "Observable behaviours"
+    "8": "Observable behaviours",
+    "12": "Baseline additions and corrections",
+    "13": "Post-freeze ledger obligations (non-dropped rows)"
   },
   "instructions": [
     "This is the **unexecuted** B4 coverage plan for [TOG-9699](/TOG/issues/TOG-9699), authored under [TOG-10885](/TOG/issues/TOG-10885). Running the soak is out of scope. `manual`/`automated`/`waived` describe the verification method, not PASS. No row has been executed by writing this checklist.",
@@ -25,9 +27,9 @@
     "",
     "## Maintaining coverage",
     "",
-    "JSON is authoritative; each `parity.section` + `parity.row` copies every source table cell except Map. Repeated ClientReady, attendance and member-event surfaces remain separate. Only DROP-prefixed Maps without an S/B/NEW slice or TOG owner are excluded; mixed mapped/DROP rows remain covered in either order, including mapped replacement work. §7 is prose: one explicit catalogue entry covers env_only/cold/hot. Adding a table there also requires entries.",
+    "JSON is authoritative; each `parity.section` + `parity.row` copies every source table cell except Map. Repeated ClientReady, attendance and member-event surfaces remain separate. Only DROP-prefixed Maps without an S/B/NEW slice or TOG owner are excluded; mixed mapped/DROP rows remain covered in either order, including mapped replacement work. §7 is prose: one explicit catalogue entry covers env_only/cold/hot. Adding a table there also requires entries. §12 copies every cell of its addition and Redirect tables except the disposition, under the same DROP rule. §13 covers each `ported`/`carded`/`gap` ledger row (commit link, area, change and status); `dropped` rows, including every history-rewrite replay, are excluded because their features stay mapped in §§1–8. Each §12/§13 entry lists `owner`: exactly the TOG cards its disposition names, in order (a `ported` row without a card names its owning slice); a changed status, row or owner card is stale until the entry is updated.",
     "",
-    "Run `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py` and `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v`. CI runs both offline before Cargo. After editing JSON, regenerate Markdown with `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py --render > docs/soak-checklist.md`. Source drift, missing/stale/duplicate rows, empty steps/evidence, invalid statuses, reasonless waivers, missing automated commands, missing voice links or Markdown drift fail the gate.",
+    "Run `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py` and `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v`. CI runs both offline before Cargo. After editing JSON, regenerate Markdown with `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py --render > docs/soak-checklist.md`. Source drift, missing/stale/duplicate rows, missing or stale owner cards, empty steps/evidence, invalid statuses, waivers missing reason or approver, missing automated commands, automated Cargo commands naming an unknown `-p` package, a missing test target or no matching test (read offline from source, never run), missing voice links or Markdown drift fail the gate.",
     "",
     "## Existing fixture entry points",
     "",
@@ -1094,7 +1096,8 @@
       "action": "Use an authorized test-container backup fixture at simulated daily 04:17; capture its TOG-9881 receipt.",
       "expected": "Dump/upload timer equivalent invokes once with integrity receipt; no staging/production DB connection.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s4-15",
@@ -1109,7 +1112,8 @@
       "action": "Use disposable guild-config snapshot fixture at simulated daily 04:31 UTC under TOG-9881.",
       "expected": "Sealed snapshot timer equivalent invokes once; allowlisted metadata only, no secret/log leakage.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s4-16",
@@ -1124,7 +1128,8 @@
       "action": "Attach TOG-9881 monthly restore-drill receipt from agent-testdb/CI services only.",
       "expected": "Restore verifies integrity and fixture row counts in isolated test DB; never replaces staging or production.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-01",
@@ -1139,22 +1144,24 @@
       "action": "Replay synthetic joins/messages/leaves and invite snapshots using the authorized test-container funnel store fixture.",
       "expected": "Append-only events and member/invite projections are idempotent and guild-scoped.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-02",
       "parity": {
         "section": 5,
         "row": [
-          "`internal_nonces`, `internal_idempotency`, `internal_action_log`, `internal_discord_events`",
-          "website-callback replay guard, idempotency, audit, dedupe"
+          "`internal_nonces`, `internal_clock_high_water`, `internal_idempotency`, `internal_action_log`, `internal_discord_events`",
+          "website-callback replay guard (plus its F8 clock high-water mark), idempotency, audit, dedupe"
         ]
       },
       "status": "waived",
       "action": "Send signed synthetic actions, replay nonce/idempotency key, and repeat Discord callback in CI store fixtures.",
       "expected": "Durable nonce refusal, stable replay response and one action/event audit across restart.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-03",
@@ -1169,7 +1176,8 @@
       "action": "Load website contract fixture on agent-testdb/CI and query every web_v1 read contract view there.",
       "expected": "Contract metadata, counters, ranks and scheduled events agree atomically; no staging database queried.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-04",
@@ -1184,7 +1192,8 @@
       "action": "Run presence-series fixture ticks at 1h in authorized test DB.",
       "expected": "One bounded presence row per tick with correct series ordering.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-05",
@@ -1199,7 +1208,8 @@
       "action": "Run counter snapshot and raid-exclusion fixtures in authorized test DB.",
       "expected": "Excluded members do not inflate live counts; history preserves prior snapshots.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-06",
@@ -1214,7 +1224,8 @@
       "action": "Use redirect campaign fixture slug against local fixture store, then unknown slug.",
       "expected": "Known slug records invite_click once and redirects; unknown slug uses fallback without invented attribution.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-07",
@@ -1230,7 +1241,8 @@
       "expected": "60s cooldown, 5 XP/min voice compatibility, reward idempotency and import-run ledger match fixture expectations.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-08",
@@ -1245,7 +1257,8 @@
       "action": "Run synthetic warnings/tempbans/lockdowns and duplicate moderation claim fixtures on test DB.",
       "expected": "Ledger, expiry queue, prior overwrite and idempotency claim persist across replay.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-09",
@@ -1260,7 +1273,8 @@
       "action": "Run audit-state fixture transitions with 5m claim expiry and 1h mirror recheck in test DB.",
       "expected": "Only valid none/pending/delivering/delivered/quarantined transitions; expired claim recoverable and duplicates blocked.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-10",
@@ -1275,7 +1289,8 @@
       "action": "Run accepted/rejected/edit/retry automod fixtures on test DB.",
       "expected": "One processed-message claim; violation ladder advances only for distinct qualifying violations.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-11",
@@ -1290,7 +1305,8 @@
       "action": "Run open/claim/close/recovery/transcript-expiry fixture in test DB.",
       "expected": "Lifecycle and transcript retention persist through restart; duplicate open does not create second ticket.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-12",
@@ -1305,7 +1321,8 @@
       "action": "Run alerts-only anti-nuke and join-burst fixtures on test DB.",
       "expected": "Signals/incidents/risk flags persist; join-risk never kicks.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-13",
@@ -1320,7 +1337,8 @@
       "action": "Run create/remove/custom-trigger/schedule/sticky fixtures on test DB.",
       "expected": "Definitions, due queue, last sticky and audit persist with guild isolation and idempotent claims.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-14",
@@ -1335,7 +1353,8 @@
       "action": "Run role add/remove/replace and claim-renewal fixtures on test DB.",
       "expected": "Claim lease prevents duplicate role action; metadata-only audit persists.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-15",
@@ -1350,7 +1369,8 @@
       "action": "Run fact/heartbeat/weekly-scorecard fixtures on test DB, excluding dropped rota extensions.",
       "expected": "Facts and stream liveness yield one weekly run/alert; dropped rota tables are not required.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-16",
@@ -1365,7 +1385,8 @@
       "action": "Run RSVP replacement, LFG capacity, feed dedupe and announcement audit fixtures on test DB.",
       "expected": "Latest RSVP, bounded signups, single delivery and idempotent announcement audit persist.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-17",
@@ -1380,7 +1401,8 @@
       "action": "Run permitted/forbidden setting changes and version-poll fixtures on test DB.",
       "expected": "Guild setting version and audit advance together for attributed hot/cold writes; wired hot changes apply live, cold changes require restart; env_only and unknown writes are refused before persistence/audit.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s5-18",
@@ -1395,7 +1417,8 @@
       "action": "Insert/remove the kill-switch fixture only in authorized test DB; simulate pending audit delivery.",
       "expected": "Presence halts the audit pipeline; absence permits resume; failure mode matches audit policy.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s6-01",
@@ -1468,7 +1491,8 @@
       "action": "In local mock/CI replay all 18 signed internal actions plus bad signature, stale timestamp, reused nonce and rate-bound fixtures; do not call live mutation endpoints.",
       "expected": "POST canonical HMAC, replay/skew rejection, durable idempotency; 20 burst/1s and add_member 10/0.5s buckets; nine moderation actions keep protection.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s6-06",
@@ -1512,7 +1536,8 @@
       "action": "Run pool/timeout/staging-guard negative fixtures with no live URLs; test connectivity only to agent-testdb/CI.",
       "expected": "Wrong stage/guild guard refuses before connect; configured pool ≤5 and statement timeout bounded.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s6-09",
@@ -1625,7 +1650,8 @@
       "action": "Run audit-switch halt/status/resume against local authorized test-container fixture only, never staging/production DB.",
       "expected": "Switch presence halts, status reports accurately, resume clears only the fixture switch and pending audit resumes safely.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
       "id": "s8-04",
@@ -1647,7 +1673,7 @@
         "section": 8,
         "row": [
           "Automod (staging-only unless live-approved; `dryRun` unless `ENFORCE=1`; 6 filters; sanctions `1:delete,2:warn,3:timeout:600`; target-protection before delete)",
-          "bad-word NFKC matching, invite/link checks, `bat/cmd/…` attachment blocklist"
+          "bad-word NFKC matching, invite/link checks, `bat/cmd/…` attachment blocklist; whitespace edge accepted ([TOG-12582](/TOG/issues/TOG-12582)): legacy JS `\\s` treats U+FEFF as blank and U+0085 as non-blank while Rust `split_whitespace` does the opposite, but both collapse to empty-vs-nonempty only for these two codepoints and all repeat-expiry blanks stay agreed (NEL: [TOG-10052](/TOG/issues/TOG-10052), format chars: [TOG-10048](/TOG/issues/TOG-10048))"
         ]
       },
       "status": "manual",
@@ -1689,15 +1715,1965 @@
         "section": 8,
         "row": [
           "Operator scripts (82 files)",
-          "schedule/backfill/migration one-shots → **[TOG-9882](/TOG/issues/TOG-9882)** (MEE6 XP, rewards, history backfill, dedupe, message-milestone scan, join capture); backup/restore/snapshot → [TOG-9881](/TOG/issues/TOG-9881); read-only reports (funnel, gate, attribution, roster, dashboard, scorecard, presence-trend, growth-review, raid-list) → **DROP** as runtime (query Postgres/`web_v1` on demand); staging provision/verify/reset + e2e harness → **DROP** (replaced by mock-discord acceptance + **S6** cutover plan); `reconcile` → **DROP** (absent/broken upstream); guild-config snapshot/restore → [TOG-9881](/TOG/issues/TOG-9881); temp-voice → staging shape-check only, no runtime on legacy `main` (TOG-3471 unmerged) → port the check under **S6**, no runtime row"
+          "schedule/backfill/migration one-shots → **[TOG-9882](/TOG/issues/TOG-9882)** (MEE6 XP, rewards, history backfill, dedupe, message-milestone scan, join capture); backup/restore/snapshot → [TOG-9881](/TOG/issues/TOG-9881); read-only reports (funnel, gate, attribution, roster, dashboard, scorecard, presence-trend, growth-review) → **DROP** as runtime (query Postgres/`web_v1` on demand); manual raid-list/raid-remove → [TOG-10867](/TOG/issues/TOG-10867) ([runbook](raid-response.md)), not scheduled runtime; staging provision/verify/reset + e2e harness → **DROP** (replaced by mock-discord acceptance + **S6** cutover plan); `reconcile` → **DROP** (absent/broken upstream); guild-config snapshot/restore → [TOG-9881](/TOG/issues/TOG-9881); temp-voice runtime shipped → [TOG-10091](/TOG/issues/TOG-10091) and voice acceptance [TOG-10119](/TOG/issues/TOG-10119); voice/leave-gap integrity reports are retained on [TOG-11152](/TOG/issues/TOG-11152), unlike the other runtime report drops"
         ]
       },
       "status": "waived",
-      "action": "Attach TOG-9882 import/backfill/dedupe fixture receipts and TOG-9881 backup/restore/config receipts; attach S6 temp-voice shape-check via TOG-10119. Do not run dropped scripts.",
-      "expected": "Ported one-shots preserve fixture totals/reward/history idempotency; sealed restore validated in test DB; reports/reconcile/rota stay dropped; temp-voice has no runtime promise.",
+      "action": "Attach TOG-9882 import/backfill/dedupe and TOG-9881 backup/restore/config fixture receipts; attach [TOG-10867](/TOG/issues/TOG-10867) raid-removal loopback/CLI and disposable raid-list DB fixture receipts; consume full temp-voice runtime acceptance from TOG-10119 and read-only voice/leave-gap integrity receipts from TOG-11152. Do not run dropped scripts or live removals.",
+      "expected": "Ported one-shots preserve fixture totals/reward/history idempotency; sealed restore validated in test DB; manual raid tools default to dry-run, fence live guild access, protect staff on every retry and audit each reached target; ordinary report runtime/reconcile/rota stay dropped. Temp-voice runtime and voice/leave-gap integrity reports remain required, not waived by the historical shape-check.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-01",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Temporary voice creator channels, control panels and `/voice` commands",
+          "[tempVoice/discord.ts](https://github.com/TogetherWeOwn/two-bot/blob/bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3/src/tempVoice/discord.ts), [config.ts](https://github.com/TogetherWeOwn/two-bot/blob/bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3/src/tempVoice/config.ts), [store.ts](https://github.com/TogetherWeOwn/two-bot/blob/bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3/src/tempVoice/store.ts)"
+        ]
+      },
+      "owner": [
+        "TOG-10093",
+        "TOG-10099",
+        "TOG-10101",
+        "TOG-10091",
+        "TOG-10119"
+      ],
+      "status": "manual",
+      "action": "Consume the TOG-10119 temp-voice scenario: join the creator channel, use the room control panel and each `/voice` subcommand on the created room, then leave so the sweep removes it.",
+      "expected": "Creator, panel and `/voice` routing work end to end in the allowlisted staging guild; config, tables, panel routing and sweeps match TOG-10091. The “never shipped” drop stays withdrawn; per-commit legs are the TOG-10093/TOG-10099/TOG-10101 s13 rows.",
+      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s12-02",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Website `event.read`, making the internal-action catalog **19**, not 18",
+          "[internal/actions.ts:35](https://github.com/TogetherWeOwn/two-bot/blob/bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3/src/internal/actions.ts#L35), [mapped-event verifier](https://github.com/TogetherWeOwn/two-bot/blob/bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3/src/internal/actions.ts#L431-L465)"
+        ]
+      },
+      "owner": [
+        "TOG-10603",
+        "TOG-10862"
+      ],
+      "status": "waived",
+      "action": "Use TOG-10603’s receiver and TOG-10862’s executor fixtures to send signed `event.read` calls for a mapped and an unmapped event key, then replay one signature.",
+      "expected": "The catalog lists 19 internal actions; the mapped key returns its Discord event, the unmapped key refuses without Discord writes and the replay is refused. Hashed dedupe is not accepted as a key→ID accessor.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-03",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Chronological membership and ordered/idempotent voice capture",
+          "[baseline commit](https://github.com/TogetherWeOwn/two-bot/commit/bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3)"
+        ]
+      },
+      "owner": [
+        "TOG-11149"
+      ],
+      "status": "waived",
+      "action": "Run TOG-11149’s gateway/member chronology contract suite on test containers: out-of-order join/leave, same-time ties, replay, channel-scoped voice dedupe, reconnect/session drop, server leave and unknown start.",
+      "expected": "Membership projections follow event chronology, not arrival order; voice frames dedupe per channel and close on drop/leave; unknown starts stay unknown. Store coverage alone does not pass this row.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-04",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Backup v4 coverage and input/publication/restore safety",
+          "§13 backup rows"
+        ]
+      },
+      "owner": [
+        "TOG-11142",
+        "TOG-11186"
+      ],
+      "status": "waived",
+      "action": "Use TOG-11142/TOG-11186 test-container backup fixtures: dump and restore every bot-owned table, then verify a dump with malformed manifest/end records.",
+      "expected": "All bot-owned tables round-trip with owned sequences reset; malformed non-table records fail verification. Completed-output publication and stable-ID restore (s13-90ab4b7, s13-3dc9720) stay green; none of this is deployed nightly-timer evidence.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-05",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Session selection, hidden fallback, rank and self-role bounds",
+          "§13 onboarding/leveling/self-role rows"
+        ]
+      },
+      "owner": [
+        "TOG-11180",
+        "TOG-10278",
+        "TOG-11147",
+        "TOG-10343",
+        "TOG-10087",
+        "TOG-10292"
+      ],
+      "status": "manual",
+      "action": "On the staging fixture guild, complete onboarding session selection with a disposable member, run `/rank member:` for a fixture member without XP, and attempt over-limit self-role panel configuration through the normal config path; use the onboarding/leveling fixtures for payloads Discord cannot send.",
+      "expected": "Valid picks route once in catalog order and invisible fallbacks are withheld (TOG-11180/TOG-10278); a member without XP shows Unranked inside the configured guild fence (TOG-11147/TOG-10343); panels over 20 reactions, 100-character custom_id or 80-character label are refused (TOG-10087/TOG-10292).",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s12-06",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Presence, scorecard and mirror safety",
+          "§13 scheduled-job rows"
+        ]
+      },
+      "owner": [
+        "TOG-11146",
+        "TOG-11145",
+        "TOG-11181"
+      ],
+      "status": "waived",
+      "action": "Use the owning slices’ test-container and mock-REST fixtures: an oversized roster scan, a failed Monday scorecard run, a stopped collector with a pending cycle and malformed scheduled-event responses.",
+      "expected": "Roster scans stop at the row/page cap and persist truncation/backoff (TOG-11146); scorecards retry only inside the Monday window (TOG-11145); stopped-collector results are discarded and malformed elements never replace the mirror (TOG-11181).",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-07",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Feed polling and announcement acknowledgement",
+          "§13 feed/announcement rows"
+        ]
+      },
+      "owner": [
+        "TOG-11022",
+        "TOG-10260"
+      ],
+      "status": "manual",
+      "action": "Poll one approved public feed into a disposable announcement channel and invoke the announcement and LFG commands; take redirect, timeout, per-item, Atom, crashed-claim and over-cap legs from the TOG-11022 s13 fixture rows.",
+      "expected": "The managed poller delivers the approved item once (TOG-11022); commands acknowledge/defer before service I/O and the reserved LFG leave-action role key is refused (TOG-10260). Feed CRUD alone does not pass this row.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s12-08",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Runtime audit, shutdown release and activation",
+          "§13 related rows"
+        ]
+      },
+      "owner": [
+        "TOG-10346",
+        "TOG-10869",
+        "TOG-11140"
+      ],
+      "status": "manual",
+      "action": "From the staging boot log and one controlled redeploy, capture the activation allowlist decision, requested intents and runtime audit records; attach TOG-10869’s shutdown-preflight fixture output.",
+      "expected": "Boot activates only allowlisted identity/capabilities with intents matching enabled capabilities (TOG-11140); audit records boot/timer events (TOG-10346); preflight reports truncation only when rows were cut and names stranded unban claims with release steps (TOG-10869). A legacy staging allowlist never authorizes activation.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s12-09",
+      "parity": {
+        "section": 12,
+        "row": [
+          "New read-only analytical reports",
+          "[voiceReconcile.ts](https://github.com/TogetherWeOwn/two-bot/blob/bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3/src/analytics/voiceReconcile.ts), [anomalies.ts](https://github.com/TogetherWeOwn/two-bot/blob/bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3/src/analytics/anomalies.ts)"
+        ]
+      },
+      "owner": [
+        "TOG-11152"
+      ],
+      "status": "waived",
+      "action": "Run TOG-11152’s voice reconcile and member-leave-gap reports against an authorized test-container fixture.",
+      "expected": "Reports are read-only, use the events-write heartbeat, retain and exclude unknown starts and compare timestamps by instant, with no auto-repair. Funnel/attribution/anomaly/dashboard runtimes stay dropped under §9.3.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-10",
+      "parity": {
+        "section": 12,
+        "row": [
+          "[Campaign miss cache](https://github.com/TogetherWeOwn/two-bot/blob/bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3/src/redirect/campaigns.ts#L85-L135): null misses cached; default negative TTL ≤2s, hit TTL 30s",
+          "[redirect-store.ts:89–103](https://github.com/TogetherWeOwn/two-bot-next/blob/8cc6edf70188ea0f6f0f0752af27a60c6431283b/wrangler/src/redirect-store.ts#L89-L103) queries the DB for every lookup; no negative cache"
+        ]
+      },
+      "owner": [
+        "TOG-11153"
+      ],
+      "status": "waived",
+      "action": "With TOG-11153’s local redirect-store fixture, look up one unknown slug repeatedly inside and after the negative TTL, then register it and look it up again.",
+      "expected": "Repeated misses inside the ≤2s negative TTL cause one store lookup; the slug resolves after the TTL; hits cache for 30s. No long-lived negative entry.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-11",
+      "parity": {
+        "section": 12,
+        "row": [
+          "[Trusted Node proxy chain](https://github.com/TogetherWeOwn/two-bot/blob/bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3/src/redirect/clientIp.ts)",
+          "[index.ts:333](https://github.com/TogetherWeOwn/two-bot-next/blob/8cc6edf70188ea0f6f0f0752af27a60c6431283b/wrangler/src/index.ts#L333) already derives caller from `CF-Connecting-IP`, not client X-Forwarded-For; `redirect.ts` has per-caller admission"
+        ]
+      },
+      "owner": [
+        "TOG-11153"
+      ],
+      "status": "manual",
+      "action": "Send one request with a spoofed `X-Forwarded-For` to the approved staging redirect origin for a disposable slug; never production go.two.gg.",
+      "expected": "Caller identity and the throttle bucket come from `CF-Connecting-IP`; the spoofed header changes neither admission nor the logged caller. Node hop-walking stays dropped.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s12-12",
+      "parity": {
+        "section": 12,
+        "row": [
+          "[Reserved `healthz` campaign input](https://github.com/TogetherWeOwn/two-bot/blob/bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3/src/redirect/campaigns.ts#L39-L47)",
+          "[redirect.ts:82–84](https://github.com/TogetherWeOwn/two-bot-next/blob/8cc6edf70188ea0f6f0f0752af27a60c6431283b/wrangler/src/redirect.ts#L82-L84) allows the slug while exact `/healthz` is served separately at `:219`; generic input parsing is not reserved-name protection"
+        ]
+      },
+      "owner": [
+        "TOG-11183"
+      ],
+      "status": "manual",
+      "action": "Attempt campaign slug `healthz` through TOG-11183’s campaign input fixture, then request `/healthz` on the approved staging redirect origin.",
+      "expected": "The reserved slug is refused at input; the `/healthz` probe still answers. No slug-management UI exists.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s12-13",
+      "parity": {
+        "section": 12,
+        "row": [
+          "[Listener port and fallback validation](https://github.com/TogetherWeOwn/two-bot/blob/bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3/src/redirect/config.ts)",
+          "[redirect-store.ts:64–66](https://github.com/TogetherWeOwn/two-bot-next/blob/8cc6edf70188ea0f6f0f0752af27a60c6431283b/wrangler/src/redirect-store.ts#L64-L66) parses snapshot JSON without row validation; redirect validates fallback only when choosing it"
+        ]
+      },
+      "owner": [
+        "TOG-11183"
+      ],
+      "status": "waived",
+      "action": "Load TOG-11183’s local fixture with an invalid fallback code and malformed snapshot rows.",
+      "expected": "Invalid fallback/snapshot inputs are rejected before any redirect effect; the Worker has no listener-port setting.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-14",
+      "parity": {
+        "section": 12,
+        "row": [
+          "[Lookup failure `slug` and bounded `errorClass`](https://github.com/TogetherWeOwn/two-bot/blob/bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3/src/redirect/server.ts#L225)",
+          "[redirect.ts:253–257](https://github.com/TogetherWeOwn/two-bot-next/blob/8cc6edf70188ea0f6f0f0752af27a60c6431283b/wrangler/src/redirect.ts#L253-L257) logs slug plus free-form error text, without the bounded classifier"
+        ]
+      },
+      "owner": [
+        "TOG-11183"
+      ],
+      "status": "waived",
+      "action": "Force a store lookup failure for a known slug in TOG-11183’s local redirect fixture.",
+      "expected": "The log names the slug and a bounded `errorClass` from the fixed classifier; no credentials or raw error text.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-15",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Staging rollout gate receipt: intended Worker version at 100% traffic, `/readyz` 200 with compiled revision/build ID, allowlisted receipt fields, plus Neon `channel_binding` acceptance",
+          "[staging-rollout-gate.md](staging-rollout-gate.md), `scripts/staging_rollout.py`, `crates/core/src/database_url.rs` (#156)"
+        ]
+      },
+      "owner": [
+        "TOG-9699"
+      ],
+      "status": "manual",
+      "action": "Attach the staging rollout-gate receipt for the deployed soak build: require the intended Worker version at 100% traffic, `/readyz` 200 with the exact compiled revision/build ID and only allowlisted receipt fields, then a control-plane re-check; a 503 or a previous-instance response never passes.",
+      "expected": "The deployed soak build serves the intended Worker version at 100% traffic with `/readyz` 200 carrying the compiled revision/build ID; the receipt carries only allowlisted fields. The gate refuses stale-instance responses.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s12-16",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Bootstrap migration accepts the `Security` release-notes section in `migrate-release-notes`",
+          "`scripts/migrate-release-notes.cjs`, [releases.md](releases.md) (#329)"
+        ]
+      },
+      "owner": [
+        "TOG-12801"
+      ],
+      "status": "waived",
+      "action": "Run the `migrate-release-notes` bootstrap fixture with a hand-written `Security` section in Unreleased: confirm the migration preserves the Security tail, removes Unreleased, and stays idempotent; confirm any other section still fails closed.",
+      "expected": "`Security` migrates alongside Added/Fixed/Changed/Notes; unknown sections fail closed; later releases do not repeat the bootstrap tail.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-17",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Guild room access-controls store (0227 migration, whole-row upsert with fail-closed validation)",
+          "`PgRoomStore` access-controls read/write plus cutover room-store round-trip tests (#360)"
+        ]
+      },
+      "owner": [
+        "TOG-10119",
+        "TOG-13123"
+      ],
+      "status": "waived",
+      "action": "Run the #360 store round-trip fixture on authorized test containers: defaults with no row, empty role list surviving reload, per-guild isolation, lifting restrictions, adapter refusals and raw-SQL CHECK rejection of unknown commands and zero roles.",
+      "expected": "Whole-row upsert persists and reloads validated controls per guild; unknown commands and zero roles fail closed on save and load.",
+      "evidence": "Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-18",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Durable join-risk event claim store over the existing flags table (unwired, no new migration)",
+          "`JoinRiskStore` record with legacy lock-key derivation and exactly-once claim tests plus audit-DB step (#362)"
+        ]
+      },
+      "owner": [
+        "TOG-13123"
+      ],
+      "status": "waived",
+      "action": "Run the #362 join-risk claim fixture on authorized test containers: 10-way concurrent exactly-once claims, serialized burst scoring with threshold-equality bonus, old-account evidence, cross-guild isolation, out-of-window exclusion, bulk-suppression persistence, duplicate replay and the legacy-0015 upgrade shape.",
+      "expected": "Event-ID dedupe returns Duplicate on replay with never a second alert; per-guild advisory locking serializes bursts; legacy IDs stay claimed with rows untouched.",
+      "evidence": "Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-19",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Staging rollout gate timeout report (last observed stage)",
+          "`scripts/staging_rollout.py` verify and timeout-fixture tests (#367)"
+        ]
+      },
+      "owner": [
+        "TOG-13123"
+      ],
+      "status": "waived",
+      "action": "Run the #367 gate timeout fixture: no-new-rollout, unconverged rollout with instance counts, converged rollout with readyz/components/identity states, hostile component names and unparseable bodies.",
+      "expected": "Timeout output names the last observed stage from the fixed vocabulary; hostile values are dropped and unparseable bodies read body=unreadable; the gate never loosens.",
+      "evidence": "Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-20",
+      "parity": {
+        "section": 12,
+        "row": [
+          "`/access` admin command for guild voice room controls with live-actor refresh",
+          "Voice room command handler, sub-command parsing and live-actor refresh tests (#368)"
+        ]
+      },
+      "owner": [
+        "TOG-10119",
+        "TOG-13123"
+      ],
+      "status": "manual",
+      "action": "As an admin invoke /access show, creation, role, restrict and unrestrict in the disposable guild, then repeat as a non-admin; exercise unknown commands, unrestricting an unrestricted command and malformed shapes.",
+      "expected": "Admin changes persist, show reflects them and the live actor gates creation without a restart; non-admin use is refused; bad input is answered without changing anything.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s12-21",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Staging-only default-dark ingress for the internal-actions receiver",
+          "Receiver gate, container-env flags and ingress-fixture tests (#370)"
+        ]
+      },
+      "owner": [
+        "TOG-13123"
+      ],
+      "status": "waived",
+      "action": "Run the #370 ingress fixture: route absent without both the staging-only Worker var and the exact operator secret; header allowlist, body bounds, per-IP bucket and in-flight cap enforced; only the receiver envelope leaves the relay.",
+      "expected": "The route stays absent unless both staging-only var and exact secret are present; production has no var, route or secret; no container contact on refusal.",
+      "evidence": "Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-22",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Gateway checkpoint advisory-lock test serialization (tests only)",
+          "Gateway lock-fence tests with exclusive lock holders (#371)"
+        ]
+      },
+      "owner": [
+        "TOG-13123"
+      ],
+      "status": "waived",
+      "action": "Run the #371 gateway lock-fence fixture: exclusive lock holders run alone while shared TestDb lifetimes hold the fence shared; sibling checkpoint commits never queue behind a held gateway key.",
+      "expected": "No checkpoint wait exceeds its IO bound due to test-parallel lock contention; no timeout raised and no step skipped; production code untouched.",
+      "evidence": "Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-23",
+      "parity": {
+        "section": 12,
+        "row": [
+          "`/logging` admin command for guild voice notice level, channel and mention role",
+          "Voice logging settings store, command handler and live-actor refresh tests (#372)"
+        ]
+      },
+      "owner": [
+        "TOG-10119",
+        "TOG-13123"
+      ],
+      "status": "manual",
+      "action": "As an admin invoke /logging show and set notice level, channel and mention role in the disposable guild, then repeat as a non-admin; exercise bad input and store-failure fixtures.",
+      "expected": "Admin changes persist, show reflects them and the live actor applies them without a restart; non-admin use is refused; failures change nothing and say so.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s12-24",
+      "parity": {
+        "section": 12,
+        "row": [
+          "`/setup` missing-permission surfacing with category-override attribution and health line",
+          "Voice permission-findings evaluation and health-line rendering tests (#373)"
+        ]
+      },
+      "owner": [
+        "TOG-10119",
+        "TOG-13123"
+      ],
+      "status": "manual",
+      "action": "Invoke /setup in the disposable guild with clean permissions, then with an approved category-override and channel-override gap; repeat with incomplete cache data.",
+      "expected": "/setup lists each missing permission once with the causing category or channel named by mention only; clean and incomplete-data guilds report no false failure.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s12-25",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Gateway start-failure class on `/readyz` plus unconverged-rollout warm-up read",
+          "Failure-class vocabulary, readyz shape and gate warm-up tests (#374)"
+        ]
+      },
+      "owner": [
+        "TOG-13123"
+      ],
+      "status": "waived",
+      "action": "Run the #374 failure-class fixture: every fallible gateway step maps to its fixed-vocabulary class, the 503 readyz body carries phase and class with no error text, the linger serves it until shutdown cuts it short, and the gate warm-up reads an unconverged rollout only from the expected Worker version and build identity.",
+      "expected": "Failure class is an enum token, never text, URL or secret; stale Worker or image answers are ignored; no probe runs before a new rollout exists.",
+      "evidence": "Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-26",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Repo standards (PR template, issue forms, public-safe pr-lint)",
+          "PR template, issue templates and lint-fixture tests (#375)"
+        ]
+      },
+      "owner": [
+        "TOG-13123"
+      ],
+      "status": "waived",
+      "action": "Run the #375 lint fixture: standards-only headers, template sections and public-safe body rules pass while private URLs, tracker IDs and secrets fail.",
+      "expected": "Standards-only change with no runtime, staging, deploy or CI-selection behavior; the lint contract holds.",
+      "evidence": "Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-27",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Required-check fail-closed job selection with pinned contract",
+          "Check workflow selector and required-checks fixture tests (#376)"
+        ]
+      },
+      "owner": [
+        "TOG-13123"
+      ],
+      "status": "waived",
+      "action": "Run the #376 selector fixture: job-selection failure fails the required check closed and the pinned contract matches the workflow.",
+      "expected": "No silent green on selection failure; contract drift fails the gate.",
+      "evidence": "Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s12-28",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Read-only `report voice-ghosts` ghost-channel count (tracked-present, tracked-gone, untracked-present plus clean flag)",
+          "`crates/cutover/src/voice_ghosts.rs` GhostCounts diff, `report voice-ghosts` live plus `--seed` demo, seed/mock-listing integration tests and rehearsal runbook section 4 (#437)"
+        ]
+      },
+      "owner": [
+        "TOG-10119",
+        "TOG-13123"
+      ],
+      "status": "manual",
+      "action": "Run `report voice-ghosts --seed` for the demo counts, then poll the live command against the disposable staging guild during a cutover rehearsal until both gaps read empty; confirm the clean flag.",
+      "expected": "Seed demo reports the fixture gaps; live staging polling shows tracked-present, tracked-gone and untracked-present counts with no deletes or writes; the clean flag is set only when both gaps are empty.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel IDs (no tokens), sanitized command output and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s12-29",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Actionable denied-path interaction copy with next steps",
+          "Router/dispatch denied, disabled-feature, unknown-command, expired-control and generic-failure copy plus `docs/interaction-replies.md` and pinned test expectations (#425)"
+        ]
+      },
+      "owner": [
+        "TOG-13123"
+      ],
+      "status": "manual",
+      "action": "On the disposable staging guild as a non-privileged member, trigger each denial path: a permission-gated command, a disabled-feature command, an unknown slash name, a stale button/control and a forced handler failure.",
+      "expected": "Every denial names the Discord permission and who grants it (or the admin-only enable path), unknown names and expired controls are distinguishable, and generic failures keep the ref correlation id with a retry hint; all replies stay ephemeral and under the 2000-character cap.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized reply text or screenshots and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-f114c44",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[f114c44](https://github.com/TogetherWeOwn/two-bot/commit/f114c44e3003dc1494133dc296dfb8af62c8226a)",
+          "`src/discord/`, `src/index.ts/`, `src/store/`, `src/tempVoice/`",
+          "TOG-3052: temp-voice generator (join-to-create), staging only",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10093",
+        "TOG-10119"
+      ],
+      "status": "manual",
+      "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Join the configured creator channel as a disposable member, then leave.",
+      "expected": "Exactly one owned room is created and the member moved; the empty room is removed; outside the allowlisted guild nothing is created.",
+      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s13-681dc29",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[681dc29](https://github.com/TogetherWeOwn/two-bot/commit/681dc291bca04c91b0e0631dea962ccf30ea5aa5)",
+          "`src/tempVoice/`",
+          "TOG-3052: mutation harness proving the delete guards are real",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10093",
+        "TOG-10119"
+      ],
+      "status": "waived",
+      "action": "Run TOG-10093’s delete-guard mutation fixture against the sweep.",
+      "expected": "Mutating or removing temp-voice provenance makes the guard refuse deletion; a channel without provenance is never deleted.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-287d00e",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[287d00e](https://github.com/TogetherWeOwn/two-bot/commit/287d00eebc7af189f3d1f0c5a666470c0417d6de)",
+          "`src/index.ts/`, `src/tempVoice/`",
+          "TOG-3052: name the missing permission instead of asking for a retry",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10093",
+        "TOG-10119"
+      ],
+      "status": "waived",
+      "action": "In TOG-10093’s mock-Discord fixture, deny the bot’s Manage Channels/Move Members permission and trigger a create.",
+      "expected": "The reply names the missing permission instead of asking for a retry; no partial room remains.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-847fbf8",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[847fbf8](https://github.com/TogetherWeOwn/two-bot/commit/847fbf812144980e0964e02b0b024207044f0913)",
+          "`src/tempVoice/`",
+          "TOG-3471: serialize guild reservations and enforce overwrite preflight",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10093",
+        "TOG-10119"
+      ],
+      "status": "manual",
+      "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Have two disposable members join the creator channel together; take the overwrite-preflight refusal from TOG-10093’s fixture.",
+      "expected": "Each member gets one distinct room with no duplicate reservation; a create whose overwrites exceed bot permissions is refused before any channel exists.",
+      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s13-a891063",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[a891063](https://github.com/TogetherWeOwn/two-bot/commit/a8910636e2de4b6bd518a78645acb5bec0422604)",
+          "`src/core/`, `src/tempVoice/`",
+          "TOG-3471: reconcile settings, command registry, and source citations",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10093",
+        "TOG-10119"
+      ],
+      "status": "manual",
+      "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. List the deployed `/voice` subcommands and temp-voice settings in the staging guild.",
+      "expected": "Registry and settings match TOG-10091’s config/registry golden; no orphan or missing subcommand.",
+      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s13-50c3e9f",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[50c3e9f](https://github.com/TogetherWeOwn/two-bot/commit/50c3e9f584e89ba4a8ff9edb504b531f1a5e938c)",
+          "`src/tempVoice/`",
+          "TOG-3471: retain temp-voice provenance after rollback failure",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10093",
+        "TOG-10119"
+      ],
+      "status": "waived",
+      "action": "In TOG-10093’s mock-Discord fixture, fail a create and then its rollback.",
+      "expected": "The room keeps its provenance so a later sweep removes it; no unmanaged orphan channel.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-984175d",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[984175d](https://github.com/TogetherWeOwn/two-bot/commit/984175de97477389c8888a34173c6f2a654402e8)",
+          "`src/tempVoice/`",
+          "TOG-3471: serialize and journal temp-voice ownership changes",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10099"
+      ],
+      "status": "manual",
+      "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Transfer room ownership with the panel/`/voice` controls, then let the owner leave; take a failed transfer from TOG-10099’s fixture.",
+      "expected": "Ownership changes are serialized and journaled; a failed transfer rolls back to the prior owner.",
+      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s13-0495e7d",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[0495e7d](https://github.com/TogetherWeOwn/two-bot/commit/0495e7dbd26e4c2c35159c0612478bd39867d28e)",
+          "`src/announcements/`, `src/automations/`, `src/automod/`, `src/index.ts/`, `src/live/`, `src/moderation/`, `src/selfRoles/`",
+          "TOG-3186: one live-activation allowlist replacing five divergent staging fences",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11140"
+      ],
+      "status": "manual",
+      "action": "From the staging boot log, capture the live-activation allowlist decision for the bot identity, guild and capabilities.",
+      "expected": "One allowlist decides activation; capabilities outside it stay inert; no legacy staging fence is inherited.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-a7f16b9",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[a7f16b9](https://github.com/TogetherWeOwn/two-bot/commit/a7f16b9b2f4d9a85c44b566bb752575f5bbd2726)",
+          "`src/core/`, `src/discord/`, `src/index.ts/`",
+          "TOG-3314: hot-wire goodbye channels so a stored value reaches the live handler",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10278"
+      ],
+      "status": "manual",
+      "action": "Set the goodbye channel through the normal config path, then have a disposable fixture member leave without a restart.",
+      "expected": "The goodbye message posts in the newly configured channel without restart; restore the disposable configuration afterwards.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-78e7c2d",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[78e7c2d](https://github.com/TogetherWeOwn/two-bot/commit/78e7c2d3fddfc978f7dfa7e44ae0316fe7aa4244)",
+          "`src/tempVoice/`",
+          "TOG-3471: renumber temp-voice migrations to 0036/0037; filter create-path names through automod",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10093",
+        "TOG-10119"
+      ],
+      "status": "manual",
+      "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Create a room whose requested name contains a configured automod-blocked fixture term.",
+      "expected": "The create path filters or refuses the name through automod; temp-voice migrations come from TOG-10091’s test-container receipt, not staging SQL.",
+      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s13-e2a3f37",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[e2a3f37](https://github.com/TogetherWeOwn/two-bot/commit/e2a3f37422ac17c5cf801a3f041abe7ebd027e00)",
+          "`src/live/`",
+          "TOG-5356: clear self_roles in LIVE_CLEARED_CAPABILITIES",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11140"
+      ],
+      "status": "manual",
+      "action": "Use a self-role panel in the staging guild while `self_roles` is not in the activation allowlist.",
+      "expected": "The capability is cleared at boot and the interaction has no role effect; it activates only when explicitly allowlisted.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-e2082e4",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[e2082e4](https://github.com/TogetherWeOwn/two-bot/commit/e2082e42e4bf69e0915eb8b21011fe194ed1019b)",
+          "`src/discord/`",
+          "TOG-5357: gate MessageContent intent on automod/tickets",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11140"
+      ],
+      "status": "manual",
+      "action": "From the staging gateway identify log, record requested intents with automod/tickets enabled and disabled per the approved config.",
+      "expected": "MessageContent is requested only when automod or tickets is enabled.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-720419b",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[720419b](https://github.com/TogetherWeOwn/two-bot/commit/720419b9789120cdd77b5481ade916de88d863f1)",
+          "`src/core/`",
+          "TOG-5683: voice blind-window reconcile report (count startKnown:false per gap)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11152"
+      ],
+      "status": "waived",
+      "action": "Run TOG-11152’s voice reconcile report on a test-container fixture with startKnown:false sessions across a blind window.",
+      "expected": "Per-gap startKnown:false counts match the fixture; the report writes nothing.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-40e266e",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[40e266e](https://github.com/TogetherWeOwn/two-bot/commit/40e266eff752d9851ffb5f5f0948ce957d7b4ad1)",
+          "`src/core/`",
+          "TOG-5683: reconcile heartbeat from events write series, not the contained probe table",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11152"
+      ],
+      "status": "waived",
+      "action": "Seed a test-container fixture with an events-write gap and a healthy probe table; run the reconcile report.",
+      "expected": "The heartbeat comes from the events write series, so the gap is reported despite healthy probes.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-edaf2dd",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[edaf2dd](https://github.com/TogetherWeOwn/two-bot/commit/edaf2dd930c7bcb22b4f02e5f9f112b5ab420577)",
+          "`src/analytics/`, `src/core/`",
+          "TOG-5684: enforce startKnown:false exclusion from duration averages",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11152"
+      ],
+      "status": "waived",
+      "action": "Run the duration averages in TOG-11152’s report on a fixture mixing known and startKnown:false sessions.",
+      "expected": "Averages exclude startKnown:false sessions; those sessions are still counted as unknown.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-59965d0",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[59965d0](https://github.com/TogetherWeOwn/two-bot/commit/59965d0c0f9370dc9b19add3712a3acf64fb30ed)",
+          "`src/core/`, `src/discord/`",
+          "TOG-5981: serialize same-member voice frames, scope voice idempotency keys by channel",
+          "gap"
+        ]
+      },
+      "owner": [
+        "TOG-11149"
+      ],
+      "status": "waived",
+      "action": "Replay interleaved same-member voice frames across two channels through TOG-11149’s contract suite.",
+      "expected": "Frames apply serially per member and idempotency keys are channel-scoped: one session per channel, no cross-channel dedupe.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-7da2c15",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[7da2c15](https://github.com/TogetherWeOwn/two-bot/commit/7da2c15d41447a3a1b0a8033039db0fddd9633e0)",
+          "`src/discord/`",
+          "TOG-6123: drop open voice sessions on fresh session (ShardReady) as well as resume",
+          "gap"
+        ]
+      },
+      "owner": [
+        "TOG-11149"
+      ],
+      "status": "waived",
+      "action": "In TOG-11149’s contract suite, open voice sessions and then deliver a fresh ShardReady and a resume.",
+      "expected": "Open sessions are dropped on both fresh session and resume.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-448cf1d",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[448cf1d](https://github.com/TogetherWeOwn/two-bot/commit/448cf1d99f8a060d1d8fbc587c5b00bec7cee9ab)",
+          "`src/core/`, `src/discord/`, `src/staging/`",
+          "TOG-6122: close open voice session on server-leave (end to open channel, duration to leave time)",
+          "gap"
+        ]
+      },
+      "owner": [
+        "TOG-11149"
+      ],
+      "status": "waived",
+      "action": "In TOG-11149’s contract suite, have a member in voice leave the server.",
+      "expected": "The open session closes on its open channel with duration ending at the leave time.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-6928f11",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[6928f11](https://github.com/TogetherWeOwn/two-bot/commit/6928f113e3bff2b1396408f50cea60266fbd29d4)",
+          "`src/core/`, `src/store/`",
+          "TOG-6817: guard so backfill gate_cleared never feeds time-to-clear",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-9882"
+      ],
+      "status": "waived",
+      "action": "Import a history backfill fixture containing gate_cleared events with TOG-9882’s importer on test containers.",
+      "expected": "Backfilled gate_cleared events never produce time-to-clear durations.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-37afd80",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[37afd80](https://github.com/TogetherWeOwn/two-bot/commit/37afd809f940d1cf36f1df3e87d7a14873ccd099)",
+          "`src/discord/`, `src/jobs/`",
+          "feat(presence): cap probe scan cost and window trend reads (#236)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11146"
+      ],
+      "status": "waived",
+      "action": "Run the presence probe with TOG-11146’s oversized mock roster and a long trend window.",
+      "expected": "The scan stops at its cost cap and trend reads are windowed; truncation is persisted.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-3f513ed",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[3f513ed](https://github.com/TogetherWeOwn/two-bot/commit/3f513ed3d8d5238c21f927a8664c194af266540b)",
+          "`src/automod/`, `src/backfill/`",
+          "test(qa): fixture-driven acceptance for roster, moderation, backfill, automod, dashboard (#218)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-9882"
+      ],
+      "status": "waived",
+      "action": "Run TOG-9882’s roster, moderation, backfill, automod and dashboard acceptance fixtures on test containers.",
+      "expected": "Each fixture contract passes; the automod export runs on demand only, not as a scheduled job.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-b948b89",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[b948b89](https://github.com/TogetherWeOwn/two-bot/commit/b948b89a166cfd6f5d920dc0607e0415412541bd)",
+          "`src/onboarding/`",
+          "fix(onboarding): dedupe repeated keys in legacy planSelection (#269)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11180",
+        "TOG-10278"
+      ],
+      "status": "manual",
+      "action": "Complete onboarding session selection with a disposable member; send repeated-key payloads Discord cannot produce through the onboarding_effects fixture.",
+      "expected": "Repeated keys are deduped and each valid pick routes once.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-7f90492",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[7f90492](https://github.com/TogetherWeOwn/two-bot/commit/7f904926891c2d97fd3f0765a2b2c34993c69f67)",
+          "`src/core/`, `src/internal/`",
+          "feat(events): add gated event.read mapped-event verifier (#266)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10862",
+        "TOG-10603"
+      ],
+      "status": "waived",
+      "action": "Send signed `event.read` calls for mapped and unmapped event keys through TOG-10862’s executor and TOG-10603’s receiver fixtures.",
+      "expected": "The gated verifier returns the mapped event and refuses unmapped keys without Discord writes.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-dc2b507",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[dc2b507](https://github.com/TogetherWeOwn/two-bot/commit/dc2b507ad03aadd56bbe71eb707a4d2facc4d2a5)",
+          "`src/analytics/`",
+          "feat(voice): reconcile open-half sessions with explicit reasons (#273)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11152"
+      ],
+      "status": "waived",
+      "action": "Run TOG-11152’s reconcile on a fixture with open-half sessions of each reason.",
+      "expected": "Every open-half session is reported with its explicit reason; nothing is repaired.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-860557f",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[860557f](https://github.com/TogetherWeOwn/two-bot/commit/860557fcfcb122717b0f84b189e57c9c0fb9c3d3)",
+          "`src/backfill/`",
+          "test(backfill): refuse malformed export rows without throwing (#289)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-9882"
+      ],
+      "status": "waived",
+      "action": "Feed malformed export rows to TOG-9882’s backfill parser fixture.",
+      "expected": "Malformed rows are refused and counted without aborting the run.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-b3747a8",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[b3747a8](https://github.com/TogetherWeOwn/two-bot/commit/b3747a8f8b5a2171b5f16c08f2d49bb139cac011)",
+          "`src/onboarding/`",
+          "fix(session): route valid picks alongside stale keys (#290)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11180",
+        "TOG-10278"
+      ],
+      "status": "manual",
+      "action": "Select valid onboarding picks after removing one catalog option from the disposable configuration, so a stale key remains.",
+      "expected": "Valid picks still route; only the stale key is ignored. Restore the configuration afterwards.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-8371181",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[8371181](https://github.com/TogetherWeOwn/two-bot/commit/83711812364c451926eafe4ba0859db279eb7e7c)",
+          "`src/announcements/`",
+          "feat(feeds): follow same-host redirects, refuse cross-host distinctly (#299)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11022"
+      ],
+      "status": "waived",
+      "action": "Serve a same-host and a cross-host redirect from TOG-11022’s local mock feed server.",
+      "expected": "The same-host redirect is followed; the cross-host redirect is refused with a distinct reason.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-b5038fb",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[b5038fb](https://github.com/TogetherWeOwn/two-bot/commit/b5038fbc6b265978accfea0df448e518cd1449f5)",
+          "`src/announcements/`",
+          "fix(feeds): bound each pollFeeds read with a timeout (#298)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11022"
+      ],
+      "status": "waived",
+      "action": "Serve a stalled feed body from TOG-11022’s local mock feed server.",
+      "expected": "Each feed read ends at its timeout and the poll continues with the next feed.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-a50e747",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[a50e747](https://github.com/TogetherWeOwn/two-bot/commit/a50e7474fb4e5493d1a412dab24eeb14748d9860)",
+          "`src/announcements/`",
+          "fix(feeds): isolate per-item failures in pollFeeds batch (#302)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11022"
+      ],
+      "status": "waived",
+      "action": "Include one item that fails delivery in a TOG-11022 mock feed batch.",
+      "expected": "The failing item is isolated; the other items are delivered.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-673cd13",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[673cd13](https://github.com/TogetherWeOwn/two-bot/commit/673cd13005499ab1289760e81f67f868118c3e0c)",
+          "`src/moderation/`",
+          "fix(moderation): report truncated only when rows were actually cut (#307)",
+          "gap"
+        ]
+      },
+      "owner": [
+        "TOG-10869",
+        "TOG-10078"
+      ],
+      "status": "waived",
+      "action": "Run TOG-10869’s shutdown-preflight fixture with pending rows exactly at and above the report limit.",
+      "expected": "Truncated is reported only when rows were actually cut.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-df990c9",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[df990c9](https://github.com/TogetherWeOwn/two-bot/commit/df990c96db0615ef7e6db5f4736395b7eb89ec31)",
+          "`src/announcements/`",
+          "fix(announcements): prefer alternate link for multi-link Atom entries (#306)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11022"
+      ],
+      "status": "waived",
+      "action": "Serve an Atom entry with several links from TOG-11022’s mock feed server.",
+      "expected": "The delivered link is the alternate link.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-e2ffdf0",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[e2ffdf0](https://github.com/TogetherWeOwn/two-bot/commit/e2ffdf057b84ff6286f258d2d89775611c26cbe9)",
+          "`src/tempVoice/`",
+          "feat(tempvoice): enforce durable rolling create burst limits (#308)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10093",
+        "TOG-10119"
+      ],
+      "status": "manual",
+      "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Create rooms past the configured rolling burst limit with disposable members, across the TOG-10119 restart.",
+      "expected": "Creates beyond the limit are refused with a named reason, and the count survives restart.",
+      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s13-3c3e7e8",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[3c3e7e8](https://github.com/TogetherWeOwn/two-bot/commit/3c3e7e86f1e12ce2061add989da36882aa06e05a)",
+          "`src/core/`, `src/leveling/`",
+          "fix(voice): treat malformed leave timestamp as unknown-start (#265)",
+          "gap"
+        ]
+      },
+      "owner": [
+        "TOG-11149"
+      ],
+      "status": "waived",
+      "action": "Deliver a voice leave with a malformed timestamp through TOG-11149’s contract suite.",
+      "expected": "The session is treated as unknown-start, not a fabricated duration.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-c99fec7",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[c99fec7](https://github.com/TogetherWeOwn/two-bot/commit/c99fec78c4b211c9421cd0785e6fdc0aac8c5e73)",
+          "`src/announcements/`",
+          "fix(announcements): reclaim crashed feed-delivery claims after 60s lease (#312)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11022"
+      ],
+      "status": "waived",
+      "action": "Leave a feed-delivery claim from a simulated crash in TOG-11022’s fixture and advance its clock past 60s.",
+      "expected": "The claim is reclaimed after the 60s lease and the item is delivered once.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-7587037",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[7587037](https://github.com/TogetherWeOwn/two-bot/commit/758703733ee2b0227e0440a39be67b71e26699ac)",
+          "`src/tempVoice/`",
+          "fix(temp-voice): stop conferring ManageRoles on channel create (#314)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10093",
+        "TOG-10119"
+      ],
+      "status": "manual",
+      "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Inspect the permission overwrites on a created room.",
+      "expected": "The owner overwrite grants room controls but never ManageRoles.",
+      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s13-cad94b6",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[cad94b6](https://github.com/TogetherWeOwn/two-bot/commit/cad94b6db5dc21869d9ca9cd112c497a070556ab)",
+          "`src/moderation/`",
+          "fix(moderation): name stranded running unban claims with hand-release steps (#320)",
+          "gap"
+        ]
+      },
+      "owner": [
+        "TOG-10869",
+        "TOG-10078"
+      ],
+      "status": "waived",
+      "action": "Run TOG-10869’s shutdown-preflight fixture with a running unban claim left by a stopped worker.",
+      "expected": "The preflight names each stranded claim with hand-release steps; the executor itself stays TOG-10078.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-db84b22",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[db84b22](https://github.com/TogetherWeOwn/two-bot/commit/db84b22cb55d8eb2a446ac23fdd3362cefcabed6)",
+          "`src/announcements/`",
+          "fix(feeds): advance poll window past 20-post cap across polls (#318)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11022"
+      ],
+      "status": "waived",
+      "action": "Serve more than 20 new posts across two polls from TOG-11022’s mock feed server.",
+      "expected": "The poll window advances past the 20-post cap so no post is skipped or repeated.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-9ee2e89",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[9ee2e89](https://github.com/TogetherWeOwn/two-bot/commit/9ee2e8969e21159d8b30aea94b98ddbaecf38cbd)",
+          "`src/store/`",
+          "feat(backup): cover all bot-owned tables in dump and restore (#330)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11142"
+      ],
+      "status": "waived",
+      "action": "Dump and restore every bot-owned table with TOG-11142’s test-container fixture.",
+      "expected": "All bot-owned tables round-trip and every owned serial sequence is reset.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-2f386e8",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[2f386e8](https://github.com/TogetherWeOwn/two-bot/commit/2f386e81096385c37abcd4045221a570470d096b)",
+          "`src/automations/`",
+          "test(scheduler): prove disabled scheduler fires zero jobs (#335)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10081"
+      ],
+      "status": "waived",
+      "action": "Run TOG-10081’s scheduler fixture with the scheduled-message scheduler disabled and due jobs present.",
+      "expected": "Zero jobs fire.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-298f3a4",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[298f3a4](https://github.com/TogetherWeOwn/two-bot/commit/298f3a4f234b8b8520eebd091b789de89f6666bb)",
+          "`src/selfRoles/`",
+          "fix(selfrole): reject reaction panels over Discord's 20-reaction cap (#336)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10087",
+        "TOG-10292"
+      ],
+      "status": "manual",
+      "action": "Attempt to configure a disposable reaction self-role panel with 21 reactions through the normal config path.",
+      "expected": "Configuration is refused at the 20-reaction cap; nothing is posted. Runtime stays TOG-10292.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-4931aec",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[4931aec](https://github.com/TogetherWeOwn/two-bot/commit/4931aec4754e374e8c4dbfb8f8be85e1b7ee8285)",
+          "`src/redirect/`",
+          "fix(redirect): cache campaign misses at short negative TTL (#339)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11153"
+      ],
+      "status": "waived",
+      "action": "Look up one unknown slug repeatedly within the negative TTL in TOG-11153’s redirect fixture.",
+      "expected": "One store lookup serves the repeated misses; the cache entry expires within ≤2s.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-f9fbf5c",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[f9fbf5c](https://github.com/TogetherWeOwn/two-bot/commit/f9fbf5cd762c4af456cdab5c097d9babf82597c7)",
+          "`src/redirect/`",
+          "fix(redirect): refuse reserved healthz slug at campaign add time (#340)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11183"
+      ],
+      "status": "manual",
+      "action": "Add campaign slug `healthz` through TOG-11183’s campaign input fixture, then request `/healthz` on the approved staging redirect origin.",
+      "expected": "The slug is refused at add time and the health probe still answers.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-6433578",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[6433578](https://github.com/TogetherWeOwn/two-bot/commit/64335788c597b176a2d3eadacda4de1fd2ca783e)",
+          "`src/redirect/`",
+          "fix(redirect): validate port and fallback code at startup (#341)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11183"
+      ],
+      "status": "waived",
+      "action": "Start TOG-11183’s redirect fixture with an invalid fallback code.",
+      "expected": "Startup rejects the fallback before any redirect effect; Node listener-port configuration stays dropped.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-b3d8d97",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[b3d8d97](https://github.com/TogetherWeOwn/two-bot/commit/b3d8d9757a413c295081eaf9e92c6a34cae00293)",
+          "`src/selfRoles/`",
+          "fix(selfrole): reject button custom_ids over Discord's 100-char limit (#338)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10087",
+        "TOG-10292"
+      ],
+      "status": "manual",
+      "action": "Attempt to configure a disposable button self-role panel with a 101-character custom_id through the normal config path.",
+      "expected": "Configuration is refused at Discord’s 100-character limit.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-3400bb2",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[3400bb2](https://github.com/TogetherWeOwn/two-bot/commit/3400bb220ab9933d4bbbe4c92219770ee94f50e9)",
+          "`src/analytics/`",
+          "feat(analytics): add member_leave backfill gap sweep (#343)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11152"
+      ],
+      "status": "waived",
+      "action": "Run TOG-11152’s member_leave backfill gap sweep on a test-container fixture with leave gaps.",
+      "expected": "Each gap is reported read-only; nothing is backfilled.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-f5e62b7",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[f5e62b7](https://github.com/TogetherWeOwn/two-bot/commit/f5e62b701038d45cc26cce29cd4684186f2540b2)",
+          "`src/core/`, `src/redirect/`",
+          "fix(redirect): resolve throttle bucket through trusted-proxy chain (#342)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11153"
+      ],
+      "status": "manual",
+      "action": "Send one request with a spoofed `X-Forwarded-For` to the approved staging redirect origin.",
+      "expected": "The throttle bucket is keyed on `CF-Connecting-IP`, never the user-supplied header.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-ce3c0e2",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[ce3c0e2](https://github.com/TogetherWeOwn/two-bot/commit/ce3c0e2a381a22c8b98b979efb4c8ff24ad3a9ae)",
+          "`src/backfill/`",
+          "test(backfill): extend malformed-row coverage, fix 3 probe-found bugs (#356)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-9882"
+      ],
+      "status": "waived",
+      "action": "Run TOG-9882’s extended malformed-row backfill fixtures on test containers.",
+      "expected": "Every malformed-row case is refused without throwing, including the three probe-found cases.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-b62ff28",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[b62ff28](https://github.com/TogetherWeOwn/two-bot/commit/b62ff28f7d9f215e3dc8ab1149dbb5aaae19e7c2)",
+          "`src/redirect/`",
+          "fix(redirect): log slug and error class on lookup failure (#355)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11183"
+      ],
+      "status": "waived",
+      "action": "Force a lookup failure for a known slug in TOG-11183’s redirect fixture.",
+      "expected": "The log names the slug and a bounded errorClass; no raw error text or credentials.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-38041a1",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[38041a1](https://github.com/TogetherWeOwn/two-bot/commit/38041a1bf97ed2ba2cc24585af851e4f0173964f)",
+          "`src/tempVoice/`",
+          "fix(temp-voice): refuse renames that collide with a sibling channel name (#361)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10101"
+      ],
+      "status": "manual",
+      "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Rename a room to the name of a sibling channel in the same category, then to a unique name.",
+      "expected": "The colliding rename is refused; the unique name is applied.",
+      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s13-a40d4a5",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[a40d4a5](https://github.com/TogetherWeOwn/two-bot/commit/a40d4a5891c4dfb75925a520bee98fcb0393536f)",
+          "`src/onboarding/`",
+          "fix(onboarding): plan session picks in catalog order (#258)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11180",
+        "TOG-10278"
+      ],
+      "status": "manual",
+      "action": "Select onboarding picks in reverse catalog order with a disposable member.",
+      "expected": "Picks are planned and routed in catalog order.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-90ab4b7",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[90ab4b7](https://github.com/TogetherWeOwn/two-bot/commit/90ab4b78df40f43d388709e6cc8f7a11caca1f8d)",
+          "`src/store/`",
+          "fix(backup): publish dumps only after completed output (#386)",
+          "ported"
+        ]
+      },
+      "owner": [
+        "TOG-9881"
+      ],
+      "status": "automated",
+      "action": "Run the completed-output publication fixtures in `crates/core/src/backup/dump_file.rs`.",
+      "expected": "Dumps publish only after completed, count-validated output; short writes retry, failures propagate and abandoned writers leave no backup. Not deployed timer evidence.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib backup::dump_file"
+    },
+    {
+      "id": "s13-7df2a95",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[7df2a95](https://github.com/TogetherWeOwn/two-bot/commit/7df2a95106feb48cb032c31a4cd3de52a24bf9e6)",
+          "`src/leveling/`",
+          "fix(leveling): honor configured command guild fence (#394)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10343"
+      ],
+      "status": "manual",
+      "action": "Run `/rank` in the configured staging guild; take an unconfigured-guild call from the leveling fixture.",
+      "expected": "The configured guild fence is checked before any leveling read, write or reply.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-cc27351",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[cc27351](https://github.com/TogetherWeOwn/two-bot/commit/cc27351da5c7946fe1652ff697fbdabb6bbed029)",
+          "`src/tempVoice/`",
+          "fix(tempvoice): isolate per-channel sweep failures (#393)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10093",
+        "TOG-10119"
+      ],
+      "status": "waived",
+      "action": "In TOG-10093’s mock-Discord fixture, fail one room’s delete during a sweep.",
+      "expected": "The other empty rooms are still removed and the single failure is logged.",
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
+      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-d3d9afe",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[d3d9afe](https://github.com/TogetherWeOwn/two-bot/commit/d3d9afe7af866e912b98d6e9f07ea67aba581878)",
+          "`src/discord/`, `src/onboarding/`",
+          "fix(onboarding): withhold invisible fallback destinations (#398)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11180",
+        "TOG-10278"
+      ],
+      "status": "manual",
+      "action": "Configure a disposable onboarding fallback channel the member cannot view, then complete selection.",
+      "expected": "The invisible fallback destination is withheld. Restore the configuration afterwards.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-1e64035",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[1e64035](https://github.com/TogetherWeOwn/two-bot/commit/1e640352aff1996348306543cf9d2cc4de37ff82)",
+          "`src/jobs/`",
+          "fix(presence): bound repeated truncated roster scans (#400)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11146"
+      ],
+      "status": "waived",
+      "action": "Run repeated presence scans against TOG-11146’s truncating mock roster.",
+      "expected": "Repeated truncated scans back off within bounds instead of rescanning every cycle.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-35aac83",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[35aac83](https://github.com/TogetherWeOwn/two-bot/commit/35aac8351ba8160215b925351dc63c6d5b81e7c9)",
+          "`src/analytics/`",
+          "fix(analytics): compare leave-gap timestamps by instant (#411)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11152"
+      ],
+      "status": "waived",
+      "action": "Run TOG-11152’s leave-gap comparison on fixture timestamps with different offsets for one instant.",
+      "expected": "Timestamps compare by instant, not text.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-8b5d1e1",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[8b5d1e1](https://github.com/TogetherWeOwn/two-bot/commit/8b5d1e18b1e14bd7a7a1ad63c5b7a8dde642057f)",
+          "`src/announcements/`",
+          "fix(lfg): reject reserved leave-action role keys (#414)",
+          "gap"
+        ]
+      },
+      "owner": [
+        "TOG-10260"
+      ],
+      "status": "manual",
+      "action": "Attempt to configure an LFG role key equal to the reserved leave action through the normal config path.",
+      "expected": "The key is refused; the leave action keeps working.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-218e469",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[218e469](https://github.com/TogetherWeOwn/two-bot/commit/218e469ce94d4c9f423a15efc5c892ba7e842647)",
+          "`src/store/`",
+          "fix(dump): validate non-table record shapes before declaring a backup verified (#416)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11186"
+      ],
+      "status": "waived",
+      "action": "Verify a test-container dump whose manifest/end records are malformed with TOG-11186’s fixture.",
+      "expected": "Verification fails before declaring success.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-1d64196",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[1d64196](https://github.com/TogetherWeOwn/two-bot/commit/1d6419662573084a83bcd195807747c2f83ed1e1)",
+          "`src/jobs/`",
+          "fix(scorecard): retry failed weekly runs within bounded schedule (#413)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11145"
+      ],
+      "status": "waived",
+      "action": "Fail a weekly scorecard run in TOG-11145’s fixture inside and after the Monday window.",
+      "expected": "Retries happen only inside the bounded Monday schedule window.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-287a181",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[287a181](https://github.com/TogetherWeOwn/two-bot/commit/287a181c53ffa7884c345c9e1377f743f61f67cd)",
+          "`src/jobs/`",
+          "fix(snapshots): discard pending collector cycles after stop (#421)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11181"
+      ],
+      "status": "waived",
+      "action": "Stop a snapshot collector with a pending cycle in TOG-11181’s fixture.",
+      "expected": "Pending cycle results are discarded after stop; the mirror is unchanged.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-a8d9f53",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[a8d9f53](https://github.com/TogetherWeOwn/two-bot/commit/a8d9f53f6958d036a1f6fc34afcca70baa8e45a4)",
+          "`src/announcements/`",
+          "fix(announcements): defer interactions before service I/O (#424)",
+          "gap"
+        ]
+      },
+      "owner": [
+        "TOG-10260",
+        "TOG-11022"
+      ],
+      "status": "manual",
+      "action": "Invoke the announcement and LFG commands in the staging guild; take a slow-service leg from a local mock.",
+      "expected": "Each interaction is deferred before service I/O, so no interaction-failed reply appears.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-f5edc70",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[f5edc70](https://github.com/TogetherWeOwn/two-bot/commit/f5edc70d6920d2981e1275f62281923f109444fb)",
+          "`src/leveling/`",
+          "fix(leveling): show absent members as unranked (#429)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11147"
+      ],
+      "status": "manual",
+      "action": "Run `/rank member:` for a fixture member with no XP row.",
+      "expected": "The reply shows Unranked, not zero XP with a numeric rank.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-3dc9720",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[3dc9720](https://github.com/TogetherWeOwn/two-bot/commit/3dc97202b0c3be247992ac1df244a3d39371c570)",
+          "`src/redesign/`",
+          "fix(restore): prefer stable IDs for renamed guild resources (#426)",
+          "ported"
+        ]
+      },
+      "owner": [
+        "TOG-9881"
+      ],
+      "status": "automated",
+      "action": "Run the renamed/swapped role and moved-channel regressions in `crates/core/tests/guild_config_regressions.rs`.",
+      "expected": "Restore matches surviving resources by stable ID before name, for renamed/swapped roles and moved channels.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test guild_config_regressions"
+    },
+    {
+      "id": "s13-3f3f969",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[3f3f969](https://github.com/TogetherWeOwn/two-bot/commit/3f3f96906c577026bf6eea52061b73c79e7b651f)",
+          "`src/jobs/`",
+          "fix(events): reject malformed scheduled-event response elements (#436)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11181"
+      ],
+      "status": "waived",
+      "action": "Return malformed scheduled-event elements from TOG-11181’s mock REST fixture.",
+      "expected": "Malformed elements are rejected before the atomic mirror replacement.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-881d21d",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[881d21d](https://github.com/TogetherWeOwn/two-bot/commit/881d21d5f4bde7038060e3fb866175ee6891a2bd)",
+          "`src/jobs/`",
+          "fix(events): reject malformed optional snapshot fields (#432)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11181"
+      ],
+      "status": "waived",
+      "action": "Return scheduled events with malformed optional fields from TOG-11181’s mock REST fixture.",
+      "expected": "Malformed optional fields are rejected; the mirror keeps the last good snapshot.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+    },
+    {
+      "id": "s13-3676c1d",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[3676c1d](https://github.com/TogetherWeOwn/two-bot/commit/3676c1d15f94bf6fd17c909f6ddea5d030bb4326)",
+          "`src/selfRoles/`",
+          "fix(self-role): reject button labels over Discord's 80-char limit (#337)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-10087",
+        "TOG-10292"
+      ],
+      "status": "manual",
+      "action": "Attempt to configure a disposable button self-role panel with an 81-character label through the normal config path.",
+      "expected": "Configuration is refused at Discord’s 80-character label limit.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s13-bffccf3",
+      "parity": {
+        "section": 13,
+        "row": [
+          "[bffccf3](https://github.com/TogetherWeOwn/two-bot/commit/bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3)",
+          "`src/core/`, `src/discord/`, `src/store/`",
+          "fix(events): keep membership projections chronological (#387)",
+          "carded"
+        ]
+      },
+      "owner": [
+        "TOG-11149"
+      ],
+      "status": "waived",
+      "action": "Deliver out-of-order and same-time join/leave events and a replay through TOG-11149’s contract suite.",
+      "expected": "Membership projections follow event chronology and tie rules, not arrival order; replay is idempotent.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
+      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     }
   ]
 }

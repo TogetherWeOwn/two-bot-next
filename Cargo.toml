@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/testsupport"]
+members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store", "crates/testsupport"]
 exclude = ["fuzz"]
-default-members = [".", "crates/core", "crates/discord", "crates/bot", "crates/cutover"]
+default-members = [".", "crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store"]
 
 # One native Rust release strategy versions the whole workspace. The root
 # library exposes release metadata; it is not a crates.io distribution.
@@ -13,6 +13,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
+
+# Library/runtime modules must use structured tracing, not stdout/debug macros.
+# Only operator CLI modules locally allow print_stdout; dbg_macro stays denied.
+[lints]
+workspace = true
+
+[workspace.lints.clippy]
+print_stdout = "deny"
+dbg_macro = "deny"
 
 [workspace.package]
 edition = "2021"
@@ -124,6 +133,6 @@ twilight-model = "0.17"
 opt-level = "z"
 lto = true
 codegen-units = 1
-# Job tasks must unwind so the supervisor can isolate a panic in release too.
+# Router handlers and supervised jobs must unwind to isolate panics in release.
 panic = "unwind"
 strip = true
