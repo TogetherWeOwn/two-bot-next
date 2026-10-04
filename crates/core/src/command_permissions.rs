@@ -75,8 +75,7 @@ use PolicyHook::{
 
 /// All 30 parity rows, including the three non-static-slash dispositions,
 /// plus the Next-only `/help` discovery command (parity row 31 — legacy has
-/// no help command). The voice vote-kick shares the `/kick` name (parity
-/// row 5 governs it; the voice sink claims room targets before this check).
+/// no help command).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
 pub const COMMAND_PERMISSIONS: [CommandPermission; 31] = [
     row(1, "rank", BuiltinSlash, 0, None),

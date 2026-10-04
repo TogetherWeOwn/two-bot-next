@@ -3700,14 +3700,32 @@ fn moderation_gates() -> RouterGates {
 }
 
 #[tokio::test]
-async fn kick_keeps_the_moderation_path() {
+async fn claimed_kick_stays_silent_for_the_voice_sink() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(moderation_gates(), false, origin);
+    // Claimed (target in a tracked room): the voice sink answers the vote,
+    // so the router sends no callback at all.
+    runtime.set_voice_kick_claim(Arc::new(|_, _| Box::pin(async move { Some(500u64) })));
+    runtime.on_interaction(&kick_slash()).await;
+    assert!(
+        mock.posts_to("/callback").await.is_empty(),
+        "claimed kick sends no router callback"
+    );
+    assert!(mock.requests().is_empty(), "no other REST effects");
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn unclaimed_kick_keeps_the_moderation_path() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(moderation_gates(), false, origin.clone());
-    // No voice claim is wired here, so `/kick` keeps the moderation path;
-    // a claimed room target would yield to the voice sink instead.
+    // No claim wired: pre-existing behavior, one unavailable callback.
+    runtime.on_interaction(&kick_slash()).await;
+    // Claim wired but target outside any tracked room: same path.
+    runtime.set_voice_kick_claim(Arc::new(|_, _| Box::pin(async move { None })));
     runtime.on_interaction(&kick_slash()).await;
     let callbacks = mock.posts_to("/callback").await;
-    assert_eq!(callbacks.len(), 1, "moderation kick answers");
+    assert_eq!(callbacks.len(), 2, "both unclaimed kicks answer");
     for callback in callbacks {
         let reply: serde_json::Value = serde_json::from_slice(&callback.body).unwrap();
         assert_eq!(reply["type"], 4, "immediate response, not a defer");

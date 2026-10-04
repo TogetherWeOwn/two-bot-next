@@ -83,10 +83,7 @@ library code with no Discord dependency and can start immediately.
 
 ## V4: Vote-kick
 
-- `/kick member [reason]`: inside a tracked voice room any occupant can
-  start a vote instead of a moderation kick (runtime dispatch by occupancy,
-  not by name). Votes never remove a member from the server, and outside
-  tracked rooms `/kick` stays the moderation kick.
+- `/kick member [reason]`: any occupant can start a vote.
 - It passes with a strict majority of the occupants other than the target.
   Progress shows as required/total. Votes are cast with buttons; not voting
   counts as No. The vote expires after 2 minutes.

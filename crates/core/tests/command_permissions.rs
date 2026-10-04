@@ -89,16 +89,15 @@ fn all_30_rows_equal_parity_section1() {
     }
     assert_eq!(seen, (1..=30).collect::<HashSet<_>>());
     // The 30 legacy parity rows plus the Next-only `/help` discovery command
-    // (parity row 31 — legacy has no help command) and the Next-only voice
-    // vote-kick (parity row 32 — legacy has no vote-kick slash).
-    assert_eq!(COMMAND_PERMISSIONS.len(), 32);
+    // (parity row 31 — legacy has no help command).
+    assert_eq!(COMMAND_PERMISSIONS.len(), 31);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        32
+        31
     );
     let help = command_permission("help").expect("help has a permission row");
     assert_eq!(help.required_permissions, 0);
@@ -118,7 +117,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 29);
+    assert_eq!(builtins.len(), 28);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published

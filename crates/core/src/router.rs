@@ -1339,17 +1339,4 @@ mod tests {
         assert!(!gates.automations && gates.announcements && !gates.moderation);
         assert!(gates.scorecard && !gates.tickets && gates.onboarding_picker);
     }
-
-    #[test]
-    fn kick_keeps_its_moderation_route() {
-        // The voice vote-kick shares the `/kick` name and is reached through
-        // the voice sink (occupancy claim); the core router always serves the
-        // moderation path.
-        assert_eq!(
-            router().route_slash(&ctx("kick", Some(GUILD), Some(u64::MAX))),
-            SlashOutcome::Handled {
-                handler: HandlerId::Moderation(ModerationAction::Kick)
-            }
-        );
-    }
 }
