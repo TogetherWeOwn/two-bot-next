@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 268 samples
+## Cardinality budget: 274 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -36,7 +36,9 @@ table and the test are updated together.
 | job runs, timestamps, failure streaks | 44 | 11 jobs x (2 outcomes + timestamp + streak) |
 | voice ops, reconcile, dead-letters, state | 30 | 3x5 ops + 4 reconcile + 8 dead-letter + tracked + compensation + orphans |
 | pool gauges | 4 | configured, size, idle, max |
-| `# HELP` / `# TYPE` headers | 42 | 21 families x 2 |
+| `two_bot_db_errors_total{op}` | 2 | `admission`, `other` |
+| `two_bot_send_admissions_total{outcome}` | 4 | `admitted`, `blocked`, `storage_error`, `other` |
+| `# HELP` / `# TYPE` headers | 46 | 23 families x 2 |
 
 ## Per-event caps (gateway metric labels)
 
@@ -92,6 +94,11 @@ So shedding means doing less work per dispatch, in this order:
 5. Voice reconcile detail (plan counts only; outcomes stay counted).
 6. Never shed: session lifecycle lines, checkpoint commits, disconnect and
    missed-events counters, failure classes, or the `other` catchall.
+
+The send-admission `blocked` counter is the pipeline's own shed meter:
+refused admits are counted per bounded outcome, never silently dropped,
+and storage failures land in `two_bot_db_errors_total` per bounded op.
+Both counters are class steady and never shed.
 
 Subscription facts that bound the top of the funnel: the bot never requests
 `GUILD_PRESENCES`, so presence arrives only through the hourly

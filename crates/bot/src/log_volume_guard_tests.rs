@@ -176,6 +176,27 @@ const JOB_CAPS: [JobCap; 11] = [
     },
 ];
 
+/// Closed-world pins for the storage/send-gate families: a new op or outcome
+/// fails here until it gets a budget row in the guard doc. The
+/// send-admission `blocked` outcome is the pipeline's own shed meter:
+/// refused admits are counted, never silently dropped.
+const DB_ERROR_CAP_OPS: [&str; 2] = ["admission", "other"];
+const SEND_ADMISSION_CAP_OUTCOMES: [&str; 4] = ["admitted", "blocked", "storage_error", "other"];
+
+#[test]
+fn storage_and_send_gate_labels_match_their_caps() {
+    assert_eq!(
+        metrics::DB_ERROR_OPS,
+        &DB_ERROR_CAP_OPS[..],
+        "DB_ERROR_OPS grew without a budget row; update docs/log-volume-guard.md"
+    );
+    assert_eq!(
+        metrics::SEND_ADMISSION_OUTCOMES,
+        &SEND_ADMISSION_CAP_OUTCOMES[..],
+        "SEND_ADMISSION_OUTCOMES grew without a budget row; update docs/log-volume-guard.md"
+    );
+}
+
 /// The per-dispatch hot path: the observer in `gateway_metrics.rs` and the
 /// pipeline in `dispatch.rs`. Both must stay free of `tracing`; hot
 /// dispatches only bump counters.
@@ -381,10 +402,10 @@ fn job_caps_cover_every_job_label_and_presence_sheds_first() {
     }
 }
 
-/// Voice families stay fixed-size with an `other` collapse trapdoor, so one
-/// hostile guild cannot grow the exposition.
+/// Bounded families stay fixed-size with an `other` collapse trapdoor, so
+/// one hostile guild cannot grow the exposition.
 #[test]
-fn voice_families_stay_bounded_with_collapse_traps() {
+fn bounded_families_stay_fixed_size_with_collapse_traps() {
     assert_eq!(
         metrics::VOICE_OPERATIONS.len(),
         3,
@@ -400,11 +421,23 @@ fn voice_families_stay_bounded_with_collapse_traps() {
         8,
         "voice dead-letter family grew; update the cardinality budget and the guard doc"
     );
+    assert_eq!(
+        metrics::DB_ERROR_OPS.len(),
+        2,
+        "db-error family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::SEND_ADMISSION_OUTCOMES.len(),
+        4,
+        "send-admission family grew; update the cardinality budget and the guard doc"
+    );
     for (allowlist, name) in [
         (metrics::EVENTS, "EVENTS"),
         (metrics::REST_ROUTES, "routes"),
         (metrics::JOBS, "JOBS"),
         (metrics::VOICE_DEAD_ACTIONS, "dead-letter"),
+        (metrics::DB_ERROR_OPS, "db-errors"),
+        (metrics::SEND_ADMISSION_OUTCOMES, "send-admissions"),
     ] {
         assert_eq!(
             allowlist.last(),
@@ -428,9 +461,9 @@ fn exposition_series_count_matches_the_cardinality_budget() {
     let text = metrics::Metrics::default().render(None);
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 268,
-        "exposition grew past the 268-sample budget (18 events + 4 scalars + 1 latency \
-         + 11 histogram + 156 rest + 44 jobs + 30 voice + 4 pool); \
+        series, 274,
+        "exposition grew past the 274-sample budget (18 events + 4 scalars + 1 latency \
+         + 11 histogram + 156 rest + 44 jobs + 30 voice + 2 db-errors + 4 send-admissions + 4 pool); \
          update docs/log-volume-guard.md with the new series"
     );
 }
