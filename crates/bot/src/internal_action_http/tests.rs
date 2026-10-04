@@ -117,7 +117,84 @@ impl ActionEffect for MockEffect {
 }
 
 fn state(pool: sqlx::PgPool, effect: Arc<MockEffect>) -> Arc<ReceiverState> {
-    Arc::new(ReceiverState::new(config(), pool, effect))
+    state_with_reads(pool, effect, Arc::new(MockEventRead::default()))
+}
+
+fn state_with_reads(
+    pool: sqlx::PgPool,
+    effect: Arc<MockEffect>,
+    reads: Arc<MockEventRead>,
+) -> Arc<ReceiverState> {
+    Arc::new(ReceiverState::new(config(), pool, effect, reads))
+}
+
+/// Offline read double: the auth/key/flag fences must refuse before this is
+/// ever called, so most tests assert `calls() == 0`.
+#[derive(Default)]
+struct MockEventRead {
+    calls: AtomicUsize,
+}
+
+impl MockEventRead {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl EventReadEffect for MockEventRead {
+    fn execute_read<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+        _: &'a str,
+    ) -> BoxFuture<'a, Result<Value, EventActionError>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"outcome": "read"}))
+        })
+    }
+}
+
+/// The receiver reads its enabled set from the process environment, so
+/// flag-dependent tests serialize on this lock and always restore the var.
+/// Async-aware: the guard is held across `.await` points by design.
+static EVENT_READ_FLAG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn set_event_read_flag(on: bool) {
+    if on {
+        std::env::set_var("TWO_INTERNAL_ALLOW_EVENT_READ", "1");
+    } else {
+        std::env::remove_var("TWO_INTERNAL_ALLOW_EVENT_READ");
+    }
+}
+
+fn read_payload(key: &str) -> String {
+    serde_json::json!({"action": "event.read", "event_key": key}).to_string()
+}
+
+/// Keyless read signing: no `Idempotency-Key` header is sent.
+fn signed_read(raw: &str, key: &str) -> Request {
+    signed_read_with_nonce(raw, key, &nonce())
+}
+
+fn signed_read_with_nonce(raw: &str, key: &str, nonce_value: &str) -> Request {
+    let timestamp = (now_ms() / 1000).to_string();
+    let signature = sign(
+        secret(usize::from(key == "new")).as_bytes(),
+        &timestamp,
+        nonce_value,
+        raw.as_bytes(),
+    );
+    Request::builder()
+        .method(Method::POST)
+        .uri(ACTIONS_PATH)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-two-key-id", key)
+        .header("x-two-timestamp", timestamp)
+        .header("x-two-nonce", nonce_value)
+        .header("x-two-signature", signature)
+        .body(Body::from(raw.to_owned()))
+        .unwrap()
 }
 
 fn payload() -> &'static str {
@@ -597,6 +674,239 @@ fn receiver_prerequisites_refuse_incomplete_or_non_staging_runtime() {
     assert!(crate::internal_receiver_prerequisites(&config).is_ok());
     config.guild_id = Some(111111111111111111);
     assert!(crate::internal_receiver_prerequisites(&config).is_err());
+}
+
+/// Loopback Discord double answering scheduled-event GETs. Records every
+/// request so tests prove refusals happen before any Discord call.
+struct MockEventApi {
+    origin: String,
+    requests: Arc<Mutex<Vec<Value>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+const READ_EVENT_ID: &str = "100000000000000007";
+
+fn staging_guild() -> &'static str {
+    two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID
+}
+
+fn discord_event() -> Value {
+    json!({
+        "id": READ_EVENT_ID,
+        "guild_id": staging_guild(),
+        "name": "Launch Night",
+        "scheduled_start_time": "2026-09-01T20:00:00.000Z",
+        "channel_id": Value::Null,
+        "description": Value::Null,
+        "entity_metadata": {"location": "The Hall"},
+        "status": 1,
+    })
+}
+
+impl MockEventApi {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let reply = discord_event();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(|request: Request| async move {
+                    let (parts, _) = request.into_parts();
+                    seen.lock().unwrap().push(json!({
+                        "method": parts.method.as_str(),
+                        "path": parts.uri.path(),
+                    }));
+                    (StatusCode::OK, Json(reply))
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        Self {
+            origin,
+            requests,
+            task,
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+}
+
+impl Drop for MockEventApi {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn read_app(pool: sqlx::PgPool, api: &MockEventApi) -> Router {
+    let executor =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(api.origin.clone()))
+            .unwrap();
+    let reads: Arc<dyn EventReadEffect> = Arc::new(EventReadExecutor::new(executor, pool.clone()));
+    let effect: Arc<dyn ActionEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    router(Arc::new(ReceiverState::new(config(), pool, effect, reads)))
+}
+
+async fn map_launch(pool: &sqlx::PgPool) {
+    InternalActionStore::new(pool.clone())
+        .put_event_key(staging_guild(), "launch", READ_EVENT_ID)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn event_read_forged_signature_is_unauthorized_before_any_effect() {
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let reads = Arc::new(MockEventRead::default());
+    let state = state_with_reads(lazy_pool(), effect.clone(), reads.clone());
+    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
+    set_event_read_flag(true);
+    let mut request = signed_read(&read_payload("launch"), "old");
+    request.headers_mut().insert(
+        "x-two-signature",
+        HeaderValue::from_static("sha256=bad-signature"),
+    );
+    let (status, _, body) = answer(router(state.clone()), request).await;
+    set_event_read_flag(false);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["code"], "unauthorized");
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(reads.calls(), 0);
+    assert_eq!(state.clock.lock().unwrap().high_water_ms(), None);
+}
+
+#[tokio::test]
+async fn event_read_mapped_key_returns_the_seven_fields_keyless() {
+    let Some(db) = database().await else { return };
+    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
+    set_event_read_flag(true);
+    map_launch(db.pool()).await;
+    let api = MockEventApi::start().await;
+    // No Idempotency-Key header: reads are keyless by construction.
+    let (status, headers, body) = answer(
+        read_app(db.pool().clone(), &api),
+        signed_read(&read_payload("launch"), "old"),
+    )
+    .await;
+    set_event_read_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("idempotent-replay"));
+    let result = &body["result"];
+    assert_eq!(
+        result.as_object().unwrap().len(),
+        7,
+        "legacy 7-field read contract: {result}"
+    );
+    assert_eq!(result["outcome"], "read");
+    assert_eq!(result["event_id"], READ_EVENT_ID);
+    assert_eq!(result["name"], "Launch Night");
+    assert_eq!(result["starts_at"], "2026-09-01T20:00:00.000Z");
+    assert_eq!(result["location"], "The Hall");
+    assert_eq!(result["status"], "SCHEDULED");
+    assert!(result["observed_at"].is_string());
+    assert_eq!(api.count(), 1, "one Discord GET for one mapped read");
+    assert_eq!(api.requests.lock().unwrap()[0]["method"], "GET");
+    assert!(api.requests.lock().unwrap()[0]["path"]
+        .as_str()
+        .unwrap()
+        .starts_with(&format!(
+            "/api/v10/guilds/{}/scheduled-events/{READ_EVENT_ID}",
+            staging_guild()
+        )));
+    let mirrored: String = sqlx::query_scalar(
+        "SELECT name FROM scheduled_events WHERE guild_id = $1 AND event_id = $2",
+    )
+    .bind(staging_guild())
+    .bind(READ_EVENT_ID)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(mirrored, "Launch Night");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_read_unmapped_key_is_refused_before_any_discord_call() {
+    let Some(db) = database().await else { return };
+    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
+    set_event_read_flag(true);
+    let api = MockEventApi::start().await;
+    let (status, _, body) = answer(
+        read_app(db.pool().clone(), &api),
+        signed_read(&read_payload("ghost"), "old"),
+    )
+    .await;
+    set_event_read_flag(false);
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    assert_eq!(body["error"]["retryable"], false);
+    assert_eq!(api.count(), 0, "unmapped keys never reach Discord");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_read_flag_off_is_refused_before_any_discord_call() {
+    let Some(db) = database().await else { return };
+    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
+    set_event_read_flag(false);
+    map_launch(db.pool()).await;
+    let api = MockEventApi::start().await;
+    let (status, _, body) = answer(
+        read_app(db.pool().clone(), &api),
+        signed_read(&read_payload("launch"), "old"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    assert_eq!(api.count(), 0, "disabled reads never reach Discord");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_read_malformed_key_is_refused_before_any_discord_call() {
+    let Some(db) = database().await else { return };
+    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
+    set_event_read_flag(true);
+    let api = MockEventApi::start().await;
+    let app = read_app(db.pool().clone(), &api);
+    for raw in [
+        r#"{"action":"event.read"}"#,
+        r#"{"action":"event.read","event_key":""}"#,
+        r#"{"action":"event.read","event_key":"has space"}"#,
+    ] {
+        let (status, _, body) = answer(app.clone(), signed_read(raw, "old")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{raw}");
+        assert_eq!(body["error"]["code"], "malformed");
+    }
+    set_event_read_flag(false);
+    assert_eq!(api.count(), 0, "malformed reads never reach Discord");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_read_replayed_nonce_is_refused_without_a_second_discord_call() {
+    let Some(db) = database().await else { return };
+    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
+    set_event_read_flag(true);
+    map_launch(db.pool()).await;
+    let api = MockEventApi::start().await;
+    let app = read_app(db.pool().clone(), &api);
+    let raw = read_payload("launch");
+    let replay = nonce();
+    let (first, _, _) = answer(app.clone(), signed_read_with_nonce(&raw, "old", &replay)).await;
+    assert_eq!(first, StatusCode::OK);
+    let (second, _, refused) = answer(app, signed_read_with_nonce(&raw, "old", &replay)).await;
+    set_event_read_flag(false);
+    assert_eq!(second, StatusCode::CONFLICT);
+    assert_eq!(refused["error"]["code"], "replayed");
+    assert_eq!(refused["error"]["retryable"], false);
+    assert_eq!(api.count(), 1, "the replay must not reach Discord again");
+    db.close().await.unwrap();
 }
 
 #[tokio::test]

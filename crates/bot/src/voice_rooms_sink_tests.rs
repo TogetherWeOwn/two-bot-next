@@ -43,6 +43,19 @@ impl RoomPersistence for Arc<Store> {
     async fn persist(&self, room: &VoiceRoom) -> Result<(), StoreError> {
         self.as_ref().persist(room).await
     }
+    async fn custom_names(&self, guild: u64) -> Result<Vec<(u64, String)>, StoreError> {
+        self.as_ref().custom_names(guild).await
+    }
+    async fn save_custom_name(
+        &self,
+        guild: u64,
+        channel: u64,
+        custom_name: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        self.as_ref()
+            .save_custom_name(guild, channel, custom_name)
+            .await
+    }
     async fn pending_owner_grants(&self, guild: u64) -> Result<Vec<u64>, StoreError> {
         self.as_ref().pending_owner_grants(guild).await
     }
@@ -68,8 +81,9 @@ impl RoomPersistence for Arc<Store> {
         &self,
         guild: u64,
         config: &VoiceConfiguration,
+        expected: &VoiceConfiguration,
     ) -> Result<(), StoreError> {
-        self.as_ref().config_apply(guild, config).await
+        self.as_ref().config_apply(guild, config, expected).await
     }
 
     async fn companions(&self, guild: u64) -> Result<Vec<TextCompanion>, StoreError> {

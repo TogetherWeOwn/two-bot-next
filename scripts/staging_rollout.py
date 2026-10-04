@@ -23,6 +23,9 @@ WRANGLER = "4.147.0"
 VERSION_PROBES = (["--version"], ["-v"])
 LIMIT = 100
 MAX_BODY = 2 * 1024 * 1024
+# Cloudflare rejects the default "Python-urllib/x.y" agent at the edge with 403 (error 1010),
+# so an explicit agent is required for the gate to see the Worker at all.
+USER_AGENT = "two-bot-next-staging-rollout/1.0"
 # Consecutive fully-passing verify passes required before a completed rollout
 # whose only deviation is the control-plane `active` counter still reading 0
 # (with `healthy` at 1) is accepted. Each pass re-checks every identity and
@@ -105,7 +108,7 @@ class Client:
     def request(self, url, authenticated=False):
         timeout = 10 if self.deadline is None else min(10, self.deadline - time.monotonic())
         require(timeout > 0, "rollout_timeout")
-        headers = {"Cache-Control": "no-cache"}
+        headers = {"Cache-Control": "no-cache", "User-Agent": USER_AGENT}
         if authenticated:
             headers["Authorization"] = f"Bearer {self.token}"
         try:

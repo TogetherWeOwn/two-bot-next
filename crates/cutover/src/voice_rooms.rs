@@ -343,6 +343,55 @@ impl PgRoomStore {
         Ok(true)
     }
 
+    /// Persist a V3 `/name` custom-name override on an already-tracked room,
+    /// or clear it with `None` (restore). Only the name and its change stamp
+    /// move: ownership, seed and creation stamp stay as they are. The text
+    /// is stored as typed (template tokens intact); it must be 1-100
+    /// characters, the same bound as the column's `CHECK`. Returns false when
+    /// no row exists.
+    pub async fn set_custom_name(
+        &self,
+        guild_id: Snowflake,
+        channel_id: Snowflake,
+        custom_name: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        if custom_name.is_some_and(|name| !(1..=100).contains(&name.chars().count())) {
+            return Err(invalid_argument(
+                "custom room name must be 1-100 characters",
+            ));
+        }
+        Ok(sqlx::query(
+            "UPDATE voice_rooms
+             SET custom_name = $3, name_touched_at = now()
+             WHERE guild_id = $1 AND channel_id = $2",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(custom_name)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            != 0)
+    }
+
+    /// Every custom-name override in a guild, by channel id. Rooms using
+    /// their template name have no entry.
+    pub async fn custom_names(
+        &self,
+        guild_id: Snowflake,
+    ) -> Result<Vec<(Snowflake, String)>, sqlx::Error> {
+        sqlx::query(
+            "SELECT channel_id, custom_name FROM voice_rooms
+             WHERE guild_id = $1 AND custom_name IS NOT NULL ORDER BY channel_id",
+        )
+        .bind(guild_id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|row| Ok((decode_id(row, "channel_id")?, row.try_get("custom_name")?)))
+        .collect()
+    }
+
     pub async fn room_for(
         &self,
         guild_id: Snowflake,

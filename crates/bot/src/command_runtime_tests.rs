@@ -48,7 +48,7 @@ use two_bot_core::funnel::now_millis_for_test;
 use two_bot_core::sticky::{store, ActivityOutcome};
 use two_bot_core::{
     RouterGates, RouterRefusal, ANNOUNCEMENTS_DISABLED_REPLY, AUTOMATIONS_DISABLED_REPLY,
-    MANAGE_EVENTS_REQUIRED, MANAGE_SERVER_REQUIRED,
+    MANAGE_EVENTS_REQUIRED, MANAGE_SERVER_REQUIRED, MODERATION_DISABLED_REPLY,
 };
 use two_bot_discord::ActionExecutor;
 
@@ -56,6 +56,7 @@ use crate::command_runtime::{
     actor_id, ephemeral, feed_add_options, feed_remove_option, new_id, router_with_commands,
     sticky_options, CommandRuntime, RegistrySyncError,
 };
+use crate::member_runtime::MemberRuntime;
 use crate::schedule_runtime::{schedule_options, schedule_remove_option};
 
 const GUILD: u64 = 2222;
@@ -512,6 +513,7 @@ fn activation_runtime(guild: u64, token: &str, origin: String) -> Arc<CommandRun
         requested,
         None,
         None,
+        None,
         two_bot_core::OnboardingGates {
             mode: two_bot_core::OnboardingMode::Legacy,
             dry_run: false,
@@ -759,6 +761,7 @@ async fn activation_boot_from_env_fixture() {
             mode: two_bot_core::OnboardingMode::Legacy,
             dry_run: false,
         },
+        None,
         &activation,
     );
     if expected == "invalid" {
@@ -984,6 +987,197 @@ async fn unwired_commands_preserve_disabled_and_permission_refusals() {
         assert_eq!(reply["data"]["content"], expected);
     }
     assert_eq!(mock.requests().len(), 3, "only refusal callbacks");
+    mock.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Member-moderation router-to-executor wiring (member runtime slice)
+// ---------------------------------------------------------------------------
+
+/// Runtime with the member-moderation consumer attached over a never-used
+/// lazy pool — for the routing paths that return before any DB work.
+fn runtime_with_member(
+    router_gates: RouterGates,
+    origin: String,
+    pool: PgPool,
+) -> Arc<CommandRuntime> {
+    let automations = router_gates.automations;
+    let executor =
+        ActionExecutor::with_proxy("test-token".to_owned(), Some(origin)).expect("mock executor");
+    let member = MemberRuntime::for_test(pool.clone(), GUILD_S);
+    CommandRuntime::new_with_member(
+        pool,
+        executor,
+        router_with_commands(router_gates),
+        GUILD,
+        automations,
+        member,
+    )
+}
+
+fn member_gates() -> RouterGates {
+    RouterGates {
+        moderation: true,
+        ..gates(true, true)
+    }
+}
+
+fn lazy_pool() -> PgPool {
+    PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool")
+}
+
+/// Member verb with full actor permission and a target + reason, as the
+/// router hands it to the member consumer.
+fn member_slash(name: &str) -> Interaction {
+    let mut interaction = slash(
+        name,
+        Some(CHANNEL),
+        vec![
+            option("target", CommandOptionValue::User(Id::new(3333))),
+            option("reason", CommandOptionValue::String("wiring".to_owned())),
+        ],
+    );
+    interaction.member.as_mut().unwrap().permissions = Some(Permissions::all());
+    interaction
+}
+
+#[tokio::test]
+async fn member_verbs_reach_executor_facts_then_fail_closed_without_db() {
+    // Every member verb routes through the shared router into the member
+    // consumer, which reads live guild facts over REST before touching the
+    // ledger. The mock fails that first read, so each verb must fail closed
+    // with exactly three wire calls (defer, guild read, reply edit) and never
+    // reach the connectionless lazy pool.
+    for name in ["ban", "tempban", "kick", "timeout", "warn"] {
+        let (mock, origin) = MockRest::start(vec![200, 500, 200]).await;
+        let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+        runtime.on_interaction(&member_slash(name)).await;
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 3, "{name}: defer, guild read, reply edit");
+        assert_eq!(requests[1].method, "GET");
+        assert_eq!(requests[1].path, format!("/api/v10/guilds/{GUILD_S}"));
+        let reply = mock.deferred_reply();
+        assert!(
+            reply
+                .to_string()
+                .contains("Moderation command failed; try again."),
+            "{name}: fail-closed reply, got {reply}"
+        );
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
+    for name in ["ban", "tempban", "kick", "timeout", "warn"] {
+        let json_response = |body: serde_json::Value| RestResponse {
+            status: 200,
+            body: Some(body.to_string()),
+            delay: Duration::ZERO,
+        };
+        let (mock, origin) = MockRest::start_script(vec![
+            RestResponse::status(200),
+            json_response(serde_json::json!({
+                "owner_id": "5555",
+                "roles": [{"id": GUILD_S, "position": 0}],
+            })),
+            json_response(serde_json::json!({"user": {"id": "3333", "bot": false}, "roles": []})),
+            json_response(serde_json::to_value(user(4444, true)).unwrap()),
+            json_response(serde_json::json!({"user": {"id": "4444"}, "roles": ["missing-role"]})),
+            RestResponse::status(200),
+        ])
+        .await;
+        let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+        runtime.on_interaction(&member_slash(name)).await;
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            6,
+            "{name}: facts only, no mutation or DB claim"
+        );
+        assert!(requests[1..5].iter().all(|request| request.method == "GET"));
+        assert_eq!(
+            requests[4].path,
+            format!("/api/v10/guilds/{GUILD_S}/members/4444")
+        );
+        assert!(mock.deferred_reply()["content"]
+            .as_str()
+            .unwrap()
+            .contains("Moderation command failed"));
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn member_verbs_share_actor_cooldown_before_role_reads() {
+    let (mock, origin) = MockRest::start(vec![200, 500, 200]).await;
+    let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+    runtime.on_interaction(&member_slash("ban")).await;
+    for (index, name) in ["tempban", "kick", "timeout", "warn"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut interaction = member_slash(name);
+        interaction.id = Id::new(100 + index as u64);
+        runtime.on_interaction(&interaction).await;
+        let requests = mock.requests();
+        let reply: serde_json::Value =
+            serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+        assert_eq!(
+            reply["content"],
+            "Wait 5 seconds before using another member moderation command."
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "GET")
+                .count(),
+            1
+        );
+    }
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn member_verbs_refuse_when_moderation_gate_off() {
+    // Gate-off keeps the verbs closed even with the consumer attached: one
+    // immediate refusal, no defer, no other REST.
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_with_member(gates(true, true), origin, lazy_pool());
+    runtime.on_interaction(&member_slash("ban")).await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1, "one refusal callback");
+    let reply: serde_json::Value = serde_json::from_slice(&callbacks[0].body).expect("reply json");
+    assert_eq!(reply["type"], 4);
+    assert_eq!(reply["data"]["content"], MODERATION_DISABLED_REPLY);
+    assert_eq!(mock.requests().len(), 1, "no other REST effects");
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn member_ban_refuses_without_ban_permission() {
+    // Moderation on, but the actor holds only MANAGE_GUILD: the shared router
+    // refuses before any defer, DB or REST work.
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+    let interaction = slash("ban", Some(CHANNEL), Vec::new());
+    assert_eq!(
+        interaction.member.as_ref().unwrap().permissions,
+        Some(Permissions::MANAGE_GUILD),
+        "fixture actor lacks BAN_MEMBERS"
+    );
+    runtime.on_interaction(&interaction).await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1, "one refusal callback");
+    let reply: serde_json::Value = serde_json::from_slice(&callbacks[0].body).expect("reply json");
+    assert_eq!(reply["type"], 4);
+    assert_eq!(
+        reply["data"]["content"],
+        "You need the Ban Members permission to use /ban. Ask a server moderator or admin to grant it."
+    );
+    assert_eq!(mock.requests().len(), 1, "no other REST effects");
     mock.shutdown().await;
 }
 
@@ -1363,6 +1557,7 @@ async fn production_build_requires_authoritative_custom_rows_before_full_publica
             leveling,
             GUILD,
             custom_commands,
+            None,
             None,
         );
         runtime.set_identity(1111, 1111);

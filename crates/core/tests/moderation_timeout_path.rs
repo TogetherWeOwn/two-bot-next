@@ -79,7 +79,7 @@ fn execution(request_id: &str) -> MemberExecution {
         guild_id: GUILD.to_owned(),
         actor: actor(),
         target: Some(target()),
-        bot_highest_role_position: Some(100),
+        bot_highest_role_position: 100,
         reason: "  spam in #general  ".to_owned(),
         duration_seconds: Some(3600),
         request_id: request_id.to_owned(),
@@ -226,7 +226,7 @@ fn timeout_duration_bounds_accept_edges_refuse_outsiders() {
                 &policy(),
                 &actor(),
                 Some(&target()),
-                Some(100),
+                100,
                 "spam",
                 good,
             )
@@ -240,7 +240,7 @@ fn timeout_duration_bounds_accept_edges_refuse_outsiders() {
             &policy(),
             &actor(),
             Some(&target()),
-            Some(100),
+            100,
             "spam",
             bad,
         )
@@ -261,7 +261,7 @@ fn timeout_duration_bounds_accept_edges_refuse_outsiders() {
         &policy(),
         &actor(),
         Some(&target()),
-        Some(100),
+        100,
         "spam",
         Some(59),
     )
@@ -275,7 +275,7 @@ fn timeout_duration_bounds_accept_edges_refuse_outsiders() {
 /// One actor/target refusal case: mutate the request, then the expected error
 /// and its literal copy.
 type ActorRefusalCase = (
-    fn(&mut ModerationActor, &mut Option<ModerationTarget>, &mut Option<i64>),
+    fn(&mut ModerationActor, &mut Option<ModerationTarget>, &mut i64),
     PolicyError,
     &'static str,
 );
@@ -285,7 +285,7 @@ type ActorRefusalCase = (
 type TargetRefusalCase = (fn(&mut ModerationTarget), PolicyError, &'static str);
 
 #[test]
-fn timeout_policy_refusals_name_the_protection() {
+fn timeout_policy_refusals_do_not_name_the_protected_class() {
     let cases: [ActorRefusalCase; 2] = [
         (
             |actor, _, _| actor.permissions = 0,
@@ -301,7 +301,7 @@ fn timeout_policy_refusals_name_the_protection() {
     for (mutate, expect, copy) in cases {
         let mut actor = actor();
         let mut target = Some(target());
-        let mut bot = Some(100);
+        let mut bot = 100;
         mutate(&mut actor, &mut target, &mut bot);
         let err = validate_member_request(
             ModerationAction::Timeout,
@@ -321,32 +321,32 @@ fn timeout_policy_refusals_name_the_protection() {
         (
             |t: &mut ModerationTarget| t.user_id = ACTOR_ID.to_owned(),
             PolicyError::TargetSelf,
-            "You cannot moderate yourself",
+            "This target cannot be moderated",
         ),
         (
             |t: &mut ModerationTarget| t.is_guild_owner = true,
             PolicyError::TargetGuildOwner,
-            "The guild owner is protected",
+            "This target cannot be moderated",
         ),
         (
             |t: &mut ModerationTarget| t.user_id = OWEN_ID.to_owned(),
             PolicyError::TargetOwen,
-            "Owen is protected",
+            "This target cannot be moderated",
         ),
         (
             |t: &mut ModerationTarget| t.user_id = BOT_ID.to_owned(),
             PolicyError::TargetOwen,
-            "Owen is protected",
+            "This target cannot be moderated",
         ),
         (
             |t: &mut ModerationTarget| t.is_bot = true,
             PolicyError::TargetBot,
-            "Bots are protected",
+            "This target cannot be moderated",
         ),
         (
             |t: &mut ModerationTarget| t.role_ids = vec![STAFF_ROLE.to_owned()],
             PolicyError::TargetStaffRole,
-            "Staff roles are protected",
+            "This target cannot be moderated",
         ),
         (
             |t: &mut ModerationTarget| t.highest_role_position = 50,
@@ -362,7 +362,7 @@ fn timeout_policy_refusals_name_the_protection() {
             &policy(),
             &actor(),
             Some(&target),
-            Some(100),
+            100,
             "spam",
             Some(3600),
         )
@@ -376,7 +376,7 @@ fn timeout_policy_refusals_name_the_protection() {
         &policy(),
         &actor(),
         Some(&target()),
-        Some(10),
+        10,
         "spam",
         Some(3600),
     )
@@ -389,7 +389,7 @@ fn timeout_policy_refusals_name_the_protection() {
 }
 
 #[tokio::test]
-async fn timeout_refused_execution_makes_no_discord_call_and_writes_no_audit() {
+async fn timeout_refused_execution_audits_without_discord_or_a_claim() {
     let discord = MockMemberDiscord::new();
     let store = MemMemberStore::new();
     let svc = service(discord.clone(), store.clone());
@@ -404,7 +404,9 @@ async fn timeout_refused_execution_makes_no_discord_call_and_writes_no_audit() {
         ))
     );
     assert!(discord.calls().is_empty());
-    assert!(store.audits().is_empty());
+    assert_eq!(store.audits().len(), 1);
+    assert_eq!(store.audits()[0].outcome, "denied");
+    assert_eq!(store.audits()[0].actor_id, ACTOR_ID);
 
     // The refusal happened before any claim, so the same key succeeds once
     // the caller presents the required permission.

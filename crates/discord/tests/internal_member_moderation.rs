@@ -128,6 +128,22 @@ fn action_extra(action: &str) -> Value {
     }
 }
 
+fn assert_policy_denial(store: &MemMemberStore, action: &str, request_id: &str, key: &str) {
+    let audits = store.audits();
+    assert_eq!(audits.len(), 1);
+    let row = &audits[0];
+    assert_eq!(row.action, action);
+    assert_eq!(row.outcome, "denied");
+    assert_eq!(row.request_id, format!("{request_id}:denied"));
+    assert_eq!(row.idempotency_key, key);
+    assert_eq!(row.reason, "Member moderation policy refused the request");
+    let metadata: Value = serde_json::from_str(&row.metadata_json).unwrap();
+    assert_eq!(
+        metadata,
+        json!({"stage": "policy", "request_id": request_id})
+    );
+}
+
 fn decode_reason(header: &str) -> String {
     let mut bytes = Vec::new();
     let input = header.as_bytes();
@@ -178,7 +194,7 @@ async fn all_five_verbs_execute_with_signed_wire_reason_and_plain_ledger() {
                 &request(action, action_extra(action)),
                 &actor(),
                 &target(),
-                Some(100),
+                100,
                 &format!("req-{action}"),
                 &key,
                 NOW_MS,
@@ -234,7 +250,7 @@ async fn wire_paths_match_discord_routes() {
                 &request(action, action_extra(action)),
                 &actor(),
                 &target(),
-                Some(100),
+                100,
                 &format!("req-route-{action}"),
                 &format!("key-route-{action}"),
                 NOW_MS,
@@ -285,7 +301,7 @@ async fn hierarchy_refusal_makes_no_claim_or_wire_call() {
             &request("moderation.ban", json!({})),
             &actor(),
             &high,
-            Some(100),
+            100,
             "req-hierarchy",
             "key-hierarchy",
             NOW_MS,
@@ -294,14 +310,15 @@ async fn hierarchy_refusal_makes_no_claim_or_wire_call() {
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::ActionNotAllowed);
     assert!(mock.requests().is_empty());
-    assert!(store.audits().is_empty());
-    // Nothing was claimed: the same key succeeds once the target is lower.
+    assert_policy_denial(&store, "moderation.ban", "req-hierarchy", "key-hierarchy");
+    // Nothing was claimed: the same key succeeds once the target is lower,
+    // and the denied request-id suffix leaves room for its success audit.
     let result = exec
         .execute(
             &request("moderation.ban", json!({})),
             &actor(),
             &target(),
-            Some(100),
+            100,
             "req-hierarchy",
             "key-hierarchy",
             NOW_MS,
@@ -310,6 +327,14 @@ async fn hierarchy_refusal_makes_no_claim_or_wire_call() {
         .unwrap();
     assert_eq!(result.outcome, "banned");
     assert!(!result.replayed);
+    let audits = store.audits();
+    assert_eq!(audits.len(), 2);
+    assert_eq!(audits[0].request_id, "req-hierarchy:denied");
+    assert_eq!(audits[0].outcome, "denied");
+    assert_eq!(audits[1].request_id, "req-hierarchy");
+    assert_eq!(audits[1].outcome, "banned");
+    assert_eq!(audits[1].reason, "spam");
+    assert_eq!(mock.requests().len(), 1);
     mock.shutdown().await;
 }
 
@@ -325,7 +350,7 @@ async fn protected_role_refusal_makes_no_claim_or_wire_call() {
             &request("moderation.kick", json!({})),
             &actor(),
             &staff,
-            Some(100),
+            100,
             "req-protected",
             "key-protected",
             NOW_MS,
@@ -334,7 +359,7 @@ async fn protected_role_refusal_makes_no_claim_or_wire_call() {
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::ActionNotAllowed);
     assert!(mock.requests().is_empty());
-    assert!(store.audits().is_empty());
+    assert_policy_denial(&store, "moderation.kick", "req-protected", "key-protected");
     mock.shutdown().await;
 }
 
@@ -351,7 +376,7 @@ async fn tempban_schedules_unban_and_sweep_dispatches_it() {
             &request("moderation.tempban", json!({"duration_seconds": 3600})),
             &actor(),
             &target(),
-            Some(100),
+            100,
             "req-tempban",
             "key-tempban",
             NOW_MS,
@@ -388,7 +413,7 @@ async fn same_key_replays_stored_outcome_without_second_wire_call() {
             &request("moderation.ban", json!({})),
             &actor(),
             &target(),
-            Some(100),
+            100,
             "req-replay",
             "key-replay",
             NOW_MS,
@@ -401,7 +426,7 @@ async fn same_key_replays_stored_outcome_without_second_wire_call() {
             &request("moderation.ban", json!({})),
             &actor(),
             &target(),
-            Some(100),
+            100,
             "req-replay",
             "key-replay",
             NOW_MS,
@@ -428,7 +453,7 @@ async fn key_reuse_with_different_content_is_mismatch() {
         &request("moderation.ban", json!({})),
         &actor(),
         &target(),
-        Some(100),
+        100,
         "req-mismatch",
         "key-mismatch",
         NOW_MS,
@@ -448,7 +473,7 @@ async fn key_reuse_with_different_content_is_mismatch() {
             &InternalMemberRequest::from_body("moderation.ban", body.as_object().unwrap()).unwrap(),
             &actor(),
             &target(),
-            Some(100),
+            100,
             "req-mismatch-other",
             "key-mismatch",
             NOW_MS,
@@ -474,7 +499,7 @@ async fn ledger_rows_match_slash_path_exactly() {
         guild_id: GUILD.to_owned(),
         actor: actor(),
         target: Some(target()),
-        bot_highest_role_position: Some(100),
+        bot_highest_role_position: 100,
         reason: "spam".to_owned(),
         duration_seconds: None,
         request_id: "req-parity".to_owned(),
@@ -494,7 +519,7 @@ async fn ledger_rows_match_slash_path_exactly() {
             &request("moderation.ban", json!({})),
             &actor(),
             &target(),
-            Some(100),
+            100,
             "req-parity",
             "key-parity",
             NOW_MS,
@@ -535,7 +560,7 @@ async fn disabled_config_or_unresolved_identity_refuses_before_store() {
             &request("moderation.ban", json!({})),
             &actor(),
             &target(),
-            Some(100),
+            100,
             "req-closed",
             "key-closed",
             NOW_MS,
@@ -553,7 +578,7 @@ async fn disabled_config_or_unresolved_identity_refuses_before_store() {
             &request("moderation.ban", json!({})),
             &stranger,
             &target(),
-            Some(100),
+            100,
             "req-stranger",
             "key-stranger",
             NOW_MS,
@@ -566,7 +591,7 @@ async fn disabled_config_or_unresolved_identity_refuses_before_store() {
             &request("moderation.ban", json!({})),
             &actor(),
             &target(),
-            Some(100),
+            100,
             "req-bad-key",
             "short",
             NOW_MS,
@@ -593,7 +618,7 @@ async fn discord_rejection_releases_claim_for_retry() {
             &request("moderation.ban", json!({})),
             &actor(),
             &target(),
-            Some(100),
+            100,
             "req-rejected",
             "key-rejected",
             NOW_MS,
@@ -607,7 +632,7 @@ async fn discord_rejection_releases_claim_for_retry() {
             &request("moderation.ban", json!({})),
             &actor(),
             &target(),
-            Some(100),
+            100,
             "req-rejected",
             "key-rejected",
             NOW_MS,
@@ -634,7 +659,7 @@ async fn uncertain_timeout_keeps_fence() {
             &request("moderation.timeout", json!({"duration_seconds": 3600})),
             &actor(),
             &target(),
-            Some(100),
+            100,
             "req-uncertain",
             "key-uncertain",
             NOW_MS,
@@ -649,7 +674,7 @@ async fn uncertain_timeout_keeps_fence() {
             &request("moderation.timeout", json!({"duration_seconds": 3600})),
             &actor(),
             &target(),
-            Some(100),
+            100,
             "req-uncertain",
             "key-uncertain",
             NOW_MS,
@@ -744,15 +769,7 @@ async fn postgres_all_five_verbs_write_ledger_and_replay() {
         let key = format!("pg-key-{verb}");
         let req = format!("pg-req-{verb}");
         let result = exec
-            .execute(
-                &parsed,
-                &actor(),
-                &target_member,
-                Some(100),
-                &req,
-                &key,
-                NOW_MS,
-            )
+            .execute(&parsed, &actor(), &target_member, 100, &req, &key, NOW_MS)
             .await
             .unwrap();
         assert_eq!(result.outcome, expected_outcome(verb));
@@ -770,15 +787,7 @@ async fn postgres_all_five_verbs_write_ledger_and_replay() {
         );
         // Same-key replay returns the stored outcome without a second mutation.
         let replay = exec
-            .execute(
-                &parsed,
-                &actor(),
-                &target_member,
-                Some(100),
-                &req,
-                &key,
-                NOW_MS,
-            )
+            .execute(&parsed, &actor(), &target_member, 100, &req, &key, NOW_MS)
             .await
             .unwrap();
         assert!(replay.replayed);
@@ -807,7 +816,7 @@ async fn postgres_tempban_schedules_pending_unban_with_exact_expiry() {
         &request("moderation.tempban", json!({"duration_seconds": 3600})),
         &actor(),
         &target(),
-        Some(100),
+        100,
         "pg-tempban",
         "pg-tempban-key",
         NOW_MS,
@@ -839,7 +848,7 @@ async fn postgres_tempban_schedules_pending_unban_with_exact_expiry() {
 
 #[tokio::test]
 #[ignore = "requires agent-testdb or CI service container"]
-async fn postgres_hierarchy_refusal_writes_nothing() {
+async fn postgres_hierarchy_refusal_audits_denial_without_claim() {
     let db = TestDb::new().await;
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
     let exec = pg_executor(&db, &mock);
@@ -850,7 +859,7 @@ async fn postgres_hierarchy_refusal_writes_nothing() {
             &request("moderation.ban", json!({})),
             &actor(),
             &high,
-            Some(100),
+            100,
             "pg-hierarchy",
             "pg-hierarchy-key",
             NOW_MS,
@@ -866,7 +875,22 @@ async fn postgres_hierarchy_refusal_writes_nothing() {
         .fetch_one(db.fixture.pool())
         .await
         .unwrap();
-    assert_eq!((audits, claims), (0, 0));
+    assert_eq!((audits, claims), (1, 0));
+    let row: (String, String, String, String) = sqlx::query_as(
+        "SELECT action, outcome, reason, metadata_json FROM moderation_audit WHERE request_id = $1",
+    )
+    .bind("pg-hierarchy:denied")
+    .fetch_one(db.fixture.pool())
+    .await
+    .unwrap();
+    assert_eq!(row.0, "moderation.ban");
+    assert_eq!(row.1, "denied");
+    assert_eq!(row.2, "Member moderation policy refused the request");
+    let metadata: Value = serde_json::from_str(&row.3).unwrap();
+    assert_eq!(
+        metadata,
+        json!({"stage": "policy", "request_id": "pg-hierarchy"})
+    );
     assert!(mock.requests().is_empty());
     mock.shutdown().await;
     db.cleanup().await;

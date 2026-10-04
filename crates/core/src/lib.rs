@@ -139,6 +139,7 @@ pub mod voice_private;
 pub mod voice_reconcile;
 pub mod voice_rename_coalescer;
 pub mod voice_room_controls;
+pub mod voice_room_name;
 pub mod voice_rooms;
 pub mod voice_style;
 pub mod voice_template;
@@ -167,11 +168,11 @@ pub use automod::{
     DEFAULT_SANCTIONS,
 };
 pub use channel_moderation::{
-    moderation_result_text, plan_lockdown, plan_unlock, require_channel_reason,
-    validate_purge_count, validate_slowmode_seconds, BoundsError, ChannelModerationVerb,
-    ChannelOutcome, EveryoneOverwrite, LockdownPlan, LockdownRecord, LockdownSeed, MaskError,
-    UnlockError, UnlockPlan, MAX_PURGE_COUNT, MAX_SLOWMODE_SECONDS, MIN_PURGE_COUNT,
-    SEND_MESSAGES_BIT,
+    message_created_ms, moderation_result_text, plan_lockdown, plan_purge, plan_unlock,
+    require_channel_reason, validate_purge_count, validate_slowmode_seconds, BoundsError,
+    ChannelModerationVerb, ChannelOutcome, EveryoneOverwrite, LockdownPlan, LockdownRecord,
+    LockdownSeed, MaskError, PurgePlan, UnlockError, UnlockPlan, LOCKDOWN_BITS, MAX_PURGE_COUNT,
+    MAX_SLOWMODE_SECONDS, MIN_PURGE_COUNT, SEND_MESSAGES_BIT,
 };
 #[cfg(feature = "db")]
 pub use channel_moderation_store::{
@@ -210,10 +211,11 @@ pub use custom_commands::{
     accepted_text_trigger, adjudicate_delete, adjudicate_put, adjudicate_run,
     builtin_command_names, check_capacity, deregister_set, error_code, format_command_list,
     is_builtin_trigger, max_custom_commands, placeholders_in, registry_with_custom,
-    render_template, require_automations_enabled, trigger_word, validate_put_input,
-    validate_template, AuditRecord, CommandError, DeleteDecision, PutCommandInput, PutDecision,
-    RunOutcome, StoredCommand, TemplateContext, TemplateError, MAX_COMMAND_NAME_CHARS,
-    MAX_DESCRIPTION_CHARS, MAX_RENDERED_CHARS, MAX_TEMPLATE_CHARS, TEMPLATE_PLACEHOLDERS,
+    render_template, require_automations_enabled, reserved_command_names, trigger_word,
+    validate_put_input, validate_template, AuditRecord, CommandError, DeleteDecision,
+    PutCommandInput, PutDecision, RunOutcome, StoredCommand, TemplateContext, TemplateError,
+    MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_RENDERED_CHARS, MAX_TEMPLATE_CHARS,
+    TEMPLATE_PLACEHOLDERS,
 };
 pub use events::{CoreEvent, VoiceSessionDelta};
 pub use evidence::{
