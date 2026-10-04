@@ -133,6 +133,38 @@ async fn override_flag_allows_owed_loudly() {
 }
 
 #[tokio::test]
+async fn env_override_exits_zero_but_json_still_reports_owed_releases() {
+    let Some(db) = migrated().await else { return };
+    seed_owed(db.pool()).await;
+    let url = db_url(&db);
+    let output = cli(
+        &["moderation", "preflight", "--json"],
+        &[("TWO_DATABASE_URL", &url), ("TWO_ALLOW_OWED_RELEASES", "1")],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout is JSON");
+    assert_eq!(report["clear"], false);
+    assert_eq!(report["overridden"], true);
+    assert_eq!(
+        report["pending_unbans"],
+        serde_json::json!(["req-cli-owed"])
+    );
+
+    // The recovery verification command must omit both overrides, not trust exit 0.
+    let output = cli(
+        &["moderation", "preflight", "--json"],
+        &[("TWO_DATABASE_URL", &url)],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout is JSON");
+    assert_eq!(report["clear"], false);
+    assert_eq!(report["overridden"], false);
+    db.close().await.expect("drops fixture database");
+}
+
+#[tokio::test]
 async fn clear_database_exits_zero() {
     let Some(db) = migrated().await else { return };
     let url = db_url(&db);

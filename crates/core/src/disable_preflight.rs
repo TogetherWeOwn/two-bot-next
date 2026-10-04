@@ -256,7 +256,7 @@ pub async fn boot_check(
 #[cfg(feature = "db")]
 async fn pending_unbans(pool: &PgPool) -> Result<(Vec<String>, Vec<String>), sqlx::Error> {
     let rows: Vec<(String, String)> = match sqlx::query_as(
-        "SELECT request_id, state FROM moderation_scheduled_unbans
+        "SELECT request_id, state::text FROM moderation_scheduled_unbans
           WHERE state NOT IN ('cancelled', 'done', 'superseded') ORDER BY request_id",
     )
     .fetch_all(pool)
