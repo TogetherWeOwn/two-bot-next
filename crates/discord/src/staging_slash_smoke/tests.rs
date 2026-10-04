@@ -142,6 +142,8 @@ impl SmokeFixtures for RecordingFixtures {
 
 #[tokio::test]
 async fn live_guild_and_bad_configuration_refuse_before_all_calls() {
+    let padded_guild = format!("{TWO_STAGING_GUILD_ID} ");
+    let leading_zero_guild = format!("0{TWO_STAGING_GUILD_ID}");
     let mut cases = vec![
         (SmokeConfig::default(), Refusal::MissingApplication),
         (
@@ -197,8 +199,8 @@ async fn live_guild_and_bad_configuration_refuse_before_all_calls() {
     for guild in [
         "",
         "0",
-        "1545644954272137297 ",
-        "01545644954272137297",
+        padded_guild.as_str(),
+        leading_zero_guild.as_str(),
         "999",
         "fixture-config-sensitive",
     ] {
