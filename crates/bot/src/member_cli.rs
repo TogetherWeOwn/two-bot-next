@@ -254,6 +254,7 @@ async fn run(
                             format!("execute_at={}", row.execute_at.as_deref().unwrap_or(""))
                         }
                     };
+                    // codeql[rust/cleartext-logging]: FP - Discord user IDs are public guild-visible snowflakes, not secrets; --list is an identifiers-only operator report to stdout; claim tokens never print; connection/SQL errors are redacted; output is staging-guild fenced; printing the fenced member ID is the tool purpose.
                     println!(
                         "{}\t{}\t{}\t{detail}",
                         row.kind.as_str(),
