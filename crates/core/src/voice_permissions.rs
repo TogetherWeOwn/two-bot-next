@@ -21,11 +21,12 @@
 //! 1. Without Manage Roles the bot cannot legally set any override, so the
 //!    plan is [`RoomPermissionPlan::SyncToCategory`], never a list. No other
 //!    input is validated on this path.
-//! 2. Otherwise the source overrides are copied verbatim, except that each
-//!    override is normalized so deny wins over allow on the same target
-//!    (`allow &= !deny`). The three [`InheritanceSource`] variants behave
-//!    identically here; the caller resolves which channel's overrides to
-//!    pass.
+//! 2. Otherwise source overrides are copied with Manage Roles removed from
+//!    every allow, and normalized so deny wins on the same target
+//!    (`allow &= !(deny | PERM_MANAGE_ROLES)`). All source denies, including
+//!    Manage Roles, are retained: a deny restricts rather than confers it.
+//!    The three [`InheritanceSource`] variants behave identically here; the
+//!    caller resolves which channel's overrides to pass.
 //! 3. Private rooms deny Connect to @everyone while preserving whatever View
 //!    allow the source had ("keep View" preserves, never creates: a source
 //!    with no @everyone entry yields `allow: 0, deny: CONNECT`). A source
@@ -47,7 +48,8 @@
 //! bit the source override for the same target did not allow, except the
 //! documented owner bits and, on its own target only, the required-role
 //! bits; (b) deny wins over allow for every output target
-//! (`allow & deny == 0`); (c) no duplicate targets.
+//! (`allow & deny == 0`); (c) no duplicate targets; (d) no emitted allow
+//! contains Manage Roles, whether inherited or newly granted.
 
 use crate::Snowflake;
 
@@ -151,7 +153,8 @@ pub enum RoomPermissionPlan {
     SyncToCategory,
     /// The complete override set to include in the channel-create call.
     /// Never patched afterwards. At most one entry per `(id, kind)`, and
-    /// every entry satisfies `allow & deny == 0` (deny wins).
+    /// every entry satisfies `allow & deny == 0` (deny wins) and
+    /// `allow & PERM_MANAGE_ROLES == 0` (never conferred, even if inherited).
     Overrides(Vec<ChannelOverride>),
 }
 
@@ -231,9 +234,10 @@ fn require_id(id: Snowflake) -> Result<(), PermissionPlanError> {
     }
 }
 
-/// Deny wins over allow for the same target.
+/// Deny wins on the same target; create-time allows never confer Manage Roles.
+/// Keep all source denies, including Manage Roles, to preserve restrictions.
 fn normalized(mut entry: ChannelOverride) -> ChannelOverride {
-    entry.allow &= !entry.deny;
+    entry.allow &= !(entry.deny | PERM_MANAGE_ROLES);
     entry
 }
 
