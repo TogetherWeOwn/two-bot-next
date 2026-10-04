@@ -149,11 +149,11 @@ struct Targets {
     ticket_complete: bool,
 }
 
-/// Strict self-role catalogue validation lives in
-/// `two_bot_core::self_roles::parse_self_role_panels` (Discord bounds: 20
-/// reactions, 100-unit custom ids, 80-unit button labels). Preflight reuses it
-/// so a catalogue the bot would refuse at boot fails here instead of passing
-/// with only channel/role targets collected.
+// Strict self-role catalogue validation lives in
+// `two_bot_core::self_roles::parse_self_role_panels` (Discord bounds: 20
+// reactions, 100-unit custom ids, 80-unit button labels). Preflight reuses it
+// so a catalogue the bot would refuse at boot fails here instead of passing
+// with only channel/role targets collected.
 
 fn snowflake(raw: &str) -> Result<u64, &'static str> {
     if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -764,7 +764,7 @@ mod tests {
         // id/messageId/mode/option key/label/permissions shape.
         env.insert(
             "TWO_SELF_ROLE_PANELS".into(),
-            r#"[{"id":"games","channelId":"100000000000000007","messageId":"100000000000000008","mode":"button","options":[{"key":"chess","label":"Chess","roleId":"100000000000000004","permissions":"0"}]}]"#.into(),
+            r#"[{"id":"games","channelId":"10000000000000000007","messageId":"10000000000000000008","mode":"button","options":[{"key":"chess","label":"Chess","roleId":"10000000000000000004","permissions":"0"}]}]"#.into(),
         );
         let targets = Targets::from_map(&env, None).unwrap();
         assert_eq!(targets.channels.len(), 3);
