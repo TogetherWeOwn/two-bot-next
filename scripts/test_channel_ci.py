@@ -64,12 +64,41 @@ class ChannelCiTests(unittest.TestCase):
                              check=True, capture_output=True, text=True)
         return dict(line.split("=", 1) for line in run.stdout.splitlines())
 
+    def gate(self, job):
+        body = re.split(r"\n  (?=\S)", self.workflow.split(f"\n  {job}:\n", 1)[1], maxsplit=1)[0]
+        self.assertIn("    needs: changes\n", body)
+        return re.search(r"^    if: \$\{\{ (.+) \}\}$", body, re.M).group(1)
+
+    def runs(self, gate, output, selector_failed=False, cancelled=False):
+        """Evaluate a nightly gate the way Actions does for a `changes` outcome.
+
+        Without `!cancelled()` Actions prepends an implicit `success()` that
+        skips the job whenever the selector job failed or timed out.
+        """
+        if cancelled:
+            return False
+        if "!cancelled()" not in gate and selector_failed:
+            return False
+        value = "" if selector_failed else output
+        return gate.endswith(" != 'false'") and value != "false"
+
     def test_nightly_gates_heavy_jobs_at_job_level(self):
         self.assertNotIn("    paths:", self.workflow)
         for job, output in [("pipeline-benchmark", "rust"), ("sweep", "rust"), ("advisories", "supply")]:
-            body = re.split(r"\n  (?=\S)", self.workflow.split(f"\n  {job}:\n", 1)[1], maxsplit=1)[0]
-            self.assertIn("    needs: changes\n", body)
-            self.assertIn(f"    if: ${{{{ needs.changes.outputs.{output} != 'false' }}}}", body)
+            self.assertEqual(self.gate(job), f"!cancelled() && needs.changes.outputs.{output} != 'false'")
+
+    def test_nightly_gates_fail_closed_when_the_selector_job_fails(self):
+        for job in ["pipeline-benchmark", "sweep", "advisories"]:
+            gate = self.gate(job)
+            self.assertTrue(self.runs(gate, "true"), job)
+            self.assertFalse(self.runs(gate, "false"), job)
+            # Selector failure or timeout: no output, the heavy job must still run.
+            self.assertTrue(self.runs(gate, "", selector_failed=True), job)
+            # A cancelled run (superseded push) must not start heavy jobs.
+            self.assertFalse(self.runs(gate, "true", cancelled=True), job)
+        # The pre-fix gate would have skipped the job on selector failure.
+        old = "needs.changes.outputs.rust != 'false'"
+        self.assertFalse(self.runs(old, "", selector_failed=True))
 
     def test_nightly_pr_selection_respects_the_shared_classifier(self):
         self.assertEqual(self.selected_jobs("pull_request", "rust=false\nsupply=false"),

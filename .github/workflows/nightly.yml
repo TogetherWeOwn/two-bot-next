@@ -47,10 +47,14 @@ jobs:
           fi
           printf 'rust=%s\nsupply=%s\n' "$rust" "$supply" >>"$GITHUB_OUTPUT"
 
+  # Every heavy job gates on `!cancelled() && <output> != 'false'`. A failed or
+  # timed-out `changes` job emits no output, so the comparison is true and the
+  # job still runs: only an explicit `false` skips it. Without `!cancelled()` the
+  # implicit `success()` would skip the jobs when `changes` fails.
   pipeline-benchmark:
     name: nightly pipeline budget
     needs: changes
-    if: ${{ needs.changes.outputs.rust != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     # A called workflow can only narrow the caller grant; with the default-deny
     # top level it would otherwise check out this private repo with no token.
     permissions:
@@ -60,7 +64,7 @@ jobs:
   advisories:
     name: nightly advisories
     needs: changes
-    if: ${{ needs.changes.outputs.supply != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.supply != 'false' }}
     permissions:
       contents: read
     # Runner routing: see the note on `check` in check.yml.
@@ -80,7 +84,7 @@ jobs:
   sweep:
     name: nightly ignored tests and docs
     needs: changes
-    if: ${{ needs.changes.outputs.rust != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     permissions:
       contents: read
     # Runner routing: see the note on `check` in check.yml.
