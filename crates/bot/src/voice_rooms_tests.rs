@@ -1354,7 +1354,15 @@ async fn lacking_manage_roles_creates_without_overrides_so_the_room_syncs_to_its
     use twilight_model::channel::permission_overwrite::{
         PermissionOverwrite, PermissionOverwriteType,
     };
-    let (live, store, http, _) = fixture();
+    let (live, store, http, trace) = fixture();
+    let mut creator = channel(CREATOR, 2, Some(CATEGORY));
+    creator.permission_overwrites = Some(vec![PermissionOverwrite {
+        id: Id::new(600),
+        kind: PermissionOverwriteType::Member,
+        allow: Permissions::MANAGE_ROLES,
+        deny: Permissions::empty(),
+    }]);
+    live.upsert_channel(creator);
     let overwrite = PermissionOverwrite {
         id: Id::new(GUILD),
         kind: PermissionOverwriteType::Role,
@@ -1369,11 +1377,193 @@ async fn lacking_manage_roles_creates_without_overrides_so_the_room_syncs_to_its
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
-    // The bot cannot set overrides without Manage Roles: none are sent, so
-    // Discord syncs the new room to the category it is created in.
+    dispatch(&mut worker, 1).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "move:300:500"]
+    );
+    assert!(worker.failures().is_empty());
+    // The bot cannot set overrides without Manage Roles: none are sent, even
+    // if the source grants it to someone else. Discord syncs to the category.
     let created = worker.http.created_attributes.lock().unwrap();
+    assert_eq!(created.len(), 1);
     assert_eq!(created[0].parent_id, Some(CATEGORY));
     assert!(created[0].overwrites.is_empty());
+}
+
+#[tokio::test]
+async fn create_request_strips_inherited_manage_roles_from_every_overwrite() {
+    use twilight_model::channel::permission_overwrite::{
+        PermissionOverwrite, PermissionOverwriteType,
+    };
+    use two_bot_core::voice_permissions::OWNER_ALLOW_BITS;
+
+    for source in [
+        PermissionSource::Creator,
+        PermissionSource::Category,
+        PermissionSource::Channel(700),
+    ] {
+        for private in [false, true] {
+            for inherited_bot in [false, true] {
+                let (live, store, http, trace) = fixture();
+                {
+                    let mut creators = store.creators.lock().unwrap();
+                    creators[0].permission_source = source;
+                    creators[0].permission_channel_id = match source {
+                        PermissionSource::Channel(id) => Some(id),
+                        _ => None,
+                    };
+                    creators[0].private_default = private;
+                    creators[0].validate().unwrap();
+                }
+                let source_id = match source {
+                    PermissionSource::Creator => CREATOR,
+                    PermissionSource::Category => CATEGORY,
+                    PermissionSource::Channel(id) => id,
+                };
+                let mut source_channel = channel(
+                    source_id,
+                    if source_id == CATEGORY { 4 } else { 2 },
+                    if source_id == CATEGORY {
+                        None
+                    } else {
+                        Some(CATEGORY)
+                    },
+                );
+                let mut overwrites: Vec<_> = [
+                    (
+                        GUILD,
+                        PermissionOverwriteType::Role,
+                        Permissions::VIEW_CHANNEL | Permissions::CONNECT,
+                        Permissions::empty(),
+                    ),
+                    (
+                        MEMBER,
+                        PermissionOverwriteType::Member,
+                        Permissions::VIEW_CHANNEL | Permissions::CONNECT,
+                        Permissions::SEND_MESSAGES,
+                    ),
+                    (
+                        600,
+                        PermissionOverwriteType::Role,
+                        Permissions::SPEAK,
+                        Permissions::STREAM,
+                    ),
+                    (
+                        601,
+                        PermissionOverwriteType::Member,
+                        Permissions::SPEAK,
+                        Permissions::MANAGE_ROLES,
+                    ),
+                ]
+                .into_iter()
+                .map(|(id, kind, allow, deny)| PermissionOverwrite {
+                    id: Id::new(id),
+                    kind,
+                    allow: allow | Permissions::MANAGE_ROLES,
+                    deny,
+                })
+                .collect();
+                if inherited_bot {
+                    overwrites.push(PermissionOverwrite {
+                        id: Id::new(999),
+                        kind: PermissionOverwriteType::Member,
+                        allow: Permissions::MANAGE_ROLES,
+                        deny: Permissions::SEND_MESSAGES,
+                    });
+                }
+                source_channel.permission_overwrites = Some(overwrites);
+                live.upsert_channel(source_channel);
+                let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+                join(&mut worker, MEMBER);
+                dispatch(&mut worker, 0).await;
+                assert!(
+                    worker.failures().is_empty(),
+                    "source={source:?}, private={private}, inherited_bot={inherited_bot}: {:?}",
+                    worker.failures()
+                );
+                dispatch(&mut worker, 1).await;
+                assert_eq!(
+                    *trace.lock().unwrap(),
+                    ["create", "persist:500", "move:300:500"]
+                );
+                assert!(worker.failures().is_empty());
+                let created = worker.http.created_attributes.lock().unwrap();
+                assert_eq!(created.len(), 1);
+                let attributes = &created[0];
+                assert_eq!(attributes.parent_id, Some(CATEGORY));
+                assert_eq!(
+                    attributes.overwrites.len(),
+                    if inherited_bot || private { 5 } else { 4 }
+                );
+                for overwrite in &attributes.overwrites {
+                    assert!(
+                        !overwrite.allow.contains(Permissions::MANAGE_ROLES),
+                        "{overwrite:?}"
+                    );
+                    assert!(!overwrite.allow.intersects(overwrite.deny), "{overwrite:?}");
+                }
+                let entry = |id| {
+                    attributes
+                        .overwrites
+                        .iter()
+                        .find(|overwrite| overwrite.id.get() == id)
+                        .unwrap()
+                };
+                let owner = entry(MEMBER);
+                assert_eq!(owner.allow.bits(), OWNER_ALLOW_BITS);
+                assert!(!owner.allow.contains(Permissions::ADMINISTRATOR));
+                assert_eq!(owner.deny, Permissions::SEND_MESSAGES);
+                assert_eq!(entry(600).allow, Permissions::SPEAK);
+                assert_eq!(entry(600).deny, Permissions::STREAM);
+                assert_eq!(entry(601).allow, Permissions::SPEAK);
+                // Manage Roles denies restrict rather than confer it, and stay intact.
+                assert_eq!(entry(601).deny, Permissions::MANAGE_ROLES);
+                let everyone = entry(GUILD);
+                assert_eq!(everyone.deny.contains(Permissions::CONNECT), private);
+                assert!(everyone.allow.contains(Permissions::VIEW_CHANNEL));
+                assert_eq!(everyone.allow.contains(Permissions::CONNECT), !private);
+                if private {
+                    let bot = entry(999);
+                    assert_eq!(bot.allow, permissions() & !Permissions::MANAGE_ROLES);
+                    assert_eq!(
+                        bot.deny,
+                        if inherited_bot {
+                            Permissions::SEND_MESSAGES
+                        } else {
+                            Permissions::empty()
+                        }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn lacking_manage_roles_refuses_a_private_default_before_any_create() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].private_default = true;
+    live.inner.write().unwrap().bot.as_mut().unwrap().roles =
+        vec![role(permissions() & !Permissions::MANAGE_ROLES)];
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(worker.http.created_attributes.lock().unwrap().is_empty());
+    assert!(worker.tracked().is_empty());
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call == "create" || call.starts_with("persist:") || call.starts_with("move:")));
+    assert!(matches!(
+        worker.failures().back(),
+        Some(LifecycleFailure::Discord {
+            error: RoomHttpError::AccessDenied,
+            ..
+        })
+    ));
+    assert!(!worker.dispatch_one(60000).await);
 }
 
 #[tokio::test]
