@@ -114,6 +114,8 @@ pub const DUMP_TABLES: &[&str] = &[
     "invite_campaigns",
     "voice_creators",
     "voice_rooms",
+    // V3 block list: references voice_rooms, so it restores after it.
+    "voice_room_blocks",
     "voice_owner_grants",
     "voice_text_companions",
     "voice_access_controls",

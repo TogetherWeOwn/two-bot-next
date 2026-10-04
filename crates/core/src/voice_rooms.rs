@@ -768,6 +768,32 @@ pub enum RoomAction {
         channel_id: Snowflake,
         member_id: Snowflake,
     },
+    /// V3 `/private` (`deny`) and `/public` (`!deny`): set or clear the
+    /// @everyone Connect deny on a room. View Channel is never touched and
+    /// the write is idempotent. The worker flips the room's privacy state and
+    /// plans the Join channel only after it lands.
+    SetEveryoneConnect {
+        channel_id: Snowflake,
+        deny: bool,
+    },
+    /// V3: create the "⇩ Join ‹owner›" voice channel next to a private room.
+    CreateJoinChannel {
+        room_channel_id: Snowflake,
+        name: String,
+    },
+    /// V3: delete a room's Join channel. Carries its target and scopes to no
+    /// room, like `CreateRoom`: a room deleted meanwhile must not drop the
+    /// delete and leak the channel. The dispatch refuses an id the worker
+    /// does not hold as a bot-created Join channel.
+    DeleteJoinChannel {
+        room_channel_id: Snowflake,
+        channel_id: Snowflake,
+    },
+    /// V3: persist the room's current privacy record. Reads the worker's row
+    /// at dispatch time, so a retry never writes stale state.
+    SavePrivacy {
+        channel_id: Snowflake,
+    },
 }
 
 /// Queue lane.
@@ -792,11 +818,19 @@ impl RoomAction {
     #[must_use]
     pub fn channel_id(&self) -> Option<Snowflake> {
         match self {
-            Self::CreateRoom { .. } | Self::CreateCompanion { .. } => None,
+            Self::CreateRoom { .. }
+            | Self::CreateCompanion { .. }
+            | Self::DeleteJoinChannel { .. } => None,
             Self::MoveMember { channel_id, .. }
             | Self::DeleteRoom { channel_id }
             | Self::UpdateOwnership { channel_id, .. }
             | Self::RenameRoom { channel_id, .. }
+            | Self::SetEveryoneConnect { channel_id, .. }
+            | Self::SavePrivacy { channel_id }
+            | Self::CreateJoinChannel {
+                room_channel_id: channel_id,
+                ..
+            }
             | Self::SetCustomName { channel_id, .. }
             | Self::GrantCompanionView {
                 room_channel_id: channel_id,
@@ -1462,6 +1496,14 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         CommandDefinition::new(
             "name",
             "Set a custom name for your temporary voice room, or restore the template name",
+        ),
+        CommandDefinition::new(
+            "private",
+            "Deny new members from joining your voice room and open a Join channel",
+        ),
+        CommandDefinition::new(
+            "public",
+            "Let anyone join your voice room again and remove its Join channel",
         ),
     ]
 }
@@ -2152,6 +2194,49 @@ mod tests {
     }
 
     #[test]
+    fn privacy_actions_scope_to_their_room_except_the_join_delete() {
+        assert_eq!(
+            RoomAction::SetEveryoneConnect {
+                channel_id: 500,
+                deny: true
+            }
+            .channel_id(),
+            Some(500)
+        );
+        assert_eq!(
+            RoomAction::SavePrivacy { channel_id: 500 }.channel_id(),
+            Some(500)
+        );
+        assert_eq!(
+            RoomAction::CreateJoinChannel {
+                room_channel_id: 500,
+                name: "⇩ Join Ana".to_owned()
+            }
+            .channel_id(),
+            Some(500)
+        );
+        // The Join delete names its own target and scopes to no room, so a
+        // room deleted meanwhile cannot drop it and leak the channel.
+        let delete = RoomAction::DeleteJoinChannel {
+            room_channel_id: 500,
+            channel_id: 700,
+        };
+        assert_eq!(delete.channel_id(), None);
+        let q = ActionQueue::new();
+        q.enqueue(GUILD, delete);
+        q.enqueue(GUILD, RoomAction::SavePrivacy { channel_id: 500 });
+        q.enqueue(
+            GUILD,
+            RoomAction::SetEveryoneConnect {
+                channel_id: 500,
+                deny: false,
+            },
+        );
+        assert_eq!(q.drop_for_channel(GUILD, 500), 2);
+        assert_eq!(q.pending_counts(GUILD), (1, 0));
+    }
+
+    #[test]
     fn voice_command_shapes_and_gates() {
         let defs = voice_commands();
         assert_eq!(
@@ -2174,7 +2259,9 @@ mod tests {
                 "defaultlimit",
                 "alwaysprivate",
                 "kick",
-                "name"
+                "name",
+                "private",
+                "public"
             ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
@@ -2357,6 +2444,14 @@ mod tests {
         assert_eq!(defs[7].options[0].name, "member");
         assert_eq!(defs[7].options[0].kind, CommandOptionType::User as u8);
         assert!(defs[7].options[0].required == Some(true));
+        // `/private` and `/public` take no options and are not permission
+        // gated here: the handler allows only the room owner or an admin.
+        assert_eq!(defs[18].name, "private");
+        assert_eq!(defs[19].name, "public");
+        for def in &defs[18..20] {
+            assert_eq!(def.default_member_permissions, None);
+            assert!(def.options.is_empty());
+        }
         // Merges cleanly alongside the other slices, first-wins.
         // Moderation's `kick` sorts before the voice one, so the shared
         // merge keeps the moderation definition; runtime dispatch (not the
@@ -2375,6 +2470,8 @@ mod tests {
         assert!(merged.iter().any(|d| d.name == "reclaim"));
         assert!(merged.iter().any(|d| d.name == "transfer"));
         assert!(merged.iter().any(|d| d.name == "logging"));
+        assert!(merged.iter().any(|d| d.name == "private"));
+        assert!(merged.iter().any(|d| d.name == "public"));
 
         assert!(!VoiceGates::from_map(&Default::default()).enabled);
         let vars: HashMap<String, String> = [("TWO_VOICE".to_owned(), "1".to_owned())]
