@@ -4545,7 +4545,9 @@ fn export_file_response(content: &str, filename: String, bytes: Vec<u8>) -> Inte
     }
 }
 
-/// Ephemeral `/import` preview reply with Confirm/Cancel buttons.
+/// Ephemeral `/import` preview reply with Confirm/Cancel buttons. Mentions
+/// are disabled: the preview quotes uploaded template text, which must never
+/// ping.
 fn import_preview_response(text: &str, member_id: Snowflake, hash: &str) -> InteractionResponse {
     InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
@@ -4553,6 +4555,12 @@ fn import_preview_response(text: &str, member_id: Snowflake, hash: &str) -> Inte
             content: Some(text.to_owned()),
             components: Some(import_preview_components(member_id, hash)),
             flags: Some(MessageFlags::EPHEMERAL),
+            allowed_mentions: Some(AllowedMentions {
+                parse: Vec::new(),
+                users: Vec::new(),
+                roles: Vec::new(),
+                replied_user: false,
+            }),
             ..Default::default()
         }),
     }
