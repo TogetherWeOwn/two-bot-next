@@ -709,6 +709,7 @@ fn decode_is_strict_about_the_top_level_shape() {
 fn templates_are_linted_at_every_template_field() {
     let (config, inventory) = fixture();
     let original = serde_json::to_value(&config).unwrap();
+    let too_long = "x".repeat(5000);
     for (path, field) in [
         ("/creators/0/name_template", "creators[0].name_template"),
         ("/creators/0/status_template", "creators[0].status_template"),
@@ -724,7 +725,7 @@ fn templates_are_linted_at_every_template_field() {
             "{{PLAYING ?? open",
             "ok @@owner@@ @@nope@@",
             "<<one/many",
-            &"x".repeat(5000),
+            too_long.as_str(),
         ] {
             let mut value = original.clone();
             *value.pointer_mut(path).unwrap() = json!(bad);
