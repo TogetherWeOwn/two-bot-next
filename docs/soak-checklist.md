@@ -1187,13 +1187,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-287d00e: 287d00e — TOG-3052: name the missing permission instead of asking for a retry
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** In TOG-10093’s mock-Discord fixture, deny the bot’s Manage Channels/Move Members permission and trigger a create.
-- **Expected:** The reply names the missing permission instead of asking for a retry; no partial room remains.
-- **Evidence:** Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the worker-level refused-create and refused-move fixtures in `crates/bot/src/voice_rooms_tests.rs`: deny the bot Manage Channels or Move Members (guild, category or creator-channel scope) and trigger a join-time create; also a 403 the permission cache cannot explain.
+- **Expected:** The recorded failure, the error notice and the `/setup` failure line name the missing permission and, when known, the category or channel override that removes it (or, with a clean cache, the permission the refused write needs); no partial room remains.
+- **Evidence:** Attach the exact-head fixture command and PASS/NEEDS WORK result; fixture proof only (the worker fixtures run against mock Discord/store doubles), not a deployed-network soak receipt. Staging acceptance stays on TOG-10119.
 - **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
-- **Reason:** Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot --lib voice_rooms::tests::missing_permission_
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-847fbf8: 847fbf8 — TOG-3471: serialize guild reservations and enforce overwrite preflight
@@ -1254,11 +1253,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-78e7c2d: 78e7c2d — TOG-3471: renumber temp-voice migrations to 0036/0037; filter create-path names through automod
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Create a room whose requested name contains a configured automod-blocked fixture term.
-- **Expected:** The create path filters or refuses the name through automod; temp-voice migrations come from TOG-10091’s test-container receipt, not staging SQL.
-- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the worker-level create-path name-filter fixtures in `crates/bot/src/voice_rooms_tests.rs` with a fixture automod policy (invented blocked term, no real word list): a display name containing the term, an invite link, and a template that is itself blocked; also the `/create` name.
+- **Expected:** A blocked name is retried without the username; when even the bare template is blocked the join is refused with the `name_blocked` reason and no Discord create call is made. A blocked `/create` name is refused before any REST call.
+- **Evidence:** Attach the exact-head fixture command and PASS/NEEDS WORK result; fixture proof only (mock Discord/store doubles), not a deployed-network soak receipt. Temp-voice migrations come from the test-container receipt and staging acceptance stays on TOG-10119.
 - **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot --lib voice_rooms::tests::name_filter_
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-e2a3f37: e2a3f37 — TOG-5356: clear self_roles in LIVE_CLEARED_CAPABILITIES

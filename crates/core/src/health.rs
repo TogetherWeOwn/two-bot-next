@@ -106,7 +106,7 @@ impl VoiceHealthReport {
     }
 }
 
-/// Permissions named by docs/voice-rooms.md §V10, not raw Discord error text.
+/// Permissions named by voice health and write diagnostics, not raw Discord error text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VoicePermission {
@@ -114,6 +114,7 @@ pub enum VoicePermission {
     MoveMembers,
     ManageRoles,
     ViewChannel,
+    Connect,
 }
 
 /// Preserves the level causing a refusal; category names/IDs stay with the adapter.

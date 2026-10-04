@@ -2,10 +2,11 @@
 
 use two_bot_core::health::{VoiceDiagnostic, VoicePermission, VoicePermissionScope};
 use two_bot_core::voice_permission_health::{
-    evaluate_permissions, notice_target, resolve_effective_permissions, NoticeCandidates,
-    NoticeTarget, NoticeThrottle, OverwriteMasks, OverwriteTarget, PermissionFinding,
-    PermissionOverwrite, TrackedFailure, NOTICE_BACKOFF_MS, NOTICE_MAX_SENDS, PERM_ADMINISTRATOR,
-    PERM_MANAGE_CHANNELS, PERM_MANAGE_ROLES, PERM_MOVE_MEMBERS, PERM_VIEW_CHANNEL,
+    evaluate_permissions, evaluate_write_permissions, notice_target, resolve_effective_permissions,
+    NoticeCandidates, NoticeTarget, NoticeThrottle, OverwriteMasks, OverwriteTarget,
+    PermissionFinding, PermissionOverwrite, TrackedFailure, NOTICE_BACKOFF_MS, NOTICE_MAX_SENDS,
+    PERM_ADMINISTRATOR, PERM_CONNECT, PERM_MANAGE_CHANNELS, PERM_MANAGE_ROLES, PERM_MOVE_MEMBERS,
+    PERM_VIEW_CHANNEL,
 };
 
 const CATEGORY: u64 = 10;
@@ -43,6 +44,64 @@ fn evaluate(
 
 fn all_required() -> u64 {
     PERM_MANAGE_CHANNELS | PERM_MOVE_MEMBERS | PERM_MANAGE_ROLES | PERM_VIEW_CHANNEL
+}
+
+#[test]
+fn write_findings_use_actual_requirements_and_surface_not_unrelated_health_gaps() {
+    let required = PERM_MANAGE_CHANNELS | PERM_MOVE_MEMBERS | PERM_VIEW_CHANNEL | PERM_CONNECT;
+    for scope in [
+        VoicePermissionScope::Channel,
+        VoicePermissionScope::Category,
+    ] {
+        assert_eq!(
+            evaluate_write_permissions(
+                required,
+                required & !PERM_CONNECT,
+                required,
+                scope,
+                CHANNEL
+            ),
+            [PermissionFinding {
+                permission: VoicePermission::Connect,
+                scope,
+                category_id: (scope == VoicePermissionScope::Category).then_some(CHANNEL),
+                channel_id: (scope == VoicePermissionScope::Channel).then_some(CHANNEL),
+            }]
+        );
+    }
+    assert_eq!(
+        evaluate_write_permissions(
+            required & !PERM_CONNECT,
+            required & !PERM_CONNECT,
+            required,
+            VoicePermissionScope::Channel,
+            CHANNEL
+        ),
+        [PermissionFinding {
+            permission: VoicePermission::Connect,
+            scope: VoicePermissionScope::Guild,
+            category_id: None,
+            channel_id: None
+        }]
+    );
+    // A channel grant rescues a missing guild bit; unrelated category state
+    // is not an input to the actual write gate or its findings.
+    assert!(evaluate_write_permissions(
+        required & !PERM_CONNECT,
+        required,
+        required,
+        VoicePermissionScope::Channel,
+        CHANNEL
+    )
+    .is_empty());
+    assert!(evaluate_write_permissions(
+        PERM_ADMINISTRATOR,
+        0,
+        required,
+        VoicePermissionScope::Channel,
+        CHANNEL
+    )
+    .is_empty());
 }
 
 // --- Resolution order table (criterion 2): base, @everyone, roles, member ---
