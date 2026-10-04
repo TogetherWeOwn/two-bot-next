@@ -57,6 +57,8 @@ struct Fixture {
     outsider: String,
     mlogin: String,
     rologin: String,
+    /// Holds both groups: connects and `SET ROLE`s to the RO group, but is not RO only.
+    bothlogin: String,
 }
 
 impl Fixture {
@@ -76,6 +78,7 @@ impl Fixture {
         let outsider = format!("stg_fx_outsider_{pid}_{nonce}");
         let mlogin = format!("stg_fx_mlogin_{pid}_{nonce}");
         let rologin = format!("stg_fx_rologin_{pid}_{nonce}");
+        let bothlogin = format!("stg_fx_bothlogin_{pid}_{nonce}");
         // Cluster-level groups shared with other suites: tolerate concurrent creates.
         sqlx::query(
             "DO $$ BEGIN CREATE ROLE two_bot_migrator NOLOGIN; \
@@ -97,6 +100,9 @@ impl Fixture {
             format!("CREATE ROLE {mlogin} LOGIN"),
             // Read-only plan login: holds only the RO group, never the migrator.
             format!("CREATE ROLE {rologin} LOGIN"),
+            // Holds both groups: the plan runner must refuse it even though
+            // it can SET ROLE two_bot_migrator_ro.
+            format!("CREATE ROLE {bothlogin} LOGIN"),
         ] {
             sqlx::query(sqlx::AssertSqlSafe(sql))
                 .execute(&mut admin)
@@ -114,6 +120,11 @@ impl Fixture {
         .await?;
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "GRANT two_bot_migrator_ro TO {rologin}"
+        )))
+        .execute(&mut admin)
+        .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "GRANT two_bot_migrator, two_bot_migrator_ro TO {bothlogin}"
         )))
         .execute(&mut admin)
         .await?;
@@ -140,6 +151,7 @@ impl Fixture {
             outsider,
             mlogin,
             rologin,
+            bothlogin,
         })
     }
 
@@ -265,7 +277,7 @@ impl Fixture {
         )))
         .execute(&mut self.admin)
         .await?;
-        for role in [&self.outsider, &self.mlogin, &self.rologin] {
+        for role in [&self.outsider, &self.mlogin, &self.rologin, &self.bothlogin] {
             sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE {role}")))
                 .execute(&mut self.admin)
                 .await?;
@@ -347,6 +359,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
     let migrator = fx.url("agent_test", &fx.database);
     let member = fx.url(&fx.mlogin, &fx.database);
     let ro = fx.url(&fx.rologin, &fx.database);
+    let both = fx.url(&fx.bothlogin, &fx.database);
     let (host, db) = (fx.host.clone(), fx.database.clone());
     let total = two_bot_cutover::staging_migrate::MIGRATOR.iter().count() as u64;
 
@@ -447,6 +460,30 @@ async fn real_sqlx_runner_cases() -> TestResult {
         .run("--apply", Some(outsider), &host, &db, Some(""), None)
         .await;
     assert_eq!(code, 2, "{err}");
+    // "RO only" is enforced: a plan login that holds the migrator group is
+    // refused, whether it also holds the RO group (it can SET ROLE to it) or
+    // is a superuser (implicitly a member of every group). The refusal names
+    // the role, echoes neither the URL nor the login, and emits no manifest.
+    for (label, url, login) in [
+        ("both groups", both.clone(), fx.bothlogin.clone()),
+        ("superuser", migrator.clone(), "agent_test".to_owned()),
+    ] {
+        let (code, out, err) = fx
+            .run("--plan", Some(url.clone()), &host, &db, None, None)
+            .await;
+        assert_eq!(code, 2, "{label}: {err}");
+        assert!(err.contains("two_bot_migrator group"), "{label}: {err}");
+        assert!(err.contains("two_bot_migrator_ro"), "{label}: {err}");
+        assert!(
+            !err.contains(&url),
+            "{label}: refusal must not echo the URL"
+        );
+        assert!(
+            !err.contains(&format!("{login}@")),
+            "{label}: refusal must not echo the login"
+        );
+        assert!(out.is_empty(), "{label}: refusal must not emit a manifest");
+    }
     let ledger: bool =
         sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations') IS NOT NULL")
             .fetch_one(&mut c)

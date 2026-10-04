@@ -23,7 +23,7 @@
 //! 3. One deterministic chat-completions body is serialized; every attempt
 //!    sends the same bytes.
 //! 4. Up to [`MAX_BUILD_ATTEMPTS`] endpoint calls: each reply is parsed with
-//!    [`parse_reply`], then suggestions are tried best-first with
+//!    [`parse_reply_each`], then suggestions are tried best-first with
 //!    [`validate_template`]. The first suggestion that validates against all
 //!    six scenarios wins with its previews and explanation. A suggestion the
 //!    strict reply parse rejects never reaches scenario validation; it
@@ -77,7 +77,7 @@ pub struct BuiltTemplate {
 /// The endpoint call behind [`build_template`]. The implementor POSTs `body`
 /// — the exact chat-completions JSON — to `endpoint` (the full
 /// chat-completions URL from configuration; no path is joined here) with a
-/// JSON content type, and returns the raw response body for [`parse_reply`]
+/// JSON content type, and returns the raw response body for [`parse_reply_each`]
 /// to bound and parse.
 ///
 /// Implementors must bound the call with their own deadline and must redact
