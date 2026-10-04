@@ -19,10 +19,8 @@ proptest! {
 
     #[test]
     fn property_voice_codec_preserves_template_source_and_optional_fields(
-        template in proptest::collection::vec(any::<char>(), 0..128)
-            .prop_map(|chars| chars.into_iter().collect::<String>()),
-        status in proptest::option::of(proptest::collection::vec(any::<char>(), 0..128)
-            .prop_map(|chars| chars.into_iter().collect::<String>())),
+        template in "[A-Za-z0-9 🎮-]{0,64}",
+        status in proptest::option::of("[A-Za-z0-9 🎮-]{0,64}"),
         flags in any::<[bool; 6]>(),
         limit in 0u16..=99,
         first_number in 1u32..=u32::MAX,
@@ -30,9 +28,9 @@ proptest! {
         logging in any::<bool>(),
     ) {
         let (mut config, inventory) = fixture();
-        // The codec retains source; malformed template syntax is the compiler's
-        // concern. Include both placeholder delimiters and arbitrary Unicode.
-        config.creators[0].name_template = format!("@@owner@@ [[{template}]] {{username}} ##");
+        // The codec retains source byte for byte; validation only lints it.
+        // Include well-formed constructs and arbitrary Unicode text.
+        config.creators[0].name_template = format!("@@owner@@ [[{template}/x]] {{username}} ##");
         config.creators[0].status_template = status.clone();
         config.creators[0].default_limit = limit;
         config.creators[0].first_number = first_number;
@@ -64,9 +62,12 @@ proptest! {
         prop_assert_eq!(import_configuration(&unvalidated, &inventory).is_ok(), accepted);
     }
 }
+use two_bot_core::voice_access::VOICE_COMMANDS;
+use two_bot_core::voice_alias::MAX_ALIASES_PER_GUILD;
 use two_bot_core::voice_config::{
-    export_configuration, import_configuration, validate_configuration, ChannelKind,
-    ChannelReference, GuildInventory, VoiceConfigError, VoiceConfiguration,
+    decode_configuration, export_configuration, import_configuration, validate_configuration,
+    ChannelKind, ChannelReference, GuildInventory, VoiceConfigError, VoiceConfiguration, MAX_LISTS,
+    MAX_LIST_CHOICES, MAX_LIST_TEXT_CHARS,
 };
 
 // Synthetic IDs only. Exercise every version-1 field without Discord or a DB.
@@ -652,4 +653,266 @@ fn permission_source_variants_and_logging_levels_round_trip_as_data_only() {
             );
         }
     }
+}
+
+fn assert_invalid(value: &Value, inventory: &GuildInventory, field: &str, label: &str) {
+    match import_value(value, inventory) {
+        Err(VoiceConfigError::Invalid { field: actual, .. }) => {
+            assert_eq!(actual, field, "{label}");
+        }
+        other => panic!("{label}: expected Invalid at {field}, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_is_strict_about_the_top_level_shape() {
+    let (config, inventory) = fixture();
+    let object = serde_json::to_value(&config).unwrap();
+    // The positional array form of the same document: serde's derived decoder
+    // accepts it, which is the gap `decode_configuration` closes.
+    let positional = serde_json::to_vec(&json!([
+        object["version"],
+        object["guild_id"],
+        object["creators"],
+        object["templates"],
+        object["aliases"],
+        object["lists"],
+        object["logging"],
+        object["settings"],
+    ]))
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<VoiceConfiguration>(&positional).unwrap(),
+        config,
+        "precondition: the derived decoder takes positional arrays"
+    );
+    assert!(matches!(
+        decode_configuration(&positional),
+        Err(VoiceConfigError::Malformed { .. })
+    ));
+    assert!(matches!(
+        import_configuration(&positional, &inventory),
+        Err(VoiceConfigError::Malformed { .. })
+    ));
+    let canonical = serde_json::to_vec(&object).unwrap();
+    assert_eq!(decode_configuration(&canonical).unwrap(), config);
+    // Trailing data after the document is malformed, not ignored.
+    let mut trailing = canonical;
+    trailing.extend_from_slice(b" {}");
+    assert!(matches!(
+        decode_configuration(&trailing),
+        Err(VoiceConfigError::Malformed { .. })
+    ));
+}
+
+#[test]
+fn templates_are_linted_at_every_template_field() {
+    let (config, inventory) = fixture();
+    let original = serde_json::to_value(&config).unwrap();
+    let too_long = "x".repeat(5000);
+    for (path, field) in [
+        ("/creators/0/name_template", "creators[0].name_template"),
+        ("/creators/0/status_template", "creators[0].status_template"),
+        ("/templates/0/name_template", "templates[0].name_template"),
+        (
+            "/templates/1/status_template",
+            "templates[1].status_template",
+        ),
+    ] {
+        for bad in [
+            "@@not_a_token@@",
+            "[[never closed",
+            "{{PLAYING ?? open",
+            "ok @@owner@@ @@nope@@",
+            "<<one/many",
+            too_long.as_str(),
+        ] {
+            let mut value = original.clone();
+            *value.pointer_mut(path).unwrap() = json!(bad);
+            let label = format!("{path}: {}", bad.chars().take(20).collect::<String>());
+            assert_invalid(&value, &inventory, field, &label);
+        }
+    }
+}
+
+#[test]
+fn template_lint_never_echoes_the_uploaded_source() {
+    let (config, inventory) = fixture();
+    let mut value = serde_json::to_value(&config).unwrap();
+    *value.pointer_mut("/creators/0/name_template").unwrap() = json!("@@secret_marker_token@@");
+    let error = import_value(&value, &inventory).unwrap_err();
+    assert!(
+        !error.to_string().contains("secret_marker_token"),
+        "{error}"
+    );
+}
+
+#[test]
+fn well_formed_and_empty_templates_stay_valid() {
+    let (config, inventory) = fixture();
+    let mut config = config;
+    for good in [
+        "",
+        "   ",
+        "plain text",
+        "@@owner@@'s [[den/crew]] ##",
+        "{{FULL ?? full // open}}",
+        "__resting/@@num@@ people__",
+    ] {
+        config.creators[0].name_template = good.to_owned();
+        config.creators[0].status_template = Some(good.to_owned());
+        config.templates[0].name_template = good.to_owned();
+        validate_configuration(&config, &inventory).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+    }
+}
+
+#[test]
+fn aliases_are_held_to_the_runtime_table_rules() {
+    let (config, inventory) = fixture();
+    let original = serde_json::to_value(&config).unwrap();
+    let with_aliases = |aliases: Value| {
+        let mut value = original.clone();
+        *value.pointer_mut("/aliases").unwrap() = aliases;
+        value
+    };
+    let long = "x".repeat(101);
+    for (aliases, field, label) in [
+        (
+            json!([{"game": long, "alias": "ok"}]),
+            "aliases[0]",
+            "key too long",
+        ),
+        (
+            json!([{"game": "ok", "alias": long}]),
+            "aliases[0]",
+            "target too long",
+        ),
+        (
+            json!([{"game": "a\nb", "alias": "ok"}]),
+            "aliases[0]",
+            "control in key",
+        ),
+        (
+            json!([{"game": "ok", "alias": "a\u{202e}b"}]),
+            "aliases[0]",
+            "bidi override",
+        ),
+        (
+            json!([{"game": "Apex", "alias": "A"}, {"game": "apex", "alias": "B"}]),
+            "aliases[1]",
+            "case-folded duplicate key",
+        ),
+        (
+            json!([{"game": "A", "alias": "B"}, {"game": "B", "alias": "C"}]),
+            "aliases[1]",
+            "alias chain",
+        ),
+    ] {
+        assert_invalid(&with_aliases(aliases), &inventory, field, label);
+    }
+    let too_many: Vec<Value> = (0..=MAX_ALIASES_PER_GUILD)
+        .map(|i| json!({"game": format!("game {i}"), "alias": format!("alias {i}")}))
+        .collect();
+    assert_invalid(
+        &with_aliases(Value::Array(too_many)),
+        &inventory,
+        &format!("aliases[{MAX_ALIASES_PER_GUILD}]"),
+        "one past the alias limit",
+    );
+    let at_limit: Vec<Value> = (0..MAX_ALIASES_PER_GUILD)
+        .map(|i| json!({"game": format!("game {i}"), "alias": format!("alias {i}")}))
+        .collect();
+    import_value(&with_aliases(Value::Array(at_limit)), &inventory).unwrap();
+}
+
+#[test]
+fn lists_are_bounded_in_count_choices_and_text() {
+    let (config, inventory) = fixture();
+    let original = serde_json::to_value(&config).unwrap();
+    let with_lists = |lists: Value| {
+        let mut value = original.clone();
+        *value.pointer_mut("/lists").unwrap() = lists;
+        value
+    };
+    let long = "x".repeat(MAX_LIST_TEXT_CHARS + 1);
+    assert_invalid(
+        &with_lists(json!([{"name": long, "choices": ["a"]}])),
+        &inventory,
+        "lists[0].name",
+        "name too long",
+    );
+    assert_invalid(
+        &with_lists(json!([{"name": "rooms", "choices": [long]}])),
+        &inventory,
+        "lists[0].choices[0]",
+        "choice too long",
+    );
+    assert_invalid(
+        &with_lists(json!([{"name": "rooms", "choices": ["a\u{0007}b"]}])),
+        &inventory,
+        "lists[0].choices[0]",
+        "control in choice",
+    );
+    assert_invalid(
+        &with_lists(json!([{"name": "ro\nms", "choices": ["a"]}])),
+        &inventory,
+        "lists[0].name",
+        "control in name",
+    );
+    let many_choices: Vec<String> = (0..=MAX_LIST_CHOICES).map(|i| format!("c{i}")).collect();
+    assert_invalid(
+        &with_lists(json!([{"name": "rooms", "choices": many_choices}])),
+        &inventory,
+        "lists[0].choices",
+        "too many choices",
+    );
+    let many_lists: Vec<Value> = (0..=MAX_LISTS)
+        .map(|i| json!({"name": format!("list {i}"), "choices": ["a"]}))
+        .collect();
+    assert_invalid(
+        &with_lists(Value::Array(many_lists)),
+        &inventory,
+        "lists",
+        "too many lists",
+    );
+    let at_limit: Vec<Value> = (0..MAX_LISTS)
+        .map(|i| {
+            let choices: Vec<String> = (0..MAX_LIST_CHOICES).map(|j| format!("c{j}")).collect();
+            json!({"name": format!("list {i}"), "choices": choices})
+        })
+        .collect();
+    import_value(&with_lists(Value::Array(at_limit)), &inventory).unwrap();
+}
+
+#[test]
+fn command_roles_accept_only_restrictable_voice_commands() {
+    let (config, inventory) = fixture();
+    let original = serde_json::to_value(&config).unwrap();
+    for bad in [
+        "",
+        "ban",
+        "KICK",
+        " kick",
+        "kick ",
+        "not-a-command",
+        "setup\u{0}",
+    ] {
+        let mut value = original.clone();
+        *value
+            .pointer_mut("/settings/command_roles/0/command")
+            .unwrap() = json!(bad);
+        assert_invalid(
+            &value,
+            &inventory,
+            "settings.command_roles[0].command",
+            &format!("{bad:?}"),
+        );
+    }
+    let roles: Vec<Value> = VOICE_COMMANDS
+        .iter()
+        .map(|command| json!({"command": command, "role_ids": ["201"]}))
+        .collect();
+    let mut value = original;
+    *value.pointer_mut("/settings/command_roles").unwrap() = Value::Array(roles);
+    import_value(&value, &inventory).unwrap();
 }

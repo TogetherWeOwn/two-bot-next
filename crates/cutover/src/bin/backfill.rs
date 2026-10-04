@@ -16,9 +16,9 @@ use twilight_model::channel::ChannelType;
 use twilight_model::id::Id;
 use two_bot_cutover::cli::{open_db, Args, ScanReport};
 use two_bot_cutover::{
-    mark_bot, member_log_kind_for_channel, parse_member_log_message, parse_voice_message,
-    plan_backfill_merge, record_earliest, record_event, touch_activity, DedupableEvent, EmbedView,
-    FunnelWrite, ListedMember, MessageView, RestClient,
+    event_metadata_json, mark_bot, member_log_kind_for_channel, parse_member_log_message,
+    parse_voice_message, plan_backfill_merge, record_earliest, record_event, touch_activity,
+    DedupableEvent, EmbedView, FunnelWrite, ListedMember, MessageView, RestClient,
 };
 
 fn usage() -> ! {
@@ -329,11 +329,7 @@ async fn main() {
                 event_type: e.event_type.clone(),
                 occurred_at: e.occurred_at.clone(),
                 source: e.source.clone(),
-                metadata: Some(if e.event_type == "gate_cleared" {
-                    r#"{"backfill":true,"timestampIsJoinTime":true}"#.to_owned()
-                } else {
-                    r#"{"backfill":true}"#.to_owned()
-                }),
+                metadata: Some(event_metadata_json(&e.event_type).to_owned()),
             };
             let (is_new, _) = if e.event_type == "first_voice_session" {
                 record_earliest(&db, &write).await.unwrap_or_else(|err| {

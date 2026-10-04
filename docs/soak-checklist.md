@@ -1301,11 +1301,11 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s13-edaf2dd: edaf2dd — TOG-5684: enforce startKnown:false exclusion from duration averages
 
 - **Method:** `automated` (not an execution verdict).
-- **Action:** Run the duration summary fixtures and the DB-backed `report_cli` scenario mixing known and startKnown:false sessions.
-- **Expected:** `durations` averages known-start sessions only (the unknown start carrying a number is excluded) and counts the excluded unknown starts.
-- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Fixture proof only, not a deployed-network soak receipt.
+- **Action:** Run the duration summary fixtures, the core metadata-parsing fixtures in `crates/core/src/voice.rs` and the DB-backed `report_cli` scenario mixing known and startKnown:false sessions.
+- **Expected:** `durations` averages known-start sessions only (the unknown start carrying a number is excluded) and counts the excluded unknown starts. Known 60 / unknown 600 averages to 60 (removing the start-known filter yields 330); mixed numeric/numeric-string metadata averages to 60 with measured=2 and excluded_unknown_starts=4; invalid-only metadata yields no average, not fabricated zeroes. Finite decimal numeric strings are measured; legacy JavaScript coercions of empty strings, booleans, containers and radix-prefixed strings are deliberately rejected.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Include the core `voice::tests` results (`averages_filter_on_flag_not_null`, `metadata_average_excludes_unknown_numbers_and_numeric_strings`, `metadata_numbers_and_numeric_strings_enter_known_average`, `metadata_invalid_durations_never_become_measured_zeroes`). Fixture proof only, not a deployed-network soak receipt; the separate voice receipt gate is unchanged.
 - **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
-- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib voice::tests::
 
 ### s13-59965d0: 59965d0 — TOG-5981: serialize same-member voice frames, scope voice idempotency keys by channel
 
@@ -1364,7 +1364,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Action:** Run TOG-9882’s roster, moderation, backfill, automod and dashboard acceptance fixtures on test containers.
 - **Expected:** Each fixture contract passes; the automod export runs on demand only, not as a scheduled job.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
-- **Owner:** [TOG-9882](/TOG/issues/TOG-9882)
+- **Owner:** [TOG-15759](/TOG/issues/TOG-15759)
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
@@ -1389,13 +1389,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-dc2b507: dc2b507 — feat(voice): reconcile open-half sessions with explicit reasons (#273)
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Run TOG-11152’s reconcile on a fixture with open-half sessions of each reason.
-- **Expected:** Every open-half session is reported with its explicit reason; nothing is repaired.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the open-half reconcile fixtures (every reason), the timestamp-parser boundary fixtures in `crates/core/src/funnel.rs`, the `Number()` duration-string fixtures and the DB-backed `report_cli` legacy-fixture scenario.
+- **Expected:** Every open-half session is reported with its explicit reason (restart-gap, server-leave and metadata-recompute resolve; still-open, superseded, no-start-on-file and bad-end-row are flagged) and nothing is repaired. A timestamp with a multi-byte zone (`+1é1`) or an absurd year is unparseable (legacy `Date.parse` NaN): the row is skipped or falls through to the bad-end-row or earlier-start path, and the sweep never panics. A `durationSeconds` string reads as legacy `Number()` does (`"0x3c"` is 60, `"6e1"` is 60, whitespace is trimmed, `""` is 0; `"nan"`, `"inf"` and `"Infinity"` are unmeasured); negative and non-finite values never become a measured time. Accepted divergence: a JSON array or object is unmeasured (legacy `Number([])` is 0).
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Include the core `funnel::tests` results (`multibyte_zone_is_unparseable_not_a_panic`, `non_ascii_anywhere_in_a_timestamp_never_panics`, `absurd_years_are_unparseable_not_an_overflow`) and the cutover `voice_reconcile::tests` results. Fixture proof only, not a deployed-network soak receipt; the separate voice receipt gate is unchanged.
 - **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_matches_legacy_fixtures_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib funnel::tests::
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-860557f: 860557f — test(backfill): refuse malformed export rows without throwing (#289)
