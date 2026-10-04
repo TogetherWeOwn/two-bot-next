@@ -15,8 +15,8 @@ fn valued_opt_ins_refuse_with_exact_copy() {
             let equals = format!("--{flag}={value}");
             for invalid in [vec![equals.as_str()], vec![bare.as_str(), value]] {
                 let mut before = invalid.clone();
-                before.extend_from_slice(&["--guild-id", "111111111111111111"]);
-                let mut after = vec!["--guild-id", "111111111111111111"];
+                before.extend_from_slice(&["--guild-id", "fixture-guild"]);
+                let mut after = vec!["--guild-id", "fixture-guild"];
                 after.extend_from_slice(&invalid);
                 for argv in [invalid, before, after] {
                     assert_eq!(parse(&argv).unwrap_err(), expected, "{argv:?}");
@@ -36,11 +36,7 @@ fn repeated_and_mixed_opt_ins_refuse_with_exact_copy() {
         for (argv, expected) in [
             (vec![bare.as_str(), bare.as_str()], repeated.as_str()),
             (
-                vec![
-                    bare.as_str(),
-                    "--guild-id=111111111111111111",
-                    bare.as_str(),
-                ],
+                vec![bare.as_str(), "--guild-id=fixture-guild", bare.as_str()],
                 repeated.as_str(),
             ),
             (
@@ -82,7 +78,7 @@ fn bare_opt_ins_remain_flags_alongside_ordinary_arguments() {
             "inventory",
             "--apply",
             "--guild-id",
-            "111111111111111111",
+            "fixture-guild",
             "--allow-lower",
             "--input=fixture.json",
             "--allow-live-guild",
@@ -92,7 +88,7 @@ fn bare_opt_ins_remain_flags_alongside_ordinary_arguments() {
             "--allow-live-guild",
             "--input",
             "fixture.json",
-            "--guild-id=111111111111111111",
+            "--guild-id=fixture-guild",
             "--allow-lower",
             "--apply",
         ],
@@ -105,7 +101,7 @@ fn bare_opt_ins_remain_flags_alongside_ordinary_arguments() {
             assert!(args.has(flag));
             assert_eq!(args.get(flag), Some(""));
         }
-        assert_eq!(args.get("guild-id"), Some("111111111111111111"));
+        assert_eq!(args.get("guild-id"), Some("fixture-guild"));
         assert_eq!(args.get("input"), Some("fixture.json"));
     }
     let defaults = parse(&[]).unwrap();
