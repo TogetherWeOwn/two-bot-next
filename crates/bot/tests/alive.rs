@@ -460,6 +460,8 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
     let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = reserved.local_addr().unwrap();
     drop(reserved);
+    // Registry-sync requests consumed by the per-boot assertion below.
+    let mut consumed = 0usize;
     for boot in 0..2 {
         // Restart with an unreachable bootstrap URL: RESUME must select the
         // unchanged persisted endpoint rather than quietly IDENTIFY again.
@@ -488,11 +490,36 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
             })
             .cloned()
             .collect();
-        assert_eq!(requests.len(), (boot + 1) * 2, "registry sync on each boot");
-        let identity = &requests[boot * 2];
+        // Boot performs three registry-sync requests before gateway connect,
+        // all awaited before Identify so the boot-0 slice is exact: the
+        // custom-command bootstrap identity, the ordered-interaction boot-sync
+        // identity, then the boot-sync publication. The mock withholds READY
+        // until the release below, so no READY/RESUMED publish can appear in
+        // boot 0's slice. Boot 1's slice may additionally carry boot 0's
+        // READY-time republication at its head; only its trailing three are
+        // asserted.
+        let fresh = &requests[consumed..];
+        let sync = if boot == 0 {
+            assert_eq!(
+                fresh.len(),
+                3,
+                "registry sync on each boot: two identities plus one publication"
+            );
+            &fresh[..]
+        } else {
+            assert!(
+                fresh.len() >= 3,
+                "registry sync on each boot: two identities plus one publication"
+            );
+            &fresh[fresh.len() - 3..]
+        };
+        let bootstrap_identity = &sync[0];
+        assert_eq!(bootstrap_identity.method, "GET");
+        assert_eq!(bootstrap_identity.path, "/api/v10/applications/@me");
+        let identity = &sync[1];
         assert_eq!(identity.method, "GET");
         assert_eq!(identity.path, "/api/v10/applications/@me");
-        let publish = &requests[boot * 2 + 1];
+        let publish = &sync[2];
         assert_eq!(publish.method, "PUT");
         assert_eq!(
             publish.path,
@@ -518,10 +545,11 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         }
         if boot == 1 {
             assert_eq!(
-                publish.body, requests[1].body,
+                publish.body, requests[2].body,
                 "same registry on RESUMED boot"
             );
         }
+        consumed += fresh.len();
         // The DML-only binary has now finished checkpoint loading against the
         // harness-migrated schema.
         assert_eq!(
