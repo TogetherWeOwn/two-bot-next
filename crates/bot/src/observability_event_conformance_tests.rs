@@ -162,10 +162,11 @@ const MAIN_RS_ADJACENT: [&str; 13] = [
 
 // `crates/bot/src/voice_rooms.rs`: per-command voice UX receipts, not gateway
 // session events.
-const VOICE_RS_ADJACENT: [&str; 8] = [
+const VOICE_RS_ADJACENT: [&str; 9] = [
     "voice succession refused",
     "voice notice settings unreadable",
     "voice notice had no working destination",
+    "voice create reservation settle failed",
     "import preview planned an apply; refusing without writing",
     "voice vote response failed; not retried",
     "voice ballot response failed; not retried",
