@@ -100,7 +100,9 @@ WORKER_PREFIX = "wrangler/"
 # reader-coverage test): parity/cutover by the preconditions binary,
 # commands/configuration by the reference_docs test, voice-rooms by the
 # fixture validator, staging-e2e-command-matrix by the matrix coverage test,
-# soak/parity by the checklist and baseline guards.
+# soak/parity by the checklist and baseline guards, smoke-run-record and
+# smoke-expected-responses by the smoke surface inventory link test (and
+# smoke-surface-inventory for the same family of smoke content reads).
 # parity.md and the baseline also gate parity-docs. Existence-only docs
 # (staging-soak/backup/preflight: the preconditions binary checks is_file,
 # never content) and runbook/container-readiness (worker tests only) fall
@@ -116,6 +118,9 @@ RUST_DOCS = frozenset({
     "docs/soak-checklist.json",
     "docs/soak-checklist.md",
     "docs/staging-e2e-command-matrix.md",
+    "docs/smoke-expected-responses.md",
+    "docs/smoke-run-record.md",
+    "docs/smoke-surface-inventory.md",
 })
 PARITY_DOCS = frozenset({
     "docs/parity.md",
