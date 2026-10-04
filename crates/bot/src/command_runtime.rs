@@ -28,6 +28,9 @@
 //! - leveling (`/rank [member]`, `/leaderboard`): one immediate callback,
 //!   ephemeral rank and public mention-suppressed top ten. The ordered gateway
 //!   award path shares this runtime's pool, executor and onboarding gates.
+//! - discovery (`/help`): one immediate ephemeral callback rendered from the
+//!   live publish set, grouped with permission hints; never deferred, never
+//!   stored.
 //!
 //! Registry publication runs here too: every `Event::Ready` publishes the
 //! router's ONE merged publish set (`set_guild_commands` is idempotent, so a
@@ -43,7 +46,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, PoisonError, RwLock,
     },
 };
 
@@ -78,8 +81,9 @@ use two_bot_core::{
     SurfaceFlags,
 };
 use two_bot_discord::{
-    publish_commands, register_channel_handlers, response_for_slash, route_interaction,
-    ActionExecutor, ChannelModerationRuntime, LevelingRuntime, RoutedInteraction,
+    help_response, publish_commands, register_channel_handlers, response_for_slash,
+    route_interaction, ActionExecutor, ChannelModerationRuntime, LevelingRuntime,
+    RoutedInteraction,
 };
 
 use crate::activation::BootActivation;
@@ -187,6 +191,9 @@ pub struct CommandRuntime {
     executor: ActionExecutor,
     interactions: two_bot_discord::interactions::InteractionRuntime,
     custom_commands: Option<Vec<two_bot_core::CustomCommand>>,
+    /// Confirmed publication for the non-DB/fallback publisher. Production
+    /// discovery reads the custom-command publisher's shared snapshot instead.
+    published_commands: RwLock<Option<Arc<[two_bot_core::CommandDefinition]>>>,
     application_id: AtomicU64,
     /// Bootstrapped custom-command execution seam (dynamic dispatch, prefix
     /// triggers, serialized republication). Shares the interaction runtime's
@@ -280,6 +287,7 @@ impl CommandRuntime {
             executor,
             interactions,
             custom_commands,
+            published_commands: RwLock::new(None),
             application_id: AtomicU64::new(0),
             gateway_commands: tokio::sync::OnceCell::new(),
             channel,
@@ -294,6 +302,16 @@ impl CommandRuntime {
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
             voice_kick_claim: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn published_commands(&self) -> Option<Arc<[two_bot_core::CommandDefinition]>> {
+        if let Some(custom) = self.gateway_commands.get() {
+            return custom.published_commands();
+        }
+        self.published_commands
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn set_identity(&self, bot_user_id: u64, application_id: u64) {
@@ -889,6 +907,11 @@ impl CommandRuntime {
             .publish_guild_commands(application_id, self.guild_id, &commands)
             .await
             .map_err(|_| RegistrySyncError::Publish)?;
+        let snapshot: Arc<[two_bot_core::CommandDefinition]> = defs.into();
+        *self
+            .published_commands
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(snapshot);
         *synced = true;
         Ok(())
     }
@@ -1002,7 +1025,18 @@ impl CommandRuntime {
             }
             return;
         }
+        if handler == HandlerId::Help {
+            // Read the actual confirmed publication, including DB-backed
+            // custom rows and successful add/remove refreshes. No store wait.
+            let response = match self.published_commands() {
+                Some(defs) => help_response(&defs),
+                None => ephemeral("The command list is still refreshing. Try /help again shortly."),
+            };
+            self.answer(interaction, response).await;
+            return;
+        }
         let owner = match name.as_str() {
+            "help" => Some(HandlerId::Help),
             "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
                 Some(HandlerId::AutomationAdmin)
             }
@@ -1783,6 +1817,9 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     for id in [HandlerId::Rank, HandlerId::Leaderboard] {
         router.register(Box::new(SliceHandler(id)));
     }
+    // `/help` discovery is never activation-fenced either: it renders from
+    // the live publish set, so gated-off features simply do not appear.
+    router.register(Box::new(SliceHandler(HandlerId::Help)));
     router
 }
 

@@ -15,6 +15,7 @@ use two_bot_core::{
 use two_bot_discord::executor::ActionExecutor;
 
 use crate::{
+    activation::BootActivation,
     audit_runtime, community_jobs, feed_jobs,
     jobs::{self, ErrorClass, Job},
     member_runtime::{self, MemberRuntime},
@@ -142,6 +143,9 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let mut registered = Vec::new();
     let mut parked = Vec::new();
+    // The same token-derived identity the router and gateway fence use, so a
+    // job that posts under the bot identity cannot outrun a refused capability.
+    let activation = BootActivation::from_config(config);
     if let Ok((token, url, guild)) = crate::gateway_prerequisites(config) {
         // The settings poll is DB-only: register it before REST construction
         // so a bad DISCORD_API_BASE cannot park hot reload.
@@ -198,7 +202,7 @@ pub async fn serve(
                         }),
                     });
                 }
-                let scheduled = scheduled_jobs::register(context.clone());
+                let scheduled = scheduled_jobs::register(context.clone(), &activation);
                 let scheduled_parked = scheduled.is_none();
                 registered.extend(scheduled);
                 // The unban sweep shares the boot-composed member consumer:
@@ -213,7 +217,7 @@ pub async fn serve(
                 if scheduled_parked {
                     parked.push(scheduled_jobs::NAMES[0]);
                 }
-                if let Some(job) = feed_jobs::register(context.clone()) {
+                if let Some(job) = feed_jobs::register(context.clone(), &activation) {
                     registered.push(job);
                 } else {
                     parked.push(feed_jobs::NAME);

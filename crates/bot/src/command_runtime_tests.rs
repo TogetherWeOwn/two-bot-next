@@ -662,7 +662,7 @@ async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
                 .collect();
             assert_eq!(
                 names,
-                vec!["rank", "leaderboard"],
+                vec!["rank", "leaderboard", "help"],
                 "unrelated core commands remain; uncleared surfaces are replaced"
             );
         }
@@ -775,7 +775,7 @@ async fn activation_boot_from_env_fixture() {
     let defs = runtime.router().publish_set(&[]).unwrap();
     let names: Vec<_> = defs.iter().map(|def| def.name.as_str()).collect();
     if expected == "narrowed" {
-        assert_eq!(names, ["rank", "leaderboard"]);
+        assert_eq!(names, ["rank", "leaderboard", "help"]);
         assert!(!runtime.router().gates().moderation);
         assert!(!runtime.router().gates().automations);
         assert!(!runtime.router().gates().announcements);
@@ -877,6 +877,67 @@ async fn refused_interaction_is_answered_ephemerally_via_executor() {
 }
 
 #[tokio::test]
+async fn unconfirmed_help_does_not_invent_a_live_registry() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    assert!(runtime.published_commands().is_none());
+    runtime
+        .on_interaction(&slash("help", Some(CHANNEL), Vec::new()))
+        .await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1);
+    let reply: serde_json::Value = serde_json::from_slice(&callbacks[0].body).unwrap();
+    assert_eq!(reply["type"], 4);
+    assert_eq!(reply["data"]["flags"], 64);
+    assert_eq!(
+        reply["data"]["content"],
+        "The command list is still refreshing. Try /help again shortly."
+    );
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "no publication or store work from help"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn help_answers_immediately_from_the_live_publish_set() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    // All feature gates on: the reply must equal the rendered live set.
+    let router_gates = RouterGates {
+        scorecard: true,
+        moderation: true,
+        ..gates(true, true)
+    };
+    let runtime = runtime_without_db(router_gates, true, origin);
+    assert!(runtime.published_commands().is_none());
+    runtime.publish_registry_checked(Some(1111)).await.unwrap();
+    assert!(runtime.published_commands().is_some());
+    runtime
+        .on_interaction(&slash("help", Some(CHANNEL), Vec::new()))
+        .await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1, "one immediate callback, no defer");
+    let reply: serde_json::Value =
+        serde_json::from_slice(&callbacks[0].body).expect("callback json");
+    assert_eq!(reply["type"], 4, "immediate response, not a defer");
+    assert_eq!(reply["data"]["flags"], 64, "ephemeral");
+    let content = reply["data"]["content"].as_str().expect("content");
+    let defs = router_with_commands(router_gates)
+        .publish_set(&[])
+        .expect("live set");
+    assert_eq!(content, two_bot_core::help_text(&defs));
+    assert!(content.contains("/help"), "lists itself");
+    assert!(content.contains("/ban"), "lists gated commands");
+    assert!(
+        content.contains("needs Ban Members"),
+        "marks the gate: {content}"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn published_unwired_commands_reply_without_defer_or_store_work() {
     for router_gates in [
         gates(false, false),
@@ -916,11 +977,13 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "schedule-list"
                         | "rank"
                         | "leaderboard"
+                        | "help"
                 )
             })
             .collect();
         assert!(!unwired.contains(&"rank"));
         assert!(!unwired.contains(&"leaderboard"));
+        assert!(!unwired.contains(&"help"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }

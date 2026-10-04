@@ -5,7 +5,10 @@ use two_bot_testsupport::TestDatabase;
 
 use super::*;
 
-use crate::discord_test_common::{MockRest, ScriptedResponse};
+use crate::{
+    activation::fixtures,
+    discord_test_common::{MockRest, ScriptedResponse},
+};
 
 const GUILD: &str = "3333";
 const CHANNEL: &str = "4444";
@@ -148,6 +151,44 @@ async fn registration_builds_no_job_while_automations_are_off() {
     assert_eq!(calls.load(Ordering::SeqCst), 0, "registration is lazy");
     (job.action)().await.expect("action runs");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// TOG-15758: the ticker posts under the token's identity, so the capability
+/// fence binds it like the `/schedule` verbs. With `TWO_AUTOMATIONS=1` the
+/// staging pair registers; the live pair (automations uncleared), an unknown
+/// guild, a mismatched pair and a missing or unparseable token build no job.
+#[tokio::test]
+async fn identity_fence_registers_the_ticker_only_where_automations_are_permitted() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let action: JobAction = Arc::new({
+        let calls = calls.clone();
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    });
+    let on = gates(Some("1"));
+
+    let job = register_fenced(on, &fixtures::staging(), action.clone())
+        .expect("staging identity registers the ticker");
+    assert_eq!(job.name, "scheduled_messages");
+    (job.action)().await.expect("staging action runs");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    for (label, activation) in fixtures::refused() {
+        assert!(
+            register_fenced(on, &activation, action.clone()).is_none(),
+            "{label} must not register the ticker"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "refused jobs never run");
+
+    // Identity never enables what the environment left off.
+    for value in [None, Some("0")] {
+        assert!(register_fenced(gates(value), &fixtures::staging(), action.clone()).is_none());
+    }
 }
 
 /// The same legacy row against a database with a due row: the disabled
