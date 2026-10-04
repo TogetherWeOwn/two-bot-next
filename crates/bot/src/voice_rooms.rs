@@ -4141,6 +4141,19 @@ fn initial_seed() -> u64 {
         .unwrap_or(0x9E37_79B9_7F4A_7C15)
 }
 
+/// V1 room name until the V5 template engine owns naming: the joiner's
+/// display name, truncated to the Discord 100-character ceiling.
+fn room_name(display: &str) -> String {
+    const SUFFIX: &str = "'s room";
+    let base = format!("{display}{SUFFIX}");
+    if base.chars().count() <= MAX_CHANNEL_NAME_LEN as usize {
+        return base;
+    }
+    let keep = (MAX_CHANNEL_NAME_LEN as usize).saturating_sub(SUFFIX.chars().count());
+    let head: String = display.chars().take(keep).collect();
+    format!("{head}{SUFFIX}")
+}
+
 /// V1 room-name template until the V5 engine owns naming, in the legacy
 /// placeholder syntax the create-path filter renders.
 const ROOM_NAME_TEMPLATE: &str = "{username}'s room";
