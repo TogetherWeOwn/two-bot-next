@@ -106,9 +106,11 @@ def staging_migrate_errors(workflow):
     plan-bound expected_pending list optional at dispatch but required by the
     runner for apply, and the plan_manifest_sha256/plan_run_id pair optional
     at dispatch but required by the runner for apply). Two jobs: `plan` always
-    runs through the no-reviewer staging-migrate-plan environment and uploads
+    runs through the no-reviewer staging-migrate-plan environment, reads only
+    the read-only TWO_BOT_STAGING_PLAN_DATABASE_URL binding, and uploads
     the manifest artifact; `apply` runs only for mode=apply after a green plan
-    through the reviewed staging-migrate-apply environment and passes the
+    through the reviewed staging-migrate-apply environment, reads only the
+    migrator TWO_BOT_STAGING_MIGRATOR_DATABASE_URL binding, and passes the
     plan-bound inputs to the runner. Each job pins main-branch dispatch, its
     own routed runner, and the pipefail Run step. No push/pull_request/schedule
     trigger, no production path, no wrangler/probe markers: anything else is
@@ -191,6 +193,18 @@ def staging_migrate_errors(workflow):
             if step.get("shell") != "bash" or "set -o pipefail" not in str(step.get("run", "")):
                 errors.append(f"{name}:{job_id}: Run step must use a pipefail shell so a "
                               "migrator refusal/failure fails the job instead of reporting green")
+    plan_env = " ".join(str(step.get("env", "")) for step in plan.get("steps", []))
+    apply_env = " ".join(str(step.get("env", "")) for step in apply.get("steps", []))
+    # Plan is physically read-only: it reads only the RO binding and must never
+    # see the migrator credential; apply reads only the migrator binding.
+    if "TWO_BOT_STAGING_PLAN_DATABASE_URL" not in plan_env:
+        errors.append(f"{name}:plan: must read only the TWO_BOT_STAGING_PLAN_DATABASE_URL binding")
+    if "TWO_BOT_STAGING_MIGRATOR_DATABASE_URL" in plan_env:
+        errors.append(f"{name}:plan: must never read the migrator TWO_BOT_STAGING_MIGRATOR_DATABASE_URL binding")
+    if "TWO_BOT_STAGING_MIGRATOR_DATABASE_URL" not in apply_env:
+        errors.append(f"{name}:apply: must read only the TWO_BOT_STAGING_MIGRATOR_DATABASE_URL binding")
+    if "TWO_BOT_STAGING_PLAN_DATABASE_URL" in apply_env:
+        errors.append(f"{name}:apply: must never read the plan TWO_BOT_STAGING_PLAN_DATABASE_URL binding")
     plan_runs = " ".join(str(step.get("run", "")) for step in plan.get("steps", []))
     apply_runs = " ".join(str(step.get("run", "")) for step in apply.get("steps", []))
     # Match the standalone mode flag: the plan-binding flags
