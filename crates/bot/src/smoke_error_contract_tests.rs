@@ -13,8 +13,8 @@
 //!
 //! | Smoke path | Watch-log class | User reply (exact) |
 //! | --- | --- | --- |
-//! | unknown command | none — expected refusal, not an error | `I don't recognize that command. ...` ([`UNKNOWN_COMMAND_REPLY`], documented in `docs/interaction-replies.md`) |
-//! | permission denied | none — the harness identity lacks rights, the bot is healthy | `You need the Manage Server permission ...` ([`RouterRefusal::ManageServerRequired`]) |
+//! | unknown command | none — expected refusal, not an error | `I don't recognize that command. It may have been removed or renamed — pick it again from the / command list.` ([`UNKNOWN_COMMAND_REPLY`], documented in `docs/interaction-replies.md`) |
+//! | permission denied | none — the harness identity lacks rights, the bot is healthy | `You need the Manage Server permission to use this command. Ask a server admin to grant it.` ([`RouterRefusal::ManageServerRequired`]) |
 //! | store unavailable | `store_unavailable` — the only path that is a watch-log error | `Feed command failed; try again.` (safe text, never sqlx internals) |
 //! | invalid input | none — the harness sent a bad argument | `Unknown feed kind.` ([`FeedError::InvalidKind`]) |
 //!

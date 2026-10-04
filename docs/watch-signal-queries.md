@@ -152,6 +152,71 @@ container (for example a fatal gateway task); a `container started`
 without new `READY`/`RESUMED` events means the gateway never connected
 after the restart.
 
+## 6. DB-error counter
+
+Source: `two_bot_db_errors_total{op}` (storage-layer failures, not pool
+pressure). The `op` label is `admission` (send-admission SQL:
+admit/extend/complete) or `other` (every other store until its operation
+joins the allowlist; stays zero until then). Fixed cardinality: two series.
+Unknown operations collapse to `other`; no error text, query, or identifier
+is retained. Series contract: [metrics](metrics.md).
+
+```promql
+sum(increase(two_bot_db_errors_total[48h]))
+sum by (op) (increase(two_bot_db_errors_total[48h]))
+sum(increase(two_bot_db_errors_total{op="admission"}[1h]))
+```
+
+Read the `op` label before acting: an `admission`-only burst points at the
+send-admission SQL path and its recent deploys, not at the database as a
+whole. Do not sum this counter together with
+`two_bot_send_admissions_total{outcome="storage_error"}`: the same failure
+is counted in both, so adding them double-counts one outage. A counter that
+reset to zero between scrapes means the process restarted; it does not mean
+the window was quiet.
+
+Alert-threshold sketch (not a threshold): the paging rule fires at 3 or more
+storage failures between two keepalive samples, and a restart reset skips
+the window rather than firing. A slow trickle below that burst stays silent
+here and surfaces instead through `two_bot_job_consecutive_failures`. When
+this sketch disagrees with the runbook or the budgets in
+[production-deploy](production-deploy.md#signal-thresholds-budgets-and-rollback-triggers),
+those win. Runbook: [runbook](runbook.md) (DB errors section).
+
+## 7. Send-admission decisions
+
+Source: `two_bot_send_admissions_total{outcome}` (one `admit()` decision per
+increment, not per retry or per completion). The `outcome` label is
+`admitted` (Ok), `blocked` (lane or cooldown refusal), `storage_error` (the
+admission SQL itself failed; also counted in
+`two_bot_db_errors_total{op="admission"}`), or `other` (anything else).
+Failed `complete()`/`extend()` storage writes count only in the DB-error
+counter above: the admit decision was already recorded. Fixed cardinality:
+four series. Series contract: [metrics](metrics.md).
+
+```promql
+sum by (outcome) (increase(two_bot_send_admissions_total[48h]))
+sum(increase(two_bot_send_admissions_total{outcome="blocked"}[1h]))
+sum(increase(two_bot_send_admissions_total{outcome="storage_error"}[48h]))
+sum(increase(two_bot_send_admissions_total{outcome="blocked"}[48h]))
+  / sum(increase(two_bot_send_admissions_total[48h]))
+```
+
+A rising `blocked` share means the token-wide lane in front of every Discord
+send is refusing work (held lane or active cooldown), not that Discord
+returned 429s; correlate with the container logs for cooldown and held-lane
+lines before acting. A rising `storage_error` count is the same outage as
+section 6, not a second outage. Do not replay uncertain writes, hammer
+Discord, or restart the container to "free" the lane.
+
+Alert-threshold sketch (not a threshold): the paging rule fires only when
+windows with *new* `blocked` refusals arrive in 3 consecutive keepalive
+samples; one busy tick stays silent, and an idle or self-clearing burst never
+pages. Storage failures of the admission SQL page once via the DB-error rule
+above, not here. When this sketch disagrees with the runbook or the budgets
+in [production-deploy](production-deploy.md#signal-thresholds-budgets-and-rollback-triggers),
+those win. Runbook: [runbook](runbook.md) (send admission blocked section).
+
 ## What this pack does not do
 
 - No threshold is set or changed here.
