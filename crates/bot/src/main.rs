@@ -8,6 +8,7 @@
 mod activation;
 #[cfg(test)]
 mod admission_test_support;
+mod audit_gateway;
 mod audit_runtime;
 mod automod_gateway;
 mod backup_cli;
