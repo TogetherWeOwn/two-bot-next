@@ -29,9 +29,10 @@ async fn worker() -> (Worker, Trace) {
     )
 }
 
-/// Run every queued write to completion; each tick jumps past any backoff.
+/// Run every queued write to completion; each tick jumps past any backoff, so
+/// a write that failed before the call is due again on the first tick.
 async fn drain(worker: &mut Worker) {
-    for step in 0..40u64 {
+    for step in 1..=40u64 {
         if !worker.dispatch_one(step * 1_000_000).await {
             return;
         }
