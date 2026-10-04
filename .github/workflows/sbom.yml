@@ -62,7 +62,7 @@ jobs:
           git -C source rev-parse HEAD > sbom/source-sha.txt
           docker image inspect "$IMAGE" --format '{{.Id}}' > sbom/image-id.txt
       - name: Rust workspace CycloneDX SBOM
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           version: v0.69.3
           cache: false
@@ -74,7 +74,7 @@ jobs:
           output: sbom/rust-workspace.cdx.json
           exit-code: '0'
       - name: Runtime image CycloneDX SBOM
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           version: v0.69.3
           cache: false
@@ -89,7 +89,7 @@ jobs:
       # Scan the lockfile as well; do not mistake an OS-only image BOM for a
       # complete inventory of the bot's statically linked Rust dependencies.
       - name: Gate Rust dependencies (HIGH/CRITICAL, including unfixed)
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           version: v0.69.3
           cache: false
@@ -109,7 +109,7 @@ jobs:
       # and `verify` still validates/retains even when a gate fails.
       - name: Gate runtime image (HIGH/CRITICAL, including unfixed)
         if: ${{ !cancelled() }}
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           version: v0.69.3
           cache: false
