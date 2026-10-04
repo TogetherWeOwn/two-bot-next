@@ -280,9 +280,19 @@ impl RoomPersistence for Store {
             None => Ok(self.config.lock().unwrap().clone()),
         }
     }
-    async fn config_apply(&self, _: u64, config: &VoiceConfiguration) -> Result<(), StoreError> {
+    async fn config_apply(
+        &self,
+        _: u64,
+        config: &VoiceConfiguration,
+        expected: &VoiceConfiguration,
+    ) -> Result<(), StoreError> {
         if let Some(error) = self.save_config_error {
             return Err(error);
+        }
+        // Compare-and-swap like `PgVoiceConfigStore::apply`: a concurrent
+        // change between the Confirm re-read and the write is `Conflict`.
+        if *self.config.lock().unwrap() != *expected {
+            return Err(StoreError::Conflict);
         }
         self.trace.lock().unwrap().push("config_apply".to_owned());
         *self.config.lock().unwrap() = config.clone();
@@ -5236,6 +5246,26 @@ async fn import_stale_confirm_repreviews_instead_of_applying() {
     assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
     assert_eq!(*shared.lock().unwrap(), full_config());
     assert!(applied(&trace));
+}
+
+#[tokio::test]
+async fn config_apply_rejects_stale_expected() {
+    // The test double mirrors `PgVoiceConfigStore::apply`: the write lands
+    // only when the stored configuration still equals the snapshot the
+    // preview was rendered from.
+    let trace = Trace::default();
+    let store = Store::new(trace.clone());
+    *store.config.lock().unwrap() = empty_config();
+    store
+        .config_apply(GUILD, &full_config(), &empty_config())
+        .await
+        .expect("matching expected applies");
+    assert!(applied(&trace));
+    let conflict = store
+        .config_apply(GUILD, &empty_config(), &empty_config())
+        .await;
+    assert_eq!(conflict, Err(StoreError::Conflict));
+    assert_eq!(*store.config.lock().unwrap(), full_config());
 }
 
 #[tokio::test]

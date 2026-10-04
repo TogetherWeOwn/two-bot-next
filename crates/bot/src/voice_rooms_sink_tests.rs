@@ -69,8 +69,9 @@ impl RoomPersistence for Arc<Store> {
         &self,
         guild: u64,
         config: &VoiceConfiguration,
+        expected: &VoiceConfiguration,
     ) -> Result<(), StoreError> {
-        self.as_ref().config_apply(guild, config).await
+        self.as_ref().config_apply(guild, config, expected).await
     }
 
     async fn companions(&self, guild: u64) -> Result<Vec<TextCompanion>, StoreError> {

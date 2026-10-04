@@ -191,10 +191,15 @@ pub trait RoomPersistence: Send + Sync {
     ) -> impl Future<Output = Result<VoiceConfiguration, StoreError>> + Send;
     /// Replace the guild's V11 voice configuration in one transaction
     /// (`/import` Confirm only; never touches live rooms or companions).
+    /// Compare-and-swap on `expected` (the snapshot the preview was rendered
+    /// from): a concurrent change is `Conflict`, never a silent overwrite.
+    /// The preview hash already binds (`current`, `candidate`); this closes
+    /// the re-read-to-write window under the store's per-guild lock.
     fn config_apply(
         &self,
         guild: Snowflake,
         config: &VoiceConfiguration,
+        expected: &VoiceConfiguration,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
     fn forget(
         &self,
@@ -329,11 +334,15 @@ impl RoomPersistence for PgRoomStore {
         &self,
         guild: Snowflake,
         config: &VoiceConfiguration,
+        expected: &VoiceConfiguration,
     ) -> Result<(), StoreError> {
-        self.voice_configs()
-            .apply(guild, config)
-            .await
-            .map_err(store_error)
+        match self.voice_configs().apply(guild, config, expected).await {
+            Ok(()) => Ok(()),
+            // The store's compare-and-swap sentinel: the guild changed
+            // between the Confirm re-read and the locked write.
+            Err(sqlx::Error::RowNotFound) => Err(StoreError::Conflict),
+            Err(error) => Err(store_error(error)),
+        }
     }
 
     async fn companions(&self, guild: Snowflake) -> Result<Vec<TextCompanion>, StoreError> {
@@ -6368,9 +6377,67 @@ where
             reply(import_preview_response(&text, member_id, &hash)).await;
         }
         ImportDecision::Apply { candidate, message } => {
-            match store.config_apply(guild_id, &candidate).await {
+            match store.config_apply(guild_id, &candidate, &current).await {
                 Ok(()) => {
                     reply(ephemeral_response(&message)).await;
+                }
+                Err(StoreError::Conflict) => {
+                    // Compare-and-swap lost under the lock: the guild changed
+                    // between the Confirm re-read and the locked write. The
+                    // preview hash already bound (`current`, `candidate`); that
+                    // binding stays, and the admin gets a fresh preview of the
+                    // new state instead of a silent overwrite.
+                    match store.config_snapshot(guild_id).await {
+                        Ok(fresh) => {
+                            match plan_import_confirm(&fresh, &candidate, inventory, &hash) {
+                                ImportDecision::Refuse { message } => {
+                                    reply(ephemeral_response(&message)).await;
+                                }
+                                ImportDecision::Notice { text } => {
+                                    reply(ephemeral_response(&text)).await;
+                                }
+                                ImportDecision::Preview {
+                                    candidate,
+                                    hash,
+                                    text,
+                                } => {
+                                    runtime.remember_pending_import(
+                                        guild_id, member_id, &hash, candidate,
+                                    );
+                                    reply(import_preview_response(&text, member_id, &hash)).await;
+                                }
+                                ImportDecision::Apply {
+                                    candidate: retry,
+                                    message: _,
+                                } => {
+                                    // The fresh state still matches the hash
+                                    // (the concurrent change reverted): retry
+                                    // once with the fresh snapshot as expected.
+                                    match store.config_apply(guild_id, &retry, &fresh).await {
+                                        Ok(()) => {
+                                            reply(ephemeral_response(&message)).await;
+                                        }
+                                        Err(_) => {
+                                            runtime.remember_pending_import(
+                                                guild_id, member_id, &hash, retry,
+                                            );
+                                            reply(ephemeral_response(
+                                                "That preview is stale: the configuration changed underneath. Nothing was changed; try confirming again.",
+                                            ))
+                                            .await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
+                            reply(ephemeral_response(
+                                "That preview is stale: the configuration changed underneath. Nothing was changed; try confirming again.",
+                            ))
+                            .await;
+                        }
+                    }
                 }
                 Err(_) => {
                     runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
