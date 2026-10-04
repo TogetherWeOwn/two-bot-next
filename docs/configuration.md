@@ -184,7 +184,7 @@ Catalog entries: 121.
 | `TWO_REDIRECT_PORT` | env_only | Not specified in Next | environment only | Legacy redirect listener port; environment-only network bind. |
 | `TWO_REDIRECT_TRUSTED_PROXIES` | env_only | Not specified in Next | environment only | Trusted proxy boundaries for redirect request attribution. |
 | `TWO_SELF_ROLE_DRY_RUN` | hot | Not specified in Next | stored unwired | Observe self-role plans without writing roles. |
-| `TWO_SELF_ROLE_PANELS` | cold | Not specified in Next | stored unwired | Self-role panel catalog; validated by preflight, not read by gateway boot. |
+| `TWO_SELF_ROLE_PANELS` | cold | Not specified in Next | stored unwired | Self-role panel catalog; preflight runs the same strict parser as gateway boot, which parks self-roles on invalid catalogues. |
 | `TWO_STAGING_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Staging database connection secret; never rendered. |
 | `TWO_STAGING_RESTART_CONTAINMENT` | env_only | Not specified in Next | environment only | Staging restart containment gate; legacy boot input with no Next reader. |
 | `TWO_STAGING_RESTART_SYNTHETIC_ACTORS` | env_only | Not specified in Next | environment only | Synthetic-actor allowlist for staging restart containment; legacy input with no Next reader. |

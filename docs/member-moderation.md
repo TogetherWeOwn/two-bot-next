@@ -1,15 +1,20 @@
 # Member moderation domain and ledger
 
 This slice implements `/ban`, `/tempban`, `/kick`, `/timeout`, `/warn`, and
-scheduled unban processing. It does **not** register live handlers, instantiate
-a Discord HTTP client, or start a scheduler. It stays independently testable
-until the shared S4 interaction router and REST executor merge.
+scheduled unban processing. The domain and ledger stay independently testable;
+live handler registration, Discord REST and the sweep ticker arrive in the
+runtime wiring section below, after the shared S4 interaction router and REST
+executor merged.
 
 ## Integration contract
 
 - Feed current actor/target roles and permissions into `MemberExecution`.
   `MemberModerationService::execute` reuses `assert_moderation_allowed`; it
-  validates before claiming or acting. Reasons are trimmed and capped at 512
+  validates before claiming or acting. Bot hierarchy is a required resolved
+  position; adapters must refuse unknown positions before constructing a request.
+  Protected-target refusals share one generic reply. Policy refusals persist the
+  actor, target, action and `denied` outcome without claiming or acting; audit
+  write failures fail closed. Reasons are trimmed and capped at 512
   UTF-16 code units, matching the legacy JavaScript limit. The final generated
   expiry reason, including its prefix, is also capped at 512 UTF-16 code units
   with Unicode-safe truncation. Tempban bounds
@@ -56,6 +61,54 @@ until the shared S4 interaction router and REST executor merge.
   outstanding staged/pending/running or quarantined expiries.
 - S5 owns authenticated audit-reason markers and the operational audit mirror.
   Until that integration, the Discord reason is the plain moderator reason.
+
+## Runtime wiring
+
+The runtime slice registers `/ban`, `/tempban`, `/kick`, `/timeout` and
+`/warn` through the shared router into one per-guild `MemberRuntime`
+(`crates/bot/src/member_runtime.rs`), built once at boot via
+`MemberRuntime::from_env` and cloned across command dispatch and the
+supervised `member_unban_sweep` job (30 s cadence, 25 jobs per tick, wired in
+`crates/bot/src/website_jobs.rs`). No second same-guild consumer exists:
+commands and sweep share one store `Arc`, so bans and unbans for one member
+serialize through one set of local queues.
+
+`MemberDiscord` is implemented on the shared REST executor
+(`crates/discord/src/member_moderation.rs`): one attempt per verb, the legacy
+5 s abort, no automatic retry. Kick and unban treat 404 as complete; definite
+refusals (including local guard refusals, which never reach the wire) map to
+`Rejected`, while timeouts, transport/5xx failures and rate limits stay
+uncertain and keep the claim fenced. The audit-log reason stays within the
+512-unit bound, enforced before any I/O.
+
+Interaction-to-`MemberExecution` mapping resolves live role facts (guild
+roles/owner, resolved-or-fetched target member, cached bot id); incomplete
+snapshots refuse fail-closed instead of guessing hierarchy. Actor and target
+membership are interaction-time snapshots; guild role positions and bot membership
+are fetched before execution, not atomically with the claim or Discord mutation.
+A role change during a queue wait can therefore race actor authorization. This
+residual TOCTOU risk is accepted only for the default-off, staging-only integration,
+not as production clearance; Discord's bot hierarchy check is not an actor-policy
+recheck. Production enablement requires an explicit security disposition or a fresh
+in-claim actor/target recheck.
+
+All five member verbs share a process-local, per-guild actor cooldown: one new
+interaction per actor every 5 seconds, reserved before role REST reads. It applies
+to failed attempts too, uses a monotonic clock and stores at most 1024 unexpired
+actors; capacity exhaustion refuses rather than evicting active cooldowns. Different
+actors remain independent; restart clears this local limiter. This does not replace
+shared interaction-lane admission or a durable rate limiter. The interaction id is
+the idempotency key, so redelivery of that same interaction still reaches durable
+replay instead of consuming a new cooldown or moderating twice.
+
+Operator reconciliation ships as `two-bot reconcile-member`
+(`crates/bot/src/member_cli.rs`): `--list` surfaces prepared ban intents,
+running dispatches and quarantined imports via the read-only
+`surface_uncertain` store seam; `--confirm-ban`, `--reject-ban`,
+`--resolve-unban` and `--accept-historical` resolve one exact attempt with
+authoritative exact-intent evidence. Mutations are dry-run by default
+(`--execute` writes), staging-guild only, and claim tokens never print.
+`TWO_MODERATION` stays default-off and staging-only until soak.
 
 ## Durability
 
@@ -166,8 +219,9 @@ which request Discord accepted. Reconciliation requires authoritative evidence
 for the exact intent (including guild/member/request and generation), then
 recorded acceptance or definite refusal under the same member queue. Where that
 evidence is unavailable, retain the fence and escalate for a recorded security
-disposition. The runtime reconciliation/operator workflow is not implemented by
-this domain/store PR and must exist before enabling moderation.
+disposition. The runtime reconciliation/operator workflow ships in the runtime
+wiring slice (`two-bot reconcile-member`, see below) and must exist before
+enabling moderation.
 
 Accepted ban PUTs are audited immediately after observed Discord acceptance,
 before ownership confirmation or expiry activation. Accepted scheduled DELETEs

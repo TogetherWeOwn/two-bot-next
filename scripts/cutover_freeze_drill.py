@@ -49,9 +49,12 @@ LIVE_TRANSPORT = "staging-discord-rest"
 BODY_CAP = 64 << 10
 
 # Drill bounds mirror crates/core/src/channel_moderation.rs: slowmode
-# 0..=21600 (0 disables) and the SEND_MESSAGES bit (2048) for lockdown.
+# 0..=21600 (0 disables) and the lockdown bits: SEND_MESSAGES (2048) plus
+# SEND_MESSAGES_IN_THREADS, CREATE_PUBLIC_THREADS, CREATE_PRIVATE_THREADS and
+# ADD_REACTIONS (`LOCKDOWN_BITS`).
 MAX_SLOWMODE_SECONDS = 21_600
 SEND_MESSAGES_BIT = 2048
+LOCKDOWN_BITS = SEND_MESSAGES_BIT | (1 << 6) | (1 << 35) | (1 << 36) | (1 << 38)
 DRILL_SLOWMODE_SECONDS = 30
 MAX_REASON_LEN = 512
 
@@ -88,10 +91,10 @@ def semantic_hash(slowmode, allow, deny, overwrite_exists):
 
 
 def plan_lockdown_masks(prior_allow, prior_deny):
-    """Mirror plan_lockdown: clear SEND_MESSAGES from allow, set it in deny."""
+    """Mirror plan_lockdown: clear the lockdown bits from allow, set them in deny."""
     try:
-        allow = int(prior_allow) & ~SEND_MESSAGES_BIT
-        deny = int(prior_deny) | SEND_MESSAGES_BIT
+        allow = int(prior_allow) & ~LOCKDOWN_BITS
+        deny = int(prior_deny) | LOCKDOWN_BITS
     except (TypeError, ValueError):
         raise DrillError("unparseable permission mask in @everyone overwrite")
     return str(allow), str(deny)

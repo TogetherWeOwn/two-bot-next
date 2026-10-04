@@ -21,9 +21,10 @@ New active dependencies offer MIT or Apache-2.0; `deny.toml` stays unchanged.
 | Voice configuration | Arbitrary bytes never panic; accepted documents round-trip; generated valid configuration preserves Unicode template source, nullable fields and flags; creator numeric bounds are exact |
 | Automod NFKC / word boundaries | NFKC+lowercase normalization is idempotent; fullwidth ASCII folds to ASCII; whitespace/zero-width gaps between bad-word letters still match; affixed/embedded words refuse; empty-normalization words and empty content never match |
 
-Builder parity and runtime caps are separate: tempban/timeout builders advertise
-minimum 60 with no maximum (parity §1). Internal runtime validation caps them
-at 365 days and 28 days respectively. Schedule advertises 1–525600 / 60–525600
+Tempban/timeout builders and runtime validators share inclusive duration bounds:
+60–31536000 seconds (365 days) and 60–2419200 seconds (28 days), respectively.
+The stricter Next picker ceilings are explicit registry golden exceptions to the
+frozen legacy minima-only surface. Schedule advertises 1–525600 / 60–525600
 minutes; sticky debounce is 1–300 seconds. LFG lengths use UTF-16 units, while
 voice literal names use Unicode scalars.
 

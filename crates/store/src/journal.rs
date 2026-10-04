@@ -63,6 +63,7 @@ pub const COVERED_TABLES: &[&str] = &[
     "internal_idempotency",
     "internal_nonces",
     "internal_discord_events",
+    "internal_event_keys",
     // Scheduling, gateway sessions, guild settings.
     "scheduled_messages",
     "gateway_sessions",

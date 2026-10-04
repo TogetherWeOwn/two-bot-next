@@ -349,8 +349,8 @@ mod tests {
             let definitions = crate::moderation::moderation_commands().into_iter()
                 .chain(crate::feature_commands::automation_commands()).collect::<Vec<_>>();
             for (command, option, min, max, required) in [
-                ("tempban", "duration_seconds", 60, None, true),
-                ("timeout", "duration_seconds", 60, None, true),
+                ("tempban", "duration_seconds", 60, Some(31_536_000), true),
+                ("timeout", "duration_seconds", 60, Some(2_419_200), true),
                 ("purge", "count", 1, Some(100), true),
                 ("slowmode", "seconds", 0, Some(21_600), true),
                 ("schedule", "in-minutes", 1, Some(525_600), false),
@@ -363,8 +363,8 @@ mod tests {
                 prop_assert_eq!(published.required, required.then_some(true));
                 prop_assert_eq!(published.min_value, Some(min));
                 prop_assert_eq!(published.max_value, max);
-                // Duration builders deliberately have no max; runtime validators
-                // enforce the separate Discord/service caps in internal_actions.
+                // Next advertises the service duration caps as well as the
+                // legacy registry minima captured in parity section one.
                 for n in [min - 1, min, max.unwrap_or(i64::MAX), value] {
                     let advertised = published.min_value.is_none_or(|lower| n >= lower)
                         && published.max_value.is_none_or(|upper| n <= upper);

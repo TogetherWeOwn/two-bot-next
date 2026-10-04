@@ -459,20 +459,38 @@ class DeltaChecklistTests(unittest.TestCase):
             validate(self.parity.replace(line, line + "\n" + row, 1), self.checklist)
 
     def test_owner_cards_must_match_disposition(self):
+        # A synthetic gap row, so this test does not depend on a real ledger
+        # row staying open: real rows flip to ported as their cards close.
+        line = self.line("| [bffccf3]")
+        row = ("| [abc1234](https://example.invalid) | `src/x/` | fix(x): new | gap | "
+               "[TOG-11145](/TOG/issues/TOG-11145) — open |")
+        parity = self.parity.replace(line, line + "\n" + row, 1)
         data = copy.deepcopy(self.checklist)
-        self.entry(data, "s13-1d64196")["owner"] = ["TOG-11146"]
-        with self.assertRaisesRegex(ValueError, "s13-1d64196: stale owner"):
-            validate(self.parity, data)
-        self.entry(data, "s13-1d64196")["owner"] = ["TOG-11145"]
-        line = self.line("| [1d64196]")
-        moved = self.parity.replace(line, line.replace("TOG-11145", "TOG-99999"), 1)
-        with self.assertRaisesRegex(ValueError, "s13-1d64196: stale owner"):
+        data["entries"].append({
+            "id": "s13-abc1234",
+            "parity": {"section": 13, "row": [
+                "[abc1234](https://example.invalid)", "`src/x/`", "fix(x): new", "gap"]},
+            "owner": ["TOG-11145"],
+            "status": "waived",
+            "action": "Run the fixture.",
+            "expected": "It passes.",
+            "evidence": "Attach the result.",
+            "reason": "Proposed waiver.",
+            "approver": "pending",
+        })
+        validate(parity, data)
+        self.entry(data, "s13-abc1234")["owner"] = ["TOG-11146"]
+        with self.assertRaisesRegex(ValueError, "s13-abc1234: stale owner"):
+            validate(parity, data)
+        self.entry(data, "s13-abc1234")["owner"] = ["TOG-11145"]
+        moved = parity.replace(row, row.replace("TOG-11145", "TOG-99999"), 1)
+        with self.assertRaisesRegex(ValueError, "s13-abc1234: stale owner"):
             validate(moved, data)
         for owner in (None, [], ["owner"], "TOG-11145"):
             with self.subTest(owner=owner):
-                self.entry(data, "s13-1d64196")["owner"] = owner
+                self.entry(data, "s13-abc1234")["owner"] = owner
                 with self.assertRaisesRegex(ValueError, "requires owner cards"):
-                    validate(self.parity, data)
+                    validate(parity, data)
         # A ported row with no cited card still names its owning slice.
         data = copy.deepcopy(self.checklist)
         self.entry(data, "s13-3dc9720").pop("owner")
