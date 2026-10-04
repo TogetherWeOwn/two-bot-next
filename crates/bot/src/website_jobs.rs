@@ -1,4 +1,5 @@
-//! Runtime adapters for the three existing website-contract domains.
+//! Runtime adapters for the three existing website-contract domains, plus the
+//! `guild_settings` hot-reload poll registered alongside them (TOG-10898).
 
 use std::{sync::Arc, time::Duration};
 
@@ -21,7 +22,15 @@ use crate::{
     server,
 };
 
-pub const NAMES: [&str; 3] = ["counter", "rank", "scheduled_events"];
+/// Every supervised job name, in `/readyz` order. The settings poll needs
+/// only the database, so it is registered separately from the REST-backed
+/// jobs below.
+pub const NAMES: [&str; 4] = [
+    "counter",
+    "rank",
+    "scheduled_events",
+    crate::settings_jobs::NAME,
+];
 
 #[cfg(test)]
 #[path = "website_jobs_tests.rs"]
@@ -129,6 +138,9 @@ pub async fn serve(
     let mut registered = Vec::new();
     let mut parked = Vec::new();
     if let Ok((token, url, guild)) = crate::gateway_prerequisites(config) {
+        // The settings poll is DB-only: register it before REST construction
+        // so a bad DISCORD_API_BASE cannot park hot reload.
+        registered.push(crate::settings_jobs::job(url));
         // Lazy connection preserves parked/startup behavior; every wire attempt
         // still fails closed on this same runtime database authority.
         let rest = admission_pool(url).and_then(|pool| {
@@ -204,6 +216,7 @@ pub async fn serve(
     } else {
         tracing::info!("website jobs parked: gateway prerequisites missing");
     }
+
     if let Some(service) = self_roles {
         registered.push(service.recovery_job());
     }
@@ -226,6 +239,8 @@ pub async fn serve(
 }
 
 async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::SharedStatus {
+    // NAMES already carries the DB-only settings poll alongside the
+    // REST-backed domains, so the status map lists all eleven jobs.
     let mut names: Vec<&'static str> = NAMES
         .into_iter()
         .chain(community_jobs::NAMES)

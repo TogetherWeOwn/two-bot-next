@@ -4,11 +4,13 @@
 #![allow(clippy::print_stdout)]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use two_bot_core::commands::CommandDefinition;
 use two_bot_core::feature_commands::FeatureGates;
 use two_bot_core::moderation::ModerationGates;
 use two_bot_core::router::{InteractionRouter, RouterGates, SurfaceFlags};
+use two_bot_core::send_admission::{is_loopback_http, PgSendAdmission};
 use two_bot_discord::{publish_commands, ActionExecutor};
 
 pub const USAGE: &str = "\
@@ -17,7 +19,10 @@ pub const USAGE: &str = "\
       Fetch and compare the guild command list against the compiled, feature-gated
       builtins. Both commands are read-only unless publish receives --apply.
       Env: DISCORD_TOKEN, GUILD_ID, DISCORD_APPLICATION_ID; feature gates as on boot.
-      No database is opened. See docs/command-publish.md before applying a cutover.
+      Live Discord targets additionally require TWO_DATABASE_URL (or DATABASE_URL
+      when unset), the shared send-admission Postgres. No database is opened for
+      loopback DISCORD_API_BASE fixtures, and no gateway is started.
+      See docs/command-publish.md before applying a cutover.
 ";
 
 /// Top-level `--help` surface: the registry usage plus the sibling CLI
@@ -120,12 +125,44 @@ fn desired_definitions(
     .map_err(|e| e.to_string())
 }
 
-fn executor(token: &str, vars: &HashMap<String, String>) -> Result<ActionExecutor, String> {
+/// Two-stage admission mirror of `preflight::admission_transport`: live (non-
+/// loopback) targets build `PgSendAdmission` from TWO_DATABASE_URL and route
+/// the executor through it; the explicit loopback fixture stays offline and
+/// credential-free, and a present-but-failing authority never falls back.
+/// Async because building admission opens the Postgres pool.
+async fn executor(token: &str, vars: &HashMap<String, String>) -> Result<ActionExecutor, String> {
     if token.is_empty() {
         return Err("DISCORD_TOKEN is required".into());
     }
     // Proxy is the existing executor seam; no credentials are accepted as flags.
-    ActionExecutor::with_proxy(token.to_owned(), vars.get("DISCORD_API_BASE").cloned())
+    let proxy = vars.get("DISCORD_API_BASE").cloned();
+    if proxy.as_deref().is_some_and(is_loopback_http) {
+        return ActionExecutor::with_proxy(token.to_owned(), proxy);
+    }
+    // Primary TWO_DATABASE_URL first; DATABASE_URL (the Container runtime's own
+    // name for the same authority) as fallback; a set-but-empty primary is a
+    // configuration error, never permission to try another credential.
+    let url = match vars.get("TWO_DATABASE_URL") {
+        Some(url) if !url.trim().is_empty() => url.clone(),
+        Some(_) => {
+            return Err("TWO_DATABASE_URL is set but empty".to_owned());
+        }
+        None => vars
+            .get("DATABASE_URL")
+            .filter(|url| !url.trim().is_empty())
+            .cloned()
+            .ok_or_else(|| "set TWO_DATABASE_URL before live command checks".to_owned())?,
+    };
+    let options = two_bot_core::database_url::connect_options(&url)
+        .map_err(|_| "cannot configure send-admission Postgres".to_owned())?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(options)
+        .await
+        .map_err(|_| "cannot configure send-admission Postgres".to_owned())?;
+    let admission = PgSendAdmission::new(pool, token)
+        .map_err(|_| "cannot configure send-admission Postgres".to_owned())?;
+    ActionExecutor::with_admission(token.to_owned(), proxy, Arc::new(admission))
 }
 
 pub async fn dispatch(args: &[String]) -> i32 {
@@ -148,12 +185,11 @@ pub async fn dispatch(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let executor = match executor(vars.get("DISCORD_TOKEN").map_or("", String::as_str), &vars) {
+    let executor = match executor(vars.get("DISCORD_TOKEN").map_or("", String::as_str), &vars).await
+    {
         Ok(executor) => executor,
-        Err(_) => {
-            eprintln!(
-                "cannot configure command REST client; check DISCORD_TOKEN and DISCORD_API_BASE"
-            );
+        Err(error) => {
+            eprintln!("cannot configure command REST client: {error}");
             return 2;
         }
     };
@@ -207,7 +243,9 @@ pub async fn publish_on_boot(token: &str, guild: u64) -> Result<(), String> {
         "DISCORD_APPLICATION_ID",
     )?;
     let defs = desired_definitions(guild, &vars)?;
-    let executor = executor(token, &vars).map_err(|_| "cannot configure command REST client")?;
+    let executor = executor(token, &vars)
+        .await
+        .map_err(|_| "cannot configure command REST client")?;
     let (diff, applied) = executor
         .sync_guild_commands(application, guild, &publish_commands(&defs), true)
         .await
@@ -261,6 +299,53 @@ mod tests {
                 assert!(parse(&allowed, &vars()).is_ok());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn live_target_without_database_fails_closed_before_io() {
+        // No DISCORD_API_BASE and no DB vars: must refuse with the admission
+        // requirement, never "shared durable Discord send admission required".
+        let error = executor("synthetic-token", &vars()).await.unwrap_err();
+        assert!(
+            error.contains("TWO_DATABASE_URL"),
+            "fail-closed admission requirement, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_but_empty_primary_is_a_configuration_error() {
+        let mut env = vars();
+        env.insert("TWO_DATABASE_URL".into(), "   ".into());
+        env.insert("DATABASE_URL".into(), "postgres://db/a".into());
+        let error = executor("synthetic-token", &env).await.unwrap_err();
+        assert!(
+            error.contains("set but empty"),
+            "empty primary never falls back, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_database_url_fails_before_any_socket() {
+        // Unparseable URL: connect_options rejects it with no I/O.
+        let mut env = vars();
+        env.insert("DATABASE_URL".into(), "bogus".into());
+        let error = executor("synthetic-token", &env).await.unwrap_err();
+        assert!(
+            error.contains("cannot configure send-admission Postgres"),
+            "fail-closed on bad URL, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_fixture_needs_no_database_or_token_admission() {
+        let mut env = vars();
+        env.insert("DISCORD_API_BASE".into(), "http://127.0.0.1:9".into());
+        // No TWO_DATABASE_URL/DATABASE_URL: the offline seam must still build.
+        assert!(executor("synthetic-token", &env).await.is_ok());
+        assert!(executor("", &env)
+            .await
+            .unwrap_err()
+            .contains("DISCORD_TOKEN"));
     }
 
     #[test]

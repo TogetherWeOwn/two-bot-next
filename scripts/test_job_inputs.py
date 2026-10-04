@@ -23,6 +23,7 @@ SPEC.loader.exec_module(inputs)
 ROOT = Path(__file__).resolve().parents[1]
 CHECK_YML = ROOT / ".github/workflows/check.yml"
 RUST, WORKER, PARITY = inputs.RUST, inputs.WORKER, inputs.PARITY
+SUPPLY, DOCS = inputs.SUPPLY, inputs.DOCS
 
 
 def jobs(paths):
@@ -36,7 +37,44 @@ class SelectionTests(unittest.TestCase):
                      "migrations.lock"]:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path),
-                                 {RUST, WORKER, PARITY}, path)
+                                 {RUST, WORKER, PARITY, SUPPLY}, path)
+
+    def test_selector_files_run_everything(self):
+        # CI standard rule 4 (TOG-14881): the change-detection filter
+        # itself revalidates everything rather than risk a stale gate.
+        for path in ["scripts/job-inputs.py",
+                     "scripts/container-inputs.py",
+                     "scripts/test_job_inputs.py",
+                     "scripts/test_container_inputs.py"]:
+            with self.subTest(path=path):
+                self.assertEqual(inputs.classify(path),
+                                 {RUST, WORKER, PARITY, SUPPLY}, path)
+
+    def test_github_workflows_run_everything(self):
+        # CI standard rule 4 (TOG-14881): `.github/**` edits change what
+        # every other gate means, so they revalidate everything -- not just
+        # the worker job's offline verifications.
+        for path in [".github/workflows/supply-chain.yml",
+                     ".github/workflows/release.yml",
+                     ".github/workflows/deploy-production.yml",
+                     ".github/workflows/deploy-staging.yml",
+                     ".github/workflows/nightly.yml"]:
+            with self.subTest(path=path):
+                self.assertEqual(inputs.classify(path),
+                                 {RUST, WORKER, PARITY, SUPPLY}, path)
+
+    def test_image_inputs_select_supply_only(self):
+        # The container selector owns the image build and the check job's
+        # offline manifest step always runs, so no test job is needed -- but
+        # the SBOM/vulnerability scan inventories exactly these files.
+        for path in ["Dockerfile", "Dockerfile.distroless",
+                     ".dockerignore"]:
+            with self.subTest(path=path):
+                self.assertEqual(inputs.classify(path), {SUPPLY}, path)
+        self.assertEqual(
+            jobs(["Dockerfile"]),
+            {RUST: False, WORKER: False, PARITY: False,
+             SUPPLY: True, DOCS: False})
 
     def test_crate_changes_run_rust_and_worker(self):
         rust = ["crates/core/src/lib.rs", "crates/bot/src/main.rs",
@@ -77,38 +115,47 @@ class SelectionTests(unittest.TestCase):
 
     def test_changed_path_fixture_matrix(self):
         # Fixture matrix: docs-only vs code vs asset PRs. Docs/asset-only
-        # skips the heavy Rust matrix; the always-run `check` and
-        # `worker check` aggregators still report success.
-        # Docs-only: skips Rust, keeps worker (docs/ listing assertion).
+        # skips the heavy Rust matrix and the supply-chain scan; the
+        # always-run `check` and `ci-ok` aggregators still report success.
+        # Docs-only: skips Rust and supply, keeps worker (docs/ listing
+        # assertion). `docs` is informational only and gates nothing.
         self.assertEqual(
             jobs(["docs/metrics.md", "README.md"]),
-            {RUST: False, WORKER: True, PARITY: False})
-        # Asset-only: validator assets plus chrome select nothing.
+            {RUST: False, WORKER: True, PARITY: False,
+             SUPPLY: False, DOCS: True})
+        # Asset-only: validator assets plus chrome select no job; the
+        # markdown assets still raise the informational docs flag.
         self.assertEqual(
             jobs(["tests/voice_templates/coverage.json",
                   "tests/voice_templates/test_validator.py",
                   "tests/voice_templates/README.md",
                   "LICENSE", "PACKAGES.md"]),
-            {RUST: False, WORKER: False, PARITY: False})
-        # Docs + asset: still skips Rust, keeps worker for the docs half.
+            {RUST: False, WORKER: False, PARITY: False,
+             SUPPLY: False, DOCS: True})
+        # Docs + asset: still skips Rust and supply, keeps worker.
         self.assertEqual(
             jobs(["tests/voice_templates/coverage.json",
                   "tests/voice_templates/README.md",
                   "docs/metrics.md", "README.md"]),
-            {RUST: False, WORKER: True, PARITY: False})
-        # Code: runs Rust and worker, skips parity.
+            {RUST: False, WORKER: True, PARITY: False,
+             SUPPLY: False, DOCS: True})
+        # Code: runs Rust, worker and supply (the scan inventories the
+        # shipped binary), skips parity, raises no docs flag.
         self.assertEqual(
             jobs(["crates/core/src/lib.rs"]),
-            {RUST: True, WORKER: True, PARITY: False})
+            {RUST: True, WORKER: True, PARITY: False,
+             SUPPLY: True, DOCS: False})
 
     def test_corpus_change_still_runs_rust(self):
         self.assertEqual(
             jobs(["tests/voice_templates/corpus.json"]),
-            {RUST: True, WORKER: False, PARITY: False})
+            {RUST: True, WORKER: False, PARITY: False,
+             SUPPLY: True, DOCS: False})
         self.assertEqual(
             jobs(["tests/voice_templates/coverage.json",
                   "tests/voice_templates/corpus.json"]),
-            {RUST: True, WORKER: False, PARITY: False})
+            {RUST: True, WORKER: False, PARITY: False,
+             SUPPLY: True, DOCS: False})
 
     def test_scripts_run_rust_and_worker(self):
         for path in ["scripts/check-migrations.py",
@@ -169,30 +216,26 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {WORKER}, path)
 
-    def test_worker_coupling_workflows_select_worker_only(self):
-        for path in [".github/workflows/supply-chain.yml",
-                     ".github/workflows/release.yml",
-                     ".github/workflows/deploy-production.yml",
-                     ".github/workflows/deploy-staging.yml"]:
-            with self.subTest(path=path):
-                self.assertEqual(inputs.classify(path), {WORKER}, path)
-
     def test_release_config_selects_worker_only(self):
         for path in ["release-please-config.json",
                      ".release-please-manifest.json"]:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {WORKER}, path)
 
-    def test_repo_chrome_selects_nothing(self):
+    def test_repo_chrome_selects_no_job(self):
+        # Image inputs moved out of this list (TOG-14881): Dockerfile and
+        # friends select `supply` (see test_image_inputs_select_supply_only).
+        # Markdown chrome still raises the informational docs flag, which
+        # gates nothing.
         skip = ["LICENSE", "CHANGELOG.md", ".editorconfig", ".gitignore",
                 ".gitleaks.toml", ".gitleaksignore",
                 ".github/pull_request_template.md",
                 ".github/CODEOWNERS", ".github/dependabot.yml",
                 "README.md", "AGENTS.md", "CONTEXT.md",
-                "Dockerfile", "Dockerfile.distroless", ".dockerignore",
                 "PACKAGES.md"]
         self.assertEqual(jobs(skip),
-                         {RUST: False, WORKER: False, PARITY: False})
+                         {RUST: False, WORKER: False, PARITY: False,
+                          SUPPLY: False, DOCS: True})
 
     def test_unrecognized_paths_fail_closed(self):
         for path in ["brand-new-dir/thing.txt", "Dockerfile.new",
@@ -200,35 +243,41 @@ class SelectionTests(unittest.TestCase):
                      ".github/UNKNOWN", ".gitattributes", "odd-root-file.rs"]:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path),
-                                 {RUST, WORKER, PARITY}, path)
+                                 {RUST, WORKER, PARITY, SUPPLY}, path)
 
-    def test_docs_only_pr_skips_rust(self):
+    def test_docs_only_pr_skips_rust_and_supply(self):
         self.assertEqual(
             jobs(["docs/metrics.md", "docs/gateway-recovery.md",
                   "README.md", ".github/CODEOWNERS"]),
-            {RUST: False, WORKER: True, PARITY: False})
+            {RUST: False, WORKER: True, PARITY: False,
+             SUPPLY: False, DOCS: True})
 
-    def test_wrangler_only_pr_skips_rust_and_parity(self):
+    def test_wrangler_only_pr_skips_rust_parity_and_supply(self):
         self.assertEqual(
             jobs(["wrangler/src/index.ts", "wrangler/test/x.test.ts"]),
-            {RUST: False, WORKER: True, PARITY: False})
+            {RUST: False, WORKER: True, PARITY: False,
+             SUPPLY: False, DOCS: False})
 
     def test_rust_only_pr_skips_parity(self):
         self.assertEqual(
             jobs(["crates/core/src/lib.rs"]),
-            {RUST: True, WORKER: True, PARITY: False})
+            {RUST: True, WORKER: True, PARITY: False,
+             SUPPLY: True, DOCS: False})
 
     def test_mixed_diff_runs_what_it_touches(self):
         self.assertEqual(
             jobs(["docs/runbook.md", "crates/core/src/lib.rs"]),
-            {RUST: True, WORKER: True, PARITY: False})
+            {RUST: True, WORKER: True, PARITY: False,
+             SUPPLY: True, DOCS: True})
         self.assertEqual(
             jobs(["docs/runbook.md", "docs/parity.md"]),
-            {RUST: True, WORKER: True, PARITY: True})
+            {RUST: True, WORKER: True, PARITY: True,
+             SUPPLY: True, DOCS: True})
 
     def test_empty_diff_selects_nothing(self):
         self.assertEqual(jobs([]),
-                         {RUST: False, WORKER: False, PARITY: False})
+                         {RUST: False, WORKER: False, PARITY: False,
+                          SUPPLY: False, DOCS: False})
 
     @staticmethod
     def fake_diff(changed):
@@ -245,12 +294,15 @@ class SelectionTests(unittest.TestCase):
                 printed.assert_any_call("rust=true")
                 printed.assert_any_call("worker=true")
                 printed.assert_any_call("parity=false")
+                printed.assert_any_call("supply=true")
+                printed.assert_any_call("docs=false")
 
     def test_cli_job_flag_prints_single_value(self):
         with patch.object(inputs, "git_diff_names",
                           side_effect=self.fake_diff(["docs/metrics.md"])):
             for job, want in ((RUST, "false"), (WORKER, "true"),
-                              (PARITY, "false")):
+                              (PARITY, "false"), (SUPPLY, "false"),
+                              (DOCS, "true")):
                 with self.subTest(job=job), patch("builtins.print") as printed:
                     self.assertEqual(
                         inputs.main(["--base-ref", "a", "--head-ref", "b",
@@ -268,6 +320,8 @@ class SelectionTests(unittest.TestCase):
                 printed.assert_any_call("rust=true")
                 printed.assert_any_call("worker=true")
                 printed.assert_any_call("parity=true")
+                printed.assert_any_call("supply=true")
+                printed.assert_any_call("docs=true")
 
     def test_cli_fails_closed_when_diff_is_undecidable(self):
         import subprocess
@@ -376,9 +430,9 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertLess(self.text.index("  job-inputs:"),
                         self.text.index("\n  container-inputs:"))
 
-    def test_selector_exposes_three_outputs(self):
+    def test_selector_exposes_five_outputs(self):
         outputs = self.selector.split("outputs:", 1)[1].split("steps:", 1)[0]
-        for job in ("rust", "worker", "parity"):
+        for job in ("rust", "worker", "parity", "supply", "docs"):
             self.assertIn(job, outputs)
 
     def test_selector_checks_out_full_history(self):
@@ -393,10 +447,13 @@ class WorkflowSurfaceTests(unittest.TestCase):
     def test_selector_defaults_to_full_jobs(self):
         # Fail-closed end to end: undecidable diffs, missing SHAs and
         # non-PR events all select full jobs in the shell step, so a
-        # classifier exit code can never silently skip coverage.
+        # classifier exit code can never silently skip coverage. `docs`
+        # defaults to false: it is informational only and gates nothing.
         self.assertIn("rust=true", self.selector)
         self.assertIn("worker=true", self.selector)
         self.assertIn("parity=true", self.selector)
+        self.assertIn("supply=true", self.selector)
+        self.assertIn("docs=false", self.selector)
         self.assertIn("github.event_name", self.selector)
 
     def test_selector_regressions_run_in_ci(self):
@@ -404,10 +461,46 @@ class WorkflowSurfaceTests(unittest.TestCase):
 
     def test_consumer_jobs_wait_on_selector(self):
         for job in ("check", "community-db", "feeds-db", "tickets-postgres",
-                    "worker", "required-checks"):
+                    "worker", "required-checks", "supply-chain", "ci-ok"):
             head = self.text.split(f"\n  {job}:")[1].split("steps:", 1)[0]
             with self.subTest(job=job):
                 self.assertIn("job-inputs", head)
+
+    def test_supply_chain_job_is_selector_gated(self):
+        # CI standard rule 6 (TOG-14881): the SBOM scan runs only when the
+        # `supply` area changed; docs-only and worker-UI-only PRs skip it.
+        head = self.text.split("\n  supply-chain:")[1].split("steps:", 1)[0]
+        self.assertIn("needs.job-inputs.outputs.supply != 'false'", head)
+
+    def test_check_job_supply_guard_is_conditional(self):
+        # A skipped supply-chain job must not fail the always-run `check`
+        # job; the guard only enforces the gate when supply was selected.
+        body = self.text.split("\n  check:", 1)[1].split(
+            "\n  parity-docs:", 1)[0]
+        self.assertIn(
+            "needs.supply-chain.result != 'success' "
+            "&& needs.job-inputs.outputs.supply != 'false'", body)
+
+    def test_ci_ok_aggregator_exists_and_is_always_run(self):
+        # CI standard rule 3 (TOG-14881): one required aggregator named
+        # `ci-ok`, running on every event, passing only when every needed
+        # job succeeded or was legitimately skipped.
+        head = self.text.split("\n  ci-ok:")[1].split("steps:", 1)[0]
+        self.assertIn("always()", head)
+        for job in ("job-inputs", "supply-chain", "check", "worker",
+                    "parity-docs", "self-role-store", "community-db",
+                    "feeds-db", "tickets-postgres", "moderation-db"):
+            self.assertIn(job, head)
+        body = self.text.split("\n  ci-ok:")[1]
+        self.assertIn("SUPPLY_SELECTED", body)
+        self.assertIn("ci-ok passed", body)
+
+    def test_weekly_full_run_schedule_exists(self):
+        # CI standard rules 5-6 (TOG-14881): push to main plus a scheduled
+        # full run (here weekly, alongside the nightly sweep workflow).
+        # No `paths:` filter may gate the workflow itself (rule 2).
+        self.assertIn("schedule:", self.on_block)
+        self.assertIn("cron:", self.on_block)
 
     def test_worker_is_always_run_required_check(self):
         # `worker check` is required on main: it must never skip at the job

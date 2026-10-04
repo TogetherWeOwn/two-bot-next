@@ -32,6 +32,11 @@ INGRESS_VAR = "INTERNAL_ACTIONS_INGRESS"
 INGRESS_ENVS = {"staging"}
 # Private-receiver config is Operator-set Worker secrets, never wrangler.toml.
 RECEIVER_CONFIG_PREFIX = "TWO_INTERNAL_"
+# Boot publication of the guild command registry is a full replacement of the
+# guild's commands. wrangler.toml may opt in for staging only; production
+# publication stays an Operator-approved Worker binding, never a committed var.
+BOOT_PUBLISH_VAR = "TWO_COMMANDS_PUBLISH_ON_BOOT"
+BOOT_PUBLISH_ENVS = {"staging"}
 
 
 def check(path: Path) -> list[str]:
@@ -59,6 +64,13 @@ def check(path: Path) -> list[str]:
             )
         if variables.get(INGRESS_VAR, "1") != "1":
             errors.append(f'{prefix}: {INGRESS_VAR} must be exactly "1" or absent')
+        if BOOT_PUBLISH_VAR in variables and env_name not in BOOT_PUBLISH_ENVS:
+            errors.append(
+                f"{prefix}: {BOOT_PUBLISH_VAR} is staging-only "
+                "(top-level vars are required in every env; production publication is Operator-approved)"
+            )
+        if variables.get(BOOT_PUBLISH_VAR, "1") != "1":
+            errors.append(f'{prefix}: {BOOT_PUBLISH_VAR} must be exactly "1" or absent')
         for key in sorted(k for k in variables if k.startswith(RECEIVER_CONFIG_PREFIX)):
             errors.append(f"{prefix}: {key} is an Operator-set Worker secret, never a wrangler.toml var")
         threshold = variables.get("UNREADY_ALERT_FAILURES")

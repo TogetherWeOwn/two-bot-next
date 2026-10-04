@@ -267,3 +267,51 @@ async fn kick_success_writes_exact_audit_event() {
         "kick carries no duration"
     );
 }
+
+#[tokio::test]
+async fn kick_same_key_retry_replays_without_second_discord_call() {
+    let discord = MockMemberDiscord::new();
+    let store = MemMemberStore::new();
+    let svc = service_with(discord.clone(), store.clone());
+    let exec = kick_execution();
+    let first = svc.execute(&exec).await.expect("eligible kick executes");
+    assert_eq!(first.outcome, MemberOutcome::Kicked);
+    assert!(!first.replayed);
+
+    // Same request retried under the same key: the stored outcome replays,
+    // Discord sees no second DELETE and the ledger keeps its single row.
+    let second = svc.execute(&exec).await.expect("retry replays");
+    assert_eq!(second.outcome, MemberOutcome::Kicked);
+    assert!(second.replayed);
+
+    assert_eq!(discord.call_count("kick"), 1);
+    assert_eq!(store.audits().len(), 1);
+}
+
+#[tokio::test]
+async fn kick_fresh_key_second_kick_still_completes() {
+    // Legacy accepts 200/204/404 for the member DELETE, so kicking an
+    // already-removed member completes as a no-op rather than failing. The
+    // mock double always completes, standing in for that 404-accepting
+    // DELETE; a genuinely new request (fresh key and request id) therefore
+    // executes and records again instead of replaying or refusing.
+    let discord = MockMemberDiscord::new();
+    let store = MemMemberStore::new();
+    let svc = service_with(discord.clone(), store.clone());
+    let first = svc
+        .execute(&kick_execution())
+        .await
+        .expect("eligible kick executes");
+    assert_eq!(first.outcome, MemberOutcome::Kicked);
+    assert!(!first.replayed);
+
+    let mut again = kick_execution();
+    again.request_id = "req-kick-again".to_owned();
+    again.idempotency_key = "req-kick-again".to_owned();
+    let second = svc.execute(&again).await.expect("re-kick completes");
+    assert_eq!(second.outcome, MemberOutcome::Kicked);
+    assert!(!second.replayed);
+
+    assert_eq!(discord.call_count("kick"), 2);
+    assert_eq!(store.audits().len(), 2);
+}

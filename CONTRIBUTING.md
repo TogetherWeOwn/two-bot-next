@@ -190,3 +190,16 @@ explicit opt-ins until migrated separately.
 The `wrangler/` Worker/DO wrapper has its own `npm ci`, `npm run typecheck`
 and `npm test`. Never commit secrets, `.env` files or `target/`. See
 [README.md](README.md) for the full service reference.
+
+### Secret-scan allowlists
+
+The required `gitleaks` check scans the full history reachable from the PR head.
+On a pull request it applies the base branch's `.gitleaks.toml` and
+`.gitleaksignore` and ignores inline `gitleaks:allow` comments, so a PR cannot
+allowlist its own leak. If a change legitimately needs a new allowlist entry,
+merge that entry first as a small, separately reviewed PR; the next scan honours
+it. Push-to-main scans use the repo's own files. Run
+`GITLEAKS_BIN=<path> .github/scripts/test-gitleaks-scan.sh` to repeat the offline
+self-test the `gitleaks` job runs. The scanner archive is pinned by SHA-256 in
+`supply-chain.yml`; bump `GITLEAKS_SHA256` from the release's
+`gitleaks_<version>_checksums.txt` together with `GITLEAKS_VERSION`.
