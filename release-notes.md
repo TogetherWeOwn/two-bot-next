@@ -17,6 +17,7 @@
 - Update the root release manifest, seven package versions and local dependency pins, Cargo.lock, and CHANGELOG.md through release-please.
 - Synchronize both excluded fuzz path requirements and the testsupport dependency example to 0.3.0. Register native generic extra-file updates so later releases synchronize them too.
 - Extend the offline native lifecycle fixture with both excluded consumers, three drift controls, all six fuzz targets, and unchanged external fuzz dependencies. Update the release documentation.
+- Route CONTRIBUTING.md-only edits to Worker CI because the release lifecycle reads its testsupport example; pin the selector and retain the README-only fast pass.
 - Keep all seven PR sections before the native notes delimiter. Preserve the generated notes region and native overflow link.
 - Credit release-please automation and the repository contributors whose changes appear below.
 
@@ -27,7 +28,9 @@
 - `python3 scripts/test-release-retry.py`: PASS, 28 tests. `python3 scripts/test-pr-lint.py`: PASS, 27 tests.
 - `python3 scripts/test-docker-deps.py`: PASS, seven package targets; Cargo compilation was not run. `git diff --check`: PASS.
 - Compilation-free offline Cargo resolver fixtures using the actual local dependency names, versions and requirements: all three failed before the fix (exit 101), compatible controls passed, and all three pass after the fix. The fuzz consumer fixtures retain six targets.
-- Repair head `13bc96ba5af9b2557d7e1b2f7dd37d45a07283e0` supersedes the reviewed head. New exact-head CI and independent approval are pending; older approvals or green heads do not satisfy the merge gate.
+- `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_job_inputs.py' -v`: PASS, 58 tests. The new contributor-example selector regression failed before the fix and passes after it. `test_container_inputs.py`: PASS, 26 tests.
+- Isolated native lifecycle controls: unchanged and restored CONTRIBUTING.md pass; removing only its version marker fails with `Unsynchronized testsupport dependency example`. A contributor-only change now selects worker=true and rust/supply/parity=false; README-only still selects no heavy job.
+- Repair head `50665888` supersedes the reviewed head. New exact-head CI and independent approval are pending; older approvals or green heads do not satisfy the merge gate.
 - No local Rust compilation, full fuzz campaign, staging E2E, production tests or deployment ran. Canonical-note preservation is verified separately against the previous stored body; publication remains unverified until merge.
 
 ## Risks
