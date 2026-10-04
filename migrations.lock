@@ -249,6 +249,10 @@
       "sha256": "9dfe6648848bc7d42ba7534b710eab36473ac57ad5c4eee26d88d3f453d60b2f",
       "justification": "Voice V2 ownership handoff stamp so the rollback delta keeps measuring rooms whose owner_id changes in place."
     },
+    "crates/cutover/migrations/0413_voice_create_reservations.sql": {
+      "sha256": "005e1fd35c23972faf06a992394dfc8f580dd73600069410eb08162962cdbb9e",
+      "justification": "Durable voice room-create admission: one reservation row per accepted create, so burst and cooldown history survives room deletion and restarts."
+    },
     "crates/store/migrations/0400_initial.sql": {
       "sha256": "49c7136827484e0625cad889208a03e48026acb854282de3a0a9c5aa4d951b00",
       "justification": "Add unpublished S6 funnel foundation for TOG-9811 under an unused workspace number; preserve proposed SQL bytes."

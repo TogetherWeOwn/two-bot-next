@@ -103,10 +103,11 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0410_member_erasure_audit | up | member_erasure_audit | backout-script | Unguarded `CREATE TABLE` fails on re-apply; backout drops the table (erasure evidence, export before dropping). |
 | 0411_invite_campaigns | up | invite_campaigns | re-runnable | Drop the table; campaigns are re-creatable. |
 | 0412_voice_rooms_ownership_touched | up | voice_rooms | re-runnable | Drop column `owner_touched_at`; ownership handoffs lose their timestamp. |
+| 0413_voice_create_reservations | up | voice_create_reservations | re-runnable | Drop the table; room creates lose their rolling burst and cooldown history (in-flight creates stop holding cap slots). |
 
 ## Notes
 
-- Voice rows (0224-0229, 0412) are listed here for completeness; their runtime
+- Voice rows (0224-0229, 0412, 0413) are listed here for completeness; their runtime
   rollback disposition belongs to the voice rollback card, not this ledger.
 - Unguarded DDL (`CREATE TABLE` / `ADD COLUMN` without `IF NOT EXISTS`) is
   classed `backout-script` even when the change is additive, because a

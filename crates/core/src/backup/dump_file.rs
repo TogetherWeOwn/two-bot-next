@@ -113,6 +113,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "invite_campaigns",
     "voice_creators",
     "voice_rooms",
+    "voice_create_reservations",
     "voice_text_companions",
     "voice_access_controls",
     "voice_logging_settings",

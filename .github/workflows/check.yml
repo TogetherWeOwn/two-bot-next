@@ -521,6 +521,12 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-cutover --test voice_config_store --locked -- --ignored
 
+      - name: Voice create admission store (isolated DBs, CI service only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-cutover --test voice_create_admission_store --locked -- --ignored
+
       - name: Docker dependency-layer manifests (offline)
         if: needs.job-inputs.outputs.rust != 'false'
         run: python3 scripts/check-docker-manifests.py

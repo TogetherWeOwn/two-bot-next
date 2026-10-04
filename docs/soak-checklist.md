@@ -1468,11 +1468,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-e2ffdf0: e2ffdf0 — feat(tempvoice): enforce durable rolling create burst limits (#308)
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Create rooms past the configured rolling burst limit with disposable members, across the TOG-10119 restart.
-- **Expected:** Creates beyond the limit are refused with a named reason, and the count survives restart.
-- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the pure admission fixture `crates/core/tests/voice_create_admission.rs`, the worker admission regressions in `crates/bot/src/voice_rooms_tests.rs` and the disposable-database store test `crates/cutover/tests/voice_create_admission_store.rs` (set `TWO_TEST_DATABASE_URL` to the agent-testdb CI service; it creates and drops its own database).
+- **Expected:** Accepted creates persist one row each; a refused create records its stable code and legacy message and never reaches Discord; the burst count survives a store restart, a deleted room frees no burst slot, and concurrent claims cannot both pass the guild cap. Fixture proof only, not staging acceptance.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with the test names; fixture proof only. Staging proof (refused creates past the limit across the TOG-10119 restart) stays on [TOG-10119](/TOG/issues/TOG-10119); do not infer PASS from this row.
 - **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_create_admission && python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- admission_claims_before_discord admission_refusal_records admission_store_failure a_429_requeue_keeps a_create_that_ends_without && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test voice_create_admission_store -- --ignored
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-3c3e7e8: 3c3e7e8 — fix(voice): treat malformed leave timestamp as unknown-start (#265)
