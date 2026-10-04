@@ -519,8 +519,8 @@ mod tests {
         );
         assert_eq!(diff.unchanged, ["same"]);
         // Validation refusals (`rank` builtin, `BAD NAME` shape) come first;
-        // then planning refusals in document order: `new` wants a trigger
-        // another row owns, and `faq` needs overwrite.
+        // then planning refusals in document order: `faq` needs overwrite,
+        // and `new` wants a trigger another row owns.
         assert_eq!(
             diff.rejected
                 .iter()
@@ -529,8 +529,8 @@ mod tests {
             [
                 ("rank", "reserved_name"),
                 ("BAD NAME", "invalid_name"),
-                ("new", "trigger_in_use"),
                 ("faq", "would_overwrite"),
+                ("new", "trigger_in_use"),
             ]
         );
         let forced = diff_import(&existing, &parsed, &builtins(), true).expect("diff plans");
