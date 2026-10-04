@@ -191,6 +191,11 @@
       "predicate": "guild_id = $1 AND (opener_id = $2 OR claimed_by = $2)"
     },
     {
+      "table": "voice_room_blocks",
+      "columns": ["blocked_member_id"],
+      "predicate": "guild_id = $1 AND blocked_member_id = $2"
+    },
+    {
       "table": "voice_rooms",
       "columns": ["owner_id", "original_creator_id"],
       "predicate": "guild_id = $1 AND (owner_id = $2 OR original_creator_id = $2)"

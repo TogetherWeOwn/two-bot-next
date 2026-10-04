@@ -95,6 +95,7 @@ impl TestDb {
             include_str!("../migrations/0224_voice_rooms.sql"),
             include_str!("../migrations/0330_guild_settings.sql"),
             include_str!("../migrations/0412_voice_rooms_ownership_touched.sql"),
+            include_str!("../migrations/0414_voice_room_privacy.sql"),
         ] {
             sqlx::raw_sql(migration).execute(&pool).await?;
         }
@@ -111,7 +112,9 @@ impl TestDb {
     /// while `m-after` joins before `T_f` but is active after it. The
     /// `voice_rooms` pair proves the same for the V2 ownership handoff stamp:
     /// `room-before` is created and last touched before `T_f`, while
-    /// `room-handoff` is created before `T_f` but handed off after it.
+    /// `room-handoff` is created before `T_f` but handed off after it and
+    /// `room-private` is created before `T_f` but made private after it (the
+    /// V3 privacy stamp, which `NULL` leaves out of the GREATEST).
     async fn seed(pool: &Pool<Postgres>) -> TestResult {
         sqlx::raw_sql(
             "INSERT INTO events (event_type, member_id, guild_id, occurred_at, recorded_at, source, idempotency_key) VALUES
@@ -129,9 +132,10 @@ impl TestDb {
              ('t-after', 'g', 'ch-after', 'o2', 'open', '2026-10-01T12:00:00Z');
              INSERT INTO guild_settings (guild_id, key, value, version, updated_by) VALUES
              ('g', 'ROLLBACK_DELTA_PROBE', '\"probe\"', 1, 'test');
-             INSERT INTO voice_rooms (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at, owner_touched_at) VALUES
-             ('g', 'room-before', 'creator-1', 'owner-1', 'owner-1', '7', '2026-09-29T12:00:00Z', '2026-09-29T12:00:00Z'),
-             ('g', 'room-handoff', 'creator-1', 'owner-2', 'owner-1', '8', '2026-09-29T12:00:00Z', '2026-10-01T12:00:00Z');",
+             INSERT INTO voice_rooms (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at, owner_touched_at, privacy_touched_at) VALUES
+             ('g', 'room-before', 'creator-1', 'owner-1', 'owner-1', '7', '2026-09-29T12:00:00Z', '2026-09-29T12:00:00Z', NULL),
+             ('g', 'room-handoff', 'creator-1', 'owner-2', 'owner-1', '8', '2026-09-29T12:00:00Z', '2026-10-01T12:00:00Z', NULL),
+             ('g', 'room-private', 'creator-1', 'owner-1', 'owner-1', '9', '2026-09-29T12:00:00Z', '2026-09-29T12:00:00Z', '2026-10-01T12:00:00Z');",
         )
         .execute(pool)
         .await?;
@@ -173,7 +177,7 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
         // Exact post-T_f counts on both storage shapes: timestamptz
         // (events, member_levels, guild_settings), multi-column GREATEST
         // (members: only the row active after T_f; voice_rooms: only the
-        // room handed off after T_f), ISO-8601 TEXT (tickets).
+        // rooms handed off or made private after T_f), ISO-8601 TEXT (tickets).
         assert_eq!(
             count_of(&summary, "events"),
             Some(("measured".to_owned(), Some(1)))
@@ -194,11 +198,12 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
             count_of(&summary, "guild_settings"),
             Some(("measured".to_owned(), Some(1)))
         );
-        // Only the room handed off after T_f counts: the room created and
-        // last touched before T_f stays out via the GREATEST projection.
+        // Only the rooms handed off or made private after T_f count: the room
+        // created and last touched before T_f stays out via the GREATEST
+        // projection.
         assert_eq!(
             count_of(&summary, "voice_rooms"),
-            Some(("measured".to_owned(), Some(1)))
+            Some(("measured".to_owned(), Some(2)))
         );
         // Unmeasurable tables carry a reason, never a silent skip.
         for table in [
@@ -274,15 +279,15 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
         tx.rollback().await?;
 
         // Export emits one NDJSON line per post-T_f row:
-        // 1 + 1 + 2 + 1 + 1 + 1 (voice_rooms handoff).
+        // 1 + 1 + 2 + 1 + 1 + 2 (voice_rooms handoff and privacy).
         let mut lines = Vec::new();
         let exported = export_delta(&db.pool, SINCE, &mut |line: String| {
             lines.push(line);
             Ok::<(), std::io::Error>(())
         })
         .await?;
-        assert_eq!(exported, 7);
-        assert_eq!(lines.len(), 7);
+        assert_eq!(exported, 8);
+        assert_eq!(lines.len(), 8);
         for line in &lines {
             let value: serde_json::Value = serde_json::from_str(line)?;
             assert!(value.get("table").and_then(|t| t.as_str()).is_some());

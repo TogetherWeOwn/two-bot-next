@@ -1,10 +1,11 @@
 //! Fixed test-container target: never read DATABASE_URL or use staging credentials.
 
 use sqlx::{postgres::PgConnectOptions, postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use two_bot_core::voice_access::AccessControls;
 use two_bot_core::voice_logging::{DetailLevel, LoggingSettings};
+use two_bot_core::voice_private::PrivacyRecord;
 use two_bot_core::voice_rooms::{
     CreatorChannel, PermissionSource, RoomPosition, TextCompanion, VoiceRoom,
 };
@@ -231,8 +232,122 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
             .await
             .is_err()
     );
+    verify_privacy(&store, pool).await?;
     verify_access_controls(&store, pool).await?;
     verify_logging_settings(&store, pool).await
+}
+
+/// V3 privacy persistence (0414): the private flag, the Join channel and the
+/// per-room block list round-trip, survive privacy toggles, are bounded by the
+/// schema, and go with the room row.
+async fn verify_privacy(store: &PgRoomStore, pool: &PgPool) -> TestResult {
+    let room = VoiceRoom {
+        guild_id: 100,
+        channel_id: 510,
+        creator_channel_id: 200,
+        owner_id: 310,
+        original_creator_id: 310,
+        name_seed: 1,
+        created_at: "2026-09-30T02:00:00.000Z".to_owned(),
+    };
+    assert!(store.add_room(&room).await?);
+    // A new room is public with no Join channel and no blocks, so it has no
+    // record at all.
+    assert!(store.privacy_in_guild(100).await?.is_empty());
+    let stamp = "SELECT privacy_touched_at IS NOT NULL FROM voice_rooms WHERE guild_id = '100' AND channel_id = '510'";
+    assert!(!sqlx::query_scalar::<_, bool>(stamp).fetch_one(pool).await?);
+
+    let private = PrivacyRecord {
+        private: true,
+        join_channel_id: Some(700),
+        blocked: BTreeSet::from([900, u64::MAX]),
+    };
+    assert!(store.save_privacy(100, 510, &private).await?);
+    assert_eq!(
+        store.privacy_in_guild(100).await?,
+        BTreeMap::from([(510, private.clone())])
+    );
+    assert!(sqlx::query_scalar::<_, bool>(stamp).fetch_one(pool).await?);
+    // The same record again changes nothing.
+    assert!(store.save_privacy(100, 510, &private).await?);
+    assert_eq!(store.privacy_in_guild(100).await?[&510], private);
+
+    // The block list is replaced to match: 900 leaves, 901 joins.
+    let edited = PrivacyRecord {
+        blocked: BTreeSet::from([901, u64::MAX]),
+        ..private.clone()
+    };
+    assert!(store.save_privacy(100, 510, &edited).await?);
+    assert_eq!(store.privacy_in_guild(100).await?[&510], edited);
+
+    // `/public` clears the flag and the Join channel; the block list stays.
+    let public = PrivacyRecord {
+        private: false,
+        join_channel_id: None,
+        blocked: edited.blocked.clone(),
+    };
+    assert!(store.save_privacy(100, 510, &public).await?);
+    assert_eq!(store.privacy_in_guild(100).await?[&510], public);
+    // Another guild never sees it.
+    assert!(store.privacy_in_guild(101).await?.is_empty());
+
+    // A record never outlives its room: an untracked room writes nothing.
+    assert!(!store.save_privacy(100, 599, &private).await?);
+    let orphans: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM voice_room_blocks WHERE room_channel_id = '599'")
+            .fetch_one(pool)
+            .await?;
+    assert_eq!(orphans, 0);
+
+    // The schema refuses a Join channel on a public room and bad ids.
+    assert!(sqlx::query(
+        "UPDATE voice_rooms SET private = FALSE, join_channel_id = '700'
+         WHERE guild_id = '100' AND channel_id = '510'"
+    )
+    .execute(pool)
+    .await
+    .is_err());
+    for bad in ["0", "abc", "-5"] {
+        assert!(
+            sqlx::query(
+                "UPDATE voice_rooms SET private = TRUE, join_channel_id = $1
+                 WHERE guild_id = '100' AND channel_id = '510'"
+            )
+            .bind(bad)
+            .execute(pool)
+            .await
+            .is_err(),
+            "join_channel_id {bad:?} must be refused"
+        );
+    }
+    assert!(sqlx::query(
+        "INSERT INTO voice_room_blocks (guild_id, room_channel_id, blocked_member_id)
+         VALUES ('100', '510', '0')"
+    )
+    .execute(pool)
+    .await
+    .is_err());
+    assert!(
+        sqlx::query(
+            "INSERT INTO voice_room_blocks (guild_id, room_channel_id, blocked_member_id)
+             VALUES ('100', '598', '902')"
+        )
+        .execute(pool)
+        .await
+        .is_err(),
+        "a block row needs its room"
+    );
+
+    // The block list dies with the room, not with a privacy toggle.
+    assert_eq!(store.remove_room(100, 510).await?, Some(room));
+    let blocks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM voice_room_blocks WHERE guild_id = '100' AND room_channel_id = '510'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(blocks, 0);
+    assert!(store.privacy_in_guild(100).await?.is_empty());
+    Ok(())
 }
 
 async fn verify_access_controls(store: &PgRoomStore, pool: &PgPool) -> TestResult {

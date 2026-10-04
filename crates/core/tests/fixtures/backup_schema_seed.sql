@@ -397,6 +397,15 @@ VALUES ('100000000000000001', '100000000000000033', '100000000000000030',
         '2026-08-01T10:00:00.123456Z'),
        ('100000000000000001', '100000000000000034', '100000000000000035',
         '100000000000000003', '100000000000000002', '7', '2026-08-02T10:00:00Z');
+-- V3 privacy (0414): the second room is private with a Join channel and one
+-- blocked member; the first stays public with an empty block list.
+UPDATE voice_rooms
+SET private = TRUE, join_channel_id = '100000000000000038',
+    privacy_touched_at = '2026-08-03T10:00:00Z'
+WHERE guild_id = '100000000000000001' AND channel_id = '100000000000000034';
+INSERT INTO voice_room_blocks (guild_id, room_channel_id, blocked_member_id, created_at)
+VALUES ('100000000000000001', '100000000000000034', '100000000000000004',
+        '2026-08-03T10:05:00Z');
 -- Companion text channels carry the creation-time settings snapshot; one
 -- default-named, one custom-named with an @everyone viewer role.
 INSERT INTO voice_text_companions (guild_id, room_channel_id, text_channel_id,

@@ -48,7 +48,7 @@ const NEEDS_MANAGE_ROLES: &str = "I can't change who can join this room: I need 
                                   permission on it. Ask an admin to check my permissions.";
 
 /// Rewriting the overwrite needs View Channel and Manage Roles on the room.
-fn can_edit_overwrites(permissions: Option<Permissions>) -> bool {
+pub(super) fn can_edit_overwrites(permissions: Option<Permissions>) -> bool {
     permissions.is_some_and(|permissions| {
         permissions.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES)
     })
@@ -68,7 +68,7 @@ fn bot_room_access() -> Permissions {
 /// on @everyone is carried over, because the write replaces the whole entry.
 /// View Channel is never touched. Manage Roles is dropped from the allow list
 /// so this write never emits it.
-fn everyone_connect_overwrite(
+pub(super) fn everyone_connect_overwrite(
     guild_id: Snowflake,
     current: &[PermissionOverwrite],
     deny_connect: bool,
@@ -96,7 +96,7 @@ fn everyone_connect_overwrite(
 }
 
 /// `current` with `overwrite` replacing the entry for the same target.
-fn with_overwrite(
+pub(super) fn with_overwrite(
     current: &[PermissionOverwrite],
     overwrite: &PermissionOverwrite,
 ) -> Vec<PermissionOverwrite> {
@@ -116,7 +116,7 @@ fn with_overwrite(
 /// `Ok(None)` means no grant is needed; `AccessDenied` means even a grant
 /// cannot restore access (the bot's own entry denies it), so nothing is
 /// written. Manage Roles is never granted.
-fn bot_access_grant(
+pub(super) fn bot_access_grant(
     guild_id: Snowflake,
     bot: &BotAccess,
     planned: &[PermissionOverwrite],
