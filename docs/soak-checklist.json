@@ -2667,7 +2667,7 @@
           "[6928f11](https://github.com/TogetherWeOwn/two-bot/commit/6928f113e3bff2b1396408f50cea60266fbd29d4)",
           "`src/core/`, `src/store/`",
           "TOG-6817: guard so backfill gate_cleared never feeds time-to-clear",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -2709,11 +2709,11 @@
           "[3f513ed](https://github.com/TogetherWeOwn/two-bot/commit/3f513ed3d8d5238c21f927a8664c194af266540b)",
           "`src/automod/`, `src/backfill/`",
           "test(qa): fixture-driven acceptance for roster, moderation, backfill, automod, dashboard (#218)",
-          "carded"
+          "gap"
         ]
       },
       "owner": [
-        "TOG-9882"
+        "TOG-15759"
       ],
       "status": "waived",
       "action": "Run TOG-9882’s roster, moderation, backfill, automod and dashboard acceptance fixtures on test containers.",
@@ -2794,7 +2794,7 @@
           "[860557f](https://github.com/TogetherWeOwn/two-bot/commit/860557fcfcb122717b0f84b189e57c9c0fb9c3d3)",
           "`src/backfill/`",
           "test(backfill): refuse malformed export rows without throwing (#289)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3068,7 +3068,7 @@
           "[9ee2e89](https://github.com/TogetherWeOwn/two-bot/commit/9ee2e8969e21159d8b30aea94b98ddbaecf38cbd)",
           "`src/store/`",
           "feat(backup): cover all bot-owned tables in dump and restore (#330)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3151,7 +3151,7 @@
           "[f9fbf5c](https://github.com/TogetherWeOwn/two-bot/commit/f9fbf5cd762c4af456cdab5c097d9babf82597c7)",
           "`src/redirect/`",
           "fix(redirect): refuse reserved healthz slug at campaign add time (#340)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3170,7 +3170,7 @@
           "[6433578](https://github.com/TogetherWeOwn/two-bot/commit/64335788c597b176a2d3eadacda4de1fd2ca783e)",
           "`src/redirect/`",
           "fix(redirect): validate port and fallback code at startup (#341)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3251,7 +3251,7 @@
           "[ce3c0e2](https://github.com/TogetherWeOwn/two-bot/commit/ce3c0e2a381a22c8b98b979efb4c8ff24ad3a9ae)",
           "`src/backfill/`",
           "test(backfill): extend malformed-row coverage, fix 3 probe-found bugs (#356)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3272,7 +3272,7 @@
           "[b62ff28](https://github.com/TogetherWeOwn/two-bot/commit/b62ff28f7d9f215e3dc8ab1149dbb5aaae19e7c2)",
           "`src/redirect/`",
           "fix(redirect): log slug and error class on lookup failure (#355)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3479,7 +3479,7 @@
           "[218e469](https://github.com/TogetherWeOwn/two-bot/commit/218e469ce94d4c9f423a15efc5c892ba7e842647)",
           "`src/store/`",
           "fix(dump): validate non-table record shapes before declaring a backup verified (#416)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [

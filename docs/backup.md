@@ -52,29 +52,36 @@ selectors ignore it.
 ### Coverage and recovery semantics (v4, TOG-11142)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
-inventory for both dump and restore. It includes **65 durable tables from the
+inventory for both dump and restore. It includes **80 durable tables from the
 current cutover migrations**, including the bot-owned website-contract backing
 tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchanges`) plus their uncertainty baselines
 (`self_role_exchange_baselines`), the automod delivery claims, the gateway
-boot directives, the member-erasure audit and the internal clock high-water
-mark, plus **3 optional retired legacy tables**. A dump from a fresh Rust
-schema has 65 table entries; a compatible legacy-extended schema may have up to
-68. A missing current table refuses a dump/restore: migrate the target first.
+boot directives, the member-erasure audit, the internal clock high-water
+mark and the voice configuration tables. `OPTIONAL_LEGACY_TABLES` is empty: the
+coverage test fails if a covered table is not migrated. A dump from a fresh Rust
+schema has 80 table entries. A missing current table refuses a dump/restore:
+migrate the target first.
 A v4 archive written before a table joined the inventory is refused at inspect
 ("manifest is missing tables"); take a fresh dump after upgrading.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.
 
-The only application exclusion is `xp_cooldowns` (short-lived award throttles);
-restore clears target cooldowns. Migration ledgers (`_sqlx_migrations` and
+Three application tables are excluded, each with its reason inline in
+`EXCLUDED_TABLES`: `xp_cooldowns` (short-lived award throttles; restore clears
+target cooldowns), `discord_send_admission` (per-credential lane state that a
+recovered process re-learns) and `gateway_onboarding_jobs` (a restart-recovery
+queue bound to a gateway session). Migration ledgers (`_sqlx_migrations` and
 `schema_migrations`) describe target DDL and are never restored. Replay guards,
 idempotency records, gateway sessions, lease-bearing durable tables and audit
 history are **not** ephemeral exclusions. Derived `web_v1` views contain no
 independent table data; the website service's own separate database is out of
 scope. The migration-backed coverage test compares real tables against these
-classifications, so adding an unclassified table fails CI.
+classifications, so adding an unclassified table to the cutover chain fails CI.
+That test migrates only `crates/cutover/migrations`: the store chain's
+`rollback_journal` and `rollback_watermarks` tables and its `_two_bot_migrations`
+ledger are not yet classified or dumped (known hole, tracked as TOG-15760).
 
 v3 must contain its original 22 table entries. It can lack later tables, but
 restore clears their old target rows and emits a warning in both dry-run and

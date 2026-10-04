@@ -1364,7 +1364,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Action:** Run TOG-9882’s roster, moderation, backfill, automod and dashboard acceptance fixtures on test containers.
 - **Expected:** Each fixture contract passes; the automod export runs on demand only, not as a scheduled job.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
-- **Owner:** [TOG-9882](/TOG/issues/TOG-9882)
+- **Owner:** [TOG-15759](/TOG/issues/TOG-15759)
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
