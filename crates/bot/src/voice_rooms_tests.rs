@@ -305,6 +305,12 @@ impl RoomPersistence for Store {
 /// Scripted `/import` download queue shared with the harness.
 type DownloadResults = Arc<Mutex<VecDeque<Result<Vec<u8>, RoomHttpError>>>>;
 
+#[derive(Default)]
+struct OverwriteGate {
+    sent: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
 struct Http {
     trace: Trace,
     next_id: Mutex<u64>,
@@ -321,6 +327,7 @@ struct Http {
     after_create: Option<Hook>,
     before_move: Option<Hook>,
     before_delete: Option<Hook>,
+    overwrites_gate: Option<Arc<OverwriteGate>>,
     downloaded_urls: Mutex<Vec<String>>,
     download_results: DownloadResults,
 }
@@ -343,6 +350,7 @@ impl Http {
             after_create: None,
             before_move: None,
             before_delete: None,
+            overwrites_gate: None,
             downloaded_urls: Mutex::new(Vec::new()),
             download_results: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -399,6 +407,10 @@ impl RoomWrites for Http {
         }
         let mut updated = channel(channel_id, 2, Some(CATEGORY));
         updated.permission_overwrites = Some(overwrites.to_vec());
+        if let Some(gate) = &self.overwrites_gate {
+            gate.sent.notify_one();
+            gate.release.notified().await;
+        }
         Ok(updated)
     }
     async fn move_member(
@@ -1076,6 +1088,73 @@ async fn transfer_rewrites_only_this_rooms_owner_grants_before_persistence() {
         *trace.lock().unwrap(),
         ["overwrites:500", "update_ownership:500:301"]
     );
+}
+
+#[tokio::test]
+async fn late_owner_overwrite_response_never_replaces_newer_gateway_evidence() {
+    for event in ["update", "delete", "reconnect"] {
+        let (live, store, mut http, _) = owned_room();
+        let mut original = channel(500, 2, Some(CATEGORY));
+        original.permission_overwrites = Some(vec![owner_overwrite(MEMBER)]);
+        live.upsert_channel(original.clone());
+        let gate = Arc::new(OverwriteGate::default());
+        http.overwrites_gate = Some(gate.clone());
+        let mut worker = GuildRoomWorker::load(live.clone(), store, http)
+            .await
+            .unwrap();
+        let deny = PermissionOverwrite {
+            id: Id::new(777),
+            kind: PermissionOverwriteType::Member,
+            allow: Permissions::empty(),
+            deny: Permissions::CONNECT,
+        };
+        let mutation = async {
+            gate.sent.notified().await;
+            match event {
+                "update" => {
+                    let mut newer = original.clone();
+                    newer.permission_overwrites.as_mut().unwrap().push(deny);
+                    newer.name = Some("newer gateway name".to_owned());
+                    live.upsert_channel(newer);
+                }
+                "delete" => live.remove_channel(500),
+                "reconnect" => {
+                    live.disconnect();
+                    let mut refreshed = snapshot(&[500], vec![]);
+                    *refreshed
+                        .channels
+                        .iter_mut()
+                        .find(|c| c.id.get() == 500)
+                        .unwrap() = original.clone();
+                    live.publish(refreshed);
+                }
+                _ => unreachable!(),
+            }
+            gate.release.notify_one();
+        };
+        let (result, ()) = tokio::join!(worker.rewrite_owner_grant(500, MEMBER, 301), mutation);
+        assert_eq!(result, Err(RoomHttpError::Cancelled), "{event}");
+        worker.http.overwrites_gate = None;
+        if event == "delete" {
+            assert!(!live.inner.read().unwrap().channels.contains_key(&500));
+            assert_eq!(
+                worker.rewrite_owner_grant(500, MEMBER, 301).await,
+                Err(RoomHttpError::NotFound)
+            );
+        } else if event == "reconnect" {
+            assert_eq!(live.inner.read().unwrap().channels[&500], original);
+        } else {
+            worker.rewrite_owner_grant(500, MEMBER, 301).await.unwrap();
+            let state = live.inner.read().unwrap();
+            let newer = &state.channels[&500];
+            assert_eq!(newer.name.as_deref(), Some("newer gateway name"));
+            assert!(newer
+                .permission_overwrites
+                .as_ref()
+                .unwrap()
+                .contains(&deny));
+        }
+    }
 }
 
 #[tokio::test]

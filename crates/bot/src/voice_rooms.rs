@@ -668,7 +668,9 @@ struct LiveState {
     ready: bool,
     generation: u64,
     next_transition: u64,
+    next_channel_revision: u64,
     channels: HashMap<Snowflake, Channel>,
+    channel_revisions: HashMap<Snowflake, u64>,
     members: HashMap<Snowflake, MemberState>,
     bot: Option<BotAccess>,
 }
@@ -780,6 +782,7 @@ impl LiveGuild {
             .into_iter()
             .map(|channel| (channel.id.get(), channel))
             .collect();
+        live.channel_revisions = live.channels.keys().map(|id| (*id, 0)).collect();
         // One shared stamp: bootstrap order is unknown, so tenure ties
         // break by member id until transitions establish real seniority.
         // A snapshot rebuild resets tenure — tenure is continuous tracked
@@ -938,20 +941,39 @@ impl LiveGuild {
 
     pub fn upsert_channel(&self, channel: Channel) {
         if channel.guild_id.map(Id::get) == Some(self.guild_id) {
-            self.inner
-                .write()
-                .expect("live voice lock")
-                .channels
-                .insert(channel.id.get(), channel);
+            let mut live = self.inner.write().expect("live voice lock");
+            live.next_channel_revision += 1;
+            let revision = live.next_channel_revision;
+            live.channel_revisions.insert(channel.id.get(), revision);
+            live.channels.insert(channel.id.get(), channel);
         }
     }
 
     pub fn remove_channel(&self, channel: Snowflake) {
-        self.inner
-            .write()
-            .expect("live voice lock")
-            .channels
-            .remove(&channel);
+        let mut live = self.inner.write().expect("live voice lock");
+        live.channel_revisions.remove(&channel);
+        live.channels.remove(&channel);
+    }
+
+    /// REST completion must never roll back gateway evidence or resurrect a
+    /// deleted channel, even after an identical-looking reconnect snapshot.
+    fn publish_owner_overwrites(&self, channel: Channel, generation: u64, revision: u64) -> bool {
+        let mut live = self.inner.write().expect("live voice lock");
+        let id = channel.id.get();
+        if !live.ready
+            || live.generation != generation
+            || live.channel_revisions.get(&id) != Some(&revision)
+        {
+            return false;
+        }
+        let Some(current) = live.channels.get_mut(&id) else {
+            return false;
+        };
+        current.permission_overwrites = channel.permission_overwrites;
+        live.next_channel_revision += 1;
+        let revision = live.next_channel_revision;
+        live.channel_revisions.insert(id, revision);
+        true
     }
 
     fn join_guard(&self, ticket: JoinTicket) -> WriteGuard {
@@ -1691,8 +1713,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         previous_owner_id: Snowflake,
         owner_id: Snowflake,
     ) -> Result<(), RoomHttpError> {
-        let (overwrites, changed, expected_overwrites) = {
+        let (overwrites, changed, expected_overwrites, generation, revision) = {
             let live = self.live.inner.read().expect("live voice lock");
+            if !live.ready {
+                return Err(RoomHttpError::Cancelled);
+            }
+            let revision = *live
+                .channel_revisions
+                .get(&channel_id)
+                .ok_or(RoomHttpError::Cancelled)?;
             let channel = live
                 .channels
                 .get(&channel_id)
@@ -1741,7 +1770,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 });
             }
             let changed = overwrites != current;
-            (overwrites, changed, current.to_vec())
+            (
+                overwrites,
+                changed,
+                current.to_vec(),
+                live.generation,
+                revision,
+            )
         };
         if !changed {
             return Ok(());
@@ -1750,6 +1785,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let guard: WriteGuard = Arc::new(move || {
             let state = live.inner.read().expect("live voice lock");
             state.ready
+                && state.generation == generation
+                && state.channel_revisions.get(&channel_id) == Some(&revision)
                 && state.channels.get(&channel_id).is_some_and(|channel| {
                     channel.permission_overwrites.as_deref() == Some(expected_overwrites.as_slice())
                 })
@@ -1768,7 +1805,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         {
             return Err(RoomHttpError::UnknownOutcome);
         }
-        self.live.upsert_channel(channel);
+        if !self
+            .live
+            .publish_owner_overwrites(channel, generation, revision)
+        {
+            return Err(RoomHttpError::Cancelled);
+        }
         Ok(())
     }
 
