@@ -79,7 +79,7 @@ pub(super) fn everyone_connect_overwrite(
             overwrite.kind == PermissionOverwriteType::Role && overwrite.id.get() == guild_id
         })
         .map(|overwrite| (overwrite.allow, overwrite.deny))
-        .unwrap_or_default();
+        .unwrap_or((Permissions::empty(), Permissions::empty()));
     allow.remove(Permissions::MANAGE_ROLES);
     if deny_connect {
         allow.remove(Permissions::CONNECT);
@@ -142,7 +142,7 @@ pub(super) fn bot_access_grant(
             overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == bot.member_id
         })
         .map(|overwrite| (overwrite.allow, overwrite.deny))
-        .unwrap_or_default();
+        .unwrap_or((Permissions::empty(), Permissions::empty()));
     let grant = PermissionOverwrite {
         allow: (allow | missing) & !Permissions::MANAGE_ROLES,
         deny,
