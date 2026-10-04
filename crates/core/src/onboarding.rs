@@ -1668,6 +1668,80 @@ mod tests {
         assert!(text.contains(INTRO_CHANNEL_ID));
     }
 
+    #[test]
+    fn welcome_copy_is_byte_identical_to_the_pure_renderers() {
+        // Goodbye already pins byte-identity; session/anchor/legacy welcome
+        // had substring tests only. Pin the exact bytes so a copy drift (or
+        // a wiring change that renders a different string) fails loudly.
+        let legacy = legacy_welcome_text(MEMBER);
+        assert_eq!(
+            legacy,
+            "<@900000000000007777> welcome to TWO.\n\nPick what you play below and I will open the right channels for you.\nYou can change this any time, and there is an intro thread in <#1087198966346690570> if you want one."
+        );
+        let session = session_welcome_text(MEMBER);
+        assert_eq!(
+            session,
+            "<@900000000000007777> you're in - that was the whole application.\n\nWhat do you want to do right now? Pick below and I will point you at the right room. You can change your mind any time - this picks a destination for tonight, not a label forever."
+        );
+        let far = anchor_welcome_text(MEMBER, BEFORE_RUN_1, SUNDAY_SQUAD);
+        assert_eq!(
+            far,
+            "Hey <@900000000000007777> — glad you're here.\n\nThe thing to know: **Sunday Squad**, every Sunday at 8pm Eastern in <#1175127344072118405>. We play Fall Guys for about an hour. Next one is <t:1787529600:R>.\n\nYou don't need to sign up or say anything first — just join the voice room and I'll get you into the party. Haven't got Fall Guys? Come anyway, there's something we can play right there in the room. If you can't make Sunday, hop in whenever and see who's about."
+        );
+        let near = anchor_welcome_text(MEMBER, RUN_1 - 1200, SUNDAY_SQUAD);
+        assert_eq!(
+            near,
+            "Hey <@900000000000007777> — glad you're here.\n\nThe thing to know: **Sunday Squad** is happening right now in <#1175127344072118405> — Fall Guys, for about another hour. Come say hi. You don't need it installed to join in.\n\nYou don't need to sign up or say anything first — just join the voice room and I'll get you into the party. Haven't got Fall Guys? Come anyway, there's something we can play right there in the room. If you can't make Sunday, hop in whenever and see who's about."
+        );
+    }
+
+    #[test]
+    fn welcome_effects_post_the_renderer_bytes_unchanged() {
+        // The adjudicated Post content is the renderer output verbatim —
+        // no wrapper, no footer, no truncation.
+        match adjudicate_welcome(
+            OnboardingMode::Legacy,
+            MEMBER,
+            Some("111"),
+            ANCHOR_CHANNEL_ID,
+            BEFORE_RUN_1,
+            SUNDAY_SQUAD,
+            false,
+        ) {
+            WelcomeEffect::Post { content, .. } => assert_eq!(content, legacy_welcome_text(MEMBER)),
+            WelcomeEffect::Skip { .. } => panic!("legacy with a channel posts"),
+        }
+        match adjudicate_welcome(
+            OnboardingMode::Session,
+            MEMBER,
+            Some("222"),
+            ANCHOR_CHANNEL_ID,
+            BEFORE_RUN_1,
+            SUNDAY_SQUAD,
+            false,
+        ) {
+            WelcomeEffect::Post { content, .. } => {
+                assert_eq!(content, session_welcome_text(MEMBER))
+            }
+            WelcomeEffect::Skip { .. } => panic!("session with a channel posts"),
+        }
+        match adjudicate_welcome(
+            OnboardingMode::Anchor,
+            MEMBER,
+            None,
+            ANCHOR_CHANNEL_ID,
+            BEFORE_RUN_1,
+            SUNDAY_SQUAD,
+            false,
+        ) {
+            WelcomeEffect::Post { content, .. } => assert_eq!(
+                content,
+                anchor_welcome_text(MEMBER, BEFORE_RUN_1, SUNDAY_SQUAD)
+            ),
+            WelcomeEffect::Skip { .. } => panic!("anchor always posts"),
+        }
+    }
+
     // --- session picker -------------------------------------------------------------------
 
     #[test]

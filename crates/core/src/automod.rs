@@ -823,11 +823,14 @@ impl AutomodConfig {
 }
 
 /// One validated export rule: `id` + `name` are required, everything else
-/// passes through (legacy `AutomodExportRule`).
+/// passes through (legacy `AutomodExportRule`, whose index signature keeps
+/// every extra field). `raw` is the rule object unchanged, so a validated
+/// export written back out is byte-faithful to what Discord returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutomodExportRule {
     pub id: String,
     pub name: String,
+    pub raw: serde_json::Value,
 }
 
 /// Unusable export payload (legacy `AutomodExportError`): every bad row, not
@@ -880,6 +883,7 @@ pub fn validate_automod_rules(
         out.push(AutomodExportRule {
             id: rule["id"].as_str().expect("checked").to_owned(),
             name: rule["name"].as_str().expect("checked").to_owned(),
+            raw: raw.clone(),
         });
     }
     if problems.is_empty() {
@@ -1370,11 +1374,57 @@ mod tests {
         let ok = serde_json::json!([{"id": "123456789012345678", "name": "spam rule"}]);
         let rules = validate_automod_rules(&ok).expect("valid");
         assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, "123456789012345678");
+        assert_eq!(rules[0].name, "spam rule");
         assert_eq!(
             validate_automod_rules(&serde_json::json!({"nope": true}))
                 .expect_err("object")
                 .problems,
             vec!["export must be an array of rules"]
         );
+    }
+
+    #[test]
+    fn export_validation_accepts_empty_and_refuses_non_arrays() {
+        // An empty guild export is usable: zero rules, no problems.
+        let rules = validate_automod_rules(&serde_json::json!([])).expect("empty is valid");
+        assert!(rules.is_empty());
+        // `null` and scalar payloads are refused, not treated as zero rules.
+        for payload in [
+            serde_json::json!(null),
+            serde_json::json!("rules"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+        ] {
+            assert_eq!(
+                validate_automod_rules(&payload)
+                    .expect_err("must fail")
+                    .problems,
+                vec!["export must be an array of rules"],
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_validation_keeps_extra_fields_and_repeats_identically() {
+        let payload = serde_json::json!([
+            {
+                "id": "123456789012345678",
+                "name": "spam rule",
+                "event_type": 1,
+                "trigger_metadata": {"keyword_filter": ["spam"]},
+                "actions": [{"type": 1}],
+            },
+            {"id": "223456789012345678", "name": "invite rule"},
+        ]);
+        let first = validate_automod_rules(&payload).expect("valid");
+        assert_eq!(first.len(), 2);
+        // The extra fields pass through: the raw rule is unchanged.
+        assert_eq!(first[0].raw, payload[0]);
+        assert_eq!(first[1].raw, payload[1]);
+        // Repeated validation is identical — the validator is a pure check.
+        let second = validate_automod_rules(&payload).expect("valid again");
+        assert_eq!(first, second);
     }
 }

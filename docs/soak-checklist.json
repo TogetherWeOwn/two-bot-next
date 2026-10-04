@@ -2709,18 +2709,17 @@
           "[3f513ed](https://github.com/TogetherWeOwn/two-bot/commit/3f513ed3d8d5238c21f927a8664c194af266540b)",
           "`src/automod/`, `src/backfill/`",
           "test(qa): fixture-driven acceptance for roster, moderation, backfill, automod, dashboard (#218)",
-          "gap"
+          "ported"
         ]
       },
       "owner": [
         "TOG-15759"
       ],
-      "status": "waived",
-      "action": "Run TOG-9882’s roster, moderation, backfill, automod and dashboard acceptance fixtures on test containers.",
-      "expected": "Each fixture contract passes; the automod export runs on demand only, not as a scheduled job.",
-      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "automated",
+      "action": "Run the message-scan accounting unit fixtures, the automod validator unit fixtures, the welcome byte-identity unit fixtures, the inactivity empty-window DB fixture and the ladder second-pass DB fixture on disposable test databases.",
+      "expected": "Rerun-identical ladders, zero-scan zeros, malformed rows counted and never laddered; empty automod export valid with null/scalar refused and validation repeat-identical with extra fields passing through; legacy/session/anchor welcome bytes and Post content byte-identical; empty-window sweep writes zero events; second write pass over the same ladder inserts zero events while an older re-scan pulls the milestone back.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the `#[ignore]` DB scenarios need the disposable agent-testdb URL and run in the `check.yml` cutover-reward-ladder lib step and the community-db inactivity step. Fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib message_scan::tests && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib message_scan_write_tests -- --ignored && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib automod::tests::export && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib welcome_copy_is_byte_identical_to_the_pure_renderers welcome_effects_post_the_renderer_bytes_unchanged && python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --lib inactivity_store"
     },
     {
       "id": "s13-b948b89",
