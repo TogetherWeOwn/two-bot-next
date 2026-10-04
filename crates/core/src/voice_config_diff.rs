@@ -31,6 +31,12 @@ const LINE_CHAR_LIMIT: usize = 200;
 /// Free-text keys (game and list names) are shown up to this many characters.
 const KEY_CHAR_LIMIT: usize = 80;
 
+/// Free-text values (new template text, aliases, choices) are shown up to
+/// this many characters each, quoted and escaped. The preview reply sends
+/// with mentions disabled, so `@everyone` or `<@123>` in uploaded text
+/// cannot ping.
+const VALUE_CHAR_LIMIT: usize = 80;
+
 /// One keyed entry present on both sides with a different value. `fields`
 /// names the differing fields in declaration order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,8 +215,11 @@ pub fn diff_content_hash(current: &VoiceConfiguration, candidate: &VoiceConfigur
 /// for the lines left out. The body never exceeds [`PREVIEW_CHAR_LIMIT`]
 /// characters. An empty diff renders `No changes`.
 ///
-/// Free-text keys are quoted and escaped, but the text is not Markdown-escaped;
-/// send it with mentions disabled.
+/// Added and changed lines also show the new template text (bounded, quoted
+/// and escaped) after a `→` separator, so the admin confirms the text they
+/// will get instead of field names alone. Free-text keys are quoted and
+/// escaped, but the text is not Markdown-escaped; send it with mentions
+/// disabled.
 #[must_use]
 pub fn render_preview(diff: &ConfigDiff, max_lines: usize) -> String {
     if diff.is_empty() {
@@ -248,6 +257,21 @@ trait Entry: Clone + PartialEq {
     fn key(&self) -> &str;
 
     fn fields(&self, after: &Self) -> Vec<&'static str>;
+
+    /// New template text for an added entry, if the section carries any.
+    /// `None` keeps the bare `+ section key` line.
+    fn added_preview(&self) -> Option<String> {
+        None
+    }
+
+    /// New template text for a changed entry, limited to the fields in
+    /// `changed` that carry free text. `None` keeps the bare
+    /// `~ section key (fields)` line (for example scalar-only edits, logging
+    /// and settings).
+    fn change_preview(&self, changed: &[&str]) -> Option<String> {
+        let _ = changed;
+        None
+    }
 }
 
 impl Entry for CreatorConfiguration {
@@ -288,6 +312,24 @@ impl Entry for CreatorConfiguration {
             ),
         ])
     }
+
+    fn added_preview(&self) -> Option<String> {
+        template_pair_preview(
+            Some(self.name_template.as_str()),
+            Some(self.status_template.as_deref()),
+        )
+    }
+
+    fn change_preview(&self, changed: &[&str]) -> Option<String> {
+        template_pair_preview(
+            changed
+                .contains(&"name_template")
+                .then_some(self.name_template.as_str()),
+            changed
+                .contains(&"status_template")
+                .then_some(self.status_template.as_deref()),
+        )
+    }
 }
 
 impl Entry for ChannelTemplates {
@@ -308,6 +350,24 @@ impl Entry for ChannelTemplates {
             ("status_template", status_template != &after.status_template),
         ])
     }
+
+    fn added_preview(&self) -> Option<String> {
+        template_pair_preview(
+            Some(self.name_template.as_str()),
+            Some(self.status_template.as_deref()),
+        )
+    }
+
+    fn change_preview(&self, changed: &[&str]) -> Option<String> {
+        template_pair_preview(
+            changed
+                .contains(&"name_template")
+                .then_some(self.name_template.as_str()),
+            changed
+                .contains(&"status_template")
+                .then_some(self.status_template.as_deref()),
+        )
+    }
 }
 
 impl Entry for GameAlias {
@@ -321,6 +381,16 @@ impl Entry for GameAlias {
         let Self { game: _, alias } = self;
         differing([("alias", alias != &after.alias)])
     }
+
+    fn added_preview(&self) -> Option<String> {
+        Some(display_value(&self.alias))
+    }
+
+    fn change_preview(&self, changed: &[&str]) -> Option<String> {
+        changed
+            .contains(&"alias")
+            .then(|| display_value(&self.alias))
+    }
 }
 
 impl Entry for RandomList {
@@ -333,6 +403,16 @@ impl Entry for RandomList {
     fn fields(&self, after: &Self) -> Vec<&'static str> {
         let Self { name: _, choices } = self;
         differing([("choices", choices != &after.choices)])
+    }
+
+    fn added_preview(&self) -> Option<String> {
+        Some(display_choices(&self.choices))
+    }
+
+    fn change_preview(&self, changed: &[&str]) -> Option<String> {
+        changed
+            .contains(&"choices")
+            .then(|| display_choices(&self.choices))
     }
 }
 
@@ -471,17 +551,21 @@ fn apply_section<T: Entry>(current: &[T], diff: &SectionDiff<T>) -> Vec<T> {
 }
 
 /// Appends one line per entry, ordered by key across added/removed/changed.
+/// Added and changed lines carry the new template text after a `→`
+/// separator so the admin confirms what they will get; removed lines keep
+/// the bare key they already know.
 fn section_lines<T: Entry>(lines: &mut Vec<String>, diff: &SectionDiff<T>) {
     let mut keyed: Vec<(&str, String)> = Vec::with_capacity(diff.len());
-    keyed.extend(
-        diff.added
-            .iter()
-            .map(|entry| (entry.key(), entry_line::<T>('+', entry.key()))),
-    );
+    keyed.extend(diff.added.iter().map(|entry| {
+        (
+            entry.key(),
+            entry_line::<T>('+', entry.key(), entry.added_preview()),
+        )
+    }));
     keyed.extend(
         diff.removed
             .iter()
-            .map(|entry| (entry.key(), entry_line::<T>('-', entry.key()))),
+            .map(|entry| (entry.key(), entry_line::<T>('-', entry.key(), None))),
     );
     keyed.extend(
         diff.changed
@@ -492,17 +576,69 @@ fn section_lines<T: Entry>(lines: &mut Vec<String>, diff: &SectionDiff<T>) {
     lines.extend(keyed.into_iter().map(|(_, line)| line));
 }
 
-fn entry_line<T: Entry>(sign: char, key: &str) -> String {
+fn entry_base<T: Entry>(sign: char, key: &str) -> String {
     if T::SINGLETON {
         format!("{sign} {}", T::SECTION)
     } else {
-        cap_line(format!("{sign} {} {}", T::SECTION, display_key(key)))
+        format!("{sign} {} {}", T::SECTION, display_key(key))
+    }
+}
+
+fn entry_line<T: Entry>(sign: char, key: &str, preview: Option<String>) -> String {
+    let base = entry_base::<T>(sign, key);
+    match preview {
+        Some(text) => cap_line(format!("{base} → {text}")),
+        None => cap_line(base),
     }
 }
 
 fn changed_line<T: Entry>(change: &EntryChange<T>) -> String {
     let fields = change.fields.join(", ");
-    cap_line(format!("{} ({fields})", entry_line::<T>('~', &change.key)))
+    let base = format!("{} ({fields})", entry_base::<T>('~', &change.key));
+    match change.after.change_preview(&change.fields) {
+        Some(text) => cap_line(format!("{base} → {text}")),
+        None => cap_line(base),
+    }
+}
+
+/// Quoted, escaped and shortened free-text value, so uploaded text cannot
+/// break the line layout. The preview reply sends with mentions disabled, so
+/// `@everyone` or `<@123>` inside cannot ping either.
+fn display_value(text: &str) -> String {
+    let shown: String = text.chars().take(VALUE_CHAR_LIMIT).collect();
+    let cut = if shown.len() < text.len() { "…" } else { "" };
+    format!("{shown:?}{cut}")
+}
+
+/// `name="..." status="..."` pair for creator and channel templates. Each
+/// side is shown only when its outer `Option` is `Some` (added entries show
+/// both; changed entries show only the fields that changed). Returns `None`
+/// when neither side is shown.
+fn template_pair_preview(name: Option<&str>, status: Option<Option<&str>>) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(name) = name {
+        parts.push(format!("name={}", display_value(name)));
+    }
+    if let Some(status) = status {
+        let shown = status.map_or_else(|| "none".to_owned(), display_value);
+        parts.push(format!("status={shown}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// Up to three quoted, escaped choices in brackets, with a trailer for the
+/// rest. The line cap keeps the whole preview line bounded.
+fn display_choices(choices: &[String]) -> String {
+    let shown: Vec<String> = choices
+        .iter()
+        .take(3)
+        .map(|choice| display_value(choice))
+        .collect();
+    let mut text = format!("[{}]", shown.join(", "));
+    if choices.len() > 3 {
+        text.push_str(&format!(" +{} more", choices.len() - 3));
+    }
+    text
 }
 
 /// Snowflake-shaped keys are shown bare; anything else is quoted, escaped and

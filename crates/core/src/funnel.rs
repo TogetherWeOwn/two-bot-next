@@ -305,6 +305,12 @@ fn parse_zone(s: &str) -> Option<i64> {
         Some(r) => (1_i64, r),
         None => (-1, s.strip_prefix('-')?),
     };
+    // Digits and one `:` only. The byte slices below would land inside a
+    // multi-byte character (`+1é1`) and panic, aborting the whole sweep;
+    // legacy `Date.parse` is NaN, so the row is simply unparseable.
+    if !rest.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+        return None;
+    }
     let (hh, mm): (i64, i64) = match rest.len() {
         2 => (rest.parse().ok()?, 0),
         4 => (rest[..2].parse().ok()?, rest[2..].parse().ok()?),
@@ -320,6 +326,12 @@ fn parse_zone(s: &str) -> Option<i64> {
 /// Days since 1970-01-01 (Howard Hinnant's algorithm). `None` if out of range.
 fn days_from_civil(y: i64, m: u32, d: u32) -> Option<i64> {
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // The year is an unbounded `i64` from the row: bound it before the era
+    // arithmetic below can overflow (a panic in debug, a wrapped instant in
+    // release). 300k years comfortably contains the day bound further down.
+    if y.unsigned_abs() > 300_000 {
         return None;
     }
     let y_adj = if m <= 2 { y - 1 } else { y };
@@ -481,6 +493,73 @@ mod tests {
         ] {
             assert_eq!(parse_iso_millis(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn multibyte_zone_is_unparseable_not_a_panic() {
+        // `+1é1` is a four-byte zone whose second byte sits inside `é`: the
+        // old `rest[..2]` slice panicked and aborted the whole sweep.
+        for bad in [
+            "2026-09-20T12:00:00+1é1",
+            "2026-09-20T12:00:00+0é0",
+            "2026-09-20T12:00:00-1é1",
+            "2026-09-20T12:00:00+é1",
+            "2026-09-20T12:00:00+1é",
+            "2026-09-20T12:00:00+12é",
+            "2026-09-20T12:00:00+12:é",
+            "2026-09-20T12:00:00+１２:００",
+        ] {
+            assert_eq!(parse_iso_millis(bad), None, "{bad}");
+        }
+        // The well-formed zone shapes still parse to the same instant.
+        let utc = parse_iso_millis("2026-09-20T12:00:00Z");
+        assert!(utc.is_some());
+        for zone in ["+00", "+0000", "+00:00", "-00:00"] {
+            assert_eq!(
+                parse_iso_millis(&format!("2026-09-20T12:00:00{zone}")),
+                utc,
+                "{zone}"
+            );
+        }
+        assert_eq!(
+            parse_iso_millis("2026-09-20T14:00:00+0200"),
+            utc,
+            "offset without a colon"
+        );
+    }
+
+    #[test]
+    fn non_ascii_anywhere_in_a_timestamp_never_panics() {
+        // Every parse helper sees a multi-byte character at each position:
+        // the answer is `None` (legacy `Date.parse` NaN), never a panic.
+        let base = "2026-09-20T12:00:00.123+01:00";
+        for (i, _) in base.char_indices() {
+            for glyph in ["é", "日", "🙂"] {
+                let mut s = String::from(&base[..i]);
+                s.push_str(glyph);
+                s.push_str(&base[i + 1..]);
+                assert_eq!(parse_iso_millis(&s), None, "{s}");
+                let mut inserted = String::from(&base[..i]);
+                inserted.push_str(glyph);
+                inserted.push_str(&base[i..]);
+                assert_eq!(parse_iso_millis(&inserted), None, "{inserted}");
+            }
+        }
+    }
+
+    #[test]
+    fn absurd_years_are_unparseable_not_an_overflow() {
+        // The year is an unbounded integer; the era arithmetic used to
+        // overflow (debug panic, release wrap to a bogus instant).
+        for bad in [
+            "9223372036854775807-01-01T00:00:00Z",
+            "9223372036854775806-06-15T00:00:00Z",
+            "99999999999-01-01T00:00:00Z",
+            "300001-01-01T00:00:00Z",
+        ] {
+            assert_eq!(parse_iso_millis(bad), None, "{bad}");
+        }
+        assert!(parse_iso_millis("9999-12-31T23:59:59.999Z").is_some());
     }
 
     #[test]

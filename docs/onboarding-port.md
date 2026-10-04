@@ -64,6 +64,11 @@ this slice.
    final linked reply with `game_picker_reply` before recording routing. `GamePickerOutcome.reply/routed`
    are provisional at the pre-write point, not an authoritative post-grant
    permission answer. Clearing game roles records no selection/routing row.
+   A selection with no reachable room replies through the same builder
+   (`Game roles saved.` plus a line per pick naming that no channel is
+   available) and writes no `channel_routed` row. When only some picks have a
+   room, the `channel_routed` metadata lists the others under `unavailable`;
+   the key is absent when every pick routed.
 6. Session selection has no role effect. A routed plan records the legacy
    `channel_routed` row with `session-picker` source; no
    `game_roles_selected`. Re-selection is repeatable at a new timestamp.

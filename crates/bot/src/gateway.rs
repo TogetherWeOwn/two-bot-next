@@ -29,7 +29,7 @@ use two_bot_core::gateway_session::{
     boot_action_with, dispatch_action, invalidates_session, BootAction, DispatchAction,
     GatewaySession,
 };
-use two_bot_core::{ComponentStatus, Config, InviteState, Snowflake};
+use two_bot_core::{AutomodPolicy, ComponentStatus, Config, InviteState, Snowflake};
 use two_bot_cutover::gateway_session::{GatewayJob, GatewaySessionStore};
 use two_bot_cutover::{connect, DB_POOL_MAX_DEFAULT};
 use two_bot_discord::{
@@ -1037,7 +1037,10 @@ pub async fn build_voice_runtime(
             return None;
         }
     };
-    match build_production_runtime(token, db.pool().clone()) {
+    // Name restrictions are independent of chat counts, sanctions and gates:
+    // a malformed unrelated setting must not discard the configured word list.
+    let name_policy = AutomodPolicy::name_policy_from_map(&std::env::vars().collect());
+    match build_production_runtime(token, db.pool().clone(), name_policy) {
         Ok(runtime) => {
             info!("voice rooms enabled; gateway sink attached");
             Some(Arc::new(runtime))

@@ -109,6 +109,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // DB instant that advanced the mark, so its maximum is the row's last write.
     TableSpec { table: "internal_clock_high_water", measure: TableMeasure::Columns(&["observed_at"]) },
     TableSpec { table: "internal_discord_events", measure: TableMeasure::Columns(&["claimed_at"]) },
+    // Re-mapped keys rewrite updated_at without touching created_at, so the
+    // maximum across both is the row's last write (same shape as tickets).
+    TableSpec { table: "internal_event_keys", measure: TableMeasure::Columns(&["created_at", "updated_at"]) },
     TableSpec { table: "internal_idempotency", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "internal_nonces", measure: TableMeasure::Columns(&["burned_at"]) },
     // Retirements rewrite disabled_at without touching created_at, so the
@@ -202,8 +205,12 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         ),
     },
     // Insert-once creation snapshot plus V2 ownership handoffs, whose
-    // timestamp lives in `owner_touched_at` (migration 0412).
-    TableSpec { table: "voice_rooms", measure: TableMeasure::Columns(&["created_at", "owner_touched_at"]) },
+    // timestamp lives in `owner_touched_at` (migration 0412), plus V3 `/name`
+    // custom-name changes, stamped in `name_touched_at` (migration 0414).
+    TableSpec {
+        table: "voice_rooms",
+        measure: TableMeasure::Columns(&["created_at", "owner_touched_at", "name_touched_at"]),
+    },
     // Capture both accepted creates and post-baseline bindings/rollbacks of
     // reservations created before the baseline (migration 0413).
     TableSpec { table: "voice_create_reservations", measure: TableMeasure::Columns(&["created_at", "settled_at"]) },

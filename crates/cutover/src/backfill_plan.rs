@@ -27,6 +27,21 @@ pub struct PlannedEvent {
     pub source: String,
 }
 
+/// Row metadata the backfill writes for a planned event. A recovered
+/// `gate_cleared` carries `timestampIsJoinTime` because its `occurred_at` is
+/// the JOIN time, a placeholder (Discord keeps no history of the transition);
+/// together with the `backfill:` source prefix it keeps the row out of
+/// time-to-clear arithmetic via `two_bot_core::is_measurable_gate_clearing`,
+/// while counts and conversion still include it (legacy 6928f11).
+#[must_use]
+pub fn event_metadata_json(event_type: &str) -> &'static str {
+    if event_type == "gate_cleared" {
+        r#"{"backfill":true,"timestampIsJoinTime":true}"#
+    } else {
+        r#"{"backfill":true}"#
+    }
+}
+
 /// One current member as Discord reports them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedMember {
@@ -256,6 +271,61 @@ mod tests {
         ];
         let m = plan_backfill_merge(&[], &[], &members);
         assert_eq!((m.gate_stuck, m.gate_clearings), (1, 2));
+    }
+
+    #[test]
+    fn backfilled_gate_clearings_never_feed_time_to_clear_but_still_count() {
+        use two_bot_core::is_measurable_gate_clearing;
+        let members = vec![
+            ListedMember {
+                id: "1".to_owned(),
+                joined_at: Some("2025-01-01T10:00:00.000Z".to_owned()),
+                pending: Some(false),
+                is_bot: false,
+            },
+            ListedMember {
+                id: "2".to_owned(),
+                joined_at: Some("2025-01-02T10:00:00.000Z".to_owned()),
+                pending: None,
+                is_bot: false,
+            },
+        ];
+        let m = plan_backfill_merge(&[], &[], &members);
+        // Counting is unchanged: every through-the-gate member is a clearing.
+        assert_eq!(m.gate_clearings, 2);
+        let clearings: Vec<_> = m
+            .ordered
+            .iter()
+            .filter(|e| e.event_type == "gate_cleared")
+            .collect();
+        assert_eq!(clearings.len(), 2);
+        for e in &clearings {
+            // The placeholder instant is the member's join time.
+            assert!(m.ordered.iter().any(|j| j.event_type == "member_join"
+                && j.member_id == e.member_id
+                && j.occurred_at == e.occurred_at));
+            let metadata: serde_json::Value =
+                serde_json::from_str(event_metadata_json(&e.event_type)).expect("valid JSON");
+            assert_eq!(metadata["timestampIsJoinTime"], true);
+            // Either signal alone disqualifies the row from timing...
+            assert!(!is_measurable_gate_clearing(&e.source, None));
+            assert!(!is_measurable_gate_clearing("gateway", Some(&metadata)));
+            // ...and together, as written, certainly.
+            assert!(!is_measurable_gate_clearing(&e.source, Some(&metadata)));
+        }
+    }
+
+    #[test]
+    fn only_gate_clearings_carry_the_join_time_placeholder_flag() {
+        for event_type in ["member_join", "member_leave", "first_voice_session"] {
+            let metadata: serde_json::Value =
+                serde_json::from_str(event_metadata_json(event_type)).expect("valid JSON");
+            assert_eq!(metadata["backfill"], true, "{event_type}");
+            assert!(
+                metadata.get("timestampIsJoinTime").is_none(),
+                "{event_type}"
+            );
+        }
     }
 
     #[test]

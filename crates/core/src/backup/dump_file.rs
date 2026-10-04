@@ -108,6 +108,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "internal_idempotency",
     "internal_action_log",
     "internal_discord_events",
+    "internal_event_keys",
     "moderation_channel_executions",
     "moderation_member_bans",
     "invite_campaigns",
@@ -128,13 +129,15 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_guild_settings",
     "voice_command_roles",
     "voice_command_role_members",
-    // V5 adds accepted-create history after the frozen 80-table v4 inventory.
+    // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
 ];
 
-/// Frozen coverage emitted before create-reservation persistence. Pin this
-/// prefix rather than accepting arbitrary missing tables from older archives.
-pub const V4_TABLE_COUNT: usize = 80;
+/// Tables first covered by v5. A v4 archive predates them and need not declare
+/// them; every other covered table is still required, so a v4 recovery point
+/// written before create-reservation persistence stays readable without
+/// waiving arbitrary missing tables.
+pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations"];
 
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
@@ -158,11 +161,21 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     // into a recovered process; welcome/goodbye state of record lives in the
     // onboarding stores, which are archived.
     "gateway_onboarding_jobs",
+    // Durable cutover rollback journal and per-table watermarks (store chain
+    // 0406). The journal is unwired append-only cutover evidence: no writer
+    // calls record yet, and rows are re-capturable during the watch window.
+    // Never replay pre-restore cutover cursors into a recovered process: a
+    // restored watermark could mark post-backup writes as already journaled
+    // and silently break rollback coverage.
+    "rollback_journal",
+    "rollback_watermarks",
     // Migration ledgers describe target DDL; replacing them would falsely mark
     // unapplied migrations as applied. Legacy schema_migrations is diagnostic
-    // manifest metadata only, never restored application data.
+    // manifest metadata only, never restored application data. The store
+    // chain's own runner bookkeeping belongs beside cutover's ledger.
     "_sqlx_migrations",
     "schema_migrations",
+    "_two_bot_migrations",
 ];
 
 /// Columns the destination allocates itself: never archived, never restored.
@@ -907,19 +920,20 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
-    // Historical inventories are fixed prefixes, pinned by fixtures. New v5
-    // archives must cover reservations too; v4 recovery points remain readable.
-    let required = match obj.get("version").and_then(Value::as_u64) {
-        Some(3) => 22,
-        Some(4) => V4_TABLE_COUNT,
-        _ => DUMP_TABLES.len(),
-    };
+    // Historical inventories are pinned by fixtures. New v5 archives must cover
+    // reservations too; v4 recovery points remain readable without them.
+    let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
-        .take(required)
-        .filter(|name| required == 22 || !OPTIONAL_LEGACY_TABLES.contains(name))
-        .filter(|name| !names.contains(**name))
         .copied()
+        .enumerate()
+        .filter(|(index, name)| match version {
+            Some(3) => *index < 22,
+            Some(4) => !V5_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
+            _ => !OPTIONAL_LEGACY_TABLES.contains(name),
+        })
+        .map(|(_, name)| name)
+        .filter(|name| !names.contains(*name))
         .collect();
     if !missing.is_empty() {
         return Err(refuse(format!(
@@ -1665,7 +1679,12 @@ mod tests {
             .iter()
             .map(|t| t.name.as_str())
             .collect();
-        assert_eq!(names, &DUMP_TABLES[..V4_TABLE_COUNT]);
+        let expected: Vec<&str> = DUMP_TABLES
+            .iter()
+            .copied()
+            .filter(|name| !V5_ADDED_TABLES.contains(name))
+            .collect();
+        assert_eq!(names, expected);
         assert_eq!(
             contents.manifest.missing_tables(),
             ["voice_create_reservations"]

@@ -43,6 +43,10 @@ gates (owner-only commands, admin override), persistence of the decided limit
 `/name`, and Discord writes (user limit, bitrate, renames). No live channel
 update is performed or verified by this component's tests.
 
+`/name` is wired: see [`voice-name-panel.md`](voice-name-panel.md). `/limit`,
+`/unlimit`, `/private`, `/public`, the Join channel and the bitrate preference
+are not.
+
 ## Hermetic verification
 
 ```sh

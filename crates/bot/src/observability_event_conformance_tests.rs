@@ -170,6 +170,7 @@ const VOICE_RS_ADJACENT: [&str; 9] = [
     "import preview planned an apply; refusing without writing",
     "voice vote response failed; not retried",
     "voice ballot response failed; not retried",
+    "voice name modal response failed; not retried",
     "voice acknowledgement failed; command not executed",
     "voice response completion failed; not retried",
 ];

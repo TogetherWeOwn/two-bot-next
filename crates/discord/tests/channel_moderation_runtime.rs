@@ -3,7 +3,7 @@
 #[allow(dead_code)]
 mod common;
 
-use common::{MockRest, ScriptedResponse};
+use common::{aged_message_id, fresh_message_id, MockRest, ScriptedResponse};
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::PgPool;
@@ -458,7 +458,7 @@ async fn purge_and_slowmode_success_audit_and_replay_without_repeating_effects()
         vec![
             ScriptedResponse::json(
                 200,
-                json!([{"id":"600000000000000001"},{"id":"600000000000000002"}]),
+                json!([{"id":fresh_message_id(1)},{"id":fresh_message_id(2)}]),
             ),
             ScriptedResponse::status(204),
             patched(),
@@ -511,17 +511,51 @@ async fn purge_and_slowmode_success_audit_and_replay_without_repeating_effects()
     db.close().await;
 }
 
+/// A quiet channel holds only messages older than 14 days. Discord answers a
+/// bulk delete of those with a 400, which used to surface as "Discord refused
+/// the channel action". They are deleted one by one instead.
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn purge_of_messages_older_than_fourteen_days_deletes_them_singly() {
+    let db = Database::open().await;
+    let (old_a, old_b) = (aged_message_id(1), aged_message_id(2));
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!([{"id": old_a}, {"id": old_b}])),
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(204),
+        ],
+        // A bulk delete here would hit the default and fail the purge.
+        ScriptedResponse::status(400),
+    )
+    .await;
+    let runtime = runtime(&db, &mock);
+    let router = router(true);
+    let purge = interaction(80, "purge", options(Some(("count", 2))), PERMISSIONS);
+    let result = runtime.execute(&router, &purge).await.unwrap().unwrap();
+    assert_eq!(result.outcome, "purged");
+    assert!(result.text.contains("(2)"), "{}", result.text);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1..].iter().all(|r| r.method == "DELETE"));
+    assert_eq!(db.count("moderation_channel_executions").await, 0);
+    mock.shutdown().await;
+    db.close().await;
+}
+
 #[tokio::test]
 #[ignore = "requires agent-testdb or CI service"]
 async fn repeated_lockdown_keeps_first_seed_and_unlock_restores_exact_masks() {
     let db = Database::open().await;
+    // Lockdown denies sending, thread and reaction bits, not just SEND_MESSAGES.
+    let locked_deny = (8192 | two_bot_core::LOCKDOWN_BITS).to_string();
     let mock = MockRest::start(
         vec![
             overwrite("3072", "8192"),
             ScriptedResponse::status(204),
-            overwrite("1024", "10240"),
+            overwrite("1024", &locked_deny),
             ScriptedResponse::status(204),
-            overwrite("1024", "10240"),
+            overwrite("1024", &locked_deny),
             ScriptedResponse::status(204),
         ],
         ScriptedResponse::status(500),
@@ -567,7 +601,7 @@ async fn repeated_lockdown_keeps_first_seed_and_unlock_restores_exact_masks() {
     let restored: Value = serde_json::from_slice(&requests[5].body).unwrap();
     assert_eq!(
         (first["allow"].as_str(), first["deny"].as_str()),
-        (Some("1024"), Some("10240"))
+        (Some("1024"), Some(locked_deny.as_str()))
     );
     assert_eq!(
         (restored["allow"].as_str(), restored["deny"].as_str()),
@@ -828,7 +862,6 @@ async fn lockdown_after_an_external_unlock_refreshes_seed_and_fences_old_cleanup
 async fn ambiguous_unlock_retains_recovery_and_both_claims_across_all_keys() {
     for failure in [
         ScriptedResponse::status(503),
-        ScriptedResponse::rate_limited(0.0, "0"),
         ScriptedResponse::status(204).delayed(std::time::Duration::from_millis(5200)),
     ] {
         let db = Database::open().await;
@@ -893,6 +926,182 @@ async fn ambiguous_unlock_retains_recovery_and_both_claims_across_all_keys() {
         mock.shutdown().await;
         db.close().await;
     }
+}
+
+/// Lock the channel, run a purge whose history read fails, then prove the
+/// lane is free: /unlock restores the exact original masks.
+async fn assert_unlock_proceeds_after_failed_history_read(history: ScriptedResponse) {
+    let db = Database::open().await;
+    let mock = MockRest::start(
+        vec![
+            overwrite("3072", "8192"),
+            ScriptedResponse::status(204),
+            history,
+            overwrite("1024", "10240"),
+            ScriptedResponse::status(204),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(&db, &mock);
+    let router = router(true);
+    let outcome = |id, action, numeric| {
+        let request = interaction(id, action, options(numeric), PERMISSIONS);
+        let runtime = &runtime;
+        let router = &router;
+        async move {
+            runtime
+                .execute(router, &request)
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome
+        }
+    };
+    assert_eq!(outcome(60, "lockdown", None).await, "locked_down");
+    let purge = outcome(61, "purge", Some(("count", 5))).await;
+    assert_eq!(purge, "refused", "a failed history read proves no delete");
+    assert_eq!(db.count("moderation_channel_executions").await, 0);
+    assert_eq!(mock.requests().len(), 3, "no delete after a failed read");
+    assert_eq!(outcome(62, "unlock", None).await, "unlocked");
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(requests[3].method, "GET", "unlock reads the live masks");
+    assert_eq!(requests[4].method, "PUT");
+    assert!(requests[4].path.contains("/permissions/"));
+    let restored: Value = serde_json::from_slice(&requests[4].body).unwrap();
+    assert_eq!(
+        (restored["allow"].as_str(), restored["deny"].as_str()),
+        (Some("3072"), Some("8192")),
+        "unlock restores the original send bits"
+    );
+    assert_eq!(db.count("moderation_channel_executions").await, 0);
+    assert!(db.store.get_lockdown(CHANNEL).await.unwrap().is_none());
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn unlock_proceeds_after_purge_history_unavailable() {
+    assert_unlock_proceeds_after_failed_history_read(ScriptedResponse::status(503)).await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn unlock_proceeds_after_purge_history_rate_limited() {
+    assert_unlock_proceeds_after_failed_history_read(ScriptedResponse::rate_limited(0.0, "0"))
+        .await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn unlock_proceeds_after_purge_history_unreadable() {
+    assert_unlock_proceeds_after_failed_history_read(ScriptedResponse::json(
+        200,
+        json!({"not": "a message list"}),
+    ))
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn unlock_proceeds_after_purge_history_timeout() {
+    assert_unlock_proceeds_after_failed_history_read(
+        ScriptedResponse::json(200, json!([])).delayed(std::time::Duration::from_millis(5200)),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn purge_delete_failure_still_retains_the_lane() {
+    for failure in [
+        ScriptedResponse::status(503),
+        ScriptedResponse::status(204).delayed(std::time::Duration::from_millis(5200)),
+    ] {
+        let db = Database::open().await;
+        let mock = MockRest::start(
+            vec![
+                ScriptedResponse::json(
+                    200,
+                    json!([{"id":"600000000000000001"},{"id":"600000000000000002"}]),
+                ),
+                failure,
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let runtime = runtime(&db, &mock);
+        let router = router(true);
+        for (id, action, numeric) in [(70, "purge", Some(("count", 5))), (71, "unlock", None)] {
+            let request = interaction(id, action, options(numeric), PERMISSIONS);
+            assert_eq!(
+                runtime
+                    .execute(&router, &request)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .outcome,
+                "in_progress",
+                "a delete that may have applied keeps the lane"
+            );
+        }
+        assert_eq!(mock.requests().len(), 2, "no retry, no competing mutation");
+        assert_eq!(db.count("moderation_channel_executions").await, 1);
+        mock.shutdown().await;
+        db.close().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn rate_limited_mutation_proves_no_effect_and_frees_the_lane() {
+    let db = Database::open().await;
+    let mock = MockRest::start(
+        vec![
+            overwrite("3072", "8192"),
+            ScriptedResponse::status(204),
+            overwrite("1024", "10240"),
+            ScriptedResponse::rate_limited(0.0, "0"),
+            overwrite("1024", "10240"),
+            ScriptedResponse::status(204),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(&db, &mock);
+    let router = router(true);
+    let outcome = |id, action| {
+        let request = interaction(id, action, options(None), PERMISSIONS);
+        let runtime = &runtime;
+        let router = &router;
+        async move {
+            runtime
+                .execute(router, &request)
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome
+        }
+    };
+    assert_eq!(outcome(90, "lockdown").await, "locked_down");
+    let rec = db.store.get_lockdown(CHANNEL).await.unwrap().unwrap();
+    assert_eq!(
+        outcome(91, "unlock").await,
+        "refused",
+        "429 was not applied"
+    );
+    assert_eq!(
+        db.store.get_lockdown(CHANNEL).await.unwrap(),
+        Some(rec),
+        "the recovery seed survives a refused unlock"
+    );
+    assert_eq!(db.count("moderation_channel_executions").await, 0);
+    assert_eq!(outcome(92, "unlock").await, "unlocked");
+    assert!(db.store.get_lockdown(CHANNEL).await.unwrap().is_none());
+    mock.shutdown().await;
+    db.close().await;
 }
 
 #[tokio::test]

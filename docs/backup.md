@@ -50,35 +50,52 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-### Coverage and recovery semantics (v4, TOG-11142)
+### Coverage and recovery semantics (v4 and v5)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
-inventory for both dump and restore. It includes **65 durable tables from the
+inventory for both dump and restore. It includes **82 durable tables from the
 current cutover migrations**, including the bot-owned website-contract backing
 tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchanges`) plus their uncertainty baselines
 (`self_role_exchange_baselines`), the automod delivery claims, the gateway
-boot directives, the member-erasure audit and the internal clock high-water
-mark, plus **3 optional retired legacy tables**. A dump from a fresh Rust
-schema has 65 table entries; a compatible legacy-extended schema may have up to
-68. A missing current table refuses a dump/restore: migrate the target first.
-V4 requires its frozen 80-table inventory, so recovery points written before
-migration 0413 remain inspectable and restorable. V5 requires the full current
-inventory, including `voice_create_reservations`; an incomplete new archive
-refuses at inspection. Restoring a pre-reservation archive clears the destination's
-reservation table, as with other tables absent from an older version.
+boot directives, the member-erasure audit, the internal clock high-water
+mark, the voice configuration tables and the accepted voice-room create history
+(`voice_create_reservations`). `OPTIONAL_LEGACY_TABLES` is empty: the coverage
+test fails if a covered table is not migrated. A dump from a fresh Rust schema
+has 82 table entries. A missing current table refuses a dump/restore: migrate
+the target first.
+A v4 archive must declare every covered table except the ones v5 added
+(`V5_ADDED_TABLES`), so recovery points written before create-reservation
+persistence remain inspectable and restorable. A v4 archive written before any
+other table joined the inventory is refused at inspect ("manifest is missing
+tables"); take a fresh dump after upgrading. V5 requires the full current
+inventory; an incomplete new archive refuses at inspection. Restoring a
+pre-reservation archive clears the destination's reservation table, as with
+other tables absent from an older version.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.
 
-The only application exclusion is `xp_cooldowns` (short-lived award throttles);
-restore clears target cooldowns. Migration ledgers (`_sqlx_migrations` and
-`schema_migrations`) describe target DDL and are never restored. Replay guards,
-idempotency records, gateway sessions, lease-bearing durable tables and audit
-history are **not** ephemeral exclusions. Derived `web_v1` views contain no
-independent table data; the website service's own separate database is out of
-scope. The migration-backed coverage test compares real tables against these
-classifications, so adding an unclassified table fails CI.
+Three application tables are excluded, each with its reason inline in
+`EXCLUDED_TABLES`: `xp_cooldowns` (short-lived award throttles; restore clears
+target cooldowns), `discord_send_admission` (per-credential lane state that a
+recovered process re-learns) and `gateway_onboarding_jobs` (a restart-recovery
+queue bound to a gateway session). The store chain's `rollback_journal` and
+`rollback_watermarks` are excluded too: the journal is unwired append-only
+cutover evidence (no writer calls `record` yet, and its rows are re-capturable
+during the watch window), and restoring pre-backup watermarks could mark
+post-backup writes as already journaled, silently breaking rollback coverage.
+Migration ledgers (`_sqlx_migrations`, `schema_migrations` and the store
+chain's `_two_bot_migrations`) describe target DDL and are never restored.
+Replay guards, idempotency records, gateway sessions, lease-bearing durable
+tables and audit history are **not** ephemeral exclusions. Derived `web_v1`
+views contain no independent table data; the website service's own separate
+database is out of scope. The migration-backed coverage test compares real
+tables against these classifications, so adding an unclassified table to
+either chain fails CI: the cutover chain is migrated for real, and the store
+chain (`crates/store/migrations`) is text-scanned for `CREATE TABLE`, so a
+new store table without a dump/exclude decision is refused rather than
+silently omitted from the backup.
 
 v3 must contain its original 22 table entries. It can lack later tables, but
 restore clears their old target rows and emits a warning in both dry-run and

@@ -733,6 +733,65 @@ async fn migrated_tables_are_explicitly_classified_and_catalog_fks_are_parent_fi
             "migrated table {table} is neither DUMP_TABLES nor EXCLUDED_TABLES"
         );
     }
+    // The store chain (crates/store/migrations) shares the database (the
+    // operator applies both chains) but this guard migrates only the cutover
+    // chain. A pure text scan is enough, with no second database migration:
+    // every store-chain CREATE TABLE must be classified, so a new store
+    // table without a DUMP/EXCLUDED decision fails CI instead of silently
+    // leaving the backup.
+    let store_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../store/migrations");
+    let mut store_entries: Vec<_> = std::fs::read_dir(&store_dir)
+        .expect("store migrations directory")
+        .map(|entry| entry.expect("migration entry").path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql"))
+        .collect();
+    store_entries.sort();
+    assert!(!store_entries.is_empty(), "no store migrations found");
+    let mut store_tables = BTreeSet::new();
+    for path in &store_entries {
+        let sql = std::fs::read_to_string(path).expect("migration file readable");
+        for line in sql.lines() {
+            // Real DDL only: no store migration carries CREATE TABLE in a
+            // comment, and every statement names its bare table on the same
+            // line (verified: no qualified or quoted names in this directory).
+            let trimmed = line.trim_start();
+            let rest = match trimmed
+                .strip_prefix("CREATE TABLE IF NOT EXISTS")
+                .or_else(|| trimmed.strip_prefix("CREATE TABLE"))
+            {
+                Some(rest) => rest,
+                None => continue,
+            };
+            let name: String = rest
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            assert!(
+                !name.is_empty(),
+                "unparsable CREATE TABLE in {}",
+                path.display()
+            );
+            store_tables.insert(name);
+        }
+    }
+    assert!(
+        store_tables.contains("rollback_journal") && store_tables.contains("rollback_watermarks"),
+        "store-chain scan must see the journal tables: {store_tables:?}"
+    );
+    for table in &store_tables {
+        assert!(
+            covered.contains(table.as_str()) || excluded.contains(table.as_str()),
+            "store-chain table {table} is neither DUMP_TABLES nor EXCLUDED_TABLES"
+        );
+    }
+    // The store runner's bookkeeping table has no CREATE TABLE statement
+    // (sqlx creates it at runtime under TABLE_NAME): pin its ledger
+    // classification directly, beside _sqlx_migrations.
+    assert!(
+        excluded.contains("_two_bot_migrations"),
+        "store migration ledger must be excluded beside _sqlx_migrations"
+    );
     for table in &optional {
         assert!(
             !actual.contains(*table),

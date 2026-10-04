@@ -67,6 +67,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'internal_idempotency', 'table'),
     ('public', 'internal_action_log', 'table'),
     ('public', 'internal_discord_events', 'table'),
+    ('public', 'internal_event_keys', 'table'),
     ('public', 'self_role_audit', 'table'),
     ('public', 'self_role_panel_claims', 'table'),
     ('public', 'self_role_exchanges', 'table'),
