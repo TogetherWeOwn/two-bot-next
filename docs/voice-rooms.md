@@ -58,11 +58,20 @@ library code with no Discord dependency and can start immediately.
   becomes the original creator.
 - Owner-only commands refuse everyone else. Guild admins may use owner commands
   in any tracked room; channel-scoped grants never provide that override.
-- Succession, reclaim and transfer queue a room-scoped overwrite rewrite before
-  persisting ownership. The former owner's owner-grant bits are removed and the
-  current owner's grant is installed; unrelated overwrites and denies remain.
-  Rapid transfers retain each prior owner for cleanup, and HTTP failures retry
-  through the bounded guild queue. Rooms created without Manage Roles stay
+- Succession, reclaim and transfer persist a room-scoped recipient journal before
+  issuing any owner grant. The overwrite rewrite removes owner-grant bits from
+  all recorded former recipients and installs the current owner's grant; unrelated
+  overwrites and denies remain. Ownership SQL and revision-fenced cleanup
+  acknowledgement commit atomically only after the rewrite is confirmed.
+- Failed ownership SQL leaves cleanup pending across restart. Recovery converges
+  to the persisted ledger owner even while that owner remains in the room; an
+  uncommitted transfer is not promised after restart. Exhausted queue retries
+  retain pending cleanup and replay in bounded cohorts with a one-minute cooldown,
+  only with authoritative live evidence and restored overwrite access. Rapid
+  handoffs coalesce per room without forgetting any issued recipient.
+- Late overwrite responses cannot replace newer gateway channel updates/deletion
+  or evidence from another connection generation. Follow-up rewrites preserve
+  newly observed unrelated ACLs. Rooms created without Manage Roles stay
   category-synced rather than gaining a grant the bot cannot write.
 - **Accept when:**
   - The caretaker is chosen by earliest join time.

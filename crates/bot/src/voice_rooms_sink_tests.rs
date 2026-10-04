@@ -43,8 +43,20 @@ impl RoomPersistence for Arc<Store> {
     async fn persist(&self, room: &VoiceRoom) -> Result<(), StoreError> {
         self.as_ref().persist(room).await
     }
-    async fn update_ownership(&self, room: &VoiceRoom) -> Result<bool, StoreError> {
-        self.as_ref().update_ownership(room).await
+    async fn pending_owner_grants(&self, guild: u64) -> Result<Vec<u64>, StoreError> {
+        self.as_ref().pending_owner_grants(guild).await
+    }
+    async fn prepare_owner_grants(
+        &self,
+        room: &VoiceRoom,
+        previous_owner_id: u64,
+    ) -> Result<OwnerGrantIntent, StoreError> {
+        self.as_ref()
+            .prepare_owner_grants(room, previous_owner_id)
+            .await
+    }
+    async fn update_ownership(&self, room: &VoiceRoom, revision: &str) -> Result<bool, StoreError> {
+        self.as_ref().update_ownership(room, revision).await
     }
     async fn forget(&self, guild: u64, channel: u64) -> Result<(), StoreError> {
         self.as_ref().forget(guild, channel).await

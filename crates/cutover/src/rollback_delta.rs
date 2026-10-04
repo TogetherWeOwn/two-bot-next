@@ -204,6 +204,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // Insert-once creation snapshot plus V2 ownership handoffs, whose
     // timestamp lives in `owner_touched_at` (migration 0412).
     TableSpec { table: "voice_rooms", measure: TableMeasure::Columns(&["created_at", "owner_touched_at"]) },
+    TableSpec { table: "voice_owner_grants", measure: TableMeasure::Columns(&["touched_at"]) },
     // Same insert-once shape as voice_rooms (PgRoomStore::add_companion never
     // overwrites the creation snapshot).
     TableSpec { table: "voice_text_companions", measure: TableMeasure::Columns(&["created_at"]) },

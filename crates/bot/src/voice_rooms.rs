@@ -94,7 +94,7 @@ use two_bot_core::{
     CommandDefinition, OverwriteTarget, PermissionFinding, PermissionOverwrite as HealthOverwrite,
     Snowflake, VoicePermission, VoicePermissionScope,
 };
-use two_bot_cutover::voice_rooms::PgRoomStore;
+use two_bot_cutover::voice_rooms::{OwnerGrantIntent, PgRoomStore};
 use two_bot_discord::voice_rooms::{
     can_enforce_kick, can_manage_room, effective_permissions, RoomChannelAttributes, RoomHttp,
     RoomHttpError,
@@ -132,12 +132,22 @@ pub trait RoomPersistence: Send + Sync {
         channel: Snowflake,
     ) -> impl Future<Output = Result<Option<CreatorChannel>, StoreError>> + Send;
     fn persist(&self, room: &VoiceRoom) -> impl Future<Output = Result<(), StoreError>> + Send;
-    /// Persist a V2 caretaker/command handoff on an already-tracked room.
-    /// Returns `Ok(true)` when the row existed, `Ok(false)` when the tracked
-    /// row has no database counterpart (deleted out-of-band).
+    fn pending_owner_grants(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<Vec<Snowflake>, StoreError>> + Send;
+    /// Persist every possible grant recipient before writing Discord overwrites.
+    fn prepare_owner_grants(
+        &self,
+        room: &VoiceRoom,
+        previous_owner_id: Snowflake,
+    ) -> impl Future<Output = Result<OwnerGrantIntent, StoreError>> + Send;
+    /// Atomically persist ownership and acknowledge exactly this cleanup intent.
+    /// A missing row or superseded revision returns false without clearing work.
     fn update_ownership(
         &self,
         room: &VoiceRoom,
+        revision: &str,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
     /// The guild's V10b controls; an unconfigured guild reads as the defaults.
     fn access_controls(
@@ -235,15 +245,25 @@ impl RoomPersistence for PgRoomStore {
         Ok(())
     }
 
-    async fn update_ownership(&self, room: &VoiceRoom) -> Result<bool, StoreError> {
-        self.update_ownership(
-            room.guild_id,
-            room.channel_id,
-            room.owner_id,
-            room.original_creator_id,
-        )
-        .await
-        .map_err(store_error)
+    async fn pending_owner_grants(&self, guild: Snowflake) -> Result<Vec<Snowflake>, StoreError> {
+        self.pending_owner_grants(guild).await.map_err(store_error)
+    }
+
+    async fn prepare_owner_grants(
+        &self,
+        room: &VoiceRoom,
+        previous_owner_id: Snowflake,
+    ) -> Result<OwnerGrantIntent, StoreError> {
+        self.prepare_owner_grants(room, previous_owner_id)
+            .await
+            .map_err(store_error)?
+            .ok_or(StoreError::Conflict)
+    }
+
+    async fn update_ownership(&self, room: &VoiceRoom, revision: &str) -> Result<bool, StoreError> {
+        self.complete_owner_grants(room, revision)
+            .await
+            .map_err(store_error)
     }
 
     async fn access_controls(&self, guild: Snowflake) -> Result<AccessControls, StoreError> {
@@ -1120,6 +1140,10 @@ pub struct GuildRoomWorker<S, H> {
     /// Compared against live occupancy via [`occupancy_diff`] on reconcile.
     companion_seen: HashMap<Snowflake, Vec<Snowflake>>,
     queue: ActionQueue,
+    /// Security cleanup survives the queue's finite retry cohorts. Only one
+    /// ownership action per room is queued; exhausted cohorts wait a minute.
+    ownership_repairs: HashMap<Snowflake, u64>,
+    ownership_queued: HashSet<Snowflake>,
     renames: RenameCoalescer,
     desired_names: HashMap<Snowflake, String>,
     creations: HashMap<u64, Creation>,
@@ -1167,6 +1191,8 @@ const NOTICE_REPEAT_INTERVAL_MS: u64 = 15 * 60 * 1000;
 /// Longest notice body; Discord's message limit is 2000 characters.
 const NOTICE_MAX_CHARS: usize = 1500;
 
+const OWNER_REPAIR_COOLDOWN_MS: u64 = 60_000;
+
 /// Repeat bookkeeping for one tracked failure. `last_attempt_ms` is the
 /// actor's monotonic clock, so a restart begins a fresh budget.
 #[derive(Debug, Clone)]
@@ -1197,6 +1223,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .into_iter()
             .map(|c| (c.room_channel_id, c))
             .collect();
+        let ownership_repairs = store
+            .pending_owner_grants(live.guild_id)
+            .await?
+            .into_iter()
+            .map(|channel| (channel, 0))
+            .collect();
         Ok(Self {
             live,
             store,
@@ -1209,6 +1241,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             unpersisted_companions: HashSet::new(),
             companion_seen: HashMap::new(),
             queue: ActionQueue::new(),
+            ownership_repairs,
+            ownership_queued: HashSet::new(),
             renames: RenameCoalescer::new(),
             desired_names: HashMap::new(),
             creations: HashMap::new(),
@@ -1571,15 +1605,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         updated.owner_id = next.owner_id;
         updated.original_creator_id = next.original_creator_id;
         self.rooms.insert(channel, updated);
-        self.queue.enqueue(
-            self.live.guild_id,
-            RoomAction::UpdateOwnership {
-                channel_id: channel,
-                previous_owner_id,
-                owner_id: next.owner_id,
-                original_creator_id: next.original_creator_id,
-            },
-        );
+        self.queue_owner_handoff(channel, previous_owner_id);
         true
     }
 
@@ -1687,15 +1713,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         // any lingering post-move uncertainty is stale — clear it so the next
         // reconcile (and the persisted handoff) stop skipping this channel.
         self.uncertain_moves.remove(&channel);
-        self.queue.enqueue(
-            self.live.guild_id,
-            RoomAction::UpdateOwnership {
-                channel_id: channel,
-                previous_owner_id,
-                owner_id: next.owner_id,
-                original_creator_id: next.original_creator_id,
-            },
-        );
+        self.queue_owner_handoff(channel, previous_owner_id);
         match command {
             OwnershipCommand::Reclaim if was_creator => {
                 "You're the owner of this room again.".to_owned()
@@ -1707,10 +1725,67 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
     }
 
+    fn queue_owner_handoff(&mut self, channel_id: Snowflake, previous_owner_id: Snowflake) {
+        self.ownership_repairs.entry(channel_id).or_insert(0);
+        if self.ownership_queued.insert(channel_id) {
+            let room = &self.rooms[&channel_id];
+            self.queue.enqueue(
+                self.live.guild_id,
+                RoomAction::UpdateOwnership {
+                    channel_id,
+                    previous_owner_id,
+                    owner_id: room.owner_id,
+                    original_creator_id: room.original_creator_id,
+                },
+            );
+        }
+    }
+
+    /// Replay durable cleanup independently of caretaker succession. A present
+    /// owner does not prove Discord grants have converged to the ledger.
+    fn enqueue_owner_repairs(&mut self, now_ms: u64) {
+        self.ownership_repairs
+            .retain(|channel, _| self.rooms.contains_key(channel));
+        self.ownership_queued
+            .retain(|channel| self.rooms.contains_key(channel));
+        let due: Vec<_> = {
+            let live = self.live.inner.read().expect("live voice lock");
+            if !live.ready || self.halted {
+                return;
+            }
+            self.ownership_repairs
+                .iter()
+                .filter_map(|(channel, not_before)| {
+                    (*not_before <= now_ms
+                        && !self.ownership_queued.contains(channel)
+                        && live
+                            .permissions(self.live.guild_id, *channel)
+                            .is_some_and(|p| {
+                                p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES)
+                            }))
+                    .then_some(*channel)
+                })
+                .collect()
+        };
+        for channel in due {
+            self.queue_owner_handoff(channel, self.rooms[&channel].owner_id);
+        }
+    }
+
+    fn owner_action_failed(&mut self, action: QueuedAction, reason: &str, now_ms: u64) {
+        if action.attempts.saturating_add(1) >= QUEUE_MAX_ATTEMPTS {
+            let channel = action.action.channel_id().expect("ownership channel");
+            self.ownership_queued.remove(&channel);
+            self.ownership_repairs
+                .insert(channel, now_ms.saturating_add(OWNER_REPAIR_COOLDOWN_MS));
+        }
+        self.mark_failed_observed(action, reason.to_owned(), now_ms);
+    }
+
     async fn rewrite_owner_grant(
         &self,
         channel_id: Snowflake,
-        previous_owner_id: Snowflake,
+        issued_members: &[Snowflake],
         owner_id: Snowflake,
     ) -> Result<(), RoomHttpError> {
         let (overwrites, changed, expected_overwrites, generation, revision) = {
@@ -1739,7 +1814,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 // have no bot-issued owner grant to move. Do not invent one.
                 if current.iter().any(|o| {
                     o.kind == PermissionOverwriteType::Member
-                        && o.id.get() == previous_owner_id
+                        && o.id.get() != owner_id
+                        && issued_members.contains(&o.id.get())
                         && o.allow.intersects(owner_mask)
                 }) {
                     return Err(RoomHttpError::AccessDenied);
@@ -1747,13 +1823,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 return Ok(());
             }
             let mut overwrites = current.to_vec();
-            if previous_owner_id != owner_id {
-                if let Some(old) = overwrites.iter_mut().find(|o| {
-                    o.kind == PermissionOverwriteType::Member && o.id.get() == previous_owner_id
-                }) {
+            for old in &mut overwrites {
+                if old.kind == PermissionOverwriteType::Member
+                    && old.id.get() != owner_id
+                    && issued_members.contains(&old.id.get())
+                {
                     old.allow &= !owner_mask;
                 }
             }
+            overwrites.retain(|o| {
+                !(o.kind == PermissionOverwriteType::Member
+                    && o.id.get() != owner_id
+                    && issued_members.contains(&o.id.get())
+                    && o.allow.is_empty()
+                    && o.deny.is_empty())
+            });
             let owner_bits = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
             if let Some(owner) = overwrites
                 .iter_mut()
@@ -2227,6 +2311,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 RoomAction::RenameRoom { channel_id, name },
             );
         }
+        self.enqueue_owner_repairs(now_ms);
         let Some(action) = self.queue.pop_due(self.live.guild_id, now_ms) else {
             return false;
         };
@@ -2684,17 +2769,44 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             RoomAction::UpdateOwnership {
                 channel_id,
                 previous_owner_id,
-                owner_id,
-                original_creator_id,
+                ..
             } => {
                 let Some(room) = self.rooms.get(&channel_id).cloned() else {
+                    self.ownership_queued.remove(&channel_id);
+                    self.ownership_repairs.remove(&channel_id);
                     self.queue.mark_succeeded(&action);
                     return true;
                 };
-                // Even a stale A -> B action must revoke A after B -> C.
-                // Always grant the current room owner, never a stale recipient.
+                // A grant is never issued without durable recipient provenance.
+                // Retries/reloads retain every earlier possible recipient.
+                let intent = match self
+                    .store
+                    .prepare_owner_grants(&room, previous_owner_id)
+                    .await
+                {
+                    Ok(intent) => intent,
+                    Err(error) => {
+                        self.record(LifecycleFailure::Persistence {
+                            channel_id: Some(channel_id),
+                            error,
+                        });
+                        if error == StoreError::CredentialRefused {
+                            self.halted = true;
+                            self.queue.mark_succeeded(&action);
+                        } else {
+                            self.owner_action_failed(
+                                action,
+                                "owner grant preparation unavailable",
+                                elapsed_ms(now_ms, started),
+                            );
+                        }
+                        return true;
+                    }
+                };
+                // Always converge to the latest worker owner, never a stale
+                // queued recipient. After a restart that is the SQL owner.
                 if let Err(error) = self
-                    .rewrite_owner_grant(channel_id, previous_owner_id, room.owner_id)
+                    .rewrite_owner_grant(channel_id, &intent.members, room.owner_id)
                     .await
                 {
                     match error {
@@ -2713,51 +2825,47 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         }
                         _ => {
                             self.record(LifecycleFailure::Discord { channel_id, error });
-                            self.mark_failed_observed(
+                            self.owner_action_failed(
                                 action,
-                                "owner overwrite update unavailable".to_owned(),
+                                "owner overwrite update unavailable",
                                 elapsed_ms(now_ms, started),
                             );
                         }
                     }
                     return true;
                 }
-                if room.owner_id != owner_id || room.original_creator_id != original_creator_id {
-                    self.queue.mark_succeeded(&action);
-                    return true;
-                }
-                match self.store.update_ownership(&room).await {
+                match self.store.update_ownership(&room, &intent.revision).await {
                     Ok(true) => {
+                        self.ownership_queued.remove(&channel_id);
+                        self.ownership_repairs.remove(&channel_id);
                         self.queue.mark_succeeded(&action);
                     }
                     Ok(false) => {
-                        // Tracked but no database row (deleted out-of-band):
-                        // never retry a write that cannot land. The handoff
-                        // stays in the worker row and surfaces below.
                         self.record(LifecycleFailure::Persistence {
                             channel_id: Some(channel_id),
                             error: StoreError::Conflict,
                         });
-                        self.queue.mark_succeeded(&action);
-                    }
-                    Err(StoreError::CredentialRefused) => {
-                        self.record(LifecycleFailure::Persistence {
-                            channel_id: Some(channel_id),
-                            error: StoreError::CredentialRefused,
-                        });
-                        self.halted = true;
-                        self.queue.mark_succeeded(&action);
+                        self.owner_action_failed(
+                            action,
+                            "owner cleanup completion superseded",
+                            elapsed_ms(now_ms, started),
+                        );
                     }
                     Err(error) => {
                         self.record(LifecycleFailure::Persistence {
                             channel_id: Some(channel_id),
                             error,
                         });
-                        self.mark_failed_observed(
-                            action,
-                            "voice-room persistence unavailable".to_owned(),
-                            elapsed_ms(now_ms, started),
-                        );
+                        if error == StoreError::CredentialRefused {
+                            self.halted = true;
+                            self.queue.mark_succeeded(&action);
+                        } else {
+                            self.owner_action_failed(
+                                action,
+                                "voice-room persistence unavailable",
+                                elapsed_ms(now_ms, started),
+                            );
+                        }
                     }
                 }
             }

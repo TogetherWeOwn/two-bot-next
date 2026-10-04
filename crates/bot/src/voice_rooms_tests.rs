@@ -105,6 +105,11 @@ struct Store {
     trace: Trace,
     creators: Mutex<Vec<CreatorChannel>>,
     rooms: Mutex<HashMap<u64, VoiceRoom>>,
+    owner_intents: Mutex<HashMap<u64, OwnerGrantIntent>>,
+    owner_pending: Mutex<HashSet<u64>>,
+    owner_revision: AtomicU64,
+    prepare_errors: Mutex<VecDeque<StoreError>>,
+    ownership_errors: Mutex<VecDeque<StoreError>>,
     companions: Mutex<HashMap<(u64, u64), TextCompanion>>,
     persist_error: Option<StoreError>,
     access: Arc<Mutex<AccessControls>>,
@@ -128,6 +133,11 @@ impl Store {
             trace,
             creators: Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)]),
             rooms: Mutex::new(HashMap::new()),
+            owner_intents: Mutex::new(HashMap::new()),
+            owner_pending: Mutex::new(HashSet::new()),
+            owner_revision: AtomicU64::new(0),
+            prepare_errors: Mutex::new(VecDeque::new()),
+            ownership_errors: Mutex::new(VecDeque::new()),
             companions: Mutex::new(HashMap::new()),
             persist_error: None,
             access: Arc::new(Mutex::new(AccessControls::default())),
@@ -231,15 +241,57 @@ impl RoomPersistence for Store {
             .insert(room.channel_id, room.clone());
         Ok(())
     }
-    async fn update_ownership(&self, room: &VoiceRoom) -> Result<bool, StoreError> {
+    async fn pending_owner_grants(&self, _: u64) -> Result<Vec<u64>, StoreError> {
+        Ok(self.owner_pending.lock().unwrap().iter().copied().collect())
+    }
+    async fn prepare_owner_grants(
+        &self,
+        room: &VoiceRoom,
+        previous_owner_id: u64,
+    ) -> Result<OwnerGrantIntent, StoreError> {
+        if let Some(error) = self.prepare_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        let rooms = self.rooms.lock().unwrap();
+        let stored = rooms.get(&room.channel_id).ok_or(StoreError::Conflict)?;
+        let mut intents = self.owner_intents.lock().unwrap();
+        let intent = intents
+            .entry(room.channel_id)
+            .or_insert_with(|| OwnerGrantIntent {
+                revision: String::new(),
+                members: Vec::new(),
+            });
+        for member in [stored.owner_id, previous_owner_id, room.owner_id] {
+            if !intent.members.contains(&member) {
+                intent.members.push(member);
+            }
+        }
+        intent.members.sort_unstable();
+        intent.revision = (self.owner_revision.fetch_add(1, Ordering::Relaxed) + 1).to_string();
+        self.owner_pending.lock().unwrap().insert(room.channel_id);
+        Ok(intent.clone())
+    }
+    async fn update_ownership(&self, room: &VoiceRoom, revision: &str) -> Result<bool, StoreError> {
         self.trace.lock().unwrap().push(format!(
             "update_ownership:{}:{}",
             room.channel_id, room.owner_id
         ));
+        if let Some(error) = self.ownership_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
         let mut rooms = self.rooms.lock().unwrap();
+        let mut intents = self.owner_intents.lock().unwrap();
+        let Some(intent) = intents.get_mut(&room.channel_id) else {
+            return Ok(false);
+        };
+        if intent.revision != revision || !intent.members.contains(&room.owner_id) {
+            return Ok(false);
+        }
         if let Some(stored) = rooms.get_mut(&room.channel_id) {
             stored.owner_id = room.owner_id;
             stored.original_creator_id = room.original_creator_id;
+            intent.members = vec![room.owner_id];
+            self.owner_pending.lock().unwrap().remove(&room.channel_id);
             Ok(true)
         } else {
             Ok(false)
@@ -251,6 +303,8 @@ impl RoomPersistence for Store {
             return Err(error);
         }
         self.rooms.lock().unwrap().remove(&channel);
+        self.owner_intents.lock().unwrap().remove(&channel);
+        self.owner_pending.lock().unwrap().remove(&channel);
         Ok(())
     }
     async fn config_snapshot(&self, _: u64) -> Result<VoiceConfiguration, StoreError> {
@@ -1132,19 +1186,22 @@ async fn late_owner_overwrite_response_never_replaces_newer_gateway_evidence() {
             }
             gate.release.notify_one();
         };
-        let (result, ()) = tokio::join!(worker.rewrite_owner_grant(500, MEMBER, 301), mutation);
+        let (result, ()) = tokio::join!(worker.rewrite_owner_grant(500, &[MEMBER], 301), mutation);
         assert_eq!(result, Err(RoomHttpError::Cancelled), "{event}");
         worker.http.overwrites_gate = None;
         if event == "delete" {
             assert!(!live.inner.read().unwrap().channels.contains_key(&500));
             assert_eq!(
-                worker.rewrite_owner_grant(500, MEMBER, 301).await,
+                worker.rewrite_owner_grant(500, &[MEMBER], 301).await,
                 Err(RoomHttpError::NotFound)
             );
         } else if event == "reconnect" {
             assert_eq!(live.inner.read().unwrap().channels[&500], original);
         } else {
-            worker.rewrite_owner_grant(500, MEMBER, 301).await.unwrap();
+            worker
+                .rewrite_owner_grant(500, &[MEMBER], 301)
+                .await
+                .unwrap();
             let state = live.inner.read().unwrap();
             let newer = &state.channels[&500];
             assert_eq!(newer.name.as_deref(), Some("newer gateway name"));
@@ -1170,7 +1227,7 @@ async fn rapid_transfers_revoke_all_former_owners_and_never_grant_a_stale_recipi
     worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
     worker.apply_ownership(301, false, OwnershipCommand::Transfer { target_id: 302 });
     dispatch(&mut worker, 0).await;
-    dispatch(&mut worker, 1).await;
+    assert!(!worker.dispatch_one(1).await, "handoffs coalesce per room");
     let state = live.inner.read().unwrap();
     let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
     for former in [MEMBER, 301] {
@@ -1187,6 +1244,146 @@ async fn rapid_transfers_revoke_all_former_owners_and_never_grant_a_stale_recipi
         .lock()
         .unwrap()
         .contains(&"update_ownership:500:302".to_owned()));
+}
+
+#[tokio::test]
+async fn owner_grants_are_never_issued_after_failed_journal_preparation() {
+    let (live, store, http, trace) = owned_room();
+    store
+        .prepare_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::Unavailable);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
+    dispatch(&mut worker, 0).await;
+    assert!(
+        trace.lock().unwrap().is_empty(),
+        "no Discord grant or ownership commit"
+    );
+    assert!(worker.store.owner_pending.lock().unwrap().is_empty());
+    assert_eq!(worker.store.rooms.lock().unwrap()[&500].owner_id, MEMBER);
+}
+
+#[tokio::test]
+async fn failed_owner_commit_reload_and_later_transfer_revoke_every_issued_recipient() {
+    let (live, store, http, trace) = owned_room();
+    let mut original = channel(500, 2, Some(CATEGORY));
+    let independent = PermissionOverwrite {
+        id: Id::new(301),
+        kind: PermissionOverwriteType::Member,
+        allow: Permissions::EMBED_LINKS,
+        deny: Permissions::SEND_MESSAGES,
+    };
+    original.permission_overwrites = Some(vec![owner_overwrite(MEMBER), independent]);
+    live.upsert_channel(original);
+    live.voice_update_at(302, Some(500), Some(false), 1_000);
+    let store = Arc::new(store);
+    store
+        .ownership_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::Unavailable);
+    let mut worker = GuildRoomWorker::load(live.clone(), store.clone(), http)
+        .await
+        .unwrap();
+    worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
+    assert!(worker.dispatch_one(0).await);
+    assert_eq!(store.rooms.lock().unwrap()[&500].owner_id, MEMBER);
+    assert!(store.owner_pending.lock().unwrap().contains(&500));
+    assert_eq!(
+        store.owner_intents.lock().unwrap()[&500].members,
+        [MEMBER, 301]
+    );
+    assert!(live.inner.read().unwrap().channels[&500]
+        .permission_overwrites
+        .as_ref()
+        .unwrap()
+        .iter()
+        .any(|o| o.id.get() == 301 && o.allow.contains(Permissions::MANAGE_CHANNELS)));
+    drop(worker);
+
+    // The ledger owner is still present, so succession does nothing. Recovery
+    // must nevertheless undo the uncommitted recipient grant after reload.
+    let mut restarted = GuildRoomWorker::load(live.clone(), store.clone(), Http::new(trace))
+        .await
+        .unwrap();
+    restarted.reconcile();
+    assert!(restarted.dispatch_one(0).await);
+    assert!(!store.owner_pending.lock().unwrap().contains(&500));
+    assert_eq!(restarted.rooms[&500].owner_id, MEMBER);
+    restarted.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 302 });
+    assert!(restarted.dispatch_one(1).await);
+    assert_eq!(store.rooms.lock().unwrap()[&500].owner_id, 302);
+    let state = live.inner.read().unwrap();
+    let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+    for former in [MEMBER, 301] {
+        assert!(!overwrites.iter().any(|o| o.id.get() == former
+            && o.allow
+                .intersects(Permissions::from_bits_retain(OWNER_ALLOW_BITS))));
+    }
+    assert!(overwrites.contains(&independent));
+    assert!(overwrites.contains(&owner_overwrite(302)));
+}
+
+#[tokio::test]
+async fn exhausted_owner_cleanup_is_retained_and_recovers_after_access_restoration() {
+    for later_handoff in [false, true] {
+        let (live, store, http, _) = owned_room();
+        let mut original = channel(500, 2, Some(CATEGORY));
+        original.permission_overwrites = Some(vec![owner_overwrite(MEMBER)]);
+        live.upsert_channel(original);
+        for member in [302, 303] {
+            live.voice_update_at(member, Some(500), Some(false), 1_000);
+        }
+        let mut worker = GuildRoomWorker::load(live.clone(), store, http)
+            .await
+            .unwrap();
+        worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
+        dispatch(&mut worker, 0).await;
+        let full_access = live.inner.read().unwrap().bot.clone().unwrap();
+        let mut reduced = full_access.clone();
+        for role in &mut reduced.roles {
+            role.permissions &= !Permissions::MANAGE_ROLES;
+        }
+        live.refresh_bot(reduced);
+        worker.apply_ownership(301, false, OwnershipCommand::Transfer { target_id: 302 });
+        let mut now = 100_000;
+        for _ in 0..QUEUE_MAX_ATTEMPTS {
+            dispatch(&mut worker, now).await;
+            now += 100_000;
+        }
+        assert_eq!(worker.queue.failed().len(), 1);
+        assert!(worker.store.owner_pending.lock().unwrap().contains(&500));
+        assert_eq!(worker.store.rooms.lock().unwrap()[&500].owner_id, 301);
+        assert!(
+            !worker.dispatch_one(now).await,
+            "no retry storm while access is absent"
+        );
+        let owner = if later_handoff {
+            worker.apply_ownership(302, false, OwnershipCommand::Transfer { target_id: 303 });
+            dispatch(&mut worker, now).await;
+            now += 100_000;
+            assert_eq!(
+                worker.store.rooms.lock().unwrap()[&500].owner_id,
+                301,
+                "missing immediate predecessor grant cannot hide the earlier grant"
+            );
+            303
+        } else {
+            302
+        };
+        live.refresh_bot(full_access);
+        dispatch(&mut worker, now).await;
+        assert_eq!(worker.store.rooms.lock().unwrap()[&500].owner_id, owner);
+        assert!(!worker.store.owner_pending.lock().unwrap().contains(&500));
+        let state = live.inner.read().unwrap();
+        let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+        assert!(!overwrites.iter().any(|o| o.id.get() == 301
+            && o.allow
+                .intersects(Permissions::from_bits_retain(OWNER_ALLOW_BITS))));
+        assert!(overwrites.contains(&owner_overwrite(owner)));
+    }
 }
 
 #[tokio::test]

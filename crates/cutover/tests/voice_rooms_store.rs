@@ -156,6 +156,7 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
         "handoff must not move the rollback stamp backwards"
     );
     assert!(!store.update_ownership(100, 599, 301, 300).await?);
+    verify_owner_grant_journal(&store, pool, &handed).await?;
 
     // V9b companion records: creation snapshot round-trips, insert-once, and
     // get/delete per room. The snapshot decodes back into the pure settings.
@@ -233,6 +234,78 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     );
     verify_access_controls(&store, pool).await?;
     verify_logging_settings(&store, pool).await
+}
+
+async fn verify_owner_grant_journal(
+    store: &PgRoomStore,
+    pool: &PgPool,
+    room: &VoiceRoom,
+) -> TestResult {
+    let mut proposed = room.clone();
+    proposed.owner_id = 302;
+    proposed.original_creator_id = 302;
+    let first = store
+        .prepare_owner_grants(&proposed, room.owner_id)
+        .await?
+        .unwrap();
+    assert_eq!(first.members, [301, 302]);
+    let restarted = PgRoomStore::new(pool.clone());
+    assert_eq!(restarted.pending_owner_grants(100).await?, [500]);
+    assert!(restarted.pending_owner_grants(101).await?.is_empty());
+    assert_eq!(restarted.room_for(100, 500).await?, Some(room.clone()));
+
+    // Refuse the final ownership UPDATE after the preparation committed. The
+    // transaction must roll back without acknowledging any possible grant.
+    sqlx::query("ALTER TABLE voice_rooms ADD CONSTRAINT journal_test_refuse CHECK (owner_id <> '302') NOT VALID")
+        .execute(pool).await?;
+    assert!(store
+        .complete_owner_grants(&proposed, &first.revision)
+        .await
+        .is_err());
+    assert_eq!(restarted.pending_owner_grants(100).await?, [500]);
+    assert_eq!(restarted.room_for(100, 500).await?, Some(room.clone()));
+    sqlx::query("ALTER TABLE voice_rooms DROP CONSTRAINT journal_test_refuse")
+        .execute(pool)
+        .await?;
+
+    proposed.owner_id = 303;
+    proposed.original_creator_id = 303;
+    let newer = restarted
+        .prepare_owner_grants(&proposed, 302)
+        .await?
+        .unwrap();
+    assert_ne!(first.revision, newer.revision);
+    assert_eq!(newer.members, [301, 302, 303]);
+    assert!(
+        !store
+            .complete_owner_grants(&proposed, &first.revision)
+            .await?,
+        "stale completion must not clear a newer intent"
+    );
+    assert_eq!(restarted.pending_owner_grants(100).await?, [500]);
+    assert!(
+        restarted
+            .complete_owner_grants(&proposed, &newer.revision)
+            .await?
+    );
+    assert!(store.pending_owner_grants(100).await?.is_empty());
+    assert_eq!(store.room_for(100, 500).await?, Some(proposed));
+    let retained: Vec<String> = sqlx::query_scalar("SELECT member_id FROM voice_owner_grants WHERE guild_id = '100' AND channel_id = '500' ORDER BY member_id")
+        .fetch_all(pool).await?;
+    assert_eq!(retained, ["303"]);
+
+    // Restore the round-trip fixture with the same fenced completion path.
+    let restore = store.prepare_owner_grants(room, 303).await?.unwrap();
+    assert!(store.complete_owner_grants(room, &restore.revision).await?);
+    let mut missing = room.clone();
+    missing.guild_id = 101;
+    assert!(store.prepare_owner_grants(&missing, 301).await?.is_none());
+    assert!(
+        !store
+            .complete_owner_grants(&missing, &restore.revision)
+            .await?
+    );
+    Ok(())
 }
 
 async fn verify_access_controls(store: &PgRoomStore, pool: &PgPool) -> TestResult {
