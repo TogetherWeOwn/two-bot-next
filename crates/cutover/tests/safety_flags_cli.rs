@@ -34,7 +34,10 @@ fn assert_input_refusal(bin: &str, args: &[&str], flag: &str) {
     let error = String::from_utf8(output.stderr).unwrap();
     assert_eq!(output.status.code(), Some(2), "{bin} {args:?}: {error}");
     assert!(output.stdout.is_empty(), "{bin} {args:?}");
-    assert!(error.starts_with("input error: "), "{bin} {args:?}: {error}");
+    assert!(
+        error.starts_with("input error: "),
+        "{bin} {args:?}: {error}"
+    );
     assert!(error.contains(flag), "{bin} {args:?}: {error}");
     assert!(!error.contains("cannot read"), "{error}");
     assert!(!error.contains("database"), "{error}");
@@ -135,11 +138,7 @@ fn bare_opt_ins_and_normal_values_reach_the_missing_file_not_the_db() {
             LIVE_GUILD_ID,
             equals_file.as_str(),
         ],
-        vec![
-            "--guild=111111111111111111",
-            "--file",
-            MISSING_INPUT,
-        ],
+        vec!["--guild=111111111111111111", "--file", MISSING_INPUT],
     ] {
         let output = run(BINS[0], &args);
         let error = String::from_utf8(output.stderr).unwrap();

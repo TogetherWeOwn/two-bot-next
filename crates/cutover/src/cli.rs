@@ -35,7 +35,9 @@ impl Args {
                 let (k, v) = a.split_at(eq);
                 if let Some(key) = k.strip_prefix("--") {
                     if is_safety_opt_in(key) {
-                        return Err(format!("--{key} is a bare opt-in and does not accept a value"));
+                        return Err(format!(
+                            "--{key} is a bare opt-in and does not accept a value"
+                        ));
                     }
                     out.values.insert(key.to_owned(), v[1..].to_owned());
                     i += 1;
@@ -213,7 +215,11 @@ mod tests {
             let false_value = format!("--{flag}=false");
             for argv in [
                 vec![bare.as_str(), bare.as_str()],
-                vec![bare.as_str(), "--guild-id=111111111111111111", bare.as_str()],
+                vec![
+                    bare.as_str(),
+                    "--guild-id=111111111111111111",
+                    bare.as_str(),
+                ],
                 vec![bare.as_str(), false_value.as_str()],
                 vec![false_value.as_str(), bare.as_str()],
                 vec![bare.as_str(), "false", bare.as_str()],
