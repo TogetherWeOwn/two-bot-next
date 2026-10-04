@@ -3,8 +3,8 @@
 //! blindly retries a create whose response may have been lost.
 //!
 //! Sources:
-//! https://docs.rs/twilight-http/0.17.1/twilight_http/request/guild/struct.CreateGuildChannel.html
-//! https://docs.discord.com/developers/topics/permissions#permission-overwrites
+//! <https://docs.rs/twilight-http/0.17.1/twilight_http/request/guild/struct.CreateGuildChannel.html>
+//! <https://docs.discord.com/developers/topics/permissions#permission-overwrites>
 
 use std::{
     sync::{
@@ -29,13 +29,20 @@ use serde::Deserialize;
 use tokio::time::Instant;
 use twilight_http::{error::ErrorType, request::TryIntoRequest, Client};
 use twilight_model::{
-    channel::message::AllowedMentions,
+    channel::message::{component::Component, AllowedMentions},
     channel::{
         permission_overwrite::{PermissionOverwrite, PermissionOverwriteType},
         Channel, ChannelType, VideoQualityMode,
     },
     guild::{Permissions, Role},
-    http::interaction::InteractionResponse,
+    http::{
+        attachment::Attachment,
+        interaction::InteractionResponse,
+        permission_overwrite::{
+            PermissionOverwrite as HttpPermissionOverwrite,
+            PermissionOverwriteType as HttpPermissionOverwriteType,
+        },
+    },
     id::{
         marker::{ApplicationMarker, InteractionMarker, RoleMarker},
         Id,
@@ -43,6 +50,7 @@ use twilight_model::{
 };
 use two_bot_core::{
     voice_rooms::{parse_retry_after_ms, CreatorChannel, MAX_USER_LIMIT},
+    voice_text_channel::{ChannelOverwrite, OverwriteTarget, TextChannelPlan},
     Snowflake,
 };
 
@@ -105,6 +113,17 @@ pub fn can_manage_room(permissions: Option<Permissions>) -> bool {
     })
 }
 
+/// V4 vote-kick enforcement: the member-scoped Connect deny is a permission
+/// overwrite write (Manage Roles) and the disconnect is a Move Members write.
+#[must_use]
+pub fn can_enforce_kick(permissions: Option<Permissions>) -> bool {
+    permissions.is_some_and(|permissions| {
+        permissions.contains(
+            Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES | Permissions::MOVE_MEMBERS,
+        )
+    })
+}
+
 /// Attributes captured from the live creator, not from an earlier gateway frame.
 /// Overwrites are resolved by the worker according to PermissionSource, then
 /// included in the POST. No post-create permission patch is needed.
@@ -116,6 +135,9 @@ pub struct RoomChannelAttributes {
     pub video_quality_mode: Option<VideoQualityMode>,
     pub nsfw: bool,
     pub user_limit: u16,
+    /// Create-time sorting position (V8 placement); `None` lets Discord append.
+    pub position: Option<u64>,
+    /// Empty means "include no overrides": the room syncs to its category.
     pub overwrites: Vec<PermissionOverwrite>,
 }
 
@@ -148,9 +170,82 @@ impl RoomChannelAttributes {
             video_quality_mode: channel.video_quality_mode,
             nsfw: channel.nsfw.unwrap_or(false),
             user_limit,
+            position: None,
             overwrites,
         })
     }
+}
+
+/// Map one pure V9 [`ChannelOverwrite`] to its Discord wire form. View is
+/// the only bit ever set: allow grants View, deny denies it.
+fn wire_overwrite(
+    guild_id: Snowflake,
+    overwrite: &ChannelOverwrite,
+) -> Option<PermissionOverwrite> {
+    let (kind, id) = match overwrite.target {
+        OverwriteTarget::Everyone => (PermissionOverwriteType::Role, guild_id),
+        OverwriteTarget::Role(role_id) => (PermissionOverwriteType::Role, role_id),
+        OverwriteTarget::Member(member_id) => (PermissionOverwriteType::Member, member_id),
+    };
+    if id == 0 {
+        return None;
+    }
+    let mut allow = Permissions::empty();
+    let mut deny = Permissions::empty();
+    if overwrite.allow_view {
+        allow |= Permissions::VIEW_CHANNEL;
+    }
+    if overwrite.deny_view {
+        deny |= Permissions::VIEW_CHANNEL;
+    }
+    Some(PermissionOverwrite {
+        allow,
+        deny,
+        id: Id::new(id),
+        kind,
+    })
+}
+
+/// Full overwrite set for a V9 companion POST, with the bot's own View
+/// allow appended (V9 AC5): a non-admin bot denied via @everyone would
+/// otherwise get Missing Access on later overwrite edits and deletion.
+/// Overwrites ride the create POST and are never patched afterwards (V8
+/// rule). Zero IDs are dropped, never emitted.
+#[must_use]
+pub fn companion_overwrites(plan: &TextChannelPlan, bot_id: Snowflake) -> Vec<PermissionOverwrite> {
+    let mut overwrites: Vec<PermissionOverwrite> = plan
+        .overwrites
+        .iter()
+        .filter_map(|overwrite| wire_overwrite(plan.guild_id, overwrite))
+        .collect();
+    if bot_id != 0
+        && !overwrites.iter().any(|overwrite| {
+            overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == bot_id
+        })
+    {
+        overwrites.push(PermissionOverwrite {
+            allow: Permissions::VIEW_CHANNEL,
+            deny: Permissions::empty(),
+            id: Id::new(bot_id),
+            kind: PermissionOverwriteType::Member,
+        });
+    }
+    overwrites
+}
+
+/// One occupant's View grant on the companion (V9 join): Member allow, never
+/// a deny.
+#[must_use]
+pub fn companion_view_grant(member_id: Snowflake) -> Option<PermissionOverwrite> {
+    if member_id == 0 {
+        return None;
+    }
+    Some(PermissionOverwrite {
+        allow: Permissions::VIEW_CHANNEL,
+        deny: Permissions::empty(),
+        id: Id::new(member_id),
+        kind: PermissionOverwriteType::Member,
+    })
 }
 
 /// Sanitized errors: never surface HTTP bodies/tokens/member data in diagnostics.
@@ -275,6 +370,12 @@ impl RoomHttp {
                 request.body().unwrap_or_default(),
             )))
             .map_err(|_| RoomHttpError::InvalidRequest)?;
+        // One adapter-visible REST attempt per wire send, shared with the
+        // executor's accounting: template only, never IDs, tokens or bodies.
+        // `Attempt` finishes at headers so 429s stay visible even when the
+        // body is broken; transport failures and outer timeouts fall back to
+        // `transport` via `Drop`.
+        let mut attempt = crate::executor_metrics::Attempt::new(&request);
         let response = tokio::time::timeout(Duration::from_secs(10), async {
             let response = self
                 .transport
@@ -282,6 +383,7 @@ impl RoomHttp {
                 .await
                 .map_err(|_| RoomHttpError::UnknownOutcome)?;
             let status = response.status().as_u16();
+            attempt.finish(Some(status));
             if status == 401 {
                 if bot_authenticated {
                     self.unauthorized.store(true, Ordering::Relaxed);
@@ -353,23 +455,73 @@ impl RoomHttp {
     }
 
     /// Complete the deferred response, never a second initial response.
+    /// `attachments` carries `/export` file bytes; `components` carries the
+    /// `/import` Confirm/Cancel buttons. Both are omitted when empty, so a
+    /// plain text edit changes nothing else on the message.
     pub async fn complete_interaction(
         &self,
         application: Id<ApplicationMarker>,
         token: &str,
         content: &str,
+        attachments: &[Attachment],
+        components: Option<&[Component]>,
     ) -> Result<(), RoomHttpError> {
         let mentions = AllowedMentions::default();
-        let request = self
-            .http
-            .interaction(application)
+        let interaction = self.http.interaction(application);
+        let mut update = interaction
             .update_response(token)
             .content(Some(content))
-            .allowed_mentions(Some(&mentions))
-            .try_into_request()
-            .map_err(classify_http_error)?;
+            .allowed_mentions(Some(&mentions));
+        if !attachments.is_empty() {
+            update = update.attachments(attachments);
+        }
+        if let Some(components) = components {
+            update = update.components(Some(components));
+        }
+        let request = update.try_into_request().map_err(classify_http_error)?;
         self.send_request(request, || true, false).await?;
         Ok(())
+    }
+
+    /// Download a Discord-hosted `/import` file, capped at `max_bytes`.
+    /// Only the Discord CDN host is fetched, over HTTPS and without the bot
+    /// credential: attachment URLs are signed and need no authorization.
+    /// Oversized bodies, non-2xx statuses and transport failures surface as
+    /// errors with no partial bytes.
+    pub async fn download_attachment(
+        &self,
+        url: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RoomHttpError> {
+        let uri: http::Uri = url.parse().map_err(|_| RoomHttpError::InvalidRequest)?;
+        if uri.scheme() != Some(&http::uri::Scheme::HTTPS)
+            || uri.host() != Some("cdn.discordapp.com")
+        {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let request = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Full::new(Bytes::new()))
+            .map_err(|_| RoomHttpError::InvalidRequest)?;
+        let response =
+            tokio::time::timeout(Duration::from_secs(10), self.transport.request(request))
+                .await
+                .map_err(|_| RoomHttpError::UnknownOutcome)?
+                .map_err(|_| RoomHttpError::UnknownOutcome)?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(classify_response(status, &[]));
+        }
+        let body = Limited::new(response.into_body(), max_bytes.saturating_add(1))
+            .collect()
+            .await
+            .map_err(|_| RoomHttpError::UnknownOutcome)?
+            .to_bytes();
+        if body.len() > max_bytes {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        Ok(body.to_vec())
     }
 
     pub async fn create_room(
@@ -387,8 +539,15 @@ impl RoomHttp {
             .create_guild_channel(Id::new(guild_id), name)
             .kind(ChannelType::GuildVoice)
             .nsfw(attributes.nsfw)
-            .user_limit(attributes.user_limit)
-            .permission_overwrites(&attributes.overwrites);
+            .user_limit(attributes.user_limit);
+        // An empty list is omitted rather than sent, so a category-synced room
+        // really syncs instead of being created with an explicit empty set.
+        if !attributes.overwrites.is_empty() {
+            request = request.permission_overwrites(&attributes.overwrites);
+        }
+        if let Some(position) = attributes.position {
+            request = request.position(position);
+        }
         if let Some(parent_id) = attributes.parent_id {
             request = request.parent_id(Id::new(parent_id));
         }
@@ -427,6 +586,68 @@ impl RoomHttp {
         Ok(())
     }
 
+    /// V4 vote-kick enforcement, first half: move the member out of voice by
+    /// clearing their voice channel (`channel_id: null`). Source:
+    /// <https://docs.rs/twilight-http/0.17.1/twilight_http/request/guild/member/struct.UpdateGuildMember.html>
+    /// A 404 means the member already left: the spec cancels the vote when the
+    /// target leaves, so treat it as success.
+    pub async fn disconnect_member(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        still_valid: impl Fn() -> bool + Send + 'static,
+    ) -> Result<(), RoomHttpError> {
+        if guild_id == 0 || member_id == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let request = self
+            .http
+            .update_guild_member(Id::new(guild_id), Id::new(member_id))
+            .channel_id(None)
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        match self.send(request, still_valid).await {
+            Ok(_) => Ok(()),
+            Err(error) => match error {
+                // A duplicate disconnect is success: the member already left.
+                RoomHttpError::NotFound => Ok(()),
+                other => Err(other),
+            },
+        }
+    }
+
+    /// V4 vote-kick enforcement, second half: deny Connect to the target on
+    /// this room channel only (member-scoped overwrite, not a guild kick or
+    /// ban). CONNECT is denied while every other bit is left alone:
+    /// allow carries empty so the write neither grants nor (via `allow`)
+    /// preserves anything outside the deny bit.
+    ///
+    /// Named `deny_member_connect` (not `deny_connect`) so the `RoomWrites`
+    /// trait impl can call it without resolving to itself.
+    pub async fn deny_member_connect(
+        &self,
+        channel_id: Snowflake,
+        member_id: Snowflake,
+        still_valid: impl Fn() -> bool + Send + 'static,
+    ) -> Result<(), RoomHttpError> {
+        if channel_id == 0 || member_id == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let overwrite = HttpPermissionOverwrite {
+            allow: Some(Permissions::empty()),
+            deny: Some(Permissions::CONNECT),
+            id: Id::new(member_id),
+            kind: HttpPermissionOverwriteType::Member,
+        };
+        let request = self
+            .http
+            .update_channel_permission(Id::new(channel_id), &overwrite)
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        self.send(request, still_valid).await?;
+        Ok(())
+    }
+
     /// The worker must only supply channels from its tracked-room store or from
     /// its own successful create result (compensation). Never use a category scan.
     pub async fn delete_room(
@@ -450,6 +671,138 @@ impl RoomHttp {
                 other => Err(other),
             },
         }
+    }
+
+    /// Create a V9 companion text channel in the room's category, with the
+    /// full overwrite set (including the bot's View allow) in the POST —
+    /// never patched afterwards. Single attempt: an unknown outcome must not
+    /// produce another POST (the worker adopts the channel from its live
+    /// snapshot when it can, and records the failure otherwise).
+    pub async fn create_companion(
+        &self,
+        plan: &TextChannelPlan,
+        bot_id: Snowflake,
+        still_managing: impl Fn() -> bool + Send + 'static,
+    ) -> Result<Channel, RoomHttpError> {
+        if plan.guild_id == 0 || plan.room_id == 0 || plan.category_id == 0 || bot_id == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let request = self
+            .http
+            .create_guild_channel(Id::new(plan.guild_id), &plan.name)
+            .kind(ChannelType::GuildText)
+            .parent_id(Id::new(plan.category_id))
+            .permission_overwrites(&companion_overwrites(plan, bot_id))
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        let body = self.send(request, still_managing).await?;
+        serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)
+    }
+
+    /// Grant one occupant View on the companion (V9 join): a Member allow,
+    /// never a deny.
+    pub async fn grant_companion_view(
+        &self,
+        text_channel_id: Snowflake,
+        member_id: Snowflake,
+        still_managing: impl Fn() -> bool + Send + 'static,
+    ) -> Result<(), RoomHttpError> {
+        let overwrite = companion_view_grant(member_id).ok_or(RoomHttpError::InvalidRequest)?;
+        if text_channel_id == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        // The edit endpoint takes the outbound model, not the channel model.
+        let wire = HttpPermissionOverwrite {
+            allow: Some(overwrite.allow),
+            deny: Some(overwrite.deny),
+            id: overwrite.id,
+            kind: HttpPermissionOverwriteType::Member,
+        };
+        let request = self
+            .http
+            .update_channel_permission(Id::new(text_channel_id), &wire)
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        self.send(request, still_managing).await?;
+        Ok(())
+    }
+
+    /// Remove one occupant's overwrite from the companion (V9 leave): the
+    /// overwrite is deleted, never replaced with a deny. Deleting an absent
+    /// overwrite is success.
+    pub async fn revoke_companion_view(
+        &self,
+        text_channel_id: Snowflake,
+        member_id: Snowflake,
+        still_managing: impl Fn() -> bool + Send + 'static,
+    ) -> Result<(), RoomHttpError> {
+        if text_channel_id == 0 || member_id == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let request = self
+            .http
+            .delete_channel_permission(Id::new(text_channel_id))
+            .member(Id::new(member_id))
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        match self.send(request, still_managing).await {
+            Ok(_) => Ok(()),
+            // Deleting an absent overwrite (or a channel already gone) is
+            // success: the end state — no overwrite — already holds.
+            Err(RoomHttpError::NotFound) => Ok(()),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Post an operator notice to a channel. Only the given role (if any) can
+    /// be pinged: `allowed_mentions` is otherwise empty, so notice text can
+    /// never ping members, `@everyone` or other roles.
+    pub async fn post_notice(
+        &self,
+        channel_id: Snowflake,
+        content: &str,
+        mention_role: Option<Snowflake>,
+    ) -> Result<(), RoomHttpError> {
+        if channel_id == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let mut text = String::new();
+        let mut mentions = AllowedMentions::default();
+        if let Some(role) = mention_role.filter(|role| *role != 0) {
+            text.push_str(&format!("<@&{role}> "));
+            mentions.roles.push(Id::new(role));
+        }
+        text.push_str(content);
+        let request = self
+            .http
+            .create_message(Id::new(channel_id))
+            .content(&text)
+            .allowed_mentions(Some(&mentions))
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        self.send(request, || true).await?;
+        Ok(())
+    }
+
+    /// Open (or reuse) the DM channel with `user_id`, then post the notice
+    /// with no mentions allowed.
+    pub async fn direct_notice(
+        &self,
+        user_id: Snowflake,
+        content: &str,
+    ) -> Result<(), RoomHttpError> {
+        if user_id == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let request = self
+            .http
+            .create_private_channel(Id::new(user_id))
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        let body = self.send(request, || true).await?;
+        let channel: Channel =
+            serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)?;
+        self.post_notice(channel.id.get(), content, None).await
     }
 
     pub async fn rename_room(
@@ -586,6 +939,7 @@ mod tests {
                 video_quality_mode: Some(VideoQualityMode::Full),
                 nsfw: true,
                 user_limit: 8,
+                position: None,
                 overwrites: overrides,
             }
         );
@@ -730,6 +1084,35 @@ mod tests {
     }
 
     #[test]
+    fn vote_kick_enforcement_needs_view_manage_roles_and_move() {
+        use twilight_model::guild::Permissions;
+        const REQUIRED: Permissions = Permissions::VIEW_CHANNEL
+            .union(Permissions::MANAGE_ROLES)
+            .union(Permissions::MOVE_MEMBERS);
+        // All three bits present allows; extra bits do not deny.
+        assert!(can_enforce_kick(Some(REQUIRED)));
+        assert!(can_enforce_kick(Some(REQUIRED.union(Permissions::CONNECT))));
+        assert!(can_enforce_kick(Some(Permissions::all())));
+        // Fail closed on missing snapshots or empty permissions.
+        assert!(!can_enforce_kick(None));
+        assert!(!can_enforce_kick(Some(Permissions::empty())));
+        // Each missing bit denies.
+        assert!(!can_enforce_kick(Some(
+            Permissions::MANAGE_ROLES.union(Permissions::MOVE_MEMBERS)
+        )));
+        assert!(!can_enforce_kick(Some(
+            Permissions::VIEW_CHANNEL.union(Permissions::MOVE_MEMBERS)
+        )));
+        assert!(!can_enforce_kick(Some(
+            Permissions::VIEW_CHANNEL.union(Permissions::MANAGE_ROLES)
+        )));
+        // Single bits alone deny.
+        assert!(!can_enforce_kick(Some(Permissions::VIEW_CHANNEL)));
+        assert!(!can_enforce_kick(Some(Permissions::MANAGE_ROLES)));
+        assert!(!can_enforce_kick(Some(Permissions::MOVE_MEMBERS)));
+    }
+
+    #[test]
     fn rate_limits_preserve_fractional_retry_after_and_global_scope() {
         assert_eq!(
             classify_response(429, br#"{"retry_after":1.2345,"global":true}"#),
@@ -760,5 +1143,58 @@ mod tests {
                 code: 50035
             }
         );
+    }
+
+    fn companion_plan(overwrites: Vec<ChannelOverwrite>) -> TextChannelPlan {
+        TextChannelPlan {
+            room_id: 500,
+            guild_id: 100,
+            name: "voice-chat".to_owned(),
+            category_id: 400,
+            overwrites,
+            settings: two_bot_core::voice_text_channel::TextChannelSettings {
+                enabled: true,
+                configured_name: None,
+                viewer_role_id: None,
+            },
+        }
+    }
+
+    #[test]
+    fn companion_view_grant_is_a_member_allow_never_a_deny() {
+        let grant = companion_view_grant(300).unwrap();
+        assert_eq!(grant.id.get(), 300);
+        assert_eq!(grant.kind, PermissionOverwriteType::Member);
+        assert_eq!(grant.allow, Permissions::VIEW_CHANNEL);
+        assert_eq!(grant.deny, Permissions::empty());
+        assert!(companion_view_grant(0).is_none());
+    }
+
+    #[test]
+    fn companion_overwrites_add_the_bot_view_allow_exactly_once() {
+        let plan = companion_plan(vec![ChannelOverwrite {
+            target: OverwriteTarget::Everyone,
+            allow_view: false,
+            deny_view: true,
+        }]);
+        let overwrites = companion_overwrites(&plan, 999);
+        assert_eq!(overwrites.len(), 2);
+        assert_eq!(overwrites[0].id.get(), 100);
+        assert_eq!(overwrites[0].kind, PermissionOverwriteType::Role);
+        assert_eq!(overwrites[0].deny, Permissions::VIEW_CHANNEL);
+        assert_eq!(overwrites[1].id.get(), 999);
+        assert_eq!(overwrites[1].kind, PermissionOverwriteType::Member);
+        assert_eq!(overwrites[1].allow, Permissions::VIEW_CHANNEL);
+        assert_eq!(overwrites[1].deny, Permissions::empty());
+
+        // A plan that already grants the bot is not duplicated; a zero bot
+        // id adds nothing.
+        let planned_bot = companion_plan(vec![ChannelOverwrite {
+            target: OverwriteTarget::Member(999),
+            allow_view: true,
+            deny_view: false,
+        }]);
+        assert_eq!(companion_overwrites(&planned_bot, 999).len(), 1);
+        assert_eq!(companion_overwrites(&plan, 0).len(), 1);
     }
 }

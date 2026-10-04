@@ -1,0 +1,781 @@
+{
+  "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
+  "count": 27,
+  "dm_permission_all_false": true,
+  "commands": [
+    {
+      "name": "rank",
+      "description": "Show your XP, level and server rank.",
+      "family": "core",
+      "gate": "always",
+      "default_member_permissions": null,
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "member",
+          "description": "Show another member.",
+          "type": "user",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "covered",
+      "expected_response": "docs/smoke-expected-responses.md Expected-response table, `/rank` happy-path shape; docs/smoke-run-record.md row 1",
+      "deferral_reason": null
+    },
+    {
+      "name": "leaderboard",
+      "description": "Show the server XP leaderboard.",
+      "family": "core",
+      "gate": "always",
+      "default_member_permissions": null,
+      "dm_permission": false,
+      "options": [],
+      "smoke": "covered",
+      "expected_response": "docs/smoke-expected-responses.md Expected-response table, `/leaderboard` happy-path shape; docs/smoke-run-record.md row 2",
+      "deferral_reason": null
+    },
+    {
+      "name": "attendance",
+      "description": "Record a verified human attendee for a Discord event occurrence.",
+      "family": "scorecard",
+      "gate": "scorecard",
+      "default_member_permissions": "8589934592",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "event-occurrence",
+          "description": "Scheduled event id or stable occurrence id.",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 128,
+          "choices": []
+        },
+        {
+          "name": "member",
+          "description": "Human member who attended.",
+          "type": "user",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Needs a seeded event-occurrence plus a verified-human fixture; scorecard check-in path sits outside the one-per-family smoke budget."
+    },
+    {
+      "name": "command",
+      "description": "Define or replace a custom command",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "name",
+          "description": "Command name, a-z 0-9 _ -",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "template",
+          "description": "What the bot replies; {user} {username} {server} {channel}",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "description",
+          "description": "Shown in the command picker",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "text-trigger",
+          "description": "Optional !trigger form, e.g. !faq",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Mutating admin CRUD that creates live commands; the read-only smoke excludes state writes. Routing is pinned by the publish set."
+    },
+    {
+      "name": "command-remove",
+      "description": "Delete a custom command",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "name",
+          "description": "Command to delete",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Destructive admin op; excluded from the read-only smoke. Same AutomationAdmin handler family as the publish set."
+    },
+    {
+      "name": "command-list",
+      "description": "List this server's custom commands",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Read-only but needs DB-backed custom rows, which the no-DB offline rule excludes; the list is empty in the smoke guild."
+    },
+    {
+      "name": "schedule",
+      "description": "Schedule a message, once or recurring",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "body",
+          "description": "Message text",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "in-minutes",
+          "description": "Fire this many minutes from now",
+          "type": "integer",
+          "required": false,
+          "min_value": 1,
+          "max_value": 525600,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "every-minutes",
+          "description": "Recur at this interval (60 min minimum)",
+          "type": "integer",
+          "required": false,
+          "min_value": 60,
+          "max_value": 525600,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Effect fires on a wall-clock delay the offline smoke cannot observe; needs a timed live-guild pass."
+    },
+    {
+      "name": "schedule-remove",
+      "description": "Cancel a scheduled message",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "id",
+          "description": "Scheduled message id",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Destructive and needs a live scheduled-message id; sequenced after a schedule create, not standalone."
+    },
+    {
+      "name": "schedule-list",
+      "description": "List scheduled messages for this server",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Needs seeded scheduled rows (DB); the no-DB offline rule excludes it."
+    },
+    {
+      "name": "sticky",
+      "description": "Set this channel's sticky message",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "body",
+          "description": "Sticky text",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "debounce",
+          "description": "Quiet seconds before re-posting (default 5, max 300)",
+          "type": "integer",
+          "required": false,
+          "min_value": 1,
+          "max_value": 300,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Posts into a live channel (channel mutation); excluded from the read-only smoke."
+    },
+    {
+      "name": "sticky-remove",
+      "description": "Remove this channel's sticky message",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Channel-state mutation; excluded from the read-only smoke."
+    },
+    {
+      "name": "rsvp",
+      "description": "RSVP to a Discord scheduled event",
+      "family": "announcements",
+      "gate": "announcements",
+      "default_member_permissions": null,
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "event-id",
+          "description": "Discord scheduled event id",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "status",
+          "description": "Your response",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [
+            { "name": "Going", "value": "going" },
+            { "name": "Interested", "value": "interested" },
+            { "name": "Declined", "value": "declined" }
+          ]
+        }
+      ],
+      "smoke": "covered",
+      "expected_response": "docs/smoke-expected-responses.md Expected-response table, `/rsvp` happy-path echo; docs/smoke-run-record.md row 3",
+      "deferral_reason": null
+    },
+    {
+      "name": "rsvp-attendance",
+      "description": "Show Owen RSVP totals for a scheduled event",
+      "family": "announcements",
+      "gate": "announcements",
+      "default_member_permissions": null,
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "event-id",
+          "description": "Discord scheduled event id",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Read-only totals but needs seeded RSVPs on a live scheduled event; the announcements-open family is covered by rsvp."
+    },
+    {
+      "name": "lfg",
+      "description": "Post a raid/LFG signup with role slots",
+      "family": "announcements",
+      "gate": "announcements",
+      "default_member_permissions": "8589934592",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "title",
+          "description": "Event or group title",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "starts-at",
+          "description": "ISO-8601 start time",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "roles",
+          "description": "tank:Tank:2,healer:Healer:2,dps:DPS:6",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "covered",
+      "expected_response": "docs/smoke-expected-responses.md Expected-response table, `/lfg` creation + signup/leave shapes; docs/smoke-run-record.md row 4",
+      "deferral_reason": null
+    },
+    {
+      "name": "lfg-close",
+      "description": "Close a raid/LFG signup",
+      "family": "announcements",
+      "gate": "announcements",
+      "default_member_permissions": "8589934592",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "id",
+          "description": "LFG id",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Needs a live LFG post id; sequenced after the lfg create step in the live pass, not standalone."
+    },
+    {
+      "name": "feed-add",
+      "description": "Relay an RSS, YouTube, or Twitch feed into this channel",
+      "family": "announcements",
+      "gate": "announcements",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "kind",
+          "description": "Feed kind",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [
+            { "name": "RSS", "value": "rss" },
+            { "name": "YouTube", "value": "youtube" },
+            { "name": "Twitch", "value": "twitch" }
+          ]
+        },
+        {
+          "name": "source",
+          "description": "HTTPS URL or YouTube channel id",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Triggers external fetch plus channel relay writes; the offline rule excludes network effects."
+    },
+    {
+      "name": "feed-remove",
+      "description": "Remove a feed relay",
+      "family": "announcements",
+      "gate": "announcements",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "id",
+          "description": "Feed id",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Destructive and needs a live feed id; sequenced after a feed-add, not standalone."
+    },
+    {
+      "name": "feed-list",
+      "description": "List this server's feed relays",
+      "family": "announcements",
+      "gate": "announcements",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Needs seeded feed relays (DB); the no-DB offline rule excludes it."
+    },
+    {
+      "name": "ban",
+      "description": "Ban a member",
+      "family": "moderation",
+      "gate": "moderation",
+      "default_member_permissions": "4",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "target",
+          "description": "Member to moderate",
+          "type": "user",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 512,
+          "choices": []
+        }
+      ],
+      "smoke": "covered",
+      "expected_response": "docs/smoke-expected-responses.md Expected-response table, `/ban` routing + refusal copy; docs/smoke-run-record.md row 5",
+      "deferral_reason": null
+    },
+    {
+      "name": "tempban",
+      "description": "Temporarily ban a member",
+      "family": "moderation",
+      "gate": "moderation",
+      "default_member_permissions": "4",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "target",
+          "description": "Member to moderate",
+          "type": "user",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "duration_seconds",
+          "description": "Duration in seconds",
+          "type": "integer",
+          "required": true,
+          "min_value": 60,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 512,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Same Moderation handler family as ban (covered); the live membership effect is excluded from the read-only smoke."
+    },
+    {
+      "name": "kick",
+      "description": "Kick a member",
+      "family": "moderation",
+      "gate": "moderation",
+      "default_member_permissions": "2",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "target",
+          "description": "Member to moderate",
+          "type": "user",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 512,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Same Moderation handler family as ban (covered); the live membership effect is excluded from the read-only smoke."
+    },
+    {
+      "name": "timeout",
+      "description": "Timeout a member",
+      "family": "moderation",
+      "gate": "moderation",
+      "default_member_permissions": "1099511627776",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "target",
+          "description": "Member to moderate",
+          "type": "user",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "duration_seconds",
+          "description": "Duration in seconds",
+          "type": "integer",
+          "required": true,
+          "min_value": 60,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 512,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Same Moderation handler family as ban (covered); the live membership effect is excluded from the read-only smoke."
+    },
+    {
+      "name": "warn",
+      "description": "Record a warning for a member",
+      "family": "moderation",
+      "gate": "moderation",
+      "default_member_permissions": "1099511627776",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "target",
+          "description": "Member to moderate",
+          "type": "user",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 512,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Same Moderation handler family as ban (covered); writes a live audit record, excluded from the read-only smoke."
+    },
+    {
+      "name": "purge",
+      "description": "Delete recent messages",
+      "family": "moderation",
+      "gate": "moderation",
+      "default_member_permissions": "8192",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "count",
+          "description": "Messages to delete (1-100)",
+          "type": "integer",
+          "required": true,
+          "min_value": 1,
+          "max_value": 100,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 512,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Deletes live messages; destructive, excluded from the read-only smoke. Same family as ban (covered)."
+    },
+    {
+      "name": "slowmode",
+      "description": "Set channel slowmode",
+      "family": "moderation",
+      "gate": "moderation",
+      "default_member_permissions": "16",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "seconds",
+          "description": "Delay in seconds (0 disables)",
+          "type": "integer",
+          "required": true,
+          "min_value": 0,
+          "max_value": 21600,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 512,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Channel-state mutation; excluded from the read-only smoke. Same family as ban (covered)."
+    },
+    {
+      "name": "lockdown",
+      "description": "Prevent @everyone from sending messages",
+      "family": "moderation",
+      "gate": "moderation",
+      "default_member_permissions": "16",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 512,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Channel-state mutation; excluded from the read-only smoke. Same family as ban (covered)."
+    },
+    {
+      "name": "unlock",
+      "description": "Allow @everyone to send messages",
+      "family": "moderation",
+      "gate": "moderation",
+      "default_member_permissions": "16",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 512,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Channel-state mutation; excluded from the read-only smoke. Same family as ban (covered)."
+    }
+  ]
+}

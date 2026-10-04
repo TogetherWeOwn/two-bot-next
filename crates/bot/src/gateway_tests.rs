@@ -5,7 +5,7 @@
 mod database_guard;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, LazyLock,
 };
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use tokio::task::JoinHandle;
 use tokio_websockets::{Message, ServerBuilder};
 use twilight_gateway::{ConfigBuilder, Intents, Shard, ShardId};
@@ -27,9 +27,11 @@ use crate::gateway::{
     build_pipeline, ensure_crypto_provider, load_boot_session, run_shard, GatewayState,
 };
 
+mod commands;
 mod deadline;
 mod force_identify;
 mod member_journey;
+mod onboarding;
 mod persistent;
 mod recovery;
 mod voice;
@@ -37,15 +39,58 @@ mod voice;
 const GUILD: &str = "2222";
 const TOKEN: &str = "mock-token";
 
+/// `GatewaySessionStore` serializes every checkpoint on
+/// `pg_advisory_xact_lock(hashtextextended('gateway:{guild}:{shard}', 0))`.
+/// An advisory lock belongs to the database, not to a schema, so all the
+/// schema-isolated `TestDb`s of one process (same guild, same shard) contend
+/// on a single key. A test that holds that key on purpose to block a
+/// checkpoint therefore also stalls every sibling test's checkpoint past
+/// `CHECKPOINT_IO_MAX`; the sibling's worker then panics "gateway checkpoint
+/// failed" and the test hangs until its own deadline.
+///
+/// Ordinary tests hold this fence shared for the life of their `TestDb`; a test
+/// that holds the checkpoint key (`TestDb::exclusive*`) holds it exclusively,
+/// so it runs alone while the rest queue in `TestDb::new`. The serial CI step
+/// (`--test-threads=1`) is unaffected.
+static CHECKPOINT_KEY_FENCE: LazyLock<Arc<RwLock<()>>> = LazyLock::new(Arc::default);
+
+/// Held only for its `Drop`.
+#[allow(dead_code)]
+enum CheckpointKeyFence {
+    Shared(OwnedRwLockReadGuard<()>),
+    Exclusive(OwnedRwLockWriteGuard<()>),
+}
+
 struct TestDb {
     pool: PgPool,
     admin: PgPool,
     schema: String,
     store: GatewaySessionStore,
+    // Declared last: released only after `close` has dropped the schema.
+    _fence: CheckpointKeyFence,
 }
 
 impl TestDb {
     async fn new() -> Self {
+        Self::with_pool_max(3).await
+    }
+
+    async fn with_pool_max(pool_max: u32) -> Self {
+        let fence = CheckpointKeyFence::Shared(CHECKPOINT_KEY_FENCE.clone().read_owned().await);
+        Self::create(pool_max, fence).await
+    }
+
+    /// For a test that takes `gateway:{GUILD}:0` itself; see [`CHECKPOINT_KEY_FENCE`].
+    async fn exclusive() -> Self {
+        Self::exclusive_with_pool_max(3).await
+    }
+
+    async fn exclusive_with_pool_max(pool_max: u32) -> Self {
+        let fence = CheckpointKeyFence::Exclusive(CHECKPOINT_KEY_FENCE.clone().write_owned().await);
+        Self::create(pool_max, fence).await
+    }
+
+    async fn create(pool_max: u32, fence: CheckpointKeyFence) -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let options = database_guard::test_options();
         let admin = PgPoolOptions::new()
@@ -69,7 +114,7 @@ impl TestDb {
             .await
             .expect("create isolated schema");
         let pool = PgPoolOptions::new()
-            .max_connections(3)
+            .max_connections(pool_max)
             .connect_with(options.options([("search_path", schema.clone())]))
             .await
             .expect("scoped test pool");
@@ -83,7 +128,18 @@ impl TestDb {
             admin,
             schema,
             store,
+            _fence: fence,
         }
+    }
+
+    async fn independent_pool(&self, pool_max: u32) -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(pool_max)
+            .connect_with(
+                database_guard::test_options().options([("search_path", self.schema.clone())]),
+            )
+            .await
+            .expect("independent scoped test pool")
     }
 
     async fn close(self) {
@@ -404,12 +460,24 @@ async fn spawn_runner(
     JoinHandle<Result<(), sqlx::Error>>,
     Arc<RwLock<GatewayState>>,
 ) {
-    spawn_runner_until_shutdown(db, url, std::future::pending()).await
+    spawn_runner_until_shutdown(db, url, None, std::future::pending()).await
+}
+
+async fn spawn_runner_with_commands(
+    db: &TestDb,
+    url: &str,
+    commands: Option<Arc<crate::command_runtime::CommandRuntime>>,
+) -> (
+    JoinHandle<Result<(), sqlx::Error>>,
+    Arc<RwLock<GatewayState>>,
+) {
+    spawn_runner_until_shutdown(db, url, commands, std::future::pending()).await
 }
 
 async fn spawn_runner_until_shutdown(
     db: &TestDb,
     url: &str,
+    commands: Option<Arc<crate::command_runtime::CommandRuntime>>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> (
     JoinHandle<Result<(), sqlx::Error>>,
@@ -435,6 +503,8 @@ async fn spawn_runner_until_shutdown(
         state.clone(),
         db.store.clone(),
         None,
+        commands,
+        None,
         None,
         shutdown,
     ));
@@ -447,7 +517,7 @@ async fn http_shutdown_stops_the_real_gateway_runner_and_preserves_checkpoint() 
     let db = TestDb::new().await;
     let mut mock = MockGateway::new(false, false).await;
     let (shutdown, mut stopping) = tokio::sync::watch::channel(false);
-    let (runner, state) = spawn_runner_until_shutdown(&db, &mock.url, async move {
+    let (runner, state) = spawn_runner_until_shutdown(&db, &mock.url, None, async move {
         stopping.wait_for(|stopping| *stopping).await.unwrap();
     })
     .await;
@@ -480,10 +550,10 @@ async fn pending_readyz_request_observes_drain_after_database_acquisition() {
 
     let db = TestDb::new().await;
     let gateway = Arc::new(RwLock::new(GatewayState::Connected));
-    let app = crate::server::router(crate::server::SharedState {
-        gateway: gateway.clone(),
-        database: Some(db.pool.clone()),
-    });
+    let app = crate::server::router(crate::server::SharedState::new(
+        gateway.clone(),
+        Some(db.pool.clone()),
+    ));
     // Hold every connection so the real ping waits in pool acquisition.
     let mut held = Vec::new();
     for _ in 0..db.pool.options().get_max_connections() {

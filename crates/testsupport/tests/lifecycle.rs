@@ -76,9 +76,10 @@ async fn databases_are_migrated_isolated_and_removed_even_after_setup_failure() 
         assert_statement_timeout(&peer),
     );
     lock.rollback().await.unwrap();
-    peer.close().await;
+    // Leave the independent pool open: the fixture owns its teardown too.
     let a_name = a.name().to_owned();
     a.close().await.unwrap();
+    assert!(peer.is_closed());
     let (exists,): (bool,) =
         sqlx::query_as("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
             .bind(a_name)
@@ -106,6 +107,42 @@ async fn databases_are_migrated_isolated_and_removed_even_after_setup_failure() 
     assert!(TestDatabase::create(&url, &broken).await.is_err());
     let after = process_database_count(b.pool(), &prefix).await;
     assert_eq!(before, after, "migration failure leaked a database");
+
+    // Reproduce the eight-way lifecycle contention from the core store suite,
+    // while leaving peer pools open. Teardown must remain verified, not skipped
+    // or retried after the existing five-second SQL deadline.
+    let mut creating = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let url = url.clone();
+        creating.spawn(async move {
+            let migrations = sqlx::migrate!("./tests/migrations");
+            TestDatabase::create(&url, &migrations).await.unwrap()
+        });
+    }
+    let mut fixtures = Vec::new();
+    while let Some(result) = creating.join_next().await {
+        fixtures.push(result.unwrap());
+    }
+    let mut prepared = Vec::new();
+    for fixture in fixtures {
+        let peer = fixture.independent_pool().await.unwrap();
+        prepared.push((fixture, peer));
+    }
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(prepared.len() + 1));
+    let mut closing = tokio::task::JoinSet::new();
+    for (fixture, peer) in prepared {
+        let start = start.clone();
+        closing.spawn(async move {
+            start.wait().await;
+            fixture.close().await.unwrap();
+            assert!(peer.is_closed());
+        });
+    }
+    start.wait().await;
+    while let Some(result) = closing.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(process_database_count(b.pool(), &prefix).await, before);
 
     // Explicit close is blocked on a checked-out connection. Abort its caller
     // after teardown starts, then release the connection; owned cleanup must

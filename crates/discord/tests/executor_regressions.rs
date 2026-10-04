@@ -37,6 +37,56 @@ fn context(action: ModerationAction, count: Option<u64>) -> ModerationExecution 
     }
 }
 
+#[tokio::test]
+async fn original_response_edit_suppresses_mentions_bounds_content_and_validates_ids() {
+    // The `@original` PATCH requires a validated message id receipt under
+    // main's durable send admission; a bare 200 is `Unavailable`, not success.
+    let receipt = || ScriptedResponse::json(200, serde_json::json!({"id": "555555555555555555"}));
+    let mock = MockRest::start(vec![receipt(), receipt()], ScriptedResponse::status(500)).await;
+    let executor = executor_for(&mock);
+    executor
+        .edit_interaction_response(1234, "synthetic-webhook-token", "@everyone <@3333> result")
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "PATCH");
+    assert_eq!(
+        requests[0].path,
+        "/api/v10/webhooks/1234/synthetic-webhook-token/messages/@original"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["allowed_mentions"]["parse"], serde_json::json!([]));
+    // The executor rewrites mentions explicitly rather than relying on
+    // Twilight's omitted-empty serialization: empty allowlists are present
+    // but ping nobody, and parse=[] disables all pings.
+    assert_eq!(body["allowed_mentions"]["users"], serde_json::json!([]));
+    assert_eq!(body["allowed_mentions"]["roles"], serde_json::json!([]));
+    assert!(matches!(
+        executor
+            .edit_interaction_response(0, "synthetic-webhook-token", "result")
+            .await,
+        Err(DiscordError::Rejected(_))
+    ));
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "invalid id never reaches the wire"
+    );
+    executor
+        .edit_interaction_response(1234, "synthetic-webhook-token", &"x".repeat(2001))
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    let bounded: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(
+        bounded["content"].as_str().unwrap().encode_utf16().count(),
+        2000
+    );
+    mock.shutdown().await;
+}
+
 // Finding 1: a normal 600 s timeout must reach Discord with a timestamp the
 // pinned Twilight parser accepts (the `Z` form never survived `Timestamp`).
 #[tokio::test]

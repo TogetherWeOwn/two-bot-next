@@ -38,7 +38,7 @@ async fn assert_unknown_fences_restart(db: &TestDatabase, mock: &MockDiscord) {
         .is_err());
     let announced = announcement_executor(mock, gate);
     assert_eq!(
-        run_once(&announced, &announcement("independent intent")).await,
+        run_live(&announced, &announcement("independent intent")).await,
         ExecutionOutcome::NoEffect(Refusal::SendAdmissionBlocked)
     );
     assert_eq!(
@@ -154,7 +154,7 @@ async fn admission_valid_mutation_receipts_release_for_other_transports() {
     assert_eq!(backup.writes, 1);
     let announced = announcement_executor(&mock, gate);
     assert!(matches!(
-        run_once(&announced, &announcement("fixture")).await,
+        run_live(&announced, &announcement("fixture")).await,
         ExecutionOutcome::Posted(_)
     ));
     assert_eq!(mock.count(), 3);

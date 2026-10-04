@@ -118,6 +118,7 @@ fn attributes() -> RoomChannelAttributes {
         video_quality_mode: Some(VideoQualityMode::Full),
         nsfw: true,
         user_limit: 8,
+        position: None,
         overwrites: vec![PermissionOverwrite {
             id: Id::new(100),
             kind: PermissionOverwriteType::Role,
@@ -158,7 +159,7 @@ async fn ephemeral_defer_then_edit_original_use_token_only_and_no_mentions() {
         .await
         .unwrap();
     mock.api
-        .complete_interaction(Id::new(1), "interaction-token", "Created <#600>")
+        .complete_interaction(Id::new(1), "interaction-token", "Created <#600>", &[], None)
         .await
         .unwrap();
     let requests = mock.state.recorded.lock().unwrap();
@@ -176,6 +177,9 @@ async fn ephemeral_defer_then_edit_original_use_token_only_and_no_mentions() {
     );
     assert_eq!(requests[1].body["content"], "Created <#600>");
     assert_eq!(requests[1].body["allowed_mentions"]["parse"], json!([]));
+    // A plain text edit leaves attachments and components untouched.
+    assert!(requests[1].body.get("attachments").is_none());
+    assert!(requests[1].body.get("components").is_none());
     assert!(requests.iter().all(|request| !request.bot_authenticated));
 }
 
@@ -292,6 +296,24 @@ async fn sends_overwrites_with_create_then_move_and_treats_only_missing_delete_a
 }
 
 #[tokio::test]
+async fn create_sends_position_and_omits_an_empty_override_list() {
+    let mock = Mock::start(vec![response(201, created_channel())]).await;
+    let mut synced = attributes();
+    synced.position = Some(3);
+    synced.overwrites = Vec::new();
+    mock.api
+        .create_room(100, "room", &synced, || true)
+        .await
+        .unwrap();
+    let requests = mock.state.recorded.lock().unwrap();
+    assert_eq!(requests[0].body["position"], json!(3));
+    assert!(
+        requests[0].body.get("permission_overwrites").is_none(),
+        "an empty set must not be sent, so the room syncs to its category"
+    );
+}
+
+#[tokio::test]
 async fn rename_429_returns_to_the_queue_instead_of_delaying_room_deletion() {
     let mock = Mock::start(vec![
         ScriptedResponse {
@@ -402,4 +424,64 @@ async fn refused_credential_stops_all_clones_without_more_network_requests() {
         Err(RoomHttpError::Unauthorized)
     );
     assert_eq!(mock.state.recorded.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn vote_kick_disconnect_clears_voice_channel_and_missing_member_is_success() {
+    let mock = Mock::start(vec![
+        response(200, json!({})),
+        response(404, json!({"code": 10007})),
+        response(403, json!({"code": 50001})),
+    ])
+    .await;
+    mock.api.disconnect_member(100, 300, || true).await.unwrap();
+    // The target already left: the vote is cancelled, not failed.
+    mock.api.disconnect_member(100, 301, || true).await.unwrap();
+    assert_eq!(
+        mock.api.disconnect_member(100, 302, || true).await,
+        Err(RoomHttpError::AccessDenied)
+    );
+    assert_eq!(
+        mock.api.disconnect_member(0, 300, || true).await,
+        Err(RoomHttpError::InvalidRequest)
+    );
+    assert_eq!(
+        mock.api.disconnect_member(100, 0, || true).await,
+        Err(RoomHttpError::InvalidRequest)
+    );
+    let requests = mock.state.recorded.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method, Method::PATCH);
+    assert_eq!(requests[0].path, "/api/v10/guilds/100/members/300");
+    assert_eq!(requests[0].body, json!({"channel_id": null}));
+    assert!(requests.iter().all(|request| request.bot_authenticated));
+}
+
+#[tokio::test]
+async fn vote_kick_deny_is_member_scoped_connect_only_on_that_room() {
+    let mock = Mock::start(vec![response(204, Value::Null)]).await;
+    mock.api
+        .deny_member_connect(600, 300, || true)
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.api.deny_member_connect(0, 300, || true).await,
+        Err(RoomHttpError::InvalidRequest)
+    );
+    assert_eq!(
+        mock.api.deny_member_connect(600, 0, || true).await,
+        Err(RoomHttpError::InvalidRequest)
+    );
+    let requests = mock.state.recorded.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, Method::PUT);
+    assert_eq!(requests[0].path, "/api/v10/channels/600/permissions/300");
+    assert_eq!(
+        requests[0].body,
+        json!({
+            "allow": "0", "deny": Permissions::CONNECT.bits().to_string(),
+            "type": 1,
+        })
+    );
+    assert!(requests[0].bot_authenticated);
 }

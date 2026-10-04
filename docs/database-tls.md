@@ -80,22 +80,28 @@ that nothing reaches logs.
 
 ## Coverage and gaps
 
-Fenced: every caller of `two_bot_cutover::connect`.
+Fenced: every caller of `two_bot_cutover::connect`, the gateway store pool
+(`two_bot_store::connect_pool`, via `connect_pool_with_tls`), both
+`two-bot backup` URL parses (`backup_cli::open_pool`, via
+`open_pool_with_tls`, and `governed_guild_config_api`), and
+`channel_moderation_store::connect` (via `connect_with_tls`).
 
-Not yet fenced: these paths parse database URLs without this check:
-
-- the gateway store pool (`crates/store/src/pool.rs`),
-- `two-bot backup` (`crates/bot/src/backup_cli.rs`),
-- `channel_moderation_store::connect`.
-
-F6 stays open until they call `database_tls::enforce` and `apply`, and the
-deployment card records a non-secret TLS receipt.
+F6 stays open until the deployment card records a non-secret TLS receipt.
 
 ## Tests
 
 - `crates/core/src/database_tls.rs` contains table tests over every sslmode ×
   policy × host class. They also cover query-host overrides, repeated and
   percent-encoded keys, the Neon default URL and the effective SQLx mode.
-- DB suites and CLIs pass `LocalOnly` explicitly (`connect_with_tls`, or
+- Each fenced path has a refusal proof mirroring
+  `crates/cutover/tests/secret_connection.rs`: a remote `sslmode=disable` URL
+  (and the other refusal cases) fails with the same fixed string before SQLx
+  parses the URL or opens a socket, with no URL part in the error or the logs
+  (`crates/store/tests/tls_refusal.rs`,
+  `backup_cli::open_pool_with_tls_refusals_never_echo_urls_or_reach_logs`,
+  `backup_cli::tls_admission_guard_redacts_dependency_logs`,
+  `secret_redaction::channel_store_tls_refusals_never_echo_urls_or_reach_logs`).
+- DB suites and CLIs pass `LocalOnly` explicitly (`connect_with_tls` /
+  `connect_pool_with_tls` / `open_pool_with_tls`, or
   `TWO_DATABASE_TLS=local-only` on `env_clear()` subprocesses). The CI `check`
-  job sets it for in-process callers.
+  job and the nightly `sweep` job set it for in-process callers.

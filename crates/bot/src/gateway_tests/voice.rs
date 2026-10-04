@@ -3,7 +3,11 @@ use sqlx::ConnectOptions;
 use tokio::sync::Notify;
 use twilight_model::{channel::Channel, guild::Permissions};
 use two_bot::voice_rooms::{RoomWrites, VoiceEventSink, VoiceRuntime, WriteGuard};
-use two_bot_core::voice_rooms::{CreatorChannel, NewRoomSpec, VoiceRoom};
+use two_bot_core::{
+    voice_rooms::{CreatorChannel, NewRoomSpec, VoiceRoom},
+    voice_text_channel::TextChannelPlan,
+    Snowflake,
+};
 use two_bot_cutover::voice_rooms::PgRoomStore;
 use two_bot_discord::voice_rooms::{RoomChannelAttributes, RoomHttpError};
 
@@ -29,6 +33,12 @@ impl RoomWrites for DeleteOnly {
     ) -> Result<(), RoomHttpError> {
         panic!("reconciliation must not move a member");
     }
+    async fn disconnect(&self, _: u64, _: u64, _: WriteGuard) -> Result<(), RoomHttpError> {
+        panic!("reconciliation must not disconnect a member");
+    }
+    async fn deny_connect(&self, _: u64, _: u64, _: WriteGuard) -> Result<(), RoomHttpError> {
+        panic!("reconciliation must not deny connect");
+    }
     async fn delete(&self, channel: u64, guard: WriteGuard) -> Result<(), RoomHttpError> {
         assert_eq!(channel, 700);
         if !guard() {
@@ -39,6 +49,34 @@ impl RoomWrites for DeleteOnly {
     }
     async fn rename(&self, _: u64, _: &str) -> Result<(), RoomHttpError> {
         panic!("reconciliation must not rename a room");
+    }
+    async fn download_attachment(&self, _: &str, _: usize) -> Result<Vec<u8>, RoomHttpError> {
+        panic!("reconciliation must not download an import file");
+    }
+
+    async fn create_companion(
+        &self,
+        _: &TextChannelPlan,
+        _: Snowflake,
+        _: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        panic!("reconciliation must not create a companion");
+    }
+    async fn grant_companion_view(
+        &self,
+        _: Snowflake,
+        _: Snowflake,
+        _: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        panic!("reconciliation must not grant companion view");
+    }
+    async fn revoke_companion_view(
+        &self,
+        _: Snowflake,
+        _: Snowflake,
+        _: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        panic!("reconciliation must not revoke companion view");
     }
 }
 
@@ -198,6 +236,8 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
         pipeline.clone(),
         state.clone(),
         db.store.clone(),
+        None,
+        None,
         None,
         Some(voice.clone()),
         std::future::pending(),

@@ -83,6 +83,12 @@ pub(crate) fn route(request: &Request) -> &'static str {
         (Post, [Some("interactions"), Some(_), Some(_), Some("callback"), None, None]) => {
             "POST /interactions/:interaction/:token/callback"
         }
+        (Post, [Some("guilds"), Some(_), Some("channels"), None, None, None]) => {
+            "POST /guilds/:guild/channels"
+        }
+        (Delete, [Some("channels"), Some(_), None, None, None, None]) => {
+            "DELETE /channels/:channel"
+        }
         _ => "other",
     }
 }
@@ -206,6 +212,49 @@ mod tests {
         assert_eq!(route(&request), "other");
     }
 
+    #[tokio::test]
+    async fn voice_lifecycle_writes_classify_to_allowlisted_templates() {
+        use twilight_http::request::TryIntoRequest;
+        use twilight_model::{
+            channel::ChannelType,
+            id::marker::{ChannelMarker, UserMarker},
+        };
+        // Real twilight builders: the exact requests RoomHttp sends for
+        // create/move/delete. Needs a Tokio context: Client::builder spawns
+        // the ratelimit actor.
+        let client = twilight_http::Client::builder().build();
+        let create = client
+            .create_guild_channel(Id::<GuildMarker>::new(100), "room")
+            .kind(ChannelType::GuildVoice)
+            .try_into_request()
+            .unwrap();
+        assert_eq!(create.method(), Method::Post);
+        assert_eq!(route(&create), "POST /guilds/:guild/channels");
+        assert!(metrics::REST_ROUTES.contains(&route(&create)));
+        let delete = client
+            .delete_channel(Id::<ChannelMarker>::new(600))
+            .try_into_request()
+            .unwrap();
+        assert_eq!(delete.method(), Method::Delete);
+        assert_eq!(route(&delete), "DELETE /channels/:channel");
+        assert!(metrics::REST_ROUTES.contains(&route(&delete)));
+        let moved = client
+            .update_guild_member(Id::<GuildMarker>::new(100), Id::<UserMarker>::new(300))
+            .channel_id(Some(Id::<ChannelMarker>::new(600)))
+            .try_into_request()
+            .unwrap();
+        assert_eq!(moved.method(), Method::Patch);
+        assert_eq!(route(&moved), "PATCH /guilds/:guild/members/:member");
+        assert!(metrics::REST_ROUTES.contains(&route(&moved)));
+        // Over-long paths and unknown shapes collapse to `other`, never a new
+        // series: cardinality stays fixed.
+        let extra = RequestBuilder::raw(Method::Post, "guilds/100/channels/extra".to_owned())
+            .build()
+            .unwrap();
+        assert_eq!(route(&extra), "other");
+        assert!(metrics::REST_ROUTES.contains(&"other"));
+    }
+
     #[test]
     fn every_emitted_template_is_allowlisted() {
         let paths = [
@@ -221,6 +270,7 @@ mod tests {
             "guilds/1/bans/2",
             "guilds/1/scheduled-events",
             "guilds/1/scheduled-events/2",
+            "guilds/1/channels",
             "applications/1/commands",
             "applications/1/guilds/2/commands",
             "interactions/1/secret/callback",

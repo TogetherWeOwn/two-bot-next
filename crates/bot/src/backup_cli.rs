@@ -37,16 +37,41 @@ fn env_var(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Read the one TLS policy setting; an unset value is `Required`.
+fn tls_policy_from_env() -> Result<two_bot_core::database_tls::TlsPolicy, &'static str> {
+    let value = std::env::var_os(two_bot_core::database_tls::POLICY_SETTING);
+    // A non-UTF-8 value parses as "" and is refused like any unknown value.
+    two_bot_core::database_tls::TlsPolicy::from_setting(
+        value.as_ref().map(|v| v.to_str().unwrap_or("")),
+    )
+}
+
 /// Open a Postgres pool through the shared redacting parse path
 /// (`two_bot_core::database_url`): unsupported query keys are refused before
 /// the pinned driver's parser can WARN-log their values, the driver's passfile
 /// diagnostics stay suppressed for the synchronous parse, and every failure is
-/// a constant message that never echoes the URL. Same default pool options as
+/// a constant message that never echoes the URL. Threat-model F6: the
+/// `TWO_DATABASE_TLS` policy (unset means `required`) refuses
+/// plaintext/unverified modes and the wrong host class before SQLx parses the
+/// URL (see `docs/database-tls.md`). Same default pool options as
 /// `PgPool::connect`, so this only changes what failures can disclose.
 async fn open_pool(url: &str) -> Result<sqlx::PgPool, &'static str> {
+    open_pool_with_tls(url, tls_policy_from_env()?).await
+}
+
+/// [`open_pool`] with an explicit TLS policy (tests pass `LocalOnly`).
+async fn open_pool_with_tls(
+    url: &str,
+    tls: two_bot_core::database_tls::TlsPolicy,
+) -> Result<sqlx::PgPool, &'static str> {
     two_bot_core::database_url::validate(url)?;
-    let options =
-        two_bot_core::database_url::connect_options(url).map_err(|_| "invalid database URL")?;
+    // Threat-model F6: refuse plaintext/unverified modes and the wrong host
+    // class before SQLx parses the URL (see `docs/database-tls.md`).
+    two_bot_core::database_tls::enforce(url, tls)?;
+    let options = two_bot_core::database_tls::apply(
+        two_bot_core::database_url::connect_options(url).map_err(|_| "invalid database URL")?,
+        tls,
+    );
     sqlx::postgres::PgPoolOptions::new()
         .connect_with(options)
         .await
@@ -126,9 +151,19 @@ two-bot operator commands
       writes nothing (TWO_RESTORE_URL optional: with it you also get the
       target's current counts). Without --dry-run, --force is required and
       TWO_RESTORE_URL must name the target. The target variable is
-      deliberately NOT TWO_DATABASE_URL: restoring truncates the target,
-      so aiming it at production must be said twice, on purpose.
+      deliberately NOT TWO_DATABASE_URL: restoring replaces target data.
+      Requires a fresh migrated target without moderation history. --force
+      confirms intent, not authorization or a safety-guard bypass.
       `RESTORE VERIFIED` on the last line, and exit 0, is the only success.
+
+  two-bot restore-drill <backup.ndjson.gz> --confirm-scratch
+      Allocate a fresh agent-testdb scratch database, apply shipped migrations
+      plus pinned scratch-only legacy archive DDL, then guarded restore.
+      Retain prior targets, archives and exclusive receipts; never reuse/drop.
+      Inspect dropped_columns in the receipt: verification proves row counts.
+      Env: TWO_RESTORE_DRILL_BOOTSTRAP_URL (explicit empty-password test binding),
+           TWO_RESTORE_DRILL_EVIDENCE_DIR (pre-existing protected absolute directory).
+      No TWO_RESTORE_URL/source credentials or live Discord are used.
 
   two-bot backup-upload <dump.ndjson.gz>
       PUT one dump to S3-compatible storage (SigV4, single-PUT).
@@ -224,6 +259,7 @@ pub async fn dispatch(args: &[String]) -> i32 {
         "erase-member" => crate::erasure_cli::dispatch(&args[1..]).await,
         "backup" => cmd_backup().await,
         "restore" => cmd_restore(&args[1..]).await,
+        "restore-drill" => crate::restore_drill::dispatch(&args[1..]).await,
         "backup-upload" => cmd_backup_upload(&args[1..]).await,
         "guild-config-snapshot" => cmd_guild_config_snapshot().await,
         "guild-config-restore" => cmd_guild_config_restore(&args[1..]).await,
@@ -505,6 +541,17 @@ async fn cmd_restore(args: &[String]) -> i32 {
             for (table, count) in &report.initialized_tables {
                 eprintln!("restore: WARNING: {table}: initialized {count} schema-required baseline row(s), not archived data");
             }
+            if report.missing_member_ban_ownership {
+                eprintln!(
+                    "restore: old v3 dump has no member-ban ownership; acceptance not inferred"
+                );
+            }
+            if report.quarantined_unbans > 0 {
+                eprintln!(
+                    "restore: {} imported expiries quarantined (including accepted snapshots); moderation must remain off until authoritative reconciliation",
+                    report.quarantined_unbans
+                );
+            }
             for (table, cols) in &report.dropped_columns {
                 eprintln!(
                     "restore: {table}: columns in the dump the target does not have: {}",
@@ -553,6 +600,16 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
     println!("restore: --dry-run of {file}");
     println!("restore: dump taken {}", contents.manifest.created_at);
     warn_missing_dump_tables(&contents.manifest);
+    eprintln!("restore: apply refuses a destination with moderation history; preserve it and use a fresh migrated target");
+    eprintln!("restore: apply quarantines all executable imported expiries, even accepted snapshots; keep moderation off pending authoritative reconciliation of both histories");
+    if !contents
+        .manifest
+        .tables
+        .iter()
+        .any(|table| table.name == "moderation_member_bans")
+    {
+        eprintln!("restore: old v3 has no member-ban ownership; apply does not infer acceptance; keep moderation off pending reconciliation");
+    }
     println!(
         "restore: migrations in dump: {}",
         if contents.manifest.schema_migrations.is_empty() {
@@ -788,8 +845,20 @@ async fn governed_guild_config_api(
         .map_err(|error| error.to_string());
     }
     let url = env_var("TWO_DATABASE_URL").ok_or("TWO_DATABASE_URL admission authority required")?;
-    let options = two_bot_core::database_url::connect_options(&url)
+    // Threat-model F6: the admission pool is a second URL parse in this file;
+    // enforce the `TWO_DATABASE_TLS` policy (unset means `required`) before
+    // SQLx parses the URL (see `docs/database-tls.md`). A bad setting reads
+    // as the same redacted authority error as a refused URL.
+    let tls = tls_policy_from_env().map_err(|_| "Discord admission authority unavailable")?;
+    two_bot_core::database_url::validate(&url)
         .map_err(|_| "Discord admission authority unavailable")?;
+    two_bot_core::database_tls::enforce(&url, tls)
+        .map_err(|_| "Discord admission authority unavailable")?;
+    let options = two_bot_core::database_tls::apply(
+        two_bot_core::database_url::connect_options(&url)
+            .map_err(|_| "Discord admission authority unavailable")?,
+        tls,
+    );
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
         .connect_with(options)
@@ -1354,6 +1423,123 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// Threat-model F6 refusals happen before SQLx parses the URL or opens a
+    /// socket: the error is a fixed string and no URL part reaches any log
+    /// level. Mirrors `crates/cutover/tests/secret_connection.rs`.
+    #[test]
+    fn open_pool_with_tls_refusals_never_echo_urls_or_reach_logs() {
+        use two_bot_core::database_tls::TlsPolicy;
+        let cases = [
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=disable",
+                TlsPolicy::Required,
+                "database sslmode does not require TLS",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db",
+                TlsPolicy::Required,
+                "database URL must set sslmode under the required TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=prefer",
+                TlsPolicy::LocalOnly,
+                "remote database host is refused under the local-only TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@fixture-host/fixture-db?sslmode=verify-full",
+                TlsPolicy::Required,
+                "local database host is refused under the required TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@fixture-host/fixture-db?sslmode=fixture-mode",
+                TlsPolicy::LocalOnly,
+                "unsupported database sslmode",
+            ),
+        ];
+        let capture = crate::tracing_capture::Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                for (url, policy, expected) in cases {
+                    let error = super::open_pool_with_tls(url, policy).await.unwrap_err();
+                    assert_eq!(error, expected);
+                    assert!(!error.contains("fixture"), "TLS refusal echoed the URL");
+                }
+                tracing::warn!("capture remains active");
+            });
+        });
+        let text = capture.text();
+        assert!(text.contains("capture remains active"));
+        assert!(!text.contains("fixture"), "TLS refusal reached logs");
+    }
+
+    /// Child-process probe for the admission pool's TLS fence: a remote
+    /// `sslmode=disable` URL must fail as the same redacted authority error,
+    /// with no URL part in the error or the logs. Runs only when
+    /// `ADMISSION_BOOTSTRAP_PROBE` is set (see the parent test below).
+    #[test]
+    fn tls_admission_guard_child() {
+        if std::env::var_os("ADMISSION_BOOTSTRAP_PROBE").is_none() {
+            return;
+        }
+        let capture = crate::tracing_capture::Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let error = super::governed_guild_config_api(
+                    "fixture-token".to_owned(),
+                    "fixture-guild".to_owned(),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error, "Discord admission authority unavailable");
+                assert!(!error.contains("fixture"));
+                tracing::warn!("capture remains active");
+            });
+        });
+        let text = capture.text();
+        assert!(text.contains("capture remains active"));
+        assert!(!text.contains("fixture"), "TLS refusal reached logs");
+    }
+
+    /// Parent: re-run only the probe above in an env-cleared child with a
+    /// remote `sslmode=disable` fixture URL and no `TWO_DATABASE_TLS` (so the
+    /// policy is `Required`). A separate process avoids process-global
+    /// environment races with the parallel suite.
+    #[test]
+    fn tls_admission_guard_redacts_dependency_logs() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .args([
+                "backup_cli::tests::tls_admission_guard_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("ADMISSION_BOOTSTRAP_PROBE", "1")
+            .env(
+                "TWO_DATABASE_URL",
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=disable",
+            )
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "isolated TLS admission probe failed: {stderr}"
+        );
+        assert!(stdout.contains("running 1 test"));
+        for text in [stdout, stderr] {
+            assert!(!text.contains("fixture"));
+        }
     }
 
     fn strings(args: &[&str]) -> Vec<String> {

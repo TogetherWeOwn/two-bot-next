@@ -31,6 +31,8 @@ const WORKER_ENV = {
   DISCORD_TOKEN: "synthetic-discord-token",
   DATABASE_URL: "synthetic-database-value",
   GUILD_ID: "111222333444555666",
+  TWO_AUTOMATIONS: "1",
+  TWO_TEXT_COMMANDS: "1",
   KEEPALIVE_SECONDS: "60",
   REDIRECT_FALLBACK_CODE: "not-a-container-var",
   REDIRECT_MAPPINGS_JSON: "[]",
@@ -41,6 +43,8 @@ const EXPECTED_ENV = {
   DISCORD_TOKEN: WORKER_ENV.DISCORD_TOKEN,
   DATABASE_URL: WORKER_ENV.DATABASE_URL,
   GUILD_ID: WORKER_ENV.GUILD_ID,
+  TWO_AUTOMATIONS: WORKER_ENV.TWO_AUTOMATIONS,
+  TWO_TEXT_COMMANDS: WORKER_ENV.TWO_TEXT_COMMANDS,
   LISTEN_ADDR: "0.0.0.0:8080",
 };
 
@@ -437,6 +441,97 @@ test("cold keepalive passes env through the SDK's string-URL fetch path", async 
   assert.ok(h.logs.includes("two-bot /readyz unhealthy: 503"));
 });
 
+// TOG-13044: the bot reports why its gateway task failed on /readyz; the
+// Worker passes it through and logs the fixed phase/class once per keepalive.
+function readyzWith(gatewayFailure: unknown, extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    components: [["process", "ready"], ["gateway", "starting"]],
+    ...(gatewayFailure === undefined ? {} : { gateway_failure: gatewayFailure }),
+    ...extra,
+  });
+}
+
+async function keepaliveSeeing(t: TestContext, body: string) {
+  const h = await harness(t);
+  h.setProbeResponse((status) => new Response(body, {
+    status, headers: { "content-type": "application/json" },
+  }));
+  await tickKeepalive(h.bot);
+  return h;
+}
+
+const gatewayFailureLogs = (logs: string[]) =>
+  logs.filter((line) => line.includes("container_gateway_failure"));
+
+test("keepalive logs the gateway failure phase and class once, as strict tokens", async (t) => {
+  const failure = { phase: "durable_gateway", class: "checkpoint_load_failed" };
+  const h = await keepaliveSeeing(t, readyzWith(failure));
+  assert.deepEqual(gatewayFailureLogs(h.logs), [JSON.stringify({
+    event: "container_gateway_failure", phase: "durable_gateway", class: "checkpoint_load_failed",
+  })]);
+});
+
+test("public /readyz forwards the gateway failure unchanged", async (t) => {
+  const body = readyzWith({ phase: "durable_gateway", class: "automod_config_invalid" });
+  const h = await harness(t);
+  h.setProbeResponse((status) => new Response(body, {
+    status, headers: { "content-type": "application/json" },
+  }));
+  const response = await worker.fetch(new Request("https://worker.invalid/readyz"), {
+    CF_VERSION_METADATA: { id: ID },
+    TWO_BOT: { getByName: () => h.bot },
+  } as unknown as Env, {} as ExecutionContext);
+  assert.equal(response.status, 503);
+  assert.equal(await response.text(), body);
+  assert.deepEqual(gatewayFailureLogs(h.logs), [], "only the keepalive path logs the class");
+});
+
+test("keepalive without a gateway failure logs no failure event", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith(undefined));
+  assert.deepEqual(gatewayFailureLogs(h.logs), []);
+});
+
+const HOSTILE_FAILURES: [string, unknown][] = [
+  ["url as class", { phase: "durable_gateway", class: "postgres://user:hunter2@db.internal/app" }],
+  ["uppercase class", { phase: "durable_gateway", class: "Checkpoint_Load_Failed" }],
+  ["over-long class", { phase: "durable_gateway", class: "a".repeat(33) }],
+  ["empty phase", { phase: "", class: "checkpoint_load_failed" }],
+  ["spaced phase", { phase: "durable gateway", class: "checkpoint_load_failed" }],
+  ["numeric class", { phase: "durable_gateway", class: 7 }],
+  ["missing class", { phase: "durable_gateway" }],
+  ["string instead of object", "durable_gateway:checkpoint_load_failed"],
+  ["null", null],
+  ["array", ["durable_gateway", "checkpoint_load_failed"]],
+];
+for (const [name, hostile] of HOSTILE_FAILURES) {
+  test(`keepalive drops a hostile gateway failure (${name})`, async (t) => {
+    const h = await keepaliveSeeing(t, readyzWith(hostile));
+    assert.deepEqual(gatewayFailureLogs(h.logs), []);
+    assert.ok(h.logs.every((line) => !line.includes("hunter2") && !line.includes("db.internal")));
+  });
+}
+
+test("keepalive logs only phase and class even when the failure object carries more", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith({
+    phase: "durable_gateway", class: "gateway_runtime_failed", error: "postgres://user:hunter2@db.internal/app",
+  }));
+  const [line] = gatewayFailureLogs(h.logs);
+  assert.equal(line, JSON.stringify({
+    event: "container_gateway_failure", phase: "durable_gateway", class: "gateway_runtime_failed",
+  }));
+  assert.ok(h.logs.every((entry) => !entry.includes("hunter2")));
+});
+
+test("keepalive ignores a gateway failure in a non-bot (text) probe answer", async (t) => {
+  const h = await harness(t);
+  h.setProbeResponse((status) => new Response(
+    readyzWith({ phase: "durable_gateway", class: "checkpoint_load_failed" }),
+    { status, headers: { "content-type": "text/plain" } },
+  ));
+  await tickKeepalive(h.bot);
+  assert.deepEqual(gatewayFailureLogs(h.logs), []);
+});
+
 for (const path of ["/health", "/readyz", "keepalive", "start", "startAndWaitForPorts"]) {
   test(`${path} startup forwards only allowlisted publication settings`, async (t) => {
     const h = await harness(t, PUBLICATION_WORKER_ENV);
@@ -528,6 +623,51 @@ test("missing optionals are omitted; token and guild work without DATABASE_URL",
     LISTEN_ADDR: "0.0.0.0:8080",
   });
 });
+
+for (const [automations, textCommands] of [
+  [undefined, undefined],
+  ["1", undefined],
+  [undefined, "1"],
+  ["0", "0"],
+  ["1", "0"],
+  ["0", "1"],
+  ["", ""],
+  ["true", "01"],
+  [" 1", "1 "],
+] as const) {
+  test(`custom-command gates pass through unchanged (${JSON.stringify([automations, textCommands])})`, async (t) => {
+    const h = await harness(t, {
+      ...WORKER_ENV,
+      TWO_AUTOMATIONS: automations,
+      TWO_TEXT_COMMANDS: textCommands,
+    });
+    await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+    const expected: Record<string, string> = { ...EXPECTED_ENV };
+    delete expected.TWO_AUTOMATIONS;
+    delete expected.TWO_TEXT_COMMANDS;
+    if (automations !== undefined) expected.TWO_AUTOMATIONS = automations;
+    if (textCommands !== undefined) expected.TWO_TEXT_COMMANDS = textCommands;
+    assert.equal(h.starts.length, 1);
+    assert.deepEqual(h.starts[0]?.env, expected);
+  });
+}
+
+for (const automod of [undefined, "0", "1", "", "false", " 0", "00"] as const) {
+  for (const path of ["/health", "keepalive"]) {
+    test(`moderation availability passes through unchanged (${JSON.stringify(automod)}, ${path})`, async (t) => {
+      const h = await harness(t, { ...WORKER_ENV, TWO_AUTOMOD: automod });
+      if (path === "keepalive") {
+        await tickKeepalive(h.bot);
+      } else {
+        await h.bot.fetch(probeRequest(`https://worker.invalid${path}`));
+      }
+      const expected: Record<string, string> = { ...EXPECTED_ENV };
+      if (automod !== undefined) expected.TWO_AUTOMOD = automod;
+      assert.equal(h.starts.length, 1);
+      assert.deepEqual(h.starts[0]?.env, expected);
+    });
+  }
+}
 
 test("health-only config never fabricates credentials or gateway readiness", async (t) => {
   const h = await harness(t, { DISCORD_TOKEN: "", DATABASE_URL: "", GUILD_ID: "" });

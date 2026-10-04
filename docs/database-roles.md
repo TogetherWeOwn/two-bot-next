@@ -3,24 +3,45 @@
 The bot, migrations and web reader must not share an owner credential. These
 roles are PostgreSQL `NOLOGIN` privilege groups; this tooling never creates,
 prints or rotates passwords. The operator provisions separate login identities
-and grants each exactly one group. Never grant the migrator group to a runtime
-or reader login. Groups must have no outgoing memberships (including predefined
-roles such as `pg_read_all_data`) or superuser/CREATEDB/CREATEROLE/REPLICATION/
-BYPASSRLS attributes.
+and grants each exactly one group. Never grant the migrator group to a runtime,
+reader or read-only login. Groups must have no outgoing memberships (including
+predefined roles such as `pg_read_all_data`) or superuser/CREATEDB/CREATEROLE/
+REPLICATION/BYPASSRLS attributes. The read-only migrator group owns nothing and
+holds no membership path into the migrator group.
 
 | Group | Database | Bot schema | Bot tables | Sequences | `web_v1` |
 | --- | --- | --- | --- | --- | --- |
 | `two_bot_migrator` | CONNECT, CREATE; no TEMP | Owner (DDL) | Owner | Owner | Owner |
 | `two_bot_runtime` | CONNECT; no CREATE/TEMP | USAGE, no CREATE | SELECT, INSERT, UPDATE, DELETE | USAGE, SELECT; no UPDATE | No access |
 | `two_web_reader` | CONNECT; no CREATE/TEMP | No access | No access | No access | USAGE; SELECT on nine reviewed views |
+| `two_bot_migrator_ro` | CONNECT; no CREATE/TEMP | USAGE, no CREATE | SELECT on bot tables, admission lane and SQLx ledger; no DML | No access | USAGE; no view or function access |
 
-No runtime or reader grants carry grant options. Runtime cannot create schemas,
+No runtime, reader or read-only migrator grants carry grant options. Runtime cannot create schemas,
 tables, temporary tables or functions, alter tables, truncate them, or read the
-SQLx migration ledger. Existing append-only audit triggers continue to constrain
+SQLx migration ledger. The `two_bot_migrator_ro` group exists for the
+read-only migration-plan step: it reads bot tables, the admission lane and the
+ledger through SELECT only, with no DML, DDL, sequence, function or default
+privileges, so a plan run can never change data or schema. Migrator-only tables
+stay unreadable to it, exactly as for runtime and reader.
+
+Existing append-only audit triggers continue to constrain
 DML; a grant does not disable those controls. The `discord_send_admission`
 lane is a restricted exception: runtime has SELECT, INSERT and UPDATE only,
 never DELETE/TRUNCATE; reader and PUBLIC receive no lane access. The verifier
 requires these three privileges and rejects extra erase privileges.
+
+Two tables are migrator-only (`migrator` kind): `member_erasure_audit`
+(operator accountability written by the operator-only erasure path) and
+`invite_campaigns` (go.two.gg redirect store). They still have readers outside
+these three groups, so neither group receives a grant: `two-bot backup` reads
+both through `DUMP_TABLES` (`crates/core/src/backup/dump_file.rs`, via
+`dump.rs`; a runtime-group login cannot read them, so the nightly dump would
+abort), and the go.two.gg `REDIRECT_DB` connector reads `invite_campaigns`
+(`wrangler/src/redirect-store.ts`, unbound today with a snapshot fallback).
+Each of those readers needs its own reviewed identity. The plan transfers both
+tables to the migrator and grants the migrator ALL with no runtime or reader
+grant; the verifier requires migrator ownership/privileges and rejects any
+runtime/reader access, including TOAST-storage ownership drift.
 
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
@@ -35,9 +56,21 @@ functions do not need runtime EXECUTE once their triggers have been created.
 
 ```sh
 two-bot db roles plan > database-roles.sql
+two-bot db roles plan --phase bootstrap > database-roles-bootstrap.sql
 # Review the rendered SQL; operator applies it separately.
 two-bot db roles verify
 ```
+
+Both phases start, after the group-creation guard, with an ephemeral
+membership block: when the executing identity cannot SET or USE
+`two_bot_migrator`, the plan grants the membership to `current_user` for this
+transaction only (`WITH INHERIT TRUE, SET TRUE` on PostgreSQL 16+, plain
+`GRANT` on 15) and revokes it before `COMMIT`, refusing the plan when the
+membership is still absent. A non-superuser provisioning identity otherwise
+fails at `ALTER SCHEMA public OWNER TO two_bot_migrator` and loses `public`
+access once ownership flips. The bootstrap render differs from the default
+(`full`) render only by the skip lines; neither render contains a password or
+a login grant.
 
 `plan` prints SQL without opening a connection, reading a database URL or executing
 anything. There is deliberately **no apply subcommand or --apply flag**. This is
@@ -58,11 +91,17 @@ never returns PASS. Verification checks missing groups/objects, group attributes
 and memberships, database/schema privileges, ownership/object kinds, effective
 table/column/sequence/function privileges (including PUBLIC), grant options, parsed
 boolean view invoker settings and unsafe future grants. Explicit grants cover the
-current migrations' 45 ordinary bot tables plus the restricted admission lane,
-SQLx ledger, eight named SERIAL sequences and
-`guild_settings_version_seq`, nine web views and five functions. A detached SERIAL
+current migrations' 76 ordinary bot tables plus the restricted admission lane,
+SQLx ledger, two migrator-only tables, eleven sequences,
+nine web views and six functions (three trigger helpers plus three `web_v1`
+helpers). The read-only migrator group additionally reads the ordinary tables,
+the admission lane and the ledger; it reads no migrator-only table, sequence,
+view or function. This includes
+`gateway_onboarding_jobs` and its sequence: the DML-only gateway must recover and
+write this queue, while the web reader must not access it. A detached SERIAL
 sequence remains required even after `OWNED BY NONE`. New relations/sequences need
 a reviewed matrix update; there are **no wildcard future-table grants**.
+
 Migrator-created functions default to no PUBLIC EXECUTE. Ownership alone does not
 prove ordinary ACL privileges: verification checks the migrator's required table,
 sequence and helper-function rights, and reapplication restores those rights.
@@ -101,19 +140,28 @@ and revoking grants; do not copy a credential from another service if it fails.
 The plan is transactional and refuses unsafe existing groups instead of changing
 their login status or silently removing memberships. It contains no passwords.
 
-1. For the first bootstrap, the authorized provisioning identity applies
-   `crates/cutover/migrations` through the established SQLx migration process
-   (ledger in `public`) and applies `sql/web_v1.sql` with `public` as the bot-table
-   search path. The full role plan requires those objects to exist. For later
-   migrations, the dedicated migrator login must `SET ROLE two_bot_migrator`
-   before creating objects: creator-specific default ACLs belong to the group,
-   not automatically to a member login. Reapply the reviewed plan after migrations
-   and view updates, then verify.
+1. For the first bootstrap, the order is fixed: (a) the authorized
+   provisioning identity applies the rendered bootstrap phase
+   (`two-bot db roles plan --phase bootstrap`), which transfers the existing
+   allowlisted objects and skips relations/sequences the pending migrations
+   have not created yet; (b) the operator provisions the dedicated migrator
+   login as a member of `two_bot_migrator`; (c) the migration runner plans the
+   pending set read-only for review; (d) the runner applies the pending
+   migrations with `SET ROLE two_bot_migrator`, so new objects are
+   migrator-owned from creation; (e) the provisioning identity applies the
+   full phase (`two-bot db roles plan`, the default), idempotently; (f) verify
+   reads 0 findings. For later migrations, the dedicated migrator login must
+   `SET ROLE two_bot_migrator` before creating objects: creator-specific
+   default ACLs belong to the group, not automatically to a member login.
+   Reapply the reviewed full plan after migrations and view updates, then
+   verify. `sql/web_v1.sql` is applied with `public` as the bot-table search
+   path before the bootstrap phase; functions stay strict in both phases.
 2. Review and apply the rendered role plan with the authorized provisioning
    identity. It transfers only allowlisted objects to `two_bot_migrator`; unrelated
    tables are not transferred or granted to the runtime.
-3. Verify group drift and independently verify the three login bindings. Point
-   gateway `DATABASE_URL` at the runtime login and website at the reader login.
+3. Verify group drift and independently verify the four login bindings. Point
+   gateway `DATABASE_URL` at the runtime login, website at the reader login,
+   and the read-only plan step at a login holding only `two_bot_migrator_ro`.
 4. Start the gateway **after** migrations. Gateway connections now explicitly
    skip migrations: a DML-only credential must never be used for startup DDL.
 
@@ -150,10 +198,13 @@ Hosted CI automatically runs the acceptance test on its ephemeral service during
 the existing integration-test step (`GITHUB_ACTIONS=true` selects the fixed test
 URL). Without CI or `TWO_ROLES_TEST_DATABASE_URL`, the offline suite makes no
 connection; configured failures are never skipped. Tests apply every real migration
-and the actual view contract, apply the plan twice, exercise allowed DML/DDL/view
-reads and denied runtime CREATE/ALTER/TRUNCATE/temporary-table and reader base-table
+in version order (directory enumeration, not a hardcoded subset) and the actual
+view contract, apply the plan twice, exercise allowed DML/DDL/view reads and
+denied runtime CREATE/ALTER/TRUNCATE/temporary-table and reader base-table
 operations, then inject and restore privilege drift. Ticket and transcript tests
 exercise valid runtime CRUD, deny reader SELECT/INSERT and runtime ALTER/TRUNCATE,
 and detect missing runtime and excess reader privileges on both tables, restoring
-a clean matrix after each drift. Offline tests also cover CLI execution-flag
-rejection and matrix coverage, including migration 0210.
+a clean matrix after each drift. The B2 regression exercises runtime CRUD on the
+six runtime tables and migrator-only denial on the two `migrator` tables, with
+drift cases for both classes. Offline tests also cover CLI execution-flag
+rejection and directory-enumerating matrix coverage over every migration file.
