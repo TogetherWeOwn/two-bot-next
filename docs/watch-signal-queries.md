@@ -260,3 +260,6 @@ reset is not a quiet window — re-baseline both scrapes after it).
 - No database probe is authorized against staging or production.
 - No retry, breaker-reset, takeover, rollback, or credential step is
   included; those live in the runbook and cutover docs.
+- Dry-run record for the DB-error and send-admission queries (staging
+  read-only, offline rehearsal, threshold comparison):
+  [watch-signal-dry-run.md](watch-signal-dry-run.md).
