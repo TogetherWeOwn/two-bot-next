@@ -162,7 +162,7 @@ const MAIN_RS_ADJACENT: [&str; 13] = [
 
 // `crates/bot/src/voice_rooms.rs`: per-command voice UX receipts, not gateway
 // session events.
-const VOICE_RS_ADJACENT: [&str; 9] = [
+const VOICE_RS_ADJACENT: [&str; 10] = [
     "voice succession refused",
     "voice notice settings unreadable",
     "voice notice had no working destination",

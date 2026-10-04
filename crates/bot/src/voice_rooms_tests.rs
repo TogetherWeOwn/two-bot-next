@@ -1808,7 +1808,7 @@ async fn compensation_settlement_errors_are_reported_and_credentials_halt() {
                 .live
                 .voice_update(MEMBER + 1, Some(CREATOR), Some(false))
                 .unwrap();
-            assert!(!worker.accept_join(ticket, "new room".to_owned(), 7, NOW.to_owned()));
+            assert!(!worker.accept_join(ticket, "new room", 7, NOW.to_owned()));
             worker.reconcile();
             assert!(!worker.dispatch_one(600_000).await);
             assert_eq!(*trace.lock().unwrap(), before);
