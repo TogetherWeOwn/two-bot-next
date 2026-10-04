@@ -9,9 +9,13 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use twilight_model::guild::Permissions;
 
-const TOKEN: &str = "preflight-fixture-not-a-credential";
-const GUILD: u64 = 2222;
-const BOT: u64 = 1111;
+// The fixture is the staging pair so boot activation permits every capability
+// and the portal-parity checks below exercise env-driven intents. The token's
+// first segment is the base64 of the staging application id, never a secret;
+// the intent-refusal regression overrides it with an unparseable token.
+const TOKEN: &str = "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.preflight-fixture-not-a-credential";
+const GUILD: u64 = 1545644954272137297;
+const BOT: u64 = 1469137636663758888;
 const BOT_ROLE: u64 = 4444;
 const TARGET_ROLE: u64 = 5555;
 const CHANNEL: u64 = 6666;
@@ -160,15 +164,15 @@ async fn pass_warn_fail_exit_codes_and_json_match_the_real_cli() {
         assert_eq!(
             mock.requests()
                 .iter()
-                .map(|request| request.path.as_str())
+                .map(|request| request.path.clone())
                 .collect::<Vec<_>>(),
             vec![
-                "/api/v10/users/@me",
-                "/api/v10/applications/@me",
-                "/api/v10/guilds/2222/members/1111",
-                "/api/v10/guilds/2222/roles",
-                "/api/v10/guilds/2222/invites",
-                "/api/v10/channels/6666",
+                "/api/v10/users/@me".to_string(),
+                "/api/v10/applications/@me".to_string(),
+                format!("/api/v10/guilds/{GUILD}/members/{BOT}"),
+                format!("/api/v10/guilds/{GUILD}/roles"),
+                format!("/api/v10/guilds/{GUILD}/invites"),
+                format!("/api/v10/channels/{CHANNEL}"),
             ]
         );
         mock.shutdown().await;
@@ -235,6 +239,42 @@ async fn intents_follow_automod_and_the_ticket_triple() {
         );
         mock.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn refused_activation_requests_no_privileged_message_content_intent() {
+    let mock = mock(script(permissions(), 1 << 14, 1, false, channel())).await;
+    // An identity the fence cannot recognize must never request the
+    // privileged intent: with automod enabled but no portal grant, a
+    // fence-less runtime would request MESSAGE_CONTENT and the ungranted
+    // intent check fails the binary; the refusal keeps requested=false.
+    let output = cli(
+        &mock,
+        &["--json"],
+        &[
+            ("DISCORD_TOKEN", "preflight-fixture-not-a-credential"),
+            ("TWO_AUTOMOD", "1"),
+        ],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(0));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["check"] == "Message Content intent")
+        .expect("message content check present");
+    assert_eq!(check["status"], "PASS");
+    assert!(
+        check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("runtime requested=false"),
+        "{}",
+        check["detail"]
+    );
+    mock.shutdown().await;
 }
 
 #[tokio::test]

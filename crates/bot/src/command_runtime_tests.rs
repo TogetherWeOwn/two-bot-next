@@ -490,6 +490,303 @@ async fn wait_for<F: Fn() -> bool>(predicate: F, what: &str) {
 // Units (no database)
 // ---------------------------------------------------------------------------
 
+/// Exercises the same narrowed composition as `from_env`, with no env races,
+/// database connection, or external Discord calls.
+fn activation_runtime(guild: u64, token: &str, origin: String) -> Arc<CommandRuntime> {
+    let activation = crate::activation::BootActivation::from_token(Some(guild), Some(token));
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@agent-testdb:5432/agent_test")
+        .expect("unused lazy test pool");
+    let executor = ActionExecutor::with_proxy(token.to_owned(), Some(origin)).unwrap();
+    let requested = RouterGates {
+        configured_guild: Some(guild),
+        automations: true,
+        announcements: true,
+        moderation: true,
+        self_roles: true,
+        ..gates(false, false)
+    };
+    CommandRuntime::from_gates(
+        pool,
+        executor,
+        requested,
+        None,
+        None,
+        two_bot_core::OnboardingGates {
+            mode: two_bot_core::OnboardingMode::Legacy,
+            dry_run: false,
+        },
+        &activation,
+    )
+}
+
+#[tokio::test]
+async fn activation_boot_publishes_only_permitted_capabilities() {
+    use two_bot_core::{
+        activation::LiveCapability, announcement_commands, automation_commands,
+        moderation_commands, ComponentHandler, ComponentOutcome, HandlerId,
+    };
+    const STAGING: u64 = 1545644954272137297;
+    const LIVE: u64 = 326474832151838730;
+    // Public ids encoded in synthetic credentials for the local double only.
+    const STAGING_TOKEN: &str = "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature";
+    const LIVE_TOKEN: &str = "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature";
+    const THIRD_TOKEN: &str = "MTU1NTU1NTU1NTU1NTU1NTU1Ng.mock.signature";
+    for (guild, token, app, staging, self_roles) in [
+        (STAGING, STAGING_TOKEN, 1469137636663758888, true, true),
+        (LIVE, LIVE_TOKEN, 1539711683898118154, false, true),
+        (LIVE, STAGING_TOKEN, 1469137636663758888, false, false),
+        (STAGING, LIVE_TOKEN, 1539711683898118154, false, false),
+        (
+            1555555555555555555,
+            STAGING_TOKEN,
+            1469137636663758888,
+            false,
+            false,
+        ),
+        (STAGING, THIRD_TOKEN, 1555555555555555556, false, false),
+    ]
+    .into_iter()
+    .flat_map(|(guild, token, app, staging, self_roles)| {
+        [token.to_owned(), format!("Bot {token}")]
+            .map(|token| (guild, token, app, staging, self_roles))
+    }) {
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        let runtime = activation_runtime(guild, &token, origin);
+        runtime.publish_registry(Some(app)).await;
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1, "one full replacement, guild={guild}");
+        assert_eq!(requests[0].method, "PUT");
+        assert_eq!(
+            requests[0].path,
+            format!("/api/v10/applications/{app}/guilds/{guild}/commands")
+        );
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let names: Vec<_> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|command| command["name"].as_str().unwrap())
+            .collect();
+        for definition in automation_commands()
+            .into_iter()
+            .chain(announcement_commands())
+            .chain(moderation_commands())
+        {
+            assert_eq!(
+                names.contains(&definition.name.as_str()),
+                staging,
+                "capability command {}, guild={guild}, app={app}",
+                definition.name
+            );
+        }
+        for handler in [
+            HandlerId::AutomationAdmin,
+            HandlerId::FeedAdd,
+            HandlerId::FeedRemove,
+            HandlerId::FeedList,
+        ] {
+            assert_eq!(runtime.router().handler_for(&handler).is_some(), staging);
+        }
+        assert_eq!(
+            runtime
+                .router()
+                .route_component("two:self-role:fixture", Some(guild)),
+            if self_roles {
+                ComponentOutcome::Handled {
+                    handler: ComponentHandler::SelfRole,
+                }
+            } else {
+                ComponentOutcome::Ignore
+            }
+        );
+        let activation = crate::activation::BootActivation::from_token(Some(guild), Some(&token));
+        assert_eq!(activation.permitted(LiveCapability::Automod), staging);
+        if !staging {
+            // Even old sticky state cannot trigger the message hook. A lazy
+            // test pool proves the hook exits before any database access.
+            let msg = message(4444, CHANNEL, false, Some(guild));
+            assert_eq!(runtime.on_message(&msg).await, ActivityOutcome::None);
+            assert_eq!(mock.requests().len(), 1, "no sticky side effect");
+        }
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn activation_boot_invalid_token_and_ready_identity_cannot_publish() {
+    for token in ["not-a-token", "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature"] {
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        let runtime = activation_runtime(1545644954272137297, token, origin);
+        runtime.publish_registry(Some(1539711683898118154)).await;
+        assert!(
+            mock.requests().is_empty(),
+            "no PUT using an untrusted application id"
+        );
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
+    for (token, app) in [
+        "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature",
+        "Bot MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature",
+    ]
+    .into_iter()
+    .flat_map(|token| [1539711683898118154u64, 1469137636663758888u64].map(|app| (token, app)))
+    {
+        let (mock, origin) = MockRest::start_script(vec![RestResponse {
+            status: 200,
+            body: Some(format!("{{\"id\":\"{app}\"}}")),
+            delay: Duration::ZERO,
+        }])
+        .await;
+        let runtime = activation_runtime(326474832151838730, token, origin);
+        runtime.publish_registry(None).await;
+        let requests = mock.requests();
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(
+            requests.len(),
+            if app == 1539711683898118154 { 2 } else { 1 }
+        );
+        if requests.len() == 2 {
+            let body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+            let names: Vec<_> = body
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|command| command["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                names,
+                vec!["rank", "leaderboard"],
+                "unrelated core commands remain; uncleared surfaces are replaced"
+            );
+        }
+        mock.shutdown().await;
+    }
+}
+
+/// Use child test processes rather than mutating the parallel suite's env.
+#[test]
+fn activation_boot_from_env_isolates_denied_moderation_validation() {
+    for (guild, token, owen, expected) in [
+        (
+            "326474832151838730",
+            "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature",
+            "",
+            "narrowed",
+        ),
+        (
+            "326474832151838730",
+            "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+            "",
+            "narrowed",
+        ),
+        (
+            "1545644954272137297",
+            "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+            "",
+            "invalid",
+        ),
+        (
+            "1545644954272137297",
+            "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+            "123456789012345678",
+            "enabled",
+        ),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "command_runtime_tests::activation_boot_from_env_fixture",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("ACTIVATION_ENV_TEST_EXPECTED", expected)
+            .env("GUILD_ID", guild)
+            .env("DISCORD_TOKEN", token)
+            .env("DISCORD_API_BASE", "http://127.0.0.1:9")
+            .env("TWO_MODERATION", "1")
+            .env("TWO_OWEN_USER_ID", owen)
+            .env(
+                "TWO_MODERATION_PROTECTED_ROLE_IDS",
+                if expected == "narrowed" {
+                    "invalid"
+                } else {
+                    ""
+                },
+            )
+            .env("TWO_AUTOMOD", "1")
+            .env("TWO_AUTOMATIONS", "1")
+            .env("TWO_ANNOUNCEMENTS", "1")
+            .output()
+            .expect("isolated boot env fixture");
+        assert!(
+            output.status.success(),
+            "fixture {expected}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+}
+
+#[tokio::test]
+async fn activation_boot_from_env_fixture() {
+    let Ok(expected) = std::env::var("ACTIVATION_ENV_TEST_EXPECTED") else {
+        return;
+    };
+    let config = two_bot_core::Config::from_env().unwrap();
+    let guild = config.guild_id.unwrap();
+    let token = config.discord_token.as_ref().unwrap().expose();
+    let activation = crate::activation::BootActivation::from_config(&config);
+    assert_eq!(
+        crate::gateway::intents_from_env(&activation)
+            .contains(twilight_gateway::Intents::MESSAGE_CONTENT),
+        expected != "narrowed"
+    );
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@agent-testdb:5432/agent_test")
+        .unwrap();
+    let runtime = CommandRuntime::from_env(
+        pool,
+        token,
+        guild,
+        None,
+        two_bot_core::OnboardingGates {
+            mode: two_bot_core::OnboardingMode::Legacy,
+            dry_run: false,
+        },
+        &activation,
+    );
+    if expected == "invalid" {
+        assert!(
+            runtime.is_none(),
+            "permitted staging moderation still validates Owen"
+        );
+        return;
+    }
+    let runtime = runtime.expect("denied moderation must not disable unrelated commands");
+    let defs = runtime.router().publish_set(&[]).unwrap();
+    let names: Vec<_> = defs.iter().map(|def| def.name.as_str()).collect();
+    if expected == "narrowed" {
+        assert_eq!(names, ["rank", "leaderboard"]);
+        assert!(!runtime.router().gates().moderation);
+        assert!(!runtime.router().gates().automations);
+        assert!(!runtime.router().gates().announcements);
+        assert!(
+            !runtime.router().gates().self_roles,
+            "permission never enables an unconfigured surface"
+        );
+    } else {
+        assert!(runtime.router().gates().moderation);
+        assert!(names.contains(&"ban"));
+        assert!(names.contains(&"sticky"));
+    }
+}
+
 #[test]
 fn sticky_options_extract_body_and_debounce() {
     let interaction = slash(

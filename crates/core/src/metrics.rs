@@ -100,6 +100,17 @@ pub const VOICE_DEAD_ACTIONS: &[&str] = &[
     "rename",
     "other",
 ];
+/// Storage-failure operations: `admission` is send-admission SQL
+/// (admit/extend/complete). Every other store reports `other` until its op
+/// joins this allowlist.
+pub const DB_ERROR_OPS: &[&str] = &["admission", "other"];
+/// Terminal outcomes of one send-admission `admit()` decision:
+/// `admitted` on Ok, `blocked` on lane/cooldown refusal, `storage_error`
+/// when the admission SQL itself failed (also counted in
+/// `two_bot_db_errors_total{op="admission"}`); anything else collapses to
+/// `other`. Failed `complete()`/`extend()` storage writes count only in
+/// db_errors: the admit decision was already recorded.
+pub const SEND_ADMISSION_OUTCOMES: &[&str] = &["admitted", "blocked", "storage_error", "other"];
 const BUCKETS_MICROS: &[u64] = &[
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
@@ -160,6 +171,8 @@ struct Values {
     jobs: [JobMetrics; JOBS.len()],
     reconnects: u64,
     resumes: u64,
+    disconnects: u64,
+    missed_events: u64,
     latency_micros: Option<u64>,
     handler: Histogram,
     voice_ops: [[u64; 5]; 3],
@@ -168,6 +181,8 @@ struct Values {
     voice_tracked: u64,
     voice_compensation: u64,
     voice_orphans: u64,
+    db_errors: [u64; DB_ERROR_OPS.len()],
+    send_admissions: [u64; SEND_ADMISSION_OUTCOMES.len()],
 }
 
 /// All storage is fixed-size. Unknown labels collapse to `other`, including hostile input.
@@ -200,6 +215,32 @@ impl Metrics {
         values.reconnects = values.reconnects.saturating_add(1);
         // A stale ACK must not look like latency on the new connection.
         values.latency_micros = None;
+    }
+
+    /// One observed transport loss: reconnect failure, close frame, invalid
+    /// session, or stream termination. The 48h watch pairs every disconnect
+    /// with the matching RESUME or fresh READY; an unpaired disconnect means
+    /// the gateway never came back.
+    pub fn gateway_disconnect(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.disconnects = values.disconnects.saturating_add(1);
+    }
+
+    /// Dispatches Discord assigned but this process never received (sequence
+    /// gaps inside one session). Zero is a no-op. Any nonzero increase over
+    /// the watch window fails the zero-missed-events acceptance.
+    pub fn gateway_missed_events(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.missed_events = values.missed_events.saturating_add(count);
     }
 
     pub fn gateway_latency(&self, latency: Duration) {
@@ -321,6 +362,29 @@ impl Metrics {
         values.voice_orphans = values.voice_orphans.saturating_add(1);
     }
 
+    /// One storage-layer failure. Unknown `op` values collapse
+    /// to `other`; no error text, query or identifier is retained.
+    pub fn db_error(&self, op: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.db_errors[bounded_index(op, DB_ERROR_OPS)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One send-admission `admit()` terminal outcome. Call once
+    /// per admit decision, not per retry or per completion. Unknown outcomes
+    /// collapse to `other`.
+    pub fn send_admission(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.send_admissions[bounded_index(outcome, SEND_ADMISSION_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
     /// Pool samples are supplied at scrape time; this function never opens a DB connection.
     pub fn render(&self, pool: Option<(u32, usize, u32)>) -> String {
         let values = self
@@ -352,6 +416,18 @@ impl Metrics {
             "two_bot_gateway_resumes_total",
             "counter",
             values.resumes,
+        );
+        scalar(
+            &mut out,
+            "two_bot_gateway_disconnects_total",
+            "counter",
+            values.disconnects,
+        );
+        scalar(
+            &mut out,
+            "two_bot_gateway_missed_events_total",
+            "counter",
+            values.missed_events,
         );
         header(
             &mut out,
@@ -495,6 +571,28 @@ impl Metrics {
             "counter",
             values.voice_orphans,
         );
+        header(
+            &mut out,
+            "two_bot_db_errors_total",
+            "counter",
+            "Storage-layer failures by bounded operation; pool gauges are pressure, this is errors.",
+        );
+        for (op, count) in DB_ERROR_OPS.iter().zip(values.db_errors) {
+            writeln!(out, "two_bot_db_errors_total{{op=\"{op}\"}} {count}").unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_send_admissions_total",
+            "counter",
+            "Send-admission admit() decisions by bounded terminal outcome.",
+        );
+        for (outcome, count) in SEND_ADMISSION_OUTCOMES.iter().zip(values.send_admissions) {
+            writeln!(
+                out,
+                "two_bot_send_admissions_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
         let (size, idle, max) = pool.unwrap_or_default();
         scalar(
             &mut out,
@@ -574,6 +672,8 @@ mod tests {
             metrics.rest_response(&hostile, Some(429));
             metrics.job_success(&hostile, 123);
             metrics.job_failure(&hostile);
+            metrics.db_error(&hostile);
+            metrics.send_admission(&hostile);
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
@@ -672,6 +772,30 @@ mod tests {
     }
 
     #[test]
+    fn db_and_admission_signals_stay_bounded_and_saturate() {
+        let metrics = Metrics::default();
+        metrics.db_error("admission");
+        metrics.db_error("admission");
+        metrics.send_admission("admitted");
+        metrics.send_admission("blocked");
+        metrics.send_admission("storage_error");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_db_errors_total{op=\"admission\"} 2\n"));
+        assert!(text.contains("two_bot_db_errors_total{op=\"other\"} 0\n"));
+        assert!(text.contains("two_bot_send_admissions_total{outcome=\"admitted\"} 1\n"));
+        assert!(text.contains("two_bot_send_admissions_total{outcome=\"blocked\"} 1\n"));
+        assert!(text.contains("two_bot_send_admissions_total{outcome=\"storage_error\"} 1\n"));
+        assert!(text.contains("two_bot_send_admissions_total{outcome=\"other\"} 0\n"));
+        // Fixed cardinality: 2 db-error ops + 4 admission outcomes.
+        let mut series = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(series.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
     fn rest_errors_and_reconnects_are_distinguished() {
         let metrics = Metrics::default();
         for status in [Some(204), Some(302), Some(403), Some(429), Some(503), None] {
@@ -688,5 +812,32 @@ mod tests {
         }
         assert!(text.contains("two_bot_gateway_reconnects_total 1\n"));
         assert!(text.contains("two_bot_gateway_latency_seconds NaN\n"));
+    }
+
+    #[test]
+    fn disconnects_and_missed_events_start_at_zero_and_saturate() {
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_gateway_disconnects_total 0\n"));
+        assert!(text.contains("two_bot_gateway_missed_events_total 0\n"));
+        metrics.gateway_disconnect();
+        metrics.gateway_missed_events(0);
+        metrics.gateway_missed_events(3);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_gateway_disconnects_total 1\n"));
+        assert!(text.contains("two_bot_gateway_missed_events_total 3\n"));
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.disconnects = u64::MAX;
+            values.missed_events = u64::MAX;
+        }
+        metrics.gateway_disconnect();
+        metrics.gateway_missed_events(9);
+        let text = metrics.render(None);
+        assert!(text.contains(&format!("two_bot_gateway_disconnects_total {}\n", u64::MAX)));
+        assert!(text.contains(&format!(
+            "two_bot_gateway_missed_events_total {}\n",
+            u64::MAX
+        )));
     }
 }

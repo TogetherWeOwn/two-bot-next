@@ -60,6 +60,27 @@ class RequiredChecksReportTests(unittest.TestCase):
         self.assertEqual(guard["if"], "needs.job-inputs.result != 'success'")
         self.assertEqual(guard["run"], "exit 1")
 
+    def test_required_checks_aggregator_covers_path_filtered_jobs(self):
+        agg = self.workflows["check.yml"]["jobs"]["required-checks"]
+        self.assertEqual(agg["name"], "required checks")
+        self.assertIn("always()", agg["if"])
+        for job in ("job-inputs", "supply-chain", "check", "worker",
+                    "parity-docs", "self-role-store", "community-db",
+                    "feeds-db", "tickets-postgres", "moderation-db"):
+            self.assertIn(job, agg["needs"], job)
+        # The container image smoke is not a correctness gate; keeping it out
+        # of `needs` keeps this signal off the image-build critical path.
+        self.assertNotIn("container", agg["needs"])
+        self.assertNotIn("container-inputs", agg["needs"])
+        self.assertIn("required-checks", agg["runs-on"])
+        body = "\n".join(step.get("run", "") for step in agg["steps"])
+        for marker in ("JOB_INPUTS_RESULT", "SUPPLY_CHAIN_RESULT",
+                       "CHECK_RESULT", "WORKER_RESULT", "PARITY_DOCS_RESULT",
+                       "SELF_ROLE_RESULT", "COMMUNITY_DB_RESULT",
+                       "FEEDS_DB_RESULT", "TICKETS_RESULT",
+                       "MODERATION_DB_RESULT"):
+            self.assertIn(marker, body, marker)
+
     def test_gitleaks_runs_whatever_pr_lint_concluded(self):
         self.assertIn("!cancelled()", self.workflows["supply-chain.yml"]["jobs"]["gitleaks"]["if"])
 
