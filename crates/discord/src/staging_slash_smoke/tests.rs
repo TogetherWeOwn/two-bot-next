@@ -374,7 +374,8 @@ async fn pending_fixture_times_out_is_dropped_and_remaining_steps_are_recorded()
     assert_eq!(report.commands.len(), 5);
     for index in [0, 1, 4] {
         assert_eq!(report.commands[index].actual, Observation::Timeout);
-        assert_eq!(report.commands[index].duration_ms, 50);
+        // Tokio's timer wheel may round a deadline up to the next millisecond.
+        assert!((50..=51).contains(&report.commands[index].duration_ms));
     }
     assert_eq!(source.dropped.load(Ordering::SeqCst), 3);
     assert!(transport.operations.lock().unwrap().is_empty());
@@ -432,6 +433,21 @@ async fn wrong_fixture_type_and_foreign_rank_model_fail_without_rank_reply() {
             usize::from(!wrong_shape)
         );
     }
+}
+
+#[test]
+fn skipped_plan_names_are_not_compiled_core_commands() {
+    let commands = two_bot_core::commands::core_commands();
+    for name in ["rank", "leaderboard"] {
+        assert!(commands.iter().any(|command| command.name == name));
+    }
+    for name in ["help", "ping"] {
+        assert!(
+            !commands.iter().any(|command| command.name == name),
+            "core scope changed; add the fixture before claiming coverage"
+        );
+    }
+    assert!(!SmokeConfig::default().live_execution);
 }
 
 #[tokio::test]
