@@ -761,7 +761,18 @@
       "gate": "moderation",
       "default_member_permissions": "16",
       "dm_permission": false,
-      "options": [],
+      "options": [
+        {
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 512,
+          "choices": []
+        }
+      ],
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Channel-state mutation; excluded from the read-only smoke. Same family as ban (covered)."
