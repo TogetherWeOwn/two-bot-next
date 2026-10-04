@@ -468,21 +468,93 @@ fn parse_end_meta(metadata: Option<&str>) -> (bool, Option<String>, Option<f64>)
     let duration_seconds = match value.get("durationSeconds") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::Number(n)) => n.as_f64(),
-        // Legacy `Number()` coercion on strings: surrounding whitespace is
-        // ignored, and empty/whitespace-only is 0, not missing.
-        Some(serde_json::Value::String(s)) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                Some(0.0)
-            } else {
-                trimmed.parse::<f64>().ok()
-            }
-        }
+        // Legacy `Number()` coercion on strings, form for form.
+        Some(serde_json::Value::String(s)) => js_number(s),
         // Legacy `Number(boolean)`: true is 1, false is 0.
         Some(serde_json::Value::Bool(b)) => Some(if *b { 1.0 } else { 0.0 }),
+        // Accepted divergence: legacy `Number([])` is 0 and `Number([60])` is
+        // 60. A container is not a duration, and reading `[]` as a measured
+        // zero would fabricate time, so it stays unmeasured.
         _ => None,
     };
     (start_known, started_at, duration_seconds)
+}
+
+/// JavaScript `Number(string)` (the `StringToNumber` grammar); `None` is NaN.
+/// Empty or all-whitespace is 0; `0x`/`0o`/`0b` read as unsigned integers;
+/// `Infinity` is infinite (rejected downstream by `usable_duration`, like
+/// NaN). Rust's own `f64` parse is looser in one way (`inf`, `nan`) and
+/// stricter in another (no radix prefixes), so the grammar is checked first.
+fn js_number(raw: &str) -> Option<f64> {
+    let s = raw.trim_matches(is_js_whitespace);
+    if s.is_empty() {
+        return Some(0.0);
+    }
+    match s {
+        "Infinity" | "+Infinity" => return Some(f64::INFINITY),
+        "-Infinity" => return Some(f64::NEG_INFINITY),
+        _ => {}
+    }
+    let radix = match s.as_bytes() {
+        [b'0', b'x' | b'X', ..] => Some(16),
+        [b'0', b'o' | b'O', ..] => Some(8),
+        [b'0', b'b' | b'B', ..] => Some(2),
+        _ => None,
+    };
+    if let Some(radix) = radix {
+        // `to_digit` takes ASCII digits only, and no sign: `-0x10` is NaN.
+        let digits = &s[2..];
+        if digits.is_empty() {
+            return None;
+        }
+        return digits.chars().try_fold(0.0_f64, |acc, c| {
+            Some(acc * f64::from(radix) + f64::from(c.to_digit(radix)?))
+        });
+    }
+    if is_decimal_literal(s) {
+        s.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// ECMAScript `WhiteSpace` and `LineTerminator`, which is what `Number()`
+/// trims. Rust's `char::is_whitespace` is the same set except that it trims
+/// U+0085 (NaN in JavaScript) and keeps U+FEFF (trimmed by JavaScript).
+fn is_js_whitespace(c: char) -> bool {
+    (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}'
+}
+
+/// `[+-] digits [. digits] [e [+-] digits]` with at least one mantissa digit
+/// (`5.` and `.5` are numbers, `.` and `1e` are not).
+fn is_decimal_literal(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = usize::from(matches!(b.first(), Some(b'+' | b'-')));
+    let digits = |i: &mut usize| {
+        let start = *i;
+        while b.get(*i).is_some_and(u8::is_ascii_digit) {
+            *i += 1;
+        }
+        *i - start
+    };
+    let mut mantissa = digits(&mut i);
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        mantissa += digits(&mut i);
+    }
+    if mantissa == 0 {
+        return false;
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(b.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        if digits(&mut i) == 0 {
+            return false;
+        }
+    }
+    i == b.len()
 }
 
 /// The feeds the pairing and the two summaries need. SELECT only: the sweep
@@ -499,8 +571,8 @@ pub struct VoiceHalves {
     pub heartbeats: Vec<String>,
     /// One row per member-bearing end, read strictly (only a finite JSON number
     /// or decimal numeric string is a duration), for the average. Reconcile's
-    /// own parse is more forgiving: it also reads `""`/`false` as 0 and
-    /// `true` as 1.
+    /// own parse follows legacy `Number()`: it also reads `""`/`false` as 0,
+    /// `true` as 1 and radix strings such as `"0x3c"` as their value.
     pub duration_rows: Vec<VoiceDurationRow>,
 }
 
@@ -1179,6 +1251,237 @@ mod tests {
         assert!(start_known);
         assert_eq!(started_at, None);
         assert_eq!(duration, None);
+    }
+
+    /// The duration reconcile reads out of `{"durationSeconds": <value>}`.
+    fn meta_duration(value: serde_json::Value) -> Option<f64> {
+        let blob = serde_json::json!({ "durationSeconds": value }).to_string();
+        parse_end_meta(Some(&blob)).2
+    }
+
+    #[test]
+    fn numeric_string_durations_follow_javascript_number() {
+        // What legacy `Number(raw)` yields, string by string (`None` = NaN).
+        // Radix prefixes and the whitespace set are the forms Rust's own
+        // `f64` parse disagrees on.
+        let cases: &[(&str, Option<f64>)] = &[
+            ("60", Some(60.0)),
+            ("600", Some(600.0)),
+            ("6e1", Some(60.0)),
+            ("6E1", Some(60.0)),
+            ("6e+1", Some(60.0)),
+            ("600e-1", Some(60.0)),
+            ("1.5", Some(1.5)),
+            (".5", Some(0.5)),
+            ("5.", Some(5.0)),
+            ("+5", Some(5.0)),
+            ("-5", Some(-5.0)),
+            ("0x3c", Some(60.0)),
+            ("0X3C", Some(60.0)),
+            ("0o74", Some(60.0)),
+            ("0b111100", Some(60.0)),
+            ("0x0", Some(0.0)),
+            // Whitespace: JavaScript's set (NBSP, BOM, line terminators),
+            // not Rust's (U+0085 is NaN there).
+            ("  60  ", Some(60.0)),
+            ("\n\t60\r\n", Some(60.0)),
+            ("\u{a0}60\u{feff}", Some(60.0)),
+            ("\u{2028}60\u{2029}", Some(60.0)),
+            ("\u{85}60", None),
+            // Empty and all-whitespace are 0, not missing.
+            ("", Some(0.0)),
+            ("  \n", Some(0.0)),
+            // NaN forms.
+            ("abc", None),
+            ("6 0", None),
+            ("6_0", None),
+            ("1,5", None),
+            (".", None),
+            ("+", None),
+            ("1e", None),
+            ("e1", None),
+            ("1e+", None),
+            ("--5", None),
+            ("0x", None),
+            ("0xg", None),
+            ("0x+3c", None),
+            ("-0x3c", None),
+            ("+0x3c", None),
+            ("0b102", None),
+            ("0o8", None),
+            ("0x3c ghost", None),
+            ("nan", None),
+            ("NaN", None),
+            ("inf", None),
+            ("infinity", None),
+            ("INFINITY", None),
+            ("Inf", None),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(js_number(raw), *want, "{raw:?}");
+            assert_eq!(meta_duration(serde_json::json!(raw)), *want, "{raw:?}");
+        }
+        // `Infinity` is a real JavaScript number, rejected like NaN once it
+        // reaches `usable_duration`; so is a decimal that overflows.
+        assert_eq!(js_number("Infinity"), Some(f64::INFINITY));
+        assert_eq!(js_number("+Infinity"), Some(f64::INFINITY));
+        assert_eq!(js_number("-Infinity"), Some(f64::NEG_INFINITY));
+        assert_eq!(js_number(" Infinity "), Some(f64::INFINITY));
+        assert_eq!(js_number("1e999"), Some(f64::INFINITY));
+        for raw in ["Infinity", "-Infinity", "1e999", "nan", "NaN", "inf", "-5"] {
+            assert_eq!(usable_duration(js_number(raw)), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn end_metadata_never_fabricates_a_duration() {
+        let d = |raw: &str| parse_end_meta(Some(raw)).2;
+        // Numbers, numeric strings and the legacy boolean coercions.
+        assert_eq!(d(r#"{"durationSeconds":60}"#), Some(60.0));
+        assert_eq!(d(r#"{"durationSeconds":"600"}"#), Some(600.0));
+        assert_eq!(d(r#"{"durationSeconds":"0x3c"}"#), Some(60.0));
+        assert_eq!(d(r#"{"durationSeconds":true}"#), Some(1.0));
+        assert_eq!(d(r#"{"durationSeconds":false}"#), Some(0.0));
+        // Null, missing and unreadable metadata carry no duration.
+        assert_eq!(d(r#"{"durationSeconds":null}"#), None);
+        assert_eq!(d(r#"{}"#), None);
+        assert_eq!(d("not json"), None);
+        assert_eq!(d(r#"{"durationSeconds":"#), None);
+        assert_eq!(parse_end_meta(None).2, None);
+        // Accepted divergence from legacy `Number()`: a container is never a
+        // duration (`Number([])` is 0, `Number([60])` is 60 in JavaScript).
+        for raw in [
+            r#"{"durationSeconds":[]}"#,
+            r#"{"durationSeconds":[60]}"#,
+            r#"{"durationSeconds":["60"]}"#,
+            r#"{"durationSeconds":{}}"#,
+            r#"{"durationSeconds":{"v":60}}"#,
+        ] {
+            assert_eq!(d(raw), None, "{raw}");
+        }
+        // Negative and non-finite values parse, then `usable_duration`
+        // refuses them: reconcile falls back to the row's own start, never
+        // a measured zero.
+        assert_eq!(d(r#"{"durationSeconds":-5}"#), Some(-5.0));
+        assert_eq!(usable_duration(d(r#"{"durationSeconds":-5}"#)), None);
+        assert_eq!(usable_duration(d(r#"{"durationSeconds":"-5"}"#)), None);
+        assert_eq!(usable_duration(d(r#"{"durationSeconds":"nan"}"#)), None);
+        assert_eq!(
+            usable_duration(d(r#"{"durationSeconds":"Infinity"}"#)),
+            None
+        );
+        assert_eq!(
+            usable_duration(d(r#"{"durationSeconds":"0x3c"}"#)),
+            Some(60)
+        );
+        // The start flag is read separately, from the flag only.
+        assert!(!parse_end_meta(Some(r#"{"startKnown":false,"durationSeconds":"600"}"#)).0);
+        assert!(parse_end_meta(Some(r#"{"startKnown":"false"}"#)).0);
+        assert!(parse_end_meta(Some(r#"{"startKnown":null}"#)).0);
+    }
+
+    /// A reconcile end row built the way `fetch_voice_halves` builds it: the
+    /// raw metadata blob through `parse_end_meta`.
+    fn end_with_metadata(member: &str, at: &str, metadata: &str) -> HalfEnd {
+        let (start_known, started_at, duration_seconds) = parse_end_meta(Some(metadata));
+        HalfEnd {
+            guild_id: G.to_owned(),
+            member_id: member.to_owned(),
+            occurred_at: at.to_owned(),
+            channel: "ch-a".to_owned(),
+            start_known,
+            started_at,
+            duration_seconds,
+        }
+    }
+
+    #[test]
+    fn javascript_number_forms_decide_complete_versus_flagged() {
+        // `"0x3c"` is a measured 60 in legacy: a healthy complete session.
+        let r = reconcile_voice_halves(
+            &[],
+            &[end_with_metadata(
+                "m",
+                "2026-09-20T10:30:00.000Z",
+                r#"{"startKnown":true,"durationSeconds":"0x3c"}"#,
+            )],
+            &[],
+        );
+        assert_eq!(r.complete, 1);
+        assert!(r.resolved.is_empty() && r.unresolvable.is_empty());
+        // `"nan"` and `"-5"` are not durations: with nothing else on file the
+        // end is flagged, never counted complete with an invented time.
+        for raw in ["nan", "NaN", "inf", "Infinity", "-5", "abc", "0x", "-0x3c"] {
+            let blob = serde_json::json!({"startKnown": true, "durationSeconds": raw}).to_string();
+            let r = reconcile_voice_halves(
+                &[],
+                &[end_with_metadata("m", "2026-09-20T10:30:00.000Z", &blob)],
+                &[],
+            );
+            assert_eq!(r.complete, 0, "{raw}");
+            assert!(r.resolved.is_empty(), "{raw}");
+            assert_eq!(r.unresolvable.len(), 1, "{raw}");
+            assert_eq!(r.unresolvable[0].reason, UnresolvableReason::BadEndRow);
+        }
+        // The same unusable string recomputes from the row's own `startedAt`.
+        let blob =
+            r#"{"startKnown":true,"startedAt":"2026-09-20T10:00:00.000Z","durationSeconds":"nan"}"#;
+        let r = reconcile_voice_halves(
+            &[],
+            &[end_with_metadata("m", "2026-09-20T10:30:00.000Z", blob)],
+            &[],
+        );
+        assert_eq!(r.resolved.len(), 1);
+        assert_eq!(r.resolved[0].resolution, ResolutionKind::MetadataRecompute);
+        assert_eq!(r.resolved[0].duration_seconds, 1800);
+    }
+
+    #[test]
+    fn multibyte_zone_in_a_timestamp_never_aborts_the_sweep() {
+        // `+1é1` used to panic inside the timestamp parser and abort the
+        // whole report. Legacy `Date.parse` is NaN: the row is unparseable.
+        const BAD: &str = "2026-09-20T12:00:00+1é1";
+        // As the end's own `startedAt`: no recompute, so a bad end row.
+        let r = reconcile_voice_halves(
+            &[],
+            &[end("m", "2026-09-20T12:30:00.000Z", true, Some(BAD), None)],
+            &[],
+        );
+        assert!(r.resolved.is_empty());
+        assert_eq!(r.unresolvable.len(), 1);
+        assert_eq!(r.unresolvable[0].reason, UnresolvableReason::BadEndRow);
+        assert_eq!(r.unresolvable[0].start_at.as_deref(), Some(BAD));
+        // With an earlier start row on file it falls through to that start.
+        let r = reconcile_voice_halves(
+            &[start("m", "2026-09-20T12:00:00.000Z", "ch-a")],
+            &[end("m", "2026-09-20T12:30:00.000Z", true, Some(BAD), None)],
+            &[],
+        );
+        assert!(r.unresolvable.is_empty());
+        assert_eq!(r.resolved.len(), 1);
+        assert_eq!(r.resolved[0].resolution, ResolutionKind::RestartGap);
+        assert_eq!(r.resolved[0].duration_seconds, 1800);
+        // As a row's own `occurred_at`: skipped and counted, never paired.
+        let r = reconcile_voice_halves(
+            &[start("m", BAD, "ch-a")],
+            &[end("m", BAD, true, None, Some(60.0))],
+            &[leave("m", BAD)],
+        );
+        assert_eq!(r.skipped, 3);
+        assert_eq!(r.complete, 0);
+        assert!(r.resolved.is_empty() && r.unresolvable.is_empty());
+        // The same through the metadata blob `fetch_voice_halves` parses.
+        let blob = serde_json::json!({
+            "startKnown": true, "startedAt": BAD, "durationSeconds": null
+        })
+        .to_string();
+        let r = reconcile_voice_halves(
+            &[],
+            &[end_with_metadata("m", "2026-09-20T12:30:00.000Z", &blob)],
+            &[],
+        );
+        assert_eq!(r.unresolvable.len(), 1);
+        assert_eq!(r.unresolvable[0].reason, UnresolvableReason::BadEndRow);
     }
 
     #[test]
