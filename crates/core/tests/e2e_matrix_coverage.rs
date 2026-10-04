@@ -132,12 +132,10 @@ fn matrix_doc_names_every_row() {
     }
     assert!(missing.is_empty(), "matrix doc drops rows for: {missing:?}");
     // The doc must not promise what the registry does not publish.
-    let published: HashSet<&str> = InteractionRouter::new(all_gates_on())
+    let published_defs = InteractionRouter::new(all_gates_on())
         .publish_set(&[])
-        .expect("full set assembles")
-        .iter()
-        .map(|d| d.name.as_str())
-        .collect();
+        .expect("full set assembles");
+    let published: HashSet<&str> = published_defs.iter().map(|d| d.name.as_str()).collect();
     for name in ["create", "templateassistant", "rota-acknowledge"] {
         assert!(
             !published.contains(name),
