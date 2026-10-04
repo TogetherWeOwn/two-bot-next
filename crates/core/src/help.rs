@@ -104,8 +104,8 @@ const HELP_GROUPS: &[HelpGroup] = &[
 /// Render the ephemeral `/help` reply for the given live publish set.
 ///
 /// Only commands present in `defs` render, in publish order within each
-/// group; empty groups are skipped. Well under Discord's 2000-character
-/// content ceiling for any publishable set (the ceiling is 100 commands).
+/// group; empty groups are skipped. Large custom-command sets exceed the
+/// plain content ceiling; the Discord adapter uses an embed to preserve names.
 #[must_use]
 pub fn help_text(defs: &[CommandDefinition]) -> String {
     let live: HashSet<&str> = defs.iter().map(|d| d.name.as_str()).collect();

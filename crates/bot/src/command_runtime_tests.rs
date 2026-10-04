@@ -883,6 +883,9 @@ async fn help_answers_immediately_from_the_live_publish_set() {
         ..gates(true, true)
     };
     let runtime = runtime_without_db(router_gates, true, origin);
+    assert!(runtime.published_commands().is_none());
+    runtime.publish_registry_checked(Some(1111)).await.unwrap();
+    assert!(runtime.published_commands().is_some());
     runtime
         .on_interaction(&slash("help", Some(CHANNEL), Vec::new()))
         .await;

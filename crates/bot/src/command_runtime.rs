@@ -46,7 +46,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, PoisonError, RwLock,
     },
 };
 
@@ -68,7 +68,6 @@ use two_bot_core::{
     },
     feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit},
     funnel::now_millis_for_test,
-    help_text,
     sticky::{
         activity_eligible, decide_activity, normalize_debounce, sticky_removed_reply,
         sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
@@ -80,8 +79,9 @@ use two_bot_core::{
     SurfaceFlags,
 };
 use two_bot_discord::{
-    publish_commands, register_channel_handlers, response_for_slash, route_interaction,
-    ActionExecutor, ChannelModerationRuntime, LevelingRuntime, RoutedInteraction,
+    help_response, publish_commands, register_channel_handlers, response_for_slash,
+    route_interaction, ActionExecutor, ChannelModerationRuntime, LevelingRuntime,
+    RoutedInteraction,
 };
 
 use crate::activation::BootActivation;
@@ -189,6 +189,9 @@ pub struct CommandRuntime {
     executor: ActionExecutor,
     interactions: two_bot_discord::interactions::InteractionRuntime,
     custom_commands: Option<Vec<two_bot_core::CustomCommand>>,
+    /// Confirmed publication for the non-DB/fallback publisher. Production
+    /// discovery reads the custom-command publisher's shared snapshot instead.
+    published_commands: RwLock<Option<Arc<[two_bot_core::CommandDefinition]>>>,
     application_id: AtomicU64,
     /// Bootstrapped custom-command execution seam (dynamic dispatch, prefix
     /// triggers, serialized republication). Shares the interaction runtime's
@@ -264,6 +267,7 @@ impl CommandRuntime {
             executor,
             interactions,
             custom_commands,
+            published_commands: RwLock::new(None),
             application_id: AtomicU64::new(0),
             gateway_commands: tokio::sync::OnceCell::new(),
             channel,
@@ -277,6 +281,16 @@ impl CommandRuntime {
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
             voice_kick_claim: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn published_commands(&self) -> Option<Arc<[two_bot_core::CommandDefinition]>> {
+        if let Some(custom) = self.gateway_commands.get() {
+            return custom.published_commands();
+        }
+        self.published_commands
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn set_identity(&self, bot_user_id: u64, application_id: u64) {
@@ -840,6 +854,11 @@ impl CommandRuntime {
             .publish_guild_commands(application_id, self.guild_id, &commands)
             .await
             .map_err(|_| RegistrySyncError::Publish)?;
+        let snapshot: Arc<[two_bot_core::CommandDefinition]> = defs.into();
+        *self
+            .published_commands
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(snapshot);
         *synced = true;
         Ok(())
     }
@@ -954,16 +973,13 @@ impl CommandRuntime {
             return;
         }
         if handler == HandlerId::Help {
-            // Discovery is a pure registry read: answer immediately with the
-            // live publish set (same definitions picker sees), never defer
-            // and never touch the store.
-            let custom = self.custom_commands.as_deref().unwrap_or(&[]);
-            let defs = self
-                .interactions
-                .router
-                .publish_set(custom)
-                .unwrap_or_default();
-            self.answer(interaction, ephemeral(help_text(&defs))).await;
+            // Read the actual confirmed publication, including DB-backed
+            // custom rows and successful add/remove refreshes. No store wait.
+            let response = match self.published_commands() {
+                Some(defs) => help_response(&defs),
+                None => ephemeral("The command list is still refreshing. Try /help again shortly."),
+            };
+            self.answer(interaction, response).await;
             return;
         }
         let owner = match name.as_str() {

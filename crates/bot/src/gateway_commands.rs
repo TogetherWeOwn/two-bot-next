@@ -157,6 +157,10 @@ impl GatewayCommands {
             .clone()
     }
 
+    pub fn published_commands(&self) -> Option<Arc<[two_bot_core::CommandDefinition]>> {
+        self.runtime.published_commands()
+    }
+
     /// One complete registry for READY and for a cold RESUME where READY is
     /// absent. The session must name the bootstrapped application; a mismatch
     /// publishes nothing.

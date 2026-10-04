@@ -2,7 +2,10 @@
 //! Database mutations commit before the ONE full registry is republished.
 //! No gateway listener here: the runtime injects this service into its dispatch.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, PoisonError, RwLock},
+    time::Duration,
+};
 
 use sqlx::PgPool;
 use tokio::sync::Mutex;
@@ -75,6 +78,9 @@ pub struct CustomCommandRuntime {
     // All clones serialize mutation + read + publish, not just the HTTP PUT.
     // Otherwise an older full-set snapshot can overwrite a newer addition.
     registry: Arc<Mutex<()>>,
+    /// Exact merged set from the last confirmed full-registry PUT. Clones share
+    /// this snapshot; committed DB changes alone must not advance discovery.
+    published_commands: Arc<RwLock<Option<Arc<[two_bot_core::CommandDefinition]>>>>,
 }
 
 impl CustomCommandRuntime {
@@ -95,7 +101,17 @@ impl CustomCommandRuntime {
             executor,
             application_id,
             registry: Arc::new(Mutex::new(())),
+            published_commands: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Clone the last confirmed publication without a DB read or a lock held
+    /// across the reply's I/O. `None` means publication is not yet confirmed.
+    pub fn published_commands(&self) -> Option<Arc<[two_bot_core::CommandDefinition]>> {
+        self.published_commands
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Used on READY and after successful add/remove. Never publish just the
@@ -126,7 +142,13 @@ impl CustomCommandRuntime {
         self.executor
             .publish_guild_commands(self.application_id, guild, &publish_commands(&defs))
             .await
-            .map_err(|_| CustomCommandError::Publication)
+            .map_err(|_| CustomCommandError::Publication)?;
+        let snapshot: Arc<[two_bot_core::CommandDefinition]> = defs.into();
+        *self
+            .published_commands
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(snapshot);
+        Ok(())
     }
 
     /// Returns false for another feature's interaction. Guild/application fences

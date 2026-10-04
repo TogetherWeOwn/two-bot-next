@@ -57,7 +57,7 @@ pub use executor::{
 };
 pub use intents::{cache_resource_types, gateway_intents, needs_message_content};
 pub use interactions::{
-    command_to_twilight, deferred_response, dispatch_interaction, publish_commands,
+    command_to_twilight, deferred_response, dispatch_interaction, help_response, publish_commands,
     refusal_response, response_for_slash, route_interaction, text_response, DispatchOptions,
     InteractionReplyTransport, RoutedInteraction,
 };
