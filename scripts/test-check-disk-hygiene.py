@@ -21,6 +21,14 @@ its own job container, so each keeps the guards (TOG-12134):
 - the `rust-tests` integration step still runs the full
   `--workspace --test '*'` graph: coverage must not be narrowed as a
   substitute for freeing disk.
+
+Toolchain ordering guard: pip 23 probes `rustc --version` from the workspace
+with a 0.5 s timeout for its user agent. If the pinned toolchain still lacks
+the components named in rust-toolchain.toml, the rustup proxy starts
+installing them and the timeout kills it half-way, leaving untracked
+`bin/cargo-fmt`; the later `cargo fmt` then fails with a file conflict in
+roughly half the runs. Every lane that runs pip installs the components
+before its first pip run.
 """
 
 import re
@@ -146,6 +154,31 @@ class CheckDiskHygieneTests(unittest.TestCase):
         # The test lanes never run cargo-deny: it belongs to the lint lane.
         for lane in LANES[1:]:
             self.assertNotIn("cargo-deny", step_names(self.jobs[lane]))
+
+    def test_toolchain_components_installed_before_first_pip_run(self):
+        install = "Install pinned Rust toolchain components"
+        for lane, body in self.jobs.items():
+            with self.subTest(lane=lane):
+                first_pip = next(
+                    (i for i, line in enumerate(body)
+                     if re.search(r"(?:-m pip\b|^\s*pip3? )", line)),
+                    None,
+                )
+                if first_pip is None:
+                    continue  # lane never invokes pip; nothing to guard
+                install_at = next(
+                    (i for i, line in enumerate(body)
+                     if line.strip() == f"- name: {install}"),
+                    None,
+                )
+                self.assertIsNotNone(install_at, f"missing step {install!r} in {lane}")
+                self.assertLess(
+                    install_at, first_pip,
+                    f"pip probes `rustc --version`; finish the toolchain install first ({lane})",
+                )
+                step = step_body(body, install)
+                self.assertRegex(step, r"(?m)^\s+run: rustup toolchain install --no-self-update$")
+                self.assertRegex(step, r"(?m)^\s+if: needs\.job-inputs\.outputs\.rust != 'false'$")
 
 
 if __name__ == "__main__":

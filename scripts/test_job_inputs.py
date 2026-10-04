@@ -222,6 +222,18 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {WORKER}, path)
 
+    def test_release_contributor_example_selects_worker_only(self):
+        # The native release fixture reads and synchronizes the copyable
+        # testsupport example, so a root-doc edit must run its worker step.
+        self.assertEqual(
+            jobs(["CONTRIBUTING.md"]),
+            {RUST: False, WORKER: True, PARITY: False,
+             SUPPLY: False, DOCS: True})
+        self.assertEqual(
+            jobs(["README.md"]),
+            {RUST: False, WORKER: False, PARITY: False,
+             SUPPLY: False, DOCS: True})
+
     def test_repo_chrome_selects_no_job(self):
         # Image inputs moved out of this list (TOG-14881): Dockerfile and
         # friends select `supply` (see test_image_inputs_select_supply_only).

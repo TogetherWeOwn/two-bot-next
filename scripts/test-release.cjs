@@ -30,6 +30,7 @@ const bootstrapSnapshot = Object.freeze({
   ...Object.fromEntries([
     'Cargo.toml', 'Cargo.lock', 'src/lib.rs',
     'release-please-config.json', '.release-please-manifest.json',
+    'fuzz/Cargo.toml', 'CONTRIBUTING.md',
     ...members.map(member => `${member}/Cargo.toml`),
   ].map(file => [file, read(file)])),
   'CHANGELOG.md': bootstrapChangelog,
@@ -42,6 +43,25 @@ assert.deepEqual(Object.keys(config.packages), ['.']);
 assert.equal(config.packages['.']['release-type'], 'rust');
 assert.equal(config.packages['.']['include-component-in-tag'], false);
 assert.equal(cargo.package.publish, false);
+
+function assertExcludedConsumers(snapshot, version) {
+  const fuzz = parseCargoManifest(snapshot['fuzz/Cargo.toml']);
+  assert.equal(fuzz.package.version, '0.0.0', 'The unpublished fuzz harness keeps its own version');
+  const original = parseCargoManifest(bootstrapSnapshot['fuzz/Cargo.toml']);
+  assert.equal(fuzz.bin.length, 6, 'Retain all six fuzz targets');
+  assert.deepEqual(fuzz.bin, original.bin, 'Release updates must preserve the fuzz target definitions');
+  for (const [name, dependency] of Object.entries(original.dependencies)) {
+    if (dependency.path) {
+      assert.deepEqual(fuzz.dependencies[name], {...dependency, version}, `Unsynchronized fuzz dependency ${name}`);
+    } else {
+      assert.deepEqual(fuzz.dependencies[name], dependency, `Release updates must preserve external fuzz dependency ${name}`);
+    }
+  }
+  const examples = snapshot['CONTRIBUTING.md'].match(/^two-bot-testsupport = .*$/gm);
+  assert.equal(examples?.length, 1, 'Retain one copyable testsupport dependency example');
+  const example = parseCargoManifest(`[dev-dependencies]\n${examples[0]}`);
+  assert.equal(example['dev-dependencies']['two-bot-testsupport'].version, version, 'Unsynchronized testsupport dependency example');
+}
 
 function assertSynchronizedSnapshot(snapshot) {
   const cargo = parseCargoManifest(snapshot['Cargo.toml']);
@@ -59,8 +79,20 @@ function assertSynchronizedSnapshot(snapshot) {
     }
     assert.equal(packages.find(pkg => pkg.name === parsed.package.name).version, version, `Unsynchronized lock entry for ${file}`);
   }
+  assertExcludedConsumers(snapshot, version);
   return version;
 }
+
+const seedVersion = assertSynchronizedSnapshot(bootstrapSnapshot);
+for (const name of ['two-bot-core', 'two-bot-cutover']) {
+  const stale = bootstrapSnapshot['fuzz/Cargo.toml'].replace(
+    new RegExp(`(${name} = .*version = ")[^"]+`), (_, prefix) => `${prefix}0.0.0`);
+  assert.throws(() => assertExcludedConsumers({...bootstrapSnapshot, 'fuzz/Cargo.toml': stale}, seedVersion), new RegExp(`Unsynchronized fuzz dependency ${name}`));
+}
+const staleExample = bootstrapSnapshot['CONTRIBUTING.md'].replace(
+  /^(two-bot-testsupport = .*version = ")[^"]+/m, (_, prefix) => `${prefix}0.0.0`);
+assert.throws(() => assertExcludedConsumers({...bootstrapSnapshot, 'CONTRIBUTING.md': staleExample}, seedVersion), /Unsynchronized testsupport dependency example/);
+console.log('PASS 3 excluded-consumer drift guards: both fuzz dependencies and the contributor example');
 
 async function simulate(snapshot, {message, file, tagged, bootstrap}) {
   // Everything, including the prior version/tag, is derived from this snapshot.
