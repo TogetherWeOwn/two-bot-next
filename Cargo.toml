@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store", "crates/testsupport"]
+exclude = ["fuzz"]
 default-members = [".", "crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store"]
 
 # One native Rust release strategy versions the whole workspace. The root

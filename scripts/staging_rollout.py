@@ -28,6 +28,11 @@ MAX_BODY = 2 * 1024 * 1024
 # (with `healthy` at 1) is accepted. Each pass re-checks every identity and
 # runtime probe; any non-passing poll resets the streak.
 ACTIVE_LAG_CONFIRMATIONS = 2
+# Polls (5s apart) tolerated while a completed rollout's target image is not
+# yet reflected by the application listing. The listing is read separately from
+# the rollout record and can trail it right after a deploy; a persistent
+# mismatch still fails closed as `application_image_drift`.
+APPLICATION_IMAGE_STALE_POLLS = 12
 TOKEN = re.compile(r"[a-z0-9_]{1,32}")
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 IMAGE = rf"registry\.cloudflare\.com/[^/@\s]+/{APPLICATION}@sha256:[0-9a-f]{{64}}"
@@ -517,6 +522,7 @@ def verify(args, client):
     url = staging_url()
     pinned = None
     lag_streak = 0
+    image_stale = 0
     while time.monotonic() < client.deadline:
         probed = False
         passed = False
@@ -532,8 +538,14 @@ def verify(args, client):
             complete = converged(row, image, number(pinned.get("target_version")))
             lag = False if complete else active_lag(row, image, number(pinned.get("target_version")))
             client.observation = rollout_observation(row)
-            if complete or lag:
-                require(mapping(app.get("configuration")).get("image") == image, "application_image_drift")
+            stale = (complete or lag) and mapping(app.get("configuration")).get("image") != image
+            if stale:
+                image_stale += 1
+                require(image_stale <= APPLICATION_IMAGE_STALE_POLLS, "application_image_drift")
+                client.observation += " application_image=stale"
+            else:
+                image_stale = 0
+            if (complete or lag) and not stale:
                 active_worker(client, version)
                 status, headers, body = client.request(url + "/readyz")
                 probed = True

@@ -1391,11 +1391,52 @@ class OrchestrationTests(OfflineTestCase):
                                  ("configuration", {"image": OLD_IMAGE}, "application_image_drift")]:
             with self.subTest(key=key):
                 client = verify_client()
+                client.deadline = 400  # long enough to exhaust the stale-image tolerance
                 changed = app()
                 changed[key] = value
                 client.api_routes[APP_PATH] = [[changed]]
                 self.assert_gate(code, rollout.verify, self.args, client)
                 self.assert_no_evidence()
+
+    def test_application_listing_trailing_the_completed_rollout_is_tolerated(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        stale = app()
+        stale["configuration"] = {"image": OLD_IMAGE}
+        client.api_routes[APP_PATH] = [[stale], [stale], [app()]]
+        client.deadline = 400
+        rollout.verify(self.args, client)
+        evidence = json.loads(Path(self.args.evidence).read_text())
+        self.assertEqual(evidence["image"], IMAGE)
+        self.assertNotIn("active_lag", evidence)
+        # Stale polls never count toward acceptance: two waits, then the fresh pass.
+        self.assertEqual(self.clock.sleeps[:2], [5, 5])
+        self.assert_no_secret_saved_or_printed()
+
+    def test_stale_application_image_is_reported_and_never_accepted(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        stale = app()
+        stale["configuration"] = {"image": OLD_IMAGE}
+        client.api_routes[APP_PATH] = [[stale]]
+        client.deadline = 100 + 5 * 3  # times out before the tolerance runs out
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertIn("application_image=stale", client.observation)
+        self.assert_no_evidence()
+
+    def test_persistent_stale_application_image_fails_as_drift_after_the_tolerance(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        stale = app()
+        stale["configuration"] = {"image": OLD_IMAGE}
+        client.api_routes[APP_PATH] = [[stale]]
+        client.deadline = 1000
+        self.assert_gate("application_image_drift", rollout.verify, self.args, client)
+        self.assertEqual(client.calls.count(("api", APP_PATH)), rollout.APPLICATION_IMAGE_STALE_POLLS + 1)
+        self.assert_no_evidence()
 
     def test_final_application_id_namespace_and_image_are_rechecked(self):
         self.prepare_baseline()
