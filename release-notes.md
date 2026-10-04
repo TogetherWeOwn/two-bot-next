@@ -1,16 +1,61 @@
 :robot: I have created a release *beep* *boop*
 
-## Summary
+## Thinking Path
 
-Publish the next synchronized Rust workspace release through release-please.
+> - two-bot-next is the Together We Own Discord bot, written in Rust, running as one always-on container.
+> - Its workspace ships as one synchronized release with one root changelog and tag.
+> - The release snapshot must include current main so newly merged fixes do not disappear from release notes.
+> - Regeneration must retain the reviewed excluded-consumer synchronization and contributor-example CI repairs.
+> - This pull request publishes synchronized 0.3.0 metadata and preserved notes; it does not authorize production cutover.
 
-## Changes
+## Linked Issues or Issue Description
 
-Update the release manifest, Cargo versions and lockfile, and preserve generated and bootstrap changelog notes.
+- Regenerate this same release PR from current main `26a98420`, including the read-only staging-plan login fix in #550 and the rustdoc fixes in #533. Preserve the prior source repairs and canonical seven-section metadata. The incorporated builder/toolchain update in #350 is intentionally excluded from the user-facing changelog by its `build` type.
 
-## Testing
+## What Changed
 
-Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publication.cjs`, `python3 scripts/test-release-retry.py` and `python3 scripts/test-pr-lint.py`. Required checks are dispatched on this PR head; their green results and independent review are mandatory before merge.
+- Update the root release manifest, seven package versions and local dependency pins, Cargo.lock, and CHANGELOG.md through release-please 17.6.0.
+- Restore both excluded fuzz path requirements and the copyable testsupport dependency example at 0.3.0, including native generic extra-file updates for subsequent releases.
+- Retain the offline native lifecycle coverage for excluded consumers, drift controls, all six fuzz targets, and unchanged external fuzz dependencies.
+- Retain CONTRIBUTING.md-only routing to Worker CI and its selector regression; unrelated README-only changes keep the fast pass.
+- Integrate the native snapshot generated from `26a98420`; keep its regenerated changelog verbatim. The repair-only delta against the generated head is the same seven files as the prior repairs.
+- Keep all seven PR sections before the first native notes delimiter. Preserve the fresh native region and overflow link, every historical notes line, and the two newly generated fix entries.
+- Credit release-please automation and all repository contributors whose changes appear below.
+
+## Verification
+
+- Regeneration workflow [37203110138](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/37203110138): SUCCESS at snapshot `26a98420455f804f14702a4b0091a75f0898a2c2`. Generated head `b60b0483` was integrated with the saved source repairs and pushed as `8ccbad3f`.
+- `NODE_PATH=<pinned-dependencies> node scripts/test-release.cjs`: PASS, 22 bootstrap plus 22 generated post-release native lifecycles, five migration guards, eight overflow guards, four snapshot guards and one overflow lifecycle.
+- `node scripts/test-release-publication.cjs` with release-please 17.6.0: PASS, native publication, retry, seed-link repair and misplaced-template negative control.
+- `python3 scripts/test-release-retry.py`: PASS, 28 tests. `python3 scripts/test-pr-lint.py`: PASS, 27 tests.
+- `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_job_inputs.py' -v`: PASS, 58 tests. `test_container_inputs.py`: PASS, 26 tests.
+- `python3 scripts/test-docker-deps.py`: PASS, seven valid package targets without Cargo compilation. `git diff --check`: PASS. The seven repaired files are byte-identical to the previous repair head, and CHANGELOG.md is byte-identical to the fresh native reconciliation output.
+- Current canonical overflow-body publication is replayed separately against the pinned native library, with fail-closed mocked GitHub transport and a misplaced-template negative control. No real tag or release is created by that replay.
+- Exact-head CI and fresh independent approval remain pending. Earlier approvals or green heads do not satisfy the merge gate; live current-main freshness is required immediately before merge.
+- No local Rust compilation, full fuzz campaign, staging E2E, production test, deployment, tag verification or SBOM publication verification was performed in this regeneration.
+
+## Risks
+
+- Pre-1.0 release publication is not production deployment or cutover approval.
+- Native delimiter placement controls published notes; the pinned publication fixture protects that boundary.
+- The generic updater changes only annotated version lines; native lifecycles preserve the unpublished fuzz package version, external dependencies and target definitions.
+- Keep the release freeze until publication is verified. Further main movement invalidates this generation snapshot and requires regeneration, not an ancestry-only merge or stale-main exception.
+
+## Model Used
+
+- OpenAI `gpt-6.1-sol` authored the earlier synchronization/CI repairs and this regeneration integration, canonical metadata repair, and verification. release-please 17.6.0 generated versions and release notes. No routed model output was incorporated in this regeneration. Historical work remains credited to its contributors; context-window size was not supplied.
+
+## Checklist
+
+- [x] I wrote a thinking path that runs from the project to this change
+- [x] I named the model used, with its version
+- [x] I searched for related PRs and linked them above
+- [x] I ran the relevant offline release tests locally and they pass
+- [x] I retained regression coverage for excluded consumers, subsequent releases and contributor-only CI selection
+- [x] I updated the documentation this change touches
+- [x] No secret, token or credential is in the diff, the title, the body or the branch name
+- [x] No internal ticket id, instance link or private host is in the title, body, commits or branch name
+- [ ] CI is green on the repaired exact head before independent approval (pending)
 ---
 
 
