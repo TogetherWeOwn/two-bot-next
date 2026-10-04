@@ -3646,59 +3646,137 @@ async fn sticky_and_feed_slices_share_one_runtime() {
     db.close().await;
 }
 
-fn kick_slash() -> Interaction {
+fn kick_as(permissions: Permissions, guild: u64) -> Interaction {
     let mut interaction = slash(
         "kick",
         Some(CHANNEL),
         vec![option("member", CommandOptionValue::User(Id::new(303)))],
     );
-    interaction.member.as_mut().unwrap().permissions = Some(Permissions::all());
+    interaction.member.as_mut().unwrap().permissions = Some(permissions);
+    interaction.guild_id = Some(Id::new(guild));
     interaction
 }
 
-fn moderation_gates() -> RouterGates {
+fn kick_gates(moderation: bool) -> RouterGates {
     RouterGates {
         configured_guild: Some(GUILD),
-        moderation: true,
+        moderation,
         ..gates(false, false)
     }
 }
 
-#[tokio::test]
-async fn claimed_kick_stays_silent_for_the_voice_sink() {
-    let (mock, origin) = MockRest::start(Vec::new()).await;
-    let runtime = runtime_without_db(moderation_gates(), false, origin);
-    // Claimed (target in a tracked room): the voice sink answers the vote,
-    // so the router sends no callback at all.
-    runtime.set_voice_kick_claim(Arc::new(|_, _| Box::pin(async move { Some(500u64) })));
-    runtime.on_interaction(&kick_slash()).await;
-    assert!(
-        mock.posts_to("/callback").await.is_empty(),
-        "claimed kick sends no router callback"
-    );
-    assert!(mock.requests().is_empty(), "no other REST effects");
-    mock.shutdown().await;
+/// Wire a voice delegate that counts its calls and answers `claims`. The
+/// stub never sends a callback itself, so a `true` answer must leave the
+/// router silent and a `false` answer must leave exactly one router reply.
+fn wire_kick_vote(runtime: &CommandRuntime, claims: bool) -> Arc<AtomicU64> {
+    let calls = Arc::new(AtomicU64::new(0));
+    let observed = Arc::clone(&calls);
+    runtime.set_voice_kick_vote(Arc::new(move |_| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move { claims })
+    }));
+    calls
 }
 
-#[tokio::test]
-async fn unclaimed_kick_keeps_the_moderation_path() {
-    let (mock, origin) = MockRest::start(Vec::new()).await;
-    let runtime = runtime_without_db(moderation_gates(), false, origin.clone());
-    // No claim wired: pre-existing behavior, one unavailable callback.
-    runtime.on_interaction(&kick_slash()).await;
-    // Claim wired but target outside any tracked room: same path.
-    runtime.set_voice_kick_claim(Arc::new(|_, _| Box::pin(async move { None })));
-    runtime.on_interaction(&kick_slash()).await;
+async fn sole_ephemeral_reply(mock: &MockRest, case: &str) -> String {
     let callbacks = mock.posts_to("/callback").await;
-    assert_eq!(callbacks.len(), 2, "both unclaimed kicks answer");
-    for callback in callbacks {
-        let reply: serde_json::Value = serde_json::from_slice(&callback.body).unwrap();
-        assert_eq!(reply["type"], 4, "immediate response, not a defer");
-        assert_eq!(reply["data"]["flags"], 64);
-        assert_eq!(
-            reply["data"]["content"],
-            "This command is not available in this build yet."
-        );
+    assert_eq!(callbacks.len(), 1, "{case} answers exactly once");
+    let reply: serde_json::Value = serde_json::from_slice(&callbacks[0].body).unwrap();
+    assert_eq!(reply["type"], 4, "{case}: immediate reply, not a defer");
+    assert_eq!(reply["data"]["flags"], 64, "{case}: ephemeral reply");
+    assert_eq!(mock.requests().len(), 1, "{case}: no other REST effects");
+    reply["data"]["content"].as_str().unwrap().to_owned()
+}
+
+// The router is the only answerer of `/kick`. A passing moderation gate or the
+// guild fence decides the interaction before the voice delegate is consulted,
+// so sitting in a voice room never shields a member from a moderator and a
+// foreign guild never reaches the vote path.
+#[tokio::test]
+async fn kick_moderation_outcomes_never_consult_the_voice_delegate() {
+    let cases = [
+        (
+            "moderator",
+            Permissions::all(),
+            true,
+            GUILD,
+            "This command is not available in this build yet.".to_owned(),
+        ),
+        (
+            "foreign guild",
+            Permissions::all(),
+            true,
+            9999,
+            RouterRefusal::GuildRestricted.message(),
+        ),
+    ];
+    for (case, permissions, moderation, guild, expected) in cases {
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        let runtime = runtime_without_db(kick_gates(moderation), false, origin);
+        // A delegate that would claim every interaction must still not run.
+        let calls = wire_kick_vote(&runtime, true);
+        runtime.on_interaction(&kick_as(permissions, guild)).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "{case} skips voice");
+        assert_eq!(sole_ephemeral_reply(&mock, case).await, expected, "{case}");
+        mock.shutdown().await;
     }
-    mock.shutdown().await;
+}
+
+// Moderation off, or the invoker lacking Kick Members, still serves the V4
+// vote for room occupants: the delegate is asked once and, when it answers
+// the interaction, the router stays silent.
+#[tokio::test]
+async fn refused_kick_hands_the_interaction_to_the_voice_delegate() {
+    let cases = [
+        ("missing permission", Permissions::empty(), true),
+        ("moderation disabled", Permissions::all(), false),
+    ];
+    for (case, permissions, moderation) in cases {
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        let runtime = runtime_without_db(kick_gates(moderation), false, origin);
+        let calls = wire_kick_vote(&runtime, true);
+        runtime.on_interaction(&kick_as(permissions, GUILD)).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "{case} asks voice once");
+        assert!(
+            mock.posts_to("/callback").await.is_empty(),
+            "{case}: voice owns the callback, the router sends none"
+        );
+        assert!(mock.requests().is_empty(), "{case}: no other REST effects");
+        mock.shutdown().await;
+    }
+}
+
+// Voice declines (the invoker is not in the target's room, the target left
+// between reads, or voice is off): the router refusal is the single reply.
+// The same holds with no delegate wired at all.
+#[tokio::test]
+async fn declined_kick_gets_the_router_refusal_exactly_once() {
+    let cases = [
+        (
+            "missing permission",
+            Permissions::empty(),
+            true,
+            RouterRefusal::ModerationPermission(two_bot_core::ModerationAction::Kick).message(),
+        ),
+        (
+            "moderation disabled",
+            Permissions::all(),
+            false,
+            RouterRefusal::ModerationDisabled.message(),
+        ),
+    ];
+    for (case, permissions, moderation, expected) in cases {
+        for wired in [true, false] {
+            let case = format!("{case} (delegate wired: {wired})");
+            let (mock, origin) = MockRest::start(Vec::new()).await;
+            let runtime = runtime_without_db(kick_gates(moderation), false, origin);
+            let calls = wired.then(|| wire_kick_vote(&runtime, false));
+            runtime.on_interaction(&kick_as(permissions, GUILD)).await;
+            if let Some(calls) = calls {
+                assert_eq!(calls.load(Ordering::Relaxed), 1, "{case} asks voice once");
+            }
+            assert_eq!(sole_ephemeral_reply(&mock, &case).await, expected, "{case}");
+            mock.shutdown().await;
+        }
+    }
 }
