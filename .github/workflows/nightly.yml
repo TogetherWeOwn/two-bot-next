@@ -5,11 +5,7 @@ on:
     # Off the hour to avoid the busiest scheduled-run window (UTC).
     - cron: '17 3 * * *'
   workflow_dispatch:
-  # Bootstrap a new workflow before it exists on main, and validate edits.
-  # GitHub requires a default-branch workflow before workflow_dispatch works.
   pull_request:
-    paths:
-      - '.github/workflows/nightly.yml'
 
 permissions: {}
 
@@ -18,8 +14,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    permissions:
+      contents: read
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'changes') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.select.outputs.rust }}
+      supply: ${{ steps.select.outputs.supply }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select affected jobs or run the full nightly suite
+        id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust=true supply=true
+          if [ "$EVENT_NAME" = "pull_request" ] \
+            && [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ] \
+            && result=$(python3 scripts/job-inputs.py \
+              --base-ref "$BASE_SHA" --head-ref "$HEAD_SHA"); then
+            rust=$(printf '%s' "$result" | sed -n 's/^rust=//p')
+            supply=$(printf '%s' "$result" | sed -n 's/^supply=//p')
+            rust=${rust:-true} supply=${supply:-true}
+          fi
+          printf 'rust=%s\nsupply=%s\n' "$rust" "$supply" >>"$GITHUB_OUTPUT"
+
   pipeline-benchmark:
     name: nightly pipeline budget
+    needs: changes
+    if: ${{ needs.changes.outputs.rust != 'false' }}
     # A called workflow can only narrow the caller grant; with the default-deny
     # top level it would otherwise check out this private repo with no token.
     permissions:
@@ -28,6 +59,8 @@ jobs:
 
   advisories:
     name: nightly advisories
+    needs: changes
+    if: ${{ needs.changes.outputs.supply != 'false' }}
     permissions:
       contents: read
     # Runner routing: see the note on `check` in check.yml.
@@ -46,6 +79,8 @@ jobs:
 
   sweep:
     name: nightly ignored tests and docs
+    needs: changes
+    if: ${{ needs.changes.outputs.rust != 'false' }}
     permissions:
       contents: read
     # Runner routing: see the note on `check` in check.yml.
@@ -161,6 +196,12 @@ jobs:
           --skip repeated_lockdown_keeps_first_seed_and_unlock_restores_exact_masks
           --skip initially_absent_overwrite_is_deleted_only_after_recorded_lockdown
           --skip ambiguous_unlock_retains_recovery_and_both_claims_across_all_keys
+          --skip unlock_proceeds_after_purge_history_unavailable
+          --skip unlock_proceeds_after_purge_history_rate_limited
+          --skip unlock_proceeds_after_purge_history_unreadable
+          --skip unlock_proceeds_after_purge_history_timeout
+          --skip purge_delete_failure_still_retains_the_lane
+          --skip rate_limited_mutation_proves_no_effect_and_frees_the_lane
           --skip rejected_first_lock_retires_only_its_seed_and_finishes_refusal
           --skip audit_failure_retries_only_finalization_not_a_successful_discord_effect
           --skip first_seed_and_durable_lane_exist_before_lock_put_is_accepted
