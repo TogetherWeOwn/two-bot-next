@@ -130,6 +130,7 @@ def green():
         "check": {"check_runs": [check_run("check")]},
         "worker check": {"check_runs": [check_run("worker check")]},
         "staging": {"total_count": 1, "workflow_runs": [{"conclusion": "success"}]},
+        "staging-all": {"total_count": 1, "workflow_runs": [staging_run()]},
         "environment": {
             "name": "production",
             "protection_rules": [
@@ -141,6 +142,10 @@ def green():
         },
         "branches": {"total_count": 1, "branch_policies": [{"name": "main", "type": "branch"}]},
     }
+
+
+def staging_run(run_id=501, number=5, status="completed", conclusion="success", sha=SHA):
+    return {"id": run_id, "run_number": number, "head_sha": sha, "status": status, "conclusion": conclusion}
 
 
 def failed_call():
@@ -259,7 +264,7 @@ class StaticGuardTests(unittest.TestCase):
 
 
 class GuardBehaviourTests(unittest.TestCase):
-    def guard(self, sha=SHA, rollback="", ref="refs/heads/main", **responses):
+    def guard(self, sha=SHA, rollback="", ref="refs/heads/main", auto="", **responses):
         api = {**green(), **responses}
         calls = []
 
@@ -283,6 +288,13 @@ class GuardBehaviourTests(unittest.TestCase):
                 key = "ci-run"
             elif re.fullmatch(rf"repos/{REPO}/actions/runs/[0-9]+/attempts/[0-9]+/jobs", path):
                 key = "ci-jobs"
+            elif path == f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs" and "status" not in query:
+                # Automated approval: every run on the SHA, never a success-only filter.
+                self.assertEqual(
+                    {k: query[k] for k in ("head_sha", "branch")},
+                    {"head_sha": sha.strip().lower(), "branch": "main"},
+                )
+                key = "staging-all"
             elif path == f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs":
                 self.assertEqual(
                     {k: query[k] for k in ("head_sha", "branch", "status")},
@@ -314,6 +326,7 @@ class GuardBehaviourTests(unittest.TestCase):
             output, summary = Path(tmp) / "output", Path(tmp) / "summary"
             env = {
                 "GITHUB_REPOSITORY": REPO, "GITHUB_REF": ref, "SHA": sha, "ROLLBACK": rollback,
+                "AUTO_APPROVE": auto,
                 "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary),
             }
             stdout, code = io.StringIO(), 0
@@ -591,6 +604,49 @@ class GuardBehaviourTests(unittest.TestCase):
             with self.subTest(branches=branches):
                 result = self.guard(branches={"branch_policies": branches})
                 self.assertRefused(result, "from main only")
+
+    def test_auto_approve_passes_without_reviewers_when_latest_staging_deploy_is_green(self):
+        environment = {**green()["environment"], "protection_rules": [{"type": "branch_policy"}]}
+        code, outputs, summary, calls, _ = self.guard(auto="true", environment=environment)
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": ""})
+        self.assertIn("Approval: automated", summary)
+        self.assertIn("deploy-staging run `501`", summary)
+        self.assertTrue(any(path.endswith("deploy-staging.yml/runs") and "status" not in q for path, q in calls))
+
+    def test_auto_approve_refuses_unless_the_latest_staging_deploy_succeeded(self):
+        environment = {**green()["environment"], "protection_rules": []}
+        for runs, reason in (
+            ([], "no verifiable latest run"),
+            ([staging_run(conclusion="failure")], "not a completed success"),
+            ([staging_run(), staging_run(run_id=502, number=6, conclusion="failure")], "not a completed success"),
+            ([staging_run(), staging_run(run_id=502, number=6, status="in_progress", conclusion=None)],
+             "not a completed success"),
+            ([staging_run(sha="f" * 40)], "no verifiable latest run"),
+        ):
+            with self.subTest(runs=runs):
+                result = self.guard(auto="true", environment=environment,
+                                    **{"staging-all": {"total_count": len(runs), "workflow_runs": runs}})
+                self.assertRefused(result, reason)
+
+    def test_auto_approve_keeps_every_other_guard(self):
+        environment = {**green()["environment"], "protection_rules": []}
+        self.assertRefused(self.guard(auto="true", environment=environment,
+                                      staging={"total_count": 0, "workflow_runs": []}),
+                           "deploy-staging has no successful run")
+        self.assertRefused(self.guard(auto="true", environment=environment, compare={"status": "behind"}),
+                           "not an ancestor of origin/main")
+        self.assertRefused(self.guard(auto="true", ref="refs/heads/feature"), "dispatch this workflow from main only")
+        policy = {**environment, "deployment_branch_policy": None}
+        self.assertRefused(self.guard(auto="true", environment=policy), "restrict deployments to main")
+        self.assertRefused(self.guard(auto="true", branches={"branch_policies": [{"name": "*", "type": "branch"}]}),
+                           "from main only")
+
+    def test_reviewers_stay_required_unless_auto_approve_is_exactly_true(self):
+        environment = {**green()["environment"], "protection_rules": []}
+        for flag in ("", "false", "TRUE", "1", " true"):
+            with self.subTest(flag=flag):
+                self.assertRefused(self.guard(auto=flag, environment=environment), "no required reviewers")
 
     def test_api_failures_fail_closed(self):
         for key in ("compare", "ci-runs", "ci-run", "ci-jobs", "ci-ok", "worker check", "staging", "branches"):
