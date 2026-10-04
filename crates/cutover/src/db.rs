@@ -372,16 +372,19 @@ pub async fn record_earliest(
     .await?;
     // The column name comes from a fixed 3-way match over event types, so
     // each branch is a static string (sqlx 0.9 audits dynamic SQL).
+    // `$4` binds ISO-8601 text and must cast: without it Postgres refuses
+    // `timestamptz > text`, so the pull-back errors instead of moving the
+    // milestone earlier.
     if let Some(member_id) = e.member_id.as_deref() {
         let pull_back = match e.event_type.as_str() {
             "first_message" => Some(
-                "UPDATE members SET first_message_at = $1::timestamptz WHERE guild_id = $2 AND member_id = $3 AND (first_message_at IS NULL OR first_message_at > $4)",
+                "UPDATE members SET first_message_at = $1::timestamptz WHERE guild_id = $2 AND member_id = $3 AND (first_message_at IS NULL OR first_message_at > $4::timestamptz)",
             ),
             "third_message" => Some(
-                "UPDATE members SET third_message_at = $1::timestamptz WHERE guild_id = $2 AND member_id = $3 AND (third_message_at IS NULL OR third_message_at > $4)",
+                "UPDATE members SET third_message_at = $1::timestamptz WHERE guild_id = $2 AND member_id = $3 AND (third_message_at IS NULL OR third_message_at > $4::timestamptz)",
             ),
             "first_voice_session" => Some(
-                "UPDATE members SET first_voice_at = $1::timestamptz WHERE guild_id = $2 AND member_id = $3 AND (first_voice_at IS NULL OR first_voice_at > $4)",
+                "UPDATE members SET first_voice_at = $1::timestamptz WHERE guild_id = $2 AND member_id = $3 AND (first_voice_at IS NULL OR first_voice_at > $4::timestamptz)",
             ),
             _ => None,
         };

@@ -185,6 +185,7 @@ pub struct ScannedMessage {
 }
 
 /// Summarise a finished scan (legacy `findEarlyMessages` tail).
+#[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn find_early_messages(
     early: &HashMap<String, MemberMessages>,
