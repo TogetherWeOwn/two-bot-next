@@ -41,6 +41,8 @@ pub mod onboarding_messages;
 pub mod onboarding_permissions;
 pub mod pipeline;
 pub mod ratelimit_guard;
+#[cfg(feature = "db")]
+pub mod rsvp;
 #[cfg(test)]
 mod test_clock;
 pub mod voice_rooms;

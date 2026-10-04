@@ -19,6 +19,20 @@ A crash before commit rolls the batch and checkpoint back together; a crash afte
 
 Open voice sessions are **never** restored. The existing pipeline drops them on READY and RESUMED (legacy `ShardReady`/`ShardResume`). This intentionally avoids outage-inflated durations. Twilight's channel/member cache is also cold after a process restart; this slice does not claim a fully restored cache or invite baseline. Facts, real leveling, REST side effects and invite fetching remain the existing S4/S6 seams; this transaction currently covers the S3 funnel, not arbitrary external side effects. Maintain one running shard owner per guild; overlapping independent deployments are not a supported recovery mechanism.
 
+## RSVP interaction scheduling (S4)
+
+The shared executor resolves the current bot application and synchronizes the full guild command registry before polling the shard. This also covers a persisted-session boot that receives RESUMED without READY; failed registry sync prevents gateway readiness.
+
+Each received RSVP/attendance interaction is routed and acknowledged immediately in a callback task, independently of earlier feature I/O. Only successful defers create an executable prepared command. The ordered dispatch loop consumes that preparation once, performs store effects, attempts the final ephemeral edit, then checkpoints; it never sends another callback for a prepared command. Refusals and failed acknowledgements cannot write. Committed duplicate dispatches are filtered before starting callback tasks.
+
+Read-ahead retains at most 64 packets, including their acknowledgement tasks. Past capacity, or when the 20-second I/O or 30-second drain deadline elapses, the bounded dispatcher returns a fatal error (`dispatch backlog full`, `dispatch I/O deadline exceeded`, `dispatch drain deadline exceeded`) instead of silently dropping the active command or queued preparations; transport end likewise waits for the current operation to finish. This differs from the transactional checkpoint deadline above: Discord acknowledgement is an external effect that cannot be rolled back. Once capacity is reached, heartbeats and packets not yet received may be delayed; this is bounded buffering, not an unlimited admission or delivery guarantee. Effects remain serialized, so a slow command can delay later final replies even though their defers were timely.
+
+Shared sticky/feed interactions start their existing detached dispatch at receipt as well, rather than waiting behind ordered RSVP completion. Their runtime still owns its defer-before-effects policy and final edit. The buffered packet records that dispatch has started, so queue consumption cannot send a second callback or repeat effects; RSVP names and registry publication stay excluded from this remaining-command path.
+
+On a checkpoint error or timeout, readiness stays Starting and no new packets are admitted. Before returning the original error, the runner consumes the current and queued RSVP preparations in receipt order, completing only successfully acknowledged commands. It does not run buffered funnel events or advance any checkpoint past the failed transaction. This deliberately separates draining accepted external work from recovering the transactional funnel; retrying an uncertain checkpoint in-process would be unsafe.
+
+These changes prevent scheduler-induced loss at backlog/deadline and recoverable checkpoint-error boundaries, not process-crash exactly-once delivery. RSVP store effects and Discord acknowledgements are not atomic with the gateway checkpoint, and no durable interaction inbox is introduced. A failed final edit never retries the already-executed command.
+
 ## Force-fresh IDENTIFY (first production boot)
 
 The age policy alone RESUMEs any checkpoint up to 15 minutes old. The first production boot must IDENTIFY with RESUME disabled, so an operator arms a one-shot directive instead of relying on checkpoint age. The Worker forwards no feature flags, so an environment toggle cannot do this.
@@ -46,12 +60,22 @@ Residual window: the directive is consumed when the boot read commits. If the pr
 
 ## Verification (test containers only)
 
+On the persistent controller, compiling commands use the bounded cache wrapper
+from the isolated worktree; a refused lease is not permission to bypass it.
+Ephemeral CI retains its existing direct Cargo commands.
+
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+python3 scripts/cargo_cache.py run -- clippy --workspace --all-targets --locked -- -D warnings
+python3 scripts/cargo_cache.py run -- test --workspace --locked
+TWO_GATEWAY_TEST_DATABASE_URL=postgresql://agent_test@agent-testdb:5432/agent_test \
+  python3 scripts/cargo_cache.py run -- test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
+# Ephemeral CI only — on the persistent controller use the wrapper form above.
 TWO_GATEWAY_TEST_DATABASE_URL=postgresql://agent_test@agent-testdb:5432/agent_test \
   cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
+# Ephemeral CI only — on the persistent controller use the wrapper form below.
+TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/postgres \
+  python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --locked --test gateway_force_identify_cli
 TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/postgres \
   cargo test -p two-bot-cutover --locked --test gateway_force_identify_cli
 ```
@@ -59,6 +83,8 @@ TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/postgres \
 The nine opt-in tests cover stored-sequence RESUME after a new pipeline/shard, saved endpoint selection and failed-saved-endpoint fallback, no duplicate repeatable funnel row when replay uses a newly generated timestamp, opcode-9 and close-4007/4009 fallback to IDENTIFY, stale expiry, restored message ladder, monotonic sequence, session reset, and transaction rollback after a deliberately invalid row. An isolated-schema write-failure trigger proves that the service terminates on a failed funnel dispatch, leaves its checkpoint unchanged, and a recreated runner resumes from the committed sequence after recovery. An isolated advisory-lock test uses a 1000ms HELLO interval: readiness drops immediately, the complete transaction times out at 250ms before a whole heartbeat interval, checkpoint remains at sequence 1, and a recreated runner resumes at 1 and persists the missed dispatch exactly once. Unit tests cover total timeout, readiness while pending, successful restoration, and failure remaining unready. Four socket/task lifecycle tests also prove that error, stream termination and panic stop the health listener, and HTTP shutdown aborts the gateway task. Three more opt-in tests in `gateway_tests::force_identify` prove the directive: an armed boot IDENTIFYs over a fresh checkpoint and the next boot after READY RESUMEs, two concurrent boot reads consume it exactly once without changing the checkpoint, and arming keeps a pending directive and re-arms after consumption. `gateway_force_identify_cli` proves the CLI refusals exit 2 before connecting and, on a disposable agent-testdb database, that the dry run leaves both tables byte-identical and `--apply` arms once. These are local failure/restart simulations, not a deployed Container-supervisor drill.
 
 Tests never consult runtime `DATABASE_URL`. Their dedicated URL is restricted to `agent-testdb` or the CI loopback Postgres service, database/user `agent_test`. Each test migrates its own generated schema and deletes only that schema. CI runs these tests explicitly against its service container.
+
+The RSVP scheduling regressions use a real Twilight shard with mock websocket/REST listeners and the same isolated schemas. They delay the first live-event response by 3.2 seconds, deliver a second command during that wait, exceed the 64-packet backlog, and verify a timely second defer, ordered going/interested writes, two audits, two final edits and checkpoint drain. A second case holds an exclusive RSVP-table lock past the 30-second feature threshold and verifies both accepted commands still complete. A RESUMED-only startup must publish the full registry with exactly one attendance, RSVP and namespaced totals command; malformed/denied application lookups prevent publication and gateway startup. Committed replay sends no duplicate callback or store effect. The mixed-runtime regression delivers sticky and feed interactions behind the slow RSVP, asserting callbacks inside three seconds, one final edit each, and no duplicate dispatch at queue consumption or committed replay. Two more scenarios inject a checkpoint trigger failure or exclusive-table-lock timeout after both RSVP defers; both commands must finish with two audits and ordered final edits before the runner returns the error, while the checkpoint stays at 1 and queued funnel rows remain absent.
 
 ## Rollback
 

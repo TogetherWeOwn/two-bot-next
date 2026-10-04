@@ -221,6 +221,10 @@ async fn unsupported_get_path_is_refused_without_io() {
         "/channels/4444/bogus",
         "/users/3333",
         "/channels/not-a-snowflake",
+        "/guilds/2222/scheduled-events/0",
+        "/guilds/2222/scheduled-events/not-a-snowflake",
+        "/guilds/2222/scheduled-events/3333/extra",
+        "/guilds/2222/scheduled-events/3333?with_user_count=true",
     ] {
         assert!(
             exec.get_json(path).await.is_err(),

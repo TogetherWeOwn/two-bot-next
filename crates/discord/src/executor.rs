@@ -69,6 +69,14 @@ pub const PACE_INTERVAL_MS: u64 = 110;
 pub const KICK_INTERVAL_MS: u64 = 350;
 /// Per-call abort for moderation verbs, ms (legacy `timeoutMs ?? 5000`).
 pub const MODERATION_TIMEOUT_MS: u64 = 5_000;
+/// Admission-wait budget for receipt-callback and completion retries, ms.
+/// Absolute and receipt-relative: it bounds admission waits, transport time
+/// and backoff sleeps together, leaving margin below Discord's three-second
+/// acknowledgement window. Only provably pre-wire admission-Blocked failures
+/// may consume it; every other error returns immediately with no retry.
+pub const RECEIPT_ADMISSION_BUDGET_MS: u64 = 2_500;
+/// Backoff between admission-Blocked retries, ms.
+pub const BLOCKED_RETRY_SLEEP_MS: u64 = 20;
 /// Bound response-body collection, including the otherwise untimed GET/kick
 /// lanes, so a stalled global response cannot retain pending admission forever.
 pub const RESPONSE_BODY_TIMEOUT_MS: u64 = 5_000;
@@ -115,6 +123,17 @@ impl DiscordError {
     #[must_use]
     pub fn is_safe_pre_mutation(&self) -> bool {
         matches!(self, Self::Rejected(_) | Self::Guard(_))
+    }
+
+    /// True only for the durable send-admission single-flight refusal: the
+    /// token lane is occupied, so this attempt never reached the wire and a
+    /// bounded receipt-callback retry may re-attempt. Every other error —
+    /// including timeouts, transport failures and rate limits — is uncertain
+    /// or definitive and must never be retried by the callback path.
+    #[must_use]
+    pub fn is_admission_blocked(&self) -> bool {
+        matches!(self, Self::Unavailable(detail)
+            if detail == &two_bot_core::send_admission::AdmissionError::Blocked.to_string())
     }
 }
 
@@ -1558,6 +1577,43 @@ impl ActionExecutor {
         }
     }
 
+    /// Announcement RSVP's single paced lookup: only 404 means absent. Unlike
+    /// the generic legacy REST GET, HTTP failures and malformed JSON must not
+    /// masquerade as a missing event. Never expose transport details in replies.
+    pub async fn get_scheduled_event(
+        &self,
+        guild_id: &str,
+        event_id: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let guild = snowflake::<GuildMarker>(guild_id).map_err(|_| "Invalid guild id.")?;
+        let event = snowflake::<twilight_model::id::marker::ScheduledEventMarker>(event_id)
+            .map_err(|_| "Invalid scheduled event id.")?;
+        let request = Request::from_route(&Route::GetGuildScheduledEvent {
+            guild_id: guild.get(),
+            scheduled_event_id: event.get(),
+            with_user_count: false,
+        });
+        // Guard admission and pacing run inside bounded attempts. The lookup
+        // is mutation-free, so retrying a provably pre-wire admission-Blocked
+        // failure cannot double-apply anything; HTTP and parse outcomes still
+        // return after a single attempt with no retry.
+        let res = self
+            .retry_admission_blocked(|_| async {
+                self.send_with_timeout(&request, Some(false))
+                    .await
+                    .map(|(res, _)| res)
+            })
+            .await
+            .map_err(|_| "Unable to validate scheduled event.")?;
+        match res.status {
+            404 => Ok(None),
+            200..=299 => serde_json::from_slice(&res.body)
+                .map(Some)
+                .map_err(|_| "Discord returned an invalid scheduled event status.".to_owned()),
+            status => Err(format!("Discord request failed: HTTP {status}")),
+        }
+    }
+
     async fn read_json(
         &self,
         path: &str,
@@ -2199,6 +2255,9 @@ impl ActionExecutor {
     }
 
     /// Complete an already-deferred ephemeral reply through the same executor.
+    /// Re-attempts ONLY admission-Blocked failures within the absolute
+    /// [`RECEIPT_ADMISSION_BUDGET_MS`] budget: a Blocked attempt never reached
+    /// the wire, so retrying it cannot repeat an accepted edit.
     pub async fn finish_interaction(
         &self,
         application_id: u64,
@@ -2214,14 +2273,17 @@ impl ActionExecutor {
             roles: vec![],
             users: vec![],
         };
-        let req = Self::request_of(
-            interaction
-                .update_response(token)
-                .content(Some(content))
-                .allowed_mentions(Some(&mentions)),
-        )?;
-        self.call_once_raw(req, &[200]).await?;
-        Ok(())
+        self.retry_admission_blocked(|_| async {
+            let req = Self::request_of(
+                interaction
+                    .update_response(token)
+                    .content(Some(content))
+                    .allowed_mentions(Some(&mentions)),
+            )?;
+            self.call_once_raw(req, &[200]).await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Raw message send shared by [`Self::post_message`] and the audit
@@ -2720,6 +2782,25 @@ impl ActionExecutor {
         interaction_token: &str,
         response: &twilight_model::http::interaction::InteractionResponse,
     ) -> Result<(), DiscordError> {
+        self.answer_interaction_with_timeout(
+            interaction_id,
+            interaction_token,
+            response,
+            self.inner.moderation_timeout,
+        )
+        .await
+    }
+
+    /// One receipt-callback attempt bounded by `timeout`: guard admission and
+    /// the admitted send share the one deadline, so a slow transport cannot
+    /// outlive the caller's remaining acknowledgement budget.
+    async fn answer_interaction_with_timeout(
+        &self,
+        interaction_id: u64,
+        interaction_token: &str,
+        response: &twilight_model::http::interaction::InteractionResponse,
+        timeout: Duration,
+    ) -> Result<(), DiscordError> {
         let interaction_id =
             Id::<InteractionMarker>::new_checked(interaction_id).ok_or_else(|| {
                 DiscordError::Rejected(format!("bad interaction id: {interaction_id}"))
@@ -2732,7 +2813,7 @@ impl ActionExecutor {
                 .create_response(interaction_id, interaction_token, &response),
         )?;
         // request_of maps pre-send build failures to Rejected (finding 7).
-        let (mut res, _) = self.send_with_timeout(&req, None).await?;
+        let (mut res, _) = self.send_with_timeout_for(&req, None, timeout).await?;
         match res.status {
             200 => {
                 mutation_receipt_id(&res.body)?;
@@ -2745,6 +2826,64 @@ impl ActionExecutor {
             }
             _ => Err(throw_for_status(&res)),
         }
+    }
+
+    /// Bounded retry for provably pre-wire admission-Blocked failures: the
+    /// absolute [`RECEIPT_ADMISSION_BUDGET_MS`] budget covers admission waits,
+    /// transport time and backoff sleeps together. Each attempt receives the
+    /// remaining budget capped by the moderation timeout, so the final attempt
+    /// cannot overrun the budget with its own transport wait. A Blocked
+    /// attempt never reached the wire, so retrying it cannot double-send;
+    /// every other error returns immediately with no retry.
+    async fn retry_admission_blocked<T, F, Fut>(&self, mut attempt: F) -> Result<T, DiscordError>
+    where
+        F: FnMut(Duration) -> Fut,
+        Fut: std::future::Future<Output = Result<T, DiscordError>>,
+    {
+        let start = tokio::time::Instant::now();
+        let budget = Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS);
+        let sleep = Duration::from_millis(BLOCKED_RETRY_SLEEP_MS);
+        let mut blocked: Option<DiscordError> = None;
+        loop {
+            let elapsed = start.elapsed();
+            if elapsed >= budget {
+                // Only reachable after a Blocked attempt: the first iteration
+                // always runs with the full budget remaining.
+                return Err(blocked.expect("blocked retry exhausted without an attempt"));
+            }
+            let remaining = budget - elapsed;
+            match attempt(remaining.min(self.inner.moderation_timeout)).await {
+                Ok(value) => return Ok(value),
+                Err(error) if error.is_admission_blocked() => {
+                    blocked = Some(error);
+                    tokio::time::sleep(remaining.min(sleep)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Bounded receipt-callback retry for governed-lane occupancy: re-attempts
+    /// ONLY admission-Blocked failures within the absolute receipt-relative
+    /// [`RECEIPT_ADMISSION_BUDGET_MS`] budget, leaving margin below Discord's
+    /// three-second acknowledgement window. A Blocked attempt never reached
+    /// the wire, so retrying it cannot double-ACK; every other error returns
+    /// immediately with no retry.
+    pub async fn answer_interaction_with_blocked_retry(
+        &self,
+        interaction_id: u64,
+        interaction_token: &str,
+        response: &twilight_model::http::interaction::InteractionResponse,
+    ) -> Result<(), DiscordError> {
+        self.retry_admission_blocked(|timeout| {
+            self.answer_interaction_with_timeout(
+                interaction_id,
+                interaction_token,
+                response,
+                timeout,
+            )
+        })
+        .await
     }
 
     /// Execute a router reply operation in the unpaced interaction lane.
@@ -2836,6 +2975,7 @@ impl ActionExecutor {
 
     /// Complete an acknowledged interaction by editing its original response.
     /// Like the initial callback, this bypasses the paced moderation lane.
+    /// One attempt: a lost reply must not repeat already-committed store effects.
     /// Single attempt with bounded errors: never repeat an accepted effect after
     /// an edit failure or expose the interaction token in a returned error.
     /// The original callback decides ephemerality; edits retain it.
@@ -2862,6 +3002,24 @@ impl ActionExecutor {
         mutation_receipt_id(&res.body)?;
         res.complete().await;
         Ok(())
+    }
+
+    /// Complete an acknowledged interaction with bounded contention tolerance:
+    /// re-attempts ONLY admission-Blocked failures within the absolute
+    /// [`RECEIPT_ADMISSION_BUDGET_MS`] budget. A Blocked attempt never reached
+    /// the wire, so retrying it cannot repeat an accepted edit; any accepted
+    /// or ambiguous outcome returns immediately with no retry.
+    pub async fn edit_interaction_response_with_blocked_retry(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+    ) -> Result<(), DiscordError> {
+        self.retry_admission_blocked(|_| async {
+            self.edit_interaction_response(application_id, interaction_token, content)
+                .await
+        })
+        .await
     }
 
     /// Turn one adjudicated [`ModerationExecution`] into its Discord effect
@@ -3163,6 +3321,18 @@ fn raw_get_route(path: &str) -> Result<Route<'static>, String> {
                 guild_id,
                 with_user_count: query_param(query, "with_user_count").is_some_and(|v| v == "true"),
             }),
+            Some(rest) if rest.starts_with("scheduled-events/") && query.is_empty() => {
+                let scheduled_event_id = rest
+                    .strip_prefix("scheduled-events/")
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .filter(|id| *id != 0)
+                    .ok_or_else(err)?;
+                Ok(Route::GetGuildScheduledEvent {
+                    guild_id,
+                    scheduled_event_id,
+                    with_user_count: false,
+                })
+            }
             _ => Err(err()),
         };
     }
@@ -3281,6 +3451,23 @@ mod tests {
 
     fn never_send_admission(token: &str) -> Arc<dyn SendAdmission> {
         Arc::new(NeverSendAdmission(TokenKey::for_bot_token(token).unwrap()))
+    }
+
+    #[test]
+    fn only_the_canonical_blocked_detail_is_retryable() {
+        assert!(
+            DiscordError::Unavailable(AdmissionError::Blocked.to_string()).is_admission_blocked()
+        );
+        for error in [
+            DiscordError::Unavailable("transport: connection reset".to_owned()),
+            DiscordError::Unavailable("Discord response body unavailable".to_owned()),
+            DiscordError::Unavailable("discord send admission is blocked ".to_owned()),
+            DiscordError::Timeout,
+            DiscordError::RateLimited,
+            DiscordError::Rejected("discord refused the request".to_owned()),
+        ] {
+            assert!(!error.is_admission_blocked(), "{error:?}");
+        }
     }
 
     #[test]

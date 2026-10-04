@@ -38,6 +38,8 @@ mod gateway_failure;
 mod gateway_metrics;
 #[cfg(test)]
 mod gateway_tests;
+#[cfg(test)]
+mod interaction_composition_tests;
 mod internal_action_http;
 mod jobs;
 mod join_risk_runtime;
@@ -385,6 +387,12 @@ async fn main() {
                         gates,
                         &activation,
                     );
+                    // Ordered RSVP surface over the runtime's governed executor.
+                    // `None` whenever the command runtime is parked; the gateway
+                    // and funnel still boot.
+                    let interactions = runtime.as_ref().and_then(|runtime| {
+                        build_interaction_runtime(&pool, guild_id, &gates, runtime.executor())
+                    });
                     if let Some(runtime) = &runtime {
                         let config = gateway_commands::GatewayCommandConfig::from_map(
                             guild_id,
@@ -549,6 +557,7 @@ async fn main() {
                         pipeline,
                         Arc::clone(&state),
                         store,
+                        interactions,
                         onboarding,
                         runtime,
                         automod,
@@ -616,6 +625,55 @@ async fn main() {
         );
         std::process::exit(1);
     }
+}
+
+/// Ordered RSVP surface over the command runtime's governed REST executor:
+/// one shared executor (one token key, one pacing lane) serves both the
+/// detached command dispatch and the ordered interaction completion. Returns
+/// `None` — gateway and funnel still boot — when command-gate parsing fails,
+/// so bad env parks only this surface. Mirrors
+/// [`command_runtime::CommandRuntime::from_env`]: no permissive defaults,
+/// no loopback broadening, no live probe.
+fn build_interaction_runtime(
+    pool: &sqlx::Pool<sqlx::Postgres>,
+    guild_id: u64,
+    onboarding: &two_bot_core::OnboardingGates,
+    executor: two_bot_discord::ActionExecutor,
+) -> Option<Arc<two_bot_discord::interactions::InteractionRuntime>> {
+    let features = match two_bot_core::FeatureGates::from_env() {
+        Ok(features) => features,
+        Err(err) => {
+            tracing::warn!(error = %err, "feature gates invalid; ordered interaction surface parked");
+            return None;
+        }
+    };
+    let moderation = match two_bot_core::ModerationGates::from_env() {
+        Ok(moderation) => moderation,
+        Err(err) => {
+            tracing::warn!(error = %err, "moderation gates invalid; ordered interaction surface parked");
+            return None;
+        }
+    };
+    let router = two_bot_core::InteractionRouter::new(two_bot_core::RouterGates::from_slices(
+        Some(guild_id),
+        &features,
+        &moderation,
+        two_bot_core::SurfaceFlags {
+            session_picker: onboarding.mode == two_bot_core::OnboardingMode::Session,
+            tickets: ticket_runtime::TicketConfig::from_env(guild_id).is_some(),
+            scorecard: std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|v| v == "1"),
+            ..Default::default()
+        },
+    ));
+    Some(Arc::new(
+        two_bot_discord::interactions::InteractionRuntime::with_router(
+            router,
+            pool.clone(),
+            executor,
+            0,
+            two_bot_core::ClassifierConfig::from_env(),
+        ),
+    ))
 }
 
 /// This receiver slice is staging-only, not authority to enable production.

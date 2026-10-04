@@ -16,8 +16,8 @@ use std::collections::BTreeSet;
 // them to. The message string (last argument to the `tracing` macro) is the
 // event name; fields such as `sequence` or `guild_id` are context, not names.
 
-/// `crates/bot/src/gateway.rs`: all twelve traced in the file are cataloged.
-const GATEWAY_RS_EVENTS: [&str; 12] = [
+/// `crates/bot/src/gateway.rs`: all fourteen traced in the file are cataloged.
+const GATEWAY_RS_EVENTS: [&str; 14] = [
     "cold resume committed; requesting voice snapshot via identify",
     "gateway reconnect failed; Twilight will retry",
     "gateway shard loop started",
@@ -30,15 +30,19 @@ const GATEWAY_RS_EVENTS: [&str; 12] = [
     "voice database unavailable; voice rooms disabled",
     "voice rooms enabled; gateway sink attached",
     "voice HTTP setup failed; voice rooms disabled",
+    "interaction acknowledgement blocked; checkpoint unchanged",
+    "interaction response failed; not replaying command",
 ];
 
-/// `crates/bot/src/main.rs`: the five cataloged `tracing` messages.
-const MAIN_RS_TRACED_EVENTS: [&str; 5] = [
+/// `crates/bot/src/main.rs`: the seven cataloged `tracing` messages.
+const MAIN_RS_TRACED_EVENTS: [&str; 7] = [
     "durable gateway initialized; shard connecting",
     "gateway prerequisites missing; gateway parked, /readyz reports down",
     "container service failed",
     "durable gateway failed; checkpoint unchanged, readiness unavailable",
     "shutdown_deadline_exceeded: abandoning in-flight work",
+    "feature gates invalid; ordered interaction surface parked",
+    "moderation gates invalid; ordered interaction surface parked",
 ];
 
 /// `crates/bot/src/main.rs`: cataloged drain outcomes that surface as

@@ -29,7 +29,11 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `gateway leveling dispatch failed` | `crates/bot/src/gateway.rs:609` | Leveling funnel drain failed inside the checkpoint deadline |
 | `onboarding interaction interrupted; member must reselect` | `crates/bot/src/gateway.rs:791` | Durable onboarding job recovered without callback credentials; kept as interruption receipt |
 | `invite counter read unavailable; retaining snapshot` | `crates/bot/src/gateway.rs:899` | REST invite read failed; persisted baseline kept instead of an empty listing |
+| `interaction acknowledgement blocked; checkpoint unchanged` | `crates/bot/src/gateway.rs:286` | Ordered RSVP acknowledgement hit send-admission Blocked; cursor holds instead of passing a never-acknowledged command |
+| `interaction response failed; not replaying command` | `crates/bot/src/gateway.rs:290`, `:294`, `:300` | Ordered RSVP preparation or completion failed without admission blockage; command advances without replaying uncertain effects |
 | `gateway prerequisites missing; gateway parked, /readyz reports down` | `crates/bot/src/main.rs:564` | Token, database URL or guild ID missing; shard never starts |
+| `feature gates invalid; ordered interaction surface parked` | `crates/bot/src/main.rs:639` | Feature-gate parsing failed; gateway still boots, only the ordered interaction surface stays off |
+| `moderation gates invalid; ordered interaction surface parked` | `crates/bot/src/main.rs:646` | Moderation-gate parsing failed; gateway still boots, only the ordered interaction surface stays off |
 | `durable gateway failed; checkpoint unchanged, readiness unavailable` | `crates/bot/src/main.rs:617` | Gateway task failed with the fixed class in `error_class`; checkpoint not advanced |
 | `gateway task stopped; container restart required` | `crates/bot/src/main.rs:709` | Supervisor saw the essential task end; process must restart from checkpoint |
 | `gateway drain failed; restart required` | `crates/bot/src/main.rs:716` | Drain path failed; restart required |

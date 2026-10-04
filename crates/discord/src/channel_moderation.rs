@@ -141,8 +141,11 @@ impl ChannelModerationRuntime {
         // rather than using the executor's five-second mutation abort here.
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            self.executor
-                .answer_interaction(interaction.id.get(), &interaction.token, &defer),
+            self.executor.answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &defer,
+            ),
         )
         .await
         .map_err(|_| ChannelResponseError::Defer)?
@@ -154,7 +157,11 @@ impl ChannelModerationRuntime {
         };
         let edit = self
             .executor
-            .edit_interaction_response(interaction.application_id.get(), &interaction.token, text)
+            .edit_interaction_response_with_blocked_retry(
+                interaction.application_id.get(),
+                &interaction.token,
+                text,
+            )
             .await;
         if result.is_err() {
             return Err(ChannelResponseError::Persistence);
