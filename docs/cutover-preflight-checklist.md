@@ -15,16 +15,17 @@ evidence location, never in public comments.
 - [ ] The candidate is one full 40-character commit on `main`, merged and
   independently reviewed on its exact head, with that head re-verified
   on `origin/main` before dispatch.
-- [ ] `check` (fmt, clippy `-D warnings`, tests, cargo-deny),
-  `worker check`, `pr-lint` and `gitleaks` are green on that exact head.
-  Missing evidence is NO-GO; the deployer never waives it.
+- [ ] `ci-ok` (the full verdict over lint, worker checks and all selected
+  Rust/DB test lanes), `worker check`, `pr-lint` and `gitleaks` are green on
+  that exact head. A green lint-only `check` job is not enough.
+  Missing or incomplete evidence is NO-GO; the deployer never waives it.
 - [ ] The resulting deployment digest (commit plus old and new Worker
   version IDs from the deploy summary) is pinned on the execution card.
 
 Source: [cutover.md § Preconditions](cutover.md#preconditions-all-must-pass)
 and [cutover.md § Roles](cutover.md#roles-safety-and-evidence);
 [production-deploy.md](production-deploy.md) (dispatch SHA rule,
-green `check` and `worker check` plus a successful staging run,
+green full `ci-ok` verdict and `worker check` plus a successful staging run,
 `main`-only branch policy, checkout re-verification, digest in the run
 summary).
 
