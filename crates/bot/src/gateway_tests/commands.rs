@@ -343,6 +343,128 @@ async fn ready_routes_custom_slash_and_accepted_prefix_before_checkpoint() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn help_tracks_confirmed_ready_add_and_remove_publications() {
+    fn interaction(
+        id: u64,
+        name: &str,
+        permissions: &str,
+        options: Value,
+    ) -> twilight_model::application::interaction::Interaction {
+        let mut packet = slash(0, id);
+        packet["d"]["data"]["name"] = json!(name);
+        packet["d"]["data"]["options"] = options;
+        packet["d"]["member"]["permissions"] = json!(permissions);
+        serde_json::from_value(packet["d"].take()).expect("interaction fixture")
+    }
+    fn help_content(rest: &MockRest, id: u64) -> String {
+        let requests = rest.requests();
+        let suffix = format!("/interactions/{id}/custom-command-fixture/callback");
+        let replies: Vec<_> = requests
+            .iter()
+            .filter(|request| request.path.ends_with(&suffix))
+            .collect();
+        assert_eq!(replies.len(), 1, "one immediate help callback");
+        let reply: Value = serde_json::from_slice(&replies[0].body).unwrap();
+        assert_eq!(reply["type"], 4);
+        assert_eq!(reply["data"]["flags"], 64);
+        assert_eq!(reply["data"]["allowed_mentions"]["parse"], json!([]));
+        reply["data"]["content"].as_str().unwrap().to_owned()
+    }
+    let db = TestDb::new().await;
+    seed(&db).await;
+    let mut script = bootstrap_responses();
+    script.extend([
+        ScriptedResponse::status(200), // READY PUT: echo complete registry
+        ScriptedResponse::status(204), // help
+        ScriptedResponse::status(204), // add defer
+        ScriptedResponse::status(200), // add PUT
+        ScriptedResponse::json(200, json!({"id": "9001"})),
+        ScriptedResponse::status(204), // help after add
+        ScriptedResponse::status(204), // remove defer
+        ScriptedResponse::status(200), // remove PUT
+        ScriptedResponse::json(200, json!({"id": "9001"})),
+        ScriptedResponse::status(204), // help after remove
+    ]);
+    let rest = MockRest::start(script, ScriptedResponse::status(500)).await;
+    let runtime = bootstrap(&db, &rest, &vars(Some("0"))).await;
+    assert!(runtime.published_commands().is_none());
+    let mut gateway = CommandGateway::start(45000).await;
+    let (runner, state) =
+        spawn_runner_with_commands(&db, &gateway.url, Some(Arc::clone(&runtime))).await;
+    assert_eq!(gateway.authentication().await["op"], 2);
+    gateway.send(ready(&gateway.url, "help-session")).await;
+    wait_sequence(&db.store, 1).await;
+    // Receiving a PUT is not enough: wait for its confirmed receipt/snapshot.
+    tokio::time::timeout(BOUND, async {
+        while runtime.published_commands().is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("confirmed READY publication deadline");
+    wait_connected(&state).await;
+    runtime
+        .on_interaction(&interaction(80, "help", "0", json!([])))
+        .await;
+    let initial = help_content(&rest, 80);
+    assert!(initial.contains("/faq"), "READY DB row is discoverable");
+    assert!(!initial.contains("/newfaq"));
+    runtime
+        .on_interaction(&interaction(
+            81,
+            "command",
+            "32",
+            json!([
+                {"name": "name", "type": 3, "value": "newfaq"},
+                {"name": "template", "type": 3, "value": "New FAQ"}
+            ]),
+        ))
+        .await;
+    assert!(runtime
+        .published_commands()
+        .unwrap()
+        .iter()
+        .any(|command| command.name == "newfaq"));
+    runtime
+        .on_interaction(&interaction(82, "help", "0", json!([])))
+        .await;
+    let added = help_content(&rest, 82);
+    assert!(added.contains("/faq") && added.contains("/newfaq"));
+    runtime
+        .on_interaction(&interaction(
+            83,
+            "command-remove",
+            "32",
+            json!([
+                {"name": "name", "type": 3, "value": "newfaq"}
+            ]),
+        ))
+        .await;
+    assert!(!runtime
+        .published_commands()
+        .unwrap()
+        .iter()
+        .any(|command| command.name == "newfaq"));
+    runtime
+        .on_interaction(&interaction(84, "help", "0", json!([])))
+        .await;
+    let removed = help_content(&rest, 84);
+    assert!(removed.contains("/faq") && !removed.contains("/newfaq"));
+    assert_eq!(
+        rest.requests().len(),
+        12,
+        "help adds no DB/registry REST reads"
+    );
+    runner.abort();
+    let _ = runner.await;
+    gateway.stop().await;
+    rest.shutdown().await;
+    drop(runtime);
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn shared_runtime_preserves_custom_sticky_and_feed_registry_and_single_replies() {
     let db = TestDb::new().await;
     seed(&db).await;

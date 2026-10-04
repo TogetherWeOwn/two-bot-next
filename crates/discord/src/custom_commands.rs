@@ -69,6 +69,8 @@ impl InteractionHandler for Registration {
     }
 }
 
+type PublishedCommands = Option<Arc<[two_bot_core::CommandDefinition]>>;
+
 #[derive(Clone)]
 pub struct CustomCommandRuntime {
     pool: PgPool,
@@ -80,7 +82,7 @@ pub struct CustomCommandRuntime {
     registry: Arc<Mutex<()>>,
     /// Exact merged set from the last confirmed full-registry PUT. Clones share
     /// this snapshot; committed DB changes alone must not advance discovery.
-    published_commands: Arc<RwLock<Option<Arc<[two_bot_core::CommandDefinition]>>>>,
+    published_commands: Arc<RwLock<PublishedCommands>>,
 }
 
 impl CustomCommandRuntime {

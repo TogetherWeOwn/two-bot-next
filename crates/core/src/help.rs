@@ -3,12 +3,12 @@
 //! The staging-guild UX walk found 27 builtins publishing with no discovery
 //! surface: typing `/help` answered with the stale-interaction reply because
 //! no such command existed. This module renders the ephemeral `/help` reply
-//! from the router's live publish set, so gated-off features never appear and
-//! gated-on-but-restricted commands carry their permission hint.
+//! from the last confirmed publication, so omitted features never appear and
+//! published-but-restricted commands carry their permission hint.
 //!
 //! Pure data in, text out: no Discord calls, no store reads. The caller passes
-//! the same definitions it publishes (`InteractionRouter::publish_set`), so
-//! the reply can never name a command the picker does not show. Groups render
+//! the successfully published definitions, not a boot vector or a fresh DB
+//! read. Failed refreshes retain the last confirmed snapshot. Groups render
 //! in publish order; a group renders only while at least one of its commands
 //! is live. Names outside the table (DB custom rows, or a future builtin this
 //! table predates) render under Custom rather than being dropped.
@@ -159,7 +159,7 @@ pub fn help_text(defs: &[CommandDefinition]) -> String {
         out.push('\n');
     }
     out.push_str(
-        "\nYour picker hides gated commands you cannot use — this list always shows the full live set.",
+        "\nThis is the last confirmed command list. Your picker hides gated commands you cannot use.",
     );
     out
 }
