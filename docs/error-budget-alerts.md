@@ -1,9 +1,9 @@
 # Error-budget burn alerts (48h watch)
 
 Paging thresholds for error-budget consumption on the bot container during
-the 48h production watch. Companion to `docs/log-volume-guard.md`, which
-covers volume and cardinality: that guard says what is normal, this page
-says when to wake someone. The burn math below is pinned by the offline
+the 48h production watch. Log volume and cardinality are covered by a
+separate guard; this page says when to wake someone. The burn math below
+is pinned by the offline
 test `crates/bot/src/burn_rate_tests.rs`; a threshold change here without
 the matching test change fails the suite. No staging, secret or live
 paging test is involved.
