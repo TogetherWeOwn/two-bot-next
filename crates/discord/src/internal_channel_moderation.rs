@@ -366,7 +366,10 @@ impl InternalChannelExecutor {
                         return Err(database_error(failure));
                     }
                 };
-                if existing.is_none() {
+                if existing
+                    .as_ref()
+                    .is_none_or(|old| old.recovery_generation != record.recovery_generation)
+                {
                     clear_on_rejection = Some(record.recovery_generation);
                 }
                 self.discord
@@ -390,14 +393,16 @@ impl InternalChannelExecutor {
                         return Err(database_error(failure));
                     }
                 };
-                let plan = match channel_moderation::plan_unlock(record.as_ref()) {
+                let current = current.map(|ow| channel_moderation::EveryoneOverwrite {
+                    allow: ow.allow,
+                    deny: ow.deny,
+                });
+                let plan = match channel_moderation::plan_unlock(record.as_ref(), current.as_ref())
+                {
                     Ok(plan) => plan,
-                    Err(_) => {
+                    Err(failure) => {
                         self.abort(&ticket, &audit, None).await?;
-                        return Err(error(
-                            ErrorCode::ActionNotAllowed,
-                            "channel is not locked down or recovery masks are invalid",
-                        ));
+                        return Err(error(ErrorCode::ActionNotAllowed, failure.to_string()));
                     }
                 };
                 let record = record.expect("plan requires record");
