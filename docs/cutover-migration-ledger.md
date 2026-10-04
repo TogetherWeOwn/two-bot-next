@@ -105,6 +105,7 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0412_voice_rooms_ownership_touched | up | voice_rooms | re-runnable | Drop column `owner_touched_at`; ownership handoffs lose their timestamp. |
 | 0414_voice_rooms_custom_name | up | voice_rooms | re-runnable | Drop columns `custom_name` and `name_touched_at`; rooms fall back to their template name. |
 | 0415_internal_event_keys | up | internal_event_keys | backout-script | Unguarded `CREATE TABLE` fails on re-apply; backout drops the table (event.read loses its key map until upsert re-registers keys). |
+| 0416_voice_room_privacy | up | voice_rooms, voice_room_blocks | backout-script | Unguarded `ADD COLUMN`/`ADD CONSTRAINT` fail on re-apply; backout drops the join-channel constraint, the three privacy columns and the block table (private rooms become public in the store while their Discord overwrite stays; export the block list first). |
 
 ## Notes
 

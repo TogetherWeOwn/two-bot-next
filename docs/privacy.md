@@ -27,7 +27,10 @@ are outside this implementation's scope.
   (`voice_creators`, including V9 text-channel name/viewer-role settings) and
   companion text-channel records (`voice_text_companions`, Discord channel IDs
   plus the creation-time settings snapshot) store no member IDs and are
-  untouched by member erasure. Guild room-command controls
+  untouched by member erasure. A room's private flag and Join channel ID
+  (`voice_rooms`) hold no member IDs. Its block list (`voice_room_blocks`) does:
+  erasure removes the erased member's rows from every room's list, and a room
+  erased with its owner takes its whole list with it (the rows cascade). Guild room-command controls
   (`voice_access_controls`: creation switch, required role ID, per-command role
   IDs) and room logging settings (`voice_logging_settings`: detail level, notice
   channel ID, mention role ID) hold channel and role IDs only and no member IDs.

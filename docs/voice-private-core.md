@@ -77,6 +77,54 @@ Stale snapshots and delayed event replays are **not** detected by this pure
 core. No exactly-once Discord effects or crash recovery are claimed by these
 tests.
 
+## Runtime wiring: `/private` and `/public`
+
+`crates/bot/src/voice_rooms/private_runtime.rs` runs this core inside the
+guild worker. It covers the two owner commands, the persisted privacy state and
+the Join channel; the join-request buttons, grants and pending requests are a
+later slice.
+
+- **Gate.** The caller must be in the room and be its owner or hold Manage
+  Channels (`require_room_owner`). Both commands are idempotent and reply
+  ephemerally with what was queued, not that Discord finished; a failed write is
+  recorded as a lifecycle failure and shows in `/setup`.
+- **Discord first, state after.** `/private` and `/public` queue one
+  `RoomAction::SetEveryoneConnect`. The private flag, the Join-channel plan and
+  the stored record change only after that write lands, so a refused write
+  leaves the room as it was. A repeated `/private` on a private room whose
+  @everyone overwrite no longer denies Connect re-asserts it. `/public` on a
+  room whose stored flag is public but whose @everyone overwrite still denies
+  Connect (a room an `/alwaysprivate` creator made) lifts that deny; with no
+  deny it changes nothing.
+- **The overwrite.** Only the Connect bit moves; every other @everyone bit (View
+  Channel included) is carried over unchanged, because the write replaces the
+  whole entry. Manage Roles is never emitted as an allow, on any overwrite
+  this slice writes. When denying @everyone would leave the bot unable to manage
+  the room, a bot-member allow for exactly the missing bits is written first.
+  `/public` removes only the Connect deny; an explicit @everyone Connect allow
+  that `/private` stripped is not re-added.
+- **The Join channel.** Created once in the room's category, directly after the
+  room, with no overwrites (it syncs to the category). A retry after an unknown
+  outcome adopts the channel the live snapshot shows instead of creating a second
+  one. It is deleted on `/public`, and with its room (ahead of the row, so a
+  failed delete retries the whole room delete instead of leaking it). On
+  `/public` the delete runs inside the same retried action, after the Connect
+  write and before the flag flips and the record is saved, so the stored Join id
+  outlives a restart until the channel is gone and `/public` can run again to
+  finish the job. The Join channel's name carries the owner's display name only
+  after it is sanitized like a `/create` name and passes the name filter. The
+  worker only deletes Join channel ids it created or loaded from its own store.
+- **Persistence** (`0416_voice_room_privacy`). `voice_rooms.private` and
+  `join_channel_id`, plus `voice_room_blocks` rows that cascade with the room.
+  `PrivacyRecord` is the durable subset of `PrivateRoom`; a corrupt record is
+  refused at load rather than repaired.
+- **Restart.** A stored Join channel that is in the live snapshot is adopted;
+  one that is not is forgotten and the forgetting persisted. The room stays
+  private; `/private` plans a new Join channel. Nothing is forgotten without an
+  authoritative snapshot that still shows the room.
+- **Not yet.** Renaming the Join channel when ownership or the owner's name
+  changes (`set_owner`), and persisting grants and pending requests.
+
 ## Residual parent work
 
 V1 room storage, V2 ownership tracking, `/nick` resolution, Discord permission

@@ -204,13 +204,18 @@ pub const TABLE_SPECS: &[TableSpec] = &[
             "no timestamp column; creator configuration is upserted in place (see PgRoomStore::add_creator)",
         ),
     },
+    // V3 block list (0416): one row per blocked member, stamped on insert; an
+    // unblock deletes the row, so only additions are measurable.
+    TableSpec { table: "voice_room_blocks", measure: TableMeasure::Columns(&["created_at"]) },
     // Insert-once creation snapshot plus V2 ownership handoffs, whose
-    // timestamp lives in `owner_touched_at` (migration 0412), plus V3 `/name`
-    // custom-name changes, stamped in `name_touched_at` (migration 0414).
+    // timestamp lives in `owner_touched_at` (migration 0412), V3 `/name`
+    // custom-name changes, stamped in `name_touched_at` (migration 0414), and V3
+    // privacy writes, stamped in `privacy_touched_at` (migration 0416).
     TableSpec {
         table: "voice_rooms",
-        measure: TableMeasure::Columns(&["created_at", "owner_touched_at", "name_touched_at"]),
+        measure: TableMeasure::Columns(&["created_at", "owner_touched_at", "name_touched_at", "privacy_touched_at"]),
     },
+    TableSpec { table: "voice_owner_grants", measure: TableMeasure::Columns(&["touched_at"]) },
     // Same insert-once shape as voice_rooms (PgRoomStore::add_companion never
     // overwrites the creation snapshot).
     TableSpec { table: "voice_text_companions", measure: TableMeasure::Columns(&["created_at"]) },
