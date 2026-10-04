@@ -2590,10 +2590,10 @@
         "TOG-11152"
       ],
       "status": "automated",
-      "action": "Run the duration summary fixtures and the DB-backed `report_cli` scenario mixing known and startKnown:false sessions.",
-      "expected": "`durations` averages known-start sessions only (the unknown start carrying a number is excluded) and counts the excluded unknown starts.",
-      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Fixture proof only, not a deployed-network soak receipt.",
-      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests"
+      "action": "Run the duration summary fixtures, the core metadata-parsing fixtures in `crates/core/src/voice.rs` and the DB-backed `report_cli` scenario mixing known and startKnown:false sessions.",
+      "expected": "`durations` averages known-start sessions only (the unknown start carrying a number is excluded) and counts the excluded unknown starts. Known 60 / unknown 600 averages to 60 (removing the start-known filter yields 330); mixed numeric/numeric-string metadata averages to 60 with measured=2 and excluded_unknown_starts=4; invalid-only metadata yields no average, not fabricated zeroes. Finite decimal numeric strings are measured; legacy JavaScript coercions of empty strings, booleans, containers and radix-prefixed strings are deliberately rejected.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Include the core `voice::tests` results (`averages_filter_on_flag_not_null`, `metadata_average_excludes_unknown_numbers_and_numeric_strings`, `metadata_numbers_and_numeric_strings_enter_known_average`, `metadata_invalid_durations_never_become_measured_zeroes`). Fixture proof only, not a deployed-network soak receipt; the separate voice receipt gate is unchanged.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib voice::tests::"
     },
     {
       "id": "s13-59965d0",
@@ -2773,19 +2773,18 @@
           "[dc2b507](https://github.com/TogetherWeOwn/two-bot/commit/dc2b507ad03aadd56bbe71eb707a4d2facc4d2a5)",
           "`src/analytics/`",
           "feat(voice): reconcile open-half sessions with explicit reasons (#273)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
         "TOG-11152"
       ],
-      "status": "waived",
-      "action": "Run TOG-11152’s reconcile on a fixture with open-half sessions of each reason.",
-      "expected": "Every open-half session is reported with its explicit reason; nothing is repaired.",
-      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "status": "automated",
+      "action": "Run the open-half reconcile fixtures (every reason), the timestamp-parser boundary fixtures in `crates/core/src/funnel.rs`, the `Number()` duration-string fixtures and the DB-backed `report_cli` legacy-fixture scenario.",
+      "expected": "Every open-half session is reported with its explicit reason (restart-gap, server-leave and metadata-recompute resolve; still-open, superseded, no-start-on-file and bad-end-row are flagged) and nothing is repaired. A timestamp with a multi-byte zone (`+1é1`) or an absurd year is unparseable (legacy `Date.parse` NaN): the row is skipped or falls through to the bad-end-row or earlier-start path, and the sweep never panics. A `durationSeconds` string reads as legacy `Number()` does (`\"0x3c\"` is 60, `\"6e1\"` is 60, whitespace is trimmed, `\"\"` is 0; `\"nan\"`, `\"inf\"` and `\"Infinity\"` are unmeasured); negative and non-finite values never become a measured time. Accepted divergence: a JSON array or object is unmeasured (legacy `Number([])` is 0).",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the DB-backed scenario skips without `TWO_TEST_DATABASE_URL` and runs in CI on disposable agent-testdb databases. Include the core `funnel::tests` results (`multibyte_zone_is_unparseable_not_a_panic`, `non_ascii_anywhere_in_a_timestamp_never_panics`, `absurd_years_are_unparseable_not_an_overflow`) and the cutover `voice_reconcile::tests` results. Fixture proof only, not a deployed-network soak receipt; the separate voice receipt gate is unchanged.",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test report_cli voice_reconcile_matches_legacy_fixtures_read_only && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib voice_reconcile::tests && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib funnel::tests::"
     },
     {
       "id": "s13-860557f",
