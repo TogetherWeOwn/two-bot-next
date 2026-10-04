@@ -431,14 +431,24 @@ SHA, per-migration SHA-384, ledger before/after, applied count, plus its own
 `plan_manifest_sha256` and the bound `plan_run_id`) is the evidence;
 on failure the ledger-after is preserved, not repaired.
 
-The workflow runs only when dispatched from `main` and splits into two jobs.
+The workflow runs only when dispatched from `main` and splits into three jobs.
 The `plan` job always runs and reads the binding from the `staging-migrate-plan`
 GitHub environment, which carries no reviewer because planning changes nothing;
 it uploads `staging-migrate-manifest.json` as the `staging-migrate-manifest`
 run artifact (14-day retention), which is where the reviewer reads
-`plan_manifest_sha256`/`plan_run_id` for the apply dispatch.
-the `apply` job runs only for `mode: apply`, after a green plan, and reads the
-binding from the `staging-migrate-apply` environment, which must have a
+`plan_manifest_sha256`/`plan_run_id` for the apply dispatch. The digest is the
+embedded source/pending/migration projection, **not** SHA-256 of the JSON or ZIP.
+For `mode: apply`, the unprotected `claim` job validates this dispatch's read-only
+plan against the request and uploads `staging-migrate-apply-claim.json` as the
+`staging-migrate-apply-claim` artifact, before apply waits for environment approval.
+It has no database secrets or environment; a step inside the waiting apply job
+cannot publish evidence before approval. Both artifact uploads disable compression
+for the bounded stored-ZIP reader. The [claim contract](staging-migrate-claim.md)
+defines the exact versioned fields, serialization vector and consumer requirements.
+The claim is a request, not proof of producer provenance or CEO GO; the independent
+protection-rule consumer must authenticate both runs and the prior plan artifact.
+The `apply` job runs only for `mode: apply`, after a green plan **and claim**, and
+reads the binding from the `staging-migrate-apply` environment, which must have a
 required reviewer and a main-only deployment-branch rule. Both bindings must be
 environment secrets, not repository secrets; otherwise a workflow edited on
 another branch could read them. This change does not create the environments or

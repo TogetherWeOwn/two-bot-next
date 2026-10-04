@@ -644,6 +644,42 @@ mod tests {
     }
 
     #[test]
+    fn claim_transport_projection_fixture_matches_rust() {
+        use sqlx::{
+            migrate::{Migration, MigrationType},
+            SqlSafeStr,
+        };
+        // Synthetic SQL, no database. The shared consumer vector contains an
+        // i64 above JS's safe-integer bound and a UTF-8 description.
+        let migrator = Migrator::with_migrations(vec![
+            Migration::new(
+                1,
+                "first fixture".into(),
+                MigrationType::Simple,
+                "SELECT 1;".into_sql_str(),
+                false,
+            ),
+            Migration::new(
+                9_007_199_254_740_993,
+                "fixture résumé".into(),
+                MigrationType::Simple,
+                "SELECT 2;".into_sql_str(),
+                false,
+            ),
+        ]);
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/staging-migrate-plan.json"))
+                .unwrap();
+        let pending = [1, 9_007_199_254_740_993];
+        assert_eq!(fixture["source_migrations"], source_manifest(&migrator));
+        assert_eq!(fixture["pending_before"], json!(pending));
+        assert_eq!(
+            fixture["plan_manifest_sha256"],
+            manifest_hash(&"a".repeat(40), &pending, &migrator)
+        );
+    }
+
+    #[test]
     fn sqlx_pin_matches_lockfile() {
         let lock = include_str!("../../../Cargo.lock");
         assert!(lock.contains(&format!("name = \"sqlx\"\nversion = \"{SQLX_VERSION}\"")));
