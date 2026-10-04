@@ -137,11 +137,13 @@ the Join channel. The join-request flow is in
   under a fresh id. Bots are skipped; the core already ignores the owner,
   occupants, approved members and blocked members (silently).
 - **Prompt.** One `RoomAction::AskJoinOwner` posts a message in the room's own
-  chat (a DM when the chat refuses it) with three buttons,
+  chat with three buttons,
   `two:voice:join-approve|deny|block:<room>:<request>`. Only the owner is pinged;
-  the requester is named by id. A request answered or withdrawn before the
-  queue reaches the prompt posts nothing. When neither destination works the
-  request is dropped, so it does not sit pending behind buttons nobody got.
+  the requester is named by id. There is no DM fallback: a press on a DM carries
+  no guild, so it could not be routed or role-gated. A request answered or
+  withdrawn before the queue reaches the prompt posts nothing. When the bot
+  cannot post in the room's chat the request is dropped (the failure shows in
+  `/setup`) instead of sitting pending behind buttons nobody got.
 - **Answer.** A press runs the guild's `/private` role gate, then the worker
   checks the room's *current* owner (admins do not count) and the request's
   current state. A stale, answered or withdrawn button, and one minted before a
@@ -160,7 +162,8 @@ the Join channel. The join-request flow is in
 - **Withdrawal.** An ownership change withdraws requests raised to the previous
   owner, retires their buttons and asks the new owner about everyone still
   waiting. `/public` takes approved members' Connect allow back and retires
-  open prompts. A room delete retires its prompts and forgets the state.
+  open prompts. A room delete forgets the state; its prompts go with the
+  channel.
 - **Request ids.** Pending requests, grants and prompts are runtime-only. An id
   is `epoch << 20 | n`, where the epoch is the worker's start time in
   milliseconds and never lower than an earlier worker's in the same process, so

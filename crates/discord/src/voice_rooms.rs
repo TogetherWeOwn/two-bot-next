@@ -271,8 +271,8 @@ pub enum RoomHttpError {
     UnknownOutcome,
 }
 
-/// A message the bot posted: the channel it landed in (a room's chat or a DM)
-/// and its id, so the same message can be edited later.
+/// A message the bot posted: the channel it landed in and its id, so the same
+/// message can be edited later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MessageRef {
     pub channel_id: Snowflake,
@@ -877,12 +877,6 @@ impl RoomHttp {
         user_id: Snowflake,
         content: &str,
     ) -> Result<(), RoomHttpError> {
-        let channel_id = self.direct_channel(user_id).await?;
-        self.post_notice(channel_id, content, None).await
-    }
-
-    /// Open (or reuse) the DM channel with `user_id`.
-    async fn direct_channel(&self, user_id: Snowflake) -> Result<Snowflake, RoomHttpError> {
         if user_id == 0 {
             return Err(RoomHttpError::InvalidRequest);
         }
@@ -894,7 +888,7 @@ impl RoomHttp {
         let body = self.send(request, || true).await?;
         let channel: Channel =
             serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)?;
-        Ok(channel.id.get())
+        self.post_notice(channel.id.get(), content, None).await
     }
 
     /// V3 join request: post a message with buttons to a channel and return
@@ -926,19 +920,6 @@ impl RoomHttp {
             .map_err(classify_http_error)?;
         let body = self.send(request, || true).await?;
         parse_posted_message(channel_id, &body)
-    }
-
-    /// Like [`Self::post_component_message`], into a DM with `user_id`.
-    pub async fn post_direct_component_message(
-        &self,
-        user_id: Snowflake,
-        content: &str,
-        mention_user: Option<Snowflake>,
-        components: &[Component],
-    ) -> Result<MessageRef, RoomHttpError> {
-        let channel_id = self.direct_channel(user_id).await?;
-        self.post_component_message(channel_id, content, mention_user, components)
-            .await
     }
 
     /// Replace the text and buttons of a message the bot posted. An empty

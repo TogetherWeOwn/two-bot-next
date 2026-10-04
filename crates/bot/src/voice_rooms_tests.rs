@@ -460,7 +460,7 @@ struct OverwriteGate {
 /// One join-request message the fake Discord accepted.
 #[derive(Clone)]
 struct SentPrompt {
-    target: NoticeTarget,
+    channel: u64,
     content: String,
     mention: Option<u64>,
     components: Vec<Component>,
@@ -481,8 +481,8 @@ struct Http {
     written_overwrites: Mutex<Vec<(u64, PermissionOverwrite)>>,
     notices: Mutex<Vec<(NoticeTarget, String, Option<u64>)>>,
     refused_notices: Mutex<Vec<NoticeTarget>>,
-    /// V3 join-request prompts the owner was sent, and the scripted errors
-    /// (one per attempt) the next sends fail with.
+    /// V3 join-request prompts posted in a room's chat, and the scripted
+    /// errors (one per attempt) the next sends fail with.
     prompts: Mutex<Vec<SentPrompt>>,
     prompt_errors: Mutex<VecDeque<RoomHttpError>>,
     next_message: Mutex<u64>,
@@ -812,15 +812,12 @@ impl RoomWrites for Http {
     }
     async fn send_component_message(
         &self,
-        target: NoticeTarget,
+        channel: u64,
         content: &str,
         mention_user: Option<u64>,
         components: &[Component],
     ) -> Result<MessageRef, RoomHttpError> {
-        self.trace
-            .lock()
-            .unwrap()
-            .push(format!("prompt:{target:?}"));
+        self.trace.lock().unwrap().push(format!("prompt:{channel}"));
         if let Some(error) = self.prompt_errors.lock().unwrap().pop_front() {
             return Err(error);
         }
@@ -830,16 +827,12 @@ impl RoomWrites for Http {
             *id += 1;
             next
         };
-        let channel_id = match target {
-            NoticeTarget::Channel(channel) => channel,
-            NoticeTarget::DirectMessage(user) => 8_000 + user,
-        };
         let message = MessageRef {
-            channel_id,
+            channel_id: channel,
             message_id,
         };
         self.prompts.lock().unwrap().push(SentPrompt {
-            target,
+            channel,
             content: content.to_owned(),
             mention: mention_user,
             components: components.to_vec(),

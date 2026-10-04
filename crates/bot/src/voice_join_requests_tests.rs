@@ -167,7 +167,7 @@ async fn entering_the_join_channel_asks_the_owner_once() {
     drain(&mut worker).await;
     let sent = prompts(&worker);
     assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].target, NoticeTarget::Channel(ROOM));
+    assert_eq!(sent[0].channel, ROOM);
     // Only the owner is pinged; the requester is named by id, never by text.
     assert_eq!(sent[0].mention, Some(OWNER));
     assert!(sent[0].content.contains(&format!("<@{OWNER}>")));
@@ -453,12 +453,12 @@ async fn an_ownership_transfer_withdraws_pending_requests_and_asks_the_new_owner
 }
 
 #[tokio::test]
-async fn deleting_the_room_forgets_its_requests_and_retires_the_prompts() {
+async fn deleting_the_room_forgets_its_requests_and_their_prompts() {
     let (mut worker, trace) = private_room().await;
     enter(&worker, OUTSIDER, 2_000);
     worker.reconcile();
     drain(&mut worker).await;
-    let prompt = prompts(&worker)[0].message;
+    assert_eq!(worker.join.prompts.len(), 1);
     trace.lock().unwrap().clear();
     // Everyone leaves: the room is deleted, and its privacy state goes with it.
     worker.live.voice_update_at(OWNER, None, Some(false), 3_000);
@@ -467,10 +467,11 @@ async fn deleting_the_room_forgets_its_requests_and_retires_the_prompts() {
     drain(&mut worker).await;
     assert!(worker.privacy.is_empty());
     assert!(worker.join.prompts.is_empty());
-    assert!(calls(&trace).contains(&format!(
-        "edit_prompt:{}:{}:This join request is no longer pending.:0",
-        prompt.channel_id, prompt.message_id
-    )));
+    assert!(worker.join.entries.is_empty());
+    // The prompt lives in the room's chat and goes with the channel: no edit.
+    assert!(!calls(&trace)
+        .iter()
+        .any(|call| call.starts_with("edit_prompt")));
 }
 
 #[tokio::test]
@@ -560,45 +561,40 @@ fn request_ids_never_repeat_across_workers_started_in_the_same_millisecond() {
 }
 
 #[tokio::test]
-async fn a_refused_room_chat_falls_back_to_a_dm_and_a_dead_end_forgets_the_request() {
+async fn a_room_chat_the_bot_cannot_post_in_drops_the_request_and_records_it() {
     let (mut worker, trace) = private_room().await;
-    // The room's chat refuses the post: the owner is asked by DM instead.
+    enter(&worker, OUTSIDER, 2_000);
+    worker.reconcile();
+    drain(&mut worker).await;
+    assert_eq!(prompts(&worker).len(), 1);
+    // The chat refuses the next post. There is no DM fallback (a press on a DM
+    // carries no guild), so nobody can be asked: the request is not left
+    // pending behind buttons that were never delivered, and the failure is
+    // recorded for `/setup`.
     worker
         .http
         .prompt_errors
         .lock()
         .unwrap()
         .push_back(RoomHttpError::AccessDenied);
-    enter(&worker, OUTSIDER, 2_000);
-    worker.reconcile();
-    drain(&mut worker).await;
-    let sent = prompts(&worker);
-    assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].target, NoticeTarget::DirectMessage(OWNER));
-    assert_eq!(
-        calls(&trace),
-        [
-            format!("prompt:{:?}", NoticeTarget::Channel(ROOM)),
-            format!("prompt:{:?}", NoticeTarget::DirectMessage(OWNER)),
-        ]
-    );
-    // Neither works for the next member: nobody can be asked, so the request
-    // is not left pending behind buttons that were never delivered.
-    worker
-        .http
-        .prompt_errors
-        .lock()
-        .unwrap()
-        .extend([RoomHttpError::AccessDenied, RoomHttpError::AccessDenied]);
+    trace.lock().unwrap().clear();
     enter(&worker, OTHER, 3_000);
     worker.reconcile();
     drain(&mut worker).await;
+    assert_eq!(calls(&trace), [format!("prompt:{ROOM}")]);
     assert!(!worker.privacy[&ROOM].pending.contains_key(&MemberId(OTHER)));
     assert!(worker.privacy[&ROOM]
         .pending
         .contains_key(&MemberId(OUTSIDER)));
     assert_eq!(prompts(&worker).len(), 1);
     assert!(!worker.failures().is_empty());
+    // Coming back asks again, and the next post works.
+    leave(&worker, OTHER, 4_000);
+    worker.reconcile();
+    enter(&worker, OTHER, 5_000);
+    worker.reconcile();
+    drain(&mut worker).await;
+    assert_eq!(prompts(&worker).len(), 2);
 }
 
 #[tokio::test]

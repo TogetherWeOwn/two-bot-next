@@ -816,13 +816,12 @@ pub enum RoomAction {
         room_channel_id: Snowflake,
         member_id: Snowflake,
     },
-    /// V3: take the buttons off a join-request message whose request can no
-    /// longer be answered. Names its own target and scopes to no room, like
-    /// `DeleteJoinChannel`: a room deleted meanwhile must not drop the edit
-    /// of a prompt that lives in a DM.
+    /// V3: take the buttons off a join-request message in the room's chat
+    /// whose request can no longer be answered. Scoped to its room: once the
+    /// room is deleted the message goes with it, so a pending edit is dropped.
     RetireJoinPrompt {
-        prompt_channel_id: Snowflake,
-        prompt_message_id: Snowflake,
+        room_channel_id: Snowflake,
+        message_id: Snowflake,
     },
 }
 
@@ -850,8 +849,7 @@ impl RoomAction {
         match self {
             Self::CreateRoom { .. }
             | Self::CreateCompanion { .. }
-            | Self::DeleteJoinChannel { .. }
-            | Self::RetireJoinPrompt { .. } => None,
+            | Self::DeleteJoinChannel { .. } => None,
             Self::MoveMember { channel_id, .. }
             | Self::DeleteRoom { channel_id }
             | Self::UpdateOwnership { channel_id, .. }
@@ -872,6 +870,10 @@ impl RoomAction {
                 ..
             }
             | Self::RevokeJoinAccess {
+                room_channel_id: channel_id,
+                ..
+            }
+            | Self::RetireJoinPrompt {
                 room_channel_id: channel_id,
                 ..
             }
@@ -2280,35 +2282,34 @@ mod tests {
     }
 
     #[test]
-    fn join_request_actions_scope_to_their_room_except_the_prompt_edit() {
-        let ask = RoomAction::AskJoinOwner {
-            room_channel_id: 500,
-            member_id: 401,
-            request_id: 7,
-        };
-        let approve = RoomAction::ApproveJoin {
-            room_channel_id: 500,
-            member_id: 401,
-        };
-        let revoke = RoomAction::RevokeJoinAccess {
-            room_channel_id: 500,
-            member_id: 401,
-        };
-        for action in [&ask, &approve, &revoke] {
-            assert_eq!(action.channel_id(), Some(500));
-        }
-        // The edit names its own message and scopes to no room: a prompt that
-        // lives in a DM must lose its buttons even when its room is deleted.
-        let retire = RoomAction::RetireJoinPrompt {
-            prompt_channel_id: 8_300,
-            prompt_message_id: 9_001,
-        };
-        assert_eq!(retire.channel_id(), None);
+    fn join_request_actions_all_scope_to_their_room() {
+        let actions = [
+            RoomAction::AskJoinOwner {
+                room_channel_id: 500,
+                member_id: 401,
+                request_id: 7,
+            },
+            RoomAction::ApproveJoin {
+                room_channel_id: 500,
+                member_id: 401,
+            },
+            RoomAction::RevokeJoinAccess {
+                room_channel_id: 500,
+                member_id: 401,
+            },
+            // The prompt lives in the room's chat and goes with the room.
+            RoomAction::RetireJoinPrompt {
+                room_channel_id: 500,
+                message_id: 9_001,
+            },
+        ];
         let q = ActionQueue::new();
-        for action in [ask, approve, revoke, retire] {
+        for action in actions {
+            assert_eq!(action.channel_id(), Some(500));
             q.enqueue(GUILD, action);
         }
-        assert_eq!(q.drop_for_channel(GUILD, 500), 3);
+        q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 501 });
+        assert_eq!(q.drop_for_channel(GUILD, 500), 4);
         assert_eq!(q.pending_counts(GUILD), (1, 0));
     }
 

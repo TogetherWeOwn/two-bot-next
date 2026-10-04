@@ -546,43 +546,28 @@ async fn join_prompt_posts_buttons_pings_only_the_owner_and_returns_the_message(
 }
 
 #[tokio::test]
-async fn join_prompt_by_dm_opens_the_channel_first_and_a_bodyless_success_is_unknown() {
+async fn a_bodyless_success_is_never_a_message_id() {
     let mock = Mock::start(vec![
-        response(200, json!({"id": "8300", "type": 1})),
-        response(200, json!({"id": "9002"})),
-        response(200, json!({"id": "8300", "type": 1})),
         response(200, json!({})),
+        response(200, json!({"id": "0"})),
     ])
     .await;
-    let posted = mock
-        .api
-        .post_direct_component_message(300, "hi", Some(300), &join_buttons())
-        .await
-        .unwrap();
-    assert_eq!(
-        posted,
-        MessageRef {
-            channel_id: 8300,
-            message_id: 9002
-        }
-    );
-    // A 2xx that names no message is never an id of zero.
-    assert_eq!(
-        mock.api
-            .post_direct_component_message(300, "hi", None, &join_buttons())
-            .await,
-        Err(RoomHttpError::UnknownOutcome)
-    );
+    // A 2xx that names no message (or message zero) is an unknown outcome.
+    for _ in 0..2 {
+        assert_eq!(
+            mock.api
+                .post_component_message(500, "hi", None, &join_buttons())
+                .await,
+            Err(RoomHttpError::UnknownOutcome)
+        );
+    }
     assert_eq!(
         mock.api
             .post_component_message(0, "hi", None, &join_buttons())
             .await,
         Err(RoomHttpError::InvalidRequest)
     );
-    let requests = mock.state.recorded.lock().unwrap();
-    assert_eq!(requests[0].method, Method::POST);
-    assert_eq!(requests[0].path, "/api/v10/users/@me/channels");
-    assert_eq!(requests[1].path, "/api/v10/channels/8300/messages");
+    assert_eq!(mock.state.recorded.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

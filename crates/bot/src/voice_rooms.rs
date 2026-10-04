@@ -655,17 +655,17 @@ pub trait RoomWrites: Send + Sync {
         let _ = (channel, member, guard);
         async { Err(RoomHttpError::InvalidRequest) }
     }
-    /// V3 join request: post a message with buttons. Only `mention_user` can
-    /// be pinged. The default refuses, so a writer that cannot post fails
-    /// closed.
+    /// V3 join request: post a message with buttons to a room's chat. Only
+    /// `mention_user` can be pinged. The default refuses, so a writer that
+    /// cannot post fails closed.
     fn send_component_message(
         &self,
-        target: NoticeTarget,
+        channel: Snowflake,
         content: &str,
         mention_user: Option<Snowflake>,
         components: &[Component],
     ) -> impl Future<Output = Result<MessageRef, RoomHttpError>> + Send {
-        let _ = (target, content, mention_user, components);
+        let _ = (channel, content, mention_user, components);
         async { Err(RoomHttpError::InvalidRequest) }
     }
     /// V3 join request: replace the text and buttons of a message this bot
@@ -825,21 +825,13 @@ impl RoomWrites for RoomHttp {
 
     async fn send_component_message(
         &self,
-        target: NoticeTarget,
+        channel: Snowflake,
         content: &str,
         mention_user: Option<Snowflake>,
         components: &[Component],
     ) -> Result<MessageRef, RoomHttpError> {
-        match target {
-            NoticeTarget::Channel(channel) => {
-                self.post_component_message(channel, content, mention_user, components)
-                    .await
-            }
-            NoticeTarget::DirectMessage(user) => {
-                self.post_direct_component_message(user, content, mention_user, components)
-                    .await
-            }
-        }
+        self.post_component_message(channel, content, mention_user, components)
+            .await
     }
 
     async fn edit_component_message(

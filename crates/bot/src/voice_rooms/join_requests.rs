@@ -13,9 +13,10 @@
 //! Deny does not raise the same member again every tick: they leave and come
 //! back to ask again, and the core hands that request a fresh id.
 //!
-//! **Prompt.** The owner is asked in the room's own chat, falling back to a
-//! DM. The message carries three `two:voice:join-*` buttons bound to the room
-//! and the request id. Only the owner is pinged.
+//! **Prompt.** The owner is asked in the room's own chat. The message carries
+//! three `two:voice:join-*` buttons bound to the room and the request id. Only
+//! the owner is pinged. There is no DM fallback: a press on a DM message
+//! carries no guild, so it could not be routed or role-gated.
 //!
 //! **Answer.** A click is authorized against the room's *current* owner, never
 //! the message it sits on, and against the request's current state. A stale
@@ -517,27 +518,18 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.queue.enqueue(
                 self.live.guild_id,
                 RoomAction::RetireJoinPrompt {
-                    prompt_channel_id: message.channel_id,
-                    prompt_message_id: message.message_id,
+                    room_channel_id: room,
+                    message_id: message.message_id,
                 },
             );
         }
     }
 
-    /// The room is being forgotten: retire its outstanding prompts (one that
-    /// lives in the room's own chat goes with the channel) and drop what the
-    /// scan remembered about its Join channel.
+    /// The room is being forgotten: its prompts live in the room's chat and go
+    /// with the channel, so only the bookkeeping is dropped, along with what
+    /// the scan remembered about its Join channel.
     pub(super) fn forget_join_requests(&mut self, room: Snowflake) {
-        let outstanding: Vec<u64> = self
-            .join
-            .prompts
-            .keys()
-            .filter(|(channel, _)| *channel == room)
-            .map(|(_, request_id)| *request_id)
-            .collect();
-        for request_id in outstanding {
-            self.retire_join_prompt(room, request_id);
-        }
+        self.join.prompts.retain(|(channel, _), _| *channel != room);
         if let Some(join) = self.join_channel_of(room) {
             self.join.entries.retain(|(channel, _), _| *channel != join);
         }
@@ -581,14 +573,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     .await;
             }
             RoomAction::RetireJoinPrompt {
-                prompt_channel_id,
-                prompt_message_id,
+                room_channel_id,
+                message_id,
             } => {
                 self.dispatch_retire(
                     action,
                     MessageRef {
-                        channel_id: prompt_channel_id,
-                        message_id: prompt_message_id,
+                        channel_id: room_channel_id,
+                        message_id,
                     },
                     now_ms,
                     started,
@@ -601,8 +593,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
     }
 
-    /// Post the owner's prompt: the room's own chat first, then a DM when the
-    /// chat refuses the post.
+    /// Post the owner's prompt in the room's own chat.
     async fn dispatch_ask_owner(
         &mut self,
         action: QueuedAction,
@@ -628,33 +619,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return;
         }
         let (content, components) = prompt_message(owner, member, room, request_id);
-        let result = match self
+        let result = self
             .http
-            .send_component_message(
-                NoticeTarget::Channel(room),
-                &content,
-                Some(owner),
-                &components,
-            )
-            .await
-        {
-            Err(
-                RoomHttpError::AccessDenied
-                | RoomHttpError::NotFound
-                | RoomHttpError::Rejected { .. }
-                | RoomHttpError::InvalidRequest,
-            ) => {
-                self.http
-                    .send_component_message(
-                        NoticeTarget::DirectMessage(owner),
-                        &content,
-                        Some(owner),
-                        &components,
-                    )
-                    .await
-            }
-            other => other,
-        };
+            .send_component_message(room, &content, Some(owner), &components)
+            .await;
         match result {
             Ok(message) => {
                 self.join.prompts.insert((room, request_id), message);
@@ -678,7 +646,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 );
             }
             Err(error) => {
-                // Nobody can be asked: let the member ask again by coming back.
+                // The owner cannot be asked (the bot cannot post in the room's
+                // chat): do not leave the request pending behind buttons nobody
+                // got. The failure shows in `/setup`; the member can ask again
+                // by coming back.
                 self.drop_unreachable_request(room, request_id);
                 self.complete_error(action, room, error);
             }
