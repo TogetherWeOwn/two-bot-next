@@ -4,7 +4,9 @@
 //!
 //! `report voice-reconcile` pairs `voice_session_start` / `voice_session_end`
 //! halves per (guild, member) and recovers durations where the stored rows
-//! allow it; `report leave-gap` classifies join-without-leave members gone
+//! allow it, names the blind windows in the `events.recorded_at` write series
+//! with per-window `startKnown:false` counts, and averages known-start
+//! durations only; `report leave-gap` classifies join-without-leave members gone
 //! from the roster. Both print JSON; neither writes report data. The roster
 //! read is one bounded GET (20 pages / 20,000 members max); a ceiling hit or
 //! an unreadable page refuses loudly instead of counting a partial roster.
@@ -393,8 +395,307 @@ async fn voice_scenario(db: std::sync::Arc<TestDb>) -> TestResult {
         assert!(d >= 0, "negative duration: {r}");
     }
     assert_eq!(report["discordRequests"].as_u64(), Some(0));
+    // One INSERT stamps one `recorded_at` for every row: a single write
+    // instant cannot bound a gap, so no window, and both unknown-start ends
+    // stay visible as unattributed rather than vanishing.
+    assert_eq!(report["blindWindows"]["heartbeats"].as_u64(), Some(1));
+    assert_eq!(report["blindWindows"]["windows"], serde_json::json!([]));
+    assert_eq!(
+        report["blindWindows"]["unattributedUnknownStarts"].as_u64(),
+        Some(2)
+    );
+    // m1 (1800s) and m5 (300s) are the measured known starts; m7 is a known
+    // start with no duration; m2 and m6 are unknown starts, excluded.
+    assert_eq!(report["durations"]["measured"].as_u64(), Some(2));
+    assert_eq!(report["durations"]["averageSeconds"].as_f64(), Some(1050.0));
+    assert_eq!(
+        report["durations"]["excludedUnknownStarts"].as_u64(),
+        Some(2)
+    );
 
     // Read-only: the report never migrates (no ledger) and never changes a row.
+    let migrated: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = '_sqlx_migrations')",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(!migrated, "report ran migrations");
+    assert_eq!(db.snapshot().await?, seeded, "report wrote rows");
+    Ok(())
+}
+
+/// An `events` row with an explicit write instant: `recorded_at` is the
+/// heartbeat the blind-window report reads, `occurred_at` the event time.
+fn written_event(
+    event_type: &str,
+    member_id: &str,
+    occurred: &str,
+    recorded: &str,
+    source: &str,
+    metadata: &str,
+) -> String {
+    let meta = metadata.replace('\'', "''");
+    format!(
+        "('{event_type}', '{member_id}', '{GUILD}', '{occurred}'::timestamptz, \
+         '{recorded}'::timestamptz, '{source}', '{meta}', \
+         '{GUILD}:{member_id}:{event_type}:{occurred}')"
+    )
+}
+
+/// Events-write gaps against a healthy probe table (TOG-5683). The write
+/// series (every row's `recorded_at` equals its `occurred_at` except the
+/// backfilled row) runs 08:00 to 10:00, falls silent until 15:00 (5h), runs to
+/// 17:00, falls silent until 20:30 (3.5h) and resumes. An hourly presence
+/// probe reads right through both silences; the report must still name them.
+/// Unknown-start ends: two in window one, one (with a numeric duration the
+/// flag must still exclude) in window two, one before every window.
+async fn blind_window_scenario(db: std::sync::Arc<TestDb>) -> TestResult {
+    db.seed(include_str!("../migrations/0310_presence_probe.sql").to_owned())
+        .await?;
+    let probes: Vec<String> = (8..=21)
+        .map(|hour| format!("('{GUILD}', '2026-09-20T{hour:02}:00:00.000Z', 120, NULL)"))
+        .collect();
+    db.seed(format!(
+        "INSERT INTO presence_probe (guild_id, observed_at, approximate_presence_count, bot_floor) VALUES {}",
+        probes.join(",")
+    ))
+    .await?;
+
+    let unknown = r#"{"startKnown":false,"startedAt":null,"durationSeconds":null}"#;
+    let live = |kind: &str, member: &str, at: &str, source: &str, meta: &str| {
+        written_event(kind, member, at, at, source, meta)
+    };
+    let rows = [
+        // The write series: plain proof-of-life rows on the hour.
+        live(
+            "member_join",
+            "hb1",
+            "2026-09-20T08:00:00Z",
+            "gateway",
+            "{}",
+        ),
+        live(
+            "member_join",
+            "hb2",
+            "2026-09-20T09:00:00Z",
+            "gateway",
+            "{}",
+        ),
+        live(
+            "member_join",
+            "hb3",
+            "2026-09-20T10:00:00Z",
+            "gateway",
+            "{}",
+        ),
+        live(
+            "member_join",
+            "hb4",
+            "2026-09-20T15:00:00Z",
+            "gateway",
+            "{}",
+        ),
+        live(
+            "member_join",
+            "hb5",
+            "2026-09-20T16:00:00Z",
+            "gateway",
+            "{}",
+        ),
+        live(
+            "member_join",
+            "hb6",
+            "2026-09-20T17:00:00Z",
+            "gateway",
+            "{}",
+        ),
+        live(
+            "member_join",
+            "hb7",
+            "2026-09-20T20:30:00Z",
+            "gateway",
+            "{}",
+        ),
+        // A backfilled row: the event happened at 12:30, inside window one,
+        // but it was written at 16:30. The series is when WE wrote, so it is
+        // no proof of life at 12:30 and window one stays whole.
+        written_event(
+            "member_join",
+            "bf1",
+            "2026-09-20T12:30:00Z",
+            "2026-09-20T16:30:00Z",
+            "backfill:log:x",
+            "{}",
+        ),
+        // Before every window: unknown start, unattributed.
+        live(
+            "voice_session_end",
+            "m-e",
+            "2026-09-20T09:30:00Z",
+            "channel:ch-a",
+            unknown,
+        ),
+        // Known-start sessions (never counted as unknown, both measured).
+        live(
+            "voice_session_start",
+            "m-f",
+            "2026-09-20T08:10:00Z",
+            "channel:ch-a",
+            "{}",
+        ),
+        live(
+            "voice_session_end",
+            "m-f",
+            "2026-09-20T08:40:00Z",
+            "channel:ch-a",
+            r#"{"startKnown":true,"startedAt":"2026-09-20T08:10:00.000Z","durationSeconds":1800}"#,
+        ),
+        live(
+            "voice_session_start",
+            "m-d",
+            "2026-09-20T15:01:00Z",
+            "channel:ch-a",
+            "{}",
+        ),
+        live(
+            "voice_session_end",
+            "m-d",
+            "2026-09-20T15:11:00Z",
+            "channel:ch-a",
+            r#"{"startKnown":true,"startedAt":"2026-09-20T15:01:00.000Z","durationSeconds":600}"#,
+        ),
+        // Window one: the bot came back and met members already in voice.
+        live(
+            "voice_session_end",
+            "m-a",
+            "2026-09-20T15:05:00Z",
+            "channel:ch-a",
+            unknown,
+        ),
+        live(
+            "voice_session_end",
+            "m-b",
+            "2026-09-20T15:30:00Z",
+            "channel:ch-b",
+            unknown,
+        ),
+        // Window two: the flag decides, so a number on the row changes nothing.
+        live(
+            "voice_session_end",
+            "m-c",
+            "2026-09-20T20:40:00Z",
+            "channel:ch-a",
+            r#"{"startKnown":false,"startedAt":null,"durationSeconds":99999}"#,
+        ),
+    ];
+    db.seed(format!(
+        "INSERT INTO events (event_type, member_id, guild_id, occurred_at, recorded_at, source, metadata, idempotency_key) VALUES {}",
+        rows.join(",")
+    ))
+    .await?;
+
+    // The fixture's premise: the probe table is healthy straight through both
+    // silences, so a probe-sourced heartbeat would have hidden the gaps.
+    let probe_in_gap_one: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM presence_probe WHERE observed_at > '2026-09-20T10:00:00.000Z' AND observed_at < '2026-09-20T15:00:00.000Z'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    let probe_in_gap_two: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM presence_probe WHERE observed_at > '2026-09-20T17:00:00.000Z' AND observed_at < '2026-09-20T20:30:00.000Z'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(probe_in_gap_one >= 4 && probe_in_gap_two >= 3);
+    let distinct_writes: i64 = sqlx::query_scalar("SELECT count(DISTINCT recorded_at) FROM events")
+        .fetch_one(&db.pool)
+        .await?;
+    let seeded = db.snapshot().await?;
+
+    let out = successful_stdout(&db.run(&["voice-reconcile", "--guild", GUILD], &[]));
+    let report: serde_json::Value = serde_json::from_str(&out)?;
+    let blind = &report["blindWindows"];
+    assert_eq!(blind["heartbeatSource"], "events.recorded_at");
+    assert_eq!(blind["heartbeats"].as_i64(), Some(distinct_writes));
+    assert_eq!(blind["maxGapMs"].as_i64(), Some(2 * 3_600_000));
+    // Window one is the whole 5h silence: the 12:30-occurred backfill row was
+    // recorded at 16:30, so an `occurred_at` series would have split it.
+    assert_eq!(
+        blind["windows"],
+        serde_json::json!([
+            {
+                "start": "2026-09-20T10:00:00.000Z",
+                "end": "2026-09-20T15:00:00.000Z",
+                "gapMs": 5 * 3_600_000,
+                "unknownStarts": 2,
+            },
+            {
+                "start": "2026-09-20T17:00:00.000Z",
+                "end": "2026-09-20T20:30:00.000Z",
+                "gapMs": 3 * 3_600_000 + 1_800_000,
+                "unknownStarts": 1,
+            },
+        ])
+    );
+    assert_eq!(blind["unattributedUnknownStarts"].as_u64(), Some(1));
+    // Known-start sessions are not counted: m-d and m-f appear nowhere above.
+    // Durations: only the two measured known starts enter the mean; the four
+    // unknown starts (one carrying 99999s) are excluded and counted.
+    assert_eq!(report["durations"]["measured"].as_u64(), Some(2));
+    assert_eq!(report["durations"]["averageSeconds"].as_f64(), Some(1200.0));
+    assert_eq!(
+        report["durations"]["excludedUnknownStarts"].as_u64(),
+        Some(4)
+    );
+    assert_eq!(report["discordRequests"].as_u64(), Some(0));
+
+    // A wider threshold swallows both silences; the unknown starts stay
+    // counted, now all unattributed.
+    let wide = successful_stdout(&db.run(
+        &[
+            "voice-reconcile",
+            "--guild",
+            GUILD,
+            "--max-gap-minutes",
+            "400",
+        ],
+        &[],
+    ));
+    let wide: serde_json::Value = serde_json::from_str(&wide)?;
+    assert_eq!(
+        wide["blindWindows"]["maxGapMs"].as_i64(),
+        Some(400 * 60_000)
+    );
+    assert_eq!(wide["blindWindows"]["windows"], serde_json::json!([]));
+    assert_eq!(
+        wide["blindWindows"]["unattributedUnknownStarts"].as_u64(),
+        Some(4)
+    );
+    // A 4h30m threshold keeps only the 5h silence. The 20:40 end now belongs
+    // to it too (the latest window starting at or before an end claims it);
+    // the 09:30 end predates it and stays unattributed.
+    let narrow = successful_stdout(&db.run(
+        &[
+            "voice-reconcile",
+            "--guild",
+            GUILD,
+            "--max-gap-minutes",
+            "270",
+        ],
+        &[],
+    ));
+    let narrow: serde_json::Value = serde_json::from_str(&narrow)?;
+    let narrow_windows = narrow["blindWindows"]["windows"].as_array().unwrap();
+    assert_eq!(narrow_windows.len(), 1);
+    assert_eq!(narrow_windows[0]["start"], "2026-09-20T10:00:00.000Z");
+    assert_eq!(narrow_windows[0]["unknownStarts"].as_u64(), Some(3));
+    assert_eq!(
+        narrow["blindWindows"]["unattributedUnknownStarts"].as_u64(),
+        Some(1)
+    );
+
+    // Read-only: no ledger table appears and every table is byte-identical,
+    // the probe table included.
     let migrated: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = '_sqlx_migrations')",
     )
@@ -547,6 +848,20 @@ async fn usage_scenario(db: std::sync::Arc<TestDb>) -> TestResult {
     );
     assert_eq!(bad_days.status.code(), Some(2));
 
+    for bad_gap in ["0", "-5", "soon"] {
+        let out = db.run(
+            &[
+                "voice-reconcile",
+                "--guild",
+                GUILD,
+                "--max-gap-minutes",
+                bad_gap,
+            ],
+            &[],
+        );
+        assert_eq!(out.status.code(), Some(2), "--max-gap-minutes {bad_gap}");
+    }
+
     let bad_floor = db.run(
         &["leave-gap", "--guild", GUILD, "--floor", "not-a-date"],
         &[],
@@ -560,6 +875,14 @@ async fn usage_scenario(db: std::sync::Arc<TestDb>) -> TestResult {
     assert_eq!(seed_report["resolved"].as_array().unwrap().len(), 3);
     assert_eq!(seed_report["unresolvable"].as_array().unwrap().len(), 3);
     assert_eq!(seed_report["complete"], 2);
+    // The seeded write series has one 3.5h silence holding both unknown ends,
+    // and the average keeps m1 (1800s) and m5 (300s) only.
+    let seed_windows = seed_report["blindWindows"]["windows"].as_array().unwrap();
+    assert_eq!(seed_windows.len(), 1);
+    assert_eq!(seed_windows[0]["unknownStarts"], 2);
+    assert_eq!(seed_report["blindWindows"]["unattributedUnknownStarts"], 0);
+    assert_eq!(seed_report["durations"]["averageSeconds"], 1050.0);
+    assert_eq!(seed_report["durations"]["excludedUnknownStarts"], 2);
 
     let seed_gap = successful_stdout(&db.run(&["leave-gap", "--seed"], &[]));
     let seed_gap_report: serde_json::Value = serde_json::from_str(&seed_gap)?;
@@ -743,6 +1066,16 @@ async fn voice_reconcile_matches_legacy_fixtures_read_only() -> TestResult {
         return Ok(());
     }
     with_db("two_bot_test_report_voice", voice_scenario).await
+}
+
+#[tokio::test]
+async fn voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_read_only(
+) -> TestResult {
+    if std::env::var_os("TWO_TEST_DATABASE_URL").is_none() {
+        eprintln!("skipped: TWO_TEST_DATABASE_URL opt-in required for agent-testdb");
+        return Ok(());
+    }
+    with_db("two_bot_test_report_blind", blind_window_scenario).await
 }
 
 #[tokio::test]
