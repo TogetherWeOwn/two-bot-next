@@ -10,9 +10,19 @@ pub mod audit_mirror;
 pub mod automod;
 pub mod automod_activation;
 pub mod channel_access;
+#[cfg(feature = "db")]
+pub mod channel_moderation;
 pub mod command_registry;
+#[cfg(feature = "db")]
+pub mod custom_commands;
 pub mod executor;
 mod executor_metrics;
+
+#[cfg(feature = "db")]
+pub use channel_moderation::{
+    register_channel_handlers, ChannelModerationRuntime, ChannelReply, ChannelResponseError,
+    ChannelRuntimeError,
+};
 pub mod intents;
 pub mod interactions;
 pub mod internal_actions;
@@ -20,10 +30,19 @@ pub mod internal_actions;
 pub mod internal_channel_moderation;
 pub mod internal_events;
 #[cfg(feature = "db")]
+pub mod internal_member_moderation;
+#[cfg(feature = "db")]
 pub mod leveling_runtime;
+#[cfg(feature = "db")]
+pub mod lfg_interactions;
 mod message_safety;
+pub mod onboarding_config;
+pub mod onboarding_messages;
+pub mod onboarding_permissions;
 pub mod pipeline;
 pub mod ratelimit_guard;
+#[cfg(test)]
+mod test_clock;
 pub mod voice_rooms;
 
 #[cfg(feature = "db")]
@@ -44,6 +63,7 @@ pub use interactions::{
 };
 pub use internal_events::{event_status_name, scheduled_event_body, EventActionError, EventCall};
 pub use pipeline::{
-    build_cache, ChannelClassifier, InviteSource, MemPipeline, MessageEligibility,
-    NoClassification, NoInvites, Pipeline, PipelineSnapshots, ScriptedInvites,
+    build_cache, AuditEntryObserver, AuditLogObservation, ChannelClassifier, InviteSource,
+    JoinObservation, JoinObserver, MemPipeline, MessageEligibility, NoClassification, NoInvites,
+    Pipeline, PipelineSnapshots, ScriptedInvites,
 };

@@ -81,8 +81,24 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           environment: staging
-          wranglerVersion: "4.143.1"
+          wranglerVersion: "4.147.0"
           command: deploy --config ${{ env.ROLLOUT_DIR }}/staging-deploy.json --env staging
+      # Ordering (TOG-12939): ownership must not move to a deploy whose Wrangler
+      # receipt is not valid, fresh and pinned, so that part of the gate runs
+      # here, before the transfer. It reads only the local NDJSON (no network,
+      # no Cloudflare credentials). Readiness cannot be proven earlier: a fenced
+      # or non-owner singleton refuses /readyz, so the rollout/readiness half
+      # stays in `verify` after the transfer. A red `verify` therefore leaves
+      # staging owned by a Worker whose identity was already checked but whose
+      # rollout was not confirmed; the owner stays `active`, so the next push
+      # can hand off again, and the red run is the alert.
+      - name: Validate Wrangler deploy receipt before ownership transfer
+        run: |
+          set -euo pipefail
+          python3 ../scripts/staging_rollout.py receipt \
+            --receipt "$ROLLOUT_DIR/baseline.json" \
+            --output "$WRANGLER_OUTPUT_FILE_PATH" \
+            --evidence "$ROLLOUT_DIR/receipt.json"
       - name: Transfer staging ownership to the deployed version
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}

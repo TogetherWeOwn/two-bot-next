@@ -406,6 +406,19 @@ approved version transition.
   `LISTEN_ADDR=0.0.0.0:<port>` **for probes only** (`wrangler/src/index.ts:105`);
   a public Worker proxy would still cross a public boundary even with a guarded
   private Container listener.
+- **Staging-only ingress (TOG-12980, CISO conditions on TOG-12979):** the staging
+  Worker proxies exactly `POST /internal/actions` to a loopback receiver listener
+  (`127.0.0.1:8091`, set by the Worker, never an Operator value). It is dark
+  unless the staging-only var `INTERNAL_ACTIONS_INGRESS` and the Operator secret
+  `TWO_INTERNAL_ACTIONS` are both `1`; `scripts/check-env-bindings.py` denies the
+  var in production. The Worker bounds method, path, query, content type,
+  2 MiB body, timeouts, header allowlist, per-IP and in-flight caps before the
+  Container is touched, forwards bytes unchanged inside the ownership fence, and
+  never relays Container error text or starts the Container. Authentication is
+  still the receiver's v1 HMAC and durable nonce burn. Caps are per isolate
+  (the residual in F7 above). Whether the sidecar reaches a loopback second
+  port is proven by the first staging enable; see
+  [the receiver doc](internal-actions-receiver.md#staging-ingress-default-dark).
 
 ## Rejection logging and secret minimization
 

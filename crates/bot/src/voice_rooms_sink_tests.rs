@@ -10,14 +10,68 @@ impl RoomPersistence for Arc<Store> {
     async fn rooms(&self, guild: u64) -> Result<Vec<VoiceRoom>, StoreError> {
         self.as_ref().rooms(guild).await
     }
+    async fn access_controls(&self, guild: u64) -> Result<AccessControls, StoreError> {
+        self.as_ref().access_controls(guild).await
+    }
+    async fn save_access_controls(
+        &self,
+        guild: u64,
+        controls: &AccessControls,
+    ) -> Result<(), StoreError> {
+        self.as_ref().save_access_controls(guild, controls).await
+    }
+    async fn logging_settings(&self, guild: u64) -> Result<LoggingSettings, StoreError> {
+        self.as_ref().logging_settings(guild).await
+    }
+    async fn save_logging_settings(
+        &self,
+        guild: u64,
+        settings: &LoggingSettings,
+    ) -> Result<(), StoreError> {
+        self.as_ref().save_logging_settings(guild, settings).await
+    }
     async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), StoreError> {
         self.as_ref().add_creator(creator).await
+    }
+    async fn creator_for(
+        &self,
+        guild: u64,
+        channel: u64,
+    ) -> Result<Option<CreatorChannel>, StoreError> {
+        self.as_ref().creator_for(guild, channel).await
     }
     async fn persist(&self, room: &VoiceRoom) -> Result<(), StoreError> {
         self.as_ref().persist(room).await
     }
+    async fn update_ownership(&self, room: &VoiceRoom) -> Result<bool, StoreError> {
+        self.as_ref().update_ownership(room).await
+    }
     async fn forget(&self, guild: u64, channel: u64) -> Result<(), StoreError> {
         self.as_ref().forget(guild, channel).await
+    }
+    async fn config_snapshot(&self, guild: u64) -> Result<VoiceConfiguration, StoreError> {
+        self.as_ref().config_snapshot(guild).await
+    }
+    async fn config_apply(
+        &self,
+        guild: u64,
+        config: &VoiceConfiguration,
+    ) -> Result<(), StoreError> {
+        self.as_ref().config_apply(guild, config).await
+    }
+
+    async fn companions(&self, guild: u64) -> Result<Vec<TextCompanion>, StoreError> {
+        self.as_ref().companions(guild).await
+    }
+    async fn add_companion(&self, companion: &TextCompanion) -> Result<bool, StoreError> {
+        self.as_ref().add_companion(companion).await
+    }
+    async fn remove_companion(
+        &self,
+        guild: u64,
+        room: u64,
+    ) -> Result<Option<TextCompanion>, StoreError> {
+        self.as_ref().remove_companion(guild, room).await
     }
 }
 
@@ -69,6 +123,22 @@ impl RoomWrites for GatedHttp {
     ) -> Result<(), RoomHttpError> {
         self.http.move_member(guild, member, channel, guard).await
     }
+    async fn disconnect(
+        &self,
+        guild: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.http.disconnect(guild, member, guard).await
+    }
+    async fn deny_connect(
+        &self,
+        channel: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.http.deny_connect(channel, member, guard).await
+    }
     async fn delete(&self, channel: u64, guard: WriteGuard) -> Result<(), RoomHttpError> {
         if let Some(gate) = &self.delete {
             gate.wait().await;
@@ -77,6 +147,42 @@ impl RoomWrites for GatedHttp {
     }
     async fn rename(&self, channel: u64, name: &str) -> Result<(), RoomHttpError> {
         self.http.rename(channel, name).await
+    }
+    async fn download_attachment(
+        &self,
+        url: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RoomHttpError> {
+        self.http.download_attachment(url, max_bytes).await
+    }
+
+    async fn create_companion(
+        &self,
+        plan: &TextChannelPlan,
+        bot_id: Snowflake,
+        guard: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        self.http.create_companion(plan, bot_id, guard).await
+    }
+    async fn grant_companion_view(
+        &self,
+        text_channel_id: Snowflake,
+        member_id: Snowflake,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.http
+            .grant_companion_view(text_channel_id, member_id, guard)
+            .await
+    }
+    async fn revoke_companion_view(
+        &self,
+        text_channel_id: Snowflake,
+        member_id: Snowflake,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.http
+            .revoke_companion_view(text_channel_id, member_id, guard)
+            .await
     }
 }
 

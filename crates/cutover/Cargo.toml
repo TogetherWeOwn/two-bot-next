@@ -101,3 +101,11 @@ path = "src/bin/reengagement_list.rs"
 [[bin]]
 name = "rollback-delta"
 path = "src/bin/rollback_delta.rs"
+
+[[bin]]
+name = "report"
+path = "src/bin/report.rs"
+
+[[bin]]
+name = "ghost-cleanup"
+path = "src/bin/ghost_cleanup.rs"

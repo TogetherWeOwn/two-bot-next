@@ -418,10 +418,12 @@ impl HyperTransport {
         let url = self.url(request.path());
         let mut builder = hyper::Request::builder().method(method).uri(url);
         if let Some(headers) = builder.headers_mut() {
-            let mut authorization = hyper::header::HeaderValue::from_str(self.token.expose())
-                .map_err(|_| "bad token header".to_owned())?;
-            authorization.set_sensitive(true);
-            headers.insert(hyper::header::AUTHORIZATION, authorization);
+            if request.use_authorization_token() {
+                let mut authorization = hyper::header::HeaderValue::from_str(self.token.expose())
+                    .map_err(|_| "bad token header".to_owned())?;
+                authorization.set_sensitive(true);
+                headers.insert(hyper::header::AUTHORIZATION, authorization);
+            }
             if let Some(bytes) = request.body() {
                 headers.insert(
                     hyper::header::CONTENT_LENGTH,
@@ -678,6 +680,20 @@ pub struct ActionExecutor {
     inner: Arc<ExecutorInner>,
 }
 
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PacingLane {
+    Shared,
+    Kick,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct PacingAdmission {
+    pub lane: PacingLane,
+    pub at: tokio::time::Instant,
+}
+
 struct ExecutorInner {
     transport: HyperTransport,
     /// Twilight client kept as the request factory (builders + audit
@@ -687,8 +703,10 @@ struct ExecutorInner {
     pace_interval: Duration,
     kick_interval: Duration,
     moderation_timeout: Duration,
-    pace_last_at: tokio::sync::Mutex<std::time::Instant>,
-    kick_last_at: tokio::sync::Mutex<std::time::Instant>,
+    pace_last_at: tokio::sync::Mutex<tokio::time::Instant>,
+    kick_last_at: tokio::sync::Mutex<tokio::time::Instant>,
+    #[cfg(test)]
+    pacing_probe: Option<tokio::sync::mpsc::UnboundedSender<PacingAdmission>>,
     requests: std::sync::atomic::AtomicU64,
 }
 
@@ -777,11 +795,13 @@ impl ActionExecutor {
                 kick_interval: Duration::from_millis(KICK_INTERVAL_MS),
                 moderation_timeout: Duration::from_millis(MODERATION_TIMEOUT_MS),
                 pace_last_at: tokio::sync::Mutex::new(
-                    std::time::Instant::now() - Duration::from_secs(60),
+                    tokio::time::Instant::now() - Duration::from_secs(60),
                 ),
                 kick_last_at: tokio::sync::Mutex::new(
-                    std::time::Instant::now() - Duration::from_secs(60),
+                    tokio::time::Instant::now() - Duration::from_secs(60),
                 ),
+                #[cfg(test)]
+                pacing_probe: None,
                 requests: std::sync::atomic::AtomicU64::new(0),
             }),
         })
@@ -793,6 +813,35 @@ impl ActionExecutor {
         self.inner
             .requests
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_pacing_probe(
+        token: String,
+        proxy_url: Option<String>,
+    ) -> Result<(Self, tokio::sync::mpsc::UnboundedReceiver<PacingAdmission>), String> {
+        let mut executor = Self::with_proxy(token, proxy_url)?;
+        let (probe, admissions) = tokio::sync::mpsc::unbounded_channel();
+        Arc::get_mut(&mut executor.inner).unwrap().pacing_probe = Some(probe);
+        Ok((executor, admissions))
+    }
+
+    pub(crate) fn stamp_paced_lane(&self, last: &mut tokio::time::Instant, _kick_lane: bool) {
+        let at = tokio::time::Instant::now();
+        *last = at;
+        // Emit only committed admission, synchronously under the lane lock.
+        // Reservation and refused late authorization are not admission.
+        #[cfg(test)]
+        if let Some(probe) = &self.inner.pacing_probe {
+            let _ = probe.send(PacingAdmission {
+                lane: if _kick_lane {
+                    PacingLane::Kick
+                } else {
+                    PacingLane::Shared
+                },
+                at,
+            });
+        }
     }
 
     async fn admit(&self, request: &Request, lane: Option<bool>) -> Result<(), GuardError> {
@@ -811,13 +860,12 @@ impl ActionExecutor {
         let mut last = lock.lock().await;
         guard.admit(essential).await?;
         let earliest = *last + interval;
-        let now = std::time::Instant::now();
-        if earliest > now {
-            tokio::time::sleep(earliest - now).await;
+        if earliest > tokio::time::Instant::now() {
+            tokio::time::sleep_until(earliest).await;
         }
         // A global response/breaker may arrive during the lane sleep.
         guard.admit(essential).await?;
-        *last = std::time::Instant::now();
+        self.stamp_paced_lane(&mut last, kick_lane);
         Ok(())
     }
 
@@ -826,7 +874,7 @@ impl ActionExecutor {
     pub(crate) async fn paced_lane(
         &self,
         kick_lane: bool,
-    ) -> Result<tokio::sync::MutexGuard<'_, std::time::Instant>, GuardError> {
+    ) -> Result<tokio::sync::MutexGuard<'_, tokio::time::Instant>, GuardError> {
         let (lock, interval) = if kick_lane {
             (&self.inner.kick_last_at, self.inner.kick_interval)
         } else {
@@ -835,9 +883,8 @@ impl ActionExecutor {
         let last = lock.lock().await;
         self.inner.transport.guard.admit(false).await?;
         let earliest = *last + interval;
-        let now = std::time::Instant::now();
-        if earliest > now {
-            tokio::time::sleep(earliest - now).await;
+        if earliest > tokio::time::Instant::now() {
+            tokio::time::sleep_until(earliest).await;
         }
         self.inner.transport.guard.admit(false).await?;
         Ok(last)
@@ -1328,7 +1375,7 @@ impl ActionExecutor {
             // A deadline covers both headers and body, not just connection
             // setup. A timeout is ambiguous: retry only after fresh safety
             // authorization, and report failure if the bounded budget runs out.
-            *lane = std::time::Instant::now();
+            self.stamp_paced_lane(&mut lane, true);
             let exchange =
                 tokio::time::timeout(self.inner.moderation_timeout, self.send_admitted(&request))
                     .await
@@ -1453,6 +1500,13 @@ impl ActionExecutor {
         Ok(self.get_json_observed(path).await?.map(|(data, _)| data))
     }
 
+    /// Permission evidence must distinguish denied/absent (403/404) from an
+    /// unavailable or unreadable response. Keep the shared paced read policy,
+    /// but never let a transient failure look like a proven delivery skip.
+    pub async fn get_json_checked(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
+        self.read_json(path, true).await
+    }
+
     /// Membership evidence is bounded by the successful attempt's request
     /// start, after pacing, never by headers/body completion or an earlier
     /// failed attempt. Ordinary `get_json` keeps its data-only contract.
@@ -1500,6 +1554,69 @@ impl ActionExecutor {
                     attempt += 1;
                 }
                 _ => return Ok(None),
+            }
+        }
+    }
+
+    async fn read_json(
+        &self,
+        path: &str,
+        checked: bool,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let route = raw_get_route(path)?;
+        let mut attempt: u32 = 0;
+        loop {
+            let request = Request::from_route(&route);
+            // Guard refusals are terminal; pacing completes before the send.
+            self.admit(&request, Some(false))
+                .await
+                .map_err(|error| error.to_string())?;
+            let (res, global) = match self.send_admitted(&request).await {
+                Ok(r) => r,
+                Err(detail) => {
+                    if attempt >= MAX_HTTP_TRIES - 1 {
+                        return Err(detail.to_string());
+                    }
+                    tokio::time::sleep(Duration::from_millis(backoff_ms(attempt))).await;
+                    attempt += 1;
+                    continue;
+                }
+            };
+            match res.status {
+                200..=299 => {
+                    let value = serde_json::from_slice(&res.body);
+                    return if checked {
+                        value
+                            .map(Some)
+                            .map_err(|_| "unreadable Discord evidence".to_owned())
+                    } else {
+                        Ok(value.ok())
+                    };
+                }
+                429 => {
+                    if !global {
+                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                    }
+                }
+                403 | 404 => return Ok(None),
+                500..=599 => {
+                    if attempt >= MAX_HTTP_TRIES - 1 {
+                        return if checked {
+                            Err("Discord evidence unavailable".to_owned())
+                        } else {
+                            Ok(None)
+                        };
+                    }
+                    tokio::time::sleep(Duration::from_millis(backoff_ms(attempt))).await;
+                    attempt += 1;
+                }
+                _ => {
+                    return if checked {
+                        Err("Discord evidence unavailable".to_owned())
+                    } else {
+                        Ok(None)
+                    }
+                }
             }
         }
     }
@@ -1959,6 +2076,154 @@ impl ActionExecutor {
             .await
     }
 
+    /// Preserve the exact legacy feed nonce, even when all its hex digits are
+    /// decimal or it has leading zeroes. Never infer a numeric wire identity.
+    /// Uses the same paced, single-attempt transport and mention suppression.
+    pub async fn post_message_with_nonce(
+        &self,
+        channel_id: &str,
+        content: &str,
+        nonce: &str,
+    ) -> Result<String, DiscordError> {
+        self.send_message(
+            channel_id,
+            content,
+            Some(serde_json::Value::from(nonce)),
+            false,
+        )
+        .await
+    }
+
+    /// Post a rendered feature message through the shared request factory.
+    pub async fn post_message_with_components(
+        &self,
+        channel_id: &str,
+        content: &str,
+        components: &[serde_json::Value],
+        nonce: &str,
+    ) -> Result<String, DiscordError> {
+        self.send_message_components(
+            channel_id,
+            content,
+            Some(nonce.into()),
+            Some(components),
+            false,
+        )
+        .await
+    }
+
+    /// Refresh content and selects. Edits must suppress mentions independently of POST.
+    pub async fn edit_message_with_components(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        content: &str,
+        components: &[serde_json::Value],
+    ) -> Result<(), DiscordError> {
+        if utf16_len(content) > MAX_MESSAGE_CHARS {
+            return Err(DiscordError::Rejected(
+                "message exceeds Discord's ceiling".into(),
+            ));
+        }
+        let channel: Id<ChannelMarker> = snowflake(channel_id)?;
+        let message: Id<MessageMarker> = snowflake(message_id)?;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "content": content, "components": components, "allowed_mentions": {"parse": []}
+        }))
+        .map_err(|e| DiscordError::Rejected(format!("build message body: {e}")))?;
+        let req = Request::builder(&Route::UpdateMessage {
+            channel_id: channel.get(),
+            message_id: message.get(),
+        })
+        .body(body)
+        .build()
+        .map_err(|e| DiscordError::Rejected(format!("build: {e}")))?;
+        self.call_once_raw_paced(req, &[200]).await?;
+        Ok(())
+    }
+
+    /// Bounded nonce reconciliation. An unreadable/denied history is NOT an empty history.
+    /// Only messages from this bot in the target channel can establish acceptance.
+    pub async fn recover_message_by_nonce(
+        &self,
+        channel_id: &str,
+        nonce: &str,
+        bot_user_id: u64,
+    ) -> Result<Option<String>, DiscordError> {
+        // Without the bot's identity no author check can prove acceptance.
+        if bot_user_id == 0 {
+            return Err(DiscordError::Unavailable("bot identity unknown".into()));
+        }
+        let mut before = None;
+        for _ in 0..3 {
+            let path = match &before {
+                Some(id) => format!("/channels/{channel_id}/messages?limit=100&before={id}"),
+                None => format!("/channels/{channel_id}/messages?limit=100"),
+            };
+            let route = raw_get_route(&path).map_err(DiscordError::Rejected)?;
+            let res = self
+                .call_once_raw_paced(Request::from_route(&route), &[200])
+                .await?;
+            let rows: Vec<serde_json::Value> = serde_json::from_slice(&res.body)
+                .map_err(|_| DiscordError::Unavailable("unreadable message history".into()))?;
+            for row in &rows {
+                if row["nonce"].as_str() == Some(nonce)
+                    && row["author"]["id"].as_str() == Some(&bot_user_id.to_string())
+                    && row["channel_id"].as_str() == Some(channel_id)
+                {
+                    let id = row["id"].as_str().ok_or_else(|| {
+                        DiscordError::Unavailable("accepted message missing id".into())
+                    })?;
+                    let _: Id<MessageMarker> = snowflake(id)?;
+                    return Ok(Some(id.to_owned()));
+                }
+            }
+            if rows.len() < 100 {
+                return Ok(None);
+            }
+            let last = rows
+                .last()
+                .and_then(|r| r["id"].as_str())
+                .ok_or_else(|| DiscordError::Unavailable("unreadable history cursor".into()))?;
+            let _: Id<MessageMarker> = snowflake(last)?;
+            if before.as_deref() == Some(last) {
+                return Err(DiscordError::Unavailable(
+                    "non-progressing history cursor".into(),
+                ));
+            }
+            before = Some(last.to_owned());
+        }
+        Err(DiscordError::Unavailable(
+            "nonce recovery history bound reached".into(),
+        ))
+    }
+
+    /// Complete an already-deferred ephemeral reply through the same executor.
+    pub async fn finish_interaction(
+        &self,
+        application_id: u64,
+        token: &str,
+        content: &str,
+    ) -> Result<(), DiscordError> {
+        let application = Id::<ApplicationMarker>::new_checked(application_id)
+            .ok_or_else(|| DiscordError::Rejected("bad application id".into()))?;
+        let interaction = self.inner.factory.interaction(application);
+        let mentions = AllowedMentions {
+            parse: vec![],
+            replied_user: false,
+            roles: vec![],
+            users: vec![],
+        };
+        let req = Self::request_of(
+            interaction
+                .update_response(token)
+                .content(Some(content))
+                .allowed_mentions(Some(&mentions)),
+        )?;
+        self.call_once_raw(req, &[200]).await?;
+        Ok(())
+    }
+
     /// Raw message send shared by [`Self::post_message`] and the audit
     /// string-nonce path: the pinned Twilight `CreateMessage` builder only
     /// models a `u64` nonce and never serializes `enforce_nonce`, so the body
@@ -1971,6 +2236,18 @@ impl ActionExecutor {
         channel_id: &str,
         content: &str,
         nonce: Option<serde_json::Value>,
+        after_authorization: bool,
+    ) -> Result<String, DiscordError> {
+        self.send_message_components(channel_id, content, nonce, None, after_authorization)
+            .await
+    }
+
+    async fn send_message_components(
+        &self,
+        channel_id: &str,
+        content: &str,
+        nonce: Option<serde_json::Value>,
+        components: Option<&[serde_json::Value]>,
         after_authorization: bool,
     ) -> Result<String, DiscordError> {
         // Legacy ceiling is UTF-16 units (two-bot counts JS string length),
@@ -1995,6 +2272,9 @@ impl ActionExecutor {
             "content": content,
             "allowed_mentions": {"parse": []},
         });
+        if let Some(components) = components {
+            body["components"] = serde_json::json!(components);
+        }
         if let Some(n) = nonce {
             body["nonce"] = n;
             body["enforce_nonce"] = serde_json::Value::Bool(true);
@@ -2009,6 +2289,7 @@ impl ActionExecutor {
         .body(body_bytes)
         .build()
         .map_err(|e| DiscordError::Rejected(format!("build: {e}")))?;
+        let paced = components.is_some();
         let message_id = if after_authorization {
             self.inner.transport.guard.check_now(false)?;
             let (mut res, _) =
@@ -2025,12 +2306,132 @@ impl ActionExecutor {
             res.complete().await;
             id
         } else {
-            let mut res = self.call_once_raw(req, &[200, 201]).await?;
+            // Feature posts with selects take the paced lane; the plain
+            // `post_message` path keeps main's unpaced single attempt.
+            let mut res = if paced {
+                self.call_once_raw_paced(req, &[200, 201]).await?
+            } else {
+                self.call_once_raw(req, &[200, 201]).await?
+            };
             let id = mutation_receipt_id(&res.body)?;
             res.complete().await;
             id
         };
         Ok(message_id)
+    }
+
+    // Twilight omits empty roles/users lists when serializing AllowedMentions.
+    // Onboarding's wire contract requires all three lists explicitly present.
+    // Keep the validated builder's method/path/auth (notably webhook auth=false).
+    fn explicit_mentions(
+        req: Request,
+        mentions: &AllowedMentions,
+    ) -> Result<Request, DiscordError> {
+        let mut body: serde_json::Value = serde_json::from_slice(req.body().unwrap_or_default())
+            .map_err(|_| DiscordError::Rejected("invalid message body".into()))?;
+        body["allowed_mentions"] = serde_json::json!({
+            "parse": mentions.parse,
+            "users": mentions.users,
+            "roles": mentions.roles,
+            "replied_user": mentions.replied_user,
+        });
+        let bytes = serde_json::to_vec(&body)
+            .map_err(|_| DiscordError::Rejected("invalid mention policy".into()))?;
+        let mut builder =
+            twilight_http::request::RequestBuilder::raw(req.method(), req.path().to_owned())
+                .body(bytes)
+                .use_authorization_token(req.use_authorization_token());
+        if let Some(headers) = req.headers() {
+            builder = builder.headers(
+                headers
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
+        builder
+            .build()
+            .map_err(|_| DiscordError::Rejected("invalid message request".into()))
+    }
+
+    /// Post a component-bearing message through the shared bounded transport.
+    /// Empty components are omitted (anchor welcomes must attach nothing).
+    /// No automatic retry: send-then-record callers must not hide ambiguity.
+    /// Only the domain-authorized welcome recipient may notify; arbitrary parse,
+    /// role, multi-user and reply policies cannot enter this boundary.
+    /// Source: <https://docs.rs/twilight-http/0.17.1/twilight_http/request/channel/message/struct.CreateMessage.html>
+    pub async fn post_channel_message(
+        &self,
+        channel_id: &str,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+        policy: two_bot_core::onboarding::MentionPolicy,
+    ) -> Result<String, DiscordError> {
+        if utf16_len(content) > MAX_MESSAGE_CHARS {
+            return Err(DiscordError::Rejected(
+                "message exceeds UTF-16 ceiling".into(),
+            ));
+        }
+        if matches!(policy, two_bot_core::onboarding::MentionPolicy::Member(0)) {
+            return Err(DiscordError::Rejected("bad welcome recipient".into()));
+        }
+        let content = two_bot_core::message_safety::content(content);
+        crate::message_safety::validate_create(&serde_json::json!({
+            "content": content,
+            "components": components,
+        }))?;
+        let mentions = crate::onboarding_messages::allowed_mentions(policy);
+        let mut builder = self
+            .inner
+            .factory
+            .create_message(snowflake(channel_id)?)
+            .allowed_mentions(Some(&mentions));
+        if !content.is_empty() {
+            builder = builder.content(&content);
+        }
+        if !components.is_empty() {
+            builder = builder.components(components);
+        }
+        let req = Self::explicit_mentions(Self::request_of(builder)?, &mentions)?;
+        // An accepted mutation still needs its validated id receipt before the
+        // durable lane reopens; an unreadable receipt is uncertain, never an
+        // empty successful id that a caller would record as delivered.
+        let mut res = self.call_once_raw(req, &[200, 201]).await?;
+        let id = mutation_receipt_id(&res.body)?;
+        res.complete().await;
+        Ok(id)
+    }
+
+    /// Add or remove one member role, preserving all unrelated roles. The
+    /// shared lane owns pacing; mutations are bounded and never auto-retried.
+    pub async fn set_member_role(
+        &self,
+        guild_id: &str,
+        member_id: &str,
+        role_id: &str,
+        present: bool,
+        reason: &str,
+    ) -> Result<(), DiscordError> {
+        let guild = snowflake(guild_id)?;
+        let member = snowflake(member_id)?;
+        let role = snowflake(role_id)?;
+        let req = if present {
+            Self::request_of(
+                self.inner
+                    .factory
+                    .add_guild_member_role(guild, member, role)
+                    .reason(reason),
+            )?
+        } else {
+            Self::request_of(
+                self.inner
+                    .factory
+                    .remove_guild_member_role(guild, member, role)
+                    .reason(reason),
+            )?
+        };
+        let mut res = self.call_once_raw_paced(req, &[200, 204]).await?;
+        res.complete().await;
+        Ok(())
     }
 
     /// Carry out one [`ChannelCall`].
@@ -2188,22 +2589,53 @@ impl ActionExecutor {
         Ok(id)
     }
 
-    /// Resolve the authenticated bot's application for a resumed startup
-    /// without READY. One bounded, paced read; no alternate client or guessed id.
+    /// Resolve the authenticated bot's application via `GET /applications/@me`,
+    /// at bootstrap and for a resumed startup without READY: one paced attempt
+    /// with the shared 5 s abort and only 200 accepted. Missing or invalid
+    /// metadata refuses with a fixed error, never response content; no
+    /// alternate client or guessed id.
+    /// https://docs.rs/twilight-http/0.17.1/twilight_http/request/struct.GetUserApplicationInfo.html
     pub async fn current_application_id(&self) -> Result<u64, DiscordError> {
         let req = Self::request_of(self.inner.factory.current_user_application())?;
-        let (res, _) = self.send_with_timeout(&req, Some(false)).await?;
-        match res.status {
-            200..=299 => {
-                let body: serde_json::Value = serde_json::from_slice(&res.body).map_err(|_| {
-                    DiscordError::Unavailable("invalid application response".to_owned())
-                })?;
-                let id: Id<ApplicationMarker> = serde_json::from_value(body["id"].clone())
-                    .map_err(|_| DiscordError::Unavailable("invalid application id".to_owned()))?;
-                Ok(id.get())
-            }
-            _ => Err(throw_for_status(&res)),
-        }
+        let doc = self.bootstrap_doc(req).await?;
+        doc.as_ref()
+            .and_then(|doc| doc.get("id"))
+            .and_then(|id| id.as_str())
+            .and_then(|id| id.parse::<u64>().ok())
+            .filter(|id| *id != 0)
+            .ok_or_else(|| DiscordError::Rejected("invalid application metadata".to_owned()))
+    }
+
+    /// Bootstrap guild context via `GET /guilds/{id}`: one attempt with the
+    /// shared 5 s abort and only 200 accepted. Requires the requested nonzero
+    /// identity and a nonblank name; malformed metadata never reaches errors.
+    /// https://docs.rs/twilight-http/0.17.1/twilight_http/request/guild/struct.GetGuild.html
+    pub async fn guild_name(&self, guild_id: u64) -> Result<String, DiscordError> {
+        let guild = Id::<GuildMarker>::new_checked(guild_id)
+            .ok_or_else(|| DiscordError::Rejected("bad guild id".to_owned()))?;
+        let req = Self::request_of(self.inner.factory.guild(guild))?;
+        let doc = self.bootstrap_doc(req).await?;
+        doc.as_ref()
+            .filter(|doc| {
+                doc.get("id")
+                    .and_then(|id| id.as_str())
+                    .and_then(|id| id.parse::<u64>().ok())
+                    == Some(guild.get())
+            })
+            .and_then(|doc| doc.get("name"))
+            .and_then(|name| name.as_str())
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| DiscordError::Rejected("invalid guild metadata".to_owned()))
+    }
+
+    /// One paced, bounded bootstrap read: only 200 accepted; an unreadable
+    /// body is `None` so callers can refuse with their own fixed error.
+    async fn bootstrap_doc(&self, req: Request) -> Result<Option<serde_json::Value>, DiscordError> {
+        let mut res = self.call_once_raw_paced(req, &[200]).await?;
+        let doc = serde_json::from_slice(&res.body).ok();
+        res.complete().await;
+        Ok(doc)
     }
 
     /// Publish the router's full guild command set in one send
@@ -2240,16 +2672,24 @@ impl ActionExecutor {
                     .map_err(|_| DiscordError::Timeout)??;
             match res.status {
                 200 => {
-                    let published: Vec<twilight_model::application::command::Command> =
-                        serde_json::from_slice(&res.body).map_err(|_| {
-                            DiscordError::Unavailable("invalid command registry receipt".to_owned())
-                        })?;
+                    let parsed: Result<
+                        Vec<twilight_model::application::command::Command>,
+                        DiscordError,
+                    > = serde_json::from_slice(&res.body).map_err(|_| {
+                        DiscordError::Unavailable("invalid command registry receipt".to_owned())
+                    });
+                    // A 200 is definite: Discord stored the full replacement.
+                    // Release durable admission before validating the receipt
+                    // so an unreadable or short body cannot poison the next
+                    // boot's bootstrap (alive restart held the lane and failed
+                    // with custom_commands_init_failed).
+                    res.complete().await;
+                    let published = parsed?;
                     if published.len() != commands.len() {
                         return Err(DiscordError::Unavailable(
                             "incomplete command registry receipt".to_owned(),
                         ));
                     }
-                    res.complete().await;
                     return Ok(());
                 }
                 429 => {
@@ -2396,16 +2836,17 @@ impl ActionExecutor {
 
     /// Complete an acknowledged interaction by editing its original response.
     /// Like the initial callback, this bypasses the paced moderation lane.
+    /// Single attempt with bounded errors: never repeat an accepted effect after
+    /// an edit failure or expose the interaction token in a returned error.
+    /// The original callback decides ephemerality; edits retain it.
     pub async fn edit_interaction_response(
         &self,
         application_id: u64,
         interaction_token: &str,
         content: &str,
     ) -> Result<(), DiscordError> {
-        let application =
-            Id::<ApplicationMarker>::new_checked(application_id).ok_or_else(|| {
-                DiscordError::Rejected(format!("bad application id: {application_id}"))
-            })?;
+        let application = Id::<ApplicationMarker>::new_checked(application_id)
+            .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
         let content = two_bot_core::message_safety::content(content);
         let mentions = AllowedMentions::default();
         let req = Self::request_of(
@@ -2416,6 +2857,7 @@ impl ActionExecutor {
                 .content(Some(&content))
                 .allowed_mentions(Some(&mentions)),
         )?;
+        let req = Self::explicit_mentions(req, &mentions)?;
         let mut res = self.call_once_raw(req, &[200]).await?;
         mutation_receipt_id(&res.body)?;
         res.complete().await;
@@ -2676,14 +3118,14 @@ fn format_iso_secs(epoch_secs: u64) -> String {
 /// (finding 2). Route Display renders the query string twilight's way so the
 /// mock sees byte-identical paths.
 fn raw_get_route(path: &str) -> Result<Route<'static>, String> {
+    if path == "/users/@me" {
+        return Ok(Route::GetCurrentUser);
+    }
     let err = || format!("unsupported GET path: {path}");
     let (base, query) = match path.split_once('?') {
         Some((b, q)) => (b, q),
         None => (path, ""),
     };
-    if base == "/users/@me" && query.is_empty() {
-        return Ok(Route::GetCurrentUser);
-    }
     // Route borrows nothing here (u64/bool fields); the 'static bound is
     // satisfied because no borrowed variant is constructed.
     if let Some(id) = base.strip_prefix("/guilds/") {
@@ -2839,6 +3281,23 @@ mod tests {
 
     fn never_send_admission(token: &str) -> Arc<dyn SendAdmission> {
         Arc::new(NeverSendAdmission(TokenKey::for_bot_token(token).unwrap()))
+    }
+
+    #[test]
+    fn current_user_read_accepts_only_the_exact_route() {
+        assert!(matches!(
+            raw_get_route("/users/@me").unwrap(),
+            Route::GetCurrentUser
+        ));
+        for path in [
+            "/users/@me?",
+            "/users/@me?limit=100",
+            "/users/@me/",
+            "/users/5555",
+            "https://discord.com/api/v10/users/@me",
+        ] {
+            assert!(raw_get_route(path).is_err());
+        }
     }
 
     #[tokio::test]

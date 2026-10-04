@@ -252,6 +252,19 @@ class SupplyChainTests(unittest.TestCase):
         self.assertNotIn("inputs.ref", verify)
         self.assertIn("sbom-partial", image)
         self.assertIn("sbom-partial", verify)
+        # The internal handoff artifact is per-attempt (same
+        # run_id/run_attempt scheme as the scanned image tag): v4 artifacts
+        # are immutable and same-named uploads coexist, so a bare-name
+        # download on a `rerun failed jobs` retry can resolve to the previous
+        # attempt's BOMs/image and fail validation (or validate stale BOMs).
+        attempt_handoff = "name: sbom-partial-${{ github.run_id }}-${{ github.run_attempt }}"
+        self.assertIn(attempt_handoff, image)
+        self.assertIn(attempt_handoff, verify)
+        for line in supply.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            self.assertNotEqual(line.strip(), "name: sbom-partial",
+                                "bare sbom-partial artifact name reintroduces cross-attempt reuse on reruns")
         # The verify job reads the exact inputs.ref lockfile handed over in
         # the artifact, never its own checkout's lockfile; the handoff copy
         # is removed before checksums so release assets stay pinned.
@@ -286,20 +299,29 @@ class SupplyChainTests(unittest.TestCase):
     def test_required_check_rejects_every_non_success_scan_result(self):
         workflow = (ROOT / ".github/workflows/check.yml").read_text()
         job = workflow.split("\n  check:\n", 1)[1]
-        # Merged with main's dependency-aware selector (#282): the
-        # self-role/parity gates are selector-aware, but the supply-chain
-        # gate stays unconditional — no job-inputs exception may hide a
-        # failed, skipped or cancelled scan.
+        # CI standard rule 6 (TOG-14881): the supply-chain gate is
+        # selector-aware like the self-role/parity gates -- it rejects a
+        # failed, skipped or cancelled scan when `supply` was selected, and
+        # only tolerates the skip the selector itself produced (a `skipped`
+        # result with `supply == 'false'`). No other exception may hide a
+        # scan result.
         self.assertIn("needs: [self-role-store, supply-chain, parity-docs, job-inputs]", job)
         self.assertIn("if: ${{ always() }}", job)
         guard = re.search(r"- name: require supply-chain gate to pass\n\s+if: ([^\n]*)\n\s+run: exit 1", job)
         self.assertIsNotNone(guard)
-        self.assertEqual(guard[1], "needs.supply-chain.result != 'success'")
-        for scan in ["success", "failure", "skipped", "cancelled"]:
-            with self.subTest(scan=scan):
-                condition = guard[1].replace("needs.supply-chain.result", f"'{scan}'")
+        self.assertEqual(guard[1], "needs.supply-chain.result != 'success' "
+                                   "&& needs.job-inputs.outputs.supply != 'false'")
+        for scan, selected, fail in [
+                ("success", "true", False), ("failure", "true", True),
+                ("skipped", "true", True), ("cancelled", "true", True),
+                ("success", "false", False), ("failure", "false", False),
+                ("skipped", "false", False), ("cancelled", "false", False)]:
+            with self.subTest(scan=scan, selected=selected):
+                condition = guard[1].replace(
+                    "needs.supply-chain.result", f"'{scan}'").replace(
+                    "needs.job-inputs.outputs.supply", f"'{selected}'")
                 result = subprocess.run(["bash", "-c", f"if [[ {condition} ]]; then exit 1; fi"])
-                self.assertEqual(result.returncode, 0 if scan == "success" else 1)
+                self.assertEqual(result.returncode, 1 if fail else 0)
 
     def test_shared_gate_and_dry_run_publication_guards(self):
         supply = (ROOT / ".github/workflows/sbom.yml").read_text()

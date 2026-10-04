@@ -34,6 +34,39 @@ pub enum DetailLevel {
     Full,
 }
 
+impl DetailLevel {
+    /// Canonical lowercase text, the inverse of [`parse_detail_level`].
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Brief => "brief",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// A guild's saved `/logging` choices. An unconfigured guild gets the
+/// default: brief notices through the fallback chain, no mention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoggingSettings {
+    pub level: DetailLevel,
+    /// Preferred notice channel, tried before the fallback chain.
+    pub channel_id: Option<Snowflake>,
+    /// Role mentioned on error notices. A role, never a member.
+    pub mention_role_id: Option<Snowflake>,
+}
+
+impl Default for LoggingSettings {
+    fn default() -> Self {
+        Self {
+            level: DetailLevel::Brief,
+            channel_id: None,
+            mention_role_id: None,
+        }
+    }
+}
+
 /// Typed `/logging` refusals. Unknown level text never falls back to a
 /// default: it fails closed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

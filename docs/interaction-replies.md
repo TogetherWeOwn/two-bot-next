@@ -56,8 +56,9 @@ message with error content.
 
 Every handler `Err` and unwind panic (both future construction and polling)
 logs `reference` and the internal error at ERROR level. The only error text
-sent to Discord is `Something went wrong (ref XXXXXXXX)`; the eight hex digits
-are random and contain no interaction token or user data. Transport failures
+sent to Discord is `Something went wrong (ref XXXXXXXX). Please try again — if
+it keeps happening, share this reference with a server admin.`; the eight hex
+digits are random and contain no interaction token or user data. Transport failures
 are returned to the caller, not falsely reported as successful replies.
 Failed/uncertain callbacks are not retried: Discord may already have received
 the ACK. Failed progress edits preserve that known ACK and any replacement
@@ -69,11 +70,13 @@ No delivery guarantee is made while Discord is
 unavailable. Panic isolation needs `panic = "unwind"`, including the release
 profile; it cannot isolate process aborts or double panics in destructors.
 
-Unknown slash names, disabled/missing custom rows and unknown component/modal
-IDs inside the configured guild receive the same ephemeral
-`This interaction is no longer available.` reply. Guild fences, permissions,
-known disabled component gates, ping and autocomplete retain their existing
-behaviour. Routing does not authorize any feature side effects.
+Unknown slash names and disabled/missing custom rows inside the configured
+guild receive the ephemeral unknown-command reply (re-pick from `/`); unknown
+component/modal IDs receive the ephemeral expired-control reply (re-run the
+command for a fresh control). Permission denials name the Discord permission
+and who grants it; disabled features name the admin-only host-setting enable
+path. Guild fences, ping and autocomplete retain their existing behaviour.
+Routing does not authorize any feature side effects.
 
 Text replies cap content at 2000 Unicode scalars and suppress all mentions.
 The transport carries the selected interaction's IDs/token and deliberately
@@ -98,9 +101,10 @@ Read against `TogetherWeOwn/two-bot` main on 2026-09-30:
   must not conceal a wrong first reply. The new wire regression likewise
   asserts the first callback/edit and the exact selected token/original path.
 - Intentional improvements, not claims of legacy byte parity: deadline-driven
-  rather than unconditional defer; correlation-only generic errors; private
-  error followups for already-public ACKs; explicit replies for unknown IDs.
-  Feature-specific refusal texts remain unchanged.
+  rather than unconditional defer; correlation-only generic errors with a retry
+  hint; private error followups for already-public ACKs; split unknown-command
+  vs expired-control replies; actionable denial copy (Discord permission names,
+  who to ask, admin-only host-setting enable path).
 
 ## Evidence
 

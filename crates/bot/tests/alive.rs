@@ -205,13 +205,12 @@ struct MockDiscord {
 
 impl MockDiscord {
     async fn new() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let url = format!("ws://{addr}");
-        // Dedicated REST socket: the binary's website jobs share DISCORD_API_BASE,
-        // and a job request queued on the gateway listener would consume a boot
-        // accept slot and break resume. No `/api/v10` suffix — the executor
-        // appends `/api/v{version}/` to the origin itself.
+        let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        let url = format!("ws://{ws_addr}");
+        // Dedicated REST socket: onboarding identity and website jobs share
+        // DISCORD_API_BASE, never the gateway's two boot accept slots. No
+        // `/api/v10` suffix — the executor appends the version to this origin.
         let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = format!("http://{}", rest_listener.local_addr().unwrap());
         let (auth_tx, auth) = mpsc::channel(2);
@@ -219,7 +218,7 @@ impl MockDiscord {
         let resume_url = url.clone();
         let task = tokio::spawn(async move {
             for boot in 0..2 {
-                let (stream, _) = listener.accept().await.unwrap();
+                let (stream, _) = ws_listener.accept().await.unwrap();
                 let (_, mut ws) = ServerBuilder::new()
                     .accept(stream)
                     .await
@@ -336,16 +335,26 @@ async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<String>>>) {
                 .unwrap_or("")
                 .to_owned();
             recorded.lock().await.push(path.clone());
-            // The fixture grounds no raid windows, so only the events mirror
-            // reads; anything else fails closed without touching the gateway.
-            let (status, body): (&str, &[u8]) = if path.contains("scheduled-events") {
-                ("200 OK", b"[]")
-            } else {
-                (
-                    "404 Not Found",
-                    b"{\"message\":\"alive mock: unknown route\"}",
-                )
-            };
+            // Serve the custom-command identity probes, onboarding's boot
+            // identity probe and website event reads on one REST socket; the
+            // fixture grounds no raid windows and unknown routes fail closed.
+            let (status, body): (&str, &[u8]) =
+                if request_line.starts_with("GET ") && path == "/api/v10/users/@me" {
+                    ("200 OK", br#"{"id":"999","bot":true}"#)
+                } else if path == "/api/v10/applications/@me" {
+                    ("200 OK", b"{\"id\":\"1111\"}")
+                } else if path == "/api/v10/guilds/2222" {
+                    ("200 OK", b"{\"id\":\"2222\",\"name\":\"Alive fixture\"}")
+                } else if path == "/api/v10/applications/1111/guilds/2222/commands"
+                    || path.contains("scheduled-events")
+                {
+                    ("200 OK", b"[]")
+                } else {
+                    (
+                        "404 Not Found",
+                        b"{\"message\":\"alive mock: unknown route\"}",
+                    )
+                };
             let response = format!(
                 "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 body.len(),

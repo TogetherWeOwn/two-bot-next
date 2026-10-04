@@ -37,6 +37,26 @@ serialize per-guild settings updates, persist validated controls
 atomically, and deduplicate interaction IDs. Stale snapshots and delayed
 event replays are not detected by this core.
 
+## Persistence
+
+`PgRoomStore::access_controls(guild)` / `save_access_controls(guild, controls)`
+(migration `0227_voice_access_controls.sql`, table `voice_access_controls`)
+read and replace the whole per-guild row in one upsert. No row reads as
+`AccessControls::default()` (creation on, nothing restricted). Saves run
+`validate_access_controls` first, and loads re-validate, so a hand-edited row
+with an unknown command or zero role fails closed instead of becoming a
+silent no-op. The runtime still owns per-guild serialization and enforcement.
+
+## `/access` (admin)
+
+`/access` (Manage Channels, the spec's "admin") sets the controls at runtime:
+`show`, `creation enabled:<bool>`, `role [role]` (no role clears it),
+`restrict command:<name> [role] [role2] [role3]` (no role = admins only) and
+`unrestrict command:<name>`. Each change is a read-modify-write under one
+runtime lock, validated by `validate_access_controls`, saved with
+`save_access_controls`, then pushed to the guild's live actor so a creation
+switch applies immediately. A failed read or write changes nothing and says so.
+
 ## Residual parent work
 
 Room lifecycle (V1), owner controls (V2/V3), logging/health/error routing

@@ -28,9 +28,14 @@ impl Fixture {
             "test containers only"
         );
         assert_eq!(options.get_username(), "agent_test", "test identity only");
-        let admin = two_bot_store::connect_pool(&url)
-            .await
-            .expect("test DB connect failed");
+        // Threat-model F6: tests opt into `LocalOnly` explicitly rather than
+        // inheriting the process `TWO_DATABASE_TLS` value.
+        let admin = two_bot_store::connect_pool_with_tls(
+            &url,
+            two_bot_core::database_tls::TlsPolicy::LocalOnly,
+        )
+        .await
+        .expect("test DB connect failed");
         let schema = format!(
             "s6_test_{}_{}",
             std::process::id(),

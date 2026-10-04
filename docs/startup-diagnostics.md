@@ -23,13 +23,47 @@ Rust logs fixed `startup_phase` / `error_class` fields before fatal exits:
 | HTTP listener bind | `listener_bind_failed` |
 | Invalid gateway override | `gateway_override_invalid` |
 | Database URL validation, options, or connection | `database_connect_failed` |
+| Gateway task: shared store missing | `store_unavailable` |
+| Gateway task: checkpoint pool connect | `gateway_pool_connect_failed` |
 | Durable gateway checkpoint read | `checkpoint_load_failed` |
+| Onboarding gate parsing | `onboarding_gates_invalid` |
+| Onboarding runtime initialization | `onboarding_init_failed` |
+| Custom-command registry bootstrap | `custom_commands_init_failed` |
 | Milestone read | `milestones_load_failed` |
+| Automod configuration rejected | `automod_config_invalid` |
+| Automod REST executor build | `automod_executor_failed` |
 | Running gateway operation | `gateway_runtime_failed` |
+| Gateway task panicked | `gateway_task_panicked` |
 | HTTP/gateway supervisor termination | `container_service_failed` |
 
 These are operation classes, not raw database error codes or inferred root causes.
 No SQLx source chain, URL, credential, or arbitrary exception text is formatted.
+
+## Self-diagnosing gateway failures (`/readyz` `gateway_failure`)
+
+Container stdout is not in Workers Logs, so the gateway task's class is also
+published where a probe can read it. The gateway task rows above (`store_unavailable`
+through `gateway_task_panicked`) are an enum in `crates/bot/src/gateway_failure.rs`;
+no free-form text can reach the field. After a failure `/readyz` adds
+
+```json
+{"gateway_failure":{"phase":"durable_gateway","class":"checkpoint_load_failed"}}
+```
+
+(omitted while there is none) and keeps serving for 15 seconds
+(`shutdown::FAILURE_LINGER`) before the drain and exit-1 restart. A shutdown
+signal ends the linger at once. Readers:
+
+- Worker keepalive: one `console.warn` JSON line
+  `{"event":"container_gateway_failure","phase":…,"class":…}` per tick, only when
+  both values are `[a-z0-9_]{1,32}` tokens, so it reaches Workers Logs.
+- `scripts/staging_rollout.py`: the rollout gate's `last observation before
+  timeout` line ends with `gateway_failure=<phase>:<class>`. The gate also
+  probes `/readyz` while this build's rollout exists but has not converged,
+  accepting the value only from the expected Worker version and build identity.
+
+`database_init`, `listener_bind` and the other pre-gateway exits happen before the
+HTTP server runs, so they remain visible only in container logs.
 
 ## Worker readiness boundary
 

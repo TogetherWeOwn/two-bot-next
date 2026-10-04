@@ -26,6 +26,9 @@ export const FORWARDED_FLAGS = [
   "TWO_MODERATION",
   "TWO_MODERATION_PROTECTED_ROLE_IDS",
   "TWO_OWEN_USER_ID",
+  // Disable-guard escape hatch: explicit boot/CLI override that proceeds
+  // with owed releases. Unset by default so refusal is the default.
+  "TWO_ALLOW_OWED_RELEASES",
   // Automod (gateway intents + AutomodConfig).
   "TWO_AUTOMOD",
   "TWO_AUTOMOD_ALLOWED_DOMAINS",
@@ -88,6 +91,11 @@ export const FORWARDED_FLAGS = [
   "TWO_TEMP_VOICE_PANEL_CHANNEL_ID",
   "TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS",
   "TWO_TEMP_VOICE_SWEEP_SECONDS",
+  // Template assistant (V12): non-secret endpoint URL + model name; the
+  // endpoint credential (if any) travels as its own Container secret, never
+  // through this flag allowlist.
+  "TWO_ASSISTANT_ENDPOINT",
+  "TWO_ASSISTANT_MODEL",
 ] as const;
 
 export type ForwardedFlag = (typeof FORWARDED_FLAGS)[number];
@@ -100,7 +108,13 @@ const TEST = "test-only: CI service containers or a test fixture name";
 const BACKUP = "host backup/restore timer input (deploy/*.service), not the Container";
 const BIND = "network bind; the Worker sets LISTEN_ADDR and proxies only /health and /readyz";
 const CAPABILITY =
-  "TWO_INTERNAL_* website-to-bot capability gate; no Container reader, widening needs its own reviewed card";
+  "TWO_INTERNAL_* website-to-bot capability gate; the staging receiver runs announcement.post only, " +
+  "so none of these reach the Container; widening needs its own reviewed card";
+const RECEIVER_CONFIG =
+  "private-receiver config (TOG-12980); reaches the Container only through an explicit containerEnvVars " +
+  "line while TWO_INTERNAL_ACTIONS is exactly 1, never this flag allowlist (CISO TOG-12979 C8)";
+const RECEIVER_BIND =
+  "private-receiver bind; the Worker sets one fixed loopback literal (internal-actions.ts), never an Operator value";
 const LEGACY = "legacy input with no Next reader; settings.rs keeps it only to refuse storage";
 const REDIRECT = "go.two.gg redirect is served by the Worker (REDIRECT_*), not the Container";
 
@@ -128,18 +142,20 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_BACKUP_UPLOAD_CMD: BACKUP,
   TWO_GUILD_CONFIG_BACKUP_DIR: BACKUP,
   TWO_GUILD_CONFIG_UPLOAD_CMD: BACKUP,
+  TWO_RESTORE_DRILL_BOOTSTRAP_URL: BACKUP,
+  TWO_RESTORE_DRILL_EVIDENCE_DIR: BACKUP,
   TWO_ANTI_NUKE_SNAPSHOT_PATH: "filesystem write path; Container disk is ephemeral",
   TWO_HEALTH_BIND_HOST: BIND,
   TWO_HEALTH_PORT: BIND,
-  TWO_INTERNAL_BIND: BIND,
+  TWO_INTERNAL_BIND: RECEIVER_BIND,
   TWO_INTERNAL_BIND_HOST: BIND,
-  TWO_INTERNAL_CALLERS: CAPABILITY,
+  TWO_INTERNAL_CALLERS: RECEIVER_CONFIG,
   TWO_INTERNAL_PORT: BIND,
   TWO_REDIRECT_BIND_HOST: BIND,
   TWO_REDIRECT_PORT: BIND,
   TWO_REDIRECT_FALLBACK_CODE: REDIRECT,
   TWO_REDIRECT_TRUSTED_PROXIES: REDIRECT,
-  TWO_INTERNAL_ACTIONS: CAPABILITY,
+  TWO_INTERNAL_ACTIONS: RECEIVER_CONFIG,
   TWO_INTERNAL_ALLOW_ADD_MEMBER: CAPABILITY,
   TWO_INTERNAL_ALLOW_AUTOMATIONS: CAPABILITY,
   TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE: CAPABILITY,
@@ -147,8 +163,8 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_INTERNAL_ALLOW_EVENT_READ: CAPABILITY,
   TWO_INTERNAL_ALLOW_MODERATION: CAPABILITY,
   TWO_INTERNAL_ALLOW_SETTINGS: CAPABILITY,
-  TWO_INTERNAL_CHANNEL_KEYS: CAPABILITY,
-  TWO_INTERNAL_KEYS: CAPABILITY,
+  TWO_INTERNAL_CHANNEL_KEYS: RECEIVER_CONFIG,
+  TWO_INTERNAL_KEYS: SECRET,
   TWO_INTERNAL_ROLE_KEYS: CAPABILITY,
   TWO_ONBOARDING_ROTA_MEASUREMENT: LEGACY,
   TWO_ONBOARDING_ROTA_NOTICE: LEGACY,
@@ -162,6 +178,8 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_ROLES_TEST_DATABASE_URL: TEST,
   TWO_BOT_TEST_BACKUP_BIN: TEST,
   TWO_LEVELING_TEST_CI: TEST,
+  TWO_CUSTOM_COMMAND_TEST_CI: TEST,
+  TWO_AUTOMATION_TRANSFER_TEST_CI: TEST,
   TWO_LFG_TESTDB_CI: TEST,
   TWO_TEST_COUNTER_INTERVAL_MS: TEST,
   TWO_TEST_EVENTS_INTERVAL_MS: TEST,

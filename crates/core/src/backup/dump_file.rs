@@ -109,19 +109,33 @@ pub const DUMP_TABLES: &[&str] = &[
     "internal_action_log",
     "internal_discord_events",
     "moderation_channel_executions",
+    "moderation_member_bans",
     "invite_campaigns",
     "voice_creators",
     "voice_rooms",
     "voice_text_companions",
+    "voice_access_controls",
+    "voice_logging_settings",
+    // V11b configuration tables (0229). Guild-keyed, no foreign keys, so order
+    // among them is free.
+    "voice_channel_templates",
+    "voice_game_aliases",
+    "voice_random_lists",
+    "voice_random_list_choices",
+    "voice_logging",
+    "voice_logging_mention_members",
+    "voice_logging_mention_roles",
+    "voice_guild_settings",
+    "voice_command_roles",
+    "voice_command_role_members",
 ];
 
-/// Frozen v3 tables no longer created by cutover migrations. Keep their data
-/// when they exist, but do not require nonexistent legacy subsystems on Rust.
-pub const OPTIONAL_LEGACY_TABLES: &[&str] = &[
-    "moderation_warnings",
-    "moderation_scheduled_unbans",
-    "automation_commands",
-];
+/// Covered tables not created by the current cutover migration set, if any.
+/// Keep legacy data when such tables exist, but do not require nonexistent
+/// legacy subsystems. A table created by migrations must leave this list
+/// (the coverage test enforces it): empty means every covered table is
+/// migrated here, including automation_commands (0130).
+pub const OPTIONAL_LEGACY_TABLES: &[&str] = &[];
 
 /// Explicit migrated-schema exclusions, checked by the schema coverage test.
 pub const EXCLUDED_TABLES: &[&str] = &[
@@ -133,6 +147,11 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     // replay a pre-restore lane hold into a recovered process; a restored
     // database re-admits from generation zero and re-learns cooldowns.
     "discord_send_admission",
+    // Onboarding restart-recovery queue: captured member state and delivery
+    // receipts bound to a gateway session. Never replay a pre-restore job
+    // into a recovered process; welcome/goodbye state of record lives in the
+    // onboarding stores, which are archived.
+    "gateway_onboarding_jobs",
     // Migration ledgers describe target DDL; replacing them would falsely mark
     // unapplied migrations as applied. Legacy schema_migrations is diagnostic
     // manifest metadata only, never restored application data.

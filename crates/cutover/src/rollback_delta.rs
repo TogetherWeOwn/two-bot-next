@@ -86,6 +86,12 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
     TableSpec { table: "feed_relays", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "gateway_boot_directives", measure: TableMeasure::Columns(&["armed_at", "consumed_at"]) },
+    TableSpec {
+        table: "gateway_onboarding_jobs",
+        measure: TableMeasure::Unmeasurable(
+            "transient restart-recovery queue with no timestamp column (occurred_at_ms is a gateway event time); rows hold no durable member state",
+        ),
+    },
     TableSpec { table: "gateway_sessions", measure: TableMeasure::Columns(&["updated_at"]) },
     // Collector read-times ride the same row write, so their maximum is the
     // row's last write.
@@ -155,6 +161,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     },
     TableSpec { table: "moderation_idempotency", measure: TableMeasure::Columns(&["claimed_at"]) },
     TableSpec { table: "moderation_lockdowns", measure: TableMeasure::Columns(&["locked_at"]) },
+    TableSpec { table: "moderation_member_bans", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "moderation_scheduled_unbans", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "moderation_warnings", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "operational_audit_log", measure: TableMeasure::Columns(&["occurred_at"]) },
@@ -194,12 +201,66 @@ pub const TABLE_SPECS: &[TableSpec] = &[
             "no timestamp column; creator configuration is upserted in place (see PgRoomStore::add_creator)",
         ),
     },
-    // Insert-once rows (PgRoomStore::add_room never overwrites). An ownership
-    // transfer that updates owner_id must add its own timestamp column.
-    TableSpec { table: "voice_rooms", measure: TableMeasure::Columns(&["created_at"]) },
+    // Insert-once creation snapshot plus V2 ownership handoffs, whose
+    // timestamp lives in `owner_touched_at` (migration 0412).
+    TableSpec { table: "voice_rooms", measure: TableMeasure::Columns(&["created_at", "owner_touched_at"]) },
     // Same insert-once shape as voice_rooms (PgRoomStore::add_companion never
     // overwrites the creation snapshot).
     TableSpec { table: "voice_text_companions", measure: TableMeasure::Columns(&["created_at"]) },
+    // V11b configuration tables (0229): replaced wholesale by
+    // PgVoiceConfigStore::apply, so none carries a write timestamp.
+    TableSpec {
+        table: "voice_channel_templates",
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+    },
+    TableSpec {
+        table: "voice_game_aliases",
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+    },
+    TableSpec {
+        table: "voice_random_lists",
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+    },
+    TableSpec {
+        table: "voice_random_list_choices",
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+    },
+    TableSpec {
+        table: "voice_logging",
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+    },
+    TableSpec {
+        table: "voice_logging_mention_members",
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+    },
+    TableSpec {
+        table: "voice_logging_mention_roles",
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+    },
+    TableSpec {
+        table: "voice_guild_settings",
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+    },
+    TableSpec {
+        table: "voice_command_roles",
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+    },
+    TableSpec {
+        table: "voice_command_role_members",
+        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)"),
+    },
+    TableSpec {
+        table: "voice_logging_settings",
+        measure: TableMeasure::Unmeasurable(
+            "mutable per-guild settings row with no timestamp column; no member IDs",
+        ),
+    },
+    TableSpec {
+        table: "voice_access_controls",
+        measure: TableMeasure::Unmeasurable(
+            "mutable per-guild settings row with no timestamp column; no member IDs",
+        ),
+    },
     TableSpec {
         table: "web_contract_meta",
         measure: TableMeasure::Unmeasurable("singleton contract row with no timestamp column"),

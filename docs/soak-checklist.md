@@ -1039,6 +1039,130 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Reason:** Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
+### s12-17: Guild room access-controls store (0227 migration, whole-row upsert with fail-closed validation)
+
+- **Method:** `waived` (not an execution verdict).
+- **Action:** Run the #360 store round-trip fixture on authorized test containers: defaults with no row, empty role list surviving reload, per-guild isolation, lifting restrictions, adapter refusals and raw-SQL CHECK rejection of unknown commands and zero roles.
+- **Expected:** Whole-row upsert persists and reloads validated controls per guild; unknown commands and zero roles fail closed on save and load.
+- **Evidence:** Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119), [TOG-13123](/TOG/issues/TOG-13123)
+- **Reason:** Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+
+### s12-18: Durable join-risk event claim store over the existing flags table (unwired, no new migration)
+
+- **Method:** `waived` (not an execution verdict).
+- **Action:** Run the #362 join-risk claim fixture on authorized test containers: 10-way concurrent exactly-once claims, serialized burst scoring with threshold-equality bonus, old-account evidence, cross-guild isolation, out-of-window exclusion, bulk-suppression persistence, duplicate replay and the legacy-0015 upgrade shape.
+- **Expected:** Event-ID dedupe returns Duplicate on replay with never a second alert; per-guild advisory locking serializes bursts; legacy IDs stay claimed with rows untouched.
+- **Evidence:** Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
+- **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
+- **Reason:** Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+
+### s12-19: Staging rollout gate timeout report (last observed stage)
+
+- **Method:** `waived` (not an execution verdict).
+- **Action:** Run the #367 gate timeout fixture: no-new-rollout, unconverged rollout with instance counts, converged rollout with readyz/components/identity states, hostile component names and unparseable bodies.
+- **Expected:** Timeout output names the last observed stage from the fixed vocabulary; hostile values are dropped and unparseable bodies read body=unreadable; the gate never loosens.
+- **Evidence:** Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
+- **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
+- **Reason:** Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+
+### s12-20: `/access` admin command for guild voice room controls with live-actor refresh
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** As an admin invoke /access show, creation, role, restrict and unrestrict in the disposable guild, then repeat as a non-admin; exercise unknown commands, unrestricting an unrestricted command and malformed shapes.
+- **Expected:** Admin changes persist, show reflects them and the live actor gates creation without a restart; non-admin use is refused; bad input is answered without changing anything.
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119), [TOG-13123](/TOG/issues/TOG-13123)
+- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
+
+### s12-21: Staging-only default-dark ingress for the internal-actions receiver
+
+- **Method:** `waived` (not an execution verdict).
+- **Action:** Run the #370 ingress fixture: route absent without both the staging-only Worker var and the exact operator secret; header allowlist, body bounds, per-IP bucket and in-flight cap enforced; only the receiver envelope leaves the relay.
+- **Expected:** The route stays absent unless both staging-only var and exact secret are present; production has no var, route or secret; no container contact on refusal.
+- **Evidence:** Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
+- **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
+- **Reason:** Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+
+### s12-22: Gateway checkpoint advisory-lock test serialization (tests only)
+
+- **Method:** `waived` (not an execution verdict).
+- **Action:** Run the #371 gateway lock-fence fixture: exclusive lock holders run alone while shared TestDb lifetimes hold the fence shared; sibling checkpoint commits never queue behind a held gateway key.
+- **Expected:** No checkpoint wait exceeds its IO bound due to test-parallel lock contention; no timeout raised and no step skipped; production code untouched.
+- **Evidence:** Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
+- **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
+- **Reason:** Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+
+### s12-23: `/logging` admin command for guild voice notice level, channel and mention role
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** As an admin invoke /logging show and set notice level, channel and mention role in the disposable guild, then repeat as a non-admin; exercise bad input and store-failure fixtures.
+- **Expected:** Admin changes persist, show reflects them and the live actor applies them without a restart; non-admin use is refused; failures change nothing and say so.
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119), [TOG-13123](/TOG/issues/TOG-13123)
+- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
+
+### s12-24: `/setup` missing-permission surfacing with category-override attribution and health line
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** Invoke /setup in the disposable guild with clean permissions, then with an approved category-override and channel-override gap; repeat with incomplete cache data.
+- **Expected:** /setup lists each missing permission once with the causing category or channel named by mention only; clean and incomplete-data guilds report no false failure.
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119), [TOG-13123](/TOG/issues/TOG-13123)
+- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
+
+### s12-25: Gateway start-failure class on `/readyz` plus unconverged-rollout warm-up read
+
+- **Method:** `waived` (not an execution verdict).
+- **Action:** Run the #374 failure-class fixture: every fallible gateway step maps to its fixed-vocabulary class, the 503 readyz body carries phase and class with no error text, the linger serves it until shutdown cuts it short, and the gate warm-up reads an unconverged rollout only from the expected Worker version and build identity.
+- **Expected:** Failure class is an enum token, never text, URL or secret; stale Worker or image answers are ignored; no probe runs before a new rollout exists.
+- **Evidence:** Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
+- **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
+- **Reason:** Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+
+### s12-26: Repo standards (PR template, issue forms, public-safe pr-lint)
+
+- **Method:** `waived` (not an execution verdict).
+- **Action:** Run the #375 lint fixture: standards-only headers, template sections and public-safe body rules pass while private URLs, tracker IDs and secrets fail.
+- **Expected:** Standards-only change with no runtime, staging, deploy or CI-selection behavior; the lint contract holds.
+- **Evidence:** Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
+- **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
+- **Reason:** Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+
+### s12-27: Required-check fail-closed job selection with pinned contract
+
+- **Method:** `waived` (not an execution verdict).
+- **Action:** Run the #376 selector fixture: job-selection failure fails the required check closed and the pinned contract matches the workflow.
+- **Expected:** No silent green on selection failure; contract drift fails the gate.
+- **Evidence:** Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
+- **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
+- **Reason:** Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+
+### s12-28: Read-only `report voice-ghosts` ghost-channel count (tracked-present, tracked-gone, untracked-present plus clean flag)
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** Run `report voice-ghosts --seed` for the demo counts, then poll the live command against the disposable staging guild during a cutover rehearsal until both gaps read empty; confirm the clean flag.
+- **Expected:** Seed demo reports the fixture gaps; live staging polling shows tracked-present, tracked-gone and untracked-present counts with no deletes or writes; the clean flag is set only when both gaps are empty.
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel IDs (no tokens), sanitized command output and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119), [TOG-13123](/TOG/issues/TOG-13123)
+- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
+
+### s12-29: Actionable denied-path interaction copy with next steps
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** On the disposable staging guild as a non-privileged member, trigger each denial path: a permission-gated command, a disabled-feature command, an unknown slash name, a stale button/control and a forced handler failure.
+- **Expected:** Every denial names the Discord permission and who grants it (or the admin-only enable path), unknown names and expired controls are distinguishable, and generic failures keep the ref correlation id with a retry hint; all replies stay ephemeral and under the 2000-character cap.
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized reply text or screenshots and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
+
 ## 13. Post-freeze ledger obligations (non-dropped rows)
 
 ### s13-f114c44: f114c44 — TOG-3052: temp-voice generator (join-to-create), staging only

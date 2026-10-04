@@ -122,6 +122,8 @@ pub struct AnnouncementExecutor {
     channel_keys: HashMap<String, String>,
     timeout: Duration,
     api_origin: String,
+    #[cfg(test)]
+    response_received: Option<Arc<tokio::sync::Notify>>,
     admission: Option<Arc<dyn SendAdmission>>,
     governor: CooldownGovernor,
 }
@@ -147,6 +149,8 @@ impl AnnouncementExecutor {
             channel_keys,
             timeout: Duration::from_secs(10),
             api_origin: "https://discord.com".to_owned(),
+            #[cfg(test)]
+            response_received: None,
             admission: None,
             governor,
         }
@@ -167,6 +171,18 @@ impl AnnouncementExecutor {
         let mut executor = Self::new(twilight, channel_keys, governor);
         executor.admission = Some(admission);
         Ok(executor)
+    }
+
+    /// Downstream tests exercise the real transport without live Discord or a
+    /// runtime origin override. Preserve the admitted lane and refuse anything
+    /// except a loopback HTTP origin. This feature is a dev-dependency only.
+    #[cfg(feature = "test-support")]
+    pub fn with_loopback_test_origin(mut self, origin: &str) -> Result<Self, AdmissionError> {
+        if self.admission.is_none() || !is_loopback_http(origin) {
+            return Err(AdmissionError::Configuration);
+        }
+        self.api_origin = origin.trim_end_matches('/').to_owned();
+        Ok(self)
     }
 
     #[must_use]
@@ -296,6 +312,10 @@ impl AnnouncementExecutor {
             Ok(Err(_)) => return ExecutionOutcome::Unknown(UnknownReason::Transport),
             Err(_) => return ExecutionOutcome::Unknown(UnknownReason::Timeout),
         };
+        #[cfg(test)]
+        if let Some(ready) = &self.response_received {
+            ready.notify_one();
+        }
         match response.status().as_u16() {
             // Narrow confirmed-rejection allowlist. 408, other statuses,
             // redirects and 5xx are NOT proof of no message being created.

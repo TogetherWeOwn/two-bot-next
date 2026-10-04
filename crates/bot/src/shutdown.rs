@@ -10,6 +10,12 @@ pub(crate) const TIMEOUT_ENV: &str = "SHUTDOWN_TIMEOUT_SECONDS";
 /// Cloudflare Containers allow a 15 minute grace period before SIGKILL.
 const MAX_SECONDS: u64 = 900;
 
+/// After the gateway task fails, `/readyz` keeps serving (with `gateway_failure`)
+/// this long before the process drains and exits: long enough for the rollout
+/// gate's 5 s poll and for a keepalive tick to land in it, far below the
+/// Container's SIGTERM-to-SIGKILL grace period. A shutdown signal cuts it short.
+pub(crate) const FAILURE_LINGER: Duration = Duration::from_secs(15);
+
 /// Accepted dispatches get `DISPATCH_DRAIN_MAX` to commit their checkpoint; the
 /// extra margin covers HTTP and job cleanup.
 pub(crate) fn default_deadline() -> Duration {

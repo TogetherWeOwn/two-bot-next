@@ -472,7 +472,7 @@ pub struct RestRequest {
     pub path: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
-    pub received_at: std::time::Instant,
+    pub received_at: tokio::time::Instant,
 }
 
 impl RestRequest {
@@ -483,6 +483,17 @@ impl RestRequest {
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
+}
+
+/// Delay the first mock observation after parsing, not executor admission.
+pub struct ReceiptGate {
+    pub entered: oneshot::Receiver<()>,
+    pub release: oneshot::Sender<()>,
+}
+
+struct ReceiptHold {
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
 }
 
 /// Synchronize request arrival, response release and handler completion without timers.
@@ -507,13 +518,23 @@ impl ResponseGate {
     }
 }
 
-type ResponseQueue = Arc<Mutex<VecDeque<(ScriptedResponse, Option<Arc<ResponseGate>>)>>>;
+/// A response successfully written to the mock socket, not merely scheduled.
+#[derive(Debug, Clone)]
+pub struct RestResponse {
+    pub path: String,
+    pub status: u16,
+    pub sent_at: std::time::Instant,
+}
+
+type RestResponder =
+    Arc<dyn Fn(&RestRequest) -> (ScriptedResponse, Option<Arc<ResponseGate>>) + Send + Sync>;
 
 /// The running scripted REST double.
 pub struct MockRest {
     /// Listener address; `origin()` renders the `DISCORD_API_BASE` override.
     pub addr: SocketAddr,
     recorded: Arc<Mutex<Vec<RestRequest>>>,
+    responses: Arc<Mutex<Vec<RestResponse>>>,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -530,7 +551,7 @@ impl MockRest {
         default: ScriptedResponse,
         body_delay: Duration,
     ) -> Self {
-        Self::start_inner(ungated(script), default, Some(body_delay)).await
+        Self::start_inner(ungated(script), default, Some(body_delay), None).await
     }
 
     /// Send headers but never finish a nonempty body; clients must time out.
@@ -538,7 +559,32 @@ impl MockRest {
         script: Vec<ScriptedResponse>,
         default: ScriptedResponse,
     ) -> Self {
-        Self::start_inner(ungated(script), default, None).await
+        Self::start_inner(ungated(script), default, None, None).await
+    }
+
+    pub async fn start_with_first_receipt_gate(
+        script: Vec<ScriptedResponse>,
+        default: ScriptedResponse,
+    ) -> (Self, ReceiptGate) {
+        let (entered, observed) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let mock = Self::start_inner(
+            ungated(script),
+            default,
+            Some(Duration::ZERO),
+            Some(ReceiptHold {
+                entered,
+                release: released,
+            }),
+        )
+        .await;
+        (
+            mock,
+            ReceiptGate {
+                entered: observed,
+                release,
+            },
+        )
     }
 
     /// Hold the final scripted response until the caller releases its gate.
@@ -551,7 +597,7 @@ impl MockRest {
         let mut queue = ungated(script);
         queue.push_back((last, Some(Arc::clone(&gate))));
         (
-            Self::start_inner(queue, default, Some(Duration::ZERO)).await,
+            Self::start_inner(queue, default, Some(Duration::ZERO), None).await,
             gate,
         )
     }
@@ -560,20 +606,63 @@ impl MockRest {
         script: VecDeque<(ScriptedResponse, Option<Arc<ResponseGate>>)>,
         default: ScriptedResponse,
         body_delay: Option<Duration>,
+        first_receipt: Option<ReceiptHold>,
+    ) -> Self {
+        let queue = Mutex::new(script);
+        Self::serve(
+            Arc::new(move |_: &RestRequest| {
+                queue
+                    .lock()
+                    .expect("queue")
+                    .pop_front()
+                    .unwrap_or_else(|| (default.clone(), None))
+            }),
+            body_delay,
+            first_receipt,
+        )
+        .await
+    }
+
+    /// Route-aware stateful fixture for concurrent feature orchestration.
+    pub async fn with_responder(
+        responder: impl Fn(&RestRequest) -> ScriptedResponse + Send + Sync + 'static,
+    ) -> Self {
+        Self::serve(
+            Arc::new(move |request: &RestRequest| (responder(request), None)),
+            Some(Duration::ZERO),
+            None,
+        )
+        .await
+    }
+
+    async fn serve(
+        responder: RestResponder,
+        body_delay: Option<Duration>,
+        first_receipt: Option<ReceiptHold>,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind rest");
         let addr = listener.local_addr().expect("rest addr");
         let recorded = Arc::new(Mutex::new(Vec::new()));
-        let queue = Arc::new(Mutex::new(script));
+        let responses = Arc::new(Mutex::new(Vec::new()));
         let handle = {
             let recorded = Arc::clone(&recorded);
+            let responses = Arc::clone(&responses);
             tokio::spawn(async move {
-                rest_task(listener, recorded, queue, default, body_delay).await;
+                rest_task(
+                    listener,
+                    recorded,
+                    responses,
+                    responder,
+                    body_delay,
+                    first_receipt,
+                )
+                .await;
             })
         };
         Self {
             addr,
             recorded,
+            responses,
             handle: Some(handle),
         }
     }
@@ -588,8 +677,20 @@ impl MockRest {
         self.recorded.lock().expect("recorded").clone()
     }
 
-    /// Stop the listener.
+    pub fn responses(&self) -> Vec<RestResponse> {
+        self.responses.lock().expect("responses").clone()
+    }
+
+    /// Stop the listener and its owned connection tasks.
     pub async fn shutdown(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for MockRest {
+    fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             handle.abort();
         }
@@ -608,45 +709,52 @@ fn ungated(
 async fn rest_task(
     listener: TcpListener,
     recorded: Arc<Mutex<Vec<RestRequest>>>,
-    queue: ResponseQueue,
-    default: ScriptedResponse,
+    responses: Arc<Mutex<Vec<RestResponse>>>,
+    responder: RestResponder,
     body_delay: Option<Duration>,
+    mut first_receipt: Option<ReceiptHold>,
 ) {
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            break;
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = connections.join_next(), if !connections.is_empty() => continue,
         };
+        let Ok((stream, _)) = accepted else { break };
         let recorded = Arc::clone(&recorded);
-        let queue = Arc::clone(&queue);
-        let default = default.clone();
-        tokio::spawn(
-            async move { handle_rest(stream, recorded, queue, default, body_delay).await },
-        );
+        let responses = Arc::clone(&responses);
+        let responder = Arc::clone(&responder);
+        let receipt = first_receipt.take();
+        connections.spawn(async move {
+            handle_rest(stream, recorded, responses, responder, body_delay, receipt).await
+        });
     }
 }
 
 async fn handle_rest(
     mut stream: TcpStream,
     recorded: Arc<Mutex<Vec<RestRequest>>>,
-    queue: ResponseQueue,
-    default: ScriptedResponse,
+    responses: Arc<Mutex<Vec<RestResponse>>>,
+    responder: RestResponder,
     body_delay: Option<Duration>,
+    receipt: Option<ReceiptHold>,
 ) {
     let Some((method, path, headers, body)) = read_rest_request(&mut stream).await else {
         return;
     };
-    recorded.lock().expect("recorded").push(RestRequest {
+    if let Some(receipt) = receipt {
+        let _ = receipt.entered.send(());
+        let _ = receipt.release.await;
+    }
+    let request = RestRequest {
         method: method.clone(),
         path: path.clone(),
         headers,
         body: body.clone(),
-        received_at: std::time::Instant::now(),
-    });
-    let (mut next, gate) = queue
-        .lock()
-        .expect("queue")
-        .pop_front()
-        .unwrap_or_else(|| (default.clone(), None));
+        received_at: tokio::time::Instant::now(),
+    };
+    let (mut next, gate) = responder(&request);
+    recorded.lock().expect("recorded").push(request);
     if let Some(gate) = &gate {
         gate.arrived.notify_one();
         gate.released.notified().await;
@@ -695,7 +803,13 @@ async fn handle_rest(
     // The echo self-heal above may replace an empty scripted body; deliver
     // whichever body the receipt contract chose. A declared length beyond the
     // delivered bytes truncates on connection close.
-    let _ = stream.write_all(&body).await;
+    if stream.write_all(&body).await.is_ok() {
+        responses.lock().expect("responses").push(RestResponse {
+            path,
+            status: next.status,
+            sent_at: std::time::Instant::now(),
+        });
+    }
     if let Some(gate) = gate {
         gate.completed.notify_one();
     }
