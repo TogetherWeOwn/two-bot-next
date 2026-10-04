@@ -308,5 +308,8 @@ fn owen_target_stays_protected_for_every_role_and_action() {
             );
         }
     }
-    assert_eq!(PolicyError::TargetOwen.to_string(), "Owen is protected",);
+    assert_eq!(
+        PolicyError::TargetOwen.to_string(),
+        "This target cannot be moderated",
+    );
 }
