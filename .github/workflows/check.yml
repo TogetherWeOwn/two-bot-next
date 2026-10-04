@@ -66,6 +66,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       TWO_CUSTOM_COMMAND_TEST_CI: "1"
+      TWO_AUTOMATION_TRANSFER_TEST_CI: "1"
       # Disk hygiene for hosted overflow runners (TOG-12134): the integration
       # link step (`cargo test --workspace --test '*'`) links ~70 test
       # binaries and exhausted the job-container overlay (98 MB left, rust-lld
@@ -595,6 +596,10 @@ jobs:
       - name: custom-command Postgres proof
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-core --features db --locked --test custom_command_store -- --ignored
+
+      - name: automations import/export Postgres proof
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-core --features db --locked --test automation_transfer -- --ignored
 
       - name: custom-command routed runtime proof (mock Discord and CI Postgres only)
         if: needs.job-inputs.outputs.rust != 'false'
