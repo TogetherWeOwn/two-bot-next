@@ -23,13 +23,53 @@ use serde::{Deserialize, Serialize};
 /// `DISCORD_GUILD_COMMAND_LIMIT`).
 pub const GUILD_COMMAND_LIMIT: usize = 100;
 
+// ---------------------------------------------------------------------------
+// Moderation / automation runtime bounds (parity §1 + docs/property-tests.md).
+//
+// Builders advertise these minima (tempban/timeout deliberately expose no
+// `max_value` per legacy parity); the runtime validators in
+// `crate::moderation` enforce the maxima. Schedule and sticky builders expose
+// both ends because Discord itself clamps those options. Centralised here so
+// builders, validators and tests share one source of truth.
+// ---------------------------------------------------------------------------
+
+/// Shared floor for `tempban`/`timeout` `duration_seconds` (builders + runtime).
+pub const TEMPBAN_DURATION_MIN_SECONDS: i64 = 60;
+/// Runtime ceiling for `tempban` `duration_seconds`: 365 days (parity §1).
+pub const TEMPBAN_DURATION_MAX_SECONDS: i64 = 365 * 24 * 60 * 60;
+/// Shared floor for `timeout` `duration_seconds` (builders + runtime).
+pub const TIMEOUT_DURATION_MIN_SECONDS: i64 = 60;
+/// Runtime ceiling for `timeout` `duration_seconds`: 28 days (Discord ceiling).
+pub const TIMEOUT_DURATION_MAX_SECONDS: i64 = 28 * 24 * 60 * 60;
+/// `/schedule` `in-minutes` window: fire 1 minute to 365 days out.
+pub const SCHEDULE_IN_MINUTES_MIN: i64 = 1;
+pub const SCHEDULE_IN_MINUTES_MAX: i64 = 525_600;
+/// `/schedule` `every-minutes` recurrence: 60-minute minimum, same ceiling.
+pub const SCHEDULE_EVERY_MINUTES_MIN: i64 = 60;
+pub const SCHEDULE_EVERY_MINUTES_MAX: i64 = 525_600;
+/// `/sticky` `debounce` quiet window in seconds (default 5, legacy `?? 5`).
+pub const STICKY_DEBOUNCE_MIN_SECONDS: i64 = 1;
+pub const STICKY_DEBOUNCE_MAX_SECONDS: i64 = 300;
+pub const STICKY_DEBOUNCE_DEFAULT_SECONDS: i64 = 5;
+/// `/attendance` `event-occurrence` bound (UTF-16 units, legacy JS `length`
+/// semantics — astral counts 2). Worst-case duplicate reply is 64 framing +
+/// 20 snowflake member + 128 = 212 units, ~10x under Discord's 2000 content
+/// limit. Builders advertise it via `max_length`; `crate::rsvp` refuses
+/// longer IDs before any record operation.
+pub const OCCURRENCE_ID_MAX_CHARS: usize = 128;
+
 /// Discord application-command option types (API integers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum CommandOptionType {
+    SubCommand = 1,
     String = 3,
     Integer = 4,
+    Boolean = 5,
     User = 6,
+    Channel = 7,
+    Role = 8,
+    Attachment = 11,
 }
 
 impl CommandOptionType {
@@ -56,6 +96,9 @@ pub struct CommandOption {
     pub max_length: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub choices: Vec<CommandChoice>,
+    /// Nested options of a sub-command; empty for every other option.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub options: Vec<CommandOption>,
 }
 
 impl CommandOption {
@@ -71,7 +114,16 @@ impl CommandOption {
             max_value: None,
             max_length: None,
             choices: Vec::new(),
+            options: Vec::new(),
         }
+    }
+
+    /// Nested options for a [`CommandOptionType::SubCommand`]; required ones
+    /// must come first (Discord rejects the definition otherwise).
+    #[must_use]
+    pub fn sub_options(mut self, options: Vec<CommandOption>) -> Self {
+        self.options = options;
+        self
     }
 
     #[must_use]

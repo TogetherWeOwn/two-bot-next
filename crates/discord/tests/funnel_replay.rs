@@ -40,7 +40,7 @@ use two_bot_core::{
     ChannelClass, FunnelHandlers, GateClearedInput, InviteState, JoinInput, MemStore, MessageInput,
     StoredRow, VoiceInput, WEB_ONE_CLICK_SOURCE,
 };
-use two_bot_discord::{MemPipeline, NoClassification};
+use two_bot_discord::{JoinObservation, JoinObserver, MemPipeline, NoClassification};
 
 const GUILD: u64 = 100_000_000_000_000_001;
 const A: u64 = 900_000_000_000_001_111;
@@ -655,6 +655,130 @@ fn pipeline_gate_clear_on_pending_flip() {
     );
 }
 
+#[test]
+fn pipeline_receipt_time_is_fallback_not_payload_override() {
+    let pipeline = MemPipeline::for_replay();
+    let observed_at = stamp("12:10:00");
+    pipeline.handle_at(&join_event(A, false, "12:00:00"), &observed_at);
+    pipeline.handle_at(&message_event(A, 1, "12:01:00"), &observed_at);
+    let mut unstamped = join_event(B, false, "12:00:00");
+    if let Event::MemberAdd(ref mut add) = unstamped {
+        add.member.joined_at = None;
+    }
+    pipeline.handle_at(&unstamped, &observed_at);
+    let rows = pipeline.handlers().store().rows();
+    for (kind, member_id, at) in [
+        (two_bot_core::EventType::MemberJoin, A, stamp("12:00:00")),
+        (two_bot_core::EventType::GateCleared, A, stamp("12:00:00")),
+        (two_bot_core::EventType::FirstMessage, A, stamp("12:01:00")),
+        (two_bot_core::EventType::MemberJoin, B, observed_at.clone()),
+        (two_bot_core::EventType::GateCleared, B, observed_at),
+    ] {
+        let row = rows
+            .iter()
+            .find(|row| row.event_type == kind && row.member_id == Some(member_id))
+            .unwrap();
+        assert_eq!(row.occurred_at, at);
+    }
+}
+
+#[test]
+fn pipeline_voice_move_and_server_leave_share_receipt_boundaries() {
+    let pipeline = MemPipeline::for_replay();
+    pipeline.handle_at(&voice_event(A, Some(CH_VOICE_A)), &stamp("12:00:00"));
+    pipeline.handle_at(&voice_event(A, Some(CH_VOICE_B)), &stamp("12:00:03"));
+    pipeline.handle_at(
+        &Event::MemberRemove(MemberRemove {
+            guild_id: Id::new(GUILD),
+            user: user(A, false),
+        }),
+        &stamp("12:00:05"),
+    );
+    let rows = pipeline.handlers().store().rows();
+    let ends: Vec<_> = rows
+        .iter()
+        .filter(|row| row.event_type == two_bot_core::EventType::VoiceSessionEnd)
+        .collect();
+    assert_eq!(ends.len(), 2);
+    assert_eq!(ends[0].occurred_at, stamp("12:00:03"));
+    assert_eq!(ends[0].metadata.as_ref().unwrap()["durationSeconds"], 3);
+    assert_eq!(ends[1].occurred_at, stamp("12:00:05"));
+    assert_eq!(ends[1].metadata.as_ref().unwrap()["durationSeconds"], 2);
+    assert!(rows.iter().any(|row| {
+        row.event_type == two_bot_core::EventType::VoiceSessionStart
+            && row.source == format!("channel:{CH_VOICE_B}")
+            && row.occurred_at == ends[0].occurred_at
+    }));
+    assert!(rows.iter().any(|row| {
+        row.event_type == two_bot_core::EventType::MemberLeave
+            && row.occurred_at == ends[1].occurred_at
+    }));
+}
+
+struct RecordedJoins(std::sync::Mutex<Vec<JoinObservation>>);
+
+impl JoinObserver for RecordedJoins {
+    fn observe_join(&self, join: JoinObservation) {
+        self.0.lock().unwrap().push(join);
+    }
+}
+
+/// The raid-watch seam: non-bot joins reach the observer after the funnel
+/// rows, with Discord's `joined_at` (receipt time when absent) in epoch ms.
+#[test]
+fn pipeline_join_observer_sees_non_bot_joins_after_the_funnel() {
+    let pipeline = MemPipeline::for_replay();
+    let seen = std::sync::Arc::new(RecordedJoins(std::sync::Mutex::new(Vec::new())));
+    pipeline.set_join_observer(seen.clone());
+    let observed_at = stamp("12:10:00");
+
+    pipeline.handle_at(&join_event(A, true, "12:00:00"), &observed_at);
+    let mut unstamped = join_event(B, true, "12:00:00");
+    if let Event::MemberAdd(ref mut add) = unstamped {
+        add.member.joined_at = None;
+    }
+    pipeline.handle_at(&unstamped, &observed_at);
+    let mut bot_join = join_event(BOT, true, "12:00:30");
+    if let Event::MemberAdd(ref mut add) = bot_join {
+        add.member.user.bot = true;
+    }
+    pipeline.handle_at(&bot_join, &observed_at);
+
+    let joins = seen.0.lock().unwrap().clone();
+    assert_eq!(joins.len(), 2, "the bot join is never observed");
+    assert_eq!(joins[0].guild_id, GUILD);
+    assert_eq!(joins[0].member_id, A);
+    assert_eq!(joins[0].joined_at_ms, 1_789_905_600_000, "12:00:00Z");
+    assert_eq!(joins[0].source, "unknown");
+    assert_eq!(joins[1].member_id, B);
+    assert_eq!(
+        joins[1].joined_at_ms, 1_789_906_200_000,
+        "receipt 12:10:00Z"
+    );
+    // The funnel recorded the joins the observer was told about.
+    let rows = pipeline.handlers().store().rows();
+    for member_id in [A, B] {
+        assert!(rows.iter().any(|row| {
+            row.event_type == two_bot_core::EventType::MemberJoin
+                && row.member_id == Some(member_id)
+        }));
+    }
+}
+
+/// First registration wins; a pipeline with no observer behaves as before.
+#[test]
+fn pipeline_join_observer_registration_is_first_wins() {
+    let pipeline = MemPipeline::for_replay();
+    pipeline.handle_at(&join_event(A, true, "12:00:00"), &stamp("12:10:00"));
+    let first = std::sync::Arc::new(RecordedJoins(std::sync::Mutex::new(Vec::new())));
+    let second = std::sync::Arc::new(RecordedJoins(std::sync::Mutex::new(Vec::new())));
+    pipeline.set_join_observer(first.clone());
+    pipeline.set_join_observer(second.clone());
+    pipeline.handle_at(&join_event(B, true, "12:01:00"), &stamp("12:10:00"));
+    assert_eq!(first.0.lock().unwrap().len(), 1);
+    assert!(second.0.lock().unwrap().is_empty());
+}
+
 /// Messages: guild rows advance the ladder with the frame stamp; DMs drop.
 #[test]
 fn pipeline_messages_and_dm_drop() {
@@ -818,6 +942,72 @@ fn pipeline_failed_invite_read_still_records() {
         .find(|r| r.event_type == two_bot_core::EventType::MemberJoin && r.member_id == Some(B))
         .expect("member_join");
     assert_eq!(join.source, "unknown");
+}
+
+/// Vanity-guild joins with no invite growth attribute `vanity` (legacy catch
+/// path): a clean read showing no movement, and a failed read alike. The
+/// join still records — attribution never blocks it.
+#[test]
+fn pipeline_vanity_guild_join_attributes_vanity() {
+    let pipeline = MemPipeline::for_replay();
+    pipeline.set_guild_vanity(GUILD, true);
+    // Successful empty read: nothing grew → vanity.
+    pipeline.invite_source().push(GUILD, vec![]);
+    pipeline.handle_at(&join_event(A, false, "12:00:00"), &stamp("12:00:00"));
+    let rows = pipeline.handlers().store().rows();
+    let join = rows
+        .iter()
+        .find(|r| r.event_type == two_bot_core::EventType::MemberJoin && r.member_id == Some(A))
+        .expect("member_join");
+    assert_eq!(join.source, "vanity");
+    // Failed read on a vanity guild: still vanity, row still written.
+    pipeline.handle_at(&join_event(B, false, "12:30:00"), &stamp("12:30:00"));
+    let rows = pipeline.handlers().store().rows();
+    let join = rows
+        .iter()
+        .find(|r| r.event_type == two_bot_core::EventType::MemberJoin && r.member_id == Some(B))
+        .expect("member_join");
+    assert_eq!(join.source, "vanity");
+}
+
+/// A baseline older than the staleness bound is re-seeded, not diffed: the
+/// stale window files `unknown` and the next join measures against the fresh
+/// baseline (TOG-11716).
+#[test]
+fn pipeline_stale_baseline_reseeds_instead_of_crediting_drift() {
+    const D: u64 = 900_000_000_000_004_444;
+    let pipeline = MemPipeline::for_replay();
+    // Baseline at 12:00 (first read: stored, nothing to credit).
+    pipeline.invite_source().push(GUILD, invite_snapshot(5));
+    pipeline.handle_at(&join_event(A, false, "12:00:00"), &stamp("12:00:00"));
+    // Fresh growth at 12:30 credits normally.
+    pipeline.invite_source().push(GUILD, invite_snapshot(6));
+    pipeline.handle_at(&join_event(B, false, "12:30:00"), &stamp("12:30:00"));
+    let rows = pipeline.handlers().store().rows();
+    let join = rows
+        .iter()
+        .find(|r| r.event_type == two_bot_core::EventType::MemberJoin && r.member_id == Some(B))
+        .expect("member_join");
+    assert_eq!(join.source, "invite:twodev01");
+    // Stale read at 13:30:01 (>1h after the 12:30 baseline): re-seed, no
+    // credit — this window files `unknown`, never drift.
+    pipeline.invite_source().push(GUILD, invite_snapshot(9));
+    pipeline.handle_at(&join_event(C, false, "13:30:01"), &stamp("13:30:01"));
+    let rows = pipeline.handlers().store().rows();
+    let join = rows
+        .iter()
+        .find(|r| r.event_type == two_bot_core::EventType::MemberJoin && r.member_id == Some(C))
+        .expect("member_join");
+    assert_eq!(join.source, "unknown");
+    // Next join measures against the re-seeded baseline (9 → 10).
+    pipeline.invite_source().push(GUILD, invite_snapshot(10));
+    pipeline.handle_at(&join_event(D, false, "13:31:00"), &stamp("13:31:00"));
+    let rows = pipeline.handlers().store().rows();
+    let join = rows
+        .iter()
+        .find(|r| r.event_type == two_bot_core::EventType::MemberJoin && r.member_id == Some(D))
+        .expect("member_join");
+    assert_eq!(join.source, "invite:twodev01");
 }
 
 #[allow(dead_code)]

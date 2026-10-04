@@ -67,6 +67,30 @@ impl EventType {
             Self::MemberLeave => "member_leave",
         }
     }
+
+    /// Parse a legacy wire string (also the `event_type` column value) back
+    /// into its variant. `None` for anything else: the durable read model
+    /// fails closed on unknown strings rather than projecting a guess.
+    #[must_use]
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "invite_click" => Some(Self::InviteClick),
+            "member_join" => Some(Self::MemberJoin),
+            "gate_cleared" => Some(Self::GateCleared),
+            "onboarding_prompted" => Some(Self::OnboardingPrompted),
+            "game_roles_selected" => Some(Self::GameRolesSelected),
+            "channel_routed" => Some(Self::ChannelRouted),
+            "first_message" => Some(Self::FirstMessage),
+            "second_message" => Some(Self::SecondMessage),
+            "third_message" => Some(Self::ThirdMessage),
+            "first_voice_session" => Some(Self::FirstVoiceSession),
+            "voice_session_start" => Some(Self::VoiceSessionStart),
+            "voice_session_end" => Some(Self::VoiceSessionEnd),
+            "member_inactive" => Some(Self::MemberInactive),
+            "member_leave" => Some(Self::MemberLeave),
+            _ => None,
+        }
+    }
 }
 
 /// The message milestones in ladder order. A member's Nth message fills the
@@ -345,6 +369,30 @@ mod tests {
         assert_eq!(EventType::VoiceSessionEnd.as_str(), "voice_session_end");
         let json = serde_json::to_string(&EventType::GateCleared).expect("serializes");
         assert_eq!(json, "\"gate_cleared\"");
+    }
+
+    #[test]
+    fn wire_strings_round_trip_and_reject_unknown() {
+        for variant in [
+            EventType::InviteClick,
+            EventType::MemberJoin,
+            EventType::GateCleared,
+            EventType::OnboardingPrompted,
+            EventType::GameRolesSelected,
+            EventType::ChannelRouted,
+            EventType::FirstMessage,
+            EventType::SecondMessage,
+            EventType::ThirdMessage,
+            EventType::FirstVoiceSession,
+            EventType::VoiceSessionStart,
+            EventType::VoiceSessionEnd,
+            EventType::MemberInactive,
+            EventType::MemberLeave,
+        ] {
+            assert_eq!(EventType::from_wire(variant.as_str()), Some(variant));
+        }
+        assert_eq!(EventType::from_wire("landing_viewed"), None);
+        assert_eq!(EventType::from_wire(""), None);
     }
 
     #[test]

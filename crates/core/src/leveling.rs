@@ -147,14 +147,24 @@ pub fn grouped_number(n: u64) -> String {
 
 /// `/rank` reply body (legacy `rankText`).
 #[must_use]
-pub fn rank_text(display_name: &str, level: u64, rank: u64, member_count: u64, xp: u64) -> String {
+pub fn rank_text(
+    display_name: &str,
+    level: u64,
+    rank: Option<u64>,
+    member_count: u64,
+    xp: u64,
+) -> String {
+    let rank_label = match rank {
+        Some(rank) => format!("Rank **#{rank}** of **{member_count}**"),
+        None => "Rank **Unranked** (no XP recorded)".to_owned(),
+    };
     let floor = total_xp_for_level(level);
     let next_floor = total_xp_for_level(level + 1);
     let progress = xp - floor;
     let span = next_floor - floor;
     let to_next = next_floor - xp;
     format!(
-        "**{display_name}**\nLevel **{level}** · Rank **#{rank}** of **{member_count}**\nXP **{xp}** · {progress}/{span} this level · **{to_next}** to level {}",
+        "**{display_name}**\nLevel **{level}** · {rank_label}\nXP **{xp}** · {progress}/{span} this level · **{to_next}** to level {}",
         level + 1,
         xp = grouped_number(xp),
         progress = grouped_number(progress),
@@ -210,10 +220,9 @@ pub struct LevelProfile {
     pub message_xp: u64,
     pub voice_xp: u64,
     pub imported_xp: u64,
-    /// 1-based rank with XP ties broken by member id ascending (legacy
-    /// `COUNT(...) + 1` over strictly-greater rows, so a member with no row
-    /// ranks below every member holding XP).
-    pub rank: u64,
+    /// 1-based rank with XP ties broken by member id ascending. A member
+    /// with no XP row is unranked (`None`); a stored zero-XP row still ranks.
+    pub rank: Option<u64>,
     pub member_count: u64,
     /// `totalXpForLevel(level + 1)`.
     pub next_level_xp: u64,
@@ -489,7 +498,7 @@ mod tests {
 
     #[test]
     fn rank_text_matches_legacy_shape() {
-        let text = rank_text("Test", 1, 3, 50, 114);
+        let text = rank_text("Test", 1, Some(3), 50, 114);
         assert!(text.starts_with("**Test**\nLevel **1** · Rank **#3** of **50**"));
         assert!(text.contains("XP **114** · 14/155 this level · **141** to level 2"));
     }
@@ -520,7 +529,7 @@ mod tests {
     fn rank_text_groups_large_numbers_like_legacy() {
         // Legacy golden (service.ts `rankText` + `toLocaleString`): level 86,
         // rank 7 of 250, 1,234,567 XP (floor 1,233,025, next 1,274,405).
-        let text = rank_text("Big Earner", 86, 7, 250, 1_234_567);
+        let text = rank_text("Big Earner", 86, Some(7), 250, 1_234_567);
         assert_eq!(
             text,
             "**Big Earner**\nLevel **86** · Rank **#7** of **250**\nXP **1,234,567** · 1,542/41,380 this level · **39,838** to level 87"
@@ -554,13 +563,43 @@ mod tests {
             message_xp: 114,
             voice_xp: 0,
             imported_xp: 0,
-            rank: 3,
+            rank: Some(3),
             member_count: 50,
             next_level_xp: total_xp_for_level(2),
         };
         let reply = rank_reply(&profile, "Test");
         assert!(reply.ephemeral, "legacy answers /rank ephemerally");
         assert!(reply.content.starts_with("**Test**\nLevel **1**"));
+    }
+
+    #[test]
+    fn rank_reply_without_xp_row_is_unranked() {
+        let profile = LevelProfile {
+            guild_id: "g".to_owned(),
+            member_id: "100000000000000001".to_owned(),
+            xp: 0,
+            level: 0,
+            message_xp: 0,
+            voice_xp: 0,
+            imported_xp: 0,
+            rank: None,
+            member_count: 2,
+            next_level_xp: total_xp_for_level(1),
+        };
+        let reply = rank_reply(&profile, "New Member");
+        assert!(reply.ephemeral);
+        assert_eq!(
+            reply.content,
+            "**New Member**\nLevel **0** · Rank **Unranked** (no XP recorded)\nXP **0** · 0/100 this level · **100** to level 1"
+        );
+    }
+
+    #[test]
+    fn rank_text_with_stored_zero_xp_keeps_numeric_rank() {
+        assert_eq!(
+            rank_text("Zero XP", 0, Some(2), 3, 0),
+            "**Zero XP**\nLevel **0** · Rank **#2** of **3**\nXP **0** · 0/100 this level · **100** to level 1"
+        );
     }
 
     #[test]

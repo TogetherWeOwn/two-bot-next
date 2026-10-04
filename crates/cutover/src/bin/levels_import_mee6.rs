@@ -4,6 +4,9 @@
 //! Exit codes: 0 fine, 1 the export or the write did not reconcile,
 //! 2 usage / refused guild.
 
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
+
 use two_bot_cutover::cli::{now_iso, open_db, require_guild, require_guild_read, Args};
 use two_bot_cutover::{run_mee6_import, ImportError};
 
@@ -29,7 +32,7 @@ async fn main() {
 
     if command == "inventory" {
         let guild = require_guild_read(&args, "guild");
-        let db = open_db(&args, false).await;
+        let db = open_db(&args, true).await;
         match two_bot_cutover::mee6_xp_inventory(&db, &guild).await {
             Ok(inv) => println!("{}", serde_json::to_string_pretty(&inv).unwrap_or_default()),
             Err(e) => {
@@ -53,13 +56,14 @@ async fn main() {
         }
     };
 
-    let db = open_db(&args, false).await;
+    let apply = args.has("apply");
+    let db = open_db(&args, !apply).await;
     let manifest = match run_mee6_import(
         &db,
         &guild,
         file_path,
         &file_bytes,
-        args.has("apply"),
+        apply,
         args.has("allow-lower"),
         &now_iso(),
     )

@@ -145,11 +145,14 @@ pub const FORMER_STAGING_BOT_APPLICATION_ID: &str = "1537629682449649724";
 pub const TWO_STAGING_GUILD_ID: &str = "1545644954272137297";
 
 /// A bot token's first dot-separated segment is the base64 of the application
-/// id. Returns `None` for anything not shaped like a bot token, so a caller
+/// id. Accepts the optional `Bot ` prefix used by the Discord clients.
+/// Returns `None` for anything not shaped like a bot token, so a caller
 /// can tell "wrong bot" apart from "unparseable".
 #[must_use]
 pub fn application_id_from_token(token: &str) -> Option<String> {
-    let seg = token.trim().split('.').next()?;
+    let token = token.trim();
+    let token = token.strip_prefix("Bot ").unwrap_or(token);
+    let seg = token.split('.').next()?;
     if seg.is_empty() {
         return None;
     }
@@ -913,6 +916,23 @@ mod tests {
         let err = check_staging_token(former).expect_err("superseded token refused");
         assert!(err.contains("test-two"), "{err}");
         assert!(check_staging_token("not-a-token").is_err());
+    }
+
+    #[test]
+    fn token_identity_accepts_only_the_supported_bot_prefix() {
+        for token in [
+            "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+            "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature",
+        ] {
+            assert_eq!(
+                application_id_from_token(&format!("Bot {token}")),
+                application_id_from_token(token)
+            );
+            for prefix in ["Bearer ", "bot ", "Bot Bot "] {
+                assert_eq!(application_id_from_token(&format!("{prefix}{token}")), None);
+            }
+        }
+        assert_eq!(application_id_from_token("Bot not-a-token"), None);
     }
 
     #[test]

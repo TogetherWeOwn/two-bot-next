@@ -4,7 +4,7 @@ use super::*;
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn checkpoint_lock_wait_fails_closed_before_heartbeat_and_restart_recovers() {
-    let db = TestDb::new().await;
+    let db = TestDb::exclusive().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let gateway_url = url.clone();
@@ -48,7 +48,7 @@ async fn checkpoint_lock_wait_fails_closed_before_heartbeat_and_restart_recovers
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(*state.read().await, GatewayState::Connected);
+    wait_connected(&state).await;
     let mut lock = db.pool.begin().await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!("gateway:{GUILD}:0"))
@@ -73,6 +73,7 @@ async fn checkpoint_lock_wait_fails_closed_before_heartbeat_and_restart_recovers
                 crate::server::shutdown_requested(receiver).await;
                 Ok(())
             },
+            state.clone(),
             shutdown,
         ),
     )
@@ -83,7 +84,7 @@ async fn checkpoint_lock_wait_fails_closed_before_heartbeat_and_restart_recovers
         result.to_string(),
         "gateway task stopped; container restart required"
     );
-    assert_eq!(*state.read().await, GatewayState::Armed);
+    assert_eq!(*state.read().await, GatewayState::Draining);
     assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
     assert_eq!(db.count().await, 0);
     lock.rollback().await.unwrap();
@@ -105,7 +106,7 @@ async fn checkpoint_lock_wait_fails_closed_before_heartbeat_and_restart_recovers
     assert_eq!(auth["d"]["seq"], 1);
     wait_sequence(&db.store, 3).await;
     assert_eq!(db.count().await, 1, "missed dispatch replayed once");
-    assert_eq!(*state.read().await, GatewayState::Connected);
+    wait_connected(&state).await;
     runner.abort();
     let _ = runner.await;
     second.task.abort();

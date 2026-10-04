@@ -58,6 +58,8 @@ README. Staging deploys from `main`; production is a separate manual gate.
 - [Staging soak acceptance](docs/staging-soak.md): the evidence required before
   cutover; deployment alone is not acceptance.
 - [Backup/restore runbook](docs/backup.md) and [parity matrix](docs/parity.md).
+- [Command registry drift](docs/command-publish.md): dry-run-first
+  `two-bot commands diff|publish` and opt-in boot publication for cutover.
 
 ### Regenerate the references
 
@@ -84,12 +86,14 @@ these tests in its existing integration-test step.
 
 ## Contributing
 
-Squash-merge only; PR titles follow Conventional Commits and the body carries
-`Refs: TOG-1234`. Required exact-head checks include `gitleaks`, `pr-lint`,
-`check` (fmt, clippy -D warnings, tests, cargo-deny) and `worker check` (including
-the runbook command-drift test). The approving non-author reviewer squash-merges.
-See [Contributing](CONTRIBUTING.md). The workspace toolchain is pinned in
-`rust-toolchain.toml`.
+Squash-merge only; PR titles follow Conventional Commits and the body follows the
+[PR template](.github/pull_request_template.md). This repo is public, so keep
+internal tracker IDs out of titles, bodies, commits and branch names. The rulesets
+require `gitleaks` and `pr-lint`; a PR also needs a green `check` (fmt, clippy
+-D warnings, tests, cargo-deny) and `worker check` (including the runbook
+command-drift test) on the exact head commit. The approving non-author reviewer
+squash-merges. See [Contributing](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). The
+workspace toolchain is pinned in `rust-toolchain.toml`.
 
 Persistent-controller Rust builds use the [bounded Cargo cache wrapper](docs/build-cache.md),
 not a new `target/` in each worktree. The runbook includes offline cache tests,

@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -49,20 +50,28 @@ NOTES_BRANCH = branch + "--release-notes"
 git = os.environ["RETRY_REAL_GIT"]
 remote = os.environ["RETRY_REMOTE"]
 head = subprocess.check_output([git, "--git-dir", remote, "rev-parse", "refs/heads/" + branch], text=True).strip()
-pr = {"number": 42, "state": "open", "base": {"ref": "main", "repo": {"full_name": "fixture/repo"}}, "head": {"ref": branch, "sha": head, "repo": {"full_name": state.get("head_repo", "fixture/repo")}}, "labels": [{"name": "autorelease: pending"}]}
+pr = {"number": 42, "state": "open", "body": state["body"], "base": {"ref": "main", "repo": {"full_name": "fixture/repo"}}, "head": {"ref": branch, "sha": head, "repo": {"full_name": state.get("head_repo", "fixture/repo")}}, "labels": [{"name": "autorelease: pending"}]}
+def emit_pages(entries):
+    # Model the older gh CLI: @json emits one compact page per line, and
+    # --slurp is unsupported. Never silently accept the incompatible flags.
+    assert args[2:] == ["--paginate", "--jq", "@json"], args
+    size = state.get("page_size", 1000)
+    pages = [entries[i:i + size] for i in range(0, len(entries), size)] or [[]]
+    if state.get("empty_first_page"):
+        pages.insert(0, [])
+    for page in pages:
+        print(json.dumps(page, separators=(",", ":")))
 if args[1].startswith(repo + "/pulls?"):
-    assert "--paginate" in args and "--slurp" in args
-    print(json.dumps([[pr] if state["open"] else []]))
+    emit_pages([pr] if state["open"] else [])
 elif args[1].startswith(repo + "/compare/"):
     main, compared_head = args[1].rsplit("/", 1)[1].split("...")
     assert compared_head == head
     base = subprocess.check_output([git, "merge-base", main, head], text=True).strip()
     print(json.dumps({"merge_base_commit": {"sha": base}, "status": "identical" if main == head else "ahead" if base == main else "diverged"}))
 elif args[1].startswith(repo + "/pulls/42/commits"):
-    assert "--paginate" in args and "--slurp" in args
     log = subprocess.check_output([git, "log", "--reverse", "--format=%H%x01%s", "refs/heads/" + branch], text=True).strip()
-    entries = [{"sha": line.split("\\x01")[0], "commit": {"message": line.split("\\x01")[1]}} for line in log.splitlines()] if log else []
-    print(json.dumps([entries]))
+    entries = [{"sha": line.split("\\x01")[0], "commit": {"message": line.split("\\x01")[1] + state.get("commit_message_tail", "")}} for line in log.splitlines()] if log else []
+    emit_pages(entries)
 elif args[1].startswith(repo + "/commits/"):
     sha = args[1].rsplit("/", 1)[1]
     parents = subprocess.check_output([git, "show", "-s", "--format=%P", sha], text=True).strip()
@@ -168,6 +177,110 @@ sys.exit(subprocess.run([os.environ["RETRY_REAL_GIT"], *sys.argv[1:]]).returncod
 '''
 
 
+def workflow_text():
+    return (ROOT / ".github/workflows/release.yml").read_text()
+
+
+def job_steps(job_id):
+    """Step blocks of one release.yml job, as raw text starting after the `- `."""
+    match = re.search(rf"(?ms)^  {re.escape(job_id)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow_text())
+    assert match, job_id
+    return re.split(r"(?m)^      - ", match.group(1))[1:]
+
+
+def step_with(job_id, marker):
+    steps = [step for step in job_steps(job_id) if marker in step]
+    assert len(steps) == 1, (job_id, marker, len(steps))
+    return steps[0]
+
+
+def step_condition(step):
+    conditions = re.findall(r"(?m)^        if: (.+)$", step)
+    assert len(conditions) <= 1, conditions
+    return conditions[0] if conditions else None
+
+
+def evaluate(expression, context):
+    """Evaluate the `a == 'x' && b != 'y' || c == 'z'` conditions this workflow uses.
+
+    Deliberately tiny and fail-closed: any other syntax raises instead of guessing.
+    """
+    def atom(text):
+        match = re.fullmatch(r"\s*([\w.\-]+)\s*(==|!=)\s*'([^']*)'\s*", text)
+        assert match, f"Unsupported expression: {text!r}"
+        name, operator, literal = match.groups()
+        equal = context[name] == literal
+        return equal if operator == "==" else not equal
+    return any(all(atom(part) for part in clause.split("&&")) for clause in expression.split("||"))
+
+
+class ReleaseTriggerShapeTests(unittest.TestCase):
+    """TOG-12931: push publishes only; schedule/dispatch regenerate and dispatch checks."""
+
+    def context(self, event, pr_available="true", reuse_pr=""):
+        return {
+            "github.event_name": event,
+            "steps.select.outputs.pr_available": pr_available,
+            "needs.release-please.outputs.pr_available": pr_available,
+            "steps.plan.outputs.reuse_pr": reuse_pr,
+        }
+
+    def skip_expression(self):
+        step = step_with("release-please", "googleapis/release-please-action@")
+        match = re.search(r"(?m)^          skip-github-pull-request: \$\{\{ (.+) \}\}$", step)
+        self.assertIsNotNone(match)
+        return match.group(1)
+
+    def conditions(self):
+        return {
+            "plan": step_condition(step_with("release-please", "id: plan")),
+            "checkout": step_condition(step_with("release-please", "ref: ${{ fromJSON(steps.select.outputs.pr).headBranchName }}")),
+            "preserve": step_condition(step_with("release-please", "name: Preserve bootstrap release notes")),
+            "dispatch": re.search(r"(?m)^    if: (.*needs\.release-please\.outputs\.pr_available.*)$", workflow_text()).group(1),
+        }
+
+    def test_triggers_are_push_schedule_and_dispatch_only(self):
+        on = workflow_text().split("\npermissions:", 1)[0]
+        self.assertIn("\n  push:\n    branches: [main]\n", on)
+        self.assertRegex(on, r"(?m)^  schedule:\n(?:    #[^\n]*\n)*    - cron: '\d+ \d+ \* \* [\d*]'$")
+        self.assertEqual(on.count("- cron:"), 1)
+        self.assertIn("\n  workflow_dispatch:\n", on)
+        self.assertNotIn("pull_request", on)
+
+    def test_push_publishes_without_regenerating_or_dispatching(self):
+        skip, conditions = self.skip_expression(), self.conditions()
+        self.assertNotIn("skip-github-release:", workflow_text())
+        for pr_available in ("true", "false"):
+            for reuse_pr in ("", "true", "false"):
+                with self.subTest(pr_available=pr_available, reuse_pr=reuse_pr):
+                    context = self.context("push", pr_available, reuse_pr)
+                    self.assertTrue(evaluate(skip, context), "PR generation is skipped on push; publication is not")
+                    for name, condition in conditions.items():
+                        self.assertFalse(evaluate(condition, context), f"{name} must not run on push")
+
+    def test_schedule_and_dispatch_regenerate_reconcile_and_dispatch(self):
+        skip, conditions = self.skip_expression(), self.conditions()
+        for event in ("schedule", "workflow_dispatch"):
+            for reuse_pr in ("true", "false"):
+                with self.subTest(event=event, reuse_pr=reuse_pr):
+                    self.assertTrue(evaluate(conditions["plan"], self.context(event, "true", reuse_pr)))
+                    self.assertEqual(evaluate(skip, self.context(event, "true", reuse_pr)), reuse_pr == "true")
+            for pr_available in ("true", "false"):
+                with self.subTest(event=event, pr_available=pr_available):
+                    context = self.context(event, pr_available, "false")
+                    for name in ("checkout", "preserve", "dispatch"):
+                        self.assertEqual(evaluate(conditions[name], context), pr_available == "true", name)
+
+    def test_publication_path_and_permissions_are_untouched(self):
+        workflow = workflow_text()
+        self.assertIn("    if: github.ref == 'refs/heads/main' && inputs.dry_run != true && (inputs.release_tag == '' || github.event_name != 'workflow_dispatch')\n", workflow)
+        self.assertIn("      contents: write # Publish releases and reconcile the release/notes branches.\n      pull-requests: write # Create and reconcile the release PR.\n", workflow)
+        self.assertIn("      actions: write # Dispatch required checks for GITHUB_TOKEN-created release PRs.\n", workflow)
+        self.assertIn("needs.release-please.outputs.release_created == 'true'", workflow)
+        self.assertIn("gh workflow run check.yml --ref \"$HEAD_BRANCH\"", workflow)
+        self.assertIn("gh workflow run supply-chain.yml --ref \"$HEAD_BRANCH\" -f pr_number=\"$PR_NUMBER\"", workflow)
+
+
 class ReleaseRetryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP"))
@@ -271,7 +384,7 @@ class ReleaseRetryTests(unittest.TestCase):
         before = self.state()
         self.assertEqual(self.outputs("plan"), {"reuse_pr": "true"})
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        self.assertIn("skip-github-pull-request: ${{ steps.plan.outputs.reuse_pr == 'true' }}", workflow)
+        self.assertIn("skip-github-pull-request: ${{ github.event_name == 'push' || steps.plan.outputs.reuse_pr == 'true' }}", workflow)
         self.assertNotIn("skip-github-release:", workflow)
         self.fresh_checkout()
         self.reconcile()
@@ -385,10 +498,45 @@ class ReleaseRetryTests(unittest.TestCase):
                     self.assertEqual(self.git("rev-parse", "HEAD"), head)
                     self.assertEqual(self.git("status", "--porcelain"), "")
 
+    def test_old_gh_pagination_reads_later_pages_and_preserves_notes(self):
+        footer = '\nQuoted "notes" and a backslash \\ remain intact.\n'
+        self.state(page_size=1, empty_first_page=True, body=BODY + footer,
+                   commit_message_tail='\n\nMultiline "message" with \\ and Unicode ✓')
+        before = self.state()
+        # The selected PR and newest native commit are both on later pages.
+        self.assertEqual(self.outputs("plan"), {"reuse_pr": "true"})
+        outputs = self.outputs("select")
+        self.assertEqual(outputs["pr_available"], "true")
+        self.assertEqual(json.loads(outputs["pr"]), {"number": 42, "headBranchName": BRANCH})
+        self.assertEqual(self.state(), before, "Inspection is read-only")
+        self.reconcile()
+        self.assert_reconciled()
+        self.assertIn(footer, self.state()["body"])
+
     def test_new_main_snapshot_regenerates_native_pr(self):
         new_main = self.git("commit-tree", "HEAD^{tree}", "-p", self.main, input="feat: next main snapshot\n").strip()
         self.env["GITHUB_SHA"] = new_main
         self.assertEqual(self.outputs("plan"), {"reuse_pr": "false"})
+
+    def test_main_running_ahead_of_untouched_pr_is_stale_until_regenerated(self):
+        # A push no longer regenerates the PR (TOG-12931), so main routinely
+        # runs several commits ahead of it. The dispatch/schedule plan - and the
+        # docs/releases.md freshness check - must call that stale, and fresh
+        # again only once native force-replaces the branch on the new main.
+        self.git("checkout", "main")
+        for index in range(3):
+            (self.repo / f"main-{index}.txt").write_text("main\n")
+            self.git("add", f"main-{index}.txt")
+            self.git("commit", "-m", f"fix: main {index}")
+        new_main = self.git("rev-parse", "HEAD").strip()
+        self.env["GITHUB_SHA"] = new_main
+        self.assertEqual(self.outputs("plan"), {"reuse_pr": "false"})
+        self.git("checkout", "-B", BRANCH, new_main)
+        (self.repo / "CHANGELOG.md").write_text(CHANGELOG)
+        self.git("add", "CHANGELOG.md")
+        self.git("commit", "-m", "chore(main): release 0.2.0")
+        self.git("push", "--force", "origin", BRANCH)
+        self.assertEqual(self.outputs("plan"), {"reuse_pr": "true"})
 
     def test_update_branch_merge_regenerates_stale_release(self):
         # "Update branch" merges a newer main into the release branch: ancestry
@@ -423,8 +571,8 @@ class ReleaseRetryTests(unittest.TestCase):
         with self.assertRaises(json.JSONDecodeError):
             json.loads("")  # Negative control: original post-publication value.
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        self.assertEqual(workflow.count("if: steps.select.outputs.pr_available == 'true'"), 2)
-        self.assertIn("if: needs.release-please.outputs.pr_available == 'true'", workflow)
+        self.assertEqual(workflow.count("if: github.event_name != 'push' && steps.select.outputs.pr_available == 'true'"), 2)
+        self.assertIn("if: github.event_name != 'push' && needs.release-please.outputs.pr_available == 'true'", workflow)
         self.assertNotIn("skip-github-release:", workflow)
         self.assertEqual(self.state(), before, "No push, PATCH, notes PUT or branch creation")
 

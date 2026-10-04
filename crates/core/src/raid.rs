@@ -235,6 +235,64 @@ impl RaidWatch {
     }
 }
 
+/// One recorded join for [`scan_joins_for_bursts`]. `occurred_at` is the
+/// stored occurrence time as an RFC 3339 string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricalJoin {
+    pub guild_id: String,
+    pub member_id: String,
+    pub occurred_at: String,
+}
+
+/// Fixed settings for one replay. Legacy replay passes plain numbers, so a
+/// threshold cannot change halfway through a scan.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RaidScanOptions {
+    pub tuning: RaidTuning,
+    pub cooldown_seconds: f64,
+    pub max_ids: usize,
+}
+
+impl Default for RaidScanOptions {
+    fn default() -> Self {
+        Self {
+            tuning: RaidTuning::default(),
+            cooldown_seconds: DEFAULT_RAID_COOLDOWN_SECONDS,
+            max_ids: DEFAULT_RAID_MAX_IDS,
+        }
+    }
+}
+
+/// Replays recorded joins through a fresh [`RaidWatch`], so a threshold can be
+/// checked against history before it ships. Input need not be sorted: joins are
+/// stably sorted by parsed instant (input order on ties), not by string. A
+/// timestamp that is not valid RFC 3339 is skipped, as legacy skipped
+/// `Date.parse` NaN. Window, dedupe and cooldown state stay per guild.
+pub fn scan_joins_for_bursts(
+    joins: &[HistoricalJoin],
+    options: RaidScanOptions,
+) -> Result<Vec<RaidAlert>, RaidConfigError> {
+    let mut watch = RaidWatch::new(options.cooldown_seconds, options.max_ids)?;
+    let mut ordered: Vec<(i64, &HistoricalJoin)> = joins
+        .iter()
+        .filter_map(|join| parse_rfc3339_millis(&join.occurred_at).map(|at_ms| (at_ms, join)))
+        .collect();
+    ordered.sort_by_key(|(at_ms, _)| *at_ms);
+    Ok(ordered
+        .into_iter()
+        .filter_map(|(at_ms, join)| {
+            watch.observe(&join.guild_id, &join.member_id, at_ms, options.tuning)
+        })
+        .collect())
+}
+
+/// Strict RFC 3339 to epoch milliseconds; sub-millisecond digits truncate.
+fn parse_rfc3339_millis(value: &str) -> Option<i64> {
+    use time::format_description::well_known::Rfc3339;
+    let parsed = time::OffsetDateTime::parse(value, &Rfc3339).ok()?;
+    Some(parsed.unix_timestamp() * 1000 + i64::from(parsed.millisecond()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinRiskInput {
     pub guild_id: String,
@@ -528,6 +586,36 @@ mod tests {
         assert!(text.content.contains("...and 1 more"));
         assert!(text.content.contains("kicked, banned and messaged nobody"));
         assert_eq!(text.mentions, MentionPolicy::None);
+    }
+
+    #[test]
+    fn repeat_alert_staff_message_names_sustained_burst() {
+        // Zero cooldown: every threshold-meeting burst after the first is a
+        // repeat. A cap of one id forces the truncation branch too.
+        let mut watch = RaidWatch::new(0.0, 1).unwrap();
+        let tuning = RaidTuning::new(60.0, 2.0).unwrap();
+        assert!(watch.observe("g", "a", 0, tuning).is_none());
+        let first = watch.observe("g", "b", 500, tuning).unwrap();
+        assert!(!first.repeat);
+        let sustained = watch.observe("g", "c", 900, tuning).unwrap();
+        assert!(sustained.repeat);
+        assert!(sustained.truncated);
+        // The sustained burst renders the repeat head staff actually see.
+        let text = sustained.staff_message();
+        assert!(
+            text.content
+                .starts_with("**Join burst still going** - 3 more joins within a second."),
+            "unexpected head: {}",
+            text.content
+        );
+        assert!(text.content.contains("...and 2 more"));
+        assert!(text.content.contains("kicked, banned and messaged nobody"));
+        assert_eq!(text.mentions, MentionPolicy::None);
+        // The first alert keeps the non-repeat head for contrast.
+        assert!(first
+            .staff_message()
+            .content
+            .starts_with("**Join burst** - 2 accounts joined"));
     }
 
     #[test]

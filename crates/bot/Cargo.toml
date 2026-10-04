@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "two-bot"
 path = "src/main.rs"
@@ -14,9 +17,9 @@ path = "src/main.rs"
 # version pins the API contract between crates at a glance.
 [dependencies]
 two-bot-core = { version = "0.2.0", path = "../core", features = ["db"] }
-two-bot-discord = { version = "0.2.0", path = "../discord" }
+two-bot-discord = { version = "0.2.0", path = "../discord", features = ["db"] }
+two-bot-store = { version = "0.2.0", path = "../store" }
 two-bot-cutover = { version = "0.2.0", path = "../cutover" }
-futures-util = { workspace = true }
 # Relay/audit ids: 16 CSPRNG bytes hex-encoded (same shape as core's
 # internal_actions nonces).
 hex = { workspace = true }
@@ -24,6 +27,7 @@ rand = { workspace = true }
 serde = { workspace = true }
 time = { workspace = true }
 axum = { workspace = true }
+futures-util = { workspace = true }
 # Sole rustls crypto provider (ring): twilight's Shard build panics without
 # exactly one provider feature enabled. Declared here (not on a lib) so the
 # release binary and `cargo test` share the same provider.
@@ -41,6 +45,9 @@ twilight-http = { workspace = true }
 twilight-model = { workspace = true }
 
 [dev-dependencies]
+two-bot-discord = { version = "0.2.0", path = "../discord", features = ["test-support"] }
+# The shared loopback Discord fixture uses SinkExt only in integration tests.
+futures-util = { workspace = true, features = ["sink"] }
 two-bot-testsupport = { version = "0.2.0", path = "../testsupport" }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-websockets = { workspace = true }

@@ -96,27 +96,87 @@ appears. A live-network scratch deploy was not possible from this sandbox
 ## Rust runtime image PR gate
 
 The independent `container smoke` job in `.github/workflows/check.yml` builds
-this repository's Dockerfile on hosted `linux/amd64`, loads it into local Docker,
-and uses BuildKit's `gha` cache. It never pushes an image or receives deployment
-credentials. It also runs on `main` and workflow dispatch (including release
-check dispatches). The existing required `check` job is unchanged.
+this repository's Dockerfile on `linux/amd64`, loads it into local Docker,
+and uses BuildKit's `gha` cache. It now uses the self-hosted CI runner (the
+original measurement below used a hosted runner). It never pushes an image or
+receives deployment credentials. Automatic pull-request CI is the validation
+route; no workflow dispatch is needed for this repair. The existing required
+`check` job is unchanged.
 
 `scripts/container-smoke.py` prints both sizes in bytes and MiB to the log and
-job summary and fails above these calibrated ceilings:
+job summary and fails above these calibrated ceilings. The measurements and
+headroom below are historical, not measurements of the current PR head:
 
-| Artifact | Definition | Measured | Maximum | Headroom |
+| Artifact | Historical definition | Measured | Maximum | Headroom |
 |---|---|---|---|---|
 | Runtime image | Docker image inspect `Size` (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
-| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 7.01 MiB / 7,346,736 bytes | 10 MiB / 10,485,760 bytes | 2.99 MiB / 42.7% |
+| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 10.30 MiB / 10,805,344 bytes | 15 MiB / 15,728,640 bytes | 4.70 MiB / 45.6% |
+
+The baseline used the classic Docker image store. The gate now sums exact
+`docker image history --human=false --format '{{.Size}}'` layer bytes after
+unpacking the image, preserving the uncompressed-layer ceiling on both stores.
+With the containerd store, inspect `Size` includes compressed blobs **plus**
+unpacked snapshots and is logged separately, not compared to that ceiling.
+See [Docker's store documentation](https://docs.docker.com/engine/storage/containerd/)
+and [Moby's layer-history implementation](https://github.com/moby/moby/blob/master/daemon/containerd/image_history.go).
+Neither the 112 MiB image nor the 10 MiB binary budget is increased.
 
 Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
 at source `307b50708ec42e8fc4744c1b804216a22a17625e`. Ceilings allow roughly
 25% image growth rounded up to the next 8 MiB, and roughly 40% binary growth
 rounded up to the next MiB. Base-image/toolchain changes must remeasure and
-justify any future budget increase. Docker is not available in the controller
+justify any future budget increase. Recalibrated 2026-10-01 for the S4 self-role
+runtime (TOG-10292): PR head measured 10,805,344 bytes (10.30 MiB) on the
+ephemeral runner vs main baseline 10,377,112 bytes (9.90 MiB) at `ec49663`;
+growth is linked runtime/handlers/REST plus previously-dead domain/store code
+with no new dependencies, release profile already minimal (opt-level=z, lto,
+strip). Per calibration (measured * 1.4 rounded up to the next MiB):
+10.30 * 1.4 = 14.42 -> 15 MiB. Docker is not available in the controller
 workspace; offline fixture sizes are not measurements.
 
-The hosted parked-mode contract passed, including SIGTERM exit 0 in 0.095 s.
+### Docker history image measurement and immutable-ID pinning
+
+Docker 29.8.1 with the containerd image store reports packed content plus
+unpacked snapshot usage in inspect `Size`; that is not the uncompressed-layer
+budget metric. See the exact-version
+[Moby inspect implementation](https://github.com/moby/moby/blob/docker-v29.8.1/daemon/containerd/image_inspect.go),
+[size accounting](https://github.com/moby/moby/blob/docker-v29.8.1/daemon/containerd/image_list.go),
+and [Docker's containerd storage documentation](https://docs.docker.com/engine/storage/containerd/).
+The original runner's storage backend was not recorded, so its historical
+number is not proof that a current image fits the limit.
+
+The gate reuses merged main [PR #145](https://github.com/TogetherWeOwn/two-bot-next/pull/145)'s
+metric: **summed uncompressed Docker history layer bytes**, from
+`docker history --no-trunc --human=false --format '{{.Size}}' IMAGE_ID`.
+This is Docker history accounting, not unique tar-export bytes,
+merged-filesystem size or compressed registry transfer size. The tag is
+inspected once and its `Id` is used for history, binary measurement, the
+runtime container and the no-server healthcheck probe. The storage-driver
+inspect `Size` is printed for diagnosis only, never used as a fallback.
+
+Each history record must contain a nonempty, nonnegative integer byte count.
+Missing output, malformed/blank/negative records and an all-zero sum fail
+before any containers are created. Zero-size metadata layers are accepted
+alongside positive layers. History uses the existing 30-second Docker
+subprocess timeout; a timeout or nonzero exit aborts measurement without
+falling back to inspect `Size`. Offline fixtures cover this validation,
+separate history/daemon sizes, immutable-ID use and subprocess failures.
+
+The earlier **52/52 offline fixtures for the archive-parser implementation
+are historical and superseded**, not current-head validation. That parser
+failed real CI with `missing image config` in
+[run 36829502178, job 110273465190](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36829502178/job/110273465190).
+The unused streamed-archive helper and its archive-specific builders/tests
+have been removed in favor of main's history metric; the smoke/runtime
+contract fixtures remain.
+
+The **112 MiB image and 10 MiB binary ceilings are unchanged**. Real current-head
+CI must still record the corrected image size and pass the runtime contract and
+both one-byte-budget negative checks; fixture success alone cannot establish
+compliance. No current-head image-fit claim is made here. This measurement
+repair does not change the Dockerfile, runtime base, CA assets or configured user.
+
+The historical hosted parked-mode contract passed, including SIGTERM exit 0 in 0.095 s.
 Manual log verification confirmed both deliberate one-byte-budget invocations
 failed with the corresponding `exceeds size budget` error and that the CI
 negative-test step passed. This exercises real measured artifacts, not mocks.
@@ -158,8 +218,78 @@ Proposed branch protection: require **`container smoke`** alongside `check`,
 `pr-lint` and `gitleaks` after the first green PR. This PR does not change
 repository rules or production/staging deployments.
 
+## Rust synthetic pipeline baseline — TOG-10886
+
+Measured 2026-10-01 at source `445ca88f538c0a9b5913c1f1f53c12dd64501a52`.
+The actual Twilight `Pipeline<GatewayFunnelBuffer>` and durable dispatch
+transaction ran in an ephemeral Rust job container on
+`[self-hosted, two-selfhosted]`, with mock REST and a job-private Postgres 18.6
+service. No staging/production database or live Discord connection was used.
+This is a **debug-profile synthetic pipeline**, not the entire bot or a
+production sizing approval; the historical Node verdict above is unchanged.
+
+| Metric | Standalone baseline | Same-head nightly repeat |
+|---|---:|---:|
+| Peak process RSS | 24.676 MiB | 24.082 MiB |
+| Handler p50 | 18,675.202 µs | 2,857.018 µs |
+| Handler p99 | 119,271.538 µs | 12,171.162 µs |
+| Logical DB exchanges/event | 8.45 | 8.45 |
+| Mock REST p50 / p99 | 3,945.614 / 48,439.975 µs | 1,025.072 / 1,393.941 µs |
+| Paced replay time | 29.988 s | 29.971 s |
+| Command time, including setup and verified teardown | 38.265 s | 30.929 s |
+
+Sources: [standalone run 36821344440](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36821344440)
+and [nightly benchmark job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36821344778/job/110237375246).
+Both uploaded `pipeline-benchmark.json` and the exact tested revision. The nightly
+benchmark job passed; its separate broad sweep failed on database teardown
+statement timeouts and rustdoc bare URLs, so this is not a claim that all nightly
+jobs passed.
+
+The committed [baseline JSON](pipeline-benchmark-baseline.json) retains the first
+successful standalone report verbatim apart from added provenance. It is not
+an average, a synthetic envelope, or the faster repeat. Shared-runner latency
+varied by about 6.5× at p50 and 9.8× at p99 between these runs; host contention
+is a hypothesis, not a proven attribution. Treat the 25% comparison as a coarse
+regression signal pending controlled-runner repeatability work, not a stable
+latency SLA. Neither the tolerance nor baseline was raised to hide a failure.
+
+Both reports prove 107 cached/durable members, 10 cached channels, 600 messages
+plus 300 voice updates, 30 mock REST calls, 942 durable effects, checkpoint 1017,
+and successful disposable DB drop. DB accounting is `(6705 completed SQL
+statements + 900 unlogged BEGIN exchanges) / 900 measured events`; 900 observed
+COMMITs independently validate the transaction count. It is not transport RTT
+or prepared-statement handshake accounting. Handler nearest-rank percentiles
+include handling, drain and awaited commit, but exclude pacing, JSON parsing
+and the separately timed REST calls.
+
+**Synthetic budget verdict: PASS** — both peaks are below the strict 200 MiB
+target and both commands finish well under five minutes. No cgroup memory cap,
+CPU budget, feature-runtime overhead, real-guild soak, or production resize is
+proved by this result.
+
+After building in the authorized CI job container, reproduce in under five
+minutes with:
+
+```sh
+TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_pipeline_bench \
+  timeout 240s target/debug/examples/pipeline_bench > pipeline-benchmark.json
+python3 scripts/compare_pipeline_bench.py pipeline-benchmark.json
+```
+
+Compilation is separate. The existing strict test-database guard runs before
+connection, creates/migrates a unique disposable database, and verifies its drop
+before reporting success. See [the benchmark runbook](pipeline-benchmark.md)
+for the build command, configurable workload, controller cache restrictions,
+measurement definitions and non-required nightly integration.
+
 ## Reproduce
 
 Driver: `/tmp/tog9694/soak.mjs` (kept on the run host, not committed — it
 points at an absolute checkout path). Scratch DB `tog9694_baseline` on
 agent-testdb left intact for B2 cross-checks.
+
+Gate policy (CTO decision, TOG-11786): the comparator fails on peak RSS,
+SQL exchanges per event and handler p50 (25% tolerance). Handler p99 is still
+measured and compared to the same limit, but a breach prints an `ADVISORY` line
+and does not fail the job. Raising the p99 limit needs at least five controlled
+repeats recorded in the baseline JSON plus independent QA acceptance.
