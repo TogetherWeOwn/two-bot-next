@@ -113,3 +113,5 @@ edits require a fresh justification against the PR base, not just a new checksum
 ## License
 
 Business Source License 1.1, converting to MIT three years after each release. See [LICENSE](LICENSE).
+
+<!-- ci-probe: docs-only selection check, throwaway, will close unmerged -->
