@@ -129,7 +129,7 @@ struct JobCap {
 
 /// One row per `metrics::JOBS` entry, in the same order. The hourly
 /// presence probe parks first; the durable checkpoint marker never sheds.
-const JOB_CAPS: [JobCap; 11] = [
+const JOB_CAPS: [JobCap; 12] = [
     JobCap {
         job: "invite_snapshot",
         shed_order: None,
@@ -148,6 +148,10 @@ const JOB_CAPS: [JobCap; 11] = [
     },
     JobCap {
         job: "scheduled_events",
+        shed_order: None,
+    },
+    JobCap {
+        job: "settings",
         shed_order: None,
     },
     JobCap {
@@ -393,6 +397,7 @@ fn job_caps_cover_every_job_label_and_presence_sheds_first() {
                         | "counter"
                         | "rank"
                         | "scheduled_events"
+                        | "settings"
                         | "other"
                 ),
                 "{} never sheds; shed it only through its feature flag, not the log guard",
@@ -457,13 +462,13 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         26,
         "route family changed the budget"
     );
-    assert_eq!(metrics::JOBS.len(), 11, "job family changed the budget");
+    assert_eq!(metrics::JOBS.len(), 12, "job family changed the budget");
     let text = metrics::Metrics::default().render(None);
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 274,
-        "exposition grew past the 274-sample budget (18 events + 4 scalars + 1 latency \
-         + 11 histogram + 156 rest + 44 jobs + 30 voice + 2 db-errors + 4 send-admissions + 4 pool); \
+        series, 278,
+        "exposition grew past the 278-sample budget (18 events + 4 scalars + 1 latency \
+         + 11 histogram + 156 rest + 48 jobs + 30 voice + 2 db-errors + 4 send-admissions + 4 pool); \
          update docs/log-volume-guard.md with the new series"
     );
 }

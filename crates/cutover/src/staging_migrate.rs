@@ -64,6 +64,14 @@ pub struct Request {
     /// required for apply; both are ignored for plan.
     pub plan_manifest_sha256: Option<String>,
     pub plan_run_id: Option<String>,
+    /// Provenance anchor (TOG-15157): path to the producing plan run's
+    /// downloaded `staging-migrate-manifest.json` (the workflow fetches it
+    /// from `plan_run_id` before the runner starts). Apply hashes nothing
+    /// itself here; it parses the artifact and requires its embedded
+    /// `plan_manifest_sha256` to equal the recomputed manifest hash, so the
+    /// bound hash is proven to come from the named run. Required for apply;
+    /// ignored for plan.
+    pub plan_manifest_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +168,65 @@ pub fn check_plan_binding(
     Ok(computed)
 }
 
+/// Provenance of the bound hash, checked after manifest computation but
+/// before any DDL (TOG-15157 gap 2).
+///
+/// Exactness (`check_plan_binding`) proves the hash matches this run's own
+/// source SHA, pending list and migration table, but that recomputation
+/// alone cannot prove the hash came from the named producing run: its
+/// inputs are public. So apply additionally parses the producing run's
+/// downloaded manifest (fetched by the workflow from `plan_run_id` before
+/// the runner starts) and requires its embedded `plan_manifest_sha256` to
+/// equal the just-computed hash. A wrong run id, an expired or missing
+/// artifact, an unreadable or unparseable file, or a field mismatch all
+/// refuse: verification that is impossible is verification that failed.
+/// For plan the check is a no-op (plan produces the manifest; it binds
+/// nothing).
+pub fn check_plan_provenance(req: &Request, computed_hash: &str) -> Result<(), RunError> {
+    if !req.apply {
+        return Ok(());
+    }
+    let run_id = req.plan_run_id.as_deref().unwrap_or_default().trim();
+    let path = req.plan_manifest_path.as_deref().unwrap_or_default().trim();
+    if path.is_empty() {
+        return refuse(
+            "apply requires plan_manifest_path: the producing plan_run_id run's \
+             downloaded staging-migrate-manifest.json",
+        );
+    }
+    let bytes = std::fs::read(path).map_err(|_| {
+        RunError::Refused(format!(
+            "cannot read the manifest the workflow fetched from producing plan_run_id {run_id} \
+             at {path}; plan_run_id verification is impossible, refusing"
+        ))
+    })?;
+    let artifact: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        RunError::Refused(format!(
+            "the manifest fetched from producing plan_run_id {run_id} at {path} is not valid \
+             JSON; plan_manifest_sha256 provenance is unprovable, refusing"
+        ))
+    })?;
+    let produced = artifact
+        .get("plan_manifest_sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if produced.is_empty() {
+        return refuse(format!(
+            "the manifest fetched from producing plan_run_id {run_id} carries no \
+             plan_manifest_sha256; the bound hash is unproven, refusing"
+        ));
+    }
+    if produced != computed_hash.trim().to_ascii_lowercase() {
+        return refuse(format!(
+            "the manifest fetched from producing plan_run_id {run_id} does not match \
+             plan_manifest_sha256; apply is not bound to that plan run, refusing"
+        ));
+    }
+    Ok(())
+}
+
 /// Pure prerequisite checks; nothing here touches the network.
 ///
 /// Pinned-identity model: the workflow pins the exact non-secret staging
@@ -224,6 +291,21 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
             );
         }
         _ => {}
+    }
+    // Provenance anchor: apply must also name the producing run's downloaded
+    // manifest so `run_on_pool` can prove the bound hash came from that run.
+    // Shape only here; the read and comparison happen after the manifest is
+    // computed but before any DDL.
+    if req.apply
+        && req
+            .plan_manifest_path
+            .as_deref()
+            .is_none_or(|p| p.trim().is_empty())
+    {
+        return refuse(
+            "apply requires plan_manifest_path: the producing plan_run_id run's \
+             downloaded staging-migrate-manifest.json",
+        );
     }
     // NOTE: no `staging`-substring requirement here. The pinned host plus the
     // binding-match check in `verify_target` is the staging identity; the
@@ -430,6 +512,9 @@ async fn run_on_pool(
         return refuse("expected_pending does not match the computed pending list");
     }
     let computed_hash = check_plan_binding(req, &pending, &MIGRATOR)?;
+    // Provenance follows exactness: the bound hash must additionally be the
+    // hash the named producing plan run uploaded. Both refuse before any DDL.
+    check_plan_provenance(req, &computed_hash)?;
 
     let mut applied = 0usize;
     let mut after = before.clone();
@@ -487,6 +572,10 @@ async fn run_on_pool(
         "expected_pending": expected,
         "plan_manifest_sha256": computed_hash,
         "plan_run_id": req.plan_run_id.clone().unwrap_or_default(),
+        // True only for apply, and only because `check_plan_provenance`
+        // passed above: reaching this manifest means the bound hash was
+        // proven to come from the named producing plan run.
+        "plan_provenance_verified": req.apply,
         "applied_count": applied,
     }))
 }
@@ -677,6 +766,10 @@ mod tests {
             ),
             plan_manifest_sha256: Some(hash),
             plan_run_id: Some("123456789".to_owned()),
+            // Shape-valid only: `validate_request` checks presence, while
+            // `check_plan_provenance` reads the file. Provenance tests below
+            // point this at real temp manifests.
+            plan_manifest_path: Some("producing-plan/staging-migrate-manifest.json".to_owned()),
         }
     }
 
@@ -742,6 +835,8 @@ mod tests {
             },
             |r: &mut Request| r.plan_run_id = Some(String::new()),
             |r: &mut Request| r.plan_run_id = Some("plan-42".to_owned()),
+            |r: &mut Request| r.plan_manifest_path = None,
+            |r: &mut Request| r.plan_manifest_path = Some("   ".to_owned()),
         ] {
             let mut req = good.clone();
             mutate(&mut req);
@@ -753,9 +848,130 @@ mod tests {
             expected_pending: None,
             plan_manifest_sha256: None,
             plan_run_id: None,
+            plan_manifest_path: None,
             ..good
         };
         assert!(validate_request(&plan).is_ok());
+    }
+
+    /// Write `contents` to a unique temp file and return its path. Unit tests
+    /// run in parallel in one process, so the atomic counter keeps names
+    /// disjoint; the caller removes the file.
+    fn temp_manifest(contents: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "staging-provenance-test-{}-{id}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).expect("temp manifest must be writable");
+        path
+    }
+
+    /// A producing-run manifest artifact carrying `hash` in its embedded
+    /// `plan_manifest_sha256` field, as the plan job's `tee` would upload it.
+    fn producing_manifest(hash: &str) -> String {
+        json!({
+            "runner_version": RUNNER_VERSION,
+            "mode": "plan",
+            "source_sha": "a".repeat(40),
+            "plan_manifest_sha256": hash,
+            "plan_run_id": "",
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn plan_provenance_accepts_the_producing_run_manifest() {
+        let sha = "a".repeat(40);
+        let pending = pending_versions();
+        let hash = manifest_hash(&sha, &pending, &MIGRATOR);
+        let path = temp_manifest(&producing_manifest(&hash));
+        let req = Request {
+            plan_manifest_path: Some(path.to_string_lossy().into_owned()),
+            ..bound_apply(&pending, &sha)
+        };
+        assert!(validate_request(&req).is_ok());
+        assert_eq!(check_plan_binding(&req, &pending, &MIGRATOR).unwrap(), hash);
+        assert!(check_plan_provenance(&req, &hash).is_ok());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn plan_provenance_refuses_another_run_manifest() {
+        let sha = "a".repeat(40);
+        let pending = pending_versions();
+        let hash = manifest_hash(&sha, &pending, &MIGRATOR);
+        // Same shape, different producing run: its manifest carries another
+        // hash, so binding apply to this run id must refuse.
+        let other = manifest_hash(&"b".repeat(40), &pending, &MIGRATOR);
+        assert_ne!(other, hash);
+        let path = temp_manifest(&producing_manifest(&other));
+        let req = Request {
+            plan_manifest_path: Some(path.to_string_lossy().into_owned()),
+            ..bound_apply(&pending, &sha)
+        };
+        assert!(validate_request(&req).is_ok());
+        let err = check_plan_provenance(&req, &hash).unwrap_err();
+        assert!(matches!(err, RunError::Refused(_)));
+        let message = err.to_string();
+        assert!(message.contains("plan_run_id"), "{message}");
+        assert!(message.contains("plan_manifest_sha256"), "{message}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn plan_provenance_refuses_when_verification_is_impossible() {
+        let sha = "a".repeat(40);
+        let pending = pending_versions();
+        let hash = manifest_hash(&sha, &pending, &MIGRATOR);
+        let good = bound_apply(&pending, &sha);
+        // A wrong run id (or an expired artifact) leaves no manifest file:
+        // the download step fails and, if the runner is ever reached without
+        // one, the missing file refuses rather than proceeding unverified.
+        let missing = Request {
+            plan_manifest_path: Some(
+                std::env::temp_dir()
+                    .join("staging-provenance-test-no-such-file.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..good.clone()
+        };
+        assert!(validate_request(&missing).is_ok());
+        assert!(matches!(
+            check_plan_provenance(&missing, &hash),
+            Err(RunError::Refused(_))
+        ));
+        // Corrupt or field-less artifacts are equally unprovable.
+        for contents in [
+            "{not json".to_owned(),
+            json!({"mode": "plan"}).to_string(),
+            json!({"mode": "plan", "plan_manifest_sha256": 42}).to_string(),
+            json!({"mode": "plan", "plan_manifest_sha256": ""}).to_string(),
+        ] {
+            let path = temp_manifest(&contents);
+            let req = Request {
+                plan_manifest_path: Some(path.to_string_lossy().into_owned()),
+                ..good.clone()
+            };
+            assert!(matches!(
+                check_plan_provenance(&req, &hash),
+                Err(RunError::Refused(_))
+            ));
+            std::fs::remove_file(&path).ok();
+        }
+        // Plan binds nothing, so it never reads the (absent) artifact.
+        let plan = Request {
+            apply: false,
+            expected_pending: None,
+            plan_manifest_sha256: None,
+            plan_run_id: None,
+            plan_manifest_path: None,
+            ..good
+        };
+        assert!(check_plan_provenance(&plan, &hash).is_ok());
     }
 
     #[test]
@@ -771,6 +987,7 @@ mod tests {
             expected_pending: None,
             plan_manifest_sha256: None,
             plan_run_id: None,
+            plan_manifest_path: None,
         };
         assert!(validate_request(&ok).is_ok());
         // The verified shared-Neon staging identity needs no `staging` in the
@@ -857,9 +1074,23 @@ mod tests {
             expected_pending: Some(String::new()),
             plan_manifest_sha256: Some("ab".repeat(32)),
             plan_run_id: Some("123456789".to_owned()),
+            plan_manifest_path: Some("producing-plan/staging-migrate-manifest.json".to_owned()),
             ..ok.clone()
         })
         .is_ok());
+        // Apply refuses without the producing run's downloaded manifest: a
+        // bound hash with no provenance anchor cannot be verified.
+        assert!(matches!(
+            validate_request(&Request {
+                apply: true,
+                expected_pending: Some(String::new()),
+                plan_manifest_sha256: Some("ab".repeat(32)),
+                plan_run_id: Some("123456789".to_owned()),
+                plan_manifest_path: None,
+                ..ok.clone()
+            }),
+            Err(RunError::Refused(_))
+        ));
     }
 
     #[test]
@@ -875,6 +1106,7 @@ mod tests {
             expected_pending: None,
             plan_manifest_sha256: None,
             plan_run_id: None,
+            plan_manifest_path: None,
         };
         assert!(validate_request(&base).is_ok());
         assert!(verify_target(&base).is_ok());
