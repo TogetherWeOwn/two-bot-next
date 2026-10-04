@@ -2289,17 +2289,17 @@
           "[f114c44](https://github.com/TogetherWeOwn/two-bot/commit/f114c44e3003dc1494133dc296dfb8af62c8226a)",
           "`src/discord/`, `src/index.ts/`, `src/store/`, `src/tempVoice/`",
           "TOG-3052: temp-voice generator (join-to-create), staging only",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
-        "TOG-10093",
         "TOG-10119"
       ],
-      "status": "manual",
+      "status": "automated",
       "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Join the configured creator channel as a disposable member, then leave.",
       "expected": "Exactly one owned room is created and the member moved; the empty room is removed; outside the allowlisted guild nothing is created.",
-      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
+      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference. Fixture half: the offline `verification` command at the exact head; the staging half above is unchanged.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- joining_a_channel_that_is_not_a_creator_never_creates_a_room a_guild_without_creator_channels_never_creates_a_room",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
     },
     {
@@ -2356,17 +2356,17 @@
           "[847fbf8](https://github.com/TogetherWeOwn/two-bot/commit/847fbf812144980e0964e02b0b024207044f0913)",
           "`src/tempVoice/`",
           "TOG-3471: serialize guild reservations and enforce overwrite preflight",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
-        "TOG-10093",
         "TOG-10119"
       ],
-      "status": "manual",
+      "status": "automated",
       "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Have two disposable members join the creator channel together; take the overwrite-preflight refusal from TOG-10093’s fixture.",
       "expected": "Each member gets one distinct room with no duplicate reservation; a create whose overwrites exceed bot permissions is refused before any channel exists.",
-      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
+      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference. Fixture half: the offline `verification` command at the exact head; the staging half above is unchanged.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- refused_creation_plan_records_a_failure_before_any_channel_is_created two_simultaneous_members_get_distinct_persisted_rooms",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
     },
     {
@@ -2398,20 +2398,18 @@
           "[50c3e9f](https://github.com/TogetherWeOwn/two-bot/commit/50c3e9f584e89ba4a8ff9edb504b531f1a5e938c)",
           "`src/tempVoice/`",
           "TOG-3471: retain temp-voice provenance after rollback failure",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
-        "TOG-10093",
         "TOG-10119"
       ],
-      "status": "waived",
+      "status": "automated",
       "action": "In TOG-10093’s mock-Discord fixture, fail a create and then its rollback.",
       "expected": "The room keeps its provenance so a later sweep removes it; no unmanaged orphan channel.",
-      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
-      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
-      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion; fixture proof only, no live fault injection, staging/production SQL or credentials.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- failed_rollback_keeps_the_room_tracked_until_a_later_sweep_removes_it",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
     },
     {
       "id": "s13-984175d",
