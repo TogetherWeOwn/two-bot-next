@@ -613,6 +613,21 @@ class ActiveLagTests(OfflineTestCase):
         self.assertFalse(rollout.converged(lag_row(), IMAGE, 8))
         self.assertTrue(rollout.active_lag(lag_row(), IMAGE, 8))
 
+    def test_in_use_singleton_counted_active_not_healthy_is_lag_not_converged(self):
+        # durable_object scheduling: the serving instance reads active=1, healthy=0.
+        row = completed_row()
+        row["health"]["instances"].update(active=1, healthy=0)
+        self.assertFalse(rollout.converged(row, IMAGE, 8))
+        self.assertTrue(rollout.active_lag(row, IMAGE, 8))
+        for key in ["failed", "starting", "scheduling"]:
+            with self.subTest(key=key):
+                bad = completed_row()
+                bad["health"]["instances"].update(active=1, healthy=0, **{key: 1})
+                self.assertFalse(rollout.active_lag(bad, IMAGE, 8))
+        idle = completed_row()
+        idle["health"]["instances"].update(active=0, healthy=0)
+        self.assertFalse(rollout.active_lag(idle, IMAGE, 8))
+
     def test_pending_and_progressing_are_never_lag(self):
         for status in ["pending", "progressing"]:
             with self.subTest(status=status):

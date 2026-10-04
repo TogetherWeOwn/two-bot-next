@@ -27,8 +27,7 @@ MAX_BODY = 2 * 1024 * 1024
 # so an explicit agent is required for the gate to see the Worker at all.
 USER_AGENT = "two-bot-next-staging-rollout/1.0"
 # Consecutive fully-passing verify passes required before a completed rollout
-# whose only deviation is the control-plane `active` counter still reading 0
-# (with `healthy` at 1) is accepted. Each pass re-checks every identity and
+# whose only deviation is a `LAG_COUNTS` instance-counter shape is accepted. Each pass re-checks every identity and
 # runtime probe; any non-passing poll resets the streak.
 ACTIVE_LAG_CONFIRMATIONS = 2
 # Polls (5s apart) tolerated while a completed rollout's target image is not
@@ -349,18 +348,27 @@ def converged(row, image, target_version):
             and progress_ok)
 
 
+# Control-plane counter shapes that differ from `converged` only in how Cloudflare
+# reports one serving instance: `active` still reading 0 right after the rollout,
+# or, under durable_object scheduling, the in-use instance counted `active` but
+# not `healthy` (observed steady state while the exact build served ready).
+LAG_COUNTS = (
+    {"active": 0, "healthy": 1, "failed": 0, "starting": 0, "scheduling": 0},
+    {"active": 1, "healthy": 0, "failed": 0, "starting": 0, "scheduling": 0},
+)
+
+
 def active_lag(row, image, target_version):
-    """A completed rollout identical to `converged` except the control-plane
-    `active` counter still reads 0 while `healthy` reads 1. Only `verify`
-    consults this, and only as a provisional pass that still needs consecutive
-    fully-passing exact-version runtime probes before acceptance.
+    """A completed rollout identical to `converged` except for one of the
+    `LAG_COUNTS` counter shapes. Only `verify` consults this, and only as a
+    provisional pass that still needs consecutive fully-passing exact-version
+    runtime probes before acceptance.
     """
     shape = _rollout_shape(row, image, target_version)
     if shape is None:
         return False
     counts, progress_ok = shape
-    return (counts == {"active": 0, "healthy": 1, "failed": 0, "starting": 0, "scheduling": 0}
-            and progress_ok)
+    return counts in LAG_COUNTS and progress_ok
 
 
 def worker_namespace(client, version):
