@@ -226,12 +226,13 @@ pub async fn bind(
     pool: sqlx::PgPool,
     token: &str,
 ) -> std::io::Result<BoundReceiver> {
-    use two_bot_core::send_admission::PgSendAdmission;
+    use two_bot_core::send_admission::{PgSendAdmission, SendAdmission};
     use two_bot_discord::internal_actions::CooldownGovernor;
 
     // One shared send-admission lane for both executors: every Discord send,
-    // announcement or event read, holds the same token-wide lane.
-    let admission =
+    // announcement or event read, holds the same token-wide lane. Bound as the
+    // trait object so both executor constructors coerce without re-wrapping.
+    let admission: Arc<dyn SendAdmission> =
         Arc::new(PgSendAdmission::new(pool.clone(), token).map_err(|_| {
             std::io::Error::other("internal-action admission configuration invalid")
         })?);
