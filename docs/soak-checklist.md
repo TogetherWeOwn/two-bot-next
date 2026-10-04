@@ -1384,7 +1384,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** The gated verifier returns the mapped event with the 7-field read result and refuses unmapped keys, a disabled flag, replayed nonces and forged signatures without Discord writes.
 - **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-15757](/TOG/issues/TOG-15757)
-- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib event_key_names_a_key_never_a_snowflake && python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test internal_action_store event_key_map && python3 scripts/cargo_cache.py run -- test -p two-bot --lib event_read
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib event_key_names_a_key_never_a_snowflake && python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test internal_action_store event_key_map && python3 scripts/cargo_cache.py run -- test -p two-bot event_read
 
 ### s13-dc2b507: dc2b507 — feat(voice): reconcile open-half sessions with explicit reasons (#273)
 
