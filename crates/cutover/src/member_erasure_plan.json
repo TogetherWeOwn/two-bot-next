@@ -53,7 +53,7 @@
     {
       "table": "moderation_idempotency",
       "columns": ["result_json", "idempotency_key"],
-      "predicate": "guild_id = $1 AND (result_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR idempotency_key IN (SELECT idempotency_key FROM moderation_audit WHERE guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR metadata_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))))"
+      "predicate": "guild_id = $1 AND (state IS DISTINCT FROM 'done' OR outcome IS DISTINCT FROM 'operator_released') AND (result_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR idempotency_key IN (SELECT idempotency_key FROM moderation_audit WHERE guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR metadata_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))))"
     },
     {
       "table": "moderation_audit",

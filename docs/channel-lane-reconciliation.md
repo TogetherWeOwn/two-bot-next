@@ -39,7 +39,10 @@ existing approval gates; integration tests use only disposable test services.
    without committing release; inspect again, do not blindly reuse confirmation.
 6. Verify the released audit receipt. The CLI preserves `moderation_lockdowns`
    byte-for-byte and retires the old request to `done/operator_released`, so old
-   redelivery replays a no-mutation result. Resume workers only when safe. A new
+   redelivery replays a no-mutation result. Member erasure (operator or original
+   actor) deletes the personal audit rows but never this `operator_released`
+   ledger row: it is the replay fence, holding only the key, action, request
+   hash, a generic result and timestamps. Resume workers only when safe. A new
    `/unlock` uses the surviving seed and a new request key; do not unlock a newer
    lockdown based on an old incident. Re-observe Discord after any authorized
    follow-up. Releasing a lane does not itself restore masks or reset slowmode.
@@ -102,7 +105,9 @@ not change any executor's error classification or authorize automatic release.
 
 `crates/core/tests/channel_lane_release.rs` covers scoped inspection, redaction,
 stale/done/inconsistent claims, audit rollback, recovery preservation and terminal
-replay. `crates/bot/tests/channel_lane_release_cli.rs` exercises the real binary:
+replay. `crates/cutover/tests/member_erasure.rs` proves that erasing the releasing
+operator, then the original actor, deletes their audit rows yet leaves the old key
+replaying instead of winning a fresh claim. `crates/bot/tests/channel_lane_release_cli.rs` exercises the real binary:
 a mocked overwrite PUT returns 503, inspection writes nothing, confirmed release
 preserves the seed, old delivery does not repeat the PUT, and a new `/unlock`
 restores the exact original masks. All database connections use the guarded

@@ -1,6 +1,7 @@
 //! Full-schema erasure acceptance, only on the guarded disposable test service.
 
 use sqlx::PgPool;
+use two_bot_core::{ChannelClaim, ChannelModerationStore};
 use two_bot_cutover::member_erasure::{erase_member, plan, schema_gaps, ErasureMode};
 use two_bot_testsupport::TestDatabase;
 
@@ -451,5 +452,111 @@ async fn nested_inviter_session_keys_and_owned_children_are_included() {
     assert_eq!(snapshot(db.pool(), "events").await.len(), 3);
     assert_eq!(snapshot(db.pool(), "community_facts").await.len(), 3);
     assert_eq!(snapshot(db.pool(), "lfg_signups").await.len(), 3);
+    db.close().await.unwrap();
+}
+
+/// An operator-released request never had its Discord effect proven. Its ledger
+/// row is the only thing that makes a delayed delivery of the old key replay
+/// instead of claiming afresh and repeating the mutation, so no erasure may
+/// remove it, whether the member is the operator or the original actor.
+#[tokio::test]
+async fn operator_released_request_survives_operator_and_actor_erasure_as_replay_fence() {
+    const CHANNEL: &str = "999999999999999991";
+    const KEY: &str = "wedged-original-key";
+    const TIME: &str = "2026-10-04T00:00:00.000Z";
+    let Some(db) = database().await else { return };
+    let store = ChannelModerationStore::from_pool(db.pool().clone());
+    let ChannelClaim::Claimed { ticket } = store
+        .claim(GUILD, KEY, "moderation.lockdown", "hash", TIME)
+        .await
+        .unwrap()
+    else {
+        panic!("expected a new claim");
+    };
+    assert!(store.claim_channel(&ticket, CHANNEL).await.unwrap());
+    // The original actor's audit is selected by member ID, the operator's by
+    // actor ID; the shared ledger row is reachable through either audit key.
+    sqlx::query(
+        "INSERT INTO moderation_audit
+           (request_id, guild_id, actor_id, action, target_id, channel_id, reason, outcome,
+            idempotency_key, metadata_json, created_at)
+         VALUES ('original-request', $1, $2, 'moderation.lockdown', NULL, $3, 'fixture',
+                 'in_progress', $4, '{}', '2026-10-04T00:00:00Z')",
+    )
+    .bind(GUILD)
+    .bind(USER)
+    .bind(CHANNEL)
+    .bind(KEY)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let inspection = store
+        .inspect_channel_lane(GUILD, CHANNEL, KEY)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .force_release_channel_lane(&inspection, OTHER, "REST settled; channel reconciled")
+        .await
+        .unwrap()
+        .unwrap();
+
+    for (erased, audit_actor) in [(OTHER, "operator"), (USER, "original actor")] {
+        let dry = erase_member(db.pool(), GUILD, erased, ErasureMode::DryRun)
+            .await
+            .unwrap();
+        let rows = |table: &str| dry.iter().find(|row| row.table == table).unwrap().rows;
+        assert_eq!(
+            rows("moderation_idempotency"),
+            0,
+            "{audit_actor} dry run must not select the replay fence"
+        );
+        assert_eq!(rows("moderation_audit"), 1, "{audit_actor} audit is erased");
+        erase_member(
+            db.pool(),
+            GUILD,
+            erased,
+            ErasureMode::Execute { actor: ACTOR },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{audit_actor} erasure must not be refused: {error}"));
+        let audits: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM moderation_audit WHERE actor_id = $1")
+                .bind(erased)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(audits, 0, "{audit_actor} personal audit data must be gone");
+        let fence: (String, Option<String>) = sqlx::query_as(
+            "SELECT state, outcome FROM moderation_idempotency
+              WHERE guild_id = $1 AND idempotency_key = $2",
+        )
+        .bind(GUILD)
+        .bind(KEY)
+        .fetch_one(db.pool())
+        .await
+        .unwrap_or_else(|_| panic!("{audit_actor} erasure deleted the replay fence"));
+        assert_eq!(
+            fence,
+            ("done".to_owned(), Some("operator_released".to_owned()))
+        );
+        let ChannelClaim::Replayed { outcome, .. } = store
+            .claim(GUILD, KEY, "moderation.lockdown", "hash", TIME)
+            .await
+            .unwrap()
+        else {
+            panic!("old key must replay, not win a fresh claim, after {audit_actor} erasure");
+        };
+        assert_eq!(outcome, "operator_released");
+    }
+    // The released lane stays free for a new request on the same channel.
+    let ChannelClaim::Claimed { ticket } = store
+        .claim(GUILD, "next-attempt", "moderation.unlock", "hash", TIME)
+        .await
+        .unwrap()
+    else {
+        panic!("a new key must claim");
+    };
+    assert!(store.claim_channel(&ticket, CHANNEL).await.unwrap());
     db.close().await.unwrap();
 }

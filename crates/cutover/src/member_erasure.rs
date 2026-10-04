@@ -2,6 +2,14 @@
 //!
 //! The embedded plan is reviewed code, never operator input. Count and delete
 //! use the same predicate; a row matching several identity columns counts once.
+//!
+//! One row is deliberately never selected: a `moderation_idempotency` request
+//! an operator reconciled and released (`done` / `operator_released`). Its
+//! Discord effect was never proven, so that row is the replay fence that stops a
+//! delayed delivery of the same key from claiming afresh and repeating the
+//! mutation. It keeps only the key, action, request hash, generic result and
+//! timestamps; the actor, target, reason and operator attribution live in
+//! `moderation_audit`, which erasure still deletes.
 
 use serde::Deserialize;
 use sqlx::{PgConnection, PgPool};

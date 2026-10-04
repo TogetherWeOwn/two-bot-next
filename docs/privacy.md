@@ -49,6 +49,13 @@ are outside this implementation's scope.
 - Self-role audit and panel claims store member IDs, role effects, lease/recovery
   state and outcomes. Settled member records are covered; unresolved role effects
   or active leases refuse erasure rather than discard reconciliation evidence.
+- One moderation ledger row is retained through erasure: a channel request an
+  operator reconciled and released (`moderation_idempotency`, `done` /
+  `operator_released`). Its Discord effect was never proven, so the row is the
+  replay fence that keeps a delayed delivery of the old key from repeating the
+  mutation. It holds only the website or interaction key, action, request hash, a
+  fixed generic result and timestamps. The actor, operator, channel, reason and
+  previous-state audit (`moderation_audit`) are erased as usual.
 - Internal action/replay ledgers store actor/target/resource IDs and outcomes,
   with hashed keys/nonces/event identities. Settings and immutable settings audit
   store operator attribution and JSON policy configuration.
