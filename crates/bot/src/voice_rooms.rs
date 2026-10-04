@@ -6408,14 +6408,18 @@ where
                                 }
                                 ImportDecision::Apply {
                                     candidate: retry,
-                                    message: _,
+                                    message: fresh_message,
                                 } => {
                                     // The fresh state still matches the hash
                                     // (the concurrent change reverted): retry
                                     // once with the fresh snapshot as expected.
+                                    // The reply carries the fresh plan's
+                                    // message: its change count was computed
+                                    // against the fresh state, not the stale
+                                    // preview's.
                                     match store.config_apply(guild_id, &retry, &fresh).await {
                                         Ok(()) => {
-                                            reply(ephemeral_response(&message)).await;
+                                            reply(ephemeral_response(&fresh_message)).await;
                                         }
                                         Err(_) => {
                                             runtime.remember_pending_import(

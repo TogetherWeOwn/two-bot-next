@@ -135,7 +135,7 @@ async fn read_configuration(
              ORDER BY length(channel_id), channel_id",
     )
     .bind(guild)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?
     .iter()
     .map(decode_creator)
@@ -145,7 +145,7 @@ async fn read_configuration(
              WHERE guild_id = $1 ORDER BY length(channel_id), channel_id",
     )
     .bind(guild)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?
     .iter()
     .map(|row| {
@@ -161,7 +161,7 @@ async fn read_configuration(
                WHERE guild_id = $1 ORDER BY game COLLATE "C""#,
     )
     .bind(guild)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?
     .iter()
     .map(|row| {
@@ -177,7 +177,7 @@ async fn read_configuration(
                WHERE guild_id = $1 ORDER BY list_name COLLATE "C", position"#,
     )
     .bind(guild)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?
     {
         let name: String = row.try_get("list_name")?;
@@ -193,7 +193,7 @@ async fn read_configuration(
     let logging =
         match sqlx::query("SELECT channel_id, detail FROM voice_logging WHERE guild_id = $1")
             .bind(guild)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?
         {
             None => None,
@@ -210,14 +210,14 @@ async fn read_configuration(
                      WHERE guild_id = $1 ORDER BY length(member_id), member_id",
                 )
                 .bind(guild)
-                .fetch_all(&mut *tx)
+                .fetch_all(&mut **tx)
                 .await?,
                 mention_role_ids: sqlx::query_scalar(
                     "SELECT role_id FROM voice_logging_mention_roles
                      WHERE guild_id = $1 ORDER BY length(role_id), role_id",
                 )
                 .bind(guild)
-                .fetch_all(&mut *tx)
+                .fetch_all(&mut **tx)
                 .await?,
             }),
         };
@@ -232,7 +232,7 @@ async fn read_configuration(
                ORDER BY c.command COLLATE "C", length(m.role_id), m.role_id"#,
     )
     .bind(guild)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?
     {
         let command: String = row.try_get("command")?;
@@ -247,7 +247,7 @@ async fn read_configuration(
     }
     let settings = match sqlx::query("SELECT * FROM voice_guild_settings WHERE guild_id = $1")
         .bind(guild)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
     {
         Some(row) => GuildSettings {
