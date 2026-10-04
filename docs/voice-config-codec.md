@@ -2,7 +2,8 @@
 
 `two_bot_core::voice_config` implements the standalone, versioned JSON contract
 from `docs/voice-rooms.md`. It is original code written from that specification.
-It has no Discord, database or template-engine dependency and performs no writes.
+It has no Discord or database dependency and performs no writes. It reuses two
+pure core modules for validation: the V7b template lint and the V7a alias table.
 
 ## API and version 1
 
@@ -10,6 +11,11 @@ It has no Discord, database or template-engine dependency and performs no writes
   validates and returns pretty-printed UTF-8 JSON.
 - `import_configuration(bytes, &inventory) -> Result<VoiceConfiguration, VoiceConfigError>`
   parses and validates the entire document before returning any candidate.
+- `decode_configuration(bytes) -> Result<VoiceConfiguration, VoiceConfigError>` is
+  the strict decode alone (size cap, objects only, no duplicate keys, no trailing
+  data), for callers that must report and skip unknown channels before they
+  validate. Never feed uploaded bytes to plain `serde_json::from_slice`: the
+  derived top-level decoder also accepts the positional-array form.
 - `validate_configuration(&config, &inventory)` also validates in-memory values.
 - `VOICE_CONFIG_VERSION` is `1`; there are no implicit migrations or defaults
   between versions. Unknown fields and enum values fail rather than being lost.
@@ -59,10 +65,25 @@ occur twice or be both a creator and standalone template target. Alias/list/
 command keys and role/member lists reject duplicates, preventing silent
 last-entry-wins behaviour.
 
-Limits: default user limit `0..=99`, positive first number, nonblank timezone,
-labels, aliases, list names/choices and command names. Literal text-channel names
-and no-game labels have a 100-Unicode-scalar ceiling. Template **source** is not
-limited to 100 characters: V5 truncates rendered output, not source expressions.
+Limits: default user limit `0..=99`, positive first number, nonblank timezone and
+labels. Literal text-channel names and no-game labels have a 100-Unicode-scalar
+ceiling. Template **source** is not limited to 100 characters: V5 truncates
+rendered output, not source expressions.
+
+Further checks, each naming only the field (never the uploaded text):
+
+- **Templates.** Every creator and standalone `name_template` and `status_template`
+  passes the V7b lint with the V5 passthrough policy. Lint *errors* refuse: an
+  unclosed or unopened construct, an `@@token@@` outside the known list, source
+  over 4096 bytes or nested deeper than 64 levels. Warnings (an empty render, a
+  condition that never matches) stay valid, and an empty template is retained.
+- **Aliases.** Entries load into the V7a `AliasTable`: at most 100 entries, keys and
+  targets at most 100 characters, no control or bidi-override characters,
+  case-folded unique keys and no alias chains.
+- **Lists.** At most 100 lists of at most 100 choices; names and choices are
+  nonblank, at most 100 characters and free of control characters.
+- **Command roles.** `settings.command_roles[].command` must be an exact entry of
+  `voice_access::VOICE_COMMANDS`.
 Import accepts JSON only (YAML payloads fail as malformed) and refuses documents
 over `MAX_IMPORT_BYTES` (256 KiB) on the document before parsing, so an
 oversized upload can never partially apply.
@@ -80,13 +101,15 @@ confirmation. Cross-guild entries must never be treated as relocatable channels.
 The parent V11 slice still owns:
 
 1. Manage Server checks at **both** export/import dispatch and confirmation,
-   attachment byte/count limits, ephemeral download and replies.
+   attachment byte/count limits, ephemeral download and replies. An import that
+   adds a creator row also needs Manage Channels (as `/create` does), checked at
+   preview and again at confirmation.
 2. Mapping the version-1 DTO to V1/V7 persistent settings, and compiling templates
    (including embedded `ROLE:id`/`MEMBER:id` conditions and named-list references)
    with those slices' own implementation. This codec validates explicit DTO
    references, not IDs or conditions embedded in template text. The runtime must
-   also verify IANA timezone names and supported command names with its own
-   providers/registry before applying a candidate.
+   also verify IANA timezone names with its own provider before applying a
+   candidate.
 3. Diff preview, unknown-channel reporting/skipping, confirmation and re-reading
    current inventory/settings before a single transaction. No room is created,
    deleted, renamed, re-owned or moved by this codec.

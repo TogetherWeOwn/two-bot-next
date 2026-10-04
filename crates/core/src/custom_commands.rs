@@ -283,15 +283,19 @@ pub fn check_capacity(
 
 /// Every name Owen owns, derived from the command definitions so a new
 /// builtin can never become shadowable because somebody forgot a second
-/// handwritten list (legacy `BUILTIN_COMMAND_NAMES`). Rota is absent: the
-/// staging-only `/rota-acknowledge` was dropped with the rota stack (matrix
-/// §9 drop 1), so its name is NOT reserved in the port.
+/// handwritten list (legacy `BUILTIN_COMMAND_NAMES`). Voice-room names are
+/// reserved even while `TWO_VOICE` is off: the voice sink matches by name, so
+/// a custom command named `setup` or `export` would otherwise reach the voice
+/// handlers the moment voice turns on. Rota is absent: the staging-only
+/// `/rota-acknowledge` was dropped with the rota stack (matrix §9 drop 1), so
+/// its name is NOT reserved in the port.
 #[must_use]
 pub fn builtin_command_names() -> HashSet<String> {
     super::commands::core_commands()
         .iter()
         .chain(super::feature_commands::feature_commands().iter())
         .chain(super::moderation::moderation_commands().iter())
+        .chain(super::voice_rooms::voice_commands().iter())
         .map(|d| d.name.clone())
         .collect()
 }
@@ -786,6 +790,25 @@ mod tests {
                 validate_put_input(&input, &builtins),
                 Err(CommandError::ReservedName(reserved.to_owned())),
                 "{reserved} reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn put_validation_refuses_every_voice_room_name() {
+        // The voice sink matches by name, so a custom command named after a
+        // voice command would reach the voice handlers.
+        let builtins = builtin_command_names();
+        let voice = crate::voice_rooms::voice_commands();
+        assert!(voice.iter().any(|def| def.name == "setup"));
+        for def in &voice {
+            let mut input = put_input(&def.name);
+            input.text_trigger = None;
+            assert_eq!(
+                validate_put_input(&input, &builtins),
+                Err(CommandError::ReservedName(def.name.clone())),
+                "{} reserved",
+                def.name
             );
         }
     }
