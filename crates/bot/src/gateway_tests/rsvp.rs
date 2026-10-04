@@ -147,17 +147,22 @@ async fn spawn_governed(
     db: &TestDb,
     url: &str,
     rest: &MockRest,
-    admission: Arc<dyn SendAdmission>,
+    token: &str,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> JoinHandle<Result<(), sqlx::Error>> {
     ensure_crypto_provider();
+    // One lane row per test: the admission table is database-wide and holds no
+    // expiry, so a leaked permit under one token would fence every later
+    // governed test that shares it.
+    let admission: Arc<dyn SendAdmission> =
+        Arc::new(PgSendAdmission::new(db.pool.clone(), token).unwrap());
     let saved = load_boot_session(&db.store).await.unwrap();
     let shard =
         crate::gateway::build_shard(TOKEN.into(), Intents::empty(), saved.as_ref(), Some(url));
     let ordered = Arc::new(InteractionRuntime::with_router(
         InteractionRouter::new(gates()),
         db.pool.clone(),
-        ActionExecutor::with_admission(TOKEN.into(), Some(rest.origin()), Arc::clone(&admission))
+        ActionExecutor::with_admission(token.into(), Some(rest.origin()), Arc::clone(&admission))
             .unwrap(),
         0,
         ClassifierConfig::default(),
@@ -171,7 +176,7 @@ async fn spawn_governed(
         None,
         Some(crate::command_runtime::CommandRuntime::new(
             db.pool.clone(),
-            ActionExecutor::with_admission(TOKEN.into(), Some(rest.origin()), admission).unwrap(),
+            ActionExecutor::with_admission(token.into(), Some(rest.origin()), admission).unwrap(),
             crate::command_runtime::router_with_commands(gates()),
             GUILD.parse().unwrap(),
             true,
@@ -190,7 +195,7 @@ async fn spawn_governed(
 async fn connect_governed(
     db: &TestDb,
     rest: &MockRest,
-    admission: Arc<dyn SendAdmission>,
+    token: &str,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> (
     JoinHandle<Result<(), sqlx::Error>>,
@@ -198,7 +203,7 @@ async fn connect_governed(
 ) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
-    let runner = spawn_governed(db, &url, rest, admission, shutdown).await;
+    let runner = spawn_governed(db, &url, rest, token, shutdown).await;
     let (socket, _) = listener.accept().await.unwrap();
     let (_, mut ws) = ServerBuilder::new().accept(socket).await.unwrap();
     ws.send(Message::text(
@@ -714,12 +719,10 @@ async fn receipt_callback_waits_out_brief_lane_occupancy() {
     // A's live-event read holds the single-flight lane for 1.5 s: inside B's
     // 2.5 s retry budget and Discord's three-second acknowledgement window.
     let rest = lane_holding_rest(Arc::clone(&seen), Duration::from_millis(1500)).await;
-    let admission: Arc<dyn SendAdmission> =
-        Arc::new(PgSendAdmission::new(db.pool.clone(), TOKEN).unwrap());
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
     let (runner, mut ws) = tokio::time::timeout(
         Duration::from_secs(120),
-        connect_governed(&db, &rest, admission, Some(receiver)),
+        connect_governed(&db, &rest, "mock-token-waits", Some(receiver)),
     )
     .await
     .expect("governed gateway connect deadline");
@@ -816,9 +819,7 @@ async fn exhausted_lane_hold_fences_checkpoint_past_unacked_command() {
     // Past B's 2.5 s retry budget but inside the 5 s wire timeout, so A's read
     // still completes while only B's acknowledgement is lost.
     let rest = lane_holding_rest(Arc::clone(&seen), Duration::from_millis(3500)).await;
-    let admission: Arc<dyn SendAdmission> =
-        Arc::new(PgSendAdmission::new(db.pool.clone(), TOKEN).unwrap());
-    let (runner, mut ws) = connect_governed(&db, &rest, admission, None).await;
+    let (runner, mut ws) = connect_governed(&db, &rest, "mock-token-exhausted", None).await;
     ws.send(Message::text(interaction(2, "going").to_string()))
         .await
         .unwrap();
@@ -878,10 +879,9 @@ async fn governed_sticky_defers_through_rsvp_lane_hold() {
     // sticky command arrives through the shared governed gate: the sticky
     // defer must wait out the occupancy instead of failing pre-wire.
     let rest = lane_holding_rest(Arc::clone(&seen), Duration::from_millis(1500)).await;
-    let admission: Arc<dyn SendAdmission> =
-        Arc::new(PgSendAdmission::new(db.pool.clone(), TOKEN).unwrap());
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
-    let (runner, mut ws) = connect_governed(&db, &rest, admission, Some(receiver)).await;
+    let (mut runner, mut ws) =
+        connect_governed(&db, &rest, "mock-token-sticky", Some(receiver)).await;
     ws.send(Message::text(interaction(2, "going").to_string()))
         .await
         .unwrap();
@@ -960,7 +960,14 @@ async fn governed_sticky_defers_through_rsvp_lane_hold() {
     })
     .await
     .expect("rsvp completion deadline");
-    wait_sequence(&db.store, 2).await;
+    // Surface a quiet runner death with its error instead of timing out: the
+    // runner owns the only copy of a checkpoint-hold or I/O failure.
+    tokio::select! {
+        _ = wait_sequence(&db.store, 2) => {},
+        result = &mut runner => {
+            panic!("governed runner exited before sequence 2: {result:?}");
+        }
+    }
     let requests = rest.requests();
     let rsvp_edits: Vec<_> = requests
         .iter()
@@ -982,14 +989,21 @@ async fn governed_sticky_defers_through_rsvp_lane_hold() {
             .unwrap(),
         1
     );
+    // B (sticky) is never acknowledged by the ordered runtime — sticky is not
+    // an RSVP command — so the cursor fences past A and the runner exits with
+    // the acknowledgement-hold error instead of shutting down cleanly.
     shutdown.send_replace(true);
-    // Bound the shutdown drain: a wedged runner must fail loudly with a
-    // message instead of burning the CI budget with zero output.
-    tokio::time::timeout(Duration::from_secs(30), runner)
+    let error = tokio::time::timeout(Duration::from_secs(30), runner)
         .await
         .expect("governed runner shutdown deadline")
         .unwrap()
-        .unwrap();
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("interaction acknowledgement failed; checkpoint unchanged"),
+        "{error}"
+    );
     drop(ws);
     rest.shutdown().await;
     // Bound teardown likewise: dropping the schema must not wait forever.
@@ -1040,7 +1054,7 @@ async fn rsvp_lookup_and_completion_edit_wait_out_lane_hold() {
     let seen = Arc::new(AtomicBool::new(false));
     let rest = handoff_rest(Arc::clone(&seen)).await;
     let admission: Arc<dyn SendAdmission> =
-        Arc::new(PgSendAdmission::new(db.pool.clone(), TOKEN).unwrap());
+        Arc::new(PgSendAdmission::new(db.pool.clone(), "mock-token-lookup").unwrap());
     let holder = governed_executor(&rest, Arc::clone(&admission));
     let worker = governed_executor(&rest, Arc::clone(&admission));
     // Occupy the lane with a first lookup whose delayed response holds it.
@@ -1113,7 +1127,7 @@ async fn receipt_callback_total_stays_inside_absolute_budget() {
     })
     .await;
     let admission: Arc<dyn SendAdmission> =
-        Arc::new(PgSendAdmission::new(db.pool.clone(), TOKEN).unwrap());
+        Arc::new(PgSendAdmission::new(db.pool.clone(), "mock-token-total").unwrap());
     let holder = governed_executor(&rest, Arc::clone(&admission));
     let worker = governed_executor(&rest, Arc::clone(&admission));
     let occupied = tokio::spawn(async move { holder.get_scheduled_event(GUILD, EVENT).await });
