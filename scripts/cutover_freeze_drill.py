@@ -98,15 +98,31 @@ def plan_lockdown_masks(prior_allow, prior_deny):
 
 
 def everyone_overwrite(channel):
-    """Read the @everyone permission overwrite from a channel payload."""
+    """Read the @everyone permission overwrite from a channel payload.
+
+    The @everyone overwrite is the role overwrite (type 0) whose id is the
+    guild's own id. Both must match: any other role overwrite is skipped so
+    a foreign seed is never read from or written back to @everyone.
+    """
+    guild_id = channel.get("guild_id")
+    if not guild_id:
+        return {"allow": "0", "deny": "0", "exists": False}
     for ow in channel.get("permission_overwrites") or []:
-        if str(ow.get("type")) == "0" or ow.get("id") == channel.get("guild_id"):
-            # Role overwrites carry type 0; match the guild's own id when known.
-            if ow.get("id") == channel.get("guild_id") or str(ow.get("type")) == "0":
-                return {"allow": str(ow.get("allow", "0")),
-                        "deny": str(ow.get("deny", "0")),
-                        "exists": True}
+        if not isinstance(ow, dict):
+            continue
+        if str(ow.get("type")) == "0" and str(ow.get("id")) == str(guild_id):
+            return {"allow": str(ow.get("allow", "0")),
+                    "deny": str(ow.get("deny", "0")),
+                    "exists": True}
     return {"allow": "0", "deny": "0", "exists": False}
+
+
+def _to_int(value, what):
+    """Parse a live payload integer, normalizing failures to DrillError."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise DrillError(f"unparseable {what} in channel payload")
 
 
 class StepTimer:
@@ -161,12 +177,18 @@ def mock_transport(state=None):
             box["channel"]["rate_limit_per_user"] = seconds
             return {"rate_limit_per_user": seconds}
         if op == "patch_overwrite":
-            box["channel"]["permission_overwrites"] = [{
-                "id": box["channel"]["guild_id"], "type": 0,
-                "allow": kw["allow"], "deny": kw["deny"]}]
+            # Like the live per-overwrite PUT: upsert only the @everyone
+            # entry, preserving every unrelated overwrite.
+            overwrites = [ow for ow in box["channel"]["permission_overwrites"]
+                          if str(ow.get("id")) != str(kw["guild_id"])]
+            overwrites.append({"id": box["channel"]["guild_id"], "type": 0,
+                               "allow": kw["allow"], "deny": kw["deny"]})
+            box["channel"]["permission_overwrites"] = overwrites
             return {"allow": kw["allow"], "deny": kw["deny"]}
         if op == "delete_overwrite":
-            box["channel"]["permission_overwrites"] = []
+            box["channel"]["permission_overwrites"] = [
+                ow for ow in box["channel"]["permission_overwrites"]
+                if str(ow.get("id")) != str(kw["guild_id"])]
             return {}
         if op == "delete_notice":
             box["notices"].pop(kw["notice_id"], None)
@@ -299,11 +321,10 @@ def run_drill(guild_id, channel_id, reason, call, timer=None):
 
 def _read_baseline(call, channel_id):
     channel = call("get_channel", channel_id=channel_id)
-    if channel.get("guild_id") not in (STAGING_GUILD_ID, None) and \
-            channel.get("guild_id") != STAGING_GUILD_ID:
+    if channel.get("guild_id") != STAGING_GUILD_ID:
         raise DrillError("refusing: channel is not in the staging guild")
     ow = everyone_overwrite(channel)
-    slowmode = int(channel.get("rate_limit_per_user") or 0)
+    slowmode = _to_int(channel.get("rate_limit_per_user") or 0, "slowmode")
     state = {"slowmode": slowmode, "prior": ow,
              "hash": semantic_hash(slowmode, ow["allow"], ow["deny"], ow["exists"])}
     return _baseline_detail(state)
@@ -311,7 +332,7 @@ def _read_baseline(call, channel_id):
 
 def _baseline_detail(state):
     state = dict(state)
-    locked = (int(state["prior"]["deny"]) & SEND_MESSAGES_BIT) != 0
+    locked = (_to_int(state["prior"]["deny"], "deny mask") & SEND_MESSAGES_BIT) != 0
     state["detail"] = f"slowmode={state['slowmode']} locked={int(locked)}"
     return state
 
@@ -365,10 +386,12 @@ def _delete_notice(call, channel_id, applied):
 
 def _verify_restore(call, channel_id, pre_hash):
     channel = call("get_channel", channel_id=channel_id)
+    if channel.get("guild_id") != STAGING_GUILD_ID:
+        raise DrillError("refusing: channel is not in the staging guild")
     ow = everyone_overwrite(channel)
-    slowmode = int(channel.get("rate_limit_per_user") or 0)
+    slowmode = _to_int(channel.get("rate_limit_per_user") or 0, "slowmode")
     post_hash = semantic_hash(slowmode, ow["allow"], ow["deny"], ow["exists"])
-    unlocked = (int(ow["deny"]) & SEND_MESSAGES_BIT) == 0
+    unlocked = (_to_int(ow["deny"], "deny mask") & SEND_MESSAGES_BIT) == 0
     result = {"restored": post_hash == pre_hash and unlocked,
               "post_hash": post_hash, "unlocked": unlocked,
               "notice_removed": True}

@@ -97,6 +97,63 @@ class DrillTests(unittest.TestCase):
         self.assertEqual(call.state["channel"]["rate_limit_per_user"], 0)
         self.assertEqual(call.state["channel"]["permission_overwrites"], [])
 
+    def test_foreign_role_overwrite_is_skipped(self):
+        channel = {"id": "chan", "guild_id": STAGING_GUILD,
+                   "rate_limit_per_user": 0,
+                   "permission_overwrites": [
+                       {"id": "5555555555555555555", "type": 0,
+                        "allow": "999", "deny": "888"},
+                       {"id": STAGING_GUILD, "type": 0,
+                        "allow": "4096", "deny": "0"}]}
+        self.assertEqual(drill.everyone_overwrite(channel),
+                         {"allow": "4096", "deny": "0", "exists": True})
+
+    def test_drill_with_preceding_foreign_overwrite_uses_everyone_seed(self):
+        call = drill.mock_transport()
+        call.state["channel"]["permission_overwrites"] = [
+            {"id": "5555555555555555555", "type": 0,
+             "allow": "999", "deny": "888"},
+            {"id": STAGING_GUILD, "type": 0,
+             "allow": "4096", "deny": "0"}]
+        outcome = drill.run_drill(STAGING_GUILD, "mock-drill-channel", REASON, call)
+        self.assertEqual(outcome["result"], "pass")
+        self.assertTrue(outcome["restore"]["restored"])
+        # The foreign overwrite is untouched; @everyone is back to its seed.
+        self.assertEqual(call.state["channel"]["permission_overwrites"], [
+            {"id": "5555555555555555555", "type": 0,
+             "allow": "999", "deny": "888"},
+            {"id": STAGING_GUILD, "type": 0,
+             "allow": "4096", "deny": "0"}])
+
+    def test_missing_guild_id_refuses_without_mutation(self):
+        requested = []
+        inner = drill.mock_transport()
+        inner.state["channel"].pop("guild_id")
+
+        def counting(op, **kw):
+            requested.append(op)
+            return inner(op, **kw)
+
+        outcome = drill.run_drill(STAGING_GUILD, "mock-drill-channel", REASON, counting)
+        self.assertEqual(outcome["result"], "fail")
+        self.assertEqual([s["name"] for s in outcome["steps"] if s["result"] == "fail"],
+                         ["baseline-read"])
+        self.assertNotIn("post_notice", requested)
+        self.assertEqual(inner.state["notices"], {})
+
+    def test_garbage_payload_normalizes_to_drill_error(self):
+        inner = drill.mock_transport()
+        inner.state["channel"]["rate_limit_per_user"] = "not-a-number"
+
+        def counting(op, **kw):
+            return inner(op, **kw)
+
+        outcome = drill.run_drill(STAGING_GUILD, "mock-drill-channel", REASON, counting)
+        self.assertEqual(outcome["result"], "fail")
+        failed = [s for s in outcome["steps"] if s["result"] == "fail"]
+        self.assertEqual([s["name"] for s in failed], ["baseline-read"])
+        self.assertIn("unparseable slowmode", failed[0]["detail"])
+
     def test_missing_ping_surface_fails_and_restores(self):
         call = drill.mock_transport()
         call.state["commands"] = [{"id": "2", "name": "rank"}]
