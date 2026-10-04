@@ -80,6 +80,8 @@ use two_bot_discord::{
     ActionExecutor, ChannelModerationRuntime, LevelingRuntime, RoutedInteraction,
 };
 
+use crate::activation::BootActivation;
+
 /// Audit-log reason for retiring the previous sticky (legacy audits carry a
 /// free-text reason; kept short — `audit_reason` caps at 512 chars).
 const RETIRE_REASON: &str = "sticky re-post";
@@ -291,6 +293,7 @@ impl CommandRuntime {
         guild_id: u64,
         self_roles: Option<Arc<SelfRoleService>>,
         onboarding: two_bot_core::OnboardingGates,
+        activation: &BootActivation,
     ) -> Option<Arc<Self>> {
         let features = match FeatureGates::from_env() {
             Ok(features) => features,
@@ -299,13 +302,25 @@ impl CommandRuntime {
                 return None;
             }
         };
-        let moderation = match ModerationGates::from_env() {
-            Ok(moderation) => moderation,
-            Err(err) => {
-                warn!(error = %err, "moderation gates invalid; command runtime disabled");
-                return None;
-            }
-        };
+        // A denied capability never reaches its feature-specific validation:
+        // live/unknown identities must retain unrelated commands even with
+        // stale moderation env. Permitted staging still validates every gate.
+        let moderation =
+            if activation.permitted(two_bot_core::activation::LiveCapability::Moderation) {
+                match ModerationGates::from_env() {
+                    Ok(moderation) => moderation,
+                    Err(err) => {
+                        warn!(error = %err, "moderation gates invalid; command runtime disabled");
+                        return None;
+                    }
+                }
+            } else {
+                ModerationGates {
+                    enabled: false,
+                    owen_user_id: String::new(),
+                    protected_role_ids: Default::default(),
+                }
+            };
         let ticket_config = crate::ticket_runtime::TicketConfig::from_env(guild_id);
         let gates = RouterGates::from_slices(
             Some(guild_id),
@@ -337,26 +352,59 @@ impl CommandRuntime {
                 return None;
             }
         };
+        // A refused tickets capability never constructs its runtime, so a
+        // live identity gets no supervisor, no component execution, and a
+        // narrowed router gate; unrelated commands keep working.
+        let tickets = if activation.permitted(two_bot_core::activation::LiveCapability::Tickets) {
+            match ticket_config {
+                Some(config) => match crate::ticket_runtime::TicketRuntime::new(
+                    pool.clone(),
+                    executor.clone(),
+                    config,
+                ) {
+                    Ok(runtime) => Some(Arc::new(runtime)),
+                    Err(_) => return None,
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        Some(Self::from_gates(
+            pool, executor, gates, self_roles, tickets, onboarding, activation,
+        ))
+    }
+
+    /// Composition seam shared by boot and mock-Discord tests. Only narrowed
+    /// gates reach registration, publication and the accepted-message hook.
+    pub(crate) fn from_gates(
+        pool: Pool<Postgres>,
+        executor: ActionExecutor,
+        gates: RouterGates,
+        self_roles: Option<Arc<SelfRoleService>>,
+        tickets: Option<Arc<crate::ticket_runtime::TicketRuntime>>,
+        onboarding: two_bot_core::OnboardingGates,
+        activation: &BootActivation,
+    ) -> Arc<Self> {
+        let gates = activation.constrain_router(gates);
+        // The service only serves an open, permitted surface.
+        let self_roles = self_roles.filter(|_| gates.self_roles);
+        // A refused tickets capability keeps no runtime even when the caller
+        // composed one: no supervisor, no component execution, narrowed gate.
+        let tickets = tickets.filter(|_| gates.tickets);
+        let guild_id = gates
+            .configured_guild
+            .expect("boot supplies configured guild");
+        // The ordered leveling path shares this runtime's executor/pacing.
         let leveling = LevelingRuntime::new(
             pool.clone(),
             Arc::new(executor.clone()),
             guild_id,
             onboarding,
         );
-        let tickets = match ticket_config {
-            Some(config) => match crate::ticket_runtime::TicketRuntime::new(
-                pool.clone(),
-                executor.clone(),
-                config,
-            ) {
-                Ok(runtime) => Some(Arc::new(runtime)),
-                Err(_) => return None,
-            },
-            None => None,
-        };
         // No custom-command store exists on main yet: an empty slice is the
         // authoritative baseline (same as before LFG).
-        Some(Self::build(
+        let runtime = Self::build(
             pool,
             executor,
             router_with_commands(gates),
@@ -365,7 +413,23 @@ impl CommandRuntime {
             guild_id,
             Some(Vec::new()),
             tickets,
-        ))
+        );
+        // Pin the token-derived application identity before any READY arming:
+        // a READY-supplied id stays untrusted until this boot pin confirms it
+        // in `publish_registry_checked`. Zero means unpinned (unparseable
+        // token); such a runtime never publishes on faith.
+        if let Some(application_id) = activation.application_id() {
+            runtime.interactions.set_application_id(application_id);
+            runtime
+                .application_id
+                .store(application_id, Ordering::Relaxed);
+        }
+        runtime
+    }
+
+    #[cfg(test)]
+    pub(crate) fn router(&self) -> &InteractionRouter {
+        &self.interactions.router
     }
 
     /// Bootstrap before constructing the shard, reusing this runtime's router,
@@ -408,7 +472,7 @@ impl CommandRuntime {
             },
         );
         // Tests provide an authoritative empty custom-command fixture.
-        Self::build(
+        let runtime = Self::build(
             pool,
             executor,
             router,
@@ -417,7 +481,14 @@ impl CommandRuntime {
             guild_id,
             Some(Vec::new()),
             None,
-        )
+        );
+        // Tests pin the mock-Discord application identity (1111), like a boot
+        // whose token parses to it, so READY/RESUMED trust flows exercise
+        // the pin. The bot user stays unknown (0), so nonce recovery still
+        // resolves it through the executor exactly as on main.
+        runtime.interactions.set_application_id(1111);
+        runtime.application_id.store(1111, Ordering::Relaxed);
+        runtime
     }
 
     pub(crate) fn dispatch_guard(self: &Arc<Self>) -> CommandDispatchGuard {
@@ -497,9 +568,14 @@ impl CommandRuntime {
             session_picker: false,
         });
         let mut runtime = Self::new(pool, executor, router, 100, false);
-        Arc::get_mut(&mut runtime)
-            .expect("unshared test runtime")
-            .tickets = Some(tickets);
+        {
+            let unshared = Arc::get_mut(&mut runtime).expect("unshared test runtime");
+            unshared.tickets = Some(tickets);
+            // No boot token pins this constructor: registry publication may
+            // resolve the application id through the token-authenticated
+            // lookup, exactly like a boot whose token never parses.
+            unshared.application_id.store(0, Ordering::Relaxed);
+        }
         runtime
     }
 
@@ -571,7 +647,20 @@ impl CommandRuntime {
                 true
             }
             Event::Ready(ready) => {
-                self.set_identity(ready.user.id.get(), ready.application.id.get());
+                // A READY-supplied application id never overwrites the boot
+                // pin on faith: arm identity only when the token-derived pin
+                // confirms it (or no pin exists). Publication re-checks this
+                // in `publish_registry_checked`.
+                let ready_application = ready.application.id.get();
+                let pinned = self.application_id.load(Ordering::Relaxed);
+                if pinned == 0 || pinned == ready_application {
+                    self.set_identity(ready.user.id.get(), ready_application);
+                } else {
+                    warn!(
+                        application_id = ready_application,
+                        "READY identity differs from boot token; identity not armed"
+                    );
+                }
                 if let Some(tickets) = &self.tickets {
                     tickets.on_ready(ready.user.id.get());
                 }
@@ -704,13 +793,37 @@ impl CommandRuntime {
             return Ok(());
         };
         let application_id = match application_id {
-            Some(id) => id,
+            // A READY-supplied id is untrusted: the boot token's own identity
+            // must confirm it before anything is published. A runtime with no
+            // boot pin (zero) never publishes on faith.
+            Some(id) => {
+                let pinned = self.application_id.load(Ordering::Relaxed);
+                if pinned == 0 || pinned != id {
+                    warn!(
+                        application_id = id,
+                        "application identity differs from boot token; publish skipped"
+                    );
+                    return Ok(());
+                }
+                id
+            }
             None => {
                 let id = self
                     .executor
                     .current_application_id()
                     .await
                     .map_err(|_| RegistrySyncError::ApplicationLookup)?;
+                // The token-authenticated lookup answers for this very token;
+                // a boot pin (always present for a parseable token) must still
+                // agree before anything is published.
+                let pinned = self.application_id.load(Ordering::Relaxed);
+                if pinned != 0 && pinned != id {
+                    warn!(
+                        application_id = id,
+                        "application lookup differs from boot token; publish skipped"
+                    );
+                    return Ok(());
+                }
                 // RESUMED carries no application: arm the interaction fence from
                 // this registry lookup instead of a separate identity read.
                 self.interactions.set_application_id(id);
@@ -1542,23 +1655,37 @@ pub(crate) fn feed_remove_option(interaction: &Interaction) -> Option<String> {
         })
 }
 
-/// Shared sticky/feed/channel/leveling registrations; LFG is composed by
-/// `InteractionRuntime`. Tests that bypass `from_env`'s env reads use this
-/// same router, matching `from_env`'s registrations.
+/// Shared sticky/feed/channel/leveling registrations over the narrowed boot
+/// gates; LFG is composed by `InteractionRuntime`. Tests that bypass
+/// `from_env`'s env reads use this same router, matching `from_env`'s
+/// registrations.
 pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     let mut router = InteractionRouter::new(gates);
-    register_channel_handlers(&mut router);
-    router.register(Box::new(StickyHandler));
-    for id in [
-        HandlerId::FeedAdd,
-        HandlerId::FeedRemove,
-        HandlerId::FeedList,
-        HandlerId::Rank,
-        HandlerId::Leaderboard,
-    ] {
+    if gates.moderation {
+        register_channel_handlers(&mut router);
+    }
+    if gates.automations {
+        router.register(Box::new(StickyHandler));
+        // Custom commands are an automations capability: a refused identity
+        // must not even resolve their handlers (4014 isolation depends on the
+        // narrowed intent too). Dispatch refuses and publish withholds when
+        // off, but registration alone would advertise the surface.
+        two_bot_discord::custom_commands::CustomCommandRuntime::register(&mut router);
+    }
+    if gates.announcements {
+        for id in [
+            HandlerId::FeedAdd,
+            HandlerId::FeedRemove,
+            HandlerId::FeedList,
+        ] {
+            router.register(Box::new(SliceHandler(id)));
+        }
+    }
+    // Leveling is not an activation-fenced capability: the core rank and
+    // leaderboard commands stay available to every permitted identity.
+    for id in [HandlerId::Rank, HandlerId::Leaderboard] {
         router.register(Box::new(SliceHandler(id)));
     }
-    two_bot_discord::custom_commands::CustomCommandRuntime::register(&mut router);
     router
 }
 

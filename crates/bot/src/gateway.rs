@@ -96,26 +96,57 @@ pub fn session_snapshot(shard: &Shard) -> Option<Session> {
     shard.session().cloned()
 }
 
-/// Resolve the gateway intents from the environment: privileged
-/// `MESSAGE_CONTENT` only when enabled automod inspects public messages
-/// (`TWO_AUTOMOD=1`), tickets are configured, or custom text commands are
-/// explicitly enabled (`TWO_AUTOMATIONS=1` and `TWO_TEXT_COMMANDS=1`).
-pub fn intents_from_env() -> Intents {
+/// Resolve the gateway intents after boot activation: privileged
+/// `MESSAGE_CONTENT` only when permitted automod is enabled, tickets
+/// are independently configured (legacy `needsMessageContent`), or
+/// permitted automations enable custom text commands
+/// (`TWO_AUTOMATIONS=1` and `TWO_TEXT_COMMANDS=1`). A refused capability
+/// never contributes its condition: requesting a privileged intent without
+/// the grant closes the gateway with 4014 instead of isolated refusal.
+pub fn intents_from_env(activation: &crate::activation::BootActivation) -> Intents {
     fn var(name: &str) -> String {
         std::env::var(name).unwrap_or_default()
     }
-    let message_content = needs_message_content(
+    let base = intents_for_settings(
+        activation,
         &var("TWO_AUTOMOD"),
         [
             var("DISCORD_TICKET_CATEGORY_ID").as_str(),
             var("DISCORD_TICKET_STAFF_ROLE_ID").as_str(),
             var("DISCORD_TICKET_PANEL_CHANNEL_ID").as_str(),
         ],
-    ) || two_bot_discord::intents::needs_text_command_message_content(
-        &var("TWO_AUTOMATIONS"),
-        &var("TWO_TEXT_COMMANDS"),
     );
-    gateway_intents(message_content)
+    // Custom text commands ride the automations surface: a refused Automations
+    // capability must not request privileged MESSAGE_CONTENT, which the live
+    // app may not hold (a 4014 close would take every cleared capability
+    // down with it).
+    let text_commands = activation.permitted(two_bot_core::activation::LiveCapability::Automations)
+        && two_bot_discord::intents::needs_text_command_message_content(
+            &var("TWO_AUTOMATIONS"),
+            &var("TWO_TEXT_COMMANDS"),
+        );
+    base | gateway_intents(text_commands)
+}
+
+fn intents_for_settings(
+    activation: &crate::activation::BootActivation,
+    automod: &str,
+    ticket_vars: [&str; 3],
+) -> Intents {
+    let automod = if activation.permitted(two_bot_core::activation::LiveCapability::Automod) {
+        automod
+    } else {
+        "0"
+    };
+    // Refused tickets must not request a privileged intent the live app may
+    // not hold: a 4014 close would take every cleared capability down with
+    // it. The three ticket requirements stay independent of each other.
+    let ticket_vars = if activation.permitted(two_bot_core::activation::LiveCapability::Tickets) {
+        ticket_vars
+    } else {
+        ["", "", ""]
+    };
+    gateway_intents(needs_message_content(automod, ticket_vars))
 }
 
 /// Gateway pipeline: ordered leveling awards over the persistent funnel
@@ -1005,6 +1036,40 @@ pub async fn build_voice_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activation_intents_refuse_uncleared_automod_and_tickets() {
+        const STAGING: u64 = 1545644954272137297;
+        const LIVE: u64 = 326474832151838730;
+        const STAGING_TOKEN: &str = "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature";
+        const LIVE_TOKEN: &str = "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature";
+        for (guild, token, permitted) in [
+            (STAGING, Some(STAGING_TOKEN), true),
+            (LIVE, Some(LIVE_TOKEN), false),
+            (LIVE, Some(STAGING_TOKEN), false),
+            (STAGING, Some(LIVE_TOKEN), false),
+            (STAGING, Some("not-a-token"), false),
+            (STAGING, None, false),
+        ] {
+            let activation = crate::activation::BootActivation::from_token(Some(guild), token);
+            for automod in ["1", "0", "true", ""] {
+                for tickets in [
+                    ["", "", ""],
+                    ["cat", "", "panel"],
+                    ["cat", "staff", "panel"],
+                ] {
+                    // Either uncleared surface independently justifies the
+                    // privileged intent, but never on a refused identity.
+                    let expected =
+                        permitted && (automod == "1" || tickets.iter().all(|v| !v.is_empty()));
+                    assert_eq!(
+                        intents_for_settings(&activation, automod, tickets),
+                        gateway_intents(expected)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn mock_gateway_override_accepts_literal_loopback_only() {
