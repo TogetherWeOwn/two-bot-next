@@ -1,14 +1,18 @@
-"""Offline fixtures for the container-smoke selector; no Docker, git or GitHub needed.
+"""Offline fixtures for the container-smoke selector; no Docker or GitHub needed.
 
 Mirrors the `scripts/test_container_smoke.py` pattern: pure decision logic
 tested hermetically. The workflow-yaml surface (selector job wiring, step
 gating, push-always-build) is asserted by parsing check.yml as text, the
-same stdlib-only technique as `scripts/test-secret-scan.py`.
+same stdlib-only technique as `scripts/test-secret-scan.py`. The one diff test
+runs the real git binary on a throwaway repo and skips without it.
 """
 
 import importlib.util
 from pathlib import Path
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -155,6 +159,38 @@ class SelectionTests(unittest.TestCase):
             with patch("builtins.print"):
                 self.assertEqual(
                     inputs.main(["--base-ref", "a", "--head-ref", "b"]), 2)
+
+
+class ChangedFilesTests(unittest.TestCase):
+    """`changed_files` against a throwaway repo; needs only the git binary."""
+
+    @staticmethod
+    def git(root, *args):
+        subprocess.run(
+            ["git", "-C", str(root), "-c", "commit.gpgsign=false", *args],
+            check=True, capture_output=True)
+
+    @unittest.skipUnless(shutil.which("git"), "git binary required")
+    def test_rename_into_docs_lists_both_paths(self):
+        # With rename detection, `git mv src/lib.rs docs/lib.md` lists only the
+        # destination, the diff looks docs-only and the image build is skipped.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.git(root, "init", "-q")
+            self.git(root, "config", "user.email", "ci@example.invalid")
+            self.git(root, "config", "user.name", "ci")
+            # Rename detection on, whatever the host's global git config says.
+            self.git(root, "config", "diff.renames", "true")
+            (root / "src").mkdir()
+            (root / "docs").mkdir()
+            (root / "src" / "lib.rs").write_text("pub fn one() -> u32 {\n    1\n}\n" * 4)
+            self.git(root, "add", "-A")
+            self.git(root, "commit", "-q", "-m", "base")
+            self.git(root, "mv", "src/lib.rs", "docs/lib.md")
+            self.git(root, "commit", "-q", "-m", "move")
+            changed = inputs.changed_files("HEAD~1", "HEAD", root=root)
+            self.assertCountEqual(changed, ["src/lib.rs", "docs/lib.md"])
+            self.assertTrue(inputs.needs_image_build(changed))
 
 
 class WorkflowSurfaceTests(unittest.TestCase):
