@@ -1,0 +1,38 @@
+{
+  "runner_version": 1,
+  "tool": {
+    "name": "two-bot-cutover staging_migrate",
+    "crate_version": "0.2.0",
+    "sqlx": "0.9.0",
+    "invocation": "staging-migrate --plan|--apply"
+  },
+  "mode": "plan",
+  "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "target": {"host": "staging.invalid", "database": "two_bot"},
+  "recovery_evidence_ref": "recovery-review#decision",
+  "acl_plan_ref": "acl-review#decision",
+  "role": "two_bot_migrator_ro",
+  "role_verified_connections": 1,
+  "source_migrations": [
+    {
+      "version": 1,
+      "description": "first fixture",
+      "sha384": "26e71cc37450b183fb5bb72ec4f644ed27de1b55fad3d4d6cfb0ca0d71f42ca990911d74649814105a190325e15d2092",
+      "sha384_recomputed": "26e71cc37450b183fb5bb72ec4f644ed27de1b55fad3d4d6cfb0ca0d71f42ca990911d74649814105a190325e15d2092"
+    },
+    {
+      "version": 9007199254740993,
+      "description": "fixture résumé",
+      "sha384": "8d0f5fd04a6a06f91a39dc080b4f5087ef3b41a3cc654a6a20f84d7f90e2e20aefa0fbe122f2f209598c01747c12fb15",
+      "sha384_recomputed": "8d0f5fd04a6a06f91a39dc080b4f5087ef3b41a3cc654a6a20f84d7f90e2e20aefa0fbe122f2f209598c01747c12fb15"
+    }
+  ],
+  "ledger_before": [],
+  "ledger_after": [],
+  "pending_before": [1, 9007199254740993],
+  "expected_pending": [1, 9007199254740993],
+  "plan_manifest_sha256": "e4a3136346ca546df4f1f4f654322c278ff7df1d5902ec5685cd43036b41beea",
+  "plan_run_id": "",
+  "plan_provenance_verified": false,
+  "applied_count": 0
+}
