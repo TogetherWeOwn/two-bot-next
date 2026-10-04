@@ -89,6 +89,7 @@ only (never raw text); warn/page values live in the companion docs.
 | | | `readyz` / `revision` | checklist §2; queries pack intro | status + wired components (`process`, `gateway`); compiled revision/build-ID match | record-and-watch / paged | watcher on shift | | |
 | | | `gateway` session | queries §1 + §8 | IDENTIFY / RESUME / READY / RESUMED / invalid session / close code + session-start budget | | watcher on shift | | |
 | | | `gateway` disconnects + missed events | queries §8 | disconnect count + missed-events count (pair; any nonzero missed events fails zero-gap acceptance) | | watcher on shift | | |
+| | | `keepalive-gap` (heartbeat ACK inactivity) | [keepalive-gap detector §2–4](keepalive-gap-detector.md#2-proposed-thresholds-and-mandatory-eligibility) | adjacent ACK/recovery deltas + readiness/process eligibility + complete timestamp coverage (2 intervals/120 s = watch; 5/300 s = page candidate); scrape availability separate; tick liveness unknown without positive evidence | record-and-watch / operator investigation; paged only through existing path | watcher on shift / on-call operator | | |
 | | | `rest_429_rate` / 5xx share | queries §2; checklist alert `rest_429_rate` | 429 share, hot route, 5xx top routes | | on-call operator | | |
 | | | handler latency | queries §3 | p50 / p95 / p99 + `_count` trend (first 24 h vs second 24 h) | | watcher on shift | | |
 | | | unban-queue proxies | queries §4 | `periodic job failed` lines + `audit_retry` streak + mirror deliveries (table counts are test-copy only) | | watcher on shift | | |

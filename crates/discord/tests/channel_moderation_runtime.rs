@@ -521,6 +521,7 @@ async fn repeated_lockdown_keeps_first_seed_and_unlock_restores_exact_masks() {
             ScriptedResponse::status(204),
             overwrite("1024", "10240"),
             ScriptedResponse::status(204),
+            overwrite("1024", "10240"),
             ScriptedResponse::status(204),
         ],
         ScriptedResponse::status(500),
@@ -562,7 +563,8 @@ async fn repeated_lockdown_keeps_first_seed_and_unlock_restores_exact_masks() {
     assert!(db.store.get_lockdown(CHANNEL).await.unwrap().is_none());
     let requests = mock.requests();
     let first: Value = serde_json::from_slice(&requests[1].body).unwrap();
-    let restored: Value = serde_json::from_slice(&requests[4].body).unwrap();
+    assert_eq!(requests[4].method, "GET", "unlock must read live masks");
+    let restored: Value = serde_json::from_slice(&requests[5].body).unwrap();
     assert_eq!(
         (first["allow"].as_str(), first["deny"].as_str()),
         (Some("1024"), Some("10240"))
@@ -589,7 +591,7 @@ async fn repeated_lockdown_keeps_first_seed_and_unlock_restores_exact_masks() {
     );
     assert_eq!(
         mock.requests().len(),
-        5,
+        6,
         "untracked manual deny must not be cleared"
     );
     assert_eq!(db.count("moderation_audit").await, 4);
@@ -605,6 +607,7 @@ async fn initially_absent_overwrite_is_deleted_only_after_recorded_lockdown() {
         vec![
             ScriptedResponse::json(200, json!({"permission_overwrites":[]})),
             ScriptedResponse::status(204),
+            overwrite("0", "2048"),
             ScriptedResponse::status(204),
         ],
         ScriptedResponse::status(500),
@@ -635,8 +638,186 @@ async fn initially_absent_overwrite_is_deleted_only_after_recorded_lockdown() {
         .await
         .unwrap();
     let requests = mock.requests();
-    assert_eq!(requests[2].method, "DELETE");
-    assert!(requests[2].path.ends_with(&format!("/permissions/{GUILD}")));
+    assert_eq!(requests[2].method, "GET");
+    assert_eq!(requests[3].method, "DELETE");
+    assert!(requests[3].path.ends_with(&format!("/permissions/{GUILD}")));
+    assert_eq!(db.count("moderation_lockdowns").await, 0);
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn unlock_preserves_access_restrictions_added_after_lockdown() {
+    for existed in [false, true] {
+        let db = Database::open().await;
+        let prior = if existed {
+            overwrite("3072", "8192")
+        } else {
+            ScriptedResponse::json(200, json!({"permission_overwrites":[]}))
+        };
+        let mock = MockRest::start(
+            vec![
+                prior,
+                ScriptedResponse::status(204),
+                // Admin removed VIEW_CHANNEL allow and denied it, and added an
+                // unrelated allow. An absent seed must not cause a blind DELETE.
+                overwrite("16384", "3072"),
+                ScriptedResponse::status(204),
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let runtime = runtime(&db, &mock);
+        for (id, verb) in [(200, "lockdown"), (201, "unlock")] {
+            assert_eq!(
+                runtime
+                    .execute(
+                        &router(true),
+                        &interaction(id, verb, options(None), PERMISSIONS)
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .outcome,
+                if verb == "lockdown" {
+                    "locked_down"
+                } else {
+                    "unlocked"
+                }
+            );
+        }
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[2].method, "GET");
+        assert_eq!(
+            requests[3].method, "PUT",
+            "new access restrictions must not be deleted"
+        );
+        let restored: Value = serde_json::from_slice(&requests[3].body).unwrap();
+        assert_eq!(restored["allow"], if existed { "18432" } else { "16384" });
+        assert_eq!(restored["deny"], "1024", "VIEW_CHANNEL deny survives");
+        assert_eq!(db.count("moderation_lockdowns").await, 0);
+        mock.shutdown().await;
+        db.close().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn unlock_drift_and_read_failure_refuse_without_mutation_or_recovery_loss() {
+    for live in [
+        overwrite("0", "1024"),
+        overwrite("2048", "3072"),
+        ScriptedResponse::json(200, json!({"permission_overwrites":[]})),
+        ScriptedResponse::json(200, json!({})),
+        overwrite("bad", "2048"),
+        ScriptedResponse::status(503),
+    ] {
+        let db = Database::open().await;
+        let mock = MockRest::start(
+            vec![
+                overwrite("3072", "8192"),
+                ScriptedResponse::status(204),
+                live,
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let runtime = runtime(&db, &mock);
+        runtime
+            .execute(
+                &router(true),
+                &interaction(210, "lockdown", options(None), PERMISSIONS),
+            )
+            .await
+            .unwrap();
+        let seed = db.store.get_lockdown(CHANNEL).await.unwrap();
+        let unlock = interaction(211, "unlock", options(None), PERMISSIONS);
+        let reply = runtime
+            .execute(&router(true), &unlock)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.outcome, "refused");
+        assert!(reply.text.contains("no mutation attempted"));
+        assert_eq!(mock.requests().len(), 3);
+        assert_eq!(mock.requests()[2].method, "GET");
+        assert_eq!(db.store.get_lockdown(CHANNEL).await.unwrap(), seed);
+        assert_eq!(db.count("moderation_channel_executions").await, 0);
+        assert!(
+            runtime
+                .execute(&router(true), &unlock)
+                .await
+                .unwrap()
+                .unwrap()
+                .replayed
+        );
+        assert_eq!(mock.requests().len(), 3);
+        mock.shutdown().await;
+        db.close().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn lockdown_after_an_external_unlock_refreshes_seed_and_fences_old_cleanup() {
+    let db = Database::open().await;
+    let mock = MockRest::start(
+        vec![
+            overwrite("3072", "8192"),
+            ScriptedResponse::status(204),
+            overwrite("0", "1024"),
+            ScriptedResponse::status(204),
+            overwrite("0", "3072"),
+            ScriptedResponse::status(204),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(&db, &mock);
+    runtime
+        .execute(
+            &router(true),
+            &interaction(220, "lockdown", options(None), PERMISSIONS),
+        )
+        .await
+        .unwrap();
+    let old = db.store.get_lockdown(CHANNEL).await.unwrap().unwrap();
+    runtime
+        .execute(
+            &router(true),
+            &interaction(221, "lockdown", options(None), PERMISSIONS),
+        )
+        .await
+        .unwrap();
+    let new = db.store.get_lockdown(CHANNEL).await.unwrap().unwrap();
+    assert_eq!((&new.prior_allow[..], &new.prior_deny[..]), ("0", "1024"));
+    assert_ne!(old.recovery_generation, new.recovery_generation);
+    assert!(!db
+        .store
+        .clear_lockdown(CHANNEL, &old.recovery_generation)
+        .await
+        .unwrap());
+    assert_eq!(
+        runtime
+            .execute(
+                &router(true),
+                &interaction(222, "unlock", options(None), PERMISSIONS)
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
+        "unlocked"
+    );
+    let requests = mock.requests();
+    let restored: Value = serde_json::from_slice(&requests[5].body).unwrap();
+    assert_eq!(
+        restored["allow"], "0",
+        "stale SEND_MESSAGES allow must not return"
+    );
+    assert_eq!(restored["deny"], "1024");
     assert_eq!(db.count("moderation_lockdowns").await, 0);
     mock.shutdown().await;
     db.close().await;
@@ -654,6 +835,7 @@ async fn ambiguous_unlock_retains_recovery_and_both_claims_across_all_keys() {
             vec![
                 overwrite("3072", "8192"),
                 ScriptedResponse::status(204),
+                overwrite("1024", "10240"),
                 failure,
             ],
             ScriptedResponse::status(500),
@@ -702,7 +884,7 @@ async fn ambiguous_unlock_retains_recovery_and_both_claims_across_all_keys() {
         );
         assert_eq!(
             mock.requests().len(),
-            3,
+            4,
             "no automatic retry or competing-key mutation"
         );
         assert_eq!(db.store.get_lockdown(CHANNEL).await.unwrap(), Some(rec));

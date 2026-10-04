@@ -420,7 +420,8 @@ impl ChannelModerationRuntime {
                     Ok(plan) => plan,
                     Err(_) => return Ok(Err("Invalid channel permission masks.".to_owned())),
                 };
-                // Persist before PUT; repeated locks never replace the first seed.
+                // Persist before PUT. Keep the first seed while locked; a live
+                // overwrite without the send deny starts a new recovery cycle.
                 let rec = self
                     .store
                     .record_lockdown(
@@ -440,7 +441,10 @@ impl ChannelModerationRuntime {
                         reason,
                     },
                     restore: None,
-                    rejected_seed: if prior_record.is_none() {
+                    rejected_seed: if prior_record
+                        .as_ref()
+                        .is_none_or(|old| old.recovery_generation != rec.recovery_generation)
+                    {
                         Some(rec)
                     } else {
                         None
@@ -452,7 +456,24 @@ impl ChannelModerationRuntime {
                 if rec.as_ref().is_some_and(|r| r.guild_id != guild_id) {
                     return Ok(Err("Recovery guild does not match this channel.".to_owned()));
                 }
-                let call = match domain::plan_unlock(rec.as_ref()) {
+                if rec.is_none() {
+                    return Ok(Err(domain::UnlockError::NotLocked.to_string()));
+                }
+                let current = match self
+                    .executor
+                    .get_everyone_overwrite(&channel_id, &guild_id)
+                    .await
+                {
+                    Ok(current) => current.map(|ow| EveryoneOverwrite {
+                        allow: ow.allow,
+                        deny: ow.deny,
+                    }),
+                    Err(_) => return Ok(Err(
+                        "Could not verify the current channel overwrite; no mutation attempted."
+                            .to_owned(),
+                    )),
+                };
+                let call = match domain::plan_unlock(rec.as_ref(), current.as_ref()) {
                     Ok(UnlockPlan::Restore { allow, deny }) => ChannelCall::PutOverwrite {
                         channel_id,
                         guild_id,
