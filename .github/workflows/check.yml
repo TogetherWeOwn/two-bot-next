@@ -27,6 +27,16 @@ on:
 
 permissions: {}
 
+# Service and job-container images are pinned by digest, like the Dockerfile
+# bases, so a moved tag cannot change what a required check runs against.
+# Dependabot's `docker` ecosystem reads Dockerfiles only, so it never bumps
+# these: the CI maintainers (CODEOWNERS) bump them by hand, together with the
+# Dockerfile bases. Find every pin with
+#   grep -rn 'image: ' .github/workflows
+# and re-resolve a digest with `docker buildx imagetools inspect <tag>`. Jobs
+# that share a tag share one digest; change them all together.
+# scripts/test-supply-chain.py fails if any image here loses its digest.
+
 concurrency:
   group: check-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
@@ -181,6 +191,18 @@ jobs:
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-check-migrations.py
           python3 scripts/check-migrations.py --base-ref "$MIGRATION_BASE"
+
+      # Finish the pinned toolchain before the first pip run. The image ships
+      # the pinned Rust version without rustfmt or clippy, and rust-toolchain.toml
+      # asks for both. pip 23 (Debian bookworm) probes `rustc --version` from the
+      # workspace with a 0.5 s timeout, which makes the rustup proxy start that
+      # component install; the timeout then kills it half-way and leaves
+      # untracked bin/cargo-fmt and bin/rustfmt in the toolchain. The later
+      # `cargo fmt` fails with "detected conflict: 'bin/cargo-fmt'" in roughly
+      # half the runs. With the components in place the probe returns at once.
+      - name: Install pinned Rust toolchain components
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: rustup toolchain install --no-self-update
 
       - name: Install pinned static audit tools
         run: |
@@ -673,7 +695,7 @@ jobs:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     services:
       agent-testdb:
-        image: postgres:17
+        image: postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
         env:
           POSTGRES_USER: agent_test
           POSTGRES_DB: postgres
@@ -1026,7 +1048,7 @@ jobs:
       TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
     services:
       agent-testdb:
-        image: postgres:18-alpine
+        image: postgres:18.6-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
         env:
           POSTGRES_USER: agent_test
           POSTGRES_DB: agent_test

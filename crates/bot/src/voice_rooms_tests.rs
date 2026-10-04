@@ -6,6 +6,8 @@ use std::sync::Mutex;
 mod delete_guards;
 #[path = "voice_kick_tests.rs"]
 mod kick;
+#[path = "voice_name_tests.rs"]
+mod name;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
 
@@ -102,6 +104,8 @@ struct Store {
     config: Arc<Mutex<VoiceConfiguration>>,
     config_error: Option<StoreError>,
     save_config_error: Option<StoreError>,
+    custom_names: Mutex<HashMap<u64, String>>,
+    save_custom_name_errors: Mutex<VecDeque<StoreError>>,
 }
 
 impl Store {
@@ -127,6 +131,8 @@ impl Store {
             config: Arc::new(Mutex::new(empty_config())),
             config_error: None,
             save_config_error: None,
+            custom_names: Mutex::new(HashMap::new()),
+            save_custom_name_errors: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -235,6 +241,43 @@ impl RoomPersistence for Store {
         } else {
             Ok(false)
         }
+    }
+    async fn custom_names(&self, _: u64) -> Result<Vec<(u64, String)>, StoreError> {
+        let mut names: Vec<_> = self
+            .custom_names
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(channel, name)| (*channel, name.clone()))
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+    async fn save_custom_name(
+        &self,
+        _: u64,
+        channel: u64,
+        custom_name: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("save_custom_name:{channel}:{custom_name:?}"));
+        if let Some(error) = self.save_custom_name_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        if !self.rooms.lock().unwrap().contains_key(&channel) {
+            return Ok(false);
+        }
+        match custom_name {
+            Some(name) => self
+                .custom_names
+                .lock()
+                .unwrap()
+                .insert(channel, name.to_owned()),
+            None => self.custom_names.lock().unwrap().remove(&channel),
+        };
+        Ok(true)
     }
     async fn forget(&self, _: u64, channel: u64) -> Result<(), StoreError> {
         self.trace.lock().unwrap().push(format!("forget:{channel}"));
@@ -1492,7 +1535,8 @@ fn voice_command_set_is_gated_on_two_voice() {
             "inheritpermissions",
             "defaultlimit",
             "alwaysprivate",
-            "kick"
+            "kick",
+            "name"
         ]
     );
     let off = VoiceGates::from_map(&Default::default());
@@ -5820,6 +5864,13 @@ fn dead_letter_families_cover_every_queue_action_shape() {
             RoomAction::RenameRoom {
                 channel_id: 500,
                 name: "den".to_owned(),
+            },
+            "rename",
+        ),
+        (
+            RoomAction::SetCustomName {
+                channel_id: 500,
+                custom_name: Some("den".to_owned()),
             },
             "rename",
         ),

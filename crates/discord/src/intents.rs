@@ -95,6 +95,22 @@ mod tests {
     }
 
     #[test]
+    fn intent_bitfields_match_the_legacy_literals() {
+        // Literal bitfields, not a sum of names (legacy
+        // test/unit.stagingcapability.test.ts): a rename or reorder cannot
+        // quietly change what the gateway is asked for. Gated set 1735 is
+        // Guilds 1 + GuildMembers 2 + GuildModeration 4 + GuildInvites 64 +
+        // GuildVoiceStates 128 + GuildMessages 512 + GuildMessageReactions 1024;
+        // the full set adds MessageContent 32768.
+        assert_eq!(gateway_intents(false).bits(), 1735);
+        assert_eq!(gateway_intents(true).bits(), 34503);
+        assert_eq!(
+            gateway_intents(true).bits() - gateway_intents(false).bits(),
+            Intents::MESSAGE_CONTENT.bits()
+        );
+    }
+
+    #[test]
     fn text_commands_require_both_exact_flags() {
         let values = ["", "0", "1", "true", "01", " 1", "1 "];
         for automations in values {
