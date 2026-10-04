@@ -2177,6 +2177,49 @@ mod tests {
     }
 
     #[test]
+    fn privacy_actions_scope_to_their_room_except_the_join_delete() {
+        assert_eq!(
+            RoomAction::SetEveryoneConnect {
+                channel_id: 500,
+                deny: true
+            }
+            .channel_id(),
+            Some(500)
+        );
+        assert_eq!(
+            RoomAction::SavePrivacy { channel_id: 500 }.channel_id(),
+            Some(500)
+        );
+        assert_eq!(
+            RoomAction::CreateJoinChannel {
+                room_channel_id: 500,
+                name: "⇩ Join Ana".to_owned()
+            }
+            .channel_id(),
+            Some(500)
+        );
+        // The Join delete names its own target and scopes to no room, so a
+        // room deleted meanwhile cannot drop it and leak the channel.
+        let delete = RoomAction::DeleteJoinChannel {
+            room_channel_id: 500,
+            channel_id: 700,
+        };
+        assert_eq!(delete.channel_id(), None);
+        let q = ActionQueue::new();
+        q.enqueue(GUILD, delete);
+        q.enqueue(GUILD, RoomAction::SavePrivacy { channel_id: 500 });
+        q.enqueue(
+            GUILD,
+            RoomAction::SetEveryoneConnect {
+                channel_id: 500,
+                deny: false,
+            },
+        );
+        assert_eq!(q.drop_for_channel(GUILD, 500), 2);
+        assert_eq!(q.pending_counts(GUILD), (1, 0));
+    }
+
+    #[test]
     fn voice_command_shapes_and_gates() {
         let defs = voice_commands();
         assert_eq!(
@@ -2376,6 +2419,14 @@ mod tests {
         assert_eq!(defs[7].options[0].name, "member");
         assert_eq!(defs[7].options[0].kind, CommandOptionType::User as u8);
         assert!(defs[7].options[0].required == Some(true));
+        // `/private` and `/public` take no options and are not permission
+        // gated here: the handler allows only the room owner or an admin.
+        assert_eq!(defs[17].name, "private");
+        assert_eq!(defs[18].name, "public");
+        for def in &defs[17..19] {
+            assert_eq!(def.default_member_permissions, None);
+            assert!(def.options.is_empty());
+        }
         // Merges cleanly alongside the other slices, first-wins.
         // Moderation's `kick` sorts before the voice one, so the shared
         // merge keeps the moderation definition; runtime dispatch (not the
@@ -2394,6 +2445,8 @@ mod tests {
         assert!(merged.iter().any(|d| d.name == "reclaim"));
         assert!(merged.iter().any(|d| d.name == "transfer"));
         assert!(merged.iter().any(|d| d.name == "logging"));
+        assert!(merged.iter().any(|d| d.name == "private"));
+        assert!(merged.iter().any(|d| d.name == "public"));
 
         assert!(!VoiceGates::from_map(&Default::default()).enabled);
         let vars: HashMap<String, String> = [("TWO_VOICE".to_owned(), "1".to_owned())]
