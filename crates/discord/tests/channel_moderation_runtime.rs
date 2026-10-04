@@ -3,7 +3,7 @@
 #[allow(dead_code)]
 mod common;
 
-use common::{MockRest, ScriptedResponse};
+use common::{aged_message_id, fresh_message_id, MockRest, ScriptedResponse};
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::PgPool;
@@ -458,7 +458,7 @@ async fn purge_and_slowmode_success_audit_and_replay_without_repeating_effects()
         vec![
             ScriptedResponse::json(
                 200,
-                json!([{"id":"600000000000000001"},{"id":"600000000000000002"}]),
+                json!([{"id":fresh_message_id(1)},{"id":fresh_message_id(2)}]),
             ),
             ScriptedResponse::status(204),
             patched(),
@@ -511,17 +511,51 @@ async fn purge_and_slowmode_success_audit_and_replay_without_repeating_effects()
     db.close().await;
 }
 
+/// A quiet channel holds only messages older than 14 days. Discord answers a
+/// bulk delete of those with a 400, which used to surface as "Discord refused
+/// the channel action". They are deleted one by one instead.
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn purge_of_messages_older_than_fourteen_days_deletes_them_singly() {
+    let db = Database::open().await;
+    let (old_a, old_b) = (aged_message_id(1), aged_message_id(2));
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!([{"id": old_a}, {"id": old_b}])),
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(204),
+        ],
+        // A bulk delete here would hit the default and fail the purge.
+        ScriptedResponse::status(400),
+    )
+    .await;
+    let runtime = runtime(&db, &mock);
+    let router = router(true);
+    let purge = interaction(80, "purge", options(Some(("count", 2))), PERMISSIONS);
+    let result = runtime.execute(&router, &purge).await.unwrap().unwrap();
+    assert_eq!(result.outcome, "purged");
+    assert!(result.text.contains("(2)"), "{}", result.text);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1..].iter().all(|r| r.method == "DELETE"));
+    assert_eq!(db.count("moderation_channel_executions").await, 0);
+    mock.shutdown().await;
+    db.close().await;
+}
+
 #[tokio::test]
 #[ignore = "requires agent-testdb or CI service"]
 async fn repeated_lockdown_keeps_first_seed_and_unlock_restores_exact_masks() {
     let db = Database::open().await;
+    // Lockdown denies sending, thread and reaction bits, not just SEND_MESSAGES.
+    let locked_deny = (8192 | two_bot_core::LOCKDOWN_BITS).to_string();
     let mock = MockRest::start(
         vec![
             overwrite("3072", "8192"),
             ScriptedResponse::status(204),
-            overwrite("1024", "10240"),
+            overwrite("1024", &locked_deny),
             ScriptedResponse::status(204),
-            overwrite("1024", "10240"),
+            overwrite("1024", &locked_deny),
             ScriptedResponse::status(204),
         ],
         ScriptedResponse::status(500),
@@ -567,7 +601,7 @@ async fn repeated_lockdown_keeps_first_seed_and_unlock_restores_exact_masks() {
     let restored: Value = serde_json::from_slice(&requests[5].body).unwrap();
     assert_eq!(
         (first["allow"].as_str(), first["deny"].as_str()),
-        (Some("1024"), Some("10240"))
+        (Some("1024"), Some(locked_deny.as_str()))
     );
     assert_eq!(
         (restored["allow"].as_str(), restored["deny"].as_str()),

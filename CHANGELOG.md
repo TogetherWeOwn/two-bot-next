@@ -156,6 +156,8 @@
 
 ### Fixed
 
+- Make `/lockdown` deny `SendMessagesInThreads`, `CreatePublicThreads`, `CreatePrivateThreads` and `AddReactions` on `@everyone` along with `SendMessages`, so members cannot keep posting through threads or reactions while the reply says `locked_down`. `/unlock` restores each of those bits only while it still holds the locked state, so it also unlocks a channel locked earlier by the narrower rule and keeps a bit a moderator changed since. A role overwrite that allows sending still wins.
+- Make `/purge` work on quiet channels: it bulk-deletes the messages under 14 days old and deletes older ones one by one instead of failing the whole call with a Discord 400. It also skips pinned messages and the bot's own posts (ticket, sticky and LFG panels), skips a message deleted after the listing, and reports the count actually deleted when a later delete is refused.
 - Support the exact authenticated-user REST read used by feed history reconciliation, and preserve the uncompressed runtime-image budget when Docker's containerd store also accounts for compressed blobs.
 - Retain unsent onboarding welcome/goodbye payloads when successful REST responses contain inconsistent role snapshots or unusable channel evidence, while preserving proven-denial skips. Resolve only submitted session destinations so an unavailable unselected room cannot block valid routing. Add mock restart and selected/unselected regressions; current-head execution and independent review remain pending.
 - Synchronize the interrupted onboarding callback restart fixture on its first durable claim, not early HTTP arrival. Keep token-free receipts, exact attempt counts, replay fencing and fresh-reselection assertions unchanged.

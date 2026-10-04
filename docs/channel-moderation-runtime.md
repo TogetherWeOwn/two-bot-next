@@ -15,8 +15,20 @@ uses `HandlerId::Moderation`; no second router, registry or HTTP client exists.
 The shared router adjudicates the configured guild, feature gate and runtime
 permissions. The invoking channel is authoritative. The channel domain validates
 required reasons, purge 1–100 and slowmode 0–21600. Lockdown changes only the
-@everyone SendMessages bit; unlock requires the recorded recovery seed and
-restores exact original masks or deletes an originally absent overwrite.
+@everyone lockdown bits: SendMessages, SendMessagesInThreads, CreatePublicThreads,
+CreatePrivateThreads and AddReactions. A role- or member-specific overwrite that
+allows sending still wins; lockdown does not edit it. Unlock requires the
+recorded recovery seed and restores exact original masks or deletes an
+originally absent overwrite.
+
+Purge lists the newest `count` messages, then bulk-deletes those under 14 days
+old and deletes older ones one by one, because Discord rejects the whole bulk
+call when any message is older. It never deletes pinned messages or this bot's
+own posts (ticket, sticky and LFG panels), so it can delete fewer than `count`;
+the reply reports the number actually deleted. A message that vanished after
+the listing is skipped. If a later delete is refused or rate limited after some
+messages are gone, the purge stops and reports the count so far. An ambiguous
+failure (5xx, timeout) keeps the claim and lane for reconciliation.
 
 READY publishes the router's complete gated registry, including the other
 builtin slices. RESUMED-only startup resolves the application through the same
