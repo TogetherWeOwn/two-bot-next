@@ -57,6 +57,8 @@ README. Staging deploys from `main`; production is a separate manual gate.
   failure handling and rollback.
 - [Staging soak acceptance](docs/staging-soak.md): the evidence required before
   cutover; deployment alone is not acceptance.
+- [Offline staging slash smoke](docs/staging-slash-smoke.md): fixture-only router/reply
+  checks, explicit staging fences and honest coverage gaps; not live E2E evidence.
 - [Backup/restore runbook](docs/backup.md) and [parity matrix](docs/parity.md).
 - [Command registry drift](docs/command-publish.md): dry-run-first
   `two-bot commands diff|publish` and opt-in boot publication for cutover.

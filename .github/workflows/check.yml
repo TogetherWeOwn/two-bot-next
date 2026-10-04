@@ -192,6 +192,18 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-check-migrations.py
           python3 scripts/check-migrations.py --base-ref "$MIGRATION_BASE"
 
+      # Finish the pinned toolchain before the first pip run. The image ships
+      # the pinned Rust version without rustfmt or clippy, and rust-toolchain.toml
+      # asks for both. pip 23 (Debian bookworm) probes `rustc --version` from the
+      # workspace with a 0.5 s timeout, which makes the rustup proxy start that
+      # component install; the timeout then kills it half-way and leaves
+      # untracked bin/cargo-fmt and bin/rustfmt in the toolchain. The later
+      # `cargo fmt` fails with "detected conflict: 'bin/cargo-fmt'" in roughly
+      # half the runs. With the components in place the probe returns at once.
+      - name: Install pinned Rust toolchain components
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: rustup toolchain install --no-self-update
+
       - name: Install pinned static audit tools
         run: |
           python3 -m pip --isolated --disable-pip-version-check --no-cache-dir install --only-binary=:all: --no-deps --target "$RUNNER_TEMP/zizmor" 'zizmor==1.30.1' 'PyYAML==6.0.3'
