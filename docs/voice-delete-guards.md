@@ -52,15 +52,32 @@ Run from an isolated checkout through the bounded controller wrapper:
 python3 scripts/cargo_cache.py run -- test -p two-bot --lib voice_rooms::tests:: -- --test-threads=2
 ```
 
-The targeted new suite is `voice_rooms::tests::delete_guards::`. A separate local
-mutation receipt must show an assertion failure when removing the protected-ID
-membership check and when ignoring the grace comparison, one at a time, followed
-by restoration and a green original suite. A compilation error or wrapper
-admission refusal is **not** a killed mutation. No automated CI mutation harness
-is introduced here.
+The targeted new suite is `voice_rooms::tests::delete_guards::`.
 
-At the initial implementation checkpoint, compiling tests and mutations had not
-run: the bounded pool refused admission with `no idle, below-budget slot`.
-Therefore the parity row remains **carded**. Fixture locations alone are not a
-passing receipt, independent review, staging waiver acceptance or voice-cutover
-approval. The separate voice-receipt gate remains required.
+## Mutation receipts
+
+The controller's bounded Cargo pool refused every local compile (`no idle,
+below-budget slot`), so both mutations ran as one-off hosted `check.yml`
+dispatches on throwaway probe branches cut from the tested code (`6164d9d`),
+which were deleted afterwards. This is a manual receipt, not an automated CI
+mutation harness. Each mutation was applied alone, compiled, and failed
+assertions (not a compile error or a refused wrapper):
+
+| Mutation | Hosted run | Failing worker fixtures (`cargo test` unit step) |
+| --- | --- | --- |
+| `delete_protected` always returns `false` (protected-ID and category check removed) | [run 37209631466](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/37209631466) | 5 failed, 248 passed: `boot_configured_infrastructure_is_protected_in_each_actor`, `companion_provenance_cannot_delete_infrastructure`, `newly_added_creator_cancels_a_preexisting_delete`, `queued_delete_observes_new_protection_at_send_time`, `protected_infrastructure_with_claimed_provenance_never_deletes` |
+| `empty_grace_elapsed` always returns `true` (grace comparison removed) | [run 37211554475, attempt 2](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/37211554475) | 6 failed, 247 passed: `bot_only_occupancy_is_empty_but_unknown_identity_is_human`, `delayed_delete_rechecks_grace_after_transient_human_occupancy`, `delete_rechecks_live_grace_after_the_provenance_read`, `human_join_and_leave_between_ticks_restart_queued_delete_grace`, `ordinary_empty_room_survives_until_exact_grace_deadline`, `reconnect_restarts_grace_instead_of_counting_disconnected_time` |
+
+The unmutated head ran green in the same workflow (run 37210684046, tested head
+`6e52179`): 253 unit tests, the bin target, the integration step and the
+ignored-database gateway reconcile fixture all passed. Two earlier probe
+attempts failed for unrelated reasons (a rustup component conflict before
+`cargo fmt`, and dead-code warnings under `clippy -D warnings`) and are not
+counted. The first hosted unit run on the PR also caught four real-time sink
+fixtures and one uncataloged log event; both are fixed above and in the PR
+history.
+
+With the protected-ID and grace checks each shown to fail assertions, and every
+M1-M6 obligation mapped to a worker fixture, the legacy mutation-guard row is
+promoted. Fixture evidence is not staging acceptance, independent review or
+voice-cutover approval. The separate voice-receipt gate remains required.
