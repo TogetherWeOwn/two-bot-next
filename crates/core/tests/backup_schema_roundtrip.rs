@@ -1356,6 +1356,9 @@ async fn pre_reservation_v4_restores_and_clears_newer_reservation_rows() {
     )
     .unwrap();
     assert_eq!(inspect(&source).unwrap().manifest.version, 4);
+    // Restore fences a destination holding moderation history; this scenario
+    // deliberately replaces a reused rehearsal target.
+    forget_moderation_history(pool).await;
     let report = restore(pool, &source).await.unwrap();
     assert!(report.ok);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM voice_create_reservations")
