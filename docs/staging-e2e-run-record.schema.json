@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/TogetherWeOwn/two-bot-next/blob/main/docs/staging-e2e-run-record.schema.json",
+  "title": "staging-e2e-run-record",
+  "description": "Machine-readable record of one staging end-to-end run of two-bot-next: which revision was deployed, which deploy-staging run put it there, which commands were exercised with timings, per-command pass/fail, failure-signature references, tester identity, cleanup result and the QA verdict. Staging only; never production. Failure-signature IDs are opaque references into the separate failure-signature triage runbook, which this schema does not define.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run",
+    "environment",
+    "deployment",
+    "tester",
+    "window",
+    "commands",
+    "cleanup",
+    "verdict"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "Version of this record format. Current version is 1.",
+      "type": "integer",
+      "const": 1
+    },
+    "mock": {
+      "description": "True only for worked examples. Real run records omit this field or set it to false.",
+      "type": "boolean",
+      "default": false
+    },
+    "run": {
+      "description": "Identity of this staging run.",
+      "type": "object",
+      "required": ["id"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "Unique run label, for example staging-e2e-2026-10-04-001.",
+          "type": "string",
+          "minLength": 1
+        },
+        "plan_ref": {
+          "description": "Human-readable pointer to the run plan or checklist rows covered (no secrets, no internal tracker IDs).",
+          "type": "string"
+        }
+      }
+    },
+    "environment": {
+      "description": "Where the run executed. Staging only.",
+      "type": "object",
+      "required": ["target", "guild_id", "worker_env"],
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "type": "string",
+          "const": "staging"
+        },
+        "guild_id": {
+          "description": "Staging guild snowflake the fixture actions targeted.",
+          "type": "string",
+          "pattern": "^[0-9]{16,20}$"
+        },
+        "worker_env": {
+          "type": "string",
+          "const": "staging"
+        }
+      }
+    },
+    "deployment": {
+      "description": "What revision was under test and which deploy-staging run put it there.",
+      "type": "object",
+      "required": ["revision", "deploy_staging_run_id"],
+      "additionalProperties": false,
+      "properties": {
+        "revision": {
+          "description": "Exact deployed commit SHA under test (40 lowercase hex characters).",
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "deploy_staging_run_id": {
+          "description": "GitHub Actions run ID of the deploy-staging workflow that deployed the revision (digits only).",
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "worker_version": {
+          "description": "Worker version string reported by the staging deployment receipt, when known.",
+          "type": "string"
+        },
+        "first_readyz_utc": {
+          "description": "UTC timestamp of the first /readyz 200 after this deployment (redeploy-gap measurement).",
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "tester": {
+      "description": "Who ran the commands. A role, handle or agent name; never a token, secret or credential.",
+      "type": "object",
+      "required": ["identity"],
+      "additionalProperties": false,
+      "properties": {
+        "identity": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "window": {
+      "description": "UTC window during which commands were exercised.",
+      "type": "object",
+      "required": ["start_utc", "end_utc"],
+      "additionalProperties": false,
+      "properties": {
+        "start_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "end_utc": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "commands": {
+      "description": "One entry per command exercised, in execution order. At least one entry is required.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "started_utc", "duration_ms", "result"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "description": "Command as invoked, for example /rank or !faq.",
+            "type": "string",
+            "minLength": 1
+          },
+          "started_utc": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "duration_ms": {
+            "description": "Wall-clock time from invocation to observed reply, in whole milliseconds.",
+            "type": "integer",
+            "minimum": 0
+          },
+          "result": {
+            "type": "string",
+            "enum": ["pass", "fail", "skipped"]
+          },
+          "expected": {
+            "description": "One line: what the fixture should have produced.",
+            "type": "string"
+          },
+          "actual": {
+            "description": "One line: what was observed (sanitized, no message content, no IDs beyond fixture aliases).",
+            "type": "string"
+          },
+          "failure_signature": {
+            "description": "Opaque ID into the failure-signature triage runbook. Required when result is fail; omit otherwise.",
+            "type": "string",
+            "minLength": 1
+          },
+          "evidence_ref": {
+            "description": "Pointer to the redacted screenshot, log excerpt or CI receipt for this command.",
+            "type": "string"
+          },
+          "notes": {
+            "type": "string"
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "result": { "const": "fail" }
+              }
+            },
+            "then": {
+              "required": ["failure_signature"]
+            }
+          }
+        ]
+      }
+    },
+    "cleanup": {
+      "description": "Fixture cleanup and rollback outcome after the run.",
+      "type": "object",
+      "required": ["result"],
+      "additionalProperties": false,
+      "properties": {
+        "result": {
+          "type": "string",
+          "enum": ["restored", "pending", "not_applicable"]
+        },
+        "notes": {
+          "description": "What was restored through the normal UI/API, or what is still pending and who owns it.",
+          "type": "string"
+        }
+      }
+    },
+    "verdict": {
+      "description": "QA verdict for this run.",
+      "type": "object",
+      "required": ["disposition", "summary"],
+      "additionalProperties": false,
+      "properties": {
+        "disposition": {
+          "type": "string",
+          "enum": ["PASS", "NEEDS WORK"]
+        },
+        "summary": {
+          "description": "One or two sentences: what passed, what failed, and the next step.",
+          "type": "string",
+          "minLength": 1
+        },
+        "follow_up_refs": {
+          "description": "Public references to follow-up work (public issue numbers or plain descriptions; no secrets).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
