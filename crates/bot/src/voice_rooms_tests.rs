@@ -80,6 +80,7 @@ fn command_snapshot() -> GuildSnapshot {
         Permissions::ADMINISTRATOR,
         Permissions::MANAGE_GUILD,
         Permissions::VIEW_CHANNEL | Permissions::MANAGE_CHANNELS,
+        Permissions::VIEW_CHANNEL | Permissions::MANAGE_GUILD,
         Permissions::MANAGE_GUILD | Permissions::MANAGE_CHANNELS,
     ] {
         guild
@@ -2792,6 +2793,22 @@ async fn channel_manage_channels_cannot_select_another_members_room() {
     interaction.member.as_mut().unwrap().roles.clear();
     let (_, reply) = handle_capture(&runtime, &interaction).await;
     assert!(response_text(&reply.unwrap()).contains("isn't a temporary room"));
+}
+
+#[tokio::test]
+async fn channel_manage_channels_does_not_reveal_setup_detail() {
+    let runtime = failing_creators_runtime(Trace::default());
+    let mut interaction = voice_interaction(
+        Some(command_data("setup", Vec::new())),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
+    interaction.member.as_mut().unwrap().roles.clear();
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(text.contains("Voice rooms are running"), "{text}");
+    assert!(!text.contains("Could not load creator channels"), "{text}");
 }
 
 #[tokio::test]

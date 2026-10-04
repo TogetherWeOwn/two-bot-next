@@ -6489,10 +6489,7 @@ where
             true
         }
         VoiceCommand::Setup => {
-            let permissions = interaction
-                .member
-                .as_ref()
-                .and_then(|member| member.permissions);
+            let permissions = runtime.guild_permissions(interaction);
             let status = runtime.worker_status(guild_id).await;
             let panel = if is_voice_admin(permissions) {
                 let (store, _) = runtime.make_pair();
