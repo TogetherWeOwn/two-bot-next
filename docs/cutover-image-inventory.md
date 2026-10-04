@@ -14,7 +14,7 @@ commit; no image was built or pulled for this note.
 
 | Stage | Reference (pinned) | OS | Purpose |
 |---|---|---|---|
-| builder | `rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c` | Debian 13 (trixie) | Full toolchain; compiles the release binary, then discarded |
+| builder | `rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546` | Debian 13 (trixie) | Full toolchain; compiles the release binary, then discarded |
 | runtime | `gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2` | Debian 13, distroless `cc` | Ships glibc, libgcc, CA trust data and the `nonroot` account (uid/gid 65532); carries only the release binary |
 
 Both stages are Debian 13, so the binary links against the glibc it runs on.
