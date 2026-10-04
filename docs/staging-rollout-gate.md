@@ -80,7 +80,14 @@ not production authorization or a migration tool.
    steps, converged instance progress, and one active/healthy singleton with no
    failed/starting/scheduling instances. The rollout's `current_*` fields describe
    the **before** configuration, not an acknowledgement of the target. Verify the
-   application's actual configuration digest separately.
+   application's actual configuration digest separately. If the completed rollout
+   is otherwise exact but the control-plane `active` counter still reads 0 while
+   `healthy` reads 1, `verify` accepts it only after two consecutive full passes:
+   each pass still requires the exact Worker at 100% traffic, `/readyz` 200 with
+   all components ready and the exact compiled revision/build ID, `/health` 200
+   with the exact Worker version, and a lag-tolerant control-plane recheck. Any
+   non-passing poll resets the streak. The success evidence records
+   `"active_lag": true` on this path.
 7. Require the intended Worker version at 100% traffic, `/readyz` **200** with all
    components ready and the exact compiled revision/build ID, and `/health` 200.
    Both responses carry `x-two-worker-version`, overwritten by the outer Worker
