@@ -1,6 +1,6 @@
 [package]
 name = "two-bot"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,10 +16,10 @@ path = "src/main.rs"
 # path): cargo-deny `wildcards = "deny"` rejects version-less deps, and the
 # version pins the API contract between crates at a glance.
 [dependencies]
-two-bot-core = { version = "0.2.0", path = "../core", features = ["db"] }
-two-bot-discord = { version = "0.2.0", path = "../discord", features = ["db"] }
-two-bot-store = { version = "0.2.0", path = "../store" }
-two-bot-cutover = { version = "0.2.0", path = "../cutover" }
+two-bot-core = { version = "0.3.0", path = "../core", features = ["db"] }
+two-bot-discord = { version = "0.3.0", path = "../discord", features = ["db"] }
+two-bot-store = { version = "0.3.0", path = "../store" }
+two-bot-cutover = { version = "0.3.0", path = "../cutover" }
 # Relay/audit ids: 16 CSPRNG bytes hex-encoded (same shape as core's
 # internal_actions nonces).
 hex = { workspace = true }
@@ -45,9 +45,9 @@ twilight-http = { workspace = true }
 twilight-model = { workspace = true }
 
 [dev-dependencies]
-two-bot-discord = { version = "0.2.0", path = "../discord", features = ["test-support"] }
+two-bot-discord = { version = "0.3.0", path = "../discord", features = ["test-support"] }
 # The shared loopback Discord fixture uses SinkExt only in integration tests.
 futures-util = { workspace = true, features = ["sink"] }
-two-bot-testsupport = { version = "0.2.0", path = "../testsupport" }
+two-bot-testsupport = { version = "0.3.0", path = "../testsupport" }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-websockets = { workspace = true }

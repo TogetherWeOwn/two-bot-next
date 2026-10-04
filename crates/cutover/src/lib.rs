@@ -46,7 +46,9 @@ pub mod voice_ghosts;
 pub mod voice_reconcile;
 pub mod voice_rooms;
 
-pub use backfill_plan::{plan_backfill_merge, BackfillMerge, ListedMember, PlannedEvent};
+pub use backfill_plan::{
+    event_metadata_json, plan_backfill_merge, BackfillMerge, ListedMember, PlannedEvent,
+};
 pub use db::{
     connect, connect_with_tls, mark_bot, record_earliest, record_event, replace_role_rewards,
     role_rewards, touch_activity, CutoverDb, FunnelWrite, ReplaceRewardsError, DB_POOL_MAX_DEFAULT,

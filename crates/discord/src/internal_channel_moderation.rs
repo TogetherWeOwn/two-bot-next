@@ -172,7 +172,8 @@ impl InternalChannelExecutor {
             action: request.action,
             actor: actor.clone(),
             target: None,
-            bot_highest_role_position: None,
+            // Channel verbs skip member hierarchy entirely.
+            bot_highest_role_position: 0,
             reason: request.reason.clone(),
             duration_seconds: None,
             count: request.count.and_then(|n| n.try_into().ok()),

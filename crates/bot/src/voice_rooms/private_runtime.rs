@@ -18,7 +18,10 @@
 
 use two_bot_core::{
     voice_ownership::require_room_owner,
-    voice_private::{ChannelId, JoinChannel, MemberId, PrivacyEffect, PrivacyError, PrivateRoom},
+    voice_private::{
+        join_channel_name, ChannelId, JoinChannel, MemberId, PrivacyEffect, PrivacyError,
+        PrivateRoom,
+    },
 };
 
 use super::*;
@@ -239,6 +242,22 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
     }
 
+    /// The owner's display name as it may appear in the Join channel's name:
+    /// the full channel name goes through the same name filter as a generated
+    /// room name, and a name that fails it is left out (the channel is then
+    /// just "⇩ Join"), never sent.
+    fn joinable_display(&self, room: &VoiceRoom, display: &str) -> String {
+        let context = NameFilterContext {
+            guild_id: self.live.guild_id.to_string(),
+            channel_id: room.channel_id.to_string(),
+            user_id: room.owner_id.to_string(),
+        };
+        match filter_channel_name(&join_channel_name(display), &self.name_policy, &context) {
+            Ok(_) => display.to_owned(),
+            Err(_) => String::new(),
+        }
+    }
+
     fn privacy_state(
         &self,
         room: &VoiceRoom,
@@ -254,7 +273,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             });
         state.owner_id = MemberId(room.owner_id);
         if actor_id == room.owner_id && !actor_display.trim().is_empty() {
-            actor_display.clone_into(&mut state.owner_display);
+            state.owner_display = self.joinable_display(room, actor_display);
         }
         state.validate()?;
         Ok(state)

@@ -424,8 +424,43 @@ impl HistoricalBanAcceptance {
     }
 }
 
+/// One fenced row for operator reconciliation: a prepared ban intent, a
+/// running unban dispatch, or a quarantined import. Identifiers only —
+///
+/// claim tokens never leave the ledger. Resolving any of these needs the
+/// attempt-fenced methods with authoritative exact-intent evidence, never
+/// age or current remote state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncertainRow {
+    pub request_id: String,
+    pub user_id: String,
+    pub kind: UncertainKind,
+    pub generation: Option<i64>,
+    pub execute_at: Option<String>,
+}
+
+/// Which fence an [`UncertainRow`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UncertainKind {
+    PreparedBan,
+    RunningUnban,
+    QuarantinedUnban,
+}
+
+impl UncertainKind {
+    /// Stable operator-facing name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PreparedBan => "prepared_ban",
+            Self::RunningUnban => "running_unban",
+            Self::QuarantinedUnban => "quarantined_unban",
+        }
+    }
+}
+
 /// Persistence seam for the member slice (legacy `ModerationStore`,
-/// member-slice methods only; lockdown methods belong to TOG-10079).
+/// member-slice methods only).
 /// All timestamps are `YYYY-MM-DDTHH:MM:SS.sssZ` ISO strings, bound with
 /// `::timestamptz` casts by the sqlx implementation (repo convention).
 pub trait MemberModerationStore: Send + Sync {
@@ -642,6 +677,15 @@ pub trait MemberModerationStore: Send + Sync {
         request_id: &str,
         claim_token: &str,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Surface fenced rows for operator reconciliation: prepared ban intents,
+    /// running dispatches and quarantined imports in this guild, ordered by
+    /// request id. Read-only; resolving them needs the attempt-fenced
+    /// methods with authoritative exact-intent evidence.
+    fn surface_uncertain(
+        &self,
+        guild_id: &str,
+    ) -> impl Future<Output = Result<Vec<UncertainRow>, StoreError>> + Send;
 }
 
 // --- execution input + validation -------------------------------------------
@@ -655,7 +699,7 @@ pub struct MemberExecution {
     pub guild_id: String,
     pub actor: ModerationActor,
     pub target: Option<ModerationTarget>,
-    pub bot_highest_role_position: Option<i64>,
+    pub bot_highest_role_position: i64,
     /// Raw moderator reason; trimmed and capped by validation.
     pub reason: String,
     /// Raw `duration_seconds` for tempban/timeout (signed so the
@@ -712,7 +756,7 @@ pub fn validate_member_request(
     policy: &ModerationPolicy,
     actor: &ModerationActor,
     target: Option<&ModerationTarget>,
-    bot_highest_role_position: Option<i64>,
+    bot_highest_role_position: i64,
     reason: &str,
     duration_seconds: Option<i64>,
 ) -> Result<ValidatedMemberRequest, MemberError> {
@@ -852,7 +896,32 @@ where
         exec: &'a MemberExecution,
     ) -> impl Future<Output = Result<MemberResult, MemberError>> + Send + 'a {
         async move {
-            let validated = self.validate(exec)?;
+            let validated = match self.validate(exec) {
+                Ok(validated) => validated,
+                Err(err @ MemberError::Policy(_)) => {
+                    self.store
+                        .record_audit(&AuditRow {
+                            // A refusal must not mask a later accepted audit
+                            // when the caller retries with this request id.
+                            request_id: format!("{}:denied", exec.request_id),
+                            guild_id: exec.guild_id.clone(),
+                            actor_id: exec.actor.user_id.clone(),
+                            action: exec.action.action_name(),
+                            target_id: exec.target.as_ref().map(|target| target.user_id.clone()),
+                            reason: "Member moderation policy refused the request".to_owned(),
+                            outcome: "denied",
+                            idempotency_key: exec.idempotency_key.clone(),
+                            metadata_json: serde_json::json!({
+                                "stage": "policy",
+                                "request_id": exec.request_id,
+                            })
+                            .to_string(),
+                        })
+                        .await?;
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            };
             let hash = request_hash(
                 validated.action,
                 &exec.guild_id,
@@ -1978,6 +2047,37 @@ impl MemberModerationStore for MemMemberStore {
         }
     }
 
+    async fn surface_uncertain(&self, guild_id: &str) -> Result<Vec<UncertainRow>, StoreError> {
+        let inner = self.lock();
+        let mut rows: Vec<UncertainRow> = inner
+            .bans
+            .iter()
+            .filter(|(_, row)| row.guild_id == guild_id && row.state == BanState::Prepared)
+            .map(|(request_id, row)| UncertainRow {
+                request_id: request_id.clone(),
+                user_id: row.user_id.clone(),
+                kind: UncertainKind::PreparedBan,
+                generation: Some(row.generation),
+                execute_at: None,
+            })
+            .chain(
+                inner
+                    .unbans
+                    .iter()
+                    .filter(|(_, row)| row.guild_id == guild_id && row.state == UnbanState::Running)
+                    .map(|(request_id, row)| UncertainRow {
+                        request_id: request_id.clone(),
+                        user_id: row.user_id.clone(),
+                        kind: UncertainKind::RunningUnban,
+                        generation: row.retry_generation,
+                        execute_at: Some(row.execute_at.clone()),
+                    }),
+            )
+            .collect();
+        rows.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+        Ok(rows)
+    }
+
     async fn requeue_unban(&self, request_id: &str, claim_token: &str) -> Result<(), StoreError> {
         let mut inner = self.lock();
         if inner.unbans.get(request_id).is_some_and(|row| {
@@ -2249,7 +2349,7 @@ mod tests {
             guild_id: GUILD.to_owned(),
             actor: actor(),
             target: Some(target()),
-            bot_highest_role_position: Some(100),
+            bot_highest_role_position: 100,
             reason: "spam in #general".to_owned(),
             duration_seconds: match action {
                 ModerationAction::TempBan | ModerationAction::Timeout => Some(3600),
@@ -2469,7 +2569,7 @@ mod tests {
             &policy(),
             &actor(),
             Some(&target()),
-            Some(100),
+            100,
             "spam in #general",
             match action {
                 ModerationAction::TempBan | ModerationAction::Timeout => Some(3600),
@@ -2516,7 +2616,7 @@ mod tests {
             ModerationAction::Lockdown,
             ModerationAction::Unlock,
         ] {
-            let err = validate_member_request(action, &policy(), &actor(), None, None, "x", None)
+            let err = validate_member_request(action, &policy(), &actor(), None, 0, "x", None)
                 .expect_err("must fail");
             assert!(matches!(err, MemberError::Malformed { .. }), "{action:?}");
         }
@@ -2605,7 +2705,7 @@ mod tests {
             );
             // Bot hierarchy (equal included).
             let mut exec = base();
-            exec.bot_highest_role_position = Some(10);
+            exec.bot_highest_role_position = 10;
             let err = refuse(&exec);
             assert_eq!(
                 err,
@@ -2624,6 +2724,81 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn policy_denials_audit_the_actor_without_claiming_or_disclosing_target_class() {
+        for action in [
+            ModerationAction::Ban,
+            ModerationAction::TempBan,
+            ModerationAction::Kick,
+            ModerationAction::Timeout,
+            ModerationAction::Warn,
+        ] {
+            let store = MemMemberStore::new();
+            let discord = MockMemberDiscord::new();
+            let svc = service(discord.clone(), store.clone());
+            let mut exec = execution(action);
+            exec.target.as_mut().unwrap().role_ids = vec![STAFF_ROLE.to_owned()];
+            exec.reason = "unvalidated private reason".to_owned();
+            for _ in 0..2 {
+                let error = svc.execute(&exec).await.expect_err("protected target");
+                assert_eq!(error, MemberError::Policy(PolicyError::TargetStaffRole));
+                assert_eq!(error.to_string(), "This target cannot be moderated");
+            }
+            assert!(discord.calls().is_empty());
+            assert!(store.warnings().is_empty());
+            let audits = store.audits();
+            assert_eq!(audits.len(), 1, "redelivery deduplicates the denial");
+            let row = &audits[0];
+            assert_eq!(row.request_id, format!("{}:denied", exec.request_id));
+            assert_eq!(row.actor_id, ACTOR_ID);
+            assert_eq!(row.guild_id, GUILD);
+            assert_eq!(row.target_id.as_deref(), Some(TARGET_ID));
+            assert_eq!(row.action, action.action_name());
+            assert_eq!(row.outcome, "denied");
+            assert_eq!(row.idempotency_key, exec.idempotency_key);
+            assert_eq!(row.reason, "Member moderation policy refused the request");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&row.metadata_json).unwrap(),
+                serde_json::json!({ "stage": "policy", "request_id": exec.request_id }),
+            );
+
+            // A refusal does not bind the key or hide a later accepted audit.
+            exec.target.as_mut().unwrap().role_ids.clear();
+            assert!(!svc.execute(&exec).await.expect("repaired request").replayed);
+            let audits = store.audits();
+            assert_eq!(audits.len(), 2);
+            assert!(audits
+                .iter()
+                .any(|row| row.request_id == exec.request_id && row.outcome != "denied"));
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_denial_audit_failure_has_no_effect_or_claim() {
+        let store = MemMemberStore::new();
+        let faulty = FaultyStore::wrap(store.clone());
+        faulty.arm_audit();
+        let discord = MockMemberDiscord::new();
+        let svc =
+            MemberModerationService::new(discord.clone(), faulty, policy(), || 1_700_000_000_000);
+        let mut exec = execution(ModerationAction::Ban);
+        exec.target.as_mut().unwrap().role_ids = vec![STAFF_ROLE.to_owned()];
+        assert!(matches!(
+            svc.execute(&exec).await,
+            Err(MemberError::Store(_))
+        ));
+        assert!(store.audits().is_empty());
+        assert!(discord.calls().is_empty());
+        exec.target.as_mut().unwrap().role_ids.clear();
+        assert!(
+            !svc.execute(&exec)
+                .await
+                .expect("no key was claimed")
+                .replayed
+        );
+        assert_eq!(discord.call_count("ban"), 1);
+    }
+
     #[test]
     fn reason_and_duration_bounds_match_legacy() {
         // Empty / overlong reasons.
@@ -2633,7 +2808,7 @@ mod tests {
                 &policy(),
                 &actor(),
                 Some(&target()),
-                Some(100),
+                100,
                 reason,
                 None,
             )
@@ -2646,7 +2821,7 @@ mod tests {
             &policy(),
             &actor(),
             Some(&target()),
-            Some(100),
+            100,
             "  spam  ",
             None,
         )
@@ -2663,7 +2838,7 @@ mod tests {
                     &policy(),
                     &actor(),
                     Some(&target()),
-                    Some(100),
+                    100,
                     "x",
                     bad,
                 )
@@ -2686,7 +2861,7 @@ mod tests {
                         &policy(),
                         &actor(),
                         Some(&target()),
-                        Some(100),
+                        100,
                         "x",
                         good,
                     )
@@ -3862,6 +4037,10 @@ mod tests {
             claim_token: &str,
         ) -> Result<(), StoreError> {
             self.inner.requeue_unban(request_id, claim_token).await
+        }
+
+        async fn surface_uncertain(&self, guild_id: &str) -> Result<Vec<UncertainRow>, StoreError> {
+            self.inner.surface_uncertain(guild_id).await
         }
     }
 

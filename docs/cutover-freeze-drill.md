@@ -7,8 +7,8 @@ compare the pre/post state. Staging guild only. This document describes
 the rehearsed steps; production authorization lives on the cutover card.
 
 Source of behavior: `crates/core/src/channel_moderation.rs`
-(`plan_lockdown` moves only `SEND_MESSAGES`, `plan_unlock` restores the
-recorded seed verbatim) and `docs/cutover-sequence.md` §1 (freeze and
+(`plan_lockdown` moves only the send, thread and reaction lockdown bits,
+`plan_unlock` restores the recorded seed verbatim) and `docs/cutover-sequence.md` §1 (freeze and
 drain). The harness is `scripts/cutover_freeze_drill.py`; its offline
 checks are `scripts/test_cutover_freeze_drill.py`.
 

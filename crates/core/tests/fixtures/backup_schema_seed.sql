@@ -330,6 +330,9 @@ UPDATE internal_idempotency SET resolved_role_id = '100000000000000010' WHERE in
 UPDATE internal_action_log SET resolved_role_id = '100000000000000010' WHERE intent_id = 83;
 INSERT INTO internal_discord_events (event_hash, claimed_at)
 VALUES (repeat('3', 64), '2026-08-01T10:00:00.123456Z');
+INSERT INTO internal_event_keys (guild_id, event_key, event_id, created_at, updated_at)
+VALUES ('100000000000000001', 'backup:launch', '100000000000000002',
+        '2026-08-01T10:00:00.123456Z', '2026-08-01T10:00:00.123456Z');
 
 INSERT INTO self_role_audit
     (event_id, guild_id, panel_id, member_id, source_id, option_key, role_id, source,

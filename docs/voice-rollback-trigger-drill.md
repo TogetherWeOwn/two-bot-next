@@ -60,8 +60,8 @@ rehearsal record (NEEDS WORK, 2026-10-03).
    slice with runbook anchor and shared packet spelling) and the live
    create/move/delete rehearsal on healthy staging (which also closes the
    ghost, gateway-gap, REST and job-staleness rows).
-4. **T4.** `voice_rooms` (via `GREATEST(created_at, owner_touched_at)`) and
-   `voice_text_companions` are measured; `voice_creators`, the ten V11b
+4. **T4.** `voice_rooms` (via `GREATEST(created_at, owner_touched_at, name_touched_at, privacy_touched_at)`) and
+   `voice_room_blocks` and `voice_text_companions` are measured; `voice_creators`, the ten V11b
    config tables, `voice_logging_settings` and `voice_access_controls` are
    `Unmeasurable` with source reasons but no reviewed acceptance. Test-seed
    coverage for the measured tables is already in review elsewhere; the gap

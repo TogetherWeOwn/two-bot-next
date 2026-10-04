@@ -752,6 +752,14 @@ pub enum RoomAction {
         channel_id: Snowflake,
         name: String,
     },
+    /// V3 `/name`: persist the worker's custom-name override for a tracked
+    /// room (`None` after a restore). No Discord write: the rename itself
+    /// rides [`RoomAction::RenameRoom`] on the deferred lane. A stale action
+    /// (the override moved on, or the room was forgotten) persists nothing.
+    SetCustomName {
+        channel_id: Snowflake,
+        custom_name: Option<String>,
+    },
     /// V4 enforcement for a passed vote: deny the member Connect on this room
     /// channel only, then disconnect them. Both writes are idempotent, so a
     /// retried action is safe.
@@ -822,6 +830,7 @@ impl RoomAction {
                 room_channel_id: channel_id,
                 ..
             }
+            | Self::SetCustomName { channel_id, .. }
             | Self::GrantCompanionView {
                 room_channel_id: channel_id,
                 ..
@@ -1483,6 +1492,10 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
             )
             .max_length(512),
         ]),
+        CommandDefinition::new(
+            "name",
+            "Set a custom name for your temporary voice room, or restore the template name",
+        ),
         CommandDefinition::new(
             "private",
             "Deny new members from joining your voice room and open a Join channel",
@@ -2242,6 +2255,7 @@ mod tests {
                 "defaultlimit",
                 "alwaysprivate",
                 "kick",
+                "name",
                 "private",
                 "public"
             ]
@@ -2393,6 +2407,13 @@ mod tests {
         );
         assert_eq!(kick.options[0].required, Some(true));
         assert_eq!(kick.options[1].required, None);
+        // `/name` is open to every member with no options: the panel and modal
+        // carry the name, and the worker refuses everyone but the owner or an
+        // admin.
+        let name = &defs[17];
+        assert_eq!(name.name, "name");
+        assert_eq!(name.default_member_permissions, None);
+        assert!(name.options.is_empty());
         // `/export` takes no options; `/import` takes one required file
         // attachment. Both are Manage Server (Manage Guild) gated.
         let export = &defs[9];
@@ -2421,9 +2442,9 @@ mod tests {
         assert!(defs[7].options[0].required == Some(true));
         // `/private` and `/public` take no options and are not permission
         // gated here: the handler allows only the room owner or an admin.
-        assert_eq!(defs[17].name, "private");
-        assert_eq!(defs[18].name, "public");
-        for def in &defs[17..19] {
+        assert_eq!(defs[18].name, "private");
+        assert_eq!(defs[19].name, "public");
+        for def in &defs[18..20] {
             assert_eq!(def.default_member_permissions, None);
             assert!(def.options.is_empty());
         }

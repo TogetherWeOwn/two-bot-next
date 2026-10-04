@@ -141,6 +141,23 @@ async fn private_denies_connect_keeps_view_and_creates_one_join_channel() {
 }
 
 #[tokio::test]
+async fn a_filtered_owner_name_is_left_out_of_the_join_channel_name() {
+    let (live, store, http, trace) = parts();
+    let mut worker = GuildRoomWorker::load(live, store, http)
+        .await
+        .unwrap()
+        .with_name_policy(Arc::new(fixture_policy(&["blorp"])));
+    worker.apply_privacy(OWNER, false, "Blorp Bob", PrivacyCommand::Private);
+    drain(&mut worker).await;
+    // The channel goes up with the bare prefix, never with the filtered name.
+    assert!(calls(&trace).contains(&format!("create_join:⇩ Join:Some({CATEGORY}):None")));
+    assert!(!calls(&trace)
+        .iter()
+        .any(|c| c.to_lowercase().contains("blorp")));
+    assert_eq!(stored(&worker), Some(record(true, Some(JOIN), &[])));
+}
+
+#[tokio::test]
 async fn private_again_is_a_noop() {
     let (mut worker, trace) = worker().await;
     private_cmd(&mut worker, OWNER);

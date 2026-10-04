@@ -231,9 +231,11 @@ pub struct VoiceDurationRow {
     pub duration_seconds: Option<f64>,
 }
 
-/// Parse one `voice_session_end` metadata blob. Unparseable metadata defaults
-/// to `start_known: true` with no duration: never claim the start is unknown
-/// when the row itself is unreadable.
+/// Parse one `voice_session_end` metadata blob. Accept finite numbers and
+/// decimal numeric strings (including whitespace and exponents), not JavaScript
+/// coercions of empty strings, booleans or containers into measured zeroes.
+/// Unparseable metadata defaults to `start_known: true` with no duration:
+/// never claim the start is unknown when the row itself is unreadable.
 #[must_use]
 pub fn parse_voice_end_metadata(metadata: Option<&serde_json::Value>) -> VoiceDurationRow {
     let Some(m) = metadata.and_then(serde_json::Value::as_object) else {
@@ -246,8 +248,10 @@ pub fn parse_voice_end_metadata(metadata: Option<&serde_json::Value>) -> VoiceDu
     let duration_seconds = match m.get("durationSeconds") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::Number(n)) => n.as_f64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok(),
         Some(_) => None,
-    };
+    }
+    .filter(|d| d.is_finite());
     VoiceDurationRow {
         start_known,
         duration_seconds,
@@ -377,7 +381,7 @@ mod tests {
             },
             VoiceDurationRow {
                 start_known: false,
-                duration_seconds: Some(60.0),
+                duration_seconds: Some(600.0),
             },
             VoiceDurationRow {
                 start_known: true,
@@ -388,12 +392,142 @@ mod tests {
                 duration_seconds: Some(-5.0),
             },
         ];
+        // Removing `.filter(|r| r.start_known)` yields 330, not 60.
         assert_eq!(average_known_voice_duration(&rows), Some(60.0));
-        let s = summarize_voice_durations(&rows);
-        assert_eq!(s.measured, 1);
-        assert_eq!(s.excluded_unknown_starts, 1);
+        assert_eq!(known_voice_durations(&rows), vec![60.0]);
+        assert_eq!(
+            summarize_voice_durations(&rows),
+            VoiceDurationSummary {
+                average_seconds: Some(60.0),
+                measured: 1,
+                excluded_unknown_starts: 1,
+            }
+        );
         // Unparseable metadata never claims unknown start.
         let r = parse_voice_end_metadata(None);
         assert!(r.start_known && r.duration_seconds.is_none());
+    }
+
+    #[test]
+    fn metadata_numbers_and_numeric_strings_enter_known_average() {
+        for raw in ["600", r#""600""#, r#"" 600 ""#, r#""6e2""#] {
+            let metadata: serde_json::Value =
+                serde_json::from_str(&format!(r#"{{"durationSeconds":{raw}}}"#)).unwrap();
+            let row = parse_voice_end_metadata(Some(&metadata));
+            assert_eq!(
+                row,
+                VoiceDurationRow {
+                    start_known: true,
+                    duration_seconds: Some(600.0),
+                },
+                "{raw}"
+            );
+            assert_eq!(
+                summarize_voice_durations(&[row]),
+                VoiceDurationSummary {
+                    average_seconds: Some(600.0),
+                    measured: 1,
+                    excluded_unknown_starts: 0,
+                },
+                "{raw}"
+            );
+        }
+        for (duration, expected) in [
+            (serde_json::json!(0), 0.0),
+            (serde_json::json!("0"), 0.0),
+            (serde_json::json!(60.5), 60.5),
+            (serde_json::json!("60.5"), 60.5),
+        ] {
+            let metadata = serde_json::json!({"startKnown": true, "durationSeconds": duration});
+            let row = parse_voice_end_metadata(Some(&metadata));
+            assert_eq!(row.duration_seconds, Some(expected));
+            assert_eq!(summarize_voice_durations(&[row]).measured, 1);
+            assert_eq!(average_known_voice_duration(&[row]), Some(expected));
+        }
+    }
+
+    #[test]
+    fn metadata_average_excludes_unknown_numbers_and_numeric_strings() {
+        let metadata = serde_json::json!([
+            {"startKnown": true, "durationSeconds": 60},
+            {"startKnown": true, "durationSeconds": "60"},
+            {"startKnown": false, "durationSeconds": 600},
+            {"startKnown": false, "durationSeconds": "600"},
+            {"startKnown": false, "durationSeconds": null},
+            {"startKnown": false},
+            {"startKnown": true, "durationSeconds": null},
+            {"startKnown": true},
+            {"startKnown": true, "durationSeconds": -5},
+            {"startKnown": true, "durationSeconds": "-5"},
+            {"startKnown": true, "durationSeconds": "malformed"}
+        ]);
+        let rows: Vec<_> = metadata
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| parse_voice_end_metadata(Some(m)))
+            .collect();
+        assert_eq!(rows[2].duration_seconds, Some(600.0));
+        assert_eq!(rows[3].duration_seconds, Some(600.0));
+        assert_eq!(known_voice_durations(&rows), vec![60.0, 60.0]);
+        assert_eq!(
+            summarize_voice_durations(&rows),
+            VoiceDurationSummary {
+                average_seconds: Some(60.0),
+                measured: 2,
+                excluded_unknown_starts: 4,
+            }
+        );
+        assert_eq!(
+            summarize_voice_durations(&rows[2..]),
+            VoiceDurationSummary {
+                average_seconds: None,
+                measured: 0,
+                excluded_unknown_starts: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_invalid_durations_never_become_measured_zeroes() {
+        for raw in [
+            r#"{"durationSeconds":null}"#,
+            "{}",
+            r#"{"durationSeconds":-5}"#,
+            r#"{"durationSeconds":"-5"}"#,
+            r#"{"durationSeconds":"NaN"}"#,
+            r#"{"durationSeconds":"Infinity"}"#,
+            r#"{"durationSeconds":"1e999"}"#,
+            r#"{"durationSeconds":"600s"}"#,
+            r#"{"durationSeconds":""}"#,
+            r#"{"durationSeconds":"   "}"#,
+            r#"{"durationSeconds":"0x258"}"#,
+            r#"{"durationSeconds":"0o1130"}"#,
+            r#"{"durationSeconds":"0b1001011000"}"#,
+            r#"{"durationSeconds":true}"#,
+            r#"{"durationSeconds":false}"#,
+            r#"{"durationSeconds":[]}"#,
+            r#"{"durationSeconds":[600]}"#,
+            r#"{"durationSeconds":{}}"#,
+            "null",
+            "[]",
+            "600",
+            r#""malformed""#,
+            "not json",
+            r#"{"durationSeconds":600"#,
+        ] {
+            let metadata = serde_json::from_str(raw).ok();
+            let row = parse_voice_end_metadata(metadata.as_ref());
+            assert!(row.start_known, "{raw}");
+            assert_eq!(
+                summarize_voice_durations(&[row]),
+                VoiceDurationSummary {
+                    average_seconds: None,
+                    measured: 0,
+                    excluded_unknown_starts: 0,
+                },
+                "{raw}"
+            );
+        }
     }
 }

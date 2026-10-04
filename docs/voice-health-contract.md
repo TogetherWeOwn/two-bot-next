@@ -68,6 +68,11 @@ and fallback delivery: guild system channel → setup-person/guild-owner DM →
 creator-channel chat. This component neither chooses destinations nor sends or
 retries notices. The Discord API notes still govern retry-after handling.
 
+The `/setup` consumer shows findings, store errors and the creator-channel list
+to admins only (Manage Channels or Administrator). Every other member gets a
+generic running or paused line, plus whether anything needs attention, with no
+channel ids, error text or permission gaps.
+
 Logging configuration, guild controls, `/ping`, `/invite`, deployment and live
 guild verification remain outside this offline slice. No runtime parity, live
 health or notice delivery is established by these tests.

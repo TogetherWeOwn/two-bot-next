@@ -106,7 +106,7 @@ later slice.
   one. It is deleted on `/public`, and with its room (ahead of the row, so a
   failed delete retries the whole room delete instead of leaking it). The worker
   only deletes Join channel ids it created or loaded from its own store.
-- **Persistence** (`0414_voice_room_privacy`). `voice_rooms.private` and
+- **Persistence** (`0416_voice_room_privacy`). `voice_rooms.private` and
   `join_channel_id`, plus `voice_room_blocks` rows that cascade with the room.
   `PrivacyRecord` is the durable subset of `PrivateRoom`; a corrupt record is
   refused at load rather than repaired.

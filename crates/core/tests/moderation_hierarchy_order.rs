@@ -69,11 +69,7 @@ fn unprotected_target(position: i64) -> ModerationTarget {
 
 /// Member-targeted (`ban`) request against one target with explicit hierarchy
 /// positions on both sides.
-fn ban_against(
-    target: ModerationTarget,
-    actor_pos: i64,
-    bot_pos: Option<i64>,
-) -> ModerationRequest {
+fn ban_against(target: ModerationTarget, actor_pos: i64, bot_pos: i64) -> ModerationRequest {
     ModerationRequest {
         action: ModerationAction::Ban,
         actor: actor(actor_pos),
@@ -88,7 +84,7 @@ fn ban_against(
 
 /// Member-targeted (`ban`) request whose bot AND actor positions both sit at
 /// or below the target, so both hierarchy comparisons fail together.
-fn ban_with_positions(actor_pos: i64, target_pos: i64, bot_pos: Option<i64>) -> ModerationRequest {
+fn ban_with_positions(actor_pos: i64, target_pos: i64, bot_pos: i64) -> ModerationRequest {
     ban_against(unprotected_target(target_pos), actor_pos, bot_pos)
 }
 
@@ -100,7 +96,7 @@ fn channel_request(
         action,
         actor: actor(1),
         target,
-        bot_highest_role_position: Some(1),
+        bot_highest_role_position: 1,
         reason: "hierarchy order acceptance".to_owned(),
         duration_seconds: None,
         count: None,
@@ -112,9 +108,7 @@ fn channel_request(
 fn both_hierarchies_failing_reports_bot_first() {
     // The bot side is evaluated before the actor side (`moderation.rs`
     // order), so the margin on either side must not change the winner.
-    for (actor_pos, target_pos, bot_pos) in
-        [(15, 20, Some(10)), (1, 20, Some(19)), (19, 20, Some(1))]
-    {
+    for (actor_pos, target_pos, bot_pos) in [(15, 20, 10), (1, 20, 19), (19, 20, 1)] {
         assert_eq!(
             assert_moderation_allowed(
                 &ban_with_positions(actor_pos, target_pos, bot_pos),
@@ -131,20 +125,20 @@ fn equal_positions_refuse_bot_first() {
     // Equal-or-above refuses on both sides; with both sides equal at once the
     // bot side still wins.
     assert_eq!(
-        assert_moderation_allowed(&ban_with_positions(25, 25, Some(25)), &policy()),
+        assert_moderation_allowed(&ban_with_positions(25, 25, 25), &policy()),
         Err(PolicyError::BotHierarchy),
     );
     // An equal actor paired with a failing bot is the same simultaneous
     // condition from the other margin: still the bot refusal.
     assert_eq!(
-        assert_moderation_allowed(&ban_with_positions(30, 30, Some(5)), &policy()),
+        assert_moderation_allowed(&ban_with_positions(30, 30, 5), &policy()),
         Err(PolicyError::BotHierarchy),
     );
 }
 
 #[test]
 fn missing_permission_precedes_both_hierarchies() {
-    let mut request = ban_with_positions(15, 20, Some(10));
+    let mut request = ban_with_positions(15, 20, 10);
     request.actor.permissions = 0;
     assert_eq!(
         assert_moderation_allowed(&request, &policy()),
@@ -160,7 +154,7 @@ fn missing_target_precedes_hierarchy() {
         action: ModerationAction::Ban,
         actor: actor(1),
         target: None,
-        bot_highest_role_position: Some(1),
+        bot_highest_role_position: 1,
         reason: "hierarchy order acceptance".to_owned(),
         duration_seconds: None,
         count: None,
@@ -174,7 +168,7 @@ fn missing_target_precedes_hierarchy() {
 
 #[test]
 fn self_target_precedes_both_hierarchies() {
-    let mut request = ban_with_positions(15, 20, Some(10));
+    let mut request = ban_with_positions(15, 20, 10);
     request.target.as_mut().expect("target").user_id = ACTOR_ID.to_owned();
     assert_eq!(
         assert_moderation_allowed(&request, &policy()),
@@ -191,7 +185,7 @@ fn guild_owner_protection_precedes_both_hierarchies() {
         Some(TargetProtection::GuildOwner),
     );
     assert_eq!(
-        assert_moderation_allowed(&ban_against(target, 15, Some(10)), &policy()),
+        assert_moderation_allowed(&ban_against(target, 15, 10), &policy()),
         Err(PolicyError::TargetGuildOwner),
     );
 }
@@ -205,7 +199,7 @@ fn owen_protection_precedes_both_hierarchies() {
         Some(TargetProtection::Owen),
     );
     assert_eq!(
-        assert_moderation_allowed(&ban_against(target, 15, Some(10)), &policy()),
+        assert_moderation_allowed(&ban_against(target, 15, 10), &policy()),
         Err(PolicyError::TargetOwen),
     );
 }
@@ -219,7 +213,7 @@ fn bot_target_protection_precedes_both_hierarchies() {
         Some(TargetProtection::Bot),
     );
     assert_eq!(
-        assert_moderation_allowed(&ban_against(target, 15, Some(10)), &policy()),
+        assert_moderation_allowed(&ban_against(target, 15, 10), &policy()),
         Err(PolicyError::TargetBot),
     );
 }
@@ -233,7 +227,7 @@ fn staff_role_protection_precedes_both_hierarchies() {
         Some(TargetProtection::StaffRole),
     );
     assert_eq!(
-        assert_moderation_allowed(&ban_against(target, 15, Some(10)), &policy()),
+        assert_moderation_allowed(&ban_against(target, 15, 10), &policy()),
         Err(PolicyError::TargetStaffRole),
     );
 }
