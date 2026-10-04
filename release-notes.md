@@ -1,60 +1,16 @@
 :robot: I have created a release *beep* *boop*
 
-## Thinking Path
+## Summary
 
-> - two-bot-next is the Together We Own Discord bot, written in Rust, running as one always-on container.
-> - Its workspace ships as one synchronized release with one root changelog and tag.
-> - Version 0.3.0 must carry generated changes and all preserved bootstrap notes.
-> - Local consumers outside the root workspace also need compatible version requirements.
-> - This pull request repairs release synchronization and canonical PR metadata without authorizing production cutover.
+Publish the next synchronized Rust workspace release through release-please.
 
-## Linked Issues or Issue Description
+## Changes
 
-- Publish the synchronized 0.3.0 workspace release and preserve every release/bootstrap note. Address the independent review's excluded-fuzz-consumer and copyable-testsupport-example findings on this same PR.
+Update the release manifest, Cargo versions and lockfile, and preserve generated and bootstrap changelog notes.
 
-## What Changed
+## Testing
 
-- Update the root release manifest, seven package versions and local dependency pins, Cargo.lock, and CHANGELOG.md through release-please.
-- Synchronize both excluded fuzz path requirements and the testsupport dependency example to 0.3.0. Register native generic extra-file updates so later releases synchronize them too.
-- Extend the offline native lifecycle fixture with both excluded consumers, three drift controls, all six fuzz targets, and unchanged external fuzz dependencies. Update the release documentation.
-- Route CONTRIBUTING.md-only edits to Worker CI because the release lifecycle reads its testsupport example; pin the selector and retain the README-only fast pass.
-- Keep all seven PR sections before the native notes delimiter. Preserve the generated notes region and native overflow link.
-- Credit release-please automation and the repository contributors whose changes appear below.
-
-## Verification
-
-- `node scripts/test-release.cjs` with release-please 17.6.0: PASS, 22 bootstrap plus 22 generated post-release native lifecycles and three excluded-consumer drift controls. The new regression failed before the repair, including on the next generated release after current pins alone were fixed.
-- `node scripts/test-release-publication.cjs`: PASS, native publication, retry and misplaced-template negative control.
-- `python3 scripts/test-release-retry.py`: PASS, 28 tests. `python3 scripts/test-pr-lint.py`: PASS, 27 tests.
-- `python3 scripts/test-docker-deps.py`: PASS, seven package targets; Cargo compilation was not run. `git diff --check`: PASS.
-- Compilation-free offline Cargo resolver fixtures using the actual local dependency names, versions and requirements: all three failed before the fix (exit 101), compatible controls passed, and all three pass after the fix. The fuzz consumer fixtures retain six targets.
-- `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_job_inputs.py' -v`: PASS, 58 tests. The new contributor-example selector regression failed before the fix and passes after it. `test_container_inputs.py`: PASS, 26 tests.
-- Isolated native lifecycle controls: unchanged and restored CONTRIBUTING.md pass; removing only its version marker fails with `Unsynchronized testsupport dependency example`. A contributor-only change now selects worker=true and rust/supply/parity=false; README-only still selects no heavy job.
-- Repair head `50665888` supersedes the reviewed head. New exact-head CI and independent approval are pending; older approvals or green heads do not satisfy the merge gate.
-- No local Rust compilation, full fuzz campaign, staging E2E, production tests or deployment ran. Canonical-note preservation is verified separately against the previous stored body; publication remains unverified until merge.
-
-## Risks
-
-- Pre-1.0 release publication is not production deployment or cutover approval.
-- Native delimiter placement controls published notes; the pinned publication fixture protects that boundary.
-- The generic updater changes only annotated version lines; the lifecycle checks preserve the unpublished fuzz package version, external dependencies and target definitions.
-- Keep the freeze until publication is verified. A regeneration requires preserving this metadata repair and repeating exact-head CI and review.
-
-## Model Used
-
-- OpenAI `gpt-6.1-sol` authored the synchronization repair and verification. release-please 17.6.0 generated the versions and release notes. A routed assertion draft returned an error and contributed no code; historical work remains credited to its contributors.
-
-## Checklist
-
-- [x] I wrote a thinking path that runs from the project to this change
-- [x] I named the model used, with its version
-- [ ] I searched for duplicate or related PRs and linked them above (not required for this generated chore release)
-- [x] I ran the relevant offline release and resolver tests locally and they pass
-- [x] I added regression coverage for the excluded consumers and next-release synchronization
-- [x] I updated the documentation this change touches
-- [x] No secret, token or credential is in the diff, the title, the body or the branch name
-- [x] No internal ticket id, instance link or private host is in the title, body, commits or branch name
-- [ ] CI is green on the repaired exact head before independent approval (pending)
+Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publication.cjs`, `python3 scripts/test-release-retry.py` and `python3 scripts/test-pr-lint.py`. Required checks are dispatched on this PR head; their green results and independent review are mandatory before merge.
 ---
 
 
@@ -386,6 +342,7 @@
 * **cutover:** bound member pagination and reject stalled cursors ([#168](https://github.com/TogetherWeOwn/two-bot-next/issues/168)) ([482feab](https://github.com/TogetherWeOwn/two-bot-next/commit/482feab09efb26a3ab6c74bd7d5e2dea37a6e15f))
 * **cutover:** classify invite_campaigns in rollback-delta specs ([#324](https://github.com/TogetherWeOwn/two-bot-next/issues/324)) ([7c90a86](https://github.com/TogetherWeOwn/two-bot-next/commit/7c90a86e30a4eb77e917de8eeb073b2b4da08372))
 * **cutover:** commit capture invite counters as one transaction ([#186](https://github.com/TogetherWeOwn/two-bot-next/issues/186)) ([a050a94](https://github.com/TogetherWeOwn/two-bot-next/commit/a050a9478c5cd7f4900385b2ad0b381e5e37a2d8))
+* **cutover:** enforce read-only plan login ([#550](https://github.com/TogetherWeOwn/two-bot-next/issues/550)) ([3af90f4](https://github.com/TogetherWeOwn/two-bot-next/commit/3af90f47c2cc0ffa32fdbf325c7e1e47776a3be9))
 * **cutover:** fence event dedupe to an explicit guild ([#142](https://github.com/TogetherWeOwn/two-bot-next/issues/142)) ([5fa9d3c](https://github.com/TogetherWeOwn/two-bot-next/commit/5fa9d3c049d615df15b58fb3c9867ac627261b96))
 * **cutover:** keep MEE6 inventory and dry-run from running migrations ([#157](https://github.com/TogetherWeOwn/two-bot-next/issues/157)) ([f4f7823](https://github.com/TogetherWeOwn/two-bot-next/commit/f4f7823ee82022e1f1a5ace7bf4698874e913026))
 * **cutover:** make settings_db test schema names unique per test ([#173](https://github.com/TogetherWeOwn/two-bot-next/issues/173)) ([3844216](https://github.com/TogetherWeOwn/two-bot-next/commit/3844216e5503cbd8363471e7bff743be98ed081e))
@@ -409,6 +366,7 @@
 * **deploy:** tolerate completed-rollout active-counter lag in staging verify ([#525](https://github.com/TogetherWeOwn/two-bot-next/issues/525)) ([0bbbf84](https://github.com/TogetherWeOwn/two-bot-next/commit/0bbbf8401e84000803f03333e3418e062b0b0a01))
 * **discord:** bound outbound text and suppress injected mentions ([#80](https://github.com/TogetherWeOwn/two-bot-next/issues/80)) ([8af9b23](https://github.com/TogetherWeOwn/two-bot-next/commit/8af9b23be40935b97cf29512be3aa45a8b368858))
 * **discord:** map stalled body timeout to wire Timeout ([#306](https://github.com/TogetherWeOwn/two-bot-next/issues/306)) ([7b2da29](https://github.com/TogetherWeOwn/two-bot-next/commit/7b2da294107296f85a4558528eb21af7c39580f0))
+* **docs:** clear the rustdoc errors that fail the nightly docs job ([#533](https://github.com/TogetherWeOwn/two-bot-next/issues/533)) ([94ae748](https://github.com/TogetherWeOwn/two-bot-next/commit/94ae7483da50139d79d50a249b5d382f0efed17a))
 * **http:** redact webhook tokens from request trace spans ([#450](https://github.com/TogetherWeOwn/two-bot-next/issues/450)) ([8d9f71f](https://github.com/TogetherWeOwn/two-bot-next/commit/8d9f71f73f176ba329752566ff59dd789ced8fb4))
 * **interactions:** actionable denied-path copy with next steps ([#425](https://github.com/TogetherWeOwn/two-bot-next/issues/425)) ([96e700d](https://github.com/TogetherWeOwn/two-bot-next/commit/96e700da5377dee674ecd890014a6103b965eec2))
 * **internal-actions:** fail closed on clock rollback ([#215](https://github.com/TogetherWeOwn/two-bot-next/issues/215)) ([9192328](https://github.com/TogetherWeOwn/two-bot-next/commit/9192328aac8ced619ad02e15e0952dfa1a5b55c9))
