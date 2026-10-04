@@ -266,7 +266,8 @@ async fn command_help_needs_no_credentials_and_sends_no_rest() {
             "two-bot commands publish [--apply]",
             "--allow-live-guild",
             "DISCORD_TOKEN",
-            "No database is opened.",
+            "TWO_DATABASE_URL",
+            "no gateway is started",
         ] {
             assert!(
                 help.contains(expected),

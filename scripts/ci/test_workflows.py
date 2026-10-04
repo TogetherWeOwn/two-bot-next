@@ -163,6 +163,15 @@ def staging_migrate_errors(workflow):
         errors.append(f"{name}:plan: must read the staging-migrate-plan Environment binding")
     if apply.get("environment") != "staging-migrate-apply":
         errors.append(f"{name}:apply: must read the staging-migrate-apply Environment binding")
+    # Token-permission check (TOG-15157 gap 2): the plan job produces the
+    # manifest with contents:read only, while apply additionally needs
+    # actions:read -- and nothing more -- to fetch the producing plan run's
+    # manifest artifact for the provenance gate.
+    if plan.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:plan: must keep contents:read only (it produces the manifest)")
+    if apply.get("permissions") != {"contents": "read", "actions": "read"}:
+        errors.append(f"{name}:apply: must carry exactly contents:read plus actions:read "
+                      "(provenance artifact fetch, nothing more)")
     if plan.get("if") != "github.ref == 'refs/heads/main'":
         errors.append(f"{name}:plan: must run only from main")
     if apply.get("if") != "github.ref == 'refs/heads/main' && inputs.mode == 'apply'":
@@ -194,9 +203,35 @@ def staging_migrate_errors(workflow):
         errors.append(f"{name}:apply: must pass the plan-bound manifest hash and run id to the runner")
     if "--plan-manifest-sha256" in plan_runs or "--plan-run-id" in plan_runs:
         errors.append(f"{name}:plan: must not take plan-bound inputs (it produces the manifest)")
+    # Provenance anchor (TOG-15157 gap 2): apply fetches the producing plan
+    # run's manifest artifact by run id and hands it to the runner, which
+    # refuses unless the artifact carries the bound hash. The fetch must fail
+    # the job (no continue-on-error) so a wrong run id or missing artifact
+    # fails before the runner -- and before any DDL -- ever starts. Plan must
+    # not fetch by run id: it produces the manifest.
+    if "--plan-manifest-path" not in apply_runs:
+        errors.append(f"{name}:apply: must pass the producing run's downloaded manifest to the runner")
+    if "--plan-manifest-path" in plan_runs:
+        errors.append(f"{name}:plan: must not take the provenance manifest path (it produces the manifest)")
+    apply_fetch = [step for step in apply.get("steps", [])
+                   if str(step.get("uses", "")).startswith("actions/download-artifact@")]
+    if len(apply_fetch) != 1:
+        errors.append(f"{name}:apply: must fetch exactly one artifact (the producing plan manifest)")
+    else:
+        fetch = apply_fetch[0]
+        fetch_with = fetch.get("with", {})
+        if fetch_with.get("name") != "staging-migrate-manifest":
+            errors.append(f"{name}:apply: must fetch the staging-migrate-manifest artifact")
+        if "plan_run_id" not in str(fetch_with.get("run-id", "")):
+            errors.append(f"{name}:apply: must fetch the artifact from the plan_run_id run")
+        if fetch.get("continue-on-error") is True:
+            errors.append(f"{name}:apply: the provenance fetch must fail the job, never continue-on-error")
     plan_uses = [step.get("uses", "") for step in plan.get("steps", [])]
     if not any(str(u).startswith("actions/upload-artifact@") for u in plan_uses):
         errors.append(f"{name}:plan: must upload the staging-migrate-manifest.json run artifact")
+    if any(str(step.get("uses", "")).startswith("actions/download-artifact@")
+           for step in plan.get("steps", [])):
+        errors.append(f"{name}:plan: must not fetch artifacts by run id (it produces the manifest)")
     plan_text = str(plan.get("steps", []))
     if "staging-migrate-manifest" not in plan_text:
         errors.append(f"{name}:plan: must name the staging-migrate-manifest artifact")
@@ -507,6 +542,66 @@ class WorkflowTests(unittest.TestCase):
                     if "upload-artifact" not in str(step.get("uses", ""))
                 ]
             self.assertTrue(mutated(drop_upload))
+        # Provenance anchor (TOG-15157 gap 2): dropping the producing-run
+        # fetch, its run-id binding, its failure-closed posture or the
+        # runner's manifest-path flag must fail; widening plan with either
+        # end of the anchor, or widening the apply token grant, must fail.
+        with self.subTest(apply="no-provenance-fetch"):
+            def drop_fetch(w):
+                w["jobs"]["apply"]["steps"] = [
+                    step for step in w["jobs"]["apply"]["steps"]
+                    if "download-artifact" not in str(step.get("uses", ""))
+                ]
+            self.assertTrue(mutated(drop_fetch))
+        with self.subTest(apply="no-provenance-run-id"):
+            def drop_run_id(w):
+                for step in w["jobs"]["apply"]["steps"]:
+                    with_ = step.get("with", {})
+                    if "download-artifact" in str(step.get("uses", "")) and "run-id" in with_:
+                        del with_["run-id"]
+            self.assertTrue(mutated(drop_run_id))
+        with self.subTest(apply="provenance-fetch-continues-on-error"):
+            def soften(w):
+                for step in w["jobs"]["apply"]["steps"]:
+                    if "download-artifact" in str(step.get("uses", "")):
+                        step["continue-on-error"] = True
+            self.assertTrue(mutated(soften))
+        with self.subTest(apply="no-provenance-path-flag"):
+            def drop_path(w):
+                for step in w["jobs"]["apply"]["steps"]:
+                    if "--plan-manifest-path" in str(step.get("run", "")):
+                        step["run"] = step["run"].replace(
+                            " --plan-manifest-path producing-plan/staging-migrate-manifest.json", "")
+            self.assertTrue(mutated(drop_path))
+        with self.subTest(plan="provenance-fetch"):
+            def widen(w):
+                w["jobs"]["plan"]["steps"].append(
+                    {"uses": "actions/download-artifact@pinned",
+                     "with": {"name": "staging-migrate-manifest"}})
+            self.assertTrue(mutated(widen))
+        with self.subTest(plan="provenance-path-flag"):
+            def widen(w):
+                for step in w["jobs"]["plan"]["steps"]:
+                    if "--expected-pending" in str(step.get("run", "")):
+                        step["run"] = step["run"].replace(
+                            "--expected-pending \"$EXPECTED_PENDING\"",
+                            "--expected-pending \"$EXPECTED_PENDING\" "
+                            "--plan-manifest-path producing-plan/staging-migrate-manifest.json")
+            self.assertTrue(mutated(widen))
+        # Each mutation must differ from that job's pinned grant: plan keeps
+        # contents:read only, apply carries exactly contents:read plus
+        # actions:read. Narrowing apply (losing the provenance fetch) or
+        # widening either job must fail.
+        for job_id, permissions in (
+                ("plan", {"contents": "read", "actions": "read"}),
+                ("plan", {}),
+                ("apply", {"contents": "read"}),
+                ("apply", {"contents": "read", "actions": "read", "checks": "read"}),
+                ("apply", {"contents": "write", "actions": "read"})):
+            with self.subTest(job=job_id, permissions=permissions):
+                def change(w, job_id=job_id, permissions=permissions):
+                    w["jobs"][job_id]["permissions"] = permissions
+                self.assertTrue(mutated(change))
 
     def test_overflow_runner_must_name_its_own_job(self):
         self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))
@@ -543,6 +638,10 @@ class WorkflowTests(unittest.TestCase):
                     expected = {"contents": "read"}
                     if (name, job_id) == ("supply-chain.yml", "pr-lint"):
                         expected["pull-requests"] = "read"
+                    elif (name, job_id) == ("staging-migrate.yml", "apply"):
+                        # TOG-15157: read-only fetch of the producing plan
+                        # run's manifest artifact for the provenance gate.
+                        expected = {"contents": "read", "actions": "read"}
                     elif (name, job_id) == ("deploy-production.yml", "guard"):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
                     elif (name, job_id) == ("release.yml", "release-please"):

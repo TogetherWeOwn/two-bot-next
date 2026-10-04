@@ -244,7 +244,7 @@ jobs:
 
       - name: Install Rust toolchain
         if: needs.job-inputs.outputs.rust != 'false'
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -684,10 +684,10 @@ jobs:
     env:
       MEMBER_TESTDB: agent-testdb
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         if: needs.job-inputs.outputs.rust != 'false'
         with:
           toolchain: stable
@@ -764,7 +764,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
           toolchain: stable
       # Per-job dependency cache: the key includes the job id (no
@@ -916,11 +916,11 @@ jobs:
           printf 'Selector output: build=%s\n' "$BUILD_SELECTION"
       - name: Set up BuildKit
         if: needs.container-inputs.outputs.build == 'true'
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build runtime image (local only)
         id: build
         if: needs.container-inputs.outputs.build == 'true'
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile
@@ -985,10 +985,10 @@ jobs:
     env:
       TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/postgres
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: stable
           components: clippy
@@ -1038,7 +1038,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
           toolchain: stable
           components: clippy
@@ -1081,10 +1081,10 @@ jobs:
     env:
       TICKET_TEST_DB_HOST: agent-testdb
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
           toolchain: stable
       # TOG-11810: dependency build cache, as in the `check` job. The key
