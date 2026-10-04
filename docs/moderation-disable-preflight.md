@@ -81,8 +81,12 @@ Recovery, in order:
      it.
    - Neither is provable: leave the claim and escalate for a recorded
      security disposition. Do not guess.
-4. **Close it with the fenced store call.** No operator command exposes this
-   today. The only supported close is
+4. **Close it with the fenced store call.** No operator command on `main`
+   exposes this today. Pull request #398 (open, not merged) adds
+   `two-bot reconcile-member --guild <id> --resolve-unban --request <req> --claim <token> (--completed | --void) [--execute]`,
+   a staging-guild-only command that is dry-run unless `--execute` is given
+   and never prints the claim token. Once #398 merges, prefer it and drop the
+   rest of this step; until then, the only supported close is
    `resolve_uncertain_unban(request_id, claim_token, resolution)` in
    `crates/core/src/member_moderation_store.rs`, called under the member queue
    by an engineer with the exact `request_id` from the report and the row's
