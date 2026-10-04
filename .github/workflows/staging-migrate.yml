@@ -113,7 +113,10 @@ jobs:
       - name: Upload plan manifest
         # The apply dispatch binds to this artifact by hash: the reviewer
         # reads plan_manifest_sha256/plan_run_id off this run, and the apply
-        # runner refuses unless the hash matches on the same source_sha.
+        # runner refuses unless the hash matches on the same source_sha and
+        # the artifact fetched back from that run carries the same hash
+        # (provenance gate). Keep the 14-day retention: an expired artifact
+        # fails the apply fetch step before any DDL.
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: staging-migrate-manifest
@@ -124,6 +127,11 @@ jobs:
     name: staging-migrate (apply)
     permissions:
       contents: read
+      # Minimal grant for the provenance gate below: read-only fetch of the
+      # producing plan run's manifest artifact through the GitHub API. Same
+      # grant the deploy-production guard already carries for run gating; the
+      # plan job keeps contents:read only because it produces the manifest.
+      actions: read
     # Dispatch from main only, mode=apply only, and only after a green plan.
     # The binding must be scoped to the staging-migrate-apply environment
     # (required reviewer, main-only deployment branches) so a workflow edited
@@ -154,6 +162,20 @@ jobs:
           git merge-base --is-ancestor "$SOURCE_SHA" origin/main
       - name: Build runner
         run: cargo build -p two-bot-cutover --bin staging-migrate --locked
+      - name: Fetch producing plan manifest
+        # Provenance gate (TOG-15157 gap 2): the apply runner proves the bound
+        # plan_manifest_sha256 came from the reviewed plan run by parsing this
+        # artifact and refuses when it cannot. Resolving plan_run_id to the
+        # run's uploaded artifact needs the job's actions:read grant; a wrong
+        # run id, an expired/missing artifact or an API failure fails this
+        # step, so the job fails before the runner -- and before any DDL --
+        # ever starts. No continue-on-error: an unverified apply must not run.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: staging-migrate-manifest
+          path: producing-plan
+          run-id: ${{ inputs.plan_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Run
         env:
           # Must already exist as a staging-migrate-apply environment secret; absent means refusal.
@@ -179,4 +201,5 @@ jobs:
             --recovery-evidence-ref "$RECOVERY_REF" --acl-plan-ref "$ACL_REF" \
             --expected-pending "$EXPECTED_PENDING" \
             --plan-manifest-sha256 "$PLAN_MANIFEST_SHA256" --plan-run-id "$PLAN_RUN_ID" \
+            --plan-manifest-path producing-plan/staging-migrate-manifest.json \
             | tee staging-migrate-manifest.json

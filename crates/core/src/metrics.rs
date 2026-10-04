@@ -63,6 +63,7 @@ pub const JOBS: &[&str] = &[
     "counter",
     "rank",
     "scheduled_events",
+    "settings",
     "presence_probe",
     "community_scorecard",
     "inactivity",

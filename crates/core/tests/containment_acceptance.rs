@@ -311,10 +311,16 @@ fn cooldown_suppresses_realert_but_still_logs_with_stable_alert_shape() {
         message.content,
         "**Anti-nuke contained** — destructive heat 5/5.\n\
          Executor: `executor` · action: `member.kick` · target: `target`.\n\
+         Incident/audit entry: `e`.\n\
          Removed dangerous roles (2): `danger-a` `danger-b`.\n\
          Restore check: unavailable.\n\
          \n\
          No member join was kicked or banned by this feature. Verify the executor and run the guarded staging restore procedure if drift is reported."
+    );
+    assert_eq!(alert.incident_id, incident.id);
+    assert!(
+        message.content.contains(&format!("`{}`", incident.id)),
+        "staff text must carry the incident/audit-entry ID"
     );
     posted.push(message.content.clone());
 
@@ -378,6 +384,7 @@ fn containment_alert_shape_caps_ids_and_names_no_member_effect() {
     assert!(message.content.contains("…and 2 more"));
     assert!(message.content.contains("destructive heat 9/5"));
     assert!(message.content.contains("action: `channel.delete`"));
+    assert!(message.content.contains("Incident/audit entry: `t`"));
     assert!(message.content.contains("No member join was kicked"));
 
     let empty = ContainmentAlert::from_trigger(

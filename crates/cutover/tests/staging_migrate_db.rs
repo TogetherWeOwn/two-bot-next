@@ -127,7 +127,7 @@ impl Fixture {
         host: &str,
         db: &str,
         expected_pending: Option<&str>,
-        plan_binding: Option<(&str, &str)>,
+        plan_binding: Option<(&str, &str, &str)>,
     ) -> (i32, String, String) {
         let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_staging-migrate"));
         cmd.args([
@@ -146,8 +146,15 @@ impl Fixture {
         if let Some(list) = expected_pending {
             cmd.args(["--expected-pending", list]);
         }
-        if let Some((hash, run_id)) = plan_binding {
-            cmd.args(["--plan-manifest-sha256", hash, "--plan-run-id", run_id]);
+        if let Some((hash, run_id, manifest_path)) = plan_binding {
+            cmd.args([
+                "--plan-manifest-sha256",
+                hash,
+                "--plan-run-id",
+                run_id,
+                "--plan-manifest-path",
+                manifest_path,
+            ]);
         }
         cmd.env_remove("TWO_BOT_STAGING_MIGRATOR_DATABASE_URL");
         for key in ["PGOPTIONS", "PGPASSFILE", "PGSERVICE"] {
@@ -187,6 +194,23 @@ impl Fixture {
 
 fn manifest(stdout: &str) -> Value {
     serde_json::from_str(stdout).expect("manifest json")
+}
+
+/// Snapshot a plan run's stdout to a temp file, mirroring the workflow's
+/// `staging-migrate-manifest.json` artifact. The caller passes the path as
+/// `--plan-manifest-path` so apply proves the bound hash against the
+/// producing plan's manifest. Returns the path; the OS reclaims temp files.
+fn snapshot_plan_manifest(stdout: &str) -> String {
+    let path = std::env::temp_dir().join(format!(
+        "staging-migrate-db-plan-{}-{}.json",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::write(&path, stdout).expect("plan snapshot must be writable");
+    path.to_string_lossy().into_owned()
 }
 
 fn pending_list(value: &Value) -> Vec<i64> {
@@ -378,6 +402,9 @@ async fn real_sqlx_runner_cases() -> TestResult {
         64,
         "plan hash must be a SHA-256 hex digest"
     );
+    // Snapshot the plan stdout as the producing run's artifact: every apply
+    // below proves its bound hash against this manifest.
+    let plan_artifact = snapshot_plan_manifest(&out);
     let seed_set: HashSet<i64> = SEED_VERSIONS.into_iter().collect();
     let expected: Vec<i64> = two_bot_cutover::staging_migrate::MIGRATOR
         .iter()
@@ -427,7 +454,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(&expected_csv),
-            Some((&bad_hash, "424242")),
+            Some((&bad_hash, "424242", &plan_artifact)),
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -437,6 +464,30 @@ async fn real_sqlx_runner_cases() -> TestResult {
         .await?;
     assert_eq!(ledger, 29, "hash refusal must not change the ledger");
 
+    // The right hash with no producing manifest refuses before any DDL: the
+    // hash is exact but its provenance against the named plan run is
+    // unprovable.
+    let (code, _, err) = fx
+        .run(
+            "--apply",
+            Some(member.clone()),
+            &host,
+            &db,
+            Some(&expected_csv),
+            Some((
+                &plan_hash,
+                "424242",
+                "/tmp/staging-migrate-db-no-such-manifest.json",
+            )),
+        )
+        .await;
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("plan_run_id"), "{err}");
+    let ledger: i64 = sqlx::query_scalar("SELECT count(*) FROM public._sqlx_migrations")
+        .fetch_one(&mut c)
+        .await?;
+    assert_eq!(ledger, 29, "provenance refusal must not change the ledger");
+
     // Apply the reviewed list as the member login, bound to the plan hash.
     let (code, out, err) = fx
         .run(
@@ -445,12 +496,13 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(&expected_csv),
-            Some((&plan_hash, "424242")),
+            Some((&plan_hash, "424242", &plan_artifact)),
         )
         .await;
     assert_eq!(code, 0, "{err}");
     let m = manifest(&out);
     assert_eq!(m["applied_count"], expected.len() as u64);
+    assert_eq!(m["plan_provenance_verified"], true);
     assert!(m["role_verified_connections"].as_u64().unwrap() >= 1);
     assert_eq!(m["ledger_after"].as_array().unwrap().len() as u64, total);
     assert!(!out.contains("postgres://"), "manifest must not echo URLs");
@@ -498,7 +550,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(&expected_csv),
-            Some((&plan_hash, "424242")),
+            Some((&plan_hash, "424242", &plan_artifact)),
         )
         .await;
     assert_eq!(code, 2);
@@ -510,6 +562,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
         .as_str()
         .expect("empty plan hash")
         .to_owned();
+    let empty_artifact = snapshot_plan_manifest(&out);
     let (code, out, err) = fx
         .run(
             "--apply",
@@ -517,7 +570,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(""),
-            Some((&empty_hash, "424243")),
+            Some((&empty_hash, "424243", &empty_artifact)),
         )
         .await;
     assert_eq!(code, 0, "{err}");
@@ -525,7 +578,8 @@ async fn real_sqlx_runner_cases() -> TestResult {
 
     // SHA-384 drift refuses. The binding inputs must be valid-format so the
     // run reaches reconcile (which fails on drift) instead of refusing on the
-    // missing binding first.
+    // missing binding first. The provenance anchor must verify too, so the
+    // empty plan's artifact travels with the binding.
     sqlx::query("UPDATE public._sqlx_migrations SET checksum = decode(repeat('00', 48), 'hex') WHERE version = (SELECT min(version) FROM public._sqlx_migrations)")
         .execute(&mut c)
         .await?;
@@ -536,7 +590,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(""),
-            Some((&empty_hash, "424244")),
+            Some((&empty_hash, "424244", &empty_artifact)),
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -570,7 +624,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(""),
-            Some((&empty_hash, "424245")),
+            Some((&empty_hash, "424245", &empty_artifact)),
         )
         .await;
     assert_eq!(code, 2, "{err}");
