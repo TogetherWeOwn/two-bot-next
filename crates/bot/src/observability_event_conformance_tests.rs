@@ -16,8 +16,8 @@ use std::collections::BTreeSet;
 // them to. The message string (last argument to the `tracing` macro) is the
 // event name; fields such as `sequence` or `guild_id` are context, not names.
 
-/// `crates/bot/src/gateway.rs`: all thirteen traced in the file are cataloged.
-const GATEWAY_RS_EVENTS: [&str; 13] = [
+/// `crates/bot/src/gateway.rs`: all twelve traced in the file are cataloged.
+const GATEWAY_RS_EVENTS: [&str; 12] = [
     "cold resume committed; requesting voice snapshot via identify",
     "gateway reconnect failed; Twilight will retry",
     "gateway shard loop started",
@@ -28,7 +28,6 @@ const GATEWAY_RS_EVENTS: [&str; 13] = [
     "TWO_VOICE=1 but no discord token; voice rooms disabled",
     "TWO_VOICE=1 but no database URL; voice rooms disabled",
     "voice database unavailable; voice rooms disabled",
-    "automod environment invalid; voice room names use the default filter policy",
     "voice rooms enabled; gateway sink attached",
     "voice HTTP setup failed; voice rooms disabled",
 ];

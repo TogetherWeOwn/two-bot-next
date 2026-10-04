@@ -44,7 +44,6 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `TWO_VOICE=1 but no discord token; voice rooms disabled` | `crates/bot/src/gateway.rs:968` | Voice gate on but no token; gateway continues voice-off |
 | `TWO_VOICE=1 but no database URL; voice rooms disabled` | `crates/bot/src/gateway.rs:980` | Voice gate on but no database; gateway continues voice-off |
 | `voice database unavailable; voice rooms disabled` | `crates/bot/src/gateway.rs:989` | Voice store connect failed; gateway continues voice-off |
-| `automod environment invalid; voice room names use the default filter policy` | `crates/bot/src/gateway.rs:1047` | Automod configuration rejected while building voice; room names use the default link-blocking policy rather than the configured word list |
 | `voice rooms enabled; gateway sink attached` | `crates/bot/src/gateway.rs:995` | Voice runtime built; sink attached to the gateway writer |
 | `voice HTTP setup failed; voice rooms disabled` | `crates/bot/src/gateway.rs:999` | Voice HTTP setup failed; gateway continues voice-off |
 

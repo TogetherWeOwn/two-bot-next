@@ -60,9 +60,11 @@ reach refusal: the render falls back and truncates first.
 The bot's room worker (`crates/bot/src/voice_rooms.rs`) is the caller. On each
 join, `accept_join` renders the V1 template `{username}'s room` through
 `resolve_create_name` under the configured automod policy
-(`AutomodConfig::from_env`, applied whether or not automod enforcement is on;
-an unreadable automod environment falls back to the default policy, which
-still blocks invite and external links). A blocked display name is retried
+(`AutomodPolicy::name_policy_from_map`, applied whether or not automod enforcement
+is on). This independently loads the word list and allowed domains with the
+same normalization as chat automod; an invalid unrelated count, sanction or
+exemption cannot discard name restrictions. Chat automod's strict configuration
+validation is unchanged. A blocked display name is retried
 without the username; a blocked bare template queues nothing, so no Discord
 create call is made, and the worker records the refusal as `name_blocked` in
 its failure list. That list feeds the operator error notice and the `/setup`
