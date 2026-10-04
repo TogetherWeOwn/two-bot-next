@@ -75,6 +75,8 @@ golden exception or a claim of whole-baseline registry parity.
 |---|---|---|
 | `rsvp-attendance` | docs/parity.md §1 #12 / #25 | Rename only the RSVP-totals `attendance` (its option is `event-id`); scorecard keeps `attendance`. No option, choice, description or permission waiver. |
 | `attendance` | docs/parity.md §1 #12 bound | Advertise `max_length` 128 on the scorecard `event-occurrence` option; every other field stays legacy-identical. |
+| `tempban` | docs/parity.md §1 #4 duration ceiling | Advertise only `max_value` 31536000 on `duration_seconds`, matching the 365-day service cap; every other field stays legacy-identical. |
+| `timeout` | docs/parity.md §1 #6 duration ceiling | Advertise only `max_value` 2419200 on `duration_seconds`, matching Discord's 28-day cap; every other field stays legacy-identical. |
 | `rota-acknowledge` | docs/parity.md §1 #13 / §9 drop 1 | Remove the staging-only command; no replacement. |
 
 These are the complete behavioural exceptions, mirrored by the test allowlist.
