@@ -380,3 +380,61 @@ fn the_group_set_covers_only_live_rooms_in_the_category() {
     world.settings.position = RoomPosition::Below;
     assert_eq!(world.plan().unwrap().position, Some(5));
 }
+
+#[test]
+fn a_bot_member_deny_surviving_the_grant_is_refused_not_weakened() {
+    // A source deny on the bot still wins after `grant_bot` adds the minimum
+    // room access, so the room is refused instead of created unmanageable.
+    let mut world = World::new(full());
+    world.set_overwrites(
+        CREATOR,
+        &[PermissionOverwrite {
+            id: Id::new(BOT),
+            kind: PermissionOverwriteType::Member,
+            allow: Permissions::empty(),
+            deny: Permissions::CONNECT,
+        }],
+    );
+    assert_eq!(world.plan(), Err(RoomHttpError::AccessDenied));
+}
+
+#[test]
+fn an_unknown_source_overwrite_kind_is_refused() {
+    // An overwrite kind with no core mapping cannot be honoured: fail
+    // closed instead of silently dropping the rule.
+    let mut world = World::new(full());
+    world.set_overwrites(
+        CREATOR,
+        &[PermissionOverwrite {
+            id: Id::new(601),
+            kind: PermissionOverwriteType::from(99u8),
+            allow: Permissions::empty(),
+            deny: Permissions::empty(),
+        }],
+    );
+    assert_eq!(world.plan(), Err(RoomHttpError::InvalidRequest));
+}
+
+#[test]
+fn without_manage_roles_an_unmanageable_category_is_refused_not_synced() {
+    // Syncing would leave a room the bot cannot manage; refuse instead.
+    let mut world = World::new(full() & !Permissions::MANAGE_ROLES);
+    world.set_overwrites(
+        CATEGORY,
+        &[overwrite(GUILD, Permissions::empty(), Permissions::CONNECT)],
+    );
+    assert_eq!(world.plan(), Err(RoomHttpError::AccessDenied));
+}
+
+#[test]
+fn a_zero_id_override_is_refused_at_conversion() {
+    assert_eq!(
+        to_twilight(&[ChannelOverride {
+            id: 0,
+            kind: OverrideKind::Member,
+            allow: 1,
+            deny: 0,
+        }]),
+        Err(RoomHttpError::InvalidRequest)
+    );
+}
