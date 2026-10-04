@@ -764,8 +764,10 @@ async fn untracked_live_channels_enqueue_zero_deletes() {
     ));
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     worker.reconcile();
+    // Nothing to dispatch: the occupied room needs no action and the
+    // stranger must not create any. An empty queue proves zero enqueues.
     for time in 0..2 {
-        dispatch(&mut worker, time).await;
+        assert!(!worker.dispatch_one(time).await);
     }
     let calls = trace.lock().unwrap();
     assert!(
