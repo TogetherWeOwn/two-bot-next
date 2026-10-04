@@ -152,11 +152,21 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     // into a recovered process; welcome/goodbye state of record lives in the
     // onboarding stores, which are archived.
     "gateway_onboarding_jobs",
+    // Durable cutover rollback journal and per-table watermarks (store chain
+    // 0406). The journal is unwired append-only cutover evidence: no writer
+    // calls record yet, and rows are re-capturable during the watch window.
+    // Never replay pre-restore cutover cursors into a recovered process: a
+    // restored watermark could mark post-backup writes as already journaled
+    // and silently break rollback coverage.
+    "rollback_journal",
+    "rollback_watermarks",
     // Migration ledgers describe target DDL; replacing them would falsely mark
     // unapplied migrations as applied. Legacy schema_migrations is diagnostic
-    // manifest metadata only, never restored application data.
+    // manifest metadata only, never restored application data. The store
+    // chain's own runner bookkeeping belongs beside cutover's ledger.
     "_sqlx_migrations",
     "schema_migrations",
+    "_two_bot_migrations",
 ];
 
 /// Columns the destination allocates itself: never archived, never restored.

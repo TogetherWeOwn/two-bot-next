@@ -34,7 +34,7 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0403_gate_cleared | up | members | re-runnable | Drop column `gate_cleared_at` and its index; NULLs carry no meaning. |
 | 0404_members_third_message_at | up | members | re-runnable | Drop column `third_message_at`; the funnel log can re-derive it. |
 | 0405_timestamptz_and_boolean | up | events, members | backout-script | Type rewrite: backout is `is_bot USING is_bot::smallint` plus restoring the old defaults; `recorded_at` default must be set back explicitly. |
-| 0406_rollback_journal | up | rollback_journal, rollback_watermarks | re-runnable | Drop both tables; journal rows are cutover evidence, re-capturable. |
+| 0406_rollback_journal | up | rollback_journal, rollback_watermarks | re-runnable | Drop both tables; journal rows are cutover evidence, re-capturable. Both tables and the store chain's `_two_bot_migrations` ledger are excluded from backups (`EXCLUDED_TABLES`): journal rows are re-capturable watch-window evidence, and restoring old watermarks could mark post-backup writes as journaled. |
 | 0407_invite_campaigns | up | invite_campaigns | re-runnable | Drop the table; no other migration reads it. |
 
 ## Cutover chain (`crates/cutover/migrations/`)
