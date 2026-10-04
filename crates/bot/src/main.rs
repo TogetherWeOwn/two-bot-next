@@ -39,6 +39,7 @@ mod gateway_failure;
 mod gateway_metrics;
 #[cfg(test)]
 mod gateway_tests;
+mod interaction_admission;
 mod internal_action_http;
 mod jobs;
 mod join_risk_runtime;

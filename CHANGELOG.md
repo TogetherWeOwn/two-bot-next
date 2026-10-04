@@ -156,6 +156,7 @@
 
 ### Fixed
 
+- Keep moderation commands answerable while the shared interaction lane is busy. Cap each member at three admitted interactions, reserve an eight-worker lane for permission-gated slash commands from members who hold the permission, and answer anything not admitted with one ephemeral "busy, try again" callback instead of dropping it silently. Bound the LFG queue to the running request plus eight waiters so sign-up selects cannot fill the lane.
 - Support the exact authenticated-user REST read used by feed history reconciliation, and preserve the uncompressed runtime-image budget when Docker's containerd store also accounts for compressed blobs.
 - Retain unsent onboarding welcome/goodbye payloads when successful REST responses contain inconsistent role snapshots or unusable channel evidence, while preserving proven-denial skips. Resolve only submitted session destinations so an unavailable unselected room cannot block valid routing. Add mock restart and selected/unselected regressions; current-head execution and independent review remain pending.
 - Synchronize the interrupted onboarding callback restart fixture on its first durable claim, not early HTTP arrival. Keep token-free receipts, exact attempt counts, replay fencing and fresh-reselection assertions unchanged.
