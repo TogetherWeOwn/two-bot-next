@@ -105,11 +105,7 @@ async fn timeout_outcome_sends_a_valid_timestamp() {
             },
         )
         .await;
-    assert!(
-        result.is_ok(),
-        "normal 600 s timeout produced {result:?}; {} wire requests",
-        mock.requests().len()
-    );
+    assert!(result.is_ok(), "normal 600 s timeout was refused");
     let reqs = mock.requests();
     assert_eq!(reqs.len(), 1, "exactly one wire call");
     assert_eq!(reqs[0].method, "PATCH");
@@ -251,11 +247,7 @@ async fn unreadable_channel_does_not_mutate_permissions() {
             },
         )
         .await;
-    assert!(
-        result.is_err(),
-        "unreadable channel produced {result:?}; {} wire requests",
-        mock.requests().len()
-    );
+    assert!(result.is_err(), "unreadable channel was accepted");
     assert_eq!(
         mock.requests().len(),
         1,
@@ -286,11 +278,7 @@ async fn non_numeric_overwrite_masks_refuse_without_mutation() {
             },
         )
         .await;
-    assert!(
-        result.is_err(),
-        "non-string masks produced {result:?}; {} wire requests",
-        mock.requests().len()
-    );
+    assert!(result.is_err(), "non-string masks were accepted");
     assert_eq!(mock.requests().len(), 1, "no mutation follows");
     mock.shutdown().await;
 }
@@ -356,11 +344,7 @@ async fn malformed_overwrite_rows_refuse_without_mutation() {
                 },
             )
             .await;
-        assert!(
-            result.is_err(),
-            "{name} produced {result:?}; {} wire requests",
-            mock.requests().len()
-        );
+        assert!(result.is_err(), "{name} was accepted");
         assert_eq!(
             mock.requests().len(),
             1,
