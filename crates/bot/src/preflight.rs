@@ -6,7 +6,7 @@ use std::{
     net::SocketAddr,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use twilight_gateway::Intents;
 use twilight_http::{
     request::{Request, TryIntoRequest},
@@ -23,6 +23,7 @@ use two_bot_core::onboarding::{
     game_picker_allowed, level_role_writes_allowed, OnboardingGates, GAME_PICKS, PLATFORM_PICKS,
     TWO_GUILD_ID,
 };
+use two_bot_core::self_roles::parse_self_role_panels;
 use two_bot_core::send_admission::PgSendAdmission;
 use two_bot_discord::channel_access::{guild_permissions, resolve_channel_access};
 use two_bot_discord::executor::HyperTransport;
@@ -147,18 +148,11 @@ struct Targets {
     ticket_complete: bool,
 }
 
-#[derive(Deserialize)]
-struct Panel {
-    #[serde(rename = "channelId")]
-    channel_id: String,
-    options: Vec<PanelOption>,
-}
-
-#[derive(Deserialize)]
-struct PanelOption {
-    #[serde(rename = "roleId")]
-    role_id: String,
-}
+/// Strict self-role catalogue validation lives in
+/// `two_bot_core::self_roles::parse_self_role_panels` (Discord bounds: 20
+/// reactions, 100-unit custom ids, 80-unit button labels). Preflight reuses it
+/// so a catalogue the bot would refuse at boot fails here instead of passing
+/// with only channel/role targets collected.
 
 fn snowflake(raw: &str) -> Result<u64, &'static str> {
     if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -285,22 +279,19 @@ impl Targets {
         }
         let raw = env("TWO_SELF_ROLE_PANELS");
         if !raw.trim().is_empty() {
-            let panels: Vec<Panel> = serde_json::from_str(&raw)
-                .map_err(|_| "invalid TWO_SELF_ROLE_PANELS JSON catalogue")?;
+            let panels = parse_self_role_panels(&raw)
+                .map_err(|_| "invalid TWO_SELF_ROLE_PANELS catalogue")?;
             for panel in panels {
-                if panel.options.is_empty() {
-                    return Err("self-role panels require options");
-                }
                 targets.channel(
                     snowflake(&panel.channel_id)
-                        .map_err(|_| "invalid self-role panel channel ID")?,
+                        .map_err(|_| "invalid TWO_SELF_ROLE_PANELS catalogue")?,
                     true,
                     true,
                 );
                 for option in panel.options {
                     targets.roles.insert(
                         snowflake(&option.role_id)
-                            .map_err(|_| "invalid self-role option role ID")?,
+                            .map_err(|_| "invalid TWO_SELF_ROLE_PANELS catalogue")?,
                         "self role",
                     );
                 }
@@ -768,15 +759,67 @@ mod tests {
         env.insert("TWO_COMMUNITY_HUMAN_CHANNEL_IDS".into(), "6666".into());
         env.insert("TWO_AUTOMOD".into(), "1".into());
         env.insert("TWO_AUTOMOD_EXEMPT_CHANNEL_IDS".into(), "7777".into());
+        // Strict parser fixture: valid snowflakes plus the required
+        // id/messageId/mode/option key/label/permissions shape.
         env.insert(
             "TWO_SELF_ROLE_PANELS".into(),
-            r#"[{"channelId":"8888","options":[{"roleId":"5555"}]}]"#.into(),
+            r#"[{"id":"games","channelId":"100000000000000007","messageId":"100000000000000008","mode":"button","options":[{"key":"chess","label":"Chess","roleId":"100000000000000004","permissions":"0"}]}]"#.into(),
         );
         let targets = Targets::from_map(&env, None).unwrap();
         assert_eq!(targets.channels.len(), 3);
         assert!(targets.channels[&6666].post && targets.channels[&6666].moderate);
         assert!(targets.channels[&7777].post && !targets.channels[&7777].moderate);
-        assert!(targets.channels[&8888].post && targets.channels[&8888].moderate);
-        assert_eq!(targets.roles[&5555], "self role");
+        assert!(
+            targets.channels[&10_000_000_000_000_000_007].post
+                && targets.channels[&10_000_000_000_000_000_007].moderate
+        );
+        assert_eq!(targets.roles[&10_000_000_000_000_000_004], "self role");
+    }
+
+    #[test]
+    fn self_role_catalogue_rejects_boot_refused_bounds() {
+        // Mirrors the boot parser bounds: >20 reactions, >100-unit button
+        // custom ids and >80-unit button labels fail preflight with a static,
+        // secret-free message before any REST.
+        let valid_option = |key: &str, role_suffix: u64| {
+            serde_json::json!({
+                "key": key, "label": "Chess",
+                "roleId": format!("10000000000000{role_suffix:04}"),
+                "permissions": "0", "emoji": key,
+            })
+        };
+        let reaction_many = (0..21)
+            .map(|i| valid_option(&format!("k{i:02}"), 100 + i as u64))
+            .collect::<Vec<_>>();
+        let too_many = serde_json::json!([{
+            "id": "react", "channelId": "100000000000000007",
+            "messageId": "100000000000000008", "mode": "reaction",
+            "options": reaction_many,
+        }])
+        .to_string();
+        let oversized_id = serde_json::json!([{
+            "id": "p".repeat(60), "channelId": "100000000000000007",
+            "messageId": "100000000000000008", "mode": "button",
+            "options": [{
+                "key": "k".repeat(26), "label": "Chess",
+                "roleId": "100000000000000004", "permissions": "0",
+            }],
+        }])
+        .to_string();
+        let oversized_label = serde_json::json!([{
+            "id": "games", "channelId": "100000000000000007",
+            "messageId": "100000000000000008", "mode": "button",
+            "options": [{
+                "key": "chess", "label": "a".repeat(81),
+                "roleId": "100000000000000004", "permissions": "0",
+            }],
+        }])
+        .to_string();
+        for raw in [too_many, oversized_id, oversized_label] {
+            let mut env = vars("2222", "session");
+            env.insert("TWO_SELF_ROLE_PANELS".into(), raw);
+            let err = Targets::from_map(&env, None).expect_err("boot-refused catalogue");
+            assert_eq!(err, "invalid TWO_SELF_ROLE_PANELS catalogue");
+        }
     }
 }
