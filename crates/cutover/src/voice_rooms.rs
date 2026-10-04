@@ -467,8 +467,13 @@ impl PgRoomStore {
         .fetch_all(&self.pool)
         .await?
         .iter()
-        .map(|row| Ok((row.try_get("id")?, decode_id(row, "channel_id")?)))
-        .collect()
+        .map(|row| {
+            Ok((
+                row.try_get::<String, _>("id")?,
+                decode_id(row, "channel_id")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()
     }
 
     /// Release a claim ONLY after confirmed no-side-effect failure, channel
