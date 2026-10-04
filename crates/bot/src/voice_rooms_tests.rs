@@ -1132,6 +1132,53 @@ async fn delete_403_suspends_without_a_retry_storm_and_refresh_resumes() {
 }
 
 #[tokio::test]
+async fn one_rooms_refused_delete_does_not_stop_the_sweep_of_other_empty_rooms() {
+    // Two tracked, empty rooms. Whichever delete goes first is refused with a
+    // 403, so the test does not depend on the reconcile pass's room order: the
+    // other room must still be deleted and forgotten, and the single failure
+    // must be recorded against the refused room only.
+    let (live, store, http, trace) = fixture();
+    for id in [500, 501] {
+        store.rooms.lock().unwrap().insert(id, room(id));
+    }
+    live.publish(snapshot(&[500, 501], vec![]));
+    http.delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reconcile();
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    let calls = trace.lock().unwrap().clone();
+    assert!(calls.contains(&"delete:500".to_owned()), "{calls:?}");
+    assert!(calls.contains(&"delete:501".to_owned()), "{calls:?}");
+    let forgotten: Vec<_> = calls
+        .iter()
+        .filter(|call| call.starts_with("forget:"))
+        .collect();
+    assert_eq!(forgotten.len(), 1, "exactly one room is swept: {calls:?}");
+    let refused = if forgotten[0] == "forget:500" {
+        501
+    } else {
+        500
+    };
+    assert_eq!(
+        worker.tracked().keys().copied().collect::<Vec<_>>(),
+        [refused],
+        "only the refused room stays tracked: {calls:?}"
+    );
+    assert_eq!(worker.failures().len(), 1);
+    assert!(matches!(
+        worker.failures().back(),
+        Some(LifecycleFailure::Discord {
+            channel_id,
+            error: RoomHttpError::AccessDenied,
+        }) if *channel_id == refused
+    ));
+}
+
+#[tokio::test]
 async fn create_429_waits_exactly_and_does_not_consume_the_failure_budget() {
     let (live, store, http, trace) = fixture();
     http.create_errors
