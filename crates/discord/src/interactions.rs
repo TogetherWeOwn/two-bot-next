@@ -124,7 +124,7 @@ pub fn text_response(reply: InteractionReply) -> InteractionResponse {
 
 /// One immediate ephemeral discovery reply, preserving every published name.
 /// Large registries use an embed instead of truncating the content at 2000.
-/// https://docs.discord.com/developers/resources/message#embed-limits
+/// <https://docs.discord.com/developers/resources/message#embed-limits>
 #[must_use]
 pub fn help_response(defs: &[CommandDefinition]) -> InteractionResponse {
     let text = two_bot_core::help::help_text(defs);
