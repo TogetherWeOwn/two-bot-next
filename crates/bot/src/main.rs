@@ -11,6 +11,8 @@ mod admission_test_support;
 mod audit_runtime;
 mod automod_gateway;
 mod backup_cli;
+// Pure burn math: no runtime caller yet, the offline pin test is the consumer.
+#[allow(dead_code)]
 mod burn_rate;
 #[cfg(test)]
 mod burn_rate_tests;
