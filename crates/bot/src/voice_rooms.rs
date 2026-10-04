@@ -55,8 +55,9 @@ use two_bot_core::{
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
     },
     voice_config::{
-        export_configuration, validate_configuration, ChannelKind, ChannelReference,
-        GuildInventory, VoiceConfiguration, MAX_IMPORT_BYTES, VOICE_CONFIG_VERSION,
+        decode_configuration, export_configuration, validate_configuration, ChannelKind,
+        ChannelReference, GuildInventory, VoiceConfigError, VoiceConfiguration, MAX_IMPORT_BYTES,
+        VOICE_CONFIG_VERSION,
     },
     voice_config_diff::{
         diff_configuration, diff_content_hash, render_preview, skip_unknown_channels,
@@ -114,6 +115,18 @@ pub enum StoreError {
     Unavailable,
     CredentialRefused,
     Conflict,
+}
+
+impl std::fmt::Display for StoreError {
+    /// Plain words for an admin-facing reply; never the variant name or any
+    /// driver detail.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unavailable => "the store is unavailable",
+            Self::CredentialRefused => "the store refused the bot credential",
+            Self::Conflict => "the store reported a conflict",
+        })
+    }
 }
 
 /// No synchronous database work is allowed on the gateway event loop.
@@ -4283,12 +4296,35 @@ pub struct SetupSummary {
     pub store_error: Option<String>,
 }
 
-/// `/setup` panel text. Anyone may view it; the S4 handler gates the quick
-/// action and settings buttons on admin (spec V1).
+/// `/setup` panel text. The command stays open to every member, but only an
+/// admin gets [`setup_panel`], which names creator channels, store errors and
+/// the worker's failure lines. Everyone else gets [`setup_member_panel`]: a
+/// generic status with no ids, error classes or permission gaps. The S4
+/// handler also gates the quick action and settings buttons on admin (spec V1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupPanel {
     pub title: String,
     pub description: String,
+}
+
+/// The member (non-admin) `/setup` view: running or paused, and whether
+/// anything needs attention. Deliberately carries no channel ids, store or
+/// Discord error text, or permission gaps; those stay admin-only.
+#[must_use]
+pub fn setup_member_panel(halted: bool, needs_attention: bool) -> SetupPanel {
+    let status = if halted {
+        "Voice rooms are paused right now."
+    } else {
+        "Voice rooms are running."
+    };
+    let mut lines = vec![status.to_owned()];
+    if halted || needs_attention {
+        lines.push("Ask a server admin to check /setup for details.".to_owned());
+    }
+    SetupPanel {
+        title: "Voice rooms".to_owned(),
+        description: lines.join("\n"),
+    }
 }
 
 #[must_use]
@@ -4422,15 +4458,20 @@ pub fn plan_import_preview(
             ),
         };
     }
-    let incoming: VoiceConfiguration = match serde_json::from_slice(bytes) {
+    // The strict codec decode, never plain `serde_json`: the derived top-level
+    // decoder also takes the positional-array form the codec forbids.
+    let incoming = match decode_configuration(bytes) {
         Ok(config) => config,
-        Err(error) => {
+        Err(VoiceConfigError::Malformed { line, column }) => {
             return ImportDecision::Refuse {
                 message: format!(
-                    "Could not import that file: malformed configuration JSON at line {}, column {}. Nothing was changed.",
-                    error.line(),
-                    error.column(),
+                    "Could not import that file: malformed configuration JSON at line {line}, column {column}. Nothing was changed.",
                 ),
+            };
+        }
+        Err(error) => {
+            return ImportDecision::Refuse {
+                message: format!("Could not import that file: {error}. Nothing was changed."),
             };
         }
     };
@@ -4498,6 +4539,39 @@ pub fn plan_import_confirm(
         candidate: remaining,
         text,
     }
+}
+
+/// How many creator channels `candidate` adds over `current`.
+fn added_creator_count(current: &VoiceConfiguration, candidate: &VoiceConfiguration) -> usize {
+    candidate
+        .creators
+        .iter()
+        .filter(|creator| {
+            !current
+                .creators
+                .iter()
+                .any(|existing| existing.channel_id == creator.channel_id)
+        })
+        .count()
+}
+
+/// Manage Server alone may not turn an existing voice channel into a creator:
+/// `/create` needs Manage Channels, and an import is the same act without the
+/// channel being created. Returns the refusal text when `candidate` adds a
+/// creator row over `current` and the member lacks Manage Channels (admins
+/// pass). Removing or editing creators is not gated here.
+fn import_creator_gate(
+    current: &VoiceConfiguration,
+    candidate: &VoiceConfiguration,
+    permissions: Option<Permissions>,
+) -> Option<String> {
+    if added_creator_count(current, candidate) == 0 || is_voice_admin(permissions) {
+        return None;
+    }
+    Some(
+        "That file adds creator channels, which needs Manage Channels like /create. Ask a member with that permission to import it, or remove the new creator entries. Nothing was changed."
+            .to_owned(),
+    )
 }
 
 /// Confirm/Cancel buttons for a preview, bound to the uploading member and
@@ -5055,8 +5129,9 @@ fn parse_access_action(options: &[CommandDataOption]) -> AccessAction {
 }
 
 /// `/create`, `/textchannels` and the V8 per-creator settings commands need
-/// Manage Channels; admins pass everywhere. `/setup` is view-open and
-/// `/access` checks the admin flag itself. Fail closed on missing permissions.
+/// Manage Channels; admins pass everywhere. `/setup` is open to everyone but
+/// shows detail to admins only, and `/access` checks the admin flag itself.
+/// Fail closed on missing permissions.
 fn may_create(permissions: Option<Permissions>) -> bool {
     is_voice_admin(permissions)
 }
@@ -5348,8 +5423,8 @@ fn failure_line(failure: &LifecycleFailure) -> String {
             format!("channel <#{channel_id}>: {error}")
         }
         LifecycleFailure::Persistence { channel_id, error } => match channel_id {
-            Some(channel) => format!("store <#{channel}>: {error:?}"),
-            None => format!("store: {error:?}"),
+            Some(channel) => format!("store <#{channel}>: {error}"),
+            None => format!("store: {error}"),
         },
     }
 }
@@ -5771,28 +5846,43 @@ where
             true
         }
         VoiceCommand::Setup => {
-            let (store, _) = runtime.make_pair();
-            let (creators, store_error) = match store.creators(guild_id).await {
-                Ok(creators) => (creators, None),
-                Err(error) => (Vec::new(), Some(format!("{error:?}"))),
-            };
+            let permissions = interaction
+                .member
+                .as_ref()
+                .and_then(|member| member.permissions);
             let status = runtime.worker_status(guild_id).await;
-            let panel = setup_panel(&SetupSummary {
-                guild_id,
-                creators,
-                tracked_rooms: status.as_ref().map_or(0, |status| status.tracked_rooms),
-                // Current health findings first: they are live, failures are history.
-                failures: status.as_ref().map_or_else(Vec::new, |status| {
-                    status
-                        .health
-                        .iter()
-                        .chain(status.failures.iter())
-                        .cloned()
-                        .collect()
-                }),
-                halted: status.as_ref().is_some_and(|status| status.halted),
-                store_error,
-            });
+            let panel = if is_voice_admin(permissions) {
+                let (store, _) = runtime.make_pair();
+                let (creators, store_error) = match store.creators(guild_id).await {
+                    Ok(creators) => (creators, None),
+                    Err(error) => (Vec::new(), Some(error.to_string())),
+                };
+                setup_panel(&SetupSummary {
+                    guild_id,
+                    creators,
+                    tracked_rooms: status.as_ref().map_or(0, |status| status.tracked_rooms),
+                    // Current health findings first: they are live, failures are history.
+                    failures: status.as_ref().map_or_else(Vec::new, |status| {
+                        status
+                            .health
+                            .iter()
+                            .chain(status.failures.iter())
+                            .cloned()
+                            .collect()
+                    }),
+                    halted: status.as_ref().is_some_and(|status| status.halted),
+                    store_error,
+                })
+            } else {
+                // No store read for a member: the generic view needs none, and
+                // an open command should not cost a query per invocation.
+                setup_member_panel(
+                    status.as_ref().is_some_and(|status| status.halted),
+                    status.as_ref().is_some_and(|status| {
+                        !status.health.is_empty() || !status.failures.is_empty()
+                    }),
+                )
+            };
             reply(ephemeral_response(&format!(
                 "**{}**\n{}",
                 panel.title, panel.description
@@ -5842,7 +5932,7 @@ where
             }
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
-                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_text_channels(creator, &request) {
                     TextChannelsPlan::Refuse { message } => message,
                     TextChannelsPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -5852,7 +5942,7 @@ where
                         }
                         Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
                         Err(error) => {
-                            format!("Could not save the companion settings ({error:?}). Try again.")
+                            format!("Could not save the companion settings ({error}). Try again.")
                         }
                     },
                 },
@@ -5877,7 +5967,7 @@ where
             }
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
-                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_position(creator, &request) {
                     PositionPlan::Refuse { message } => message,
                     PositionPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -5887,7 +5977,7 @@ where
                         }
                         Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
                         Err(error) => {
-                            format!("Could not save the position settings ({error:?}). Try again.")
+                            format!("Could not save the position settings ({error}). Try again.")
                         }
                     },
                 },
@@ -5912,7 +6002,7 @@ where
             }
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
-                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_group(creator, &request) {
                     GroupPlan::Refuse { message } => message,
                     GroupPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -5922,7 +6012,7 @@ where
                         }
                         Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
                         Err(error) => {
-                            format!("Could not save the grouping settings ({error:?}). Try again.")
+                            format!("Could not save the grouping settings ({error}). Try again.")
                         }
                     },
                 },
@@ -5947,7 +6037,7 @@ where
             }
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
-                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_inherit_permissions(creator, &request) {
                     InheritPermissionsPlan::Refuse { message } => message,
                     InheritPermissionsPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -5957,7 +6047,7 @@ where
                         }
                         Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
                         Err(error) => {
-                            format!("Could not save the permission settings ({error:?}). Try again.")
+                            format!("Could not save the permission settings ({error}). Try again.")
                         }
                     },
                 },
@@ -5982,7 +6072,7 @@ where
             }
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
-                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_default_limit(creator, &request) {
                     DefaultLimitPlan::Refuse { message } => message,
                     DefaultLimitPlan::Update(creator) => match store.add_creator(&creator).await {
@@ -5992,7 +6082,7 @@ where
                         }
                         Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
                         Err(error) => {
-                            format!("Could not save the limit settings ({error:?}). Try again.")
+                            format!("Could not save the limit settings ({error}). Try again.")
                         }
                     },
                 },
@@ -6017,7 +6107,7 @@ where
             }
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
-                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_always_private(creator, &request) {
                     AlwaysPrivatePlan::Refuse { message } => message,
                     AlwaysPrivatePlan::Update(creator) => match store.add_creator(&creator).await {
@@ -6027,7 +6117,7 @@ where
                         }
                         Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
                         Err(error) => {
-                            format!("Could not save the privacy settings ({error:?}). Try again.")
+                            format!("Could not save the privacy settings ({error}). Try again.")
                         }
                     },
                 },
@@ -6254,6 +6344,10 @@ where
             hash,
             text,
         } => {
+            if let Some(message) = import_creator_gate(&current, &candidate, permissions) {
+                reply(ephemeral_response(&message)).await;
+                return true;
+            }
             runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
             reply(import_preview_response(&text, member_id, &hash)).await;
         }
@@ -6364,10 +6458,18 @@ where
             hash,
             text,
         } => {
+            if let Some(message) = import_creator_gate(&current, &candidate, permissions) {
+                reply(ephemeral_response(&message)).await;
+                return true;
+            }
             runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
             reply(import_preview_response(&text, member_id, &hash)).await;
         }
         ImportDecision::Apply { candidate, message } => {
+            if let Some(refusal) = import_creator_gate(&current, &candidate, permissions) {
+                reply(ephemeral_response(&refusal)).await;
+                return true;
+            }
             match store.config_apply(guild_id, &candidate).await {
                 Ok(()) => {
                     reply(ephemeral_response(&message)).await;

@@ -100,6 +100,7 @@ struct Store {
     config: Arc<Mutex<VoiceConfiguration>>,
     config_error: Option<StoreError>,
     save_config_error: Option<StoreError>,
+    creators_error: Option<StoreError>,
     custom_names: Mutex<HashMap<u64, String>>,
     save_custom_name_errors: Mutex<VecDeque<StoreError>>,
 }
@@ -125,6 +126,7 @@ impl Store {
             config: Arc::new(Mutex::new(empty_config())),
             config_error: None,
             save_config_error: None,
+            creators_error: None,
             custom_names: Mutex::new(HashMap::new()),
             save_custom_name_errors: Mutex::new(VecDeque::new()),
         }
@@ -133,7 +135,10 @@ impl Store {
 
 impl RoomPersistence for Store {
     async fn creators(&self, _: u64) -> Result<Vec<CreatorChannel>, StoreError> {
-        Ok(self.creators.lock().unwrap().clone())
+        match self.creators_error {
+            Some(error) => Err(error),
+            None => Ok(self.creators.lock().unwrap().clone()),
+        }
     }
     async fn access_controls(&self, _: u64) -> Result<AccessControls, StoreError> {
         match self.access_error {
@@ -3845,15 +3850,119 @@ async fn handle_create_blank_name_refuses_before_rest() {
 }
 
 #[tokio::test]
-async fn handle_setup_lists_seeded_creator() {
+async fn handle_setup_lists_seeded_creator_for_admins() {
     let trace = Trace::default();
     let runtime = test_runtime(trace);
-    let interaction = voice_interaction(Some(command_data("setup", Vec::new())), None, true);
+    let interaction = voice_interaction(
+        Some(command_data("setup", Vec::new())),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
     let (owned, response) = handle_capture(&runtime, &interaction).await;
     assert!(owned);
     let text = response_text(response.as_ref().expect("reply"));
     assert!(text.contains("Voice rooms"));
     assert!(text.contains(&format!("<#{CREATOR}>")));
+}
+
+fn failing_creators_runtime(trace: Trace) -> VoiceRuntime<Store, Http> {
+    VoiceRuntime::new(
+        move || {
+            let mut store = Store::new(trace.clone());
+            store.creators_error = Some(StoreError::Unavailable);
+            (store, Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+}
+
+#[tokio::test]
+async fn handle_setup_gives_members_a_generic_status_only() {
+    // A member (or one whose permissions are missing) gets running/paused and
+    // nothing else: no creator ids, no store error class, no Discord detail.
+    for permissions in [
+        Some(Permissions::empty()),
+        Some(Permissions::VIEW_CHANNEL | Permissions::MANAGE_GUILD),
+        None,
+    ] {
+        let runtime = failing_creators_runtime(Trace::default());
+        let interaction =
+            voice_interaction(Some(command_data("setup", Vec::new())), permissions, true);
+        let (owned, response) = handle_capture(&runtime, &interaction).await;
+        assert!(owned);
+        let text = response_text(response.as_ref().expect("reply"));
+        assert!(text.contains("Voice rooms are running"), "{text}");
+        let creator = CREATOR.to_string();
+        for leaked in [
+            "<#",
+            creator.as_str(),
+            "store",
+            "Unavailable",
+            "unavailable",
+            "Could not load",
+            "Creator channels",
+            "Tracked rooms",
+            "failures",
+        ] {
+            assert!(
+                !text.contains(leaked),
+                "{leaked:?} leaked to a member: {text}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn handle_setup_shows_store_errors_to_admins_without_the_variant_name() {
+    for permissions in [Permissions::MANAGE_CHANNELS, Permissions::ADMINISTRATOR] {
+        let runtime = failing_creators_runtime(Trace::default());
+        let interaction = voice_interaction(
+            Some(command_data("setup", Vec::new())),
+            Some(permissions),
+            true,
+        );
+        let (_, response) = handle_capture(&runtime, &interaction).await;
+        let text = response_text(response.as_ref().expect("reply"));
+        assert!(text.contains("Could not load creator channels"), "{text}");
+        assert!(text.contains("the store is unavailable"), "{text}");
+        assert!(!text.contains("Unavailable"), "{text}");
+    }
+}
+
+#[test]
+fn setup_member_panel_is_generic() {
+    let running = setup_member_panel(false, false);
+    assert_eq!(running.title, "Voice rooms");
+    assert_eq!(running.description, "Voice rooms are running.");
+    let attention = setup_member_panel(false, true);
+    assert!(attention
+        .description
+        .starts_with("Voice rooms are running."));
+    assert!(attention.description.contains("Ask a server admin"));
+    let paused = setup_member_panel(true, false);
+    assert!(paused.description.contains("paused"));
+    assert!(paused.description.contains("Ask a server admin"));
+    // The credential detail the admin panel carries stays out of the member view.
+    assert!(!paused.description.contains("token"));
+    assert!(!paused.description.contains("credential"));
+    for panel in [running, attention, paused] {
+        assert!(!panel.description.contains("<#"));
+        assert!(!panel.description.chars().any(|c| c.is_ascii_digit()));
+    }
+}
+
+#[test]
+fn store_errors_read_as_plain_words() {
+    for (error, variant) in [
+        (StoreError::Unavailable, "Unavailable"),
+        (StoreError::CredentialRefused, "CredentialRefused"),
+        (StoreError::Conflict, "Conflict"),
+    ] {
+        let text = error.to_string();
+        assert!(!text.is_empty());
+        assert!(!text.contains(variant), "{text}");
+    }
 }
 
 #[tokio::test]
@@ -4917,7 +5026,13 @@ fn with_user(mut interaction: Interaction, id: u64) -> Interaction {
     interaction
 }
 
+/// Manage Server plus Manage Channels: may import files that add creators.
 fn manager() -> Option<Permissions> {
+    Some(Permissions::MANAGE_GUILD | Permissions::MANAGE_CHANNELS)
+}
+
+/// Manage Server alone: the `/export` and `/import` gate, but not `/create`'s.
+fn server_only() -> Option<Permissions> {
     Some(Permissions::MANAGE_GUILD)
 }
 
@@ -5461,6 +5576,132 @@ async fn import_confirm_requires_manage_server() {
     let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
     assert!(owned);
     assert!(response_text(&response.expect("refusal")).contains("Manage Server"));
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+fn positional_array_form(config: &VoiceConfiguration) -> Vec<u8> {
+    let value = serde_json::to_value(config).unwrap();
+    serde_json::to_vec(&json!([
+        value["version"],
+        value["guild_id"],
+        value["creators"],
+        value["templates"],
+        value["aliases"],
+        value["lists"],
+        value["logging"],
+        value["settings"],
+    ]))
+    .unwrap()
+}
+
+#[test]
+fn plan_import_preview_uses_the_strict_decoder() {
+    let positional = positional_array_form(&full_config());
+    // Precondition: plain serde accepts this form, which is the gap.
+    assert_eq!(
+        serde_json::from_slice::<VoiceConfiguration>(&positional).unwrap(),
+        full_config()
+    );
+    let decision = plan_import_preview(&empty_config(), &positional, &config_inventory());
+    let ImportDecision::Refuse { message } = decision else {
+        panic!("positional array must be refused, got {decision:?}");
+    };
+    assert!(
+        message.contains("malformed configuration JSON"),
+        "{message}"
+    );
+    assert!(message.contains("Nothing was changed"), "{message}");
+}
+
+#[test]
+fn plan_import_preview_refuses_unlintable_templates_and_unknown_commands() {
+    let refused = |config: &VoiceConfiguration| match plan_import_preview(
+        &empty_config(),
+        &serde_json::to_vec(config).unwrap(),
+        &config_inventory(),
+    ) {
+        ImportDecision::Refuse { message } => message,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    let mut config = full_config();
+    config.creators[0].name_template = "@@secret_marker@@".to_owned();
+    let message = refused(&config);
+    assert!(message.contains("creators[0].name_template"), "{message}");
+    assert!(!message.contains("secret_marker"), "{message}");
+    assert!(message.contains("Nothing was changed"), "{message}");
+
+    let mut config = full_config();
+    config.templates[0].status_template = Some("[[never closed".to_owned());
+    assert!(refused(&config).contains("templates[0].status_template"));
+
+    let mut config = full_config();
+    config.settings.command_roles = vec![config_codec::CommandRoles {
+        command: "ban".to_owned(),
+        role_ids: Vec::new(),
+    }];
+    assert!(refused(&config).contains("settings.command_roles[0].command"));
+
+    let mut config = full_config();
+    config.aliases[0].alias = "x".repeat(101);
+    assert!(refused(&config).contains("aliases[0]"));
+}
+
+#[tokio::test]
+async fn import_without_manage_channels_cannot_add_creators() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, server_only(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    assert!(owned);
+    let response = response.expect("refusal");
+    assert!(response_text(&response).contains("Manage Channels"));
+    assert!(response_text(&response).contains("Nothing was changed"));
+    // No Confirm button, nothing stored, nothing remembered to confirm.
+    assert!(response
+        .data
+        .as_ref()
+        .and_then(|data| data.components.as_ref())
+        .is_none());
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_without_manage_channels_may_edit_existing_creators() {
+    let trace = Trace::default();
+    let mut incoming = full_config();
+    incoming.creators[0].default_limit = 5;
+    let bytes = serde_json::to_vec(&incoming).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), full_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, server_only(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+    let confirm = component_interaction(&confirm_id, server_only(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    assert_eq!(shared.lock().unwrap().creators[0].default_limit, 5);
+    assert!(applied(&trace));
+}
+
+#[tokio::test]
+async fn import_confirm_rechecks_manage_channels_for_added_creators() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+
+    // Manage Channels is gone at confirm time: the creator rows are refused.
+    let confirm = component_interaction(&confirm_id, server_only(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("Manage Channels"));
     assert_eq!(*shared.lock().unwrap(), empty_config());
     assert!(!applied(&trace));
 }

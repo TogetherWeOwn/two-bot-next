@@ -211,10 +211,11 @@ pub use custom_commands::{
     accepted_text_trigger, adjudicate_delete, adjudicate_put, adjudicate_run,
     builtin_command_names, check_capacity, deregister_set, error_code, format_command_list,
     is_builtin_trigger, max_custom_commands, placeholders_in, registry_with_custom,
-    render_template, require_automations_enabled, trigger_word, validate_put_input,
-    validate_template, AuditRecord, CommandError, DeleteDecision, PutCommandInput, PutDecision,
-    RunOutcome, StoredCommand, TemplateContext, TemplateError, MAX_COMMAND_NAME_CHARS,
-    MAX_DESCRIPTION_CHARS, MAX_RENDERED_CHARS, MAX_TEMPLATE_CHARS, TEMPLATE_PLACEHOLDERS,
+    render_template, require_automations_enabled, reserved_command_names, trigger_word,
+    validate_put_input, validate_template, AuditRecord, CommandError, DeleteDecision,
+    PutCommandInput, PutDecision, RunOutcome, StoredCommand, TemplateContext, TemplateError,
+    MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_RENDERED_CHARS, MAX_TEMPLATE_CHARS,
+    TEMPLATE_PLACEHOLDERS,
 };
 pub use events::{CoreEvent, VoiceSessionDelta};
 pub use evidence::{
