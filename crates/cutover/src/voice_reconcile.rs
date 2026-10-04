@@ -516,6 +516,12 @@ pub async fn fetch_voice_halves(
     guild: Option<&str>,
     since: Option<&str>,
 ) -> Result<VoiceHalves, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // All feeds describe one snapshot, even if gateway writes commit between
+    // SELECTs. Set both guarantees before the first read fixes that snapshot.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
     let start_rows: Vec<(String, Option<String>, time::OffsetDateTime, String)> = sqlx::query_as(
         "SELECT guild_id, member_id, occurred_at, source FROM events
           WHERE event_type = 'voice_session_start'
@@ -525,7 +531,7 @@ pub async fn fetch_voice_halves(
     )
     .bind(guild)
     .bind(since)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
     let end_rows: Vec<EndRow> = sqlx::query_as(
         "SELECT guild_id, member_id, occurred_at, source, metadata FROM events
@@ -536,7 +542,7 @@ pub async fn fetch_voice_halves(
     )
     .bind(guild)
     .bind(since)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
     let leave_rows: Vec<(String, Option<String>, time::OffsetDateTime)> = sqlx::query_as(
         "SELECT guild_id, member_id, occurred_at FROM events
@@ -547,7 +553,7 @@ pub async fn fetch_voice_halves(
     )
     .bind(guild)
     .bind(since)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
     // `recorded_at` (when WE wrote the row), not `occurred_at` (when Discord
     // says it happened): a backfilled row has a fresh `recorded_at`, so the
@@ -561,8 +567,9 @@ pub async fn fetch_voice_halves(
     )
     .bind(guild)
     .bind(since)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     let iso =
         |t: &time::OffsetDateTime| format_iso_millis((t.unix_timestamp_nanos() / 1_000_000) as i64);

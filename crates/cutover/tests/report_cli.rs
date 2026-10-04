@@ -706,6 +706,162 @@ async fn blind_window_scenario(db: std::sync::Arc<TestDb>) -> TestResult {
     Ok(())
 }
 
+/// Freeze the real CLI between its end and heartbeat reads. An owned view
+/// waits on an advisory lock only when the third (leave) feed reads its row;
+/// no timing assumption or production test hook is needed.
+async fn snapshot_consistency_scenario(db: std::sync::Arc<TestDb>) -> TestResult {
+    let rows = [
+        written_event(
+            "voice_session_start",
+            "known",
+            "2026-09-20T09:00:00Z",
+            "2026-09-20T09:00:00Z",
+            "channel:ch-a",
+            "{}",
+        ),
+        written_event(
+            "voice_session_end",
+            "known",
+            "2026-09-20T09:30:00Z",
+            "2026-09-20T09:30:00Z",
+            "channel:ch-a",
+            r#"{"startKnown":true,"startedAt":"2026-09-20T09:00:00Z","durationSeconds":1800}"#,
+        ),
+        written_event(
+            "member_leave",
+            "sentinel",
+            "2026-09-20T09:45:00Z",
+            "2026-09-20T10:00:00Z",
+            "gateway",
+            "{}",
+        ),
+    ];
+    db.seed(format!(
+        "INSERT INTO events (event_type, member_id, guild_id, occurred_at, recorded_at, source, metadata, idempotency_key) VALUES {}",
+        rows.join(",")
+    ))
+    .await?;
+    db.seed(
+        r#"ALTER TABLE events RENAME TO fixture_events;
+           CREATE FUNCTION report_leave_barrier(at timestamptz) RETURNS timestamptz
+           LANGUAGE plpgsql VOLATILE AS $$
+           BEGIN
+               PERFORM pg_advisory_xact_lock(54801);
+               RETURN at;
+           END;
+           $$;
+           CREATE VIEW events AS
+           SELECT event_type, member_id, guild_id, source, metadata, recorded_at,
+                  CASE WHEN event_type = 'member_leave'
+                       THEN report_leave_barrier(occurred_at)
+                       ELSE occurred_at END AS occurred_at
+           FROM fixture_events;"#
+            .to_owned(),
+    )
+    .await?;
+    let initial = db.snapshot().await?;
+    let baseline: serde_json::Value = serde_json::from_str(&successful_stdout(
+        &db.run(&["voice-reconcile", "--guild", GUILD], &[]),
+    ))?;
+    assert_eq!(baseline["blindWindows"]["windows"], serde_json::json!([]));
+    assert_eq!(baseline["blindWindows"]["heartbeats"], 3);
+    assert_eq!(baseline["durations"]["excludedUnknownStarts"], 0);
+    assert_eq!(db.snapshot().await?, initial);
+
+    let mut gate = db.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(54801)")
+        .execute(&mut *gate)
+        .await?;
+    let reader_db = db.clone();
+    let reader = tokio::task::spawn_blocking(move || {
+        reader_db.run(&["voice-reconcile", "--guild", GUILD], &[])
+    });
+    // Always release the barrier and join the CLI before propagating a failed
+    // rendezvous or writer. That keeps the owned fixture safe to tear down.
+    let committed: Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> = async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                     WHERE datname = $1 AND wait_event = 'advisory'
+                       AND query LIKE '%event_type = ''member_leave''%')",
+                )
+                .bind(&db.name)
+                .fetch_one(&db.pool)
+                .await?;
+                if waiting {
+                    return Ok::<_, sqlx::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        // One commit while the report's first two feeds are already read.
+        // The new end supplies both the 15:00 write and its unknown-start count.
+        let new_rows = [
+            written_event(
+                "voice_session_start",
+                "new-open",
+                "2026-09-20T12:00:00Z",
+                "2026-09-20T15:00:00Z",
+                "channel:ch-b",
+                "{}",
+            ),
+            written_event(
+                "voice_session_end",
+                "new-unknown",
+                "2026-09-20T15:00:00Z",
+                "2026-09-20T15:00:00Z",
+                "channel:ch-c",
+                r#"{"startKnown":false,"startedAt":null,"durationSeconds":99999}"#,
+            ),
+            written_event(
+                "member_leave",
+                "new-leave",
+                "2026-09-20T15:10:00Z",
+                "2026-09-20T15:00:00Z",
+                "gateway",
+                "{}",
+            ),
+        ];
+        db.seed(format!(
+            "INSERT INTO fixture_events (event_type, member_id, guild_id, occurred_at, recorded_at, source, metadata, idempotency_key) VALUES {}",
+            new_rows.join(",")
+        ))
+        .await?;
+        db.snapshot().await.map_err(Into::into)
+    }
+    .await;
+    let unlocked = gate.rollback().await;
+    let output = reader.await?;
+    unlocked?;
+    let after_write = committed?;
+    let during: serde_json::Value = serde_json::from_str(&successful_stdout(&output))?;
+    assert_eq!(during, baseline, "report mixed pre/post-commit feeds");
+    assert_eq!(db.snapshot().await?, after_write, "report wrote rows");
+
+    // The next sweep sees the whole commit, never just its heartbeat.
+    let after: serde_json::Value = serde_json::from_str(&successful_stdout(
+        &db.run(&["voice-reconcile", "--guild", GUILD], &[]),
+    ))?;
+    assert_eq!(after["blindWindows"]["heartbeats"], 4);
+    assert_eq!(
+        after["blindWindows"]["windows"],
+        serde_json::json!([{
+            "start": "2026-09-20T10:00:00.000Z",
+            "end": "2026-09-20T15:00:00.000Z",
+            "gapMs": 5 * 3_600_000,
+            "unknownStarts": 1,
+        }])
+    );
+    assert_eq!(after["durations"]["excludedUnknownStarts"], 1);
+    assert_eq!(after["durations"]["averageSeconds"], 1800.0);
+    assert_eq!(after["durations"]["measured"], 1);
+    assert_eq!(db.snapshot().await?, after_write);
+    assert!(after_write.get("_sqlx_migrations").is_none());
+    Ok(())
+}
+
 /// Legacy `buildSeedGapData` as SQL + mock roster: m-present (snowflake
 /// ...001) on the roster is correct, not a gap; m-clean (...002) resolved;
 /// m-pre (...003) pre-coverage; m-miss (...004) log-miss; m-raid (...005)
@@ -1076,6 +1232,19 @@ async fn voice_reconcile_reports_events_write_gaps_with_unknown_start_counts_rea
         return Ok(());
     }
     with_db("two_bot_test_report_blind", blind_window_scenario).await
+}
+
+#[tokio::test]
+async fn voice_reconcile_keeps_one_snapshot_across_a_concurrent_commit() -> TestResult {
+    if std::env::var_os("TWO_TEST_DATABASE_URL").is_none() {
+        eprintln!("skipped: TWO_TEST_DATABASE_URL opt-in required for agent-testdb");
+        return Ok(());
+    }
+    with_db(
+        "two_bot_test_report_snapshot",
+        snapshot_consistency_scenario,
+    )
+    .await
 }
 
 #[tokio::test]

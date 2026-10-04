@@ -10,8 +10,8 @@
 //!
 //! The database URL comes only from the mode's fixed binding:
 //! TWO_BOT_STAGING_PLAN_DATABASE_URL for --plan (a login holding only
-//! two_bot_migrator_ro, physically read-only), TWO_BOT_STAGING_MIGRATOR_DATABASE_URL
-//! for --apply. --apply refuses before any DDL unless --expected-pending equals
+//! two_bot_migrator_ro, physically read-only; --plan refuses a login that also
+//! holds two_bot_migrator), TWO_BOT_STAGING_MIGRATOR_DATABASE_URL for --apply. --apply refuses before any DDL unless --expected-pending equals
 //! the computed pending list exactly, --plan-manifest-sha256 equals the SHA-256
 //! of the plan job's uploaded manifest for the same source SHA, and the downloaded
 //! manifest at --plan-manifest-path (fetched by the workflow from the

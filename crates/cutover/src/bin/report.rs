@@ -16,8 +16,10 @@
 //! Discord REST lists channels but not their voice occupants, so occupancy
 //! classes belong to a gateway-derived snapshot, not to this report.
 //!
-//! Read-only by construction: the only SQL is SELECT (the pool opens with
-//! migrations off, so the tool cannot build schema by accident), the single
+//! Report data is read with SELECT (the pool opens with migrations off, so
+//! the tool cannot build schema by accident). `voice-reconcile` reads every
+//! feed in one `REPEATABLE READ, READ ONLY` transaction: a concurrent commit
+//! enters the next sweep, never just its heartbeats or session counts. The
 //! roster read is a bounded GET, and the fill rule in the leave-gap report is
 //! a proposal, executed nowhere. There is no repair path. On the
 //! `--discord-base` loopback path the roster uses the ungoverned transport and
