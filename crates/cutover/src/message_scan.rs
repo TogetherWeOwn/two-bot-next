@@ -14,6 +14,8 @@
 
 use std::collections::HashMap;
 
+use crate::rest::iso_to_millis;
+
 /// Ladder depth: the AM7 text bar (legacy `LADDER = MESSAGE_RUNGS.length`).
 pub const LADDER: usize = 3;
 
@@ -96,6 +98,11 @@ pub struct MessageScanSummary {
     pub authors_seen: usize,
     pub authors_with_full_ladder: usize,
     pub first_messages_written: usize,
+    /// Rows read but refused a ladder slot: no author id, an empty message
+    /// id, or an unparseable timestamp (legacy `malformed`). Counted so a
+    /// corrupt page shows up as a number rather than vanishing into the
+    /// totals. Bots are skipped, not malformed, and are not counted.
+    pub malformed: usize,
     pub truncated: Vec<String>,
     pub scanned_back_to: Option<String>,
 }
@@ -120,20 +127,30 @@ pub fn offer_message(m: &mut MemberMessages, msg: EarlyMessage) {
 }
 
 /// Fold one page of messages (newest-first or not — order does not matter)
-/// into the ladder maps. Bots never reach the ladder. Returns message count.
+/// into the ladder maps. Bots never reach the ladder. Returns
+/// `(messages_read, malformed)`: a row with no author id, an empty message
+/// id, or an unparseable timestamp is refused a ladder slot and counted, not
+/// silently skipped (legacy `malformed`, TOG-5700). Bots are skipped, not
+/// malformed, and are not counted.
 pub fn fold_messages(
     early: &mut HashMap<String, MemberMessages>,
     last_active: &mut HashMap<String, String>,
     channel_id: &str,
     messages: &[ScannedMessage],
-) -> usize {
-    let mut n = 0;
+) -> (usize, usize) {
+    let mut read = 0;
+    let mut malformed = 0;
     for msg in messages {
-        n += 1;
+        read += 1;
         let Some(author) = msg.author_id.as_deref() else {
+            malformed += 1;
             continue;
         };
         if msg.author_is_bot {
+            continue;
+        }
+        if author.is_empty() || msg.id.is_empty() || iso_to_millis(&msg.at).is_none() {
+            malformed += 1;
             continue;
         }
         let prev = last_active.get(author);
@@ -155,7 +172,7 @@ pub fn fold_messages(
             },
         );
     }
-    n
+    (read, malformed)
 }
 
 /// One scanned message: the fields the ladder reads.
@@ -175,6 +192,7 @@ pub fn find_early_messages(
     channels_scanned: usize,
     threads_scanned: usize,
     messages_read: usize,
+    malformed: usize,
     truncated: Vec<String>,
     scanned_back_to: Option<String>,
 ) -> (HashMap<String, MemberMessages>, MessageScanSummary) {
@@ -187,6 +205,7 @@ pub fn find_early_messages(
         authors_seen: early.len(),
         authors_with_full_ladder,
         first_messages_written: 0,
+        malformed,
         truncated,
         scanned_back_to,
     };
@@ -212,10 +231,22 @@ mod tests {
         let mut early = HashMap::new();
         let mut last_active = HashMap::new();
         let mut read = 0;
+        let mut malformed = 0;
         for (ch, msgs) in pages {
-            read += fold_messages(&mut early, &mut last_active, ch, msgs);
+            let (n, bad) = fold_messages(&mut early, &mut last_active, ch, msgs);
+            read += n;
+            malformed += bad;
         }
-        find_early_messages(&early, pages.len(), pages.len(), 0, read, Vec::new(), None)
+        find_early_messages(
+            &early,
+            pages.len(),
+            pages.len(),
+            0,
+            read,
+            malformed,
+            Vec::new(),
+            None,
+        )
     }
 
     #[test]
@@ -297,6 +328,100 @@ mod tests {
             }],
         )]);
         assert!(early.is_empty());
+    }
+
+    #[test]
+    fn rerun_over_same_fixture_gives_identical_ladders() {
+        let pages: &[(&str, Vec<ScannedMessage>)] = &[
+            (
+                "c1",
+                vec![
+                    post("5", "alice", "2026-03-05T00:00:00.000Z"),
+                    post("1", "alice", "2026-03-01T00:00:00.000Z"),
+                    post("4", "alice", "2026-03-04T00:00:00.000Z"),
+                ],
+            ),
+            (
+                "c2",
+                vec![
+                    post("3", "alice", "2026-03-03T00:00:00.000Z"),
+                    post("2", "alice", "2026-03-02T00:00:00.000Z"),
+                ],
+            ),
+        ];
+        let (first, first_summary) = scan(pages);
+        let (second, second_summary) = scan(pages);
+        assert_eq!(first, second);
+        assert_eq!(first_summary, second_summary);
+        assert_eq!(
+            first["alice"]
+                .rungs
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3"]
+        );
+    }
+
+    #[test]
+    fn empty_source_scans_zero() {
+        let (early, summary) = scan(&[]);
+        assert!(early.is_empty());
+        assert_eq!(summary.messages_read, 0);
+        assert_eq!(summary.malformed, 0);
+        assert_eq!(summary.authors_seen, 0);
+        assert_eq!(summary.authors_with_full_ladder, 0);
+    }
+
+    #[test]
+    fn malformed_rows_are_counted_and_never_laddered() {
+        let (early, summary) = scan(&[(
+            "c1",
+            vec![
+                post("1", "alice", "2026-03-01T00:00:00.000Z"),
+                // No author id.
+                ScannedMessage {
+                    id: "2".to_owned(),
+                    at: "2026-03-02T00:00:00.000Z".to_owned(),
+                    author_id: None,
+                    author_is_bot: false,
+                },
+                // Empty message id.
+                ScannedMessage {
+                    id: String::new(),
+                    at: "2026-03-03T00:00:00.000Z".to_owned(),
+                    author_id: Some("alice".to_owned()),
+                    author_is_bot: false,
+                },
+                // Unparseable timestamp.
+                ScannedMessage {
+                    id: "4".to_owned(),
+                    at: "not-a-timestamp".to_owned(),
+                    author_id: Some("alice".to_owned()),
+                    author_is_bot: false,
+                },
+                // A bot row is skipped, not malformed.
+                ScannedMessage {
+                    id: "5".to_owned(),
+                    at: "2026-03-05T00:00:00.000Z".to_owned(),
+                    author_id: Some("botly".to_owned()),
+                    author_is_bot: true,
+                },
+            ],
+        )]);
+        assert_eq!(summary.messages_read, 5);
+        assert_eq!(summary.malformed, 3);
+        assert_eq!(summary.authors_seen, 1);
+        assert_eq!(
+            early["alice"]
+                .rungs
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1"],
+            "only the well-formed row reaches the ladder"
+        );
+        assert!(!early.contains_key("botly"));
     }
 
     #[test]

@@ -507,6 +507,144 @@ pub enum ReplaceRewardsError {
     Db(#[from] sqlx::Error),
 }
 
+/// Message-milestone write idempotency (TOG-15759): a second write pass over
+/// the same ladder inserts 0 events. Runs in the existing `check.yml`
+/// "cutover reward ladder lib regression" step (same target, same guard).
+#[cfg(test)]
+mod message_scan_write_tests {
+    use super::*;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    const MESSAGE_RUNGS: [&str; 3] = ["first_message", "second_message", "third_message"];
+
+    fn ladder_write(member: &str, rung: usize, at: &str) -> FunnelWrite {
+        FunnelWrite {
+            member_id: Some(member.to_owned()),
+            guild_id: "100000000000000010".to_owned(),
+            event_type: MESSAGE_RUNGS[rung].to_owned(),
+            occurred_at: at.to_owned(),
+            source: "channel:999000000000000001".to_owned(),
+            metadata: Some(r#"{"backfill":"message_scan"}"#.to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn second_write_pass_over_same_ladder_inserts_zero_events(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let host = if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+            "127.0.0.1"
+        } else {
+            "agent-testdb"
+        };
+        let options = PgConnectOptions::new()
+            .host(host)
+            .port(5432)
+            .username("agent_test")
+            .password("")
+            .database("postgres")
+            .ssl_mode(PgSslMode::Disable);
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_with(options.clone())
+            .await?;
+        let schema = format!(
+            "msgladder_test_{}_{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        );
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await?;
+        let path = schema.clone();
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(Duration::from_secs(5))
+            .after_connect(move |conn, _| {
+                let path = path.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('search_path', $1, false)")
+                        .bind(path)
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect_with(options)
+            .await?;
+        let db = CutoverDb { pool };
+        let result = async {
+            sqlx::raw_sql(include_str!("../migrations/0001_funnel.sql"))
+                .execute(db.pool())
+                .await?;
+            let member = "100000000000000001";
+            let times = [
+                "2026-03-01T00:00:00.000Z",
+                "2026-03-02T00:00:00.000Z",
+                "2026-03-03T00:00:00.000Z",
+            ];
+            // First pass over a full three-rung ladder writes three events.
+            let mut first_written = 0;
+            for (i, at) in times.iter().enumerate() {
+                let (is_new, _) = record_earliest(&db, &ladder_write(member, i, at)).await?;
+                if is_new {
+                    first_written += 1;
+                }
+            }
+            assert_eq!(first_written, 3);
+            // A pure repeat of the same ladder is a no-op: 0 new events, and
+            // the stored rung times are untouched (record_earliest only moves
+            // earlier, never later).
+            let mut second_written = 0;
+            for (i, at) in times.iter().enumerate() {
+                let (is_new, _) = record_earliest(&db, &ladder_write(member, i, at)).await?;
+                if is_new {
+                    second_written += 1;
+                }
+            }
+            assert_eq!(second_written, 0, "re-run writes 0 and is a no-op");
+            let count: (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM events WHERE member_id = $1")
+                    .bind(member)
+                    .fetch_one(db.pool())
+                    .await?;
+            assert_eq!(count.0, 3);
+            // An older re-scan of the same rung pulls the milestone back
+            // without inserting (record_earliest semantics, not record).
+            let (is_new, _) = record_earliest(
+                &db,
+                &ladder_write(member, 0, "2026-02-28T00:00:00.000Z"),
+            )
+            .await?;
+            assert!(!is_new);
+            let stored: (String,) = sqlx::query_as(
+                "SELECT to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM events WHERE idempotency_key = $1",
+            )
+            .bind("100000000000000010:100000000000000001:first_message")
+            .fetch_one(db.pool())
+            .await?;
+            assert_eq!(stored.0, "2026-02-28T00:00:00.000Z");
+            let count: (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM events WHERE member_id = $1")
+                    .bind(member)
+                    .fetch_one(db.pool())
+                    .await?;
+            assert_eq!(count.0, 3, "earlier re-scan pulls back, never inserts");
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+        .await;
+        db.close().await;
+        // Only this generated schema is disposable; preserve all shared data.
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
+    }
+}
+
 #[cfg(test)]
 mod reward_tests {
     use super::*;
