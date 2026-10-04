@@ -3,14 +3,15 @@ use std::path::Path;
 use std::process::{Command, Output};
 use two_bot_cutover::LIVE_GUILD_ID;
 
-const BINS: [&str; 7] = [
+// `dedupe-events` validates raw argv with its own leaf validator and is covered
+// by `dedupe_events_cli.rs`; it never reaches the shared parser.
+const BINS: [&str; 6] = [
     env!("CARGO_BIN_EXE_levels-import-mee6"),
     env!("CARGO_BIN_EXE_levels-role-rewards"),
     env!("CARGO_BIN_EXE_levels-import-rewards-probe"),
     env!("CARGO_BIN_EXE_backfill"),
     env!("CARGO_BIN_EXE_backfill-messages"),
     env!("CARGO_BIN_EXE_capture"),
-    env!("CARGO_BIN_EXE_dedupe-events"),
 ];
 const MISSING_INPUT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
