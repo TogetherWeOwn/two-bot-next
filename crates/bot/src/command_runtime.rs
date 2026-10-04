@@ -33,8 +33,10 @@
 //! router's ONE merged publish set (`set_guild_commands` is idempotent, so a
 //! duplicate READY is a harmless repeat). A resumed process also synchronizes
 //! once: a persisted gateway session does not preserve this process's gates
-//! or command definitions. Until the custom-command store supplies authoritative
-//! rows, publication is deferred when automations enable dynamic commands.
+//! or command definitions. Custom-command publication loads persisted rows
+//! through the same router and executor with one serialized full-set
+//! publisher. Until the custom-command store is bootstrapped, publication
+//! is deferred when automations enable dynamic commands.
 
 use std::{
     future::Future,
@@ -182,6 +184,10 @@ pub struct CommandRuntime {
     interactions: two_bot_discord::interactions::InteractionRuntime,
     custom_commands: Option<Vec<two_bot_core::CustomCommand>>,
     application_id: AtomicU64,
+    /// Bootstrapped custom-command execution seam (dynamic dispatch, prefix
+    /// triggers, serialized republication). Shares the interaction runtime's
+    /// router, whose registrations are complete once built.
+    gateway_commands: tokio::sync::OnceCell<crate::gateway_commands::GatewayCommands>,
     channel: ChannelModerationRuntime,
     tasks: Mutex<DispatchTasks>,
     /// Shared self-role surface; production boot stays parked pending acceptance.
@@ -253,6 +259,7 @@ impl CommandRuntime {
             interactions,
             custom_commands,
             application_id: AtomicU64::new(0),
+            gateway_commands: tokio::sync::OnceCell::new(),
             channel,
             tasks: Mutex::new(DispatchTasks::default()),
             self_roles,
@@ -305,6 +312,7 @@ impl CommandRuntime {
             &features,
             &moderation,
             SurfaceFlags {
+                scorecard: std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|value| value == "1"),
                 session_picker: onboarding.mode == two_bot_core::OnboardingMode::Session,
                 tickets: ticket_config.is_some(),
                 self_roles: self_roles.is_some(),
@@ -358,6 +366,25 @@ impl CommandRuntime {
             Some(Vec::new()),
             tickets,
         ))
+    }
+
+    /// Bootstrap before constructing the shard, reusing this runtime's router,
+    /// pool and executor (including its proxy and shared pacing state).
+    pub(crate) async fn initialize_custom_commands(
+        &self,
+        config: crate::gateway_commands::GatewayCommandConfig,
+    ) -> Result<(), sqlx::Error> {
+        self.gateway_commands
+            .get_or_try_init(|| {
+                crate::gateway_commands::GatewayCommands::bootstrap_with_router(
+                    self.pool.clone(),
+                    self.executor.clone(),
+                    config,
+                    Arc::clone(&self.interactions.router),
+                )
+            })
+            .await
+            .map(|_| ())
     }
 
     /// Test constructor: skips env gate reads so tests inject their own
@@ -490,7 +517,12 @@ impl CommandRuntime {
     /// Saturated lanes drop events without effects, queued waiters or tokens in
     /// logs. READY/RESUMED publication has independent capacity; overlapping
     /// connection events coalesce while the full registry is being synchronized.
+    /// Custom commands answer first and report ownership, so sticky/feed
+    /// routing never sends a second response after an acknowledgement.
     pub fn dispatch(self: &Arc<Self>, event: &Event) -> bool {
+        if let Some(custom) = self.gateway_commands.get() {
+            custom.observe(event);
+        }
         match event {
             Event::MessageCreate(message) => {
                 if !self.automations {
@@ -499,6 +531,9 @@ impl CommandRuntime {
                 let runtime = Arc::clone(self);
                 let message = message.0.clone();
                 self.spawn(0, async move {
+                    if let Some(custom) = runtime.gateway_commands.get() {
+                        custom.handle_message(&message).await;
+                    }
                     runtime.on_message(&message).await;
                 })
             }
@@ -517,7 +552,13 @@ impl CommandRuntime {
                     true
                 } else {
                     self.spawn(1, async move {
-                        runtime.on_interaction(&interaction).await;
+                        let handled = match runtime.gateway_commands.get() {
+                            Some(custom) => custom.handle_interaction(&interaction).await,
+                            None => false,
+                        };
+                        if !handled {
+                            runtime.on_interaction(&interaction).await;
+                        }
                     })
                 }
             }
@@ -629,6 +670,29 @@ impl CommandRuntime {
     ) -> Result<(), RegistrySyncError> {
         let mut synced = self.registry_synced.lock().await;
         if application_id.is_none() && *synced {
+            return Ok(());
+        }
+        // Once bootstrapped, custom commands own the full-set publisher: it
+        // loads persisted rows and serializes add/remove republication.
+        if let Some(custom) = self.gateway_commands.get() {
+            let application_id = match application_id {
+                Some(id) => id,
+                None => match self.executor.current_application_id().await {
+                    Ok(id) => {
+                        // RESUMED carries no application: arm the interaction
+                        // fence from this registry lookup, as below.
+                        self.interactions.set_application_id(id);
+                        self.application_id.store(id, Ordering::Relaxed);
+                        id
+                    }
+                    Err(_) => return Err(RegistrySyncError::ApplicationLookup),
+                },
+            };
+            custom
+                .sync_registry(application_id)
+                .await
+                .map_err(|_| RegistrySyncError::Publish)?;
+            *synced = true;
             return Ok(());
         }
         let Some(defs) = publication_definitions(
@@ -1494,6 +1558,7 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     ] {
         router.register(Box::new(SliceHandler(id)));
     }
+    two_bot_discord::custom_commands::CustomCommandRuntime::register(&mut router);
     router
 }
 

@@ -495,6 +495,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
          format!("REVOKE ALL ON SEQUENCE public.guild_settings_cas_seq FROM {ro}")),
         (format!("REVOKE SELECT ON public._sqlx_migrations FROM {ro}"),
          format!("GRANT SELECT ON public._sqlx_migrations TO {ro}")),
+        (format!("REVOKE SELECT ON public.members FROM {ro}"),
+         format!("GRANT SELECT ON public.members TO {ro}")),
         (format!("GRANT {migrator} TO {ro}"), format!("REVOKE {migrator} FROM {ro}")),
     ] {
         execute(pool, change.clone()).await?;

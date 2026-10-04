@@ -17,7 +17,7 @@ use std::sync::{
 };
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha384};
+use sha2::{Digest, Sha256, Sha384};
 use sqlx::{
     migrate::Migrator,
     postgres::{PgConnection, PgPoolOptions},
@@ -59,6 +59,11 @@ pub struct Request {
     /// Raw `expected_pending` workflow input (ascending, comma-separated
     /// versions). Required for apply; ignored for plan.
     pub expected_pending: Option<String>,
+    /// Plan-bound apply identity: the SHA-256 of the plan job's uploaded
+    /// `staging-migrate-manifest.json` and the run that produced it. Both are
+    /// required for apply; both are ignored for plan.
+    pub plan_manifest_sha256: Option<String>,
+    pub plan_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +101,63 @@ pub fn parse_expected_pending(raw: &str) -> Result<Vec<i64>, String> {
         out.push(version);
     }
     Ok(out)
+}
+
+/// SHA-256 of a plan manifest's canonical projection.
+///
+/// The projection is `source_sha`, the pending list and the full source
+/// migration table, each on its own line. The workflow computes this over
+/// the plan job's uploaded `staging-migrate-manifest.json` and passes it to
+/// the apply dispatch as `plan_manifest_sha256`; the apply runner recomputes
+/// it over the manifest it just printed and refuses on any mismatch. The
+/// source table binds the hash to the exact migration SQL the plan showed,
+/// so same-pending-different-SQL replays refuse.
+pub fn manifest_hash(source_sha: &str, pending: &[i64], migrator: &Migrator) -> String {
+    let mut projection = String::from(source_sha);
+    projection.push('\n');
+    for version in pending {
+        projection.push_str(&version.to_string());
+        projection.push('\n');
+    }
+    for m in migrator
+        .iter()
+        .filter(|m| !m.migration_type.is_down_migration())
+    {
+        projection.push_str(&format!(
+            "{}:{}:{}\n",
+            m.version,
+            m.description,
+            hex::encode(&m.checksum)
+        ));
+    }
+    hex::encode(Sha256::digest(projection.as_bytes()))
+}
+
+/// Plan-bound apply identity, checked before any DDL.
+///
+/// Returns the computed manifest hash. For apply, the request's
+/// `plan_manifest_sha256` must equal the hash recomputed over this run's own
+/// source SHA, pending list and migration table; a hash minted for a
+/// different source SHA, a different pending set or different migration SQL
+/// refuses. For plan the hash is computed and returned for the manifest.
+pub fn check_plan_binding(
+    req: &Request,
+    pending: &[i64],
+    migrator: &Migrator,
+) -> Result<String, RunError> {
+    let computed = manifest_hash(&req.source_sha, pending, migrator);
+    if req.apply {
+        let want = req
+            .plan_manifest_sha256
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if computed != want {
+            return refuse("plan_manifest_sha256 does not match the computed plan manifest");
+        }
+    }
+    Ok(computed)
 }
 
 /// Pure prerequisite checks; nothing here touches the network.
@@ -139,6 +201,29 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
             return refuse("apply requires expected_pending from the reviewed plan");
         }
         None => {}
+    }
+    // Plan-bound apply identity: apply runs only the exact manifest the
+    // reviewed plan produced. Both the hash and the producing run id are
+    // required for apply; the hash check itself happens in `run_on_pool`,
+    // after the manifest is computed but before any DDL.
+    match (&req.plan_manifest_sha256, &req.plan_run_id) {
+        (Some(hash), Some(run_id)) => {
+            let hash = hash.trim().to_ascii_lowercase();
+            let run_id = run_id.trim();
+            if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                return refuse("plan_manifest_sha256 must be a 64-char lowercase hex digest");
+            }
+            if run_id.is_empty() || run_id.len() > 20 || !run_id.bytes().all(|b| b.is_ascii_digit())
+            {
+                return refuse("plan_run_id must be the numeric run id that produced the plan");
+            }
+        }
+        _ if req.apply => {
+            return refuse(
+                "apply requires plan_manifest_sha256 and plan_run_id from the reviewed plan",
+            );
+        }
+        _ => {}
     }
     // NOTE: no `staging`-substring requirement here. The pinned host plus the
     // binding-match check in `verify_target` is the staging identity; the
@@ -344,6 +429,7 @@ async fn run_on_pool(
     if req.apply && expected != pending {
         return refuse("expected_pending does not match the computed pending list");
     }
+    let computed_hash = check_plan_binding(req, &pending, &MIGRATOR)?;
 
     let mut applied = 0usize;
     let mut after = before.clone();
@@ -399,6 +485,8 @@ async fn run_on_pool(
         "ledger_after": ledger_json(&after),
         "pending_before": pending,
         "expected_pending": expected,
+        "plan_manifest_sha256": computed_hash,
+        "plan_run_id": req.plan_run_id.clone().unwrap_or_default(),
         "applied_count": applied,
     }))
 }
@@ -562,6 +650,114 @@ mod tests {
             .contains("ascending"));
     }
 
+    /// Plan-bound apply identity against the live migration table, so the
+    /// three hash cases below need no database.
+    fn pending_versions() -> Vec<i64> {
+        reconcile(&[], &MIGRATOR).expect("empty ledger leaves every version pending")
+    }
+
+    /// An apply request carrying the exact hash `check_plan_binding`
+    /// computes for its own source SHA, pending list and migration table.
+    fn bound_apply(pending: &[i64], source_sha: &str) -> Request {
+        let hash = manifest_hash(source_sha, pending, &MIGRATOR);
+        Request {
+            url: Some("postgres://u@agent-testdb:5432/two_staging".to_owned()),
+            source_sha: source_sha.to_owned(),
+            expected_host: "agent-testdb".to_owned(),
+            expected_database: "two_staging".to_owned(),
+            recovery_evidence_ref: "TOG-1#doc".to_owned(),
+            acl_plan_ref: "TOG-2#doc".to_owned(),
+            apply: true,
+            expected_pending: Some(
+                pending
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            plan_manifest_sha256: Some(hash),
+            plan_run_id: Some("123456789".to_owned()),
+        }
+    }
+
+    #[test]
+    fn plan_binding_accepts_the_matching_hash() {
+        let sha = "a".repeat(40);
+        let pending = pending_versions();
+        let req = bound_apply(&pending, &sha);
+        assert!(validate_request(&req).is_ok());
+        assert_eq!(
+            check_plan_binding(&req, &pending, &MIGRATOR).unwrap(),
+            req.plan_manifest_sha256.unwrap()
+        );
+    }
+
+    #[test]
+    fn plan_binding_refuses_a_mismatched_hash() {
+        let sha = "a".repeat(40);
+        let pending = pending_versions();
+        let mut req = bound_apply(&pending, &sha);
+        let tampered = format!(
+            "00{}",
+            req.plan_manifest_sha256.as_deref().unwrap_or_default()[2..].to_owned()
+        );
+        req.plan_manifest_sha256 = Some(tampered);
+        assert!(validate_request(&req).is_ok());
+        assert!(matches!(
+            check_plan_binding(&req, &pending, &MIGRATOR),
+            Err(RunError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn plan_binding_refuses_the_same_hash_on_a_different_source_sha() {
+        let pending = pending_versions();
+        let req = bound_apply(&pending, &"a".repeat(40));
+        // The same hash presented for another source SHA must refuse: the
+        // CEO approval names one plan for one reviewed commit.
+        let replay = Request {
+            source_sha: "b".repeat(40),
+            ..req
+        };
+        assert!(validate_request(&replay).is_ok());
+        assert!(matches!(
+            check_plan_binding(&replay, &pending, &MIGRATOR),
+            Err(RunError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn plan_binding_refuses_missing_or_malformed_binding_inputs() {
+        let sha = "a".repeat(40);
+        let pending = pending_versions();
+        let good = bound_apply(&pending, &sha);
+        for mutate in [
+            |r: &mut Request| r.plan_manifest_sha256 = None,
+            |r: &mut Request| r.plan_run_id = None,
+            |r: &mut Request| {
+                r.plan_manifest_sha256 = Some("not-a-digest".to_owned());
+            },
+            |r: &mut Request| {
+                r.plan_manifest_sha256 = Some("00".repeat(32)[1..].to_owned());
+            },
+            |r: &mut Request| r.plan_run_id = Some(String::new()),
+            |r: &mut Request| r.plan_run_id = Some("plan-42".to_owned()),
+        ] {
+            let mut req = good.clone();
+            mutate(&mut req);
+            assert!(matches!(validate_request(&req), Err(RunError::Refused(_))));
+        }
+        // Plan ignores the binding inputs entirely.
+        let plan = Request {
+            apply: false,
+            expected_pending: None,
+            plan_manifest_sha256: None,
+            plan_run_id: None,
+            ..good
+        };
+        assert!(validate_request(&plan).is_ok());
+    }
+
     #[test]
     fn validation_refuses_before_connecting() {
         let ok = Request {
@@ -573,6 +769,8 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            plan_manifest_sha256: None,
+            plan_run_id: None,
         };
         assert!(validate_request(&ok).is_ok());
         // The verified shared-Neon staging identity needs no `staging` in the
@@ -644,10 +842,21 @@ mod tests {
         for r in bad {
             assert!(matches!(validate_request(&r), Err(RunError::Refused(_))));
         }
+        // Apply refuses without the plan-bound identity.
+        assert!(matches!(
+            validate_request(&Request {
+                apply: true,
+                expected_pending: Some(String::new()),
+                ..ok.clone()
+            }),
+            Err(RunError::Refused(_))
+        ));
         // Apply accepts a well-formed binding when given one.
         assert!(validate_request(&Request {
             apply: true,
             expected_pending: Some(String::new()),
+            plan_manifest_sha256: Some("ab".repeat(32)),
+            plan_run_id: Some("123456789".to_owned()),
             ..ok.clone()
         })
         .is_ok());
@@ -664,6 +873,8 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            plan_manifest_sha256: None,
+            plan_run_id: None,
         };
         assert!(validate_request(&base).is_ok());
         assert!(verify_target(&base).is_ok());

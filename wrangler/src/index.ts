@@ -79,6 +79,9 @@ export interface Env extends ForwardedFlagEnv {
   DISCORD_TOKEN?: string;
   DATABASE_URL?: string;
   GUILD_ID?: string;
+  TWO_AUTOMATIONS?: string;
+  TWO_TEXT_COMMANDS?: string;
+  TWO_AUTOMOD?: string;
   // Explicit: not a TWO_* flag, so outside the container-env allowlist.
   DISCORD_APPLICATION_ID?: string;
   BOT_PORT?: string;
@@ -252,6 +255,17 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
   if (env.DISCORD_TOKEN) vars["DISCORD_TOKEN"] = env.DISCORD_TOKEN;
   if (env.DATABASE_URL) vars["DATABASE_URL"] = env.DATABASE_URL;
   if (env.GUILD_ID) vars["GUILD_ID"] = env.GUILD_ID;
+  // Pass gates unchanged; only the bot decides whether an exact "1" enables them.
+  if (env.TWO_AUTOMATIONS !== undefined) {
+    vars["TWO_AUTOMATIONS"] = env.TWO_AUTOMATIONS;
+  }
+  if (env.TWO_TEXT_COMMANDS !== undefined) {
+    vars["TWO_TEXT_COMMANDS"] = env.TWO_TEXT_COMMANDS;
+  }
+  // Missing moderation configuration must stay missing, not become disabled.
+  if (env.TWO_AUTOMOD !== undefined) {
+    vars["TWO_AUTOMOD"] = env.TWO_AUTOMOD;
+  }
   const applicationId = env[APPLICATION_ID_KEY];
   if (applicationId !== undefined) vars[APPLICATION_ID_KEY] = applicationId;
   vars["LISTEN_ADDR"] = `0.0.0.0:${port}`;

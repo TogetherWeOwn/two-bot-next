@@ -20,9 +20,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::voice_room_plan::{plan_room, RoomPlanInput};
+use crate::voice_room_plan::{category_room_ids, plan_room, RoomPlanInput};
 use tokio::sync::{mpsc, oneshot};
-use tracing::warn;
+use tracing::{info, warn};
 use twilight_cache_inmemory::DefaultInMemoryCache;
 use twilight_gateway::Event;
 use twilight_model::{
@@ -49,7 +49,7 @@ use twilight_model::{
     },
 };
 use two_bot_core::{
-    evaluate_permissions as evaluate_health, now_iso,
+    evaluate_permissions as evaluate_health, metrics, now_iso,
     voice_access::{
         is_voice_command, may_create_room, may_use_command, validate_access_controls,
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
@@ -76,9 +76,9 @@ use two_bot_core::{
     },
     voice_rooms::{
         category_full_message, is_usable_channel_name, voice_commands, ActionQueue, CreatorChannel,
-        NewRoomSpec, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, RoomPosition,
-        TextCompanion, VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN,
-        RENAME_MIN_INTERVAL_MS,
+        NewRoomSpec, PermissionSource, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction,
+        RoomPosition, TextCompanion, VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY,
+        MAX_CHANNEL_NAME_LEN, QUEUE_MAX_ATTEMPTS, RENAME_MIN_INTERVAL_MS,
     },
     voice_text_channel::{
         admin_view_roles, occupancy_diff, text_channel_plan,
@@ -327,6 +327,63 @@ fn store_error(error: sqlx::Error) -> StoreError {
             StoreError::CredentialRefused
         }
         _ => StoreError::Unavailable,
+    }
+}
+
+/// Bounded outcome class for a terminal Discord error (TOG-13543). Rate
+/// limits are retries, never outcomes; callers skip them before reaching
+/// here. `Rejected` status/code values never become labels.
+fn voice_outcome_from_http(error: &RoomHttpError) -> &'static str {
+    match error {
+        RoomHttpError::Cancelled => "cancelled",
+        _ => "discord",
+    }
+}
+
+/// Bounded outcome class for a terminal store error (TOG-13543). All three
+/// variants share one `persistence` outcome to keep cardinality fixed; the
+/// sanitized debug already rides the failure line for `/setup`.
+fn voice_outcome_from_store(_error: &StoreError) -> &'static str {
+    "persistence"
+}
+
+/// Bounded dead-letter family for a queue action (TOG-13543). Companion
+/// creates/grants/revokes share `companion`; unknown shapes share `other`.
+fn voice_dead_action(action: &RoomAction) -> &'static str {
+    match action {
+        RoomAction::CreateRoom { .. } => "create",
+        RoomAction::MoveMember { .. } => "move",
+        RoomAction::DeleteRoom { .. } => "delete",
+        RoomAction::CreateCompanion { .. }
+        | RoomAction::GrantCompanionView { .. }
+        | RoomAction::RevokeCompanionView { .. } => "companion",
+        RoomAction::UpdateOwnership { .. } => "ownership",
+        RoomAction::KickMember { .. } => "kick",
+        RoomAction::RenameRoom { .. } => "rename",
+    }
+}
+
+/// One finished room lifecycle outcome (TOG-13543): a fixed-cardinality
+/// counter plus a token-free log line. Event name `voice_operation` with
+/// `op`/`outcome` fields is the catalog entry coordinated with blocked
+/// TOG-10870 (which owns JSON formatting): no IDs, bodies, tokens or member
+/// data, only the bounded operation and outcome.
+fn observe_voice_operation(op: &'static str, outcome: &'static str) {
+    metrics::global().voice_operation(op, outcome);
+    if outcome == "success" {
+        info!(
+            voice_event = "voice_operation",
+            op = op,
+            outcome = outcome,
+            "voice_operation succeeded"
+        );
+    } else {
+        warn!(
+            voice_event = "voice_operation",
+            op = op,
+            outcome = outcome,
+            "voice_operation failed"
+        );
     }
 }
 
@@ -1288,9 +1345,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
         let mut empty = Vec::new();
         let mut occupied = Vec::new();
+        let mut suspended: u64 = 0;
+        let mut resumed: u64 = 0;
         for channel in self.rooms.keys().copied() {
             if !live.channels.contains_key(&channel) {
                 self.queue.resume(self.live.guild_id, channel);
+                resumed = resumed.saturating_add(1);
                 empty.push(channel);
                 continue;
             }
@@ -1311,9 +1371,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             // Move Members was revoked between the create and move.
             if !accessible && !self.moves.contains_key(&channel) {
                 self.queue.suspend(self.live.guild_id, channel);
+                suspended = suspended.saturating_add(1);
                 continue;
             }
             self.queue.resume(self.live.guild_id, channel);
+            resumed = resumed.saturating_add(1);
             let move_pending = self.moves.contains_key(&channel)
                 || self
                     .uncertain_moves
@@ -1366,6 +1428,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.companion_seen.insert(channel, current);
         }
         drop(live);
+        let delete_enqueued = empty.len() as u64;
         for channel in empty {
             self.queue_delete(channel, false);
         }
@@ -1391,8 +1454,26 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 );
             }
         }
+        let mut succession_enqueued: u64 = 0;
         for channel in occupied {
-            self.apply_succession(channel);
+            if self.apply_succession(channel) {
+                succession_enqueued = succession_enqueued.saturating_add(1);
+            }
+        }
+        metrics::global().voice_reconcile("delete_enqueued", delete_enqueued);
+        metrics::global().voice_reconcile("suspended", suspended);
+        metrics::global().voice_reconcile("resumed", resumed);
+        metrics::global().voice_reconcile("succession_enqueued", succession_enqueued);
+        self.observe_voice_state();
+        if delete_enqueued > 0 || suspended > 0 || resumed > 0 || succession_enqueued > 0 {
+            info!(
+                voice_event = "voice_reconcile",
+                delete_enqueued = delete_enqueued,
+                suspended = suspended,
+                resumed = resumed,
+                succession_enqueued = succession_enqueued,
+                "voice_reconcile planned"
+            );
         }
     }
 
@@ -1402,24 +1483,24 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// tick is idempotent; the queued [`RoomAction::UpdateOwnership`] persists
     /// the handoff. Skipped while the owner's move is still in flight and
     /// while occupancy is uncertain after a successful move.
-    fn apply_succession(&mut self, channel: Snowflake) {
+    fn apply_succession(&mut self, channel: Snowflake) -> bool {
         if self.moves.contains_key(&channel) {
-            return;
+            return false;
         }
         let (room, occupants) = {
             let live = self.live.inner.read().expect("live voice lock");
             if !live.ready {
-                return;
+                return false;
             }
             let Some(room) = self.rooms.get(&channel).cloned() else {
-                return;
+                return false;
             };
             if self
                 .uncertain_moves
                 .get(&channel)
                 .is_some_and(|ticket| live.ticket_valid(*ticket))
             {
-                return;
+                return false;
             }
             (room, live.ownership_snapshot(channel))
         };
@@ -1428,7 +1509,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 .iter()
                 .any(|member| member.member_id == room.owner_id)
         {
-            return;
+            return false;
         }
         let ownership = RoomOwnership {
             owner_id: room.owner_id,
@@ -1436,10 +1517,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         };
         let next = match decide_ownership(ownership, &occupants, OwnershipRequest::Reconcile) {
             Ok(OwnershipDecision::Changed { next, .. }) => next,
-            Ok(_) => return,
+            Ok(_) => return false,
             Err(error) => {
                 warn!(channel_id = channel, %error, "voice succession refused");
-                return;
+                return false;
             }
         };
         let mut updated = room;
@@ -1454,6 +1535,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 original_creator_id: next.original_creator_id,
             },
         );
+        true
     }
 
     /// V2 ownership command (`/reclaim`, `/transfer`), serialized in the guild
@@ -1899,6 +1981,33 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         self.failures.push_back(failure);
     }
 
+    /// Publish current ghost-verification gauges (TOG-13543): tracked rooms
+    /// plus compensation-pending orphans. No IDs leave the process.
+    fn observe_voice_state(&self) {
+        metrics::global().voice_state(self.rooms.len() as u64, self.compensation.len() as u64);
+    }
+
+    /// Retry through the queue budget and observe the dead letter (TOG-13543).
+    /// Returns the queue's release verdict. On the terminal attempt the
+    /// bounded family counter advances and one token-free warn line names
+    /// the family and attempt budget, never the channel, member or reason
+    /// body.
+    fn mark_failed_observed(&self, action: QueuedAction, reason: String, now_ms: u64) -> bool {
+        let family = voice_dead_action(&action.action);
+        let will_dead_letter = action.attempts.saturating_add(1) >= QUEUE_MAX_ATTEMPTS;
+        let released = self.queue.mark_failed(action, reason, now_ms);
+        if will_dead_letter && released {
+            metrics::global().voice_dead_letter(family);
+            warn!(
+                voice_event = "voice_dead_letter",
+                action = family,
+                attempts = QUEUE_MAX_ATTEMPTS,
+                "voice action dead-lettered"
+            );
+        }
+        released
+    }
+
     fn prepare(&self, ticket: JoinTicket) -> Result<RoomChannelAttributes, RoomHttpError> {
         let live = self.live.inner.read().expect("live voice lock");
         if !live.ticket_valid(ticket) {
@@ -1931,6 +2040,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             }
         }
         let bot = live.bot.as_ref().ok_or(RoomHttpError::AccessDenied)?;
+        let grouped = settings.group_by_category;
+        let group_room_ids = if grouped {
+            category_room_ids(channel, &live.channels, &self.rooms)
+        } else {
+            Vec::new()
+        };
         plan_room(&RoomPlanInput {
             guild_id: self.live.guild_id,
             owner_id: ticket.member_id,
@@ -1941,6 +2056,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             rooms: &self.rooms,
             bot,
             bot_permissions: permissions,
+            grouped,
+            group_room_ids: &group_room_ids,
         })
     }
 
@@ -1983,11 +2100,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 creator_id: creator_channel_id,
                                 message: category_full_message(),
                             });
+                            observe_voice_operation("create", "category_full");
                         } else if error != RoomHttpError::Cancelled {
+                            let outcome = voice_outcome_from_http(&error);
                             self.record(LifecycleFailure::Discord {
                                 channel_id: creator_channel_id,
                                 error,
                             });
+                            observe_voice_operation("create", outcome);
                         }
                         self.creations.remove(&action.id);
                         self.queue.mark_succeeded(&action);
@@ -2018,6 +2138,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 // the move. The plan's settings snapshot is the
                                 // creator row at room-creation time, so later
                                 // `/textchannels` changes never alter it.
+                                observe_voice_operation("create", "success");
+                                self.observe_voice_state();
                                 self.enqueue_companion_create(channel_id);
                                 if self
                                     .live
@@ -2039,14 +2161,17 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 }
                             }
                             Err(error) => {
+                                let outcome = voice_outcome_from_store(&error);
                                 self.record(LifecycleFailure::Persistence {
                                     channel_id: Some(channel_id),
                                     error,
                                 });
+                                observe_voice_operation("create", outcome);
                                 if error == StoreError::CredentialRefused {
                                     self.halted = true;
                                 }
                                 self.queue_delete(channel_id, true);
+                                self.observe_voice_state();
                             }
                         }
                     }
@@ -2061,6 +2186,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     Err(error) => {
                         // Unknown create outcomes must never produce another POST.
                         self.creations.remove(&action.id);
+                        if error != RoomHttpError::Cancelled {
+                            observe_voice_operation("create", voice_outcome_from_http(&error));
+                        }
                         self.complete_error(action, creator_channel_id, error);
                     }
                 }
@@ -2098,6 +2226,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         // Occupancy may lag the successful REST response. Wait for
                         // this member's transition or a complete refresh before pruning.
                         self.uncertain_moves.insert(channel_id, ticket);
+                        observe_voice_operation("move", "success");
                     }
                     Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
                         self.queue.mark_rate_limited(
@@ -2110,12 +2239,17 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     Err(RoomHttpError::UnknownOutcome) => {
                         self.moves.remove(&channel_id);
                         self.uncertain_moves.insert(channel_id, ticket);
+                        observe_voice_operation("move", "discord");
                         self.complete_error(action, channel_id, RoomHttpError::UnknownOutcome);
                     }
                     Err(error) => {
                         self.moves.remove(&channel_id);
+                        if error != RoomHttpError::Cancelled {
+                            observe_voice_operation("move", voice_outcome_from_http(&error));
+                        }
                         self.complete_error(action, channel_id, error);
                         self.queue_delete(channel_id, true);
+                        self.observe_voice_state();
                     }
                 }
             }
@@ -2168,7 +2302,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             // Companion Discord delete failed (or its row
                             // write did): retry with the room delete instead
                             // of leaking the text channel.
-                            self.queue.mark_failed(
+                            self.mark_failed_observed(
                                 action,
                                 "companion delete unavailable".to_owned(),
                                 elapsed_ms(now_ms, started),
@@ -2191,17 +2325,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 self.moves.remove(&channel_id);
                                 self.uncertain_moves.remove(&channel_id);
                                 self.desired_names.remove(&channel_id);
+                                observe_voice_operation("delete", "success");
+                                self.observe_voice_state();
                             }
                             Err(error) => {
+                                let outcome = voice_outcome_from_store(&error);
                                 self.record(LifecycleFailure::Persistence {
                                     channel_id: Some(channel_id),
                                     error,
                                 });
                                 if error == StoreError::CredentialRefused {
                                     self.halted = true;
+                                    observe_voice_operation("delete", outcome);
                                     self.queue.mark_succeeded(&action);
                                 } else {
-                                    self.queue.mark_failed(
+                                    self.mark_failed_observed(
                                         action,
                                         "voice-room persistence unavailable".to_owned(),
                                         elapsed_ms(now_ms, started),
@@ -2233,7 +2371,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             channel_id,
                             error: RoomHttpError::AccessDenied,
                         });
-                        self.queue.mark_failed(
+                        observe_voice_operation("delete", "discord");
+                        self.mark_failed_observed(
                             action,
                             "Discord access denied".to_owned(),
                             elapsed_ms(now_ms, started),
@@ -2242,9 +2381,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     Err(RoomHttpError::Cancelled) => {
                         self.queue.mark_succeeded(&action);
                         self.deletes.remove(&channel_id);
+                        observe_voice_operation("delete", "cancelled");
                     }
                     Err(RoomHttpError::UnknownOutcome) => {
-                        self.queue.mark_failed(
+                        self.mark_failed_observed(
                             action,
                             "Discord delete outcome unknown".to_owned(),
                             elapsed_ms(now_ms, started),
@@ -2252,7 +2392,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                     Err(error) => {
                         self.deletes.remove(&channel_id);
+                        if error != RoomHttpError::Cancelled {
+                            observe_voice_operation("delete", voice_outcome_from_http(&error));
+                        }
                         self.complete_error(action, channel_id, error);
+                        self.observe_voice_state();
                     }
                 }
             }
@@ -2339,7 +2483,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             )
                             .await;
                         } else {
-                            self.queue.mark_failed(
+                            self.mark_failed_observed(
                                 action,
                                 "companion create outcome unknown".to_owned(),
                                 elapsed_ms(now_ms, started),
@@ -2426,7 +2570,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             channel_id: Some(channel_id),
                             error,
                         });
-                        self.queue.mark_failed(
+                        self.mark_failed_observed(
                             action,
                             "voice-room persistence unavailable".to_owned(),
                             elapsed_ms(now_ms, started),
@@ -2493,7 +2637,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                     Err(RoomHttpError::UnknownOutcome) => {
                         // Both writes are idempotent, so a retry is safe.
-                        self.queue.mark_failed(
+                        self.mark_failed_observed(
                             action,
                             "Discord kick outcome unknown".to_owned(),
                             elapsed_ms(now_ms, started),
@@ -2635,7 +2779,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     self.companion_channels
                         .insert(room_channel_id, text_channel_id);
                     self.unpersisted_companions.insert(room_channel_id);
-                    self.queue.mark_failed(
+                    self.mark_failed_observed(
                         action.clone(),
                         "companion persistence unavailable".to_owned(),
                         elapsed_ms(now_ms, started),
@@ -2790,7 +2934,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     channel_id: text_channel_id,
                     error,
                 });
-                self.queue.mark_failed(
+                self.mark_failed_observed(
                     action.clone(),
                     if grant {
                         "companion view grant unavailable".to_owned()
@@ -3751,6 +3895,222 @@ pub fn decide_text_channels(
     TextChannelsPlan::Update(creator)
 }
 
+// --- V8 per-creator settings decisions (pure, no Discord) ------------------------
+//
+// Each command edits one creator row through `add_creator` (single-field
+// write) with the same bounds the V11 import validates: limits 0-99,
+// first numbers >= 1, permission sources creator/category/channel. The
+// stored row only governs rooms created afterwards; open rooms keep theirs.
+
+/// `/position` input after parsing. Unset options keep the stored value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionRequest {
+    pub position: Option<RoomPosition>,
+    pub first_number: Option<i64>,
+}
+
+/// What `/position` means for one creator channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PositionPlan {
+    Update(CreatorChannel),
+    Refuse { message: String },
+}
+
+/// Fold a `/position` request into the creator row, or refuse. Pure.
+#[must_use]
+pub fn decide_position(creator: Option<CreatorChannel>, request: &PositionRequest) -> PositionPlan {
+    let refuse = |message: &str| PositionPlan::Refuse {
+        message: message.to_owned(),
+    };
+    let Some(mut creator) = creator else {
+        return refuse("That channel is not a voice-room creator. Pick one made with /create.");
+    };
+    if request.position.is_none() && request.first_number.is_none() {
+        return refuse(
+            "Choose a position (above or below) or a first room number, then try again.",
+        );
+    }
+    if let Some(position) = request.position {
+        creator.position = position;
+    }
+    if let Some(first_number) = request.first_number {
+        creator.first_room_number = first_number;
+    }
+    if creator.validate().is_err() {
+        return refuse("The first room number must be 1 or higher.");
+    }
+    PositionPlan::Update(creator)
+}
+
+/// `/group` input after parsing. An omitted toggle turns grouping on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupRequest {
+    pub enabled: Option<bool>,
+}
+
+/// What `/group` means for one creator channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupPlan {
+    Update(CreatorChannel),
+    Refuse { message: String },
+}
+
+/// Fold a `/group` request into the creator row, or refuse. Pure.
+#[must_use]
+pub fn decide_group(creator: Option<CreatorChannel>, request: &GroupRequest) -> GroupPlan {
+    let refuse = |message: &str| GroupPlan::Refuse {
+        message: message.to_owned(),
+    };
+    let Some(mut creator) = creator else {
+        return refuse("That channel is not a voice-room creator. Pick one made with /create.");
+    };
+    creator.group_by_category = request.enabled.unwrap_or(true);
+    if creator.validate().is_err() {
+        return refuse("Those grouping settings are not valid. Try again.");
+    }
+    GroupPlan::Update(creator)
+}
+
+/// `/inheritpermissions` input after parsing. `source` is the raw option
+/// value (`creator`, `category` or `channel`); `source_channel` rides along
+/// only for the channel source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InheritPermissionsRequest {
+    pub source: Option<String>,
+    pub source_channel: Option<Snowflake>,
+}
+
+/// What `/inheritpermissions` means for one creator channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InheritPermissionsPlan {
+    Update(CreatorChannel),
+    Refuse { message: String },
+}
+
+/// Fold an `/inheritpermissions` request into the creator row, or refuse.
+/// Pure: same source bounds the V11 import validates.
+#[must_use]
+pub fn decide_inherit_permissions(
+    creator: Option<CreatorChannel>,
+    request: &InheritPermissionsRequest,
+) -> InheritPermissionsPlan {
+    let refuse = |message: &str| InheritPermissionsPlan::Refuse {
+        message: message.to_owned(),
+    };
+    let Some(mut creator) = creator else {
+        return refuse("That channel is not a voice-room creator. Pick one made with /create.");
+    };
+    let Some(source) = request.source.as_deref() else {
+        return refuse("Choose where new rooms copy overrides from: creator, category or channel.");
+    };
+    match source {
+        "creator" => {
+            if request.source_channel.is_some() {
+                return refuse(
+                    "Only set a source channel together with source channel, not source creator.",
+                );
+            }
+            creator.permission_source = PermissionSource::Creator;
+            creator.permission_channel_id = None;
+        }
+        "category" => {
+            if request.source_channel.is_some() {
+                return refuse(
+                    "Only set a source channel together with source channel, not source category.",
+                );
+            }
+            creator.permission_source = PermissionSource::Category;
+            creator.permission_channel_id = None;
+        }
+        "channel" => {
+            let Some(channel) = request.source_channel.filter(|channel| *channel != 0) else {
+                return refuse(
+                    "Name the channel to copy overrides from together with source channel.",
+                );
+            };
+            creator.permission_source = PermissionSource::Channel(channel);
+            creator.permission_channel_id = Some(channel);
+        }
+        _ => {
+            return refuse(
+                "Choose where new rooms copy overrides from: creator, category or channel.",
+            );
+        }
+    }
+    if creator.validate().is_err() {
+        return refuse("Those permission settings are not valid. Check the source channel.");
+    }
+    InheritPermissionsPlan::Update(creator)
+}
+
+/// `/defaultlimit` input after parsing. `None` clears to inherit the
+/// creator channel's limit; `Some(0)` is unlimited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultLimitRequest {
+    pub limit: Option<i64>,
+}
+
+/// What `/defaultlimit` means for one creator channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultLimitPlan {
+    Update(CreatorChannel),
+    Refuse { message: String },
+}
+
+/// Fold a `/defaultlimit` request into the creator row, or refuse. Pure:
+/// same 0-99 bounds the V11 import validates.
+#[must_use]
+pub fn decide_default_limit(
+    creator: Option<CreatorChannel>,
+    request: &DefaultLimitRequest,
+) -> DefaultLimitPlan {
+    let refuse = |message: &str| DefaultLimitPlan::Refuse {
+        message: message.to_owned(),
+    };
+    let Some(mut creator) = creator else {
+        return refuse("That channel is not a voice-room creator. Pick one made with /create.");
+    };
+    creator.default_limit = request.limit;
+    if creator.validate().is_err() {
+        return refuse(
+            "The starting limit must be 0-99 (0 is unlimited), or leave it empty to inherit.",
+        );
+    }
+    DefaultLimitPlan::Update(creator)
+}
+
+/// `/alwaysprivate` input after parsing. An omitted toggle turns it on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlwaysPrivateRequest {
+    pub enabled: Option<bool>,
+}
+
+/// What `/alwaysprivate` means for one creator channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlwaysPrivatePlan {
+    Update(CreatorChannel),
+    Refuse { message: String },
+}
+
+/// Fold an `/alwaysprivate` request into the creator row, or refuse. Pure.
+#[must_use]
+pub fn decide_always_private(
+    creator: Option<CreatorChannel>,
+    request: &AlwaysPrivateRequest,
+) -> AlwaysPrivatePlan {
+    let refuse = |message: &str| AlwaysPrivatePlan::Refuse {
+        message: message.to_owned(),
+    };
+    let Some(mut creator) = creator else {
+        return refuse("That channel is not a voice-room creator. Pick one made with /create.");
+    };
+    creator.private_default = request.enabled.unwrap_or(true);
+    if creator.validate().is_err() {
+        return refuse("Those privacy settings are not valid. Try again.");
+    }
+    AlwaysPrivatePlan::Update(creator)
+}
+
 fn text_channels_summary(creator: &CreatorChannel) -> String {
     let channel_id = creator.channel_id;
     if !creator.text_channels {
@@ -3770,6 +4130,68 @@ fn text_channels_summary(creator: &CreatorChannel) -> String {
     format!(
         "Companion text channels are on for <#{channel_id}>: named `{name}`, visible to {viewers}. Applies to rooms created from now on; open rooms keep their settings."
     )
+}
+
+fn position_summary(creator: &CreatorChannel) -> String {
+    let channel_id = creator.channel_id;
+    let side = match creator.position {
+        RoomPosition::Above => "above",
+        RoomPosition::Below => "below",
+    };
+    format!(
+        "New rooms from <#{channel_id}> go {side}, numbering from {}. Applies to rooms created from now on; open rooms stay where they are.",
+        creator.first_room_number
+    )
+}
+
+fn group_summary(creator: &CreatorChannel) -> String {
+    let channel_id = creator.channel_id;
+    if creator.group_by_category {
+        format!(
+            "Shared category numbering is on for <#{channel_id}>: new rooms join the category's room block. Applies to rooms created from now on."
+        )
+    } else {
+        format!(
+            "Shared category numbering is off for <#{channel_id}>. New rooms number per creator. Applies to rooms created from now on."
+        )
+    }
+}
+
+fn inherit_permissions_summary(creator: &CreatorChannel) -> String {
+    let channel_id = creator.channel_id;
+    let source = match creator.permission_source {
+        PermissionSource::Creator => "the creator channel".to_owned(),
+        PermissionSource::Category => "the category".to_owned(),
+        PermissionSource::Channel(id) => format!("<#{id}>"),
+    };
+    format!(
+        "New rooms from <#{channel_id}> copy overrides from {source}. Applies to rooms created from now on; open rooms keep theirs."
+    )
+}
+
+fn default_limit_summary(creator: &CreatorChannel) -> String {
+    let channel_id = creator.channel_id;
+    let limit = match creator.default_limit {
+        None => "inherit the creator channel's limit".to_owned(),
+        Some(0) => "start unlimited".to_owned(),
+        Some(limit) => format!("start with a limit of {limit}"),
+    };
+    format!(
+        "New rooms from <#{channel_id}> {limit}. Applies to rooms created from now on; open rooms keep theirs."
+    )
+}
+
+fn always_private_summary(creator: &CreatorChannel) -> String {
+    let channel_id = creator.channel_id;
+    if creator.private_default {
+        format!(
+            "New rooms from <#{channel_id}> start private. Applies to rooms created from now on; open rooms keep theirs."
+        )
+    } else {
+        format!(
+            "New rooms from <#{channel_id}> start public. Applies to rooms created from now on; open rooms keep theirs."
+        )
+    }
 }
 
 /// `/setup` input: creator rows plus live worker state for the guild.
@@ -4130,6 +4552,31 @@ pub enum VoiceCommand {
         channel_id: Snowflake,
         request: TextChannelsRequest,
     },
+    /// V8 per-creator placement: side plus first room number.
+    Position {
+        channel_id: Snowflake,
+        request: PositionRequest,
+    },
+    /// V8 per-creator shared category numbering toggle.
+    Group {
+        channel_id: Snowflake,
+        request: GroupRequest,
+    },
+    /// V8 per-creator permission-override source.
+    InheritPermissions {
+        channel_id: Snowflake,
+        request: InheritPermissionsRequest,
+    },
+    /// V8 per-creator starting user limit.
+    DefaultLimit {
+        channel_id: Snowflake,
+        request: DefaultLimitRequest,
+    },
+    /// V8 per-creator private default.
+    AlwaysPrivate {
+        channel_id: Snowflake,
+        request: AlwaysPrivateRequest,
+    },
     /// Original creator (or a member whose room owner is gone) claims the room.
     Reclaim,
     /// Owner (or admin) hands the room to an occupant, who becomes the
@@ -4249,6 +4696,107 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
                 }
             }
             Some(VoiceCommand::TextChannels {
+                channel_id,
+                request,
+            })
+        }
+        "position" => {
+            let mut channel_id = 0;
+            let mut request = PositionRequest {
+                position: None,
+                first_number: None,
+            };
+            for option in &command.options {
+                match (option.name.as_str(), &option.value) {
+                    ("channel", CommandOptionValue::Channel(id)) => channel_id = id.get(),
+                    ("position", CommandOptionValue::String(value)) => {
+                        request.position = match value.as_str() {
+                            "above" => Some(RoomPosition::Above),
+                            "below" => Some(RoomPosition::Below),
+                            _ => None,
+                        };
+                    }
+                    ("first-number", CommandOptionValue::Integer(value)) => {
+                        request.first_number = Some(*value);
+                    }
+                    _ => {}
+                }
+            }
+            Some(VoiceCommand::Position {
+                channel_id,
+                request,
+            })
+        }
+        "group" => {
+            let mut channel_id = 0;
+            let mut request = GroupRequest { enabled: None };
+            for option in &command.options {
+                match (option.name.as_str(), &option.value) {
+                    ("channel", CommandOptionValue::Channel(id)) => channel_id = id.get(),
+                    ("enabled", CommandOptionValue::Boolean(value)) => {
+                        request.enabled = Some(*value);
+                    }
+                    _ => {}
+                }
+            }
+            Some(VoiceCommand::Group {
+                channel_id,
+                request,
+            })
+        }
+        "inheritpermissions" => {
+            let mut channel_id = 0;
+            let mut request = InheritPermissionsRequest {
+                source: None,
+                source_channel: None,
+            };
+            for option in &command.options {
+                match (option.name.as_str(), &option.value) {
+                    ("channel", CommandOptionValue::Channel(id)) => channel_id = id.get(),
+                    ("source", CommandOptionValue::String(value)) => {
+                        request.source = Some(value.clone());
+                    }
+                    ("source-channel", CommandOptionValue::Channel(id)) => {
+                        request.source_channel = Some(id.get());
+                    }
+                    _ => {}
+                }
+            }
+            Some(VoiceCommand::InheritPermissions {
+                channel_id,
+                request,
+            })
+        }
+        "defaultlimit" => {
+            let mut channel_id = 0;
+            let mut request = DefaultLimitRequest { limit: None };
+            for option in &command.options {
+                match (option.name.as_str(), &option.value) {
+                    ("channel", CommandOptionValue::Channel(id)) => channel_id = id.get(),
+                    ("limit", CommandOptionValue::Integer(value)) => {
+                        request.limit = Some(*value);
+                    }
+                    _ => {}
+                }
+            }
+            Some(VoiceCommand::DefaultLimit {
+                channel_id,
+                request,
+            })
+        }
+        "alwaysprivate" => {
+            let mut channel_id = 0;
+            let mut request = AlwaysPrivateRequest { enabled: None };
+            for option in &command.options {
+                match (option.name.as_str(), &option.value) {
+                    ("channel", CommandOptionValue::Channel(id)) => channel_id = id.get(),
+                    ("enabled", CommandOptionValue::Boolean(value)) => {
+                        request.enabled = Some(*value);
+                    }
+                    _ => {}
+                }
+            }
+            Some(VoiceCommand::AlwaysPrivate {
                 channel_id,
                 request,
             })
@@ -4417,9 +4965,9 @@ fn parse_access_action(options: &[CommandDataOption]) -> AccessAction {
     }
 }
 
-/// `/create` and `/textchannels` need Manage Channels; admins pass
-/// everywhere. `/setup` is view-open and `/access` checks the admin flag
-/// itself. Fail closed on missing permissions.
+/// `/create`, `/textchannels` and the V8 per-creator settings commands need
+/// Manage Channels; admins pass everywhere. `/setup` is view-open and
+/// `/access` checks the admin flag itself. Fail closed on missing permissions.
 fn may_create(permissions: Option<Permissions>) -> bool {
     is_voice_admin(permissions)
 }
@@ -4441,6 +4989,11 @@ impl VoiceCommand {
             Self::Ping => "ping",
             Self::Invite => "invite",
             Self::TextChannels { .. } => "textchannels",
+            Self::Position { .. } => "position",
+            Self::Group { .. } => "group",
+            Self::InheritPermissions { .. } => "inheritpermissions",
+            Self::DefaultLimit { .. } => "defaultlimit",
+            Self::AlwaysPrivate { .. } => "alwaysprivate",
             Self::Access(_) => "access",
             Self::Reclaim => "reclaim",
             Self::Transfer { .. } => "transfer",
@@ -4751,6 +5304,17 @@ async fn execute_create<S: RoomPersistence, H: RoomWrites>(
         Err(error) => {
             let compensation = http.delete(channel_id, always).await;
             let removed = compensation.is_ok();
+            if !removed {
+                // Untracked orphan: reconcile will not delete it, so count it
+                // here with no channel ID. The ephemeral reply above names the
+                // channel for manual cleanup.
+                metrics::global().voice_orphan();
+                warn!(
+                    voice_event = "voice_creator_orphan",
+                    outcome = "manual_needed",
+                    "voice creator orphan needs manual deletion"
+                );
+            }
             match error {
                 StoreError::CredentialRefused if removed => "Voice rooms are paused: the database refused the bot credential, so the new channel was removed. Tell an admin to fix it, then restart the bot.".to_owned(),
                 StoreError::CredentialRefused => format!("Voice rooms are paused: the database refused the bot credential, and removing the new channel failed. Delete <#{channel_id}> manually, then tell an admin to fix the database."),
@@ -5168,6 +5732,181 @@ where
                         Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
                         Err(error) => {
                             format!("Could not save the companion settings ({error:?}). Try again.")
+                        }
+                    },
+                },
+            };
+            reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::Position {
+            channel_id,
+            request,
+        } => {
+            let permissions = interaction
+                .member
+                .as_ref()
+                .and_then(|member| member.permissions);
+            if !may_create(permissions) {
+                reply(ephemeral_response(
+                    "You need Manage Channels to use /position.",
+                ))
+                .await;
+                return true;
+            }
+            let (store, _) = runtime.make_pair();
+            let text = match store.creator_for(guild_id, channel_id).await {
+                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Ok(creator) => match decide_position(creator, &request) {
+                    PositionPlan::Refuse { message } => message,
+                    PositionPlan::Update(creator) => match store.add_creator(&creator).await {
+                        Ok(()) => {
+                            runtime.creator_updated(&creator);
+                            position_summary(&creator)
+                        }
+                        Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
+                        Err(error) => {
+                            format!("Could not save the position settings ({error:?}). Try again.")
+                        }
+                    },
+                },
+            };
+            reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::Group {
+            channel_id,
+            request,
+        } => {
+            let permissions = interaction
+                .member
+                .as_ref()
+                .and_then(|member| member.permissions);
+            if !may_create(permissions) {
+                reply(ephemeral_response(
+                    "You need Manage Channels to use /group.",
+                ))
+                .await;
+                return true;
+            }
+            let (store, _) = runtime.make_pair();
+            let text = match store.creator_for(guild_id, channel_id).await {
+                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Ok(creator) => match decide_group(creator, &request) {
+                    GroupPlan::Refuse { message } => message,
+                    GroupPlan::Update(creator) => match store.add_creator(&creator).await {
+                        Ok(()) => {
+                            runtime.creator_updated(&creator);
+                            group_summary(&creator)
+                        }
+                        Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
+                        Err(error) => {
+                            format!("Could not save the grouping settings ({error:?}). Try again.")
+                        }
+                    },
+                },
+            };
+            reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::InheritPermissions {
+            channel_id,
+            request,
+        } => {
+            let permissions = interaction
+                .member
+                .as_ref()
+                .and_then(|member| member.permissions);
+            if !may_create(permissions) {
+                reply(ephemeral_response(
+                    "You need Manage Channels to use /inheritpermissions.",
+                ))
+                .await;
+                return true;
+            }
+            let (store, _) = runtime.make_pair();
+            let text = match store.creator_for(guild_id, channel_id).await {
+                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Ok(creator) => match decide_inherit_permissions(creator, &request) {
+                    InheritPermissionsPlan::Refuse { message } => message,
+                    InheritPermissionsPlan::Update(creator) => match store.add_creator(&creator).await {
+                        Ok(()) => {
+                            runtime.creator_updated(&creator);
+                            inherit_permissions_summary(&creator)
+                        }
+                        Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
+                        Err(error) => {
+                            format!("Could not save the permission settings ({error:?}). Try again.")
+                        }
+                    },
+                },
+            };
+            reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::DefaultLimit {
+            channel_id,
+            request,
+        } => {
+            let permissions = interaction
+                .member
+                .as_ref()
+                .and_then(|member| member.permissions);
+            if !may_create(permissions) {
+                reply(ephemeral_response(
+                    "You need Manage Channels to use /defaultlimit.",
+                ))
+                .await;
+                return true;
+            }
+            let (store, _) = runtime.make_pair();
+            let text = match store.creator_for(guild_id, channel_id).await {
+                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Ok(creator) => match decide_default_limit(creator, &request) {
+                    DefaultLimitPlan::Refuse { message } => message,
+                    DefaultLimitPlan::Update(creator) => match store.add_creator(&creator).await {
+                        Ok(()) => {
+                            runtime.creator_updated(&creator);
+                            default_limit_summary(&creator)
+                        }
+                        Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
+                        Err(error) => {
+                            format!("Could not save the limit settings ({error:?}). Try again.")
+                        }
+                    },
+                },
+            };
+            reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::AlwaysPrivate {
+            channel_id,
+            request,
+        } => {
+            let permissions = interaction
+                .member
+                .as_ref()
+                .and_then(|member| member.permissions);
+            if !may_create(permissions) {
+                reply(ephemeral_response(
+                    "You need Manage Channels to use /alwaysprivate.",
+                ))
+                .await;
+                return true;
+            }
+            let (store, _) = runtime.make_pair();
+            let text = match store.creator_for(guild_id, channel_id).await {
+                Err(error) => format!("Could not read the creator channel ({error:?}). Try again."),
+                Ok(creator) => match decide_always_private(creator, &request) {
+                    AlwaysPrivatePlan::Refuse { message } => message,
+                    AlwaysPrivatePlan::Update(creator) => match store.add_creator(&creator).await {
+                        Ok(()) => {
+                            runtime.creator_updated(&creator);
+                            always_private_summary(&creator)
+                        }
+                        Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
+                        Err(error) => {
+                            format!("Could not save the privacy settings ({error:?}). Try again.")
                         }
                     },
                 },

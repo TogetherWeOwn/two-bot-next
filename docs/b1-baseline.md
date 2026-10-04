@@ -112,6 +112,15 @@ headroom below are historical, not measurements of the current PR head:
 | Runtime image | Docker image inspect `Size` (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
 | Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 10.30 MiB / 10,805,344 bytes | 15 MiB / 15,728,640 bytes | 4.70 MiB / 45.6% |
 
+The baseline used the classic Docker image store. The gate now sums exact
+`docker image history --human=false --format '{{.Size}}'` layer bytes after
+unpacking the image, preserving the uncompressed-layer ceiling on both stores.
+With the containerd store, inspect `Size` includes compressed blobs **plus**
+unpacked snapshots and is logged separately, not compared to that ceiling.
+See [Docker's store documentation](https://docs.docker.com/engine/storage/containerd/)
+and [Moby's layer-history implementation](https://github.com/moby/moby/blob/master/daemon/containerd/image_history.go).
+Neither the 112 MiB image nor the 10 MiB binary budget is increased.
+
 Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
 at source `307b50708ec42e8fc4744c1b804216a22a17625e`. Ceilings allow roughly
 25% image growth rounded up to the next 8 MiB, and roughly 40% binary growth
