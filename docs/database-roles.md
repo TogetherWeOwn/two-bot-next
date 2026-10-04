@@ -3,20 +3,28 @@
 The bot, migrations and web reader must not share an owner credential. These
 roles are PostgreSQL `NOLOGIN` privilege groups; this tooling never creates,
 prints or rotates passwords. The operator provisions separate login identities
-and grants each exactly one group. Never grant the migrator group to a runtime
-or reader login. Groups must have no outgoing memberships (including predefined
-roles such as `pg_read_all_data`) or superuser/CREATEDB/CREATEROLE/REPLICATION/
-BYPASSRLS attributes.
+and grants each exactly one group. Never grant the migrator group to a runtime,
+reader or read-only login. Groups must have no outgoing memberships (including
+predefined roles such as `pg_read_all_data`) or superuser/CREATEDB/CREATEROLE/
+REPLICATION/BYPASSRLS attributes. The read-only migrator group owns nothing and
+holds no membership path into the migrator group.
 
 | Group | Database | Bot schema | Bot tables | Sequences | `web_v1` |
 | --- | --- | --- | --- | --- | --- |
 | `two_bot_migrator` | CONNECT, CREATE; no TEMP | Owner (DDL) | Owner | Owner | Owner |
 | `two_bot_runtime` | CONNECT; no CREATE/TEMP | USAGE, no CREATE | SELECT, INSERT, UPDATE, DELETE | USAGE, SELECT; no UPDATE | No access |
 | `two_web_reader` | CONNECT; no CREATE/TEMP | No access | No access | No access | USAGE; SELECT on nine reviewed views |
+| `two_bot_migrator_ro` | CONNECT; no CREATE/TEMP | USAGE, no CREATE | SELECT on bot tables, admission lane and SQLx ledger; no DML | No access | USAGE; no view or function access |
 
-No runtime or reader grants carry grant options. Runtime cannot create schemas,
+No runtime, reader or read-only migrator grants carry grant options. Runtime cannot create schemas,
 tables, temporary tables or functions, alter tables, truncate them, or read the
-SQLx migration ledger. Existing append-only audit triggers continue to constrain
+SQLx migration ledger. The `two_bot_migrator_ro` group exists for the
+read-only migration-plan step: it reads bot tables, the admission lane and the
+ledger through SELECT only, with no DML, DDL, sequence, function or default
+privileges, so a plan run can never change data or schema. Migrator-only tables
+stay unreadable to it, exactly as for runtime and reader.
+
+Existing append-only audit triggers continue to constrain
 DML; a grant does not disable those controls. The `discord_send_admission`
 lane is a restricted exception: runtime has SELECT, INSERT and UPDATE only,
 never DELETE/TRUNCATE; reader and PUBLIC receive no lane access. The verifier
@@ -86,7 +94,9 @@ boolean view invoker settings and unsafe future grants. Explicit grants cover th
 current migrations' 76 ordinary bot tables plus the restricted admission lane,
 SQLx ledger, two migrator-only tables, eleven sequences,
 nine web views and six functions (three trigger helpers plus three `web_v1`
-helpers). This includes
+helpers). The read-only migrator group additionally reads the ordinary tables,
+the admission lane and the ledger; it reads no migrator-only table, sequence,
+view or function. This includes
 `gateway_onboarding_jobs` and its sequence: the DML-only gateway must recover and
 write this queue, while the web reader must not access it. A detached SERIAL
 sequence remains required even after `OWNED BY NONE`. New relations/sequences need
@@ -149,8 +159,9 @@ their login status or silently removing memberships. It contains no passwords.
 2. Review and apply the rendered role plan with the authorized provisioning
    identity. It transfers only allowlisted objects to `two_bot_migrator`; unrelated
    tables are not transferred or granted to the runtime.
-3. Verify group drift and independently verify the three login bindings. Point
-   gateway `DATABASE_URL` at the runtime login and website at the reader login.
+3. Verify group drift and independently verify the four login bindings. Point
+   gateway `DATABASE_URL` at the runtime login, website at the reader login,
+   and the read-only plan step at a login holding only `two_bot_migrator_ro`.
 4. Start the gateway **after** migrations. Gateway connections now explicitly
    skip migrations: a DML-only credential must never be used for startup DDL.
 

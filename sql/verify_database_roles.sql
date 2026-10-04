@@ -5,7 +5,7 @@ expected_objects AS (
 -- @matrix
 ),
 expected_roles(name) AS (
-    VALUES ('two_bot_migrator'), ('two_bot_runtime'), ('two_web_reader')
+    VALUES ('two_bot_migrator'), ('two_bot_runtime'), ('two_web_reader'), ('two_bot_migrator_ro')
 ),
 roles AS (
     SELECT r.* FROM pg_roles r JOIN expected_roles e ON r.rolname = e.name
@@ -38,6 +38,9 @@ table_grants(role_name, oid, privilege) AS (
     WHERE o.kind = 'table' OR (o.kind = 'admission' AND p.name <> 'DELETE')
     UNION ALL
     SELECT 'two_web_reader', oid, 'SELECT' FROM objects WHERE kind = 'view'
+    UNION ALL
+    SELECT 'two_bot_migrator_ro', oid, 'SELECT' FROM objects
+    WHERE kind IN ('table', 'admission', 'ledger')
     UNION ALL
     SELECT 'two_bot_migrator', o.oid, p.name FROM objects o
     CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), ('REFERENCES'), ('TRIGGER')) p(name)
@@ -149,11 +152,13 @@ findings AS (
     FROM roles r CROSS JOIN app_schemas n CROSS JOIN (VALUES ('USAGE'), ('CREATE')) p(name)
     WHERE r.rolname <> 'two_bot_migrator'
       AND NOT (p.name = 'USAGE' AND ((r.rolname = 'two_bot_runtime' AND n.nspname = 'public')
-          OR (r.rolname = 'two_web_reader' AND n.nspname = 'web_v1')))
+          OR (r.rolname = 'two_web_reader' AND n.nspname = 'web_v1')
+          OR (r.rolname = 'two_bot_migrator_ro' AND n.nspname IN ('public', 'web_v1'))))
       AND has_schema_privilege(r.oid, n.oid, p.name)
     UNION ALL
     SELECT 'missing schema USAGE: ' || r.rolname || '/' || n.nspname
-    FROM roles r CROSS JOIN (VALUES ('two_bot_runtime', 'public'), ('two_web_reader', 'web_v1')) n(role_name, nspname)
+    FROM roles r CROSS JOIN (VALUES ('two_bot_runtime', 'public'), ('two_web_reader', 'web_v1'),
+        ('two_bot_migrator_ro', 'public'), ('two_bot_migrator_ro', 'web_v1')) n(role_name, nspname)
     WHERE r.rolname = n.role_name
       AND NOT has_schema_privilege(r.oid, to_regnamespace(n.nspname), 'USAGE')
     UNION ALL

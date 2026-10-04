@@ -26,6 +26,7 @@ CLI_MODULES = {
     "crates/cutover/src/bin/audit_switch.rs",
     "crates/cutover/src/bin/gate_stuck_report.rs",
     "crates/cutover/src/bin/gateway_force_identify.rs",
+    "crates/cutover/src/bin/ghost_cleanup.rs",
     "crates/cutover/src/bin/preconditions.rs",
     "crates/cutover/src/bin/raid_list.rs",
     "crates/cutover/src/bin/raid_remove.rs",

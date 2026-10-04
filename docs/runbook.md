@@ -56,6 +56,16 @@ They are HTTP observations, **not database probes or test authorization**.
 | `/readyz` 503, gateway `starting` | Connecting/reconnecting or bounded checkpoint I/O. Compare duration with logs; persistent 503 is not healthy operation. |
 | Neither route answers / 500 / HTTP 1101 | Inspect Worker bindings and container startup. Named environments must repeat all Container/DO/exports wiring; do not bypass readiness. |
 
+The same two routes are graded by the read-only cutover acceptance probes
+(`scripts/qa_cutover_probes.py`, stdlib only, no credentials, no writes).
+Run from the repo root against a local preview or staging by passing its bare
+origin as `--base-url` (or `QA_PROBE_BASE_URL`); add `--expect-ready` only when
+the gate needs the service itself ready. A parked preview (truthful 503) stays
+green without the flag. Each probe line cites the code path it checks. The five
+probes cover liveness, the readyz breakdown shape, gateway truthfulness, the
+informational jobs map, and that the body is the container's breakdown rather
+than an ownership-fence refusal.
+
 The container listens on `LISTEN_ADDR` (default `0.0.0.0:8080`). The Worker
 sets it from `BOT_PORT` (default 8080). Both routes use this listener; there is
 no legacy health port 9191 or separately wired DB/voice readiness component.
@@ -95,6 +105,9 @@ observation is complete. For Rust stdout/stderr, use the affected container's
 logs in the Cloudflare dashboard. Wrangler 4.147.0 has no `containers logs`
 subcommand; do not invent one. Container inspection may list account-wide
 resources: match the affected environment/application before taking any action.
+No Cloudflare API reaches container stdout either, so voice-event emission has
+no CI read path; follow [staging voice-event verification](staging-voice-event-verification.md)
+for the dashboard procedure.
 
 Rust uses formatted `tracing` logs, configured by `RUST_LOG`, fallback
 `two_bot=info`; it does not consume legacy `LOG_LEVEL`. This wrapper currently
@@ -200,6 +213,78 @@ when exhaustion coincides with gateway `starting`/`down` or job-failure
 alerts, or when the Neon dashboard shows trouble on the staging branch — the
 fix then belongs to the dependency owner, not a redeploy.
 
+#### Alert: DB errors
+
+Three or more storage-layer failures arrived between two keepalive samples
+(`two_bot_db_errors_total`, currently counting send-admission SQL; other
+stores adopt the counter incrementally). Unlike the pool rule above, this is
+errors, not pressure: queries already failed, they are not merely waiting.
+A counter reset (process restart) skips the window rather than firing, and a
+slow trickle below threshold stays silent — sustained low-rate failures
+surface instead through `job_consecutive_failures`.
+
+First response: check Neon status for the staging branch before touching the
+bot; then correlate with the `op` label and recent deploys (a new query path
+or migration can explain a fresh error burst). Do not run SQL probes against
+staging or production, add grants, or restart the container to "clear" the
+errors; a replacement restarts the shard without fixing the failing writes.
+
+Escalate when the burst repeats across windows, when it coincides with pool
+saturation or job-failure alerts, or when the Neon dashboard shows trouble on
+the staging branch — the fix then belongs to the dependency owner.
+
+#### Alert: send admission blocked
+
+Discord sends were refused send-admission in three consecutive keepalive
+windows (`two_bot_send_admissions_total{outcome="blocked"}`). Admission is
+the token-wide lane in front of every Discord send: a held lane or an active
+cooldown refuses new sends rather than queueing them. One busy tick with a
+refusal is normal contention and stays silent; only windows with *new*
+refusals extend the streak, so an idle bot or a self-clearing burst never
+pages. Storage failures of the admission SQL itself count in
+`two_bot_db_errors_total`, not here, so one outage pages once via that rule.
+
+First response: read the recent sends from the container logs (rate-limit
+cooldowns, held lanes after failed completions) and confirm no deploy is in
+progress — a fresh deploy can briefly contend the lane. Do not replay
+uncertain writes, hammer Discord, or restart the container to "free" the
+lane; a replacement leaves the durable lane row occupied.
+
+Escalate when refusals persist after the suspect deploy or cooldown is
+identified, when they coincide with 429 or DB-error alerts, or when sends
+stay refused with no cooldown in the logs — the lane may be stuck and the
+fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: voice failures
+
+Voice room lifecycle failures between two keepalive samples
+(`two_bot_voice_operations_total`, `two_bot_voice_dead_letters_total`,
+`two_bot_voice_orphans_total`). Fires when failed operations exceed 5% of
+room operations with at least 10 operations in the window (the T3 room
+create/move/delete budget in
+[voice-cutover-rollback-triggers.md](voice-cutover-rollback-triggers.md)),
+or when any new dead-letter (a queue write that exhausted 10 attempts) or
+orphan (an untracked creator-channel orphan needing manual deletion)
+appears — so a low-volume stranded-member failure still pages. Any outcome
+other than `success` (`category_full`, `discord`, `persistence`,
+`cancelled`) counts as a failure: the join did not place a room, or the
+move/delete did not complete. A counter reset (process restart) skips the
+window rather than firing, and a slow trickle below threshold stays silent.
+
+First response: scope the failing operation from the `op`/`outcome` labels
+on `two_bot_voice_operations_total` via the authorized `/ops/metrics`
+scrape; confirm no deploy is in progress; then read the container logs for
+the matching `voice_event="voice_operation"` warn lines (see the lifecycle
+signal inventory in
+[voice-lifecycle-alert-drill.md](voice-lifecycle-alert-drill.md)). Do not
+retry uncertain room writes, replay member moves, or delete untracked
+channels by hand — untracked-channel deletion by the bot is never allowed.
+
+Escalate when failures persist across windows after the suspect deploy is
+identified, when a dead-letter or orphan names a stranded member, or when
+failures coincide with 429, DB-error or pool alerts — the fix then belongs
+to the on-call engineer, not another redeploy.
+
 ## Persisted ownership control
 
 The Worker/DO fence is implemented, not implicitly released by deployment.
@@ -295,6 +380,8 @@ Invocation (secret-free; the URL comes only from the existing
 staging-migrate --plan --source-sha <40hex> --staging-host <host> \
   --staging-database <db> --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
   [--expected-pending <ascending,comma-separated versions>]
+staging-migrate --apply <same flags> --expected-pending <list> \
+  --plan-manifest-sha256 <64hex> --plan-run-id <run id>
 ```
 
 Reconcile is set-based: pending is every source version absent from the
@@ -302,32 +389,49 @@ ledger, in source order, so a ledger may lag the source by any subset. `--plan`
 prints that list in the manifest (`pending_before`) and changes nothing.
 `--apply` requires `--expected-pending` (the workflow input of the same name)
 and refuses before any DDL unless it equals the computed pending list exactly,
-so apply can only run the pending set a reviewed plan already showed.
+so apply can only run the pending set a reviewed plan already showed. `--apply`
+additionally requires `--plan-manifest-sha256` and `--plan-run-id`: the SHA-256
+of the reviewed plan run's uploaded `staging-migrate-manifest.json` and the run
+that produced it. The runner recomputes the hash over its own source SHA,
+pending list and full source migration table (so same-pending-different-SQL
+replays refuse) and refuses on any mismatch, binding apply to the exact
+manifest the reviewed plan produced on the same `source_sha`. `--plan` prints
+its own hash (`plan_manifest_sha256`) in the manifest and ignores the binding
+flags.
 
 It refuses (exit 2, before any DDL) when the binding is absent, the target does
 not equal the pinned staging host/database inputs, either pin is empty or looks
 like production, either host pin or the binding host is a pooler endpoint
 (session `SET ROLE` and the migrator lock need the direct endpoint), the login
 cannot assume `two_bot_migrator`, a reference is missing, `--apply` has no
-`--expected-pending` or it mismatches, or the ledger has a failed/incomplete
+`--expected-pending` or it mismatches, `--apply` has no `plan_manifest_sha256`/
+`plan_run_id` or the hash does not match the recomputed manifest, or the ledger has a failed/incomplete
 row, a SHA-384 mismatch or a version unknown to the source. The database name needs no `staging`
 substring (the verified shared-Neon staging database is `two_bot`); the pinned
 host plus the binding-match check is the staging identity. It never resets,
 reverts, restores, creates roles or grants. The sanitized JSON manifest (source
-SHA, per-migration SHA-384, ledger before/after, applied count) is the evidence;
+SHA, per-migration SHA-384, ledger before/after, applied count, plus its own
+`plan_manifest_sha256` and the bound `plan_run_id`) is the evidence;
 on failure the ledger-after is preserved, not repaired.
 
-The workflow runs only when dispatched from `main` and reads the binding from
-the `staging-migrate` GitHub environment. That environment must have a required
-reviewer and a main-only deployment-branch rule, and the binding must be an
-environment secret, not a repository secret; otherwise a workflow edited on
-another branch could read it. This change does not create the environment or
-the secret.
+The workflow runs only when dispatched from `main` and splits into two jobs.
+The `plan` job always runs and reads the binding from the `staging-migrate-plan`
+GitHub environment, which carries no reviewer because planning changes nothing;
+it uploads `staging-migrate-manifest.json` as the `staging-migrate-manifest`
+run artifact (14-day retention), which is where the reviewer reads
+`plan_manifest_sha256`/`plan_run_id` for the apply dispatch.
+the `apply` job runs only for `mode: apply`, after a green plan, and reads the
+binding from the `staging-migrate-apply` environment, which must have a
+required reviewer and a main-only deployment-branch rule. Both bindings must be
+environment secrets, not repository secrets; otherwise a workflow edited on
+another branch could read them. This change does not create the environments or
+the secrets: create both before dispatch, or the jobs fail instead of running.
 
 Prerequisites the legitimate principal must verify **before dispatch** (the
 runner cannot, and this change does not claim them): the real staging Neon
 identity; that the dedicated migrator binding already exists; the
-`staging-migrate` environment protections above; and a complete
+`staging-migrate-plan` / `staging-migrate-apply` environment protections
+above; and a complete
 recovery set covering the Next schema, `_sqlx_migrations` ledger, object
 ownership, ACLs and logins. The generic legacy backup omits Next tables and the
 SQLx history, and unverified Neon PITR is not a working recovery. Apply the
@@ -566,6 +670,18 @@ lacks that protection. Apply requires the staging confirmation flag and current
 permissions/hierarchy; require converged hash and exit 0, not just `DID` lines.
 The credential-file loader refuses empty/invalid/unreadable input without
 substitution; the documented environment fallback is only for an absent file.
+
+The mock-only staging-guild E2E prep skeleton
+(`scripts/staging_guild_e2e_prep.py`, stdlib only, no network, no credentials)
+drives the guild interactions-endpoint shape against local fixtures: identity,
+the guild command list, then one per-command resource read per surface. A live
+guild id aborts before anything is built or sent; without `--mock` there is no
+transport at all. The offline regressions (`scripts/test_staging_guild_e2e_prep.py`)
+prove the live-guild refusal and run in CI on standard runners. The live
+Discord run against the staging guild arrives with the full staging suite;
+this skeleton never touches staging. Run the mock-only prep with
+`scripts/staging_guild_e2e_prep.py --mock` (local fixtures, no network); a
+live guild id exits 2 with nothing sent.
 
 The three shipped service/timer pairs are **operator-host templates**, not
 installed Cloudflare schedules: nightly DB backup 04:17, guild-config backup

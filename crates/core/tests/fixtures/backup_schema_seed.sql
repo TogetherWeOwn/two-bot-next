@@ -113,6 +113,13 @@ VALUES ('100000000000000001', '100000000000000003', E'Backup sticky | NULL\n雪 
         17, FALSE, '100000000000000006', '2026-08-01T10:00:00.123456Z',
         '100000000000000002', '2026-08-01T09:00:00Z', '100000000000000004',
         '2026-08-01T10:00:00Z', 'backup-sticky-claim', '2026-08-01T10:00:01Z');
+INSERT INTO automation_commands
+    (guild_id, name, description, template, text_trigger, enabled,
+     created_by, created_at, updated_by, updated_at)
+VALUES ('100000000000000001', 'backup-custom', 'Backup custom',
+        E'Backup custom {user} | NULL\n雪 "quote"', '!backup', TRUE,
+        '100000000000000002', '2026-08-01T09:00:00Z', '100000000000000004',
+        '2026-08-01T10:00:00Z');
 INSERT INTO automation_audit_log (id, guild_id, actor_id, action, target_key, outcome, reason, created_at)
 VALUES ('backup:automation:audit', '100000000000000001', NULL, 'sticky.run',
         '100000000000000003', 'post_failed', 'transient', '2026-08-01T10:00:00Z');

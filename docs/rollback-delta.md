@@ -58,6 +58,36 @@ entry that appears in neither list.
   50,000 post-`T_f` rows, so a mis-set `--since` cannot silently spill a
   partial window into a rollback decision.
 
+## Reviewed disposition: unmeasurable voice tables (voice window)
+
+`rollback-delta` marks a table `unmeasurable` when it has no usable
+timestamp column (`crates/cutover/src/rollback_delta.rs`, `TABLE_SPECS`).
+Thirteen of those specs are voice-prefixed. The rollback trigger document
+fires its watermark-gap trigger on any `unmeasurable` table without a
+reviewed disposition; this section is that disposition for the voice
+window, recorded 2026-10-04 from an offline tabletop replay of the trigger
+document against merged source (verdict on the day: no data, no reviewed
+disposition on record). Non-voice unmeasurable tables keep their existing
+handling.
+
+| Tables | Why unmeasurable | Disposition | Alternate evidence for the window |
+|---|---|---|---|
+| `voice_channel_templates`, `voice_game_aliases`, `voice_random_lists`, `voice_random_list_choices`, `voice_logging`, `voice_logging_mention_members`, `voice_logging_mention_roles`, `voice_guild_settings`, `voice_command_roles`, `voice_command_role_members` | No timestamp column; replaced wholesale by `PgVoiceConfigStore::apply` (migration `0229_voice_config.sql`) | Accept the reason. `apply` rewrites every section for a guild in one advisory-locked transaction (`crates/cutover/src/voice_config_store.rs`), so a window write is all-or-nothing per guild and per-row timestamps would add no signal | Freeze-time vs rollback-time configuration export pair: `snapshot` the guild (`PgVoiceConfigStore::snapshot`, the same read the `/export` command serves in `crates/bot/src/voice_rooms.rs`) and serialize with `export_configuration` (`crates/core/src/voice_config.rs`). Diff the two exports: any difference is the window's config delta, an empty diff proves no config write |
+| `voice_creators` | No timestamp column; upserted in place (`PgRoomStore::add_creator`, `write_creators` in `apply`) | Accept with the evidence alongside. The creators section rides the same export pair, except the V9b text-channel name and viewer-role columns, which the configuration does not carry (see the codec-gap note in `voice_config_store.rs`) | (1) The export pair above for all carried columns. (2) Per-guild `voice_creators` full-row dump comparison (freeze vs rollback) plus a row-count check, covering the non-carried columns |
+| `voice_logging_settings`, `voice_access_controls` | Mutable per-guild settings rows with no timestamp column (migrations `0228_voice_logging_settings.sql`, `0227_voice_access_controls.sql`); defaults apply when absent | Accept the reason. Each table holds at most one row per guild, replaced atomically by a single upsert (`save_logging_settings`, `save_access_controls` in `crates/cutover/src/voice_rooms.rs`) | Read-back pair at freeze vs rollback through the store readers (`logging_settings`, `access_controls`) or a single-row `SELECT`; any difference is the window's settings delta |
+
+### Replay rule for the voice window
+
+When a `rollback-delta --since T_f` report's only `unmeasurable` entries
+are the thirteen tables above, the watermark-gap trigger does not fire for
+lack of disposition: each table is covered either by an accepted reason or
+by the named alternate evidence, which the rollback operator attaches to
+the window record. The trigger still fires on an export-cap refusal (any
+table over the 50,000-row cap) or an incomplete journal capture, exactly
+as the trigger document states. The measured voice tables (`voice_rooms`
+via `created_at`/`owner_touched_at`, `voice_text_companions` via
+`created_at`) need no disposition: their counts are the evidence.
+
 Read access does **not** authorize execution against real databases for
 tests. Acceptance uses only the disposable test service below. Operational
 rollback execution requires its own authorized endpoint/credential context.
