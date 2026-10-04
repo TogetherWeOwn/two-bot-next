@@ -130,14 +130,12 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_command_role_members",
 ];
 
-/// Frozen v3 tables no longer created by cutover migrations. Keep their data
-/// when they exist, but do not require nonexistent legacy subsystems on Rust.
-pub const OPTIONAL_LEGACY_TABLES: &[&str] = &[
-    // Main #255 (0370) migrated containment_events/containment_incidents;
-    // this branch's 0110 migrated moderation_warnings/moderation_scheduled_unbans.
-    // Both pairs leave optional-legacy in the merged tree.
-    "automation_commands",
-];
+/// Covered tables not created by the current cutover migration set, if any.
+/// Keep legacy data when such tables exist, but do not require nonexistent
+/// legacy subsystems. A table created by migrations must leave this list
+/// (the coverage test enforces it): empty means every covered table is
+/// migrated here, including automation_commands (0130).
+pub const OPTIONAL_LEGACY_TABLES: &[&str] = &[];
 
 /// Explicit migrated-schema exclusions, checked by the schema coverage test.
 pub const EXCLUDED_TABLES: &[&str] = &[

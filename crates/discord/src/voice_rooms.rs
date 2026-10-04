@@ -370,6 +370,12 @@ impl RoomHttp {
                 request.body().unwrap_or_default(),
             )))
             .map_err(|_| RoomHttpError::InvalidRequest)?;
+        // One adapter-visible REST attempt per wire send, shared with the
+        // executor's accounting: template only, never IDs, tokens or bodies.
+        // `Attempt` finishes at headers so 429s stay visible even when the
+        // body is broken; transport failures and outer timeouts fall back to
+        // `transport` via `Drop`.
+        let mut attempt = crate::executor_metrics::Attempt::new(&request);
         let response = tokio::time::timeout(Duration::from_secs(10), async {
             let response = self
                 .transport
@@ -377,6 +383,7 @@ impl RoomHttp {
                 .await
                 .map_err(|_| RoomHttpError::UnknownOutcome)?;
             let status = response.status().as_u16();
+            attempt.finish(Some(status));
             if status == 401 {
                 if bot_authenticated {
                     self.unauthorized.store(true, Ordering::Relaxed);
@@ -1074,6 +1081,35 @@ mod tests {
             &[],
             &[deny]
         )));
+    }
+
+    #[test]
+    fn vote_kick_enforcement_needs_view_manage_roles_and_move() {
+        use twilight_model::guild::Permissions;
+        const REQUIRED: Permissions = Permissions::VIEW_CHANNEL
+            .union(Permissions::MANAGE_ROLES)
+            .union(Permissions::MOVE_MEMBERS);
+        // All three bits present allows; extra bits do not deny.
+        assert!(can_enforce_kick(Some(REQUIRED)));
+        assert!(can_enforce_kick(Some(REQUIRED.union(Permissions::CONNECT))));
+        assert!(can_enforce_kick(Some(Permissions::all())));
+        // Fail closed on missing snapshots or empty permissions.
+        assert!(!can_enforce_kick(None));
+        assert!(!can_enforce_kick(Some(Permissions::empty())));
+        // Each missing bit denies.
+        assert!(!can_enforce_kick(Some(
+            Permissions::MANAGE_ROLES.union(Permissions::MOVE_MEMBERS)
+        )));
+        assert!(!can_enforce_kick(Some(
+            Permissions::VIEW_CHANNEL.union(Permissions::MOVE_MEMBERS)
+        )));
+        assert!(!can_enforce_kick(Some(
+            Permissions::VIEW_CHANNEL.union(Permissions::MANAGE_ROLES)
+        )));
+        // Single bits alone deny.
+        assert!(!can_enforce_kick(Some(Permissions::VIEW_CHANNEL)));
+        assert!(!can_enforce_kick(Some(Permissions::MANAGE_ROLES)));
+        assert!(!can_enforce_kick(Some(Permissions::MOVE_MEMBERS)));
     }
 
     #[test]

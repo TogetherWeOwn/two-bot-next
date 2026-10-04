@@ -1431,7 +1431,13 @@ fn voice_command_set_is_gated_on_two_voice() {
             "transfer",
             "logging",
             "export",
-            "import"
+            "import",
+            "position",
+            "group",
+            "inheritpermissions",
+            "defaultlimit",
+            "alwaysprivate",
+            "kick"
         ]
     );
     let off = VoiceGates::from_map(&Default::default());
@@ -2850,6 +2856,617 @@ async fn handle_textchannels_surfaces_store_failures() {
     );
 }
 
+// --- V8 per-creator settings commands ------------------------------------------
+
+fn v8_interaction(name: &str, options: Vec<CommandDataOption>) -> Interaction {
+    voice_interaction(
+        Some(command_data(name, options)),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    )
+}
+
+#[test]
+fn parse_position_extracts_side_and_first_number() {
+    let interaction = v8_interaction(
+        "position",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("position", CommandOptionValue::String("below".to_owned())),
+            typed_option("first-number", CommandOptionValue::Integer(5)),
+        ],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Position {
+            channel_id: CREATOR,
+            request: PositionRequest {
+                position: Some(RoomPosition::Below),
+                first_number: Some(5),
+            },
+        })
+    );
+}
+
+#[test]
+fn parse_position_leaves_unset_options_unset() {
+    let interaction = v8_interaction(
+        "position",
+        vec![typed_option(
+            "channel",
+            CommandOptionValue::Channel(Id::new(CREATOR)),
+        )],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Position {
+            channel_id: CREATOR,
+            request: PositionRequest {
+                position: None,
+                first_number: None,
+            },
+        })
+    );
+}
+
+#[test]
+fn parse_group_inherit_defaultlimit_and_alwaysprivate() {
+    let interaction = v8_interaction(
+        "group",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("enabled", CommandOptionValue::Boolean(false)),
+        ],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Group {
+            channel_id: CREATOR,
+            request: GroupRequest {
+                enabled: Some(false),
+            },
+        })
+    );
+    let interaction = v8_interaction(
+        "inheritpermissions",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("source", CommandOptionValue::String("channel".to_owned())),
+            typed_option("source-channel", CommandOptionValue::Channel(Id::new(400))),
+        ],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::InheritPermissions {
+            channel_id: CREATOR,
+            request: InheritPermissionsRequest {
+                source: Some("channel".to_owned()),
+                source_channel: Some(400),
+            },
+        })
+    );
+    let interaction = v8_interaction(
+        "defaultlimit",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("limit", CommandOptionValue::Integer(4)),
+        ],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::DefaultLimit {
+            channel_id: CREATOR,
+            request: DefaultLimitRequest { limit: Some(4) },
+        })
+    );
+    let interaction = v8_interaction(
+        "alwaysprivate",
+        vec![typed_option(
+            "channel",
+            CommandOptionValue::Channel(Id::new(CREATOR)),
+        )],
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::AlwaysPrivate {
+            channel_id: CREATOR,
+            request: AlwaysPrivateRequest { enabled: None },
+        })
+    );
+}
+
+#[test]
+fn decide_position_updates_side_and_number() {
+    let base = CreatorChannel::new(GUILD, CREATOR);
+    let updated = match decide_position(
+        Some(base),
+        &PositionRequest {
+            position: Some(RoomPosition::Below),
+            first_number: Some(5),
+        },
+    ) {
+        PositionPlan::Update(creator) => creator,
+        PositionPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(updated.position, RoomPosition::Below);
+    assert_eq!(updated.first_room_number, 5);
+    // A side-only edit keeps the stored number.
+    let side_only = match decide_position(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &PositionRequest {
+            position: Some(RoomPosition::Below),
+            first_number: None,
+        },
+    ) {
+        PositionPlan::Update(creator) => creator,
+        PositionPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(side_only.first_room_number, 1);
+}
+
+#[test]
+fn decide_position_refuses_empty_and_bad_numbers() {
+    let base = || Some(CreatorChannel::new(GUILD, CREATOR));
+    assert!(matches!(
+        decide_position(
+            None,
+            &PositionRequest {
+                position: Some(RoomPosition::Above),
+                first_number: None,
+            }
+        ),
+        PositionPlan::Refuse { .. }
+    ));
+    assert!(matches!(
+        decide_position(
+            base(),
+            &PositionRequest {
+                position: None,
+                first_number: None,
+            }
+        ),
+        PositionPlan::Refuse { .. }
+    ));
+    for bad in [0, -3] {
+        assert!(
+            matches!(
+                decide_position(
+                    base(),
+                    &PositionRequest {
+                        position: None,
+                        first_number: Some(bad),
+                    }
+                ),
+                PositionPlan::Refuse { .. }
+            ),
+            "first number {bad} must refuse"
+        );
+    }
+}
+
+#[test]
+fn decide_group_defaults_to_on() {
+    let on = match decide_group(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &GroupRequest { enabled: None },
+    ) {
+        GroupPlan::Update(creator) => creator,
+        GroupPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert!(on.group_by_category);
+    let off = match decide_group(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &GroupRequest {
+            enabled: Some(false),
+        },
+    ) {
+        GroupPlan::Update(creator) => creator,
+        GroupPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert!(!off.group_by_category);
+    assert!(matches!(
+        decide_group(None, &GroupRequest { enabled: None }),
+        GroupPlan::Refuse { .. }
+    ));
+}
+
+#[test]
+fn decide_inherit_permissions_stores_each_source() {
+    let creator = match decide_inherit_permissions(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &InheritPermissionsRequest {
+            source: Some("category".to_owned()),
+            source_channel: None,
+        },
+    ) {
+        InheritPermissionsPlan::Update(creator) => creator,
+        InheritPermissionsPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(creator.permission_source, PermissionSource::Category);
+    assert_eq!(creator.permission_channel_id, None);
+    let channel = match decide_inherit_permissions(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &InheritPermissionsRequest {
+            source: Some("channel".to_owned()),
+            source_channel: Some(400),
+        },
+    ) {
+        InheritPermissionsPlan::Update(creator) => creator,
+        InheritPermissionsPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(channel.permission_source, PermissionSource::Channel(400));
+    assert_eq!(channel.permission_channel_id, Some(400));
+}
+
+#[test]
+fn decide_inherit_permissions_refuses_bad_input() {
+    let base = || Some(CreatorChannel::new(GUILD, CREATOR));
+    // No creator row, no source, unknown source.
+    assert!(matches!(
+        decide_inherit_permissions(
+            None,
+            &InheritPermissionsRequest {
+                source: Some("creator".to_owned()),
+                source_channel: None,
+            }
+        ),
+        InheritPermissionsPlan::Refuse { .. }
+    ));
+    for bad in [
+        InheritPermissionsRequest {
+            source: None,
+            source_channel: None,
+        },
+        InheritPermissionsRequest {
+            source: Some("everywhere".to_owned()),
+            source_channel: None,
+        },
+        // Channel source without a channel, or with a zero channel.
+        InheritPermissionsRequest {
+            source: Some("channel".to_owned()),
+            source_channel: None,
+        },
+        InheritPermissionsRequest {
+            source: Some("channel".to_owned()),
+            source_channel: Some(0),
+        },
+        // A source channel without the channel source.
+        InheritPermissionsRequest {
+            source: Some("creator".to_owned()),
+            source_channel: Some(400),
+        },
+        InheritPermissionsRequest {
+            source: Some("category".to_owned()),
+            source_channel: Some(400),
+        },
+    ] {
+        assert!(
+            matches!(
+                decide_inherit_permissions(base(), &bad),
+                InheritPermissionsPlan::Refuse { .. }
+            ),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn decide_default_limit_sets_and_clears() {
+    let set = match decide_default_limit(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &DefaultLimitRequest { limit: Some(4) },
+    ) {
+        DefaultLimitPlan::Update(creator) => creator,
+        DefaultLimitPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(set.default_limit, Some(4));
+    let unlimited = match decide_default_limit(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &DefaultLimitRequest { limit: Some(0) },
+    ) {
+        DefaultLimitPlan::Update(creator) => creator,
+        DefaultLimitPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(unlimited.default_limit, Some(0));
+    // An omitted limit clears back to inherit.
+    let inherit = match decide_default_limit(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &DefaultLimitRequest { limit: None },
+    ) {
+        DefaultLimitPlan::Update(creator) => creator,
+        DefaultLimitPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(inherit.default_limit, None);
+    for bad in [100, -1] {
+        assert!(
+            matches!(
+                decide_default_limit(
+                    Some(CreatorChannel::new(GUILD, CREATOR)),
+                    &DefaultLimitRequest { limit: Some(bad) }
+                ),
+                DefaultLimitPlan::Refuse { .. }
+            ),
+            "limit {bad} must refuse"
+        );
+    }
+    assert!(matches!(
+        decide_default_limit(None, &DefaultLimitRequest { limit: Some(4) }),
+        DefaultLimitPlan::Refuse { .. }
+    ));
+}
+
+#[test]
+fn decide_always_private_defaults_to_on() {
+    let on = match decide_always_private(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &AlwaysPrivateRequest { enabled: None },
+    ) {
+        AlwaysPrivatePlan::Update(creator) => creator,
+        AlwaysPrivatePlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert!(on.private_default);
+    let off = match decide_always_private(
+        Some(CreatorChannel::new(GUILD, CREATOR)),
+        &AlwaysPrivateRequest {
+            enabled: Some(false),
+        },
+    ) {
+        AlwaysPrivatePlan::Update(creator) => creator,
+        AlwaysPrivatePlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert!(!off.private_default);
+}
+
+#[test]
+fn v8_summaries_report_the_stored_settings() {
+    let mut creator = CreatorChannel::new(GUILD, CREATOR);
+    creator.position = RoomPosition::Below;
+    creator.first_room_number = 5;
+    let text = position_summary(&creator);
+    assert!(text.contains("below"), "{text}");
+    assert!(text.contains('5'), "{text}");
+    creator.group_by_category = true;
+    let grouped = group_summary(&creator);
+    assert!(grouped.contains("on"), "{grouped}");
+    creator.group_by_category = false;
+    let ungrouped = group_summary(&creator);
+    assert!(ungrouped.contains("off"), "{ungrouped}");
+    creator.permission_source = PermissionSource::Category;
+    let inherit = inherit_permissions_summary(&creator);
+    assert!(inherit.contains("category"), "{inherit}");
+    creator.default_limit = Some(4);
+    let limited = default_limit_summary(&creator);
+    assert!(limited.contains('4'), "{limited}");
+    creator.default_limit = None;
+    let inherited = default_limit_summary(&creator);
+    assert!(inherited.contains("inherit"), "{inherited}");
+    creator.private_default = true;
+    let private = always_private_summary(&creator);
+    assert!(private.contains("private"), "{private}");
+}
+
+#[test]
+fn v8_command_names_key_the_role_restrictions() {
+    let commands = [
+        VoiceCommand::Position {
+            channel_id: CREATOR,
+            request: PositionRequest {
+                position: None,
+                first_number: Some(2),
+            },
+        },
+        VoiceCommand::Group {
+            channel_id: CREATOR,
+            request: GroupRequest { enabled: None },
+        },
+        VoiceCommand::InheritPermissions {
+            channel_id: CREATOR,
+            request: InheritPermissionsRequest {
+                source: Some("creator".to_owned()),
+                source_channel: None,
+            },
+        },
+        VoiceCommand::DefaultLimit {
+            channel_id: CREATOR,
+            request: DefaultLimitRequest { limit: Some(4) },
+        },
+        VoiceCommand::AlwaysPrivate {
+            channel_id: CREATOR,
+            request: AlwaysPrivateRequest { enabled: None },
+        },
+    ];
+    for command in &commands {
+        assert!(
+            two_bot_core::voice_access::VOICE_COMMANDS.contains(&command.name()),
+            "{} is not a restrictable voice command",
+            command.name()
+        );
+    }
+    assert_eq!(commands[0].name(), "position");
+    assert_eq!(commands[1].name(), "group");
+    assert_eq!(commands[2].name(), "inheritpermissions");
+    assert_eq!(commands[3].name(), "defaultlimit");
+    assert_eq!(commands[4].name(), "alwaysprivate");
+}
+
+#[tokio::test]
+async fn handle_v8_commands_refuse_without_manage_channels() {
+    for (name, options) in [
+        (
+            "position",
+            vec![
+                typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+                typed_option("first-number", CommandOptionValue::Integer(2)),
+            ],
+        ),
+        (
+            "group",
+            vec![typed_option(
+                "channel",
+                CommandOptionValue::Channel(Id::new(CREATOR)),
+            )],
+        ),
+        (
+            "inheritpermissions",
+            vec![
+                typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+                typed_option("source", CommandOptionValue::String("category".to_owned())),
+            ],
+        ),
+        (
+            "defaultlimit",
+            vec![
+                typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+                typed_option("limit", CommandOptionValue::Integer(4)),
+            ],
+        ),
+        (
+            "alwaysprivate",
+            vec![typed_option(
+                "channel",
+                CommandOptionValue::Channel(Id::new(CREATOR)),
+            )],
+        ),
+    ] {
+        let trace = Trace::default();
+        let runtime = test_runtime(trace.clone());
+        let interaction = voice_interaction(
+            Some(command_data(name, options)),
+            Some(Permissions::VIEW_CHANNEL),
+            true,
+        );
+        let (owned, response) = handle_capture(&runtime, &interaction).await;
+        assert!(owned, "/{name} owns its interaction");
+        assert!(
+            response_text(response.as_ref().expect("reply")).contains("Manage Channels"),
+            "/{name} refuses without Manage Channels"
+        );
+        assert!(
+            !trace
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.starts_with("add_creator")),
+            "/{name} writes nothing without Manage Channels"
+        );
+    }
+}
+
+#[tokio::test]
+async fn handle_position_saves_side_and_number() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = v8_interaction(
+        "position",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("position", CommandOptionValue::String("below".to_owned())),
+            typed_option("first-number", CommandOptionValue::Integer(5)),
+        ],
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(text.contains("below"), "{text}");
+    assert!(text.contains('5'), "{text}");
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("add_creator:{CREATOR}")));
+}
+
+#[tokio::test]
+async fn handle_group_saves_the_toggle() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = v8_interaction(
+        "group",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("enabled", CommandOptionValue::Boolean(true)),
+        ],
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(
+        response_text(response.as_ref().expect("reply")).contains("on"),
+        "group reports the stored toggle"
+    );
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("add_creator:{CREATOR}")));
+}
+
+#[tokio::test]
+async fn handle_inheritpermissions_saves_the_source() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = v8_interaction(
+        "inheritpermissions",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("source", CommandOptionValue::String("category".to_owned())),
+        ],
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(
+        response_text(response.as_ref().expect("reply")).contains("category"),
+        "inheritpermissions reports the stored source"
+    );
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("add_creator:{CREATOR}")));
+}
+
+#[tokio::test]
+async fn handle_defaultlimit_saves_the_limit() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = v8_interaction(
+        "defaultlimit",
+        vec![
+            typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
+            typed_option("limit", CommandOptionValue::Integer(4)),
+        ],
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(
+        response_text(response.as_ref().expect("reply")).contains('4'),
+        "defaultlimit reports the stored limit"
+    );
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("add_creator:{CREATOR}")));
+}
+
+#[tokio::test]
+async fn handle_alwaysprivate_saves_the_default() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = v8_interaction(
+        "alwaysprivate",
+        vec![typed_option(
+            "channel",
+            CommandOptionValue::Channel(Id::new(CREATOR)),
+        )],
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(
+        response_text(response.as_ref().expect("reply")).contains("private"),
+        "alwaysprivate defaults on and reports it"
+    );
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("add_creator:{CREATOR}")));
+}
+
 #[test]
 fn ephemeral_response_is_ephemeral_channel_message() {
     let response = ephemeral_response("hello");
@@ -3103,6 +3720,16 @@ impl InteractionReplies for Replies {
         response: InteractionResponse,
     ) -> Result<(), RoomHttpError> {
         self.trace.lock().unwrap().push("complete".to_owned());
+        self.completed.lock().unwrap().push(response);
+        self.complete_error.map_or(Ok(()), Err)
+    }
+
+    async fn respond(
+        &self,
+        _: &Interaction,
+        response: InteractionResponse,
+    ) -> Result<(), RoomHttpError> {
+        self.trace.lock().unwrap().push("respond".to_owned());
         self.completed.lock().unwrap().push(response);
         self.complete_error.map_or(Ok(()), Err)
     }
@@ -4770,4 +5397,457 @@ fn notice_text_is_bounded() {
         message: "x".repeat(5000),
     };
     assert!(notice_text(&failure, DetailLevel::Full).chars().count() <= NOTICE_MAX_CHARS);
+}
+
+/// Guild-less ballot interaction: the shared builder always attaches a
+/// guild, but unscoped presses must stay silent too.
+#[allow(deprecated)]
+fn guildless_component_interaction(custom_id: &str) -> Interaction {
+    let mut interaction = voice_interaction(None, None, false);
+    interaction.kind = InteractionType::MessageComponent;
+    interaction.data = Some(InteractionData::MessageComponent(Box::new(
+        MessageComponentInteractionData {
+            custom_id: custom_id.to_owned(),
+            component_type: ComponentType::Button,
+            resolved: None,
+            values: Vec::new(),
+        },
+    )));
+    interaction
+}
+
+#[test]
+fn parse_kick_extracts_member_and_reason() {
+    let interaction = voice_interaction(
+        Some(command_data(
+            "kick",
+            vec![
+                user_option("member", 303),
+                command_option("reason", "too loud"),
+            ],
+        )),
+        None,
+        true,
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Kick {
+            target: 303,
+            reason: Some("too loud".to_owned()),
+        })
+    );
+}
+
+#[test]
+fn parse_kick_accepts_moderation_shape_without_reason() {
+    let interaction = voice_interaction(
+        Some(command_data("kick", vec![user_option("target", 303)])),
+        None,
+        true,
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Kick {
+            target: 303,
+            reason: None,
+        })
+    );
+}
+
+#[test]
+fn parse_kick_without_user_stays_silent_for_the_router() {
+    let interaction = voice_interaction(
+        Some(command_data("kick", vec![command_option("reason", "x")])),
+        None,
+        true,
+    );
+    assert_eq!(parse_voice_command(&interaction), None);
+}
+
+#[test]
+fn parse_ballot_buttons_by_vote_id() {
+    for (custom_id, expected) in [
+        (
+            "votekick:7000:yes",
+            VoiceCommand::Ballot {
+                vote_id: 7000,
+                ballot: VoteBallot::Yes,
+            },
+        ),
+        (
+            "votekick:7000:no",
+            VoiceCommand::Ballot {
+                vote_id: 7000,
+                ballot: VoteBallot::No,
+            },
+        ),
+    ] {
+        let interaction = component_interaction(custom_id, None, MEMBER);
+        assert_eq!(parse_voice_command(&interaction), Some(expected));
+    }
+}
+
+#[test]
+fn parse_foreign_buttons_stay_silent() {
+    for custom_id in [
+        "self-role:1",
+        "votekick:abc:yes",
+        "votekick:7000:maybe",
+        "votekick:7000",
+        "votekick:",
+    ] {
+        let interaction = component_interaction(custom_id, None, MEMBER);
+        assert_eq!(parse_voice_command(&interaction), None);
+    }
+    let guildless = guildless_component_interaction("votekick:7000:yes");
+    assert_eq!(parse_voice_command(&guildless), None);
+}
+
+#[test]
+fn vote_button_ids_round_trip() {
+    assert_eq!(vote_button_id(7000, VoteBallot::Yes), "votekick:7000:yes");
+    assert_eq!(vote_button_id(7000, VoteBallot::No), "votekick:7000:no");
+}
+
+#[test]
+fn kick_and_ballot_share_the_kick_restriction_name() {
+    assert_eq!(
+        VoiceCommand::Kick {
+            target: 303,
+            reason: None,
+        }
+        .name(),
+        "kick"
+    );
+    assert_eq!(
+        VoiceCommand::Ballot {
+            vote_id: 7000,
+            ballot: VoteBallot::Yes,
+        }
+        .name(),
+        "kick"
+    );
+}
+
+fn kick_sink_interaction(target: u64, initiator: u64) -> Interaction {
+    with_user(
+        voice_interaction(
+            Some(command_data(
+                "kick",
+                vec![
+                    user_option("member", target),
+                    command_option("reason", "too loud"),
+                ],
+            )),
+            None,
+            true,
+        ),
+        initiator,
+    )
+}
+
+fn voice_member_in(member_id: u64, channel_id: u64) -> VoiceMember {
+    VoiceMember {
+        member_id,
+        channel_id,
+        bot: Some(false),
+    }
+}
+
+#[tokio::test]
+async fn sink_claimed_kick_answers_public_ballot_without_defer() {
+    const VOTER: u64 = 301;
+    const TARGET: u64 = 303;
+    const KICK_ROOM: u64 = 500;
+    let trace = Trace::default();
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            move || {
+                let store = Store::new(trace.clone());
+                store
+                    .rooms
+                    .lock()
+                    .unwrap()
+                    .insert(KICK_ROOM, room(KICK_ROOM));
+                (store, Http::new(trace.clone()))
+            }
+        },
+        Duration::from_millis(10),
+        true,
+    );
+    assert!(runtime.publish_snapshot(
+        GUILD,
+        snapshot(
+            &[KICK_ROOM],
+            vec![
+                voice_member_in(VOTER, KICK_ROOM),
+                voice_member_in(TARGET, KICK_ROOM),
+            ],
+        )
+    ));
+    let replies = Replies::new(trace.clone());
+    VoiceResponder::respond_with(
+        &runtime,
+        &replies,
+        &kick_sink_interaction(TARGET, VOTER),
+        None,
+        None,
+    )
+    .await;
+    // No defer: the ballot goes out as the initial public callback, so every
+    // occupant can see the buttons and reach quorum.
+    assert_eq!(*trace.lock().unwrap(), ["respond"]);
+    let completed = replies.completed.lock().unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(
+        completed[0].kind,
+        InteractionResponseType::ChannelMessageWithSource
+    );
+    let data = completed[0].data.as_ref().expect("ballot body");
+    assert_ne!(data.flags, Some(MessageFlags::EPHEMERAL));
+    let content = data.content.as_deref().unwrap_or_default();
+    assert!(content.contains("<@303>"), "{content}");
+    assert!(content.contains("too loud"), "{content}");
+    assert_eq!(data.components.as_ref().map_or(0, Vec::len), 1);
+}
+
+#[tokio::test]
+async fn sink_unclaimed_kick_stays_fully_silent_for_the_router() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let replies = Replies::new(trace.clone());
+    // No actor, no rooms: a moderation-shaped target must produce no ack at
+    // all here, otherwise the defer races (and loses to) the router answer.
+    VoiceResponder::respond_with(
+        &runtime,
+        &replies,
+        &kick_sink_interaction(303, 301),
+        None,
+        None,
+    )
+    .await;
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(replies.completed.lock().unwrap().is_empty());
+}
+
+// ---- lifecycle-outcome signals (offline cutover verification) ----
+//
+// The worker emits fixed-cardinality outcome signals for every terminal
+// create/move/delete, reconcile plan size, queue dead-letter and
+// creator-orphan. These tests pin the emission wiring end to end through
+// the fake store/HTTP fixtures: pure mapper coverage plus worker-driven
+// metric deltas. Global counters are monotonic, so the worker tests assert
+// `after >= before + expected`: safe under parallel test threads.
+
+/// Read one counter series from the process-global metrics exposition.
+fn global_series(prefix: &str) -> u64 {
+    metrics::global()
+        .render(None)
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .map(|line| {
+            line.rsplit_once(' ')
+                .unwrap_or_else(|| panic!("bad sample: {line}"))
+                .1
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("bad sample: {line}"))
+        })
+        .sum()
+}
+
+#[test]
+fn http_error_outcomes_stay_bounded_for_cutover_queries() {
+    use RoomHttpError::*;
+    // Rate limits are retries, never outcomes; callers skip them before
+    // reaching the mapper. Everything terminal is `discord` except a
+    // stale guard, which is `cancelled`. Status/code values never leak.
+    for error in [
+        AccessDenied,
+        NotFound,
+        Unauthorized,
+        UnknownOutcome,
+        InvalidRequest,
+        RenameDeferred,
+        Rejected {
+            status: 400,
+            code: 50035,
+        },
+        Rejected {
+            status: 403,
+            code: 50013,
+        },
+    ] {
+        assert_eq!(voice_outcome_from_http(&error), "discord", "{error:?}");
+    }
+    assert_eq!(voice_outcome_from_http(&Cancelled), "cancelled");
+}
+
+#[test]
+fn store_errors_share_one_persistence_outcome() {
+    for error in [
+        StoreError::Unavailable,
+        StoreError::CredentialRefused,
+        StoreError::Conflict,
+    ] {
+        assert_eq!(voice_outcome_from_store(&error), "persistence");
+    }
+}
+
+#[test]
+fn dead_letter_families_cover_every_queue_action_shape() {
+    let companion_plan = || TextChannelPlan {
+        room_id: 500,
+        guild_id: GUILD,
+        name: "voice-chat".to_owned(),
+        category_id: CATEGORY,
+        overwrites: Vec::new(),
+        settings: two_bot_core::voice_text_channel::TextChannelSettings::default(),
+    };
+    let cases: Vec<(RoomAction, &str)> = vec![
+        (
+            RoomAction::CreateRoom {
+                creator_channel_id: CREATOR,
+                owner_id: MEMBER,
+                name: "room".to_owned(),
+                seed: 7,
+            },
+            "create",
+        ),
+        (
+            RoomAction::MoveMember {
+                member_id: MEMBER,
+                channel_id: 500,
+            },
+            "move",
+        ),
+        (RoomAction::DeleteRoom { channel_id: 500 }, "delete"),
+        (
+            RoomAction::CreateCompanion {
+                room_channel_id: 500,
+                plan: companion_plan(),
+            },
+            "companion",
+        ),
+        (
+            RoomAction::GrantCompanionView {
+                room_channel_id: 500,
+                text_channel_id: 501,
+                member_id: MEMBER,
+            },
+            "companion",
+        ),
+        (
+            RoomAction::RevokeCompanionView {
+                room_channel_id: 500,
+                text_channel_id: 501,
+                member_id: MEMBER,
+            },
+            "companion",
+        ),
+        (
+            RoomAction::UpdateOwnership {
+                channel_id: 500,
+                owner_id: MEMBER,
+                original_creator_id: MEMBER,
+            },
+            "ownership",
+        ),
+        (
+            RoomAction::KickMember {
+                channel_id: 500,
+                member_id: MEMBER,
+            },
+            "kick",
+        ),
+        (
+            RoomAction::RenameRoom {
+                channel_id: 500,
+                name: "den".to_owned(),
+            },
+            "rename",
+        ),
+    ];
+    for (action, family) in &cases {
+        assert_eq!(voice_dead_action(action), *family, "{action:?}");
+    }
+}
+
+#[tokio::test]
+async fn terminal_queue_failure_dead_letters_exactly_once_per_family() {
+    let (live, store, http, _) = fixture();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Non-terminal attempt: requeues with backoff, emits no dead letter.
+    worker.queue.enqueue(
+        GUILD,
+        RoomAction::RenameRoom {
+            channel_id: 500,
+            name: "den".to_owned(),
+        },
+    );
+    let action = worker.queue.pop_due(GUILD, 0).expect("rename due");
+    let before = global_series("two_bot_voice_dead_letters_total{action=\"rename\"}");
+    assert!(worker.mark_failed_observed(action, "flaky".to_owned(), 0));
+    assert_eq!(
+        global_series("two_bot_voice_dead_letters_total{action=\"rename\"}"),
+        before,
+        "non-terminal failure must not dead-letter"
+    );
+    // Terminal attempt (attempts saturating at QUEUE_MAX_ATTEMPTS): one
+    // dead letter under the action family, surfaced in failed().
+    let mut terminal = worker.queue.pop_due(GUILD, 60_000).expect("retry due");
+    terminal.attempts = QUEUE_MAX_ATTEMPTS - 1;
+    // Re-mark in-flight: pop_due registered this dispatch id.
+    let before = global_series("two_bot_voice_dead_letters_total{action=\"rename\"}");
+    assert!(worker.mark_failed_observed(terminal, "still down".to_owned(), 61_000));
+    assert_eq!(
+        global_series("two_bot_voice_dead_letters_total{action=\"rename\"}"),
+        before + 1,
+        "terminal failure must dead-letter exactly once"
+    );
+    assert_eq!(worker.queue.failed().len(), 1);
+    assert_eq!(worker.queue.failed()[0].action.attempts, QUEUE_MAX_ATTEMPTS);
+}
+
+#[tokio::test]
+async fn reconcile_pass_reports_its_plan_sizes() {
+    let (live, store, http, _) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    store.rooms.lock().unwrap().insert(501, room(501));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.upsert_channel(channel(501, 2, Some(CATEGORY)));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let resumed_before = global_series("two_bot_voice_reconcile_actions_total{action=\"resumed\"}");
+    let enqueued_before =
+        global_series("two_bot_voice_reconcile_actions_total{action=\"delete_enqueued\"}");
+    worker.reconcile();
+    // Both tracked rooms are present, accessible and empty: each pass
+    // resumes its lane and enqueues its delete.
+    assert!(
+        global_series("two_bot_voice_reconcile_actions_total{action=\"resumed\"}")
+            >= resumed_before + 2
+    );
+    assert!(
+        global_series("two_bot_voice_reconcile_actions_total{action=\"delete_enqueued\"}")
+            >= enqueued_before + 2
+    );
+}
+
+#[tokio::test]
+async fn failed_create_compensation_orphan_is_counted_without_a_channel_id() {
+    let trace = Trace::default();
+    let store = Store::new(trace.clone());
+    *store.add_creator_error.lock().unwrap() = Some(StoreError::Unavailable);
+    let http = Http::new(trace.clone());
+    http.delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let before = global_series("two_bot_voice_orphans_total");
+    let text = execute_create(&store, &http, GUILD, "lobby", |_, _| {}).await;
+    assert!(text.contains("manually"), "{text}");
+    assert!(
+        global_series("two_bot_voice_orphans_total") > before,
+        "untracked orphan must advance the counter"
+    );
 }

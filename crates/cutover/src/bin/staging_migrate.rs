@@ -4,11 +4,14 @@
 //! staging-migrate --plan|--apply --source-sha <40hex> --staging-host <host>
 //!   --staging-database <db> --recovery-evidence-ref <ref> --acl-plan-ref <ref>
 //!   [--expected-pending <ascending,comma-separated versions>]
+//!   [--plan-manifest-sha256 <64hex> --plan-run-id <run id>]
 //! ```
 //!
 //! The database URL comes only from TWO_BOT_STAGING_MIGRATOR_DATABASE_URL.
 //! --apply refuses before any DDL unless --expected-pending equals the computed
-//! pending list exactly; --plan prints that list in the manifest and ignores it.
+//! pending list exactly and --plan-manifest-sha256 equals the SHA-256 of the
+//! plan job's uploaded manifest for the same source SHA; --plan prints that
+//! manifest (including its own hash) and ignores the plan-binding flags.
 //! Exit: 0 ok, 2 refused before any DDL, 1 failed (evidence on stdout).
 
 // Operator CLI reports intentionally use stdout; runtime/library modules do not.
@@ -34,7 +37,9 @@ fn real_main() -> i32 {
             | "--staging-database"
             | "--recovery-evidence-ref"
             | "--acl-plan-ref"
-            | "--expected-pending" => match it.next() {
+            | "--expected-pending"
+            | "--plan-manifest-sha256"
+            | "--plan-run-id" => match it.next() {
                 Some(v) => {
                     values.insert(arg.clone(), v.clone());
                 }
@@ -56,6 +61,8 @@ fn real_main() -> i32 {
         acl_plan_ref: get("--acl-plan-ref"),
         apply,
         expected_pending: values.get("--expected-pending").cloned(),
+        plan_manifest_sha256: values.get("--plan-manifest-sha256").cloned(),
+        plan_run_id: values.get("--plan-run-id").cloned(),
     };
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()

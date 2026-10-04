@@ -22,7 +22,7 @@ binding = "CF_VERSION_METADATA"
 
 # Default-environment bindings. Named environments do NOT inherit these —
 # every [env.*] below repeats the full Container/DO wiring explicitly.
-# Verified against wrangler 4.143.1 (`deploy --dry-run --env <name>` warns on
+# Verified against wrangler 4.147.0 (`deploy --dry-run --env <name>` warns on
 # any omission); enforced in CI by scripts/check-env-bindings.py.
 [[containers]]
 class_name = "TwoBotContainer"
@@ -30,6 +30,12 @@ image = "../Dockerfile"
 # ADR 0001: target `lite`; escalate to `basic` only if measured RSS > ~200 MiB.
 instance_type = "lite"
 max_instances = 1
+
+# Pin the singleton container to US jurisdiction (production database lives in
+# AWS us-east-1): nearest-request routing would otherwise place it anywhere.
+[containers.constraints]
+regions = ["ENAM"]
+jurisdiction = "us"
 
 [[durable_objects.bindings]]
 name = "TWO_BOT"
@@ -74,6 +80,10 @@ image = "../Dockerfile"
 instance_type = "lite"
 max_instances = 1
 
+[env.staging.containers.constraints]
+regions = ["ENAM"]
+jurisdiction = "us"
+
 [[env.staging.durable_objects.bindings]]
 name = "TWO_BOT"
 class_name = "TwoBotContainer"
@@ -99,6 +109,13 @@ TWO_GUILD_NAME = "TWO Staging"
 # Never top-level (top-level vars are required in every environment) and never
 # in the production vars table: scripts/check-env-bindings.py fails either.
 INTERNAL_ACTIONS_INGRESS = "1"
+# Staging-only automation gates: publish + serve automation and announcement
+# command surfaces in the staging guild only. Never top-level and never
+# production. Forwarded into the container via FORWARDED_FLAGS
+# (wrangler/src/container-env.ts); the feed poller idles with no feeds
+# configured. Rollback is unset + re-publish (PUT is a full replacement).
+TWO_AUTOMATIONS = "1"
+TWO_ANNOUNCEMENTS = "1"
 
 [env.production.version_metadata]
 binding = "CF_VERSION_METADATA"
@@ -115,6 +132,10 @@ image = "../Dockerfile"
 # ADR 0001: target `lite`; escalate to `basic` only if measured RSS > ~200 MiB.
 instance_type = "lite"
 max_instances = 1
+
+[env.production.containers.constraints]
+regions = ["ENAM"]
+jurisdiction = "us"
 
 [[env.production.durable_objects.bindings]]
 name = "TWO_BOT"
