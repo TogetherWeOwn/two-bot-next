@@ -45,6 +45,8 @@ mod join_risk_runtime;
 mod join_risk_runtime_tests;
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod log_volume_guard_tests;
 mod metrics_http;
 mod moderation_cli;
 #[cfg(test)]
