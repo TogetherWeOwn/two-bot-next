@@ -74,7 +74,7 @@ use two_bot_core::{
         decide_ownership, OwnershipDecision, OwnershipError, OwnershipRequest, RoomActor,
         RoomMember, RoomOwnership,
     },
-    voice_permissions::{OWNER_ALLOW_BITS, OWNER_EXTRA_MASK},
+    voice_permissions::OWNER_ALLOW_BITS,
     voice_rooms::{
         category_full_message, is_usable_channel_name, voice_commands, ActionQueue, CreatorChannel,
         NewRoomSpec, PermissionSource, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction,
@@ -1691,7 +1691,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         previous_owner_id: Snowflake,
         owner_id: Snowflake,
     ) -> Result<(), RoomHttpError> {
-        let (overwrites, changed) = {
+        let (overwrites, changed, expected_overwrites) = {
             let live = self.live.inner.read().expect("live voice lock");
             let channel = live
                 .channels
@@ -1701,7 +1701,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 .permission_overwrites
                 .as_deref()
                 .ok_or(RoomHttpError::Cancelled)?;
-            let owner_mask = Permissions::from_bits_retain(OWNER_EXTRA_MASK);
+            let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
             let can_write = live
                 .permissions(self.live.guild_id, channel_id)
                 .is_some_and(|p| p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES));
@@ -1741,7 +1741,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 });
             }
             let changed = overwrites != current;
-            (overwrites, changed)
+            (overwrites, changed, current.to_vec())
         };
         if !changed {
             return Ok(());
@@ -1750,6 +1750,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let guard: WriteGuard = Arc::new(move || {
             let state = live.inner.read().expect("live voice lock");
             state.ready
+                && state.channels.get(&channel_id).is_some_and(|channel| {
+                    channel.permission_overwrites.as_deref() == Some(expected_overwrites.as_slice())
+                })
                 && state
                     .permissions(live.guild_id, channel_id)
                     .is_some_and(|p| {
@@ -3626,6 +3629,12 @@ where
             Event::ChannelDelete(deleted) => {
                 if let Some(guild_id) = deleted.guild_id.map(|id| id.get()) {
                     self.update_live(guild_id, |live| live.remove_channel(deleted.id.get()));
+                }
+            }
+            Event::GuildUpdate(updated) => {
+                let guild_id = updated.id.get();
+                if let Some(access) = bot_access_from_cache(cache, guild_id) {
+                    self.update_live(guild_id, |live| live.refresh_bot(access));
                 }
             }
             Event::RoleCreate(created) => {

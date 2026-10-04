@@ -1097,7 +1097,7 @@ async fn rapid_transfers_revoke_all_former_owners_and_never_grant_a_stale_recipi
     for former in [MEMBER, 301] {
         assert!(!overwrites.iter().any(|o| o.id.get() == former
             && o.allow
-                .intersects(Permissions::from_bits_retain(OWNER_EXTRA_MASK))));
+                .intersects(Permissions::from_bits_retain(OWNER_ALLOW_BITS))));
     }
     assert!(overwrites.contains(&owner_overwrite(302)));
     assert!(!trace
@@ -2212,6 +2212,38 @@ async fn guild_role_admins_and_owner_pass_without_channel_manage_channels() {
         let (_, response) = handle_capture(&runtime, &interaction).await;
         assert!(!response_text(&response.unwrap()).contains("You need Manage Channels"));
     }
+}
+
+#[tokio::test]
+async fn refreshed_guild_owner_and_role_permissions_revoke_old_admin_authority() {
+    let runtime = test_runtime(Trace::default());
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    let mut old_owner = voice_interaction_as(Some(command_data("access", vec![])), None, 998);
+    assert!(is_voice_admin(runtime.guild_permissions(&old_owner)));
+    let mut guild = command_snapshot();
+    guild.bot.guild_owner_id = 997;
+    runtime
+        .live_actor(GUILD)
+        .unwrap()
+        .live
+        .refresh_bot(guild.bot.clone());
+    assert!(!is_voice_admin(runtime.guild_permissions(&old_owner)));
+    old_owner.member.as_mut().unwrap().roles =
+        vec![Id::new(10_000 + Permissions::MANAGE_CHANNELS.bits())];
+    assert!(is_voice_admin(runtime.guild_permissions(&old_owner)));
+    guild
+        .bot
+        .roles
+        .iter_mut()
+        .find(|r| r.id.get() == 10_000 + Permissions::MANAGE_CHANNELS.bits())
+        .unwrap()
+        .permissions = Permissions::VIEW_CHANNEL;
+    runtime
+        .live_actor(GUILD)
+        .unwrap()
+        .live
+        .refresh_bot(guild.bot);
+    assert!(!is_voice_admin(runtime.guild_permissions(&old_owner)));
 }
 
 #[tokio::test]
