@@ -530,19 +530,16 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
             .iter()
             .map(|command| command["name"].as_str().unwrap())
             .collect();
-        for name in [
-            "rank",
-            "leaderboard",
-            "attendance",
-            "rsvp",
-            "rsvp-attendance",
-        ] {
-            assert_eq!(
-                names.iter().filter(|&&published| published == name).count(),
-                1,
-                "publish the full shared registry, without duplicate {name}"
-            );
-        }
+        // The harness boots with a synthetic token no clearance recognizes,
+        // so activation narrows every clearable surface while scorecard
+        // stays: the single boot PUT carries exactly core plus scorecard,
+        // each once. Uncleared surfaces stay unpublished (and refused at
+        // dispatch) rather than advertised.
+        assert_eq!(
+            names,
+            ["rank", "leaderboard", "attendance"],
+            "publish the narrowed shared registry exactly once, nothing withheld or extra"
+        );
         if boot == 1 {
             assert_eq!(
                 publish.body, requests[2].body,
