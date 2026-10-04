@@ -106,6 +106,10 @@ struct Store {
     claims: Mutex<Vec<(u64, i64)>>,
     settled: Mutex<Vec<(String, Option<u64>)>>,
     settle_errors: Mutex<VecDeque<StoreError>>,
+    /// Claims bound to the channel Discord returned, as `(reservation, channel)`
+    /// in bind order; the durable channel witness a restart reads back.
+    bound: Mutex<Vec<(String, u64)>>,
+    bind_errors: Mutex<VecDeque<StoreError>>,
     /// Also push `claim` / `settle` markers onto the shared trace, for tests
     /// that pin ordering against the Discord and persist calls.
     trace_claims: bool,
@@ -136,6 +140,8 @@ impl Store {
             claims: Mutex::new(Vec::new()),
             settled: Mutex::new(Vec::new()),
             settle_errors: Mutex::new(VecDeque::new()),
+            bound: Mutex::new(Vec::new()),
+            bind_errors: Mutex::new(VecDeque::new()),
             trace_claims: false,
         }
     }
@@ -265,6 +271,36 @@ impl RoomPersistence for Store {
                 reservation_id: format!("r{}", claims.len()),
             }),
         }
+    }
+    async fn bind_create_channel(
+        &self,
+        _: u64,
+        reservation_id: &str,
+        channel: u64,
+    ) -> Result<(), StoreError> {
+        if let Some(error) = self.bind_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        self.bound
+            .lock()
+            .unwrap()
+            .push((reservation_id.to_owned(), channel));
+        Ok(())
+    }
+    async fn orphaned_create_channels(&self, _: u64) -> Result<Vec<(String, u64)>, StoreError> {
+        // Unsettled, bound, and without a tracked room: the SQL predicate.
+        let settled = self.settled.lock().unwrap();
+        let rooms = self.rooms.lock().unwrap();
+        Ok(self
+            .bound
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(reservation, channel)| {
+                !settled.iter().any(|(done, _)| done == reservation) && !rooms.contains_key(channel)
+            })
+            .cloned()
+            .collect())
     }
     async fn persist_create(
         &self,
@@ -1467,6 +1503,141 @@ async fn denied_or_occupied_compensation_never_refunds_capacity() {
 }
 
 #[tokio::test]
+async fn created_channel_is_bound_to_its_claim_before_the_room_is_persisted() {
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        *worker.store.bound.lock().unwrap(),
+        [("r1".to_owned(), 500)]
+    );
+    assert_eq!(
+        *worker.store.settled.lock().unwrap(),
+        [("r1".to_owned(), Some(500))]
+    );
+    assert!(worker.compensation_reservations.is_empty());
+}
+
+#[tokio::test]
+async fn bind_failure_compensates_the_channel_and_keeps_the_hold_until_the_delete() {
+    for error in [StoreError::Unavailable, StoreError::CredentialRefused] {
+        let (live, store, http, trace) = fixture();
+        store.bind_errors.lock().unwrap().push_back(error);
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        join(&mut worker, MEMBER);
+        dispatch(&mut worker, 0).await;
+        // The channel exists but is unwitnessed: persist never ran, the hold is
+        // kept and the exact channel is queued for compensation.
+        assert!(worker.store.settled.lock().unwrap().is_empty());
+        assert_eq!(
+            worker
+                .compensation_reservations
+                .get(&500)
+                .map(String::as_str),
+            Some("r1")
+        );
+        assert_eq!(
+            worker.failures().back(),
+            Some(&LifecycleFailure::Persistence {
+                channel_id: Some(500),
+                error,
+            })
+        );
+        assert_eq!(worker.halted(), error == StoreError::CredentialRefused);
+        assert_eq!(*trace.lock().unwrap(), ["create"]);
+    }
+}
+
+#[tokio::test]
+async fn restart_after_a_refused_rollback_rediscovers_the_bound_channel_and_holds_the_slot() {
+    let (live, mut store, http, trace) = fixture();
+    store.persist_error = Some(StoreError::Unavailable);
+    http.delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert!(worker.store.settled.lock().unwrap().is_empty());
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "delete:500"]
+    );
+
+    // A fresh worker over the same durable state knows the channel and still
+    // holds its cap slot: nothing was settled and no room row exists.
+    let mut store = worker.store;
+    store.persist_error = None;
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(&[500], vec![]));
+    let mut worker = GuildRoomWorker::load(live, store, Http::new(trace.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        worker
+            .compensation_reservations
+            .get(&500)
+            .map(String::as_str),
+        Some("r1")
+    );
+    assert!(worker.compensation.contains(&500));
+    assert!(worker.tracked().is_empty());
+    assert!(worker.store.settled.lock().unwrap().is_empty());
+
+    // The first authoritative reconcile deletes it; only then is the slot freed.
+    worker.reconcile();
+    dispatch(&mut worker, 2).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            "create",
+            "persist:500",
+            "delete:500",
+            "delete:500",
+            "forget:500"
+        ]
+    );
+    assert_eq!(
+        *worker.store.settled.lock().unwrap(),
+        [("r1".to_owned(), None)]
+    );
+    assert!(worker.compensation_reservations.is_empty());
+}
+
+#[tokio::test]
+async fn restart_confirms_absence_of_a_bound_channel_before_freeing_the_slot() {
+    let trace = Trace::default();
+    let store = Store::new(trace.clone());
+    store.bound.lock().unwrap().push(("r9".to_owned(), 500));
+    // Not ready: no authoritative snapshot has been published yet.
+    let live = LiveGuild::new(GUILD);
+    let mut worker = GuildRoomWorker::load(live, store, Http::new(trace.clone()))
+        .await
+        .unwrap();
+    worker.reconcile();
+    assert!(!worker.dispatch_one(0).await);
+    assert!(worker.store.settled.lock().unwrap().is_empty());
+    // The snapshot lacks the channel: Discord no longer has it, so no delete is
+    // sent and the hold is released.
+    worker.live.publish(snapshot(&[], vec![]));
+    worker.reconcile();
+    dispatch(&mut worker, 1).await;
+    assert!(trace
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|call| call != "delete:500"));
+    assert_eq!(
+        *worker.store.settled.lock().unwrap(),
+        [("r9".to_owned(), None)]
+    );
+    assert!(worker.compensation_reservations.is_empty());
+}
+
+#[tokio::test]
 async fn compensation_settlement_errors_are_reported_and_credentials_halt() {
     for error in [StoreError::Unavailable, StoreError::CredentialRefused] {
         let (live, mut store, http, trace) = fixture();
@@ -1487,7 +1658,12 @@ async fn compensation_settlement_errors_are_reported_and_credentials_halt() {
         assert_eq!(worker.halted(), error == StoreError::CredentialRefused);
         let before = trace.lock().unwrap().clone();
         if worker.halted() {
-            join(&mut worker, MEMBER + 1);
+            // A halted worker refuses new joins and writes nothing further.
+            let ticket = worker
+                .live
+                .voice_update(MEMBER + 1, Some(CREATOR), Some(false))
+                .unwrap();
+            assert!(!worker.accept_join(ticket, "new room".to_owned(), 7, NOW.to_owned()));
             worker.reconcile();
             assert!(!worker.dispatch_one(600_000).await);
             assert_eq!(*trace.lock().unwrap(), before);

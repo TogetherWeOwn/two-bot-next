@@ -202,13 +202,17 @@ impl PgRoomStore {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| invalid_argument("create reservation does not match room"))?;
-        if claim.try_get::<bool, _>("settled")?
-            && claim.try_get::<Option<String>, _>("channel_id")?
-                != Some(room.channel_id.to_string())
-        {
+        let bound = claim.try_get::<Option<String>, _>("channel_id")?;
+        let settled = claim.try_get::<bool, _>("settled")?;
+        if bound.is_some() && bound != Some(room.channel_id.to_string()) {
+            return Err(invalid_argument(
+                "create reservation is bound to another channel",
+            ));
+        }
+        if settled && bound.is_none() {
             return Err(invalid_argument("create reservation is already settled"));
         }
-        if claim.try_get::<bool, _>("settled")? || !insert_room(&mut tx, room).await? {
+        if settled || !insert_room(&mut tx, room).await? {
             let stored =
                 sqlx::query("SELECT * FROM voice_rooms WHERE guild_id = $1 AND channel_id = $2")
                     .bind(room.guild_id.to_string())
@@ -412,16 +416,74 @@ impl PgRoomStore {
         }
     }
 
-    /// Release an unbound claim ONLY after confirmed no-side-effect failure,
-    /// channel absence or successful compensation. Unknown outcomes stay held.
-    /// The row stays for burst/cooldown history. Live-room transfers must use
-    /// [`Self::persist_create`], not a separate room insert and settlement.
-    /// Returns false when already settled (including a bound live room).
+    /// Bind a claim to the Discord channel its create returned, BEFORE the room
+    /// row is written. This is the durable channel witness: if the room persist
+    /// fails and the compensation delete is refused, a restarted worker still
+    /// learns the channel from [`Self::orphaned_create_channels`] while the claim
+    /// keeps holding its cap slot. Idempotent for the same channel; a claim that
+    /// is settled or bound elsewhere refuses.
+    pub async fn bind_create_channel(
+        &self,
+        guild_id: Snowflake,
+        reservation_id: &str,
+        channel_id: Snowflake,
+    ) -> Result<(), sqlx::Error> {
+        let bound = sqlx::query(
+            "UPDATE voice_create_reservations SET channel_id = $3
+             WHERE id = $1 AND guild_id = $2 AND settled_at IS NULL
+               AND (channel_id IS NULL OR channel_id = $3)",
+        )
+        .bind(reservation_id)
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if bound == 0 {
+            return Err(invalid_argument(
+                "create reservation cannot be bound to this channel",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Unsettled claims bound to a created channel that has no tracked room:
+    /// the channel exists (or may still exist) on Discord, its persist or
+    /// compensation never finished, and the claim still holds its cap slot.
+    /// Returns `(reservation id, channel id)` for worker load, so compensation
+    /// survives a restart.
+    pub async fn orphaned_create_channels(
+        &self,
+        guild_id: Snowflake,
+    ) -> Result<Vec<(String, Snowflake)>, sqlx::Error> {
+        sqlx::query(
+            "SELECT r.id, r.channel_id FROM voice_create_reservations r
+             WHERE r.guild_id = $1 AND r.settled_at IS NULL AND r.channel_id IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM voice_rooms v
+                                WHERE v.guild_id = r.guild_id AND v.channel_id = r.channel_id)
+             ORDER BY r.created_at, r.id",
+        )
+        .bind(guild_id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|row| Ok((row.try_get("id")?, decode_id(row, "channel_id")?)))
+        .collect()
+    }
+
+    /// Release a claim ONLY after confirmed no-side-effect failure, channel
+    /// absence (404 or an authoritative snapshot) or a successful guarded
+    /// delete. Unknown outcomes stay held. The row stays for burst/cooldown
+    /// history. A claim whose channel is a tracked live room never settles
+    /// here: that transfer is [`Self::persist_create`], not a separate room
+    /// insert and settlement. Returns false when already settled or live.
     pub async fn settle_create(&self, reservation_id: &str) -> Result<bool, sqlx::Error> {
         Ok(sqlx::query(
-            "UPDATE voice_create_reservations
+            "UPDATE voice_create_reservations r
              SET settled_at = now()
-             WHERE id = $1 AND settled_at IS NULL AND channel_id IS NULL",
+             WHERE r.id = $1 AND r.settled_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM voice_rooms v
+                                WHERE v.guild_id = r.guild_id AND v.channel_id = r.channel_id)",
         )
         .bind(reservation_id)
         .execute(&self.pool)

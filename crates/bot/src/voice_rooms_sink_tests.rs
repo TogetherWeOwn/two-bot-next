@@ -60,6 +60,19 @@ impl RoomPersistence for Arc<Store> {
             .claim_create(guild, user, config, now_secs)
             .await
     }
+    async fn bind_create_channel(
+        &self,
+        guild: u64,
+        reservation_id: &str,
+        channel: u64,
+    ) -> Result<(), StoreError> {
+        self.as_ref()
+            .bind_create_channel(guild, reservation_id, channel)
+            .await
+    }
+    async fn orphaned_create_channels(&self, guild: u64) -> Result<Vec<(String, u64)>, StoreError> {
+        self.as_ref().orphaned_create_channels(guild).await
+    }
     async fn persist_create(
         &self,
         reservation_id: &str,

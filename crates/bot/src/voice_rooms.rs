@@ -190,6 +190,23 @@ pub trait RoomPersistence: Send + Sync {
         config: &CreateAdmissionConfig,
         now_secs: i64,
     ) -> impl Future<Output = Result<CreateClaim, StoreError>> + Send;
+    /// Bind the claim to the channel Discord just created, before the room row
+    /// is written. The durable channel witness: a restarted worker rediscovers
+    /// the channel through [`Self::orphaned_create_channels`] if persist and
+    /// compensation both fail. The claim keeps holding its cap slot.
+    fn bind_create_channel(
+        &self,
+        guild: Snowflake,
+        reservation_id: &str,
+        channel: Snowflake,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// Unsettled claims bound to a created channel with no tracked room, as
+    /// `(reservation id, channel id)`: creates whose persist or compensation
+    /// never finished. Read at worker load so compensation survives restart.
+    fn orphaned_create_channels(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<Vec<(String, Snowflake)>, StoreError>> + Send;
     /// Persist the successful create and transfer its capacity hold atomically
     /// under the claim's guild lock. Failure retains the unbound hold; replay
     /// never POSTs again. No intermediate double occupancy is visible.
@@ -315,6 +332,26 @@ impl RoomPersistence for PgRoomStore {
         now_secs: i64,
     ) -> Result<CreateClaim, StoreError> {
         self.claim_create(guild, user, config, now_secs)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn bind_create_channel(
+        &self,
+        guild: Snowflake,
+        reservation_id: &str,
+        channel: Snowflake,
+    ) -> Result<(), StoreError> {
+        self.bind_create_channel(guild, reservation_id, channel)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn orphaned_create_channels(
+        &self,
+        guild: Snowflake,
+    ) -> Result<Vec<(String, Snowflake)>, StoreError> {
+        self.orphaned_create_channels(guild)
             .await
             .map_err(store_error)
     }
@@ -1236,6 +1273,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .into_iter()
             .map(|c| (c.room_channel_id, c))
             .collect();
+        // Creates whose persist or compensation never finished (a crash, or a
+        // refused delete) keep their cap slot and their channel witness; the
+        // first authoritative reconcile deletes or confirms absence of each.
+        let mut compensation = HashSet::new();
+        let mut compensation_reservations = HashMap::new();
+        for (reservation, channel) in store.orphaned_create_channels(live.guild_id).await? {
+            compensation.insert(channel);
+            compensation_reservations.insert(channel, reservation);
+        }
         Ok(Self {
             live,
             store,
@@ -1256,8 +1302,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             moves: HashMap::new(),
             uncertain_moves: HashMap::new(),
             deletes: HashSet::new(),
-            compensation: HashSet::new(),
-            compensation_reservations: HashMap::new(),
+            compensation,
+            compensation_reservations,
             denied: HashMap::new(),
             failures: VecDeque::new(),
             notices: Vec::new(),
@@ -1438,7 +1484,20 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let mut occupied = Vec::new();
         let mut suspended: u64 = 0;
         let mut resumed: u64 = 0;
-        for channel in self.rooms.keys().copied() {
+        // Held creates found at load have no tracked room: they still need the
+        // same access evidence and delete/absence confirmation as a room.
+        let held: Vec<Snowflake> = self
+            .rooms
+            .keys()
+            .copied()
+            .chain(
+                self.compensation_reservations
+                    .keys()
+                    .copied()
+                    .filter(|channel| !self.rooms.contains_key(channel)),
+            )
+            .collect();
+        for channel in held {
             if !live.channels.contains_key(&channel) {
                 self.queue.resume(self.live.guild_id, channel);
                 resumed = resumed.saturating_add(1);
@@ -2299,7 +2358,17 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         // The room and its reservation transfer commit together.
                         // On failure, keep the hold through compensation; neither
                         // a SQL error nor elapsed time proves channel absence.
-                        match self.store.persist_create(&reservation, &room).await {
+                        // The channel is bound to its claim first so a restart
+                        // can still find it if persist and compensation fail.
+                        let transferred = match self
+                            .store
+                            .bind_create_channel(self.live.guild_id, &reservation, channel_id)
+                            .await
+                        {
+                            Ok(()) => self.store.persist_create(&reservation, &room).await,
+                            Err(error) => Err(error),
+                        };
+                        match transferred {
                             Ok(()) => {
                                 // V9c: companion first (same ordered lane), then
                                 // the move. The plan's settings snapshot is the
@@ -2427,7 +2496,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 }
             }
             RoomAction::DeleteRoom { channel_id } => {
-                if !self.rooms.contains_key(&channel_id) {
+                if !self.rooms.contains_key(&channel_id)
+                    && !self.compensation_reservations.contains_key(&channel_id)
+                {
                     self.queue.mark_succeeded(&action);
                     self.deletes.remove(&channel_id);
                     return true;

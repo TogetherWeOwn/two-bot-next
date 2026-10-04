@@ -250,7 +250,7 @@
       "justification": "Voice V2 ownership handoff stamp so the rollback delta keeps measuring rooms whose owner_id changes in place."
     },
     "crates/cutover/migrations/0413_voice_create_reservations.sql": {
-      "sha256": "ff261cc8c5371adf27d5a4c05d9610fdbe6d09308e4de282a3a947beaea33126",
+      "sha256": "8c0d98f0b5dd3e45770a05b5fe211fcd29b67352a23b802658b5cf81b7e47883",
       "justification": "Durable voice room-create admission: one reservation row per accepted create, so burst and cooldown history survives room deletion and restarts."
     },
     "crates/store/migrations/0400_initial.sql": {

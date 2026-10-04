@@ -7,8 +7,12 @@
 -- restart refund nothing. `channel_id` and `settled_at` only track the
 -- in-flight state that holds a cap slot (`settled_at IS NULL`): set on
 -- success (room bound) or on rollback (no room). Cap counts add in-flight
--- reservations to `voice_rooms`; a reservation abandoned by a crash stops
--- counting after the claim's in-flight TTL (see `PgRoomStore::claim_create`).
+-- reservations to `voice_rooms`. A hold never expires by age: an unknown
+-- create outcome or a failed compensation keeps its slot until evidence
+-- (a guarded delete or a 404) permits settlement. `channel_id` is bound as
+-- soon as Discord returns the channel, before the room row is written, so a
+-- restarted worker can find a created channel whose persist failed and whose
+-- compensation delete was refused (see `PgRoomStore::claim_create`).
 --
 -- Snowflakes are TEXT with the canonical-id CHECK used by 0229; no foreign
 -- keys, as with 0224/0229. Burst and cooldown history is bounded by the

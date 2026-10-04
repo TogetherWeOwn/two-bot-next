@@ -399,6 +399,76 @@ async fn failed_settlement_rolls_back_the_room_insert_and_retains_capacity() -> 
 
 #[tokio::test]
 #[ignore = "requires TWO_TEST_DATABASE_URL on agent-testdb"]
+async fn bound_channel_witness_survives_restart_and_holds_the_slot_until_settled() -> TestResult {
+    let db = database().await;
+    let store = PgRoomStore::new(db.pool().clone());
+    let cap = config(10, 1, 0);
+    let held = admitted(&store, 300, &cap, T0).await?;
+    // Nothing is witnessed before the create returns a channel.
+    assert!(store.orphaned_create_channels(GUILD).await?.is_empty());
+
+    // Discord returned channel 500: bind it BEFORE any room row exists. Bind
+    // is idempotent for the same channel and refuses a different one.
+    store.bind_create_channel(GUILD, &held, 500).await?;
+    store.bind_create_channel(GUILD, &held, 500).await?;
+    assert!(store.bind_create_channel(GUILD, &held, 501).await.is_err());
+    assert!(store
+        .bind_create_channel(GUILD, "missing", 500)
+        .await
+        .is_err());
+    assert!(store
+        .bind_create_channel(GUILD + 1, &held, 500)
+        .await
+        .is_err());
+
+    // The persist failed and the delete was refused: a restarted worker, a
+    // brand-new pool, still learns the channel and the slot is still held.
+    drop(store);
+    let restarted = PgRoomStore::new(db.independent_pool().await?);
+    assert_eq!(
+        restarted.orphaned_create_channels(GUILD).await?,
+        [(held.clone(), 500)]
+    );
+    assert_eq!(
+        refused(&restarted, 301, &cap, T0 + 86_400).await?,
+        RefusalReason::GuildCap
+    );
+    // A claim bound to one channel cannot transfer to a different room.
+    assert!(restarted
+        .persist_create(&held, &room(300, 501))
+        .await
+        .is_err());
+
+    // Confirmed delete or 404: only now does the settlement free the slot,
+    // and the witness disappears with it. History still counts for the burst.
+    assert!(restarted.settle_create(&held).await?);
+    assert!(restarted.orphaned_create_channels(GUILD).await?.is_empty());
+    assert!(!restarted.settle_create(&held).await?);
+    let next = admitted(&restarted, 301, &cap, T0 + 86_401).await?;
+
+    // A bound claim whose persist later succeeds transfers atomically: the
+    // room is tracked, the claim settles, no witness remains, no double count.
+    restarted.bind_create_channel(GUILD, &next, 502).await?;
+    restarted.persist_create(&next, &room(301, 502)).await?;
+    assert!(restarted.orphaned_create_channels(GUILD).await?.is_empty());
+    assert!(
+        !restarted.settle_create(&next).await?,
+        "a bound live room cannot be rolled back"
+    );
+    assert!(restarted
+        .bind_create_channel(GUILD, &next, 502)
+        .await
+        .is_err());
+    assert_eq!(
+        refused(&restarted, 302, &cap, T0 + 86_402).await?,
+        RefusalReason::GuildCap
+    );
+    db.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TWO_TEST_DATABASE_URL on agent-testdb"]
 async fn zero_ids_are_refused_before_any_write() -> TestResult {
     let db = database().await;
     let store = PgRoomStore::new(db.pool().clone());

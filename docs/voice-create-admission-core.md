@@ -84,18 +84,26 @@ The pure core is now called by the runtime with persisted history:
   its reservation in one transaction under the same guild lock as claimers.
   No missing or double-counted capacity is visible between those writes; an
   insert/UPDATE failure rolls both back. Exact replay is idempotent while the
-  room exists, but cannot recreate a deleted room. `settle_create` only releases
-  an unbound claim after known no-side-effect failure, confirmed channel absence
-  or successful compensation. Either way the row stays for burst/cooldown history.
+  room exists, but cannot recreate a deleted room. `bind_create_channel` writes
+  the Discord channel id onto the claim as soon as the create returns, before the
+  room row, so the channel has a durable witness. `settle_create` only releases a
+  claim after known no-side-effect failure, confirmed channel absence or a
+  successful guarded delete, and never while its channel is a tracked live room.
+  `orphaned_create_channels` lists unsettled claims bound to a channel with no
+  room. Either way the row stays for burst/cooldown history.
 - **Worker.** `GuildRoomWorker::dispatch_one` claims after its cheap checks and
   before the only Discord create call. A refusal records
   `LifecycleFailure::CreateRefused` (stable `RefusalReason::code`, legacy
   `user_message`) and never calls Discord; a claim-time store error records a
   persistence failure, also without calling Discord. A long/repeated 429 requeue
   keeps its one non-expiring claim without counting a second burst attempt.
-  Unknown creates never retry the POST or refund their hold. Failed room
-  persistence retains the hold through delayed, denied or occupied-channel
-  compensation, and releases it only when the delete/absence is confirmed.
+  Unknown creates never retry the POST or refund their hold. The worker binds
+  the returned channel to its claim, then persists the room; a failure of either
+  retains the hold through delayed, denied or occupied-channel compensation, and
+  releases it only when the delete/absence is confirmed. `GuildRoomWorker::load`
+  reads the orphaned claims, so after a restart the first authoritative
+  reconcile deletes each held channel (or confirms its absence in the snapshot)
+  and only then settles the claim.
   A join cancelled before a retry is a confirmed no-effect outcome. Settlement
   errors reach the bounded setup failure report; a credential refusal halts all
   subsequent writes. A transient compensation settlement error retries only SQL
@@ -114,8 +122,9 @@ is no per-member reply on a gateway voice join. No retention job prunes
 conservative capacity debt across restarts, not automatically expired leases.
 They require evidence-led reconciliation before release; this slice adds no
 operator release API or automatic reconciliation for unknown POSTs. A crash
-before local compensation loses its in-memory channel association but **not**
-the durable hold. Transient settlement errors on cancelled/no-effect creates
+after the channel is bound is recovered at the next load; only a crash between
+Discord's response and the bind (or an unknown POST outcome) leaves a hold with
+no channel witness, and that hold is retained, not refunded. Transient settlement errors on cancelled/no-effect creates
 also retain the hold for reconciliation. This trades availability for the cap
 invariant; do not clear holds based solely on age. Naming, permissions, ownership
 and room lifecycle are separate slices, and unit and database tests establish behaviour only, not
