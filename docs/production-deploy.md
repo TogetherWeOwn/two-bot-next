@@ -32,10 +32,18 @@ every plan; no Enterprise plan is needed.
 `main`. That commit needs successful, completed `ci-ok` and `worker check`
 runs from GitHub Actions and a successful `deploy-staging` run. `ci-ok` is the
 full verdict over lint, worker checks and every selected Rust/DB test lane;
-a green lint-only `check` job is not enough. The guard reads the latest runs
-for that exact SHA with the GitHub Actions App filter and refuses missing,
-pending, failed, cancelled or skipped verdicts. Staging runs queue in a single
-concurrency group, so an intermediate commit may never stage. Pick one that did.
+a green lint-only `check` job is not enough. The guard enumerates `check.yml`
+runs for the exact SHA without a success filter, selects the newest run number,
+and requires its **current attempt** to be completed/success. Both `ci-ok` and
+`worker check` must be completed/success jobs in that attempt, with check-run
+URLs, SHA, suite and GitHub Actions App identity bound to those jobs. An older
+green aggregate cannot authorize a newer queued, running, failed or cancelled
+run that has not created its aggregate yet. Missing metadata, incomplete
+pagination and a run/attempt change during validation fail closed. If a partial
+rerun omits a required job from the current attempt, rerun **all jobs**; do not
+reuse the earlier attempt's receipt. The summary records the admitted run/attempt.
+Staging runs queue in a single concurrency group, so an intermediate commit may
+never stage. Pick one that did.
 After the reviewer approves, the job:
 
 1. checks out exactly that commit and re-verifies that it is on `origin/main`;

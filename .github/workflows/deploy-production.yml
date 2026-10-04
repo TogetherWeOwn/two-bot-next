@@ -3,7 +3,8 @@ name: deploy-production
 # Production deploy and rollback for the B4 cutover (TOG-9699). Dispatch only:
 # never runs on push, pull_request, schedule or another workflow's completion.
 # The guard job refuses a SHA that is not on main with a successful full
-# `ci-ok` verdict, `worker check` and a successful deploy-staging run. It also refuses
+# `ci-ok` verdict and `worker check` from the latest check.yml run/current
+# attempt, plus a successful deploy-staging run. It also refuses
 # when the `production` Environment is missing or unprotected: a job that
 # names a missing Environment makes GitHub create it with no reviewers, which
 # would remove the human gate. Runbook: docs/production-deploy.md.
@@ -11,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: "Full 40-hex commit on main with green ci-ok, worker check and deploy-staging"
+        description: "Full 40-hex commit on main with green ci-ok and worker check in the latest CI attempt, plus deploy-staging"
         required: true
         type: string
       rollback:
@@ -90,16 +91,80 @@ jobs:
           if compare.get("status") not in ("ahead", "identical"):
               refuse(f"{sha} is not an ancestor of origin/main ({compare.get('status')})")
 
+          def collection(path, what, key, **query):
+              # SHA-filtered workflow searches are capped at 1,000 by GitHub.
+              # Enumerate pages, never assume the first returned run is newest.
+              found = []
+              for page in range(1, 11):
+                  result = api(path, what, per_page="100", page=str(page), **query)
+                  batch, count = result.get(key), result.get("total_count")
+                  if not isinstance(batch, list) or type(count) is not int or not 0 <= count <= 1000:
+                      refuse(f"could not enumerate {what}; failing closed")
+                  found.extend(batch)
+                  if len(found) == count:
+                      return found
+                  if not batch or len(found) > count:
+                      break
+              refuse(f"could not enumerate {what}; failing closed")
+
+          def latest_ci():
+              # ci-ok is created only after its needs finish. Name-only queries
+              # can still return an old green aggregate during a newer run.
+              # Run numbers stay fixed on rerun; run_attempt increments:
+              # https://docs.github.com/en/actions/reference/workflows-and-actions/variables
+              runs = collection(
+                  f"repos/{repo}/actions/workflows/check.yml/runs", "check.yml runs",
+                  "workflow_runs", head_sha=sha,
+              )
+              if not runs or any(
+                  run.get("head_sha") != sha or any(
+                      type(run.get(key)) is not int or run[key] <= 0
+                      for key in ("id", "run_number")
+                  ) for run in runs
+              ):
+                  refuse(f"check.yml has no verifiable latest run on {sha}")
+              newest = max(runs, key=lambda run: (run["run_number"], run["id"]))
+              current = api(f"repos/{repo}/actions/runs/{newest['id']}", "the latest check.yml attempt")
+              if any(current.get(key) != newest.get(key) for key in ("id", "run_number", "head_sha")) or any(
+                  type(current.get(key)) is not int or current[key] <= 0
+                  for key in ("run_attempt", "check_suite_id")
+              ):
+                  refuse("could not verify the latest check.yml attempt; failing closed")
+              if current.get("status") != "completed" or current.get("conclusion") != "success":
+                  refuse(f"check.yml latest run/attempt has no successful completed verdict on {sha}")
+              return current
+
+          ci = latest_ci()
+          # The attempt endpoint provides check_run_url for each job, so an old
+          # aggregate or worker from another run/attempt cannot stand in for it.
+          # https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-specific-workflow-run-attempt
+          jobs = collection(
+              f"repos/{repo}/actions/runs/{ci['id']}/attempts/{ci['run_attempt']}/jobs",
+              "the latest check.yml attempt's jobs", "jobs",
+          )
           for name in REQUIRED_CHECKS:
+              selected = [job for job in jobs if job.get("name") == name]
+              if len(selected) != 1 or any(
+                  job.get("run_id") != ci["id"] or job.get("run_attempt") != ci["run_attempt"]
+                  or job.get("head_sha") != sha or not job.get("check_run_url")
+                  or job.get("status") != "completed" or job.get("conclusion") != "success"
+                  for job in selected
+              ):
+                  refuse(f"`{name}` has no successful completed job in the latest check.yml attempt")
               runs = api(
                   f"repos/{repo}/commits/{sha}/check-runs", f"the `{name}` check runs",
                   check_name=name, app_id=ACTIONS_APP_ID, filter="latest", per_page="100",
               ).get("check_runs", [])
-              if not runs or any(
+              bound = [run for run in runs if (
+                  run.get("url") == selected[0]["check_run_url"] and run.get("head_sha") == sha
+                  and (run.get("check_suite") or {}).get("id") == ci["check_suite_id"]
+                  and run.get("name") == name and str((run.get("app") or {}).get("id")) == ACTIONS_APP_ID
+              )]
+              if len(bound) != 1 or any(
                   run.get("status") != "completed" or run.get("conclusion") != "success"
-                  for run in runs
+                  for run in bound
               ):
-                  refuse(f"`{name}` has no successful completed run on {sha}")
+                  refuse(f"`{name}` has no successful completed run on {sha} bound to the latest check.yml attempt")
 
           staged = api(
               f"repos/{repo}/actions/workflows/deploy-staging.yml/runs", "deploy-staging runs",
@@ -126,12 +191,18 @@ jobs:
           if [(b.get("type", "branch"), b.get("name")) for b in branches] != [("branch", "main")]:
               refuse("the production Environment must allow deployments from main only")
 
+          # Refuse a new run/rerun that appeared while the other guards were read.
+          fresh = latest_ci()
+          if any(fresh[key] != ci[key] for key in ("id", "run_attempt", "check_suite_id")):
+              refuse("check.yml latest run/attempt changed during validation; retry after CI completes")
+
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write(f"sha={sha}\nmode={mode}\nversion={version}\n")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write(
                   f"### Production {mode} guard passed\n\n"
                   f"- SHA: `{sha}` (on main; full `ci-ok` verdict, `worker check` and deploy-staging green)\n"
+                  f"- Full CI: check.yml run `{ci['id']}`, attempt `{ci['run_attempt']}` (latest, completed/success)\n"
                   f"- Environment: `production`, {reviewers} required reviewer(s), main only\n"
                   + (f"- Rollback target: `{version}`\n" if version else "")
               )
