@@ -961,9 +961,11 @@ async fn governed_sticky_defers_through_rsvp_lane_hold() {
     .await
     .expect("rsvp completion deadline");
     // Surface a quiet runner death with its error instead of timing out: the
-    // runner owns the only copy of a checkpoint-hold or I/O failure.
+    // runner owns the only copy of a checkpoint-hold or I/O failure. The
+    // fence is at-least: the worker can commit the sticky dispatch
+    // microseconds after the RSVP one, skipping an exact-sequence poll.
     tokio::select! {
-        _ = wait_sequence(&db.store, 2) => {},
+        _ = wait_sequence_at_least(&db.store, 2) => {},
         result = &mut runner => {
             panic!("governed runner exited before sequence 2: {result:?}");
         }
@@ -989,21 +991,16 @@ async fn governed_sticky_defers_through_rsvp_lane_hold() {
             .unwrap(),
         1
     );
-    // B (sticky) is never acknowledged by the ordered runtime — sticky is not
-    // an RSVP command — so the cursor fences past A and the runner exits with
-    // the acknowledgement-hold error instead of shutting down cleanly.
+    // Both the RSVP and the sticky defer complete through the ordered drain
+    // (the drain holds the cursor only on admission-Blocked exhaustion, and
+    // every lane wait here stays inside the receipt budget), so the cursor
+    // advances past both and the runner shuts down cleanly.
     shutdown.send_replace(true);
-    let error = tokio::time::timeout(Duration::from_secs(30), runner)
+    tokio::time::timeout(Duration::from_secs(30), runner)
         .await
         .expect("governed runner shutdown deadline")
         .unwrap()
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("interaction acknowledgement failed; checkpoint unchanged"),
-        "{error}"
-    );
+        .unwrap();
     drop(ws);
     rest.shutdown().await;
     // Bound teardown likewise: dropping the schema must not wait forever.
@@ -1043,8 +1040,12 @@ async fn handoff_rest(seen: Arc<AtomicBool>) -> MockRest {
 fn governed_executor(
     rest: &MockRest,
     admission: Arc<dyn SendAdmission>,
+    token: &str,
 ) -> two_bot_discord::ActionExecutor {
-    ActionExecutor::with_admission(TOKEN.into(), Some(rest.origin()), admission).unwrap()
+    // The executor token must match the admission row's token key: main #117
+    // binds the durable lane to one token, so a shared-token executor against
+    // a per-test admission row fails closed with a token mismatch.
+    ActionExecutor::with_admission(token.into(), Some(rest.origin()), admission).unwrap()
 }
 
 #[tokio::test]
@@ -1055,8 +1056,8 @@ async fn rsvp_lookup_and_completion_edit_wait_out_lane_hold() {
     let rest = handoff_rest(Arc::clone(&seen)).await;
     let admission: Arc<dyn SendAdmission> =
         Arc::new(PgSendAdmission::new(db.pool.clone(), "mock-token-lookup").unwrap());
-    let holder = governed_executor(&rest, Arc::clone(&admission));
-    let worker = governed_executor(&rest, Arc::clone(&admission));
+    let holder = governed_executor(&rest, Arc::clone(&admission), "mock-token-lookup");
+    let worker = governed_executor(&rest, Arc::clone(&admission), "mock-token-lookup");
     // Occupy the lane with a first lookup whose delayed response holds it.
     let occupied = tokio::spawn(async move { holder.get_scheduled_event(GUILD, EVENT).await });
     wait_flag(&seen).await;
@@ -1078,7 +1079,7 @@ async fn rsvp_lookup_and_completion_edit_wait_out_lane_hold() {
     // Same handoff shape for the completion PATCH: occupy the lane again and
     // require the final edit to wait instead of losing the RSVP reply.
     seen.store(false, Ordering::Release);
-    let holder = governed_executor(&rest, Arc::clone(&admission));
+    let holder = governed_executor(&rest, Arc::clone(&admission), "mock-token-lookup");
     let occupied = tokio::spawn(async move { holder.get_scheduled_event(GUILD, EVENT).await });
     wait_flag(&seen).await;
     let start = tokio::time::Instant::now();
@@ -1128,8 +1129,8 @@ async fn receipt_callback_total_stays_inside_absolute_budget() {
     .await;
     let admission: Arc<dyn SendAdmission> =
         Arc::new(PgSendAdmission::new(db.pool.clone(), "mock-token-total").unwrap());
-    let holder = governed_executor(&rest, Arc::clone(&admission));
-    let worker = governed_executor(&rest, Arc::clone(&admission));
+    let holder = governed_executor(&rest, Arc::clone(&admission), "mock-token-total");
+    let worker = governed_executor(&rest, Arc::clone(&admission), "mock-token-total");
     let occupied = tokio::spawn(async move { holder.get_scheduled_event(GUILD, EVENT).await });
     wait_flag(&seen).await;
     let deferred = InteractionResponse {

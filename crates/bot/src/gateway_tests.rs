@@ -422,6 +422,28 @@ async fn wait_sequence(store: &GatewaySessionStore, sequence: u64) {
     .expect("checkpoint deadline");
 }
 
+/// Fence wait for tests whose later dispatches commit back-to-back with the
+/// awaited one: a 10 ms poller can miss an exact sequence when the worker
+/// commits the next dispatch microseconds later, so waiting for at least the
+/// sequence asserts the cursor fenced past it without the skip race.
+async fn wait_sequence_at_least(store: &GatewaySessionStore, sequence: u64) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if store
+                .load()
+                .await
+                .expect("load")
+                .is_some_and(|saved| saved.sequence >= sequence)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("checkpoint deadline");
+}
+
 // A visible checkpoint precedes the runner's in-memory readiness update.
 async fn wait_connected(state: &RwLock<GatewayState>) {
     tokio::time::timeout(Duration::from_secs(20), async {
