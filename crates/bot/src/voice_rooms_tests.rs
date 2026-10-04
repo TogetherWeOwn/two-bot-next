@@ -1366,7 +1366,12 @@ async fn create_request_strips_inherited_manage_roles_from_every_overwrite() {
                 {
                     let mut creators = store.creators.lock().unwrap();
                     creators[0].permission_source = source;
+                    creators[0].permission_channel_id = match source {
+                        PermissionSource::Channel(id) => Some(id),
+                        _ => None,
+                    };
                     creators[0].private_default = private;
+                    creators[0].validate().unwrap();
                 }
                 let source_id = match source {
                     PermissionSource::Creator => CREATOR,
@@ -1429,6 +1434,11 @@ async fn create_request_strips_inherited_manage_roles_from_every_overwrite() {
                 let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
                 join(&mut worker, MEMBER);
                 dispatch(&mut worker, 0).await;
+                assert!(
+                    worker.failures().is_empty(),
+                    "source={source:?}, private={private}, inherited_bot={inherited_bot}: {:?}",
+                    worker.failures()
+                );
                 dispatch(&mut worker, 1).await;
                 assert_eq!(
                     *trace.lock().unwrap(),
