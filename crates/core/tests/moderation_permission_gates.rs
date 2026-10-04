@@ -122,7 +122,7 @@ fn policy_request(
             permissions,
         },
         target: Some(target),
-        bot_highest_role_position: Some(100),
+        bot_highest_role_position: 100,
         reason: "parity gate fixture".to_owned(),
         duration_seconds: None,
         count: None,
