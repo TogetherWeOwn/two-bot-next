@@ -5,10 +5,40 @@
 
 use sqlx::{PgConnection, PgPool};
 use two_bot_core::gateway_funnel::{FunnelBatch, SnapshotWrite};
-use two_bot_core::gateway_session::{dispatch_action, DispatchAction, GatewaySession};
+use two_bot_core::gateway_session::{
+    dispatch_action, BootDirective, DispatchAction, GatewaySession,
+};
 use two_bot_core::{format_iso_millis, idempotency_key, FunnelEvent};
 
 use crate::db::{project_event, FunnelWrite};
+
+/// A captured feature job, not a second owner of membership funnel facts.
+/// Payloads must contain data only, never credentials or callback tokens.
+pub struct GatewayJob {
+    pub payload: String,
+    pub occurred_at_ms: i64,
+}
+
+pub struct ClaimedGatewayJob {
+    pub id: i64,
+    pub payload: String,
+    pub occurred_at_ms: i64,
+}
+
+/// Operator view of the one-shot force-fresh directive for this key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForceIdentifyStatus {
+    pub armed_at_ms: i64,
+    pub reason: String,
+    pub consumed_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArmOutcome {
+    Armed,
+    /// A pending directive already exists; it was left unchanged.
+    AlreadyArmed,
+}
 
 #[derive(Clone)]
 pub struct GatewaySessionStore {
@@ -49,6 +79,84 @@ impl GatewaySessionStore {
         .transpose()
     }
 
+    /// Boot read: one transaction locks this key's pending directive
+    /// (`FOR UPDATE`), reads the checkpoint and consumes the directive. A
+    /// concurrent boot read waits on the row lock, then re-checks
+    /// `consumed_at IS NULL` and finds nothing armed. The checkpoint is only
+    /// read; whether to clear it stays the caller's boot policy.
+    pub async fn load_for_boot(
+        &self,
+    ) -> Result<(Option<GatewaySession>, BootDirective), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let armed: Option<i32> = sqlx::query_scalar(
+            "SELECT shard_id FROM gateway_boot_directives
+             WHERE guild_id = $1 AND shard_id = $2 AND consumed_at IS NULL FOR UPDATE",
+        )
+        .bind(&self.guild_id)
+        .bind(self.shard_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let saved = self.read(&mut tx).await?;
+        let directive = if armed.is_some() {
+            sqlx::query(
+                "UPDATE gateway_boot_directives SET consumed_at = now()
+                 WHERE guild_id = $1 AND shard_id = $2 AND consumed_at IS NULL",
+            )
+            .bind(&self.guild_id)
+            .bind(self.shard_id)
+            .execute(&mut *tx)
+            .await?;
+            BootDirective::ForceIdentify
+        } else {
+            BootDirective::None
+        };
+        tx.commit().await?;
+        Ok((saved, directive))
+    }
+
+    /// Arms the next boot of this key to IDENTIFY whatever the checkpoint's
+    /// age. A pending directive is kept as it is; a consumed one is re-armed.
+    /// Never deletes or rewrites the `gateway_sessions` row.
+    pub async fn arm_force_identify(&self, reason: &str) -> Result<ArmOutcome, sqlx::Error> {
+        let armed = sqlx::query(
+            "INSERT INTO gateway_boot_directives (guild_id, shard_id, armed_at, reason)
+             VALUES ($1, $2, now(), $3)
+             ON CONFLICT (guild_id, shard_id) DO UPDATE SET
+             armed_at = EXCLUDED.armed_at, reason = EXCLUDED.reason, consumed_at = NULL
+             WHERE gateway_boot_directives.consumed_at IS NOT NULL",
+        )
+        .bind(&self.guild_id)
+        .bind(self.shard_id)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(if armed.rows_affected() == 1 {
+            ArmOutcome::Armed
+        } else {
+            ArmOutcome::AlreadyArmed
+        })
+    }
+
+    /// Read-only: the directive row for this key, armed or consumed.
+    pub async fn force_identify_status(&self) -> Result<Option<ForceIdentifyStatus>, sqlx::Error> {
+        let row: Option<(i64, String, Option<i64>)> = sqlx::query_as(
+            "SELECT floor(extract(epoch FROM armed_at) * 1000)::bigint, reason,
+                    floor(extract(epoch FROM consumed_at) * 1000)::bigint
+             FROM gateway_boot_directives WHERE guild_id = $1 AND shard_id = $2",
+        )
+        .bind(&self.guild_id)
+        .bind(self.shard_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(armed_at_ms, reason, consumed_at_ms)| ForceIdentifyStatus {
+                armed_at_ms,
+                reason,
+                consumed_at_ms,
+            },
+        ))
+    }
+
     pub async fn clear(&self) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM gateway_sessions WHERE guild_id = $1 AND shard_id = $2")
             .bind(&self.guild_id)
@@ -65,6 +173,19 @@ impl GatewaySessionStore {
         session: &GatewaySession,
         batch: FunnelBatch,
     ) -> Result<DispatchAction, sqlx::Error> {
+        self.commit_dispatch_with_job(session, batch, None)
+            .await
+            .map(|(action, _)| action)
+    }
+
+    /// The captured pre-pipeline state becomes durable in the same transaction
+    /// as the S3 facts and checkpoint. Restart recovery does not depend on cache.
+    pub async fn commit_dispatch_with_job(
+        &self,
+        session: &GatewaySession,
+        batch: FunnelBatch,
+        job: Option<GatewayJob>,
+    ) -> Result<(DispatchAction, Option<i64>), sqlx::Error> {
         let sequence =
             i64::try_from(session.sequence).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
         let mut tx = self.pool.begin().await?;
@@ -78,8 +199,41 @@ impl GatewaySessionStore {
             == DispatchAction::Duplicate
         {
             tx.rollback().await?;
-            return Ok(DispatchAction::Duplicate);
+            return Ok((DispatchAction::Duplicate, None));
         }
+        let job_id = if let Some(job) = job {
+            let queued: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM gateway_onboarding_jobs
+                 WHERE guild_id = $1 AND shard_id = $2
+                 AND state IN ('pending', 'running', 'failed')",
+            )
+            .bind(&self.guild_id)
+            .bind(self.shard_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if queued >= 32 {
+                return Err(sqlx::Error::InvalidArgument(
+                    "onboarding durable queue capacity exceeded; checkpoint unchanged".into(),
+                ));
+            }
+            Some(
+                sqlx::query_scalar::<_, i64>(
+                    "INSERT INTO gateway_onboarding_jobs
+                 (guild_id, shard_id, session_id, seq, occurred_at_ms, payload)
+                 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+                )
+                .bind(&self.guild_id)
+                .bind(self.shard_id)
+                .bind(&session.session_id)
+                .bind(sequence)
+                .bind(job.occurred_at_ms)
+                .bind(job.payload)
+                .fetch_one(&mut *tx)
+                .await?,
+            )
+        } else {
+            None
+        };
         for (guild_id, member_id) in batch.bots {
             if guild_id.to_string() != self.guild_id {
                 return Err(sqlx::Error::InvalidArgument(
@@ -216,7 +370,84 @@ impl GatewaySessionStore {
             .bind(sequence).bind(&session.resume_url).bind(session.updated_at_ms)
             .execute(&mut *tx).await?;
         tx.commit().await?;
-        Ok(DispatchAction::Apply)
+        Ok((DispatchAction::Apply, job_id))
+    }
+
+    /// A single shard owner calls this once at boot, never while its workers run.
+    /// Running rows survived a process interruption; retry at most three times.
+    pub async fn recover_onboarding_jobs(&self) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE gateway_onboarding_jobs SET
+             state = CASE WHEN attempts >= 3 THEN 'failed' ELSE 'pending' END
+             WHERE guild_id = $1 AND shard_id = $2 AND state = 'running'",
+        )
+        .bind(&self.guild_id)
+        .bind(self.shard_id)
+        .execute(&self.pool)
+        .await?;
+        let failed: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM gateway_onboarding_jobs
+             WHERE guild_id = $1 AND shard_id = $2 AND state = 'failed')",
+        )
+        .bind(&self.guild_id)
+        .bind(self.shard_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if failed {
+            return Err(sqlx::Error::InvalidArgument(
+                "onboarding delivery attempt limit reached; recovery requires corrected cause"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn claim_onboarding_job(&self) -> Result<Option<ClaimedGatewayJob>, sqlx::Error> {
+        let row: Option<(i64, String, i64)> = sqlx::query_as(
+            "UPDATE gateway_onboarding_jobs SET state = 'running', attempts = attempts + 1
+             WHERE id = (SELECT id FROM gateway_onboarding_jobs
+                 WHERE guild_id = $1 AND shard_id = $2 AND state = 'pending' AND attempts < 3
+                 ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
+             RETURNING id, payload, occurred_at_ms",
+        )
+        .bind(&self.guild_id)
+        .bind(self.shard_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(id, payload, occurred_at_ms)| ClaimedGatewayJob {
+            id,
+            payload,
+            occurred_at_ms,
+        }))
+    }
+
+    /// Retain only a delivery receipt on terminal outcomes. In particular, a
+    /// token-free interrupted-interaction receipt is not a successful reply.
+    pub async fn finish_onboarding_job(
+        &self,
+        id: i64,
+        interrupted: bool,
+    ) -> Result<(), sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE gateway_onboarding_jobs SET state = $4, payload = NULL
+             WHERE id = $1 AND guild_id = $2 AND shard_id = $3 AND state = 'running'",
+        )
+        .bind(id)
+        .bind(&self.guild_id)
+        .bind(self.shard_id)
+        .bind(if interrupted {
+            "interrupted"
+        } else {
+            "completed"
+        })
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(sqlx::Error::InvalidArgument(
+                "onboarding delivery receipt missing".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn invite_snapshots(&self) -> Result<Vec<two_bot_core::InviteState>, sqlx::Error> {

@@ -3,11 +3,14 @@
 //! Ports legacy `two-bot` at `d5d1179348feb9157bcac8c875de9399d4f5c76a`:
 //! `src/moderation/{containment,containmentStore,containmentDiscord}.ts`.
 //! Inputs are explicit timestamps, claimed evidence, incidents and role snapshots.
-//! This module neither claims durable records nor executes Discord requests.
-//! The future adapter must serialize claims and enforce the staging/identity
-//! fence before executing a plan; see `docs/containment.md`.
+//! This module neither claims durable records nor executes Discord requests;
+//! `containment_store` serializes claims. The future adapter must enforce the
+//! staging/identity fence before executing a plan; see `docs/containment.md`.
 
 use std::collections::HashSet;
+
+use crate::onboarding::MentionPolicy;
+use crate::raid::StaffAlertMessage;
 
 pub const DEFAULT_CONTAINMENT_WINDOW_MS: i64 = 60_000;
 pub const DEFAULT_CONTAINMENT_MAX_AGE_MS: i64 = 120_000;
@@ -23,6 +26,21 @@ pub const DANGEROUS_PERMISSIONS: u64 = (1 << 1) // KickMembers
     | (1 << 28) // ManageRoles
     | (1 << 40); // ModerateMembers
 
+/// Always-logged staff-alert event names (parity §8).
+///
+/// The adapter must log [`CONTAINMENT_ALERT_EVENT`] with the alert content for
+/// every `Alert` signal, even when no staff channel is configured or delivery
+/// fails — mirroring legacy `containmentAlert.post`, which logs before any
+/// channel check. A `Suppressed` signal (repeat offence inside the
+/// per-executor cooldown) must still be logged under
+/// [`CONTAINMENT_SUPPRESSED_EVENT`] with guild/executor/heat/threshold fields,
+/// but must not produce a second staff post. `Quiet` logs nothing.
+pub const CONTAINMENT_ALERT_EVENT: &str = "containment_alert";
+pub const CONTAINMENT_SUPPRESSED_EVENT: &str = "containment_alert_suppressed";
+/// IDs listed inline in the staff text before `…and N more` truncation,
+/// mirroring legacy `removedRoleIds.slice(0, 20)`.
+pub const CONTAINMENT_ALERT_MAX_IDS: usize = 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DestructiveAction {
     MemberKick,
@@ -35,6 +53,21 @@ pub enum DestructiveAction {
 }
 
 impl DestructiveAction {
+    /// Legacy wire name (`member.kick`, `channel.delete`, …). Used in the
+    /// staff alert only; never free user text.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MemberKick => "member.kick",
+            Self::MemberBan => "member.ban",
+            Self::ChannelDelete => "channel.delete",
+            Self::RoleDelete => "role.delete",
+            Self::WebhookCreate => "webhook.create",
+            Self::WebhookUpdate => "webhook.update",
+            Self::WebhookDelete => "webhook.delete",
+        }
+    }
+
     /// Unsupported actions never acquire a destructive weight.
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
@@ -174,6 +207,17 @@ impl ContainmentPolicy {
         })
     }
 
+    /// Occurrence-heat window; also the incident cooldown from processing time.
+    #[must_use]
+    pub fn window_ms(&self) -> i64 {
+        self.window_ms
+    }
+
+    #[must_use]
+    pub fn heat_threshold(&self) -> u64 {
+        self.heat_threshold
+    }
+
     #[must_use]
     pub fn disposition(
         &self,
@@ -286,18 +330,48 @@ impl ContainmentPolicy {
         incidents: &[ContainmentIncident],
         now_ms: i64,
     ) -> Option<ContainmentIncident> {
+        match self.signal(trigger, evidence, incidents, now_ms) {
+            ContainmentSignal::Alert(incident) => Some(incident),
+            ContainmentSignal::Suppressed { .. } | ContainmentSignal::Quiet => None,
+        }
+    }
+
+    /// Per-executor cooldown signal with a still-logged suppression proof.
+    ///
+    /// `Alert` carries the same proposal `incident_candidate` would return.
+    /// `Suppressed` means heat reached threshold but a same-guild/executor
+    /// incident is still blocking: the adapter must log (see
+    /// [`CONTAINMENT_SUPPRESSED_EVENT`]) and must not post a second staff
+    /// alert. `Quiet` means below threshold or unattributable: no log and no
+    /// post. Cooldowns are isolated by guild *and* executor; expiry releases
+    /// every state except `Uncertain` (see [`ContainmentIncident::blocks`]).
+    #[must_use]
+    pub fn signal(
+        &self,
+        trigger: &ClaimedContainmentEvent,
+        evidence: &[ClaimedContainmentEvent],
+        incidents: &[ContainmentIncident],
+        now_ms: i64,
+    ) -> ContainmentSignal {
         let heat = self.occurrence_heat(trigger, evidence, now_ms);
         if heat < self.heat_threshold {
-            return None;
+            return ContainmentSignal::Quiet;
         }
-        let executor = trigger.event.executor_id.as_deref()?;
+        let Some(executor) = trigger.event.executor_id.as_deref() else {
+            return ContainmentSignal::Quiet;
+        };
         if incidents
             .iter()
             .any(|incident| incident.blocks(&trigger.event.guild_id, executor, now_ms))
         {
-            return None;
+            return ContainmentSignal::Suppressed {
+                guild_id: trigger.event.guild_id.clone(),
+                executor_id: executor.to_owned(),
+                heat,
+                threshold: self.heat_threshold,
+            };
         }
-        Some(ContainmentIncident {
+        ContainmentSignal::Alert(ContainmentIncident {
             id: trigger.event.audit_entry_id.clone(),
             guild_id: trigger.event.guild_id.clone(),
             executor_id: executor.to_owned(),
@@ -329,6 +403,21 @@ pub struct ContainmentIncident {
     pub cooldown_until_ms: i64,
 }
 
+impl ContainmentIncidentState {
+    /// Legacy `completeIncident` outcome spelling used in the staff alert head.
+    #[must_use]
+    pub fn outcome_label(self) -> &'static str {
+        match self {
+            Self::Containing => "containing",
+            Self::Contained => "contained",
+            Self::DryRun => "dry_run",
+            Self::Refused => "refused",
+            Self::Uncertain => "uncertain",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 impl ContainmentIncident {
     #[must_use]
     pub fn blocks(&self, guild_id: &str, executor_id: &str, now_ms: i64) -> bool {
@@ -336,6 +425,138 @@ impl ContainmentIncident {
             && self.executor_id == executor_id
             && (self.state == ContainmentIncidentState::Uncertain
                 || self.cooldown_until_ms > now_ms)
+    }
+}
+
+/// Per-executor cooldown signal. The adapter must log `Alert` under
+/// [`CONTAINMENT_ALERT_EVENT`] (with the staff text) and `Suppressed` under
+/// [`CONTAINMENT_SUPPRESSED_EVENT`]; `Quiet` logs nothing. Only `Alert`
+/// authorizes a staff-channel post, and that post must use
+/// [`ContainmentAlert::staff_message`] (`MentionPolicy::None`: empty parse,
+/// no explicit recipients, no DMs/pings).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContainmentSignal {
+    Alert(ContainmentIncident),
+    Suppressed {
+        guild_id: String,
+        executor_id: String,
+        heat: u64,
+        threshold: u64,
+    },
+    Quiet,
+}
+
+impl ContainmentSignal {
+    #[must_use]
+    pub fn log_event(&self) -> Option<&'static str> {
+        match self {
+            Self::Alert(_) => Some(CONTAINMENT_ALERT_EVENT),
+            Self::Suppressed { .. } => Some(CONTAINMENT_SUPPRESSED_EVENT),
+            Self::Quiet => None,
+        }
+    }
+
+    #[must_use]
+    pub fn staff_post_required(&self) -> bool {
+        matches!(self, Self::Alert(_))
+    }
+}
+
+/// Staff-alert proposal, not permission to post. Mirrors legacy
+/// `formatContainmentAlert` (`src/discord/containmentAlert.ts`, blob
+/// `b3a0e19e6a4230748459b962ae6efd5829005c78`): the head, executor/action/
+/// target line, removed-role line (capped at [`CONTAINMENT_ALERT_MAX_IDS`]),
+/// restore line, and flag-only footer. Only snowflake IDs, the legacy wire
+/// action name, heat/threshold counters and the outcome label appear here —
+/// never tokens, options, or user text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainmentAlert {
+    pub guild_id: String,
+    pub executor_id: Option<String>,
+    pub action: DestructiveAction,
+    pub target_id: Option<String>,
+    pub heat: u64,
+    pub threshold: u64,
+    pub outcome: ContainmentIncidentState,
+    pub removed_role_ids: Vec<String>,
+}
+
+impl ContainmentAlert {
+    /// Build the proposal from the completed incident and its trigger. The
+    /// adapter supplies the post-execution `outcome` and confirmed removals;
+    /// `heat`/`threshold` come from the incident proposal.
+    #[must_use]
+    pub fn from_trigger(
+        trigger: &DestructiveAuditEvent,
+        heat: u64,
+        threshold: u64,
+        outcome: ContainmentIncidentState,
+        removed_role_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            guild_id: trigger.guild_id.clone(),
+            executor_id: trigger.executor_id.clone(),
+            action: trigger.action,
+            target_id: trigger.target_id.clone(),
+            heat,
+            threshold,
+            outcome,
+            removed_role_ids,
+        }
+    }
+
+    /// Pinned staff text with [`MentionPolicy::None`]. The executor must send
+    /// with empty mention parsing and no explicit recipients.
+    #[must_use]
+    pub fn staff_message(&self) -> StaffAlertMessage {
+        let executor = self.executor_id.as_deref().unwrap_or("unknown");
+        let target = self.target_id.as_deref().unwrap_or("unknown");
+        let removed = if self.removed_role_ids.is_empty() {
+            "No role removal was confirmed.".to_owned()
+        } else {
+            let listed: Vec<String> = self
+                .removed_role_ids
+                .iter()
+                .take(CONTAINMENT_ALERT_MAX_IDS)
+                .map(|id| format!("`{id}`"))
+                .collect();
+            let extra = self
+                .removed_role_ids
+                .len()
+                .saturating_sub(CONTAINMENT_ALERT_MAX_IDS);
+            let suffix = if extra > 0 {
+                format!(" …and {extra} more")
+            } else {
+                String::new()
+            };
+            format!(
+                "Removed dangerous roles ({}): {}{}.",
+                self.removed_role_ids.len(),
+                listed.join(" "),
+                suffix
+            )
+        };
+        let content = [
+            format!(
+                "**Anti-nuke {}** — destructive heat {}/{}.",
+                self.outcome.outcome_label(),
+                self.heat,
+                self.threshold
+            ),
+            format!(
+                "Executor: `{executor}` · action: `{}` · target: `{target}`.",
+                self.action.as_str()
+            ),
+            removed,
+            "Restore check: unavailable.".to_owned(),
+            String::new(),
+            "No member join was kicked or banned by this feature. Verify the executor and run the guarded staging restore procedure if drift is reported.".to_owned(),
+        ]
+        .join("\n");
+        StaffAlertMessage {
+            content,
+            mentions: MentionPolicy::None,
+        }
     }
 }
 

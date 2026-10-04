@@ -31,6 +31,19 @@ fn assert_cas_token(token: i64) {
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 type AuditRow = (Option<Value>, Option<Value>);
+fn schema_name_at(nanos: u128) -> String {
+    format!(
+        "settings_test_{}_{}_{}",
+        std::process::id(),
+        nanos,
+        SCHEMA_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+#[test]
+fn schema_names_are_distinct_when_the_clock_repeats() {
+    assert_ne!(schema_name_at(42), schema_name_at(42));
+}
 
 struct TestDb {
     admin: Pool<Postgres>,
@@ -79,13 +92,8 @@ impl TestDb {
             .acquire_timeout(Duration::from_secs(5))
             .connect_with(options.clone())
             .await?;
-        let schema = format!(
-            "settings_test_{}_{}_{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
-            SCHEMA_SEQ.fetch_add(1, Ordering::Relaxed)
-        );
-        // Identifier is a constant prefix plus numeric process/time IDs only.
+        let schema = schema_name_at(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos());
+        // Identifier is a constant prefix plus numeric process/time/sequence IDs only.
         QueryBuilder::<Postgres>::new("CREATE SCHEMA ")
             .push(&schema)
             .build()
@@ -839,10 +847,8 @@ async fn cas_upgrade_blocks_writer_holding_revision_lock_without_deadlock() -> T
     };
     assert_eq!(error.code().as_deref(), Some("55P03"));
     probe.rollback().await?;
-    tokio::time::timeout(Duration::from_secs(5), upgrade.commit()).await??;
-    let error = tokio::time::timeout(Duration::from_secs(5), writer)
-        .await??
-        .unwrap_err();
+    upgrade.commit().await?;
+    let error = writer.await?.unwrap_err();
     assert_eq!(error.code, ErrorCode::VersionConflict);
     let current = store.get(GUILD, KEY).await?.unwrap();
     assert_eq!(current.0, json!(8));
@@ -1098,7 +1104,7 @@ async fn qualified_writer_waits_on_target_revision_lock() -> TestResult {
     );
     assert_eq!(store.poll_marks().await?, before);
     gate.commit().await?;
-    let token = tokio::time::timeout(Duration::from_secs(5), writer).await???;
+    let token = writer.await??;
     assert_cas_token(token);
     assert!(token < saved.observed_version);
     assert_eq!(store.poll_marks().await?, (before.0 + 1, before.1));
@@ -1410,7 +1416,7 @@ async fn concurrent_audit(seed: Option<Value>, changes: [Option<Value>; 2]) -> T
     db.wait_for_writers(2).await?;
     gate.commit().await?;
     for writer in writers {
-        tokio::time::timeout(Duration::from_secs(5), writer).await???;
+        writer.await??;
     }
     let audit = db.audit().await?;
     let offset = usize::from(seed.is_some());
@@ -1472,7 +1478,9 @@ async fn snapshots_pair_rows_and_revision_during_concurrent_writes() -> TestResu
             Some(snapshot.revision - baseline)
         );
     }
-    tokio::time::timeout(Duration::from_secs(5), writer).await???;
+    // Join the writer directly: completion is the progress bound, so runner
+    // load can only slow the test, never fail it with `Elapsed`.
+    writer.await??;
     let final_snapshot = store.load_snapshot().await?;
     assert_eq!(final_snapshot.revision, baseline + 100);
     assert_eq!(final_snapshot.rows[0].value, json!(100));

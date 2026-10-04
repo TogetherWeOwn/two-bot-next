@@ -8,10 +8,13 @@
 //! `backfill --dry-run` reports and writes nothing. Env: `DISCORD_TOKEN` (or
 //! `DISCORD_BOT_TOKEN`), `DISCORD_GUILD_ID`, `TWO_DATABASE_URL`.
 
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
+
 use std::collections::HashSet;
 use twilight_model::channel::ChannelType;
 use twilight_model::id::Id;
-use two_bot_cutover::cli::{open_db, Args};
+use two_bot_cutover::cli::{open_db, Args, ScanReport};
 use two_bot_cutover::{
     mark_bot, member_log_kind_for_channel, parse_member_log_message, parse_voice_message,
     plan_backfill_merge, record_earliest, record_event, touch_activity, DedupableEvent, EmbedView,
@@ -84,7 +87,12 @@ async fn main() {
     }
 
     let t0 = std::time::Instant::now();
-    let rest = RestClient::with_proxy(token, args.values.get("discord-base").cloned());
+    let rest = RestClient::from_env(token, args.values.get("discord-base").cloned())
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("send admission bootstrap failed: {error}");
+            std::process::exit(1);
+        });
     let db = open_db(&args, false).await;
     let guild: Id<twilight_model::id::marker::GuildMarker> = Id::new(guild_id.parse().unwrap_or(0));
 
@@ -167,6 +175,7 @@ async fn main() {
     let mut log_leaves: Vec<DedupableEvent> = Vec::new();
     let mut voice_events: Vec<FunnelWrite> = Vec::new();
     let mut truncated: Vec<String> = Vec::new();
+    let mut scan_report = ScanReport::default();
     let mut scanned_messages = 0usize;
     let mut oldest_seen: Option<String> = None;
     let mut skipped = 0usize;
@@ -179,9 +188,14 @@ async fn main() {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("probe of #{name} failed: {e}");
+                scan_report.record(&name, two_bot_cutover::ScanCompletion::RequestFailed);
                 continue;
             }
         };
+        if probe.completion.interrupted() {
+            scan_report.record(&name, probe.completion);
+            continue;
+        }
         let probe_views: Vec<MessageView> = probe.messages.iter().map(to_message_view).collect();
         let hits = probe_views
             .iter()
@@ -210,16 +224,18 @@ async fn main() {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("scan of #{name} failed: {e}");
+                scan_report.record(&name, two_bot_cutover::ScanCompletion::RequestFailed);
                 continue;
             }
         };
+        scan_report.record(&name, page.completion);
+        if page.truncated {
+            truncated.push(name.clone());
+        }
         if page.messages.is_empty() {
             continue;
         }
         scanned_messages += page.messages.len();
-        if page.truncated {
-            truncated.push(name.clone());
-        }
         if let Some(back) = page.scanned_back_to {
             if oldest_seen.as_ref().is_none_or(|o| back < *o) {
                 oldest_seen = Some(back);
@@ -446,6 +462,7 @@ async fn main() {
         println!("  already on file      {already:>5}   (re-run is a no-op, as intended)");
     }
     println!("  invites              {invite_note}");
+    print!("{}", scan_report.render());
     if !truncated.is_empty() {
         println!(
             "\n  INCOMPLETE: hit the {max_pages}-page cap on {}. There is older history we did not read. Re-run with --max-pages={}.",

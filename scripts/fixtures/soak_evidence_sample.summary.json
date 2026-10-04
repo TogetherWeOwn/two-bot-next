@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "window": {
+    "start": "2026-09-20T00:00:01+00:00",
+    "end": "2026-09-20T00:00:26+00:00"
+  },
+  "connects": 2,
+  "disconnects": 1,
+  "resumes": 1,
+  "dispatches": 6,
+  "missed_sequence_windows": [
+    {
+      "session": "s1",
+      "expected_after": 3,
+      "received": 6,
+      "count": 2,
+      "at": "2026-09-20T00:00:05+00:00"
+    }
+  ],
+  "missed_events": 2,
+  "unknown_intervals": [
+    {
+      "start": "2026-09-20T00:00:22+00:00",
+      "end": "2026-09-20T00:00:25+00:00",
+      "reason": "log gap: supervisor restart"
+    },
+    {
+      "start": "2026-09-20T00:00:26+00:00",
+      "end": "2026-09-20T00:00:26+00:00",
+      "reason": "unrecognised event 'heartbeat_oops'"
+    }
+  ],
+  "redeploy_gaps_s": [
+    12.0
+  ],
+  "max_redeploy_gap_s": 12.0,
+  "redeploy_gap_budget_s": 60,
+  "verdict": "NEEDS WORK"
+}

@@ -60,3 +60,44 @@ environment. Names only — values never go in cards, logs, or PRs:
 - Redeploy RESUME/IDENTIFY gap measured (deploy finish to first `/readyz`
   200) and within budget: **under 60 s** (one guild, fast IDENTIFY).
 - `lite` placement confirmed by B1's RSS measurement.
+
+## Waiver ledger (B4 parity sign-off)
+
+Cutover preconditions ([cutover.md](cutover.md)) require every non-DROP
+parity behavior to have merged wiring plus acceptance evidence, **or an
+explicitly approved waiver**. Writing a waiver down is not approval: a
+`waived` checklist entry is a *proposed* waiver of staging execution only.
+Parity coverage stays, and the row remains unresolved (`NEEDS WORK`) until
+B4 records acceptance — reason, accepting actor and the owning slice's
+isolated fixture evidence — on [TOG-9699](/TOG/issues/TOG-9699).
+
+The ledger is machine-checked, not prose:
+
+- Authoritative: `docs/soak-checklist.json` — one entry per non-DROP parity
+  row in `docs/parity.md` §§1–8 (pure `DROP` rows are not ported, so they
+  carry no soak obligation; mixed mapped/`DROP` rows stay covered), per §12
+  addition under the same rule, and per non-`dropped` §13 ledger row
+  (history-rewrite replays are `dropped`). §12/§13 entries name their
+  `owner` cards, which must match the cards in the parity disposition.
+- Rendered: `docs/soak-checklist.md` (regenerate with
+  `python3 scripts/check_soak_checklist.py --render` after editing JSON).
+- Gate (offline, runs in CI before Cargo):
+  `python3 scripts/check_soak_checklist.py` plus
+  `python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v`.
+  Any unmapped row, any missing or stale owner card, any `waived` entry
+  without **both** `reason` and `approver`, or any Markdown drift fails the
+  gate.
+
+Every `waived` entry carries `reason` and `approver`. The first waivers,
+filed under [TOG-12140](/TOG/issues/TOG-12140), cover the 25 rows staging
+cannot exercise — data-plane/operator paths (backup timers, DB stores,
+internal actions, Postgres guards) and the DROP-adjacent rows
+(`community_facts` with its dropped rota extensions, operator-script
+runtime drops) — all with `approver: pending — CEO/DoE acceptance on
+[TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)`.
+
+Accepting a waiver means replacing `pending` with the accepting actor, the
+decision reference and the attached fixture receipt. Moderation,
+automation, scheduled unbans and internal actions cannot be silently
+waived: their entries still require that explicit acceptance plus the
+owning slice's fixture evidence — until then they stay `NEEDS WORK`.

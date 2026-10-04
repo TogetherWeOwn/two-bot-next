@@ -77,12 +77,41 @@ impl PromptGuard {
     /// Call only when Discord has accepted the welcome. No failed sends or
     /// log-only dry runs may count as prompted. Returns the insert result.
     pub async fn record_sent(
-        mut self,
+        self,
         channel_id: &str,
         occurred_at: &str,
     ) -> Result<bool, OnboardingStoreError> {
+        self.record_success(channel_id, occurred_at, false).await
+    }
+
+    /// An anchor welcome is also a successful route. Commit both rows under
+    /// the prompt lock, so a failed route insert cannot consume the marker.
+    pub async fn record_anchor_sent(
+        self,
+        channel_id: &str,
+        occurred_at: &str,
+    ) -> Result<bool, OnboardingStoreError> {
+        self.record_success(channel_id, occurred_at, true).await
+    }
+
+    async fn record_success(
+        mut self,
+        channel_id: &str,
+        occurred_at: &str,
+        anchor: bool,
+    ) -> Result<bool, OnboardingStoreError> {
         let row = prompted_row(&self.guild_id, &self.member_id, channel_id, occurred_at);
         let inserted = insert_row(&mut self.transaction, &row).await?;
+        if inserted && anchor {
+            let routed = channel_routed_row(
+                &self.guild_id,
+                &self.member_id,
+                &[channel_id.to_owned()],
+                0,
+                occurred_at,
+            );
+            insert_row(&mut self.transaction, &routed).await?;
+        }
         self.transaction.commit().await?;
         Ok(inserted)
     }
@@ -161,6 +190,54 @@ pub async fn record_channel_routed(
             selection.degraded_count,
             occurred_at,
         ),
+    )
+    .await?)
+}
+
+/// Stage both game success rows in the caller's role-write transaction.
+/// The caller must commit only after the deferred reply succeeds. Any insert,
+/// reply, or commit failure then leaves neither successful-selection row.
+/// An empty destination list records the granted games but no successful route.
+pub async fn record_game_selection_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    guild_id: &str,
+    member_id: &str,
+    keys: &[String],
+    selection: &GameSelection,
+    occurred_at: &str,
+) -> Result<(), OnboardingStoreError> {
+    insert_row(
+        transaction,
+        &game_selected_row(guild_id, member_id, keys, occurred_at),
+    )
+    .await?;
+    if !selection.channel_ids.is_empty() {
+        insert_row(
+            transaction,
+            &channel_routed_row(
+                guild_id,
+                member_id,
+                &selection.channel_ids,
+                selection.degraded_count,
+                occurred_at,
+            ),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Stage roleless routing until the caller's deferred reply has succeeded.
+pub async fn record_session_routed_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    guild_id: &str,
+    member_id: &str,
+    plan: &SessionPlan,
+    occurred_at: &str,
+) -> Result<bool, OnboardingStoreError> {
+    Ok(insert_row(
+        transaction,
+        &session_routed_row(guild_id, member_id, plan, occurred_at),
     )
     .await?)
 }

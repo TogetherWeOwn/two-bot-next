@@ -1,0 +1,2642 @@
+//! Temporary voice-room name template engine (spec V5, `docs/voice-rooms.md`).
+//!
+//! Pure, dependency-free parser plus evaluator over [`RoomContext`]. This
+//! module knows nothing about Discord types: callers resolve display names,
+//! activities and room numbers into a [`RoomContext`] and get back a final
+//! channel name that is never empty and never over [`MAX_NAME_LEN`]
+//! characters.
+//!
+//! ## Template syntax (V5)
+//!
+//! ```text
+//! ##                  room number as `#N`
+//! $#                  room number, bare
+//! $0#, $00#, ...      room number, zero-padded (each extra `0` adds a digit)
+//! +#                  room number as a Roman numeral
+//! @@nato@@            room number as a NATO word (wraps after 26: `Alpha 2`)
+//! @@owner@@           room member's display name (`@@creator@@` is an alias)
+//! @@original_creator@@
+//! @@num@@             humans in the room
+//! @@num_others@@      humans excluding the owner
+//! @@num_live@@        members streaming
+//! @@limit@@           the user limit (`0` when unlimited)
+//! @@slots@@           free places left (blank when unlimited)
+//! @@game_name@@       majority game (two-way tie shows both, three-way tie
+//!                     shows the no-game label)
+//! @@stream_name@@     owner's stream title while live
+//! @@num_playing@@     largest party size, else members playing
+//! @@party_size@@      party maximum, falling back to the limit
+//! @@party_state@@ / @@party_details@@  from the largest party
+//! @@weekday@@ / @@month@@ / @@hour@@   guild time zone (default UTC)
+//! @@random_emoji@@    seeded emoji pick, stable across renames
+//! <<singular/plural>>       singular only with exactly one member
+//! <<singular\plural>>       counts members excluding the owner
+//! <<singular|plural>>       counts players in the largest party
+//! [[a/b/c]]           seeded pick from the options
+//! [[list:name]]       seeded pick from a named guild list
+//! __resting/in use__  standalone channels: split on the first `/` only,
+//!                     resting side when empty, in-use side when occupied
+//! ```
+//!
+//! Evaluation order: conditionals (innermost first) → token substitution →
+//! styling → trim → truncate to [`MAX_NAME_LEN`] characters → fallback name
+//! when empty.
+//!
+//! ## V6 extension point
+//!
+//! Conditionals (`{{cond ?? yes // no}}`) and styling (`""mode:text""`) are
+//! parsed into [`Segment::Extension`] nodes but evaluated through the
+//! [`ExtensionPolicy`] trait. V5 ships [`PassthroughExtensions`], which
+//! leaves them as literal text; [`crate::voice_template::TemplateExtensions`]
+//! implements the trait with the real V6 conditional and styling passes.
+
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+
+/// Maximum channel name length enforced by the evaluator.
+pub const MAX_NAME_LEN: usize = 100;
+
+/// Largest source parsed as syntax. Longer inputs are retained as literal text.
+pub const MAX_TEMPLATE_BYTES: usize = 4096;
+
+/// Maximum nested template bodies. Deeper inputs become entirely literal.
+/// This bounds parsing, rendering, display, cloning and dropping parsed ASTs.
+pub const MAX_TEMPLATE_DEPTH: usize = 64;
+
+/// Built-in fallback used when the configured fallback name is blank.
+pub const DEFAULT_FALLBACK_NAME: &str = "Voice Room";
+
+/// NATO alphabet words for the `@@nato@@` token, index 0 = room number 1.
+const NATO_WORDS: [&str; 26] = [
+    "Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel", "India", "Juliett",
+    "Kilo", "Lima", "Mike", "November", "Oscar", "Papa", "Quebec", "Romeo", "Sierra", "Tango",
+    "Uniform", "Victor", "Whiskey", "Xray", "Yankee", "Zulu",
+];
+
+/// Built-in emoji set for `@@random_emoji@@`, rolled from the room seed.
+const RANDOM_EMOJI: [&str; 24] = [
+    "🎮", "🎧", "🎤", "🎲", "🎯", "🎨", "🎭", "🎬", "🎸", "🎺", "🎻", "🥁", "🎹", "🏆", "⚔️", "🛡️",
+    "🚀", "🌙", "⭐", "🔥", "💎", "🍕", "☕", "🌊",
+];
+
+const WEEKDAY_NAMES: [&str; 7] = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+];
+
+const MONTH_NAMES: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// A parsed name template: an ordered list of [`Segment`]s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Template(pub Vec<Segment>);
+
+/// One parsed piece of a template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Segment {
+    /// Literal text, emitted unchanged. Adjacent literals are always merged,
+    /// so two parses of the same source produce identical segment lists.
+    Text(String),
+    /// A room-number token (`##`, `$#`, `$0#`, `+#`).
+    Number(NumberStyle),
+    /// A `@@name@@` token; the name is lowercased at parse time.
+    /// Unknown names evaluate to an empty string.
+    Token(String),
+    /// `<<singular/plural>>`, `<<singular\plural>>` or `<<singular|plural>>`.
+    /// Branches are sub-templates, split on the first separator only.
+    Plural {
+        singular: Template,
+        plural: Template,
+        counter: PluralCounter,
+        /// Preserve explicit separators, including those before an empty body.
+        has_separator: bool,
+    },
+    /// `[[a/b/c]]` seeded choice, or `[[list:name]]` seeded named-list pick.
+    Choice(Choice),
+    /// `__resting/in use__`, split on the first `/` only. Without a separator,
+    /// the single shared body is stored once (`in_use` is `None`).
+    /// Non-standalone channels preserve `source` literally.
+    Resting {
+        source: String,
+        resting: Template,
+        in_use: Option<Template>,
+    },
+    /// `{{...}}` or `""mode:text""`: opaque to V5, evaluated by the
+    /// [`ExtensionPolicy`].
+    Extension(Extension),
+}
+
+/// Room-number rendering styles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumberStyle {
+    /// `##` → `#N`.
+    Hash,
+    /// `$#`, `$0#`, `$00#`, … → bare or zero-padded to `width` digits.
+    Bare { width: usize },
+    /// `+#` → Roman numeral; above 3999, parentheses multiply by 1000
+    /// (`4000` → `(IV)`). Nested parentheses keep all u32 values compact.
+    Roman,
+}
+
+/// Which headcount a `<<singular/plural>>` block tests for "exactly one".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluralCounter {
+    /// All humans in the room.
+    Members,
+    /// Humans excluding the owner (`\` separator).
+    Others,
+    /// Players in the largest rich-presence party (`|` separator).
+    Party,
+}
+
+/// A `[[...]]` seeded choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Choice {
+    /// `[[a/b/c]]`: pick one option.
+    Options(Vec<Template>),
+    /// `[[list:name]]`: pick from a named guild list.
+    NamedList(String),
+}
+
+/// A V6 conditional or styling node, carried opaquely through V5.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Extension {
+    /// `{{...}}`: full source including the braces, plus the concatenated ASTs
+    /// of independently parsed branches, used only to reserve random positions.
+    /// Malformed syntax in one branch cannot consume the other branch's slots.
+    /// Condition truth remains the extension policy's job.
+    Conditional { source: String, body: Template },
+    /// `""modes:body""`: full source plus the split modes and body.
+    Styled {
+        source: String,
+        modes: String,
+        body: Template,
+    },
+}
+
+/// Largest-party snapshot for the party tokens.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartyInfo {
+    /// Players in the party.
+    pub size: u32,
+    /// Party maximum, if advertised.
+    pub max: Option<u32>,
+    /// Party state text.
+    pub state: String,
+    /// Party details text.
+    pub details: String,
+}
+
+/// Options for [`resolve_majority_game`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GameOptions {
+    /// Alias map: alternative title → canonical title (V7 fills this;
+    /// empty in V5).
+    pub aliases: HashMap<String, String>,
+    /// Force a single game, preferring the owner's.
+    pub force_single: bool,
+    /// Members with no visible activity swell the leading game's count,
+    /// collapsing near-ties toward the plurality leader (alphabetical).
+    pub count_idle_toward_majority: bool,
+    /// Label shown when no game wins (default `General`).
+    pub no_game_label: String,
+}
+
+/// Whether standalone-only resting syntax is enabled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChannelKind {
+    /// Temporary rooms leave resting blocks as literal text.
+    #[default]
+    Temporary,
+    /// Permanent voice/stage channels evaluate resting blocks by occupancy.
+    Standalone,
+}
+
+/// Everything the evaluator needs: plain data, no Discord types.
+///
+/// Display names are resolved by the caller (nicknames land in V7); the game
+/// title is the already-resolved majority game (see
+/// [`resolve_majority_game`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoomContext {
+    /// Standalone-only syntax is disabled by default for temporary rooms.
+    pub channel_kind: ChannelKind,
+    /// Room number `N` for the numbering tokens.
+    pub room_number: u32,
+    /// Owner's display name.
+    pub owner_name: String,
+    /// Original creator's display name.
+    pub original_creator_name: String,
+    /// Humans currently in the room.
+    pub member_count: u32,
+    /// Whether the owner is among them (affects `@@num_others@@`).
+    pub owner_present: bool,
+    /// Members streaming.
+    pub live_count: u32,
+    /// User limit (`0` = unlimited).
+    pub user_limit: u32,
+    /// Resolved majority game title (empty = none).
+    pub game_name: String,
+    /// Owner's stream title while live (empty = not live).
+    pub stream_title: String,
+    /// Members with any game activity (used when there is no party).
+    pub members_playing: u32,
+    /// Distinct rich-presence parties in stable order. Metadata uses the first
+    /// largest party on a two-way tie and is empty on three or more tied.
+    /// Headcounts always use the maximum size, including ties.
+    pub parties: Vec<PartyInfo>,
+    /// Unix timestamp for the time tokens.
+    pub timestamp: i64,
+    /// Guild time-zone offset in minutes east of UTC (default `0` = UTC).
+    pub tz_offset_minutes: i32,
+    /// Per-room seed stored at creation; random picks never re-roll.
+    pub seed: u64,
+    /// Named guild lists for `[[list:name]]`.
+    pub named_lists: HashMap<String, Vec<String>>,
+    /// Fallback name when the rendered name is empty.
+    pub fallback_name: String,
+}
+
+/// Evaluates [`Segment::Extension`] nodes.
+///
+/// V5 ships [`PassthroughExtensions`]; the conditionals/styling slice
+/// implements this trait without reworking the parser or the pipeline.
+pub trait ExtensionPolicy: Sized {
+    /// Evaluate a `{{...}}` node; `source` is the full node text.
+    /// Recursive evaluation uses the same session, without finalizing names.
+    /// All syntax in the conditional reserves random positions, including
+    /// inactive branches. Use `evaluation.evaluate_selected_branch` for a
+    /// branch's own stable offset within the conditional.
+    fn conditional(&self, source: &str, evaluation: &mut Evaluation<'_, Self>) -> String;
+    /// Evaluate a `""modes:body""` node. Call `evaluation.evaluate(body)` once
+    /// before styling: it substitutes tokens but does not trim, truncate or
+    /// apply fallback. Random positions are shared with the surrounding name;
+    /// the body reserves its positions even when the policy leaves it literal.
+    fn styled(
+        &self,
+        modes: &str,
+        body: &Template,
+        source: &str,
+        evaluation: &mut Evaluation<'_, Self>,
+    ) -> String;
+}
+
+/// Composable unfinalized evaluation for extension policies. Created once by
+/// [`render`]; extensions reuse it rather than starting another render session.
+pub struct Evaluation<'a, E: ExtensionPolicy> {
+    context: &'a RoomContext,
+    extensions: &'a E,
+    dice_index: u64,
+}
+
+impl<'a, E: ExtensionPolicy> Evaluation<'a, E> {
+    /// Start an unfinalized session. Use [`render`] for a final channel name.
+    pub fn new(context: &'a RoomContext, extensions: &'a E) -> Self {
+        Self {
+            context,
+            extensions,
+            dice_index: 0,
+        }
+    }
+
+    /// Context for conditions and styling decisions.
+    pub fn context(&self) -> &RoomContext {
+        self.context
+    }
+
+    /// Substitute a body without trim, truncation or fallback. Successive
+    /// bodies and extension callbacks share stable random-choice positions.
+    pub fn evaluate(&mut self, template: &Template) -> String {
+        render_segments(&template.0, self)
+    }
+
+    /// Evaluate one branch in source order, reserving random slots in all
+    /// other branches. Conditional policies can use this for stable picks
+    /// inside either the yes or no body as the condition changes.
+    pub fn evaluate_selected_branch(&mut self, branches: &[Template], selected: usize) -> String {
+        render_selected_branch(branches.iter(), selected, self)
+    }
+}
+
+/// V5 policy: extension nodes render as their literal source text.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PassthroughExtensions;
+
+impl ExtensionPolicy for PassthroughExtensions {
+    fn conditional(&self, source: &str, _evaluation: &mut Evaluation<'_, Self>) -> String {
+        source.to_string()
+    }
+
+    fn styled(
+        &self,
+        _modes: &str,
+        _body: &Template,
+        source: &str,
+        _evaluation: &mut Evaluation<'_, Self>,
+    ) -> String {
+        source.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
+
+struct Cursor<'a> {
+    src: &'a str,
+    pos: usize,
+    depth_exceeded: bool,
+    // Separator scans reuse construct parsing, recording only successful spans.
+    // Extension bodies are opaque in this mode, so scanning cannot recurse into
+    // conditional reservation scans or reinterpret raw styling delimiters.
+    balanced_ends: Option<Vec<Option<usize>>>,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(src: &'a str) -> Self {
+        Self {
+            src,
+            pos: 0,
+            depth_exceeded: false,
+            balanced_ends: None,
+        }
+    }
+
+    fn rest(&self) -> &'a str {
+        &self.src[self.pos..]
+    }
+
+    fn eat(&mut self, lit: &str) -> bool {
+        if self.rest().starts_with(lit) {
+            self.pos += lit.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek_char(&self) -> Option<char> {
+        self.rest().chars().next()
+    }
+
+    fn bump_char(&mut self) -> Option<char> {
+        let c = self.peek_char()?;
+        self.pos += c.len_utf8();
+        Some(c)
+    }
+}
+
+/// Which delimiters terminate the segment list currently being parsed.
+/// Each bracket construct only honours its own closers, so e.g. a `>>`
+/// inside a `[[...]]` branch stays literal and degrades gracefully.
+#[derive(Clone, Copy)]
+struct Stops {
+    singles: &'static [char],
+    plural: bool,
+    choice: bool,
+    resting: bool,
+}
+
+impl Stops {
+    const NONE: Self = Self {
+        singles: &[],
+        plural: false,
+        choice: false,
+        resting: false,
+    };
+}
+
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Parse a template; malformed constructs retain their consumed source as
+/// literal text, without backtracking or reparsing their suffix. Inputs over
+/// [`MAX_TEMPLATE_BYTES`] or [`MAX_TEMPLATE_DEPTH`] become entirely literal.
+/// Work and AST storage are bounded by source length times the depth limit;
+/// this function never fails. Manually constructed ASTs must respect these
+/// same bounds when passed to recursive display/evaluation APIs.
+#[must_use]
+pub fn parse(input: &str) -> Template {
+    if input.len() > MAX_TEMPLATE_BYTES {
+        return Template(vec![Segment::Text(input.to_string())]);
+    }
+    let mut cursor = Cursor::new(input);
+    let segments = parse_segments(&mut cursor, Stops::NONE, 0);
+    if cursor.depth_exceeded {
+        Template(vec![Segment::Text(input.to_string())])
+    } else {
+        Template(segments)
+    }
+}
+
+fn parse_segments(cursor: &mut Cursor, stops: Stops, depth: usize) -> Vec<Segment> {
+    if depth > MAX_TEMPLATE_DEPTH {
+        cursor.depth_exceeded = true;
+        cursor.pos = cursor.src.len();
+        return Vec::new();
+    }
+    let mut segments = Vec::new();
+    let mut literal = String::new();
+    // Push a pending literal, merging is automatic: everything literal flows
+    // through the one buffer, so adjacent `Text` segments never occur.
+    let flush = |segments: &mut Vec<Segment>, literal: &mut String| {
+        if !literal.is_empty() {
+            segments.push(Segment::Text(std::mem::take(literal)));
+        }
+    };
+    // Never rewind speculative body parses. Preserve the consumed source on
+    // failure and continue from there, merging it with any pending literal.
+    macro_rules! try_construct {
+        ($parse:expr, $opener:literal) => {{
+            let start = cursor.pos;
+            match $parse {
+                Some(seg) => {
+                    if let Some(ends) = &mut cursor.balanced_ends {
+                        ends[start] = Some(cursor.pos);
+                    }
+                    flush(&mut segments, &mut literal);
+                    segments.push(seg);
+                }
+                None => {
+                    cursor.pos = cursor.pos.max(start + $opener.len());
+                    literal.push_str(&cursor.src[start..cursor.pos]);
+                }
+            }
+        }};
+    }
+
+    while cursor.peek_char().is_some() {
+        if matches!(cursor.peek_char(), Some(c) if stops.singles.contains(&c)) {
+            break;
+        }
+        let rest = cursor.rest();
+        if (stops.plural && rest.starts_with(">>"))
+            || (stops.choice && rest.starts_with("]]"))
+            || (stops.resting && rest.starts_with("__"))
+        {
+            break;
+        }
+
+        if rest.starts_with("##") {
+            flush(&mut segments, &mut literal);
+            cursor.pos += 2;
+            segments.push(Segment::Number(NumberStyle::Hash));
+        } else if let Some(width) = bare_number_width(rest) {
+            flush(&mut segments, &mut literal);
+            cursor.pos += 1 + width.saturating_sub(1) + 1;
+            segments.push(Segment::Number(NumberStyle::Bare { width }));
+        } else if rest.starts_with("+#") {
+            flush(&mut segments, &mut literal);
+            cursor.pos += 2;
+            segments.push(Segment::Number(NumberStyle::Roman));
+        } else if rest.starts_with('$') || rest.starts_with('+') {
+            // Lone `$`/`+` that starts no token: one literal char.
+            literal.push(cursor.bump_char().expect("peeked char"));
+        } else if rest.starts_with("@@") {
+            try_construct!(parse_at_token(cursor), "@@");
+        } else if rest.starts_with("<<") {
+            try_construct!(parse_plural(cursor, depth), "<<");
+        } else if rest.starts_with("[[") {
+            try_construct!(parse_choice(cursor, depth), "[[");
+        } else if rest.starts_with("__") {
+            try_construct!(parse_resting(cursor, depth), "__");
+        } else if rest.starts_with("{{") {
+            try_construct!(parse_conditional(cursor, depth), "{{");
+        } else if rest.starts_with("\"\"") {
+            try_construct!(parse_styled(cursor, depth), "\"\"");
+        } else {
+            literal.push(cursor.bump_char().expect("peeked char"));
+        }
+    }
+    flush(&mut segments, &mut literal);
+    segments
+}
+
+/// Width of a `$#` / `$0#` / `$00#` … token (1 = bare), or `None` when the
+/// rest is not `$` followed by zeros and a `#` terminator.
+fn bare_number_width(rest: &str) -> Option<usize> {
+    let after_dollar = rest.strip_prefix('$')?;
+    let zeros = after_dollar.chars().take_while(|c| *c == '0').count();
+    if zeros == 0 && !after_dollar.starts_with('#') {
+        return None;
+    }
+    after_dollar[zeros..].strip_prefix('#').map(|_| zeros + 1)
+}
+
+/// Try to parse `@@name@@` (cursor at the opening `@@`). Returns the
+/// token segment with a lowercased name, leaving the cursor untouched on
+/// failure.
+fn parse_at_token(cursor: &mut Cursor) -> Option<Segment> {
+    let after_open = cursor.rest().strip_prefix("@@")?;
+    let mut name = String::new();
+    for c in after_open.chars() {
+        if is_token_char(c) {
+            name.push(c);
+        } else {
+            break;
+        }
+    }
+    if name.is_empty() {
+        return None;
+    }
+    if after_open[name.len()..].starts_with("@@") {
+        cursor.pos += 2 + name.len() + 2;
+        Some(Segment::Token(name.to_lowercase()))
+    } else {
+        None
+    }
+}
+
+/// Parse a plural, splitting on the first `/`, `\` or `|`. A malformed
+/// body yields `None` at the current cursor position, never rewinds.
+fn parse_plural(cursor: &mut Cursor, depth: usize) -> Option<Segment> {
+    cursor.pos += 2;
+    let singular = parse_segments(
+        cursor,
+        Stops {
+            singles: &['/', '\\', '|'],
+            plural: true,
+            ..Stops::NONE
+        },
+        depth + 1,
+    );
+    if cursor.eat(">>") {
+        return Some(Segment::Plural {
+            singular: Template(singular),
+            plural: Template(Vec::new()),
+            counter: PluralCounter::Members,
+            has_separator: false,
+        });
+    }
+    let counter = match cursor.bump_char()? {
+        '/' => PluralCounter::Members,
+        '\\' => PluralCounter::Others,
+        '|' => PluralCounter::Party,
+        _ => return None,
+    };
+    let plural = parse_segments(
+        cursor,
+        Stops {
+            plural: true,
+            ..Stops::NONE
+        },
+        depth + 1,
+    );
+    cursor.eat(">>").then_some(Segment::Plural {
+        singular: Template(singular),
+        plural: Template(plural),
+        counter,
+        has_separator: true,
+    })
+}
+
+// The literal payload and consumed width after a choice's opening `[[`.
+fn named_list_payload(input: &str) -> Option<(&str, usize)> {
+    let payload = input.strip_prefix("list:")?;
+    let end = payload.find("]]")?;
+    let name = payload[..end].trim();
+    (!name.is_empty()).then_some((name, "list:".len() + end + 2))
+}
+
+/// Parse `[[a/b/c]]` or `[[list:name]]`, without rewinding malformed bodies.
+fn parse_choice(cursor: &mut Cursor, depth: usize) -> Option<Segment> {
+    cursor.pos += 2;
+    // List identifiers are literal keys, not nested templates. In particular,
+    // token case, plural separators and slashes must survive lookup unchanged.
+    if let Some((name, width)) = named_list_payload(cursor.rest()) {
+        let name = name.to_string();
+        cursor.pos += width;
+        return Some(Segment::Choice(Choice::NamedList(name)));
+    }
+    let branch_stops = Stops {
+        singles: &['/'],
+        choice: true,
+        ..Stops::NONE
+    };
+    let mut options = Vec::new();
+    loop {
+        let branch = parse_segments(cursor, branch_stops, depth + 1);
+        options.push(Template(branch));
+        if cursor.eat("]]") {
+            break;
+        }
+        if !cursor.eat("/") {
+            return None;
+        }
+    }
+    Some(Segment::Choice(Choice::Options(options)))
+}
+
+/// Parse a resting block, splitting on the first `/` only. Shared bodies
+/// are stored once; malformed input stays at the consumed cursor position.
+fn parse_resting(cursor: &mut Cursor, depth: usize) -> Option<Segment> {
+    let start = cursor.pos;
+    cursor.pos += 2;
+    let first = parse_segments(
+        cursor,
+        Stops {
+            singles: &['/'],
+            resting: true,
+            ..Stops::NONE
+        },
+        depth + 1,
+    );
+    if cursor.eat("__") {
+        return Some(Segment::Resting {
+            source: cursor.src[start..cursor.pos].to_string(),
+            resting: Template(first),
+            in_use: None,
+        });
+    }
+    if !cursor.eat("/") {
+        return None;
+    }
+    let second = parse_segments(
+        cursor,
+        Stops {
+            resting: true,
+            ..Stops::NONE
+        },
+        depth + 1,
+    );
+    cursor.eat("__").then(|| Segment::Resting {
+        source: cursor.src[start..cursor.pos].to_string(),
+        resting: Template(first),
+        in_use: Some(Template(second)),
+    })
+}
+
+/// Parse balanced conditional braces iteratively, enforcing the same nesting
+/// bound as template bodies. Unclosed input never rewinds.
+fn parse_conditional(cursor: &mut Cursor, outer_depth: usize) -> Option<Segment> {
+    let start = cursor.pos;
+    cursor.pos += 2;
+    let mut depth = 1usize;
+    if outer_depth + depth > MAX_TEMPLATE_DEPTH {
+        cursor.depth_exceeded = true;
+    }
+    while let Some(c) = cursor.bump_char() {
+        if c == '{' && cursor.rest().starts_with('{') {
+            cursor.pos += 1;
+            depth += 1;
+            if outer_depth + depth > MAX_TEMPLATE_DEPTH {
+                cursor.depth_exceeded = true;
+            }
+        } else if c == '}' && cursor.rest().starts_with('}') {
+            cursor.pos += 1;
+            depth -= 1;
+            if depth == 0 {
+                let inner = &cursor.src[start + 2..cursor.pos - 2];
+                let mut body = Template(Vec::new());
+                let branches = if cursor.balanced_ends.is_some() {
+                    Vec::new()
+                } else {
+                    conditional_branch_sources(inner)
+                };
+                for branch in branches {
+                    let mut branch_cursor = Cursor::new(branch);
+                    for segment in parse_segments(&mut branch_cursor, Stops::NONE, outer_depth + 1)
+                    {
+                        if let (Some(Segment::Text(previous)), Segment::Text(next)) =
+                            (body.0.last_mut(), &segment)
+                        {
+                            previous.push_str(next);
+                        } else {
+                            body.0.push(segment);
+                        }
+                    }
+                    cursor.depth_exceeded |= branch_cursor.depth_exceeded;
+                }
+                return Some(Segment::Extension(Extension::Conditional {
+                    source: cursor.src[start..cursor.pos].to_string(),
+                    body,
+                }));
+            }
+        }
+    }
+    None
+}
+
+// Split syntax only: no condition truth is evaluated here. An unclosed V5
+// construct must not hide a conditional separator and swallow the next branch.
+fn conditional_branch_sources(inner: &str) -> Vec<&str> {
+    let Some(question) = conditional_separator(inner, "??") else {
+        return vec![inner];
+    };
+    let branches = &inner[question + 2..];
+    if let Some(slash) = conditional_separator(branches, "//") {
+        vec![&branches[..slash], &branches[slash + 2..]]
+    } else {
+        vec![branches]
+    }
+}
+
+fn conditional_separator(input: &str, separator: &str) -> Option<usize> {
+    // Pair styles from the right before the non-backtracking parser pass. An
+    // unclosed style in one branch must not steal the next branch's opener as
+    // its closer. Failed styles consume only their opener in this scan, so
+    // balanced children still hide their own separators. Other constructs use
+    // the parser's boundaries (e.g. `>>` inside styled text stays opaque).
+    let mut cursor = Cursor::new(input);
+    cursor.balanced_ends = Some(separator_style_ends(input));
+    parse_segments(&mut cursor, Stops::NONE, 0);
+    let ends = cursor.balanced_ends.expect("separator scan records spans");
+    let mut pos = 0;
+    while pos < input.len() {
+        let rest = &input[pos..];
+        if rest.starts_with(separator) {
+            return Some(pos);
+        }
+        // Balanced choices may contain empty options (`[[a//b]]`); unclosed
+        // constructs remain literal and cannot hide the next branch boundary.
+        pos = ends[pos]
+            .unwrap_or_else(|| pos + rest.chars().next().expect("nonempty suffix").len_utf8());
+    }
+    None
+}
+
+// Each payload and quote pair is visited once; mode headers are disjoint.
+// Only a colon before a quote or newline forms a header, matching parse_styled.
+fn separator_style_ends(input: &str) -> Vec<Option<usize>> {
+    let mut payload_starts = vec![None; input.len()];
+    let mut payload_end = 0;
+    for (start, _) in input.match_indices("[[list:") {
+        if start < payload_end {
+            continue;
+        }
+        let suffix = &input[start + 2..];
+        if !suffix.contains("]]") {
+            break; // No subsequent list can close either; scan this suffix once.
+        }
+        if let Some((_, width)) = named_list_payload(suffix) {
+            payload_end = start + 2 + width;
+            payload_starts[start..payload_end].fill(Some(start));
+        }
+    }
+
+    let mut ends = vec![None; input.len()];
+    let quotes: Vec<_> = input.match_indices("\"\"").map(|(pos, _)| pos).collect();
+    for pair in quotes.windows(2).rev() {
+        let (start, close) = (pair[0], pair[1]);
+        if payload_starts[start].is_some() || ends[close].is_some() {
+            continue; // Literal list keys cannot open styles.
+        }
+        let modes = &input[start + 2..close];
+        if let Some((colon, ':')) = modes
+            .char_indices()
+            .find(|(_, c)| matches!(c, ':' | '"' | '\n'))
+        {
+            // A style already opened before a list still uses its first raw
+            // quote as a closer. But a colon in the list's opaque payload must
+            // not turn the preceding style's closer into another opener.
+            if payload_starts[close].is_none_or(|list| start + 2 + colon < list) {
+                ends[start] = Some(close + 2);
+            }
+        }
+    }
+    ends
+}
+
+/// Parse styling without rewinding; its body inherits the nesting budget.
+fn parse_styled(cursor: &mut Cursor, depth: usize) -> Option<Segment> {
+    let start = cursor.pos;
+    cursor.pos += 2;
+    if let Some(ends) = &cursor.balanced_ends {
+        cursor.pos = ends[start]?;
+        return Some(Segment::Extension(Extension::Styled {
+            source: cursor.src[start..cursor.pos].to_string(),
+            modes: String::new(),
+            body: Template(Vec::new()),
+        }));
+    }
+    let modes_start = cursor.pos;
+    while let Some(c) = cursor.peek_char() {
+        if c == ':' || c == '"' || c == '\n' {
+            break;
+        }
+        cursor.bump_char();
+    }
+    if !cursor.eat(":") {
+        return None;
+    }
+    let modes = cursor.src[modes_start..cursor.pos - 1].to_string();
+    let body_start = cursor.pos;
+    // First `""` wins as the closer; nested styling semantics belong to V6.
+    while cursor.pos < cursor.src.len() && !cursor.rest().starts_with("\"\"") {
+        cursor.bump_char();
+    }
+    let end = cursor.pos;
+    if !cursor.eat("\"\"") {
+        return None;
+    }
+    let mut body_cursor = Cursor::new(&cursor.src[body_start..end]);
+    let body = Template(parse_segments(&mut body_cursor, Stops::NONE, depth + 1));
+    cursor.depth_exceeded |= body_cursor.depth_exceeded;
+    Some(Segment::Extension(Extension::Styled {
+        source: cursor.src[start..cursor.pos].to_string(),
+        modes,
+        body,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Display (canonical rendering, used for round-trip property tests)
+// ---------------------------------------------------------------------------
+
+impl fmt::Display for Template {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&display_template(&self.0))
+    }
+}
+
+fn display_template(segments: &[Segment]) -> String {
+    let mut out = String::new();
+    for seg in segments {
+        match seg {
+            Segment::Text(t) => out.push_str(t),
+            Segment::Number(NumberStyle::Hash) => out.push_str("##"),
+            Segment::Number(NumberStyle::Bare { width }) => {
+                out.push('$');
+                out.push_str(&"0".repeat(width.saturating_sub(1)));
+                out.push('#');
+            }
+            Segment::Number(NumberStyle::Roman) => out.push_str("+#"),
+            Segment::Token(name) => {
+                out.push_str("@@");
+                out.push_str(name);
+                out.push_str("@@");
+            }
+            Segment::Plural {
+                singular,
+                plural,
+                counter,
+                has_separator,
+            } => {
+                let sep = match counter {
+                    PluralCounter::Members => '/',
+                    PluralCounter::Others => '\\',
+                    PluralCounter::Party => '|',
+                };
+                out.push_str("<<");
+                out.push_str(&display_template(&singular.0));
+                // Omitting an explicit separator can move trailing `>` text
+                // outside the singular branch. Separator-free sources stay small.
+                if *has_separator {
+                    out.push(sep);
+                    out.push_str(&display_template(&plural.0));
+                }
+                out.push_str(">>");
+            }
+            Segment::Choice(Choice::Options(options)) => {
+                out.push_str("[[");
+                let parts: Vec<String> = options.iter().map(|o| display_template(&o.0)).collect();
+                out.push_str(&parts.join("/"));
+                out.push_str("]]");
+            }
+            Segment::Choice(Choice::NamedList(name)) => {
+                out.push_str("[[list:");
+                out.push_str(name);
+                out.push_str("]]");
+            }
+            Segment::Resting { source, .. } => out.push_str(source),
+            Segment::Extension(Extension::Conditional { source, .. })
+            | Segment::Extension(Extension::Styled { source, .. }) => out.push_str(source),
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Evaluation
+// ---------------------------------------------------------------------------
+
+/// Deterministic SplitMix64 dice: random picks derive from the room seed
+/// plus their position in the template, so renames never re-roll.
+struct Dice {
+    state: u64,
+}
+
+impl Dice {
+    fn new(seed: u64, index: u64) -> Self {
+        Self {
+            state: seed.wrapping_add(index.wrapping_mul(0x9E3779B97F4A7C15)),
+        }
+    }
+
+    fn next(&mut self) -> u64 {
+        // SplitMix64.
+        self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % (n as u64).max(1)) as usize
+    }
+}
+
+/// Render a parsed template against a room context.
+///
+/// Pipeline tail: trim → truncate to [`MAX_NAME_LEN`] characters →
+/// fallback name when empty.
+pub fn render<E: ExtensionPolicy>(template: &Template, ctx: &RoomContext, ext: &E) -> String {
+    let rendered = Evaluation::new(ctx, ext).evaluate(template);
+    // Pipeline tail: trim → truncate → fallback.
+    let mut out = truncate_chars(rendered.trim(), MAX_NAME_LEN);
+    out = out.trim_end().to_string();
+    if out.is_empty() {
+        let fallback = ctx.fallback_name.trim();
+        if fallback.is_empty() {
+            out = DEFAULT_FALLBACK_NAME.to_string();
+        } else {
+            out = truncate_chars(fallback, MAX_NAME_LEN);
+            out = out.trim_end().to_string();
+            if out.is_empty() {
+                out = DEFAULT_FALLBACK_NAME.to_string();
+            }
+        }
+    }
+    out
+}
+
+/// Parse and render in one step with the V5 passthrough extension policy.
+pub fn render_str(input: &str, ctx: &RoomContext) -> String {
+    render(&parse(input), ctx, &PassthroughExtensions)
+}
+
+fn render_segments<E: ExtensionPolicy>(
+    segments: &[Segment],
+    evaluation: &mut Evaluation<'_, E>,
+) -> String {
+    let ctx = evaluation.context;
+    let ext = evaluation.extensions;
+    let mut out = String::new();
+    for seg in segments {
+        match seg {
+            Segment::Text(t) => out.push_str(t),
+            Segment::Number(style) => out.push_str(&render_number(*style, ctx.room_number)),
+            Segment::Token(name) => out.push_str(&render_token(name, ctx)),
+            Segment::Plural {
+                singular,
+                plural,
+                counter,
+                ..
+            } => {
+                let count = match counter {
+                    PluralCounter::Members => ctx.member_count,
+                    PluralCounter::Others => others_count(ctx),
+                    PluralCounter::Party => largest_party_size(ctx).unwrap_or(0),
+                };
+                out.push_str(&render_selected_branch(
+                    [singular, plural],
+                    usize::from(count != 1),
+                    evaluation,
+                ));
+            }
+            Segment::Choice(choice) => {
+                let index = evaluation.dice_index;
+                evaluation.dice_index += 1;
+                match choice {
+                    Choice::Options(options) => {
+                        if !options.is_empty() {
+                            let mut dice = Dice::new(ctx.seed, index);
+                            let pick = dice.below(options.len());
+                            out.push_str(&render_selected_branch(options.iter(), pick, evaluation));
+                        }
+                    }
+                    Choice::NamedList(name) => {
+                        if let Some(list) = ctx.named_lists.get(name) {
+                            if !list.is_empty() {
+                                let mut dice = Dice::new(ctx.seed, index);
+                                out.push_str(&list[dice.below(list.len())]);
+                            }
+                        }
+                    }
+                }
+            }
+            Segment::Resting {
+                source,
+                resting,
+                in_use,
+            } => {
+                if ctx.channel_kind != ChannelKind::Standalone {
+                    out.push_str(source);
+                    evaluation.dice_index += random_choice_count(resting)
+                        + in_use.as_ref().map_or(0, random_choice_count);
+                } else if let Some(in_use) = in_use {
+                    out.push_str(&render_selected_branch(
+                        [resting, in_use],
+                        usize::from(ctx.member_count > 0),
+                        evaluation,
+                    ));
+                } else {
+                    // A separator-free body is the same node in both states.
+                    out.push_str(&evaluation.evaluate(resting));
+                }
+            }
+            Segment::Extension(Extension::Conditional { source, body }) => {
+                let end = evaluation.dice_index + random_choice_count(body);
+                out.push_str(&ext.conditional(source, evaluation));
+                // A policy can evaluate additional syntax; never reuse a slot
+                // it consumed even if it exceeds the syntax-only reservation.
+                evaluation.dice_index = evaluation.dice_index.max(end);
+            }
+            Segment::Extension(Extension::Styled {
+                source,
+                modes,
+                body,
+            }) => {
+                let end = evaluation.dice_index + random_choice_count(body);
+                out.push_str(&ext.styled(modes, body, source, evaluation));
+                // A policy can evaluate additional syntax; never reuse a slot
+                // it consumed even if it exceeds the syntax-only reservation.
+                evaluation.dice_index = evaluation.dice_index.max(end);
+            }
+        }
+    }
+    out
+}
+
+// Reserve random positions in every branch, including inactive branches.
+// Otherwise a headcount change can re-roll choices later in the template.
+fn random_choice_count(template: &Template) -> u64 {
+    template
+        .0
+        .iter()
+        .map(|segment| match segment {
+            Segment::Choice(Choice::Options(options)) => {
+                1 + options.iter().map(random_choice_count).sum::<u64>()
+            }
+            Segment::Choice(Choice::NamedList(_)) => 1,
+            Segment::Plural {
+                singular, plural, ..
+            } => random_choice_count(singular) + random_choice_count(plural),
+            Segment::Resting {
+                resting, in_use, ..
+            } => random_choice_count(resting) + in_use.as_ref().map_or(0, random_choice_count),
+            Segment::Extension(Extension::Conditional { body, .. })
+            | Segment::Extension(Extension::Styled { body, .. }) => random_choice_count(body),
+            _ => 0,
+        })
+        .sum()
+}
+
+fn render_selected_branch<'a, E: ExtensionPolicy>(
+    branches: impl IntoIterator<Item = &'a Template>,
+    selected: usize,
+    evaluation: &mut Evaluation<'_, E>,
+) -> String {
+    let mut out = String::new();
+    for (index, branch) in branches.into_iter().enumerate() {
+        if index == selected {
+            out = evaluation.evaluate(branch);
+        } else {
+            evaluation.dice_index += random_choice_count(branch);
+        }
+    }
+    out
+}
+
+fn render_number(style: NumberStyle, n: u32) -> String {
+    match style {
+        NumberStyle::Hash => format!("#{n}"),
+        NumberStyle::Bare { width } => {
+            if width <= 1 {
+                format!("{n}")
+            } else {
+                format!("{n:0>width$}", width = width)
+            }
+        }
+        NumberStyle::Roman => roman(n),
+    }
+}
+
+fn render_token(name: &str, ctx: &RoomContext) -> String {
+    match name {
+        "owner" | "creator" => ctx.owner_name.clone(),
+        "original_creator" => ctx.original_creator_name.clone(),
+        "num" => ctx.member_count.to_string(),
+        "num_others" => others_count(ctx).to_string(),
+        "num_live" => ctx.live_count.to_string(),
+        "limit" => ctx.user_limit.to_string(),
+        "slots" => {
+            if ctx.user_limit == 0 {
+                String::new()
+            } else {
+                ctx.user_limit.saturating_sub(ctx.member_count).to_string()
+            }
+        }
+        "game_name" => ctx.game_name.clone(),
+        "stream_name" => ctx.stream_title.clone(),
+        "num_playing" => largest_party_size(ctx)
+            .unwrap_or(ctx.members_playing)
+            .to_string(),
+        "party_size" => match largest_party(ctx) {
+            Some(party) => party.max.unwrap_or(ctx.user_limit).to_string(),
+            None if ctx.parties.is_empty() => ctx.user_limit.to_string(),
+            None => String::new(),
+        },
+        "party_state" => largest_party(ctx).map_or(String::new(), |p| p.state.clone()),
+        "party_details" => largest_party(ctx).map_or(String::new(), |p| p.details.clone()),
+        "weekday" | "month" | "hour" => render_time_token(name, ctx),
+        "random_emoji" => {
+            let mut dice = Dice::new(ctx.seed, u64::MAX);
+            RANDOM_EMOJI[dice.below(RANDOM_EMOJI.len())].to_string()
+        }
+        "nato" => nato(ctx.room_number),
+        _ => String::new(),
+    }
+}
+
+fn others_count(ctx: &RoomContext) -> u32 {
+    ctx.member_count
+        .saturating_sub(u32::from(ctx.owner_present))
+}
+
+/// Headcount is known even when tied parties have ambiguous metadata.
+fn largest_party_size(ctx: &RoomContext) -> Option<u32> {
+    ctx.parties.iter().map(|party| party.size).max()
+}
+
+/// Metadata is suppressed on three or more equally largest parties. In a
+/// two-way tie, use the first party in the caller's stable snapshot order.
+fn largest_party(ctx: &RoomContext) -> Option<&PartyInfo> {
+    let top = largest_party_size(ctx)?;
+    let mut leaders = ctx.parties.iter().filter(|party| party.size == top);
+    let first = leaders.next()?;
+    leaders.next();
+    if leaders.next().is_some() {
+        None
+    } else {
+        Some(first)
+    }
+}
+
+fn render_time_token(name: &str, ctx: &RoomContext) -> String {
+    let (weekday, month, hour) = civil_parts(ctx.timestamp, ctx.tz_offset_minutes);
+    match name {
+        "weekday" => WEEKDAY_NAMES[weekday].to_string(),
+        "month" => MONTH_NAMES[month].to_string(),
+        _ => hour.to_string(),
+    }
+}
+
+/// Split a timestamp plus zone offset into weekday (Mon 0 – Sun 6),
+/// month (0-based) and hour (0–23) using proleptic Gregorian math.
+fn civil_parts(timestamp: i64, offset_minutes: i32) -> (usize, usize, u32) {
+    let adjusted = timestamp + i64::from(offset_minutes) * 60;
+    let days = adjusted.div_euclid(86_400);
+    let hour = (adjusted.rem_euclid(86_400) / 3600) as u32;
+    // 1970-01-01 was a Thursday; Monday-based index.
+    let weekday = ((days + 3).rem_euclid(7)) as usize;
+    // Howard Hinnant's days-to-civil.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let month = (m - 1) as usize;
+    (weekday, month, hour)
+}
+
+/// `1` → `I`, `4` → `IV`, `2026` → `MMXXVI`; `0` renders as `N`.
+/// Above 3999, parentheses multiply their contents by 1000 (and may nest).
+/// Each recursion reduces the number by 1000; u32 needs at most four groups.
+/// This keeps conversion bounded without truncating before extension styling.
+fn roman(n: u32) -> String {
+    if n == 0 {
+        return "N".to_string();
+    }
+    if n >= 4000 {
+        let thousands = roman(n / 1000);
+        let remainder = n % 1000;
+        return if remainder == 0 {
+            format!("({thousands})")
+        } else {
+            format!("({thousands}){}", roman(remainder))
+        };
+    }
+    const TABLE: [(u32, &str); 13] = [
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+    let mut out = String::new();
+    let mut rest = n;
+    for (value, glyph) in TABLE {
+        while rest >= value {
+            out.push_str(glyph);
+            rest -= value;
+        }
+    }
+    out
+}
+
+/// `1` → `Alpha`; after 26 the words wrap and a cycle number is appended
+/// (`27` → `Alpha 2`, `52` → `Zulu 2`).
+fn nato(n: u32) -> String {
+    let word = NATO_WORDS[((n.max(1) - 1) % 26) as usize];
+    if (1..=26).contains(&n) {
+        word.to_string()
+    } else {
+        format!("{word} {}", (n.max(1) - 1) / 26 + 1)
+    }
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let end = s.char_indices().nth(max_chars).map_or(s.len(), |(i, _)| i);
+    s[..end].to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Room-number allocation and majority-game resolution
+// ---------------------------------------------------------------------------
+
+/// Lowest free room number at or above `start`, given the numbers already
+/// in use. The caller passes the creator channel's numbers, or the
+/// category's numbers when grouping is on. Returns `None` when every number
+/// from `start` through `u32::MAX` is occupied; never returns a duplicate.
+#[must_use]
+pub fn allocate_room_number(used: &[u32], start: u32) -> Option<u32> {
+    let taken: HashSet<u32> = used.iter().copied().collect();
+    let mut candidate = start;
+    while taken.contains(&candidate) {
+        candidate = candidate.checked_add(1)?;
+    }
+    Some(candidate)
+}
+
+/// Resolve the majority game title from one entry per member (`None` = no
+/// visible activity).
+///
+/// Rules: a two-way tie shows both names (`"A & B"`, alphabetical); three or
+/// more tied shows the no-game label; [`GameOptions::force_single`] picks one
+/// game preferring `owner_game`, then the highest count, then the alphabet.
+#[must_use]
+pub fn resolve_majority_game(
+    activities: &[Option<String>],
+    owner_game: Option<&str>,
+    options: &GameOptions,
+) -> String {
+    let games = majority_games(activities, owner_game, options);
+    if !games.is_empty() {
+        return games.join(" & ");
+    }
+    if options.no_game_label.is_empty() {
+        "General".to_string()
+    } else {
+        options.no_game_label.clone()
+    }
+}
+
+/// The aliased titles [`resolve_majority_game`] shows, under the same rules:
+/// one title, both titles of a two-way tie (alphabetical), or none when no
+/// member shows a game or three or more tie. Feed this to the V6 `GAME`
+/// condition so a condition always agrees with `@@game_name@@`.
+#[must_use]
+pub fn majority_games(
+    activities: &[Option<String>],
+    owner_game: Option<&str>,
+    options: &GameOptions,
+) -> Vec<String> {
+    let canonical = |title: &str| -> String {
+        options
+            .aliases
+            .get(title)
+            .cloned()
+            .unwrap_or_else(|| title.to_string())
+    };
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut idle = 0usize;
+    for activity in activities {
+        match activity {
+            Some(title) => {
+                *counts.entry(canonical(title)).or_insert(0) += 1;
+            }
+            None => idle += 1,
+        }
+    }
+    if counts.is_empty() {
+        return Vec::new();
+    }
+    if options.force_single {
+        if let Some(owner) = owner_game {
+            let owned = canonical(owner);
+            if counts.contains_key(&owned) {
+                return vec![owned];
+            }
+        }
+        let mut ranked: Vec<&String> = counts.keys().collect();
+        ranked.sort_by(|a, b| counts[*a].cmp(&counts[*b]).reverse().then_with(|| a.cmp(b)));
+        return vec![ranked[0].clone()];
+    }
+
+    let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    if options.count_idle_toward_majority && idle > 0 {
+        ranked[0].1 += idle;
+    }
+    let top = ranked[0].1;
+    let leaders: Vec<String> = ranked
+        .into_iter()
+        .filter(|(_, count)| *count == top)
+        .map(|(name, _)| name)
+        .collect();
+    if leaders.len() > 2 {
+        Vec::new()
+    } else {
+        leaders
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Room create/rename wiring (V5b)
+// ---------------------------------------------------------------------------
+
+/// Default name template for new rooms (spec V5).
+pub const DEFAULT_NAME_TEMPLATE: &str =
+    "@@random_emoji@@ @@owner@@'s [[den/crew/lair/hangout/base/club]]";
+
+/// Resolve the channel name for a room create or rename.
+///
+/// `template` is the creator channel's (or standalone channel's) configured
+/// name template, `ctx` carries the current room state, and `raw_name` is the
+/// caller-supplied name (custom `/name` value, or the previous channel name
+/// on rename).
+///
+/// Intended call sites (no room-lifecycle runtime exists yet; V1 owns it):
+/// create renders once after the room number is allocated, rename re-renders
+/// on join/leave, activity, limit or privacy changes (spec V5).
+///
+/// Template errors never propagate: a blank or oversized template falls back
+/// to `raw_name` without touching the engine, and an empty render falls back
+/// through [`RoomContext::fallback_name`] (wired to `raw_name` here).
+/// Output is never empty and never over [`MAX_NAME_LEN`] characters.
+///
+/// This renders conditionals and styling as literal text; runtime callers
+/// use [`crate::voice_template::resolve_room_name`] for full V6 behaviour.
+#[must_use]
+pub fn resolve_room_name(template: &str, ctx: &RoomContext, raw_name: &str) -> String {
+    resolve_room_name_with(template, ctx, raw_name, &PassthroughExtensions)
+}
+
+/// [`resolve_room_name`] with a caller-chosen [`ExtensionPolicy`], under the
+/// same fallback contract.
+#[must_use]
+pub fn resolve_room_name_with<E: ExtensionPolicy>(
+    template: &str,
+    ctx: &RoomContext,
+    raw_name: &str,
+    extensions: &E,
+) -> String {
+    let fallback = finalize_raw(raw_name);
+    if template.trim().is_empty() || template.len() > MAX_TEMPLATE_BYTES {
+        return fallback;
+    }
+    let mut ctx = ctx.clone();
+    ctx.fallback_name = fallback;
+    render(&parse(template), &ctx, extensions)
+}
+
+/// Trim → truncate → built-in default, mirroring the engine's pipeline tail.
+fn finalize_raw(raw_name: &str) -> String {
+    let mut out = truncate_chars(raw_name.trim(), MAX_NAME_LEN);
+    out = out.trim_end().to_string();
+    if out.is_empty() {
+        DEFAULT_FALLBACK_NAME.to_string()
+    } else {
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> RoomContext {
+        RoomContext {
+            channel_kind: ChannelKind::Standalone,
+            room_number: 3,
+            owner_name: "Ava".to_string(),
+            original_creator_name: "Ava".to_string(),
+            member_count: 4,
+            owner_present: true,
+            live_count: 1,
+            user_limit: 10,
+            game_name: "Apex".to_string(),
+            stream_title: String::new(),
+            members_playing: 3,
+            parties: Vec::new(),
+            timestamp: 1_790_683_200, // 2026-09-29 12:00:00 UTC (a Tuesday).
+            tz_offset_minutes: 0,
+            seed: 42,
+            named_lists: HashMap::new(),
+            fallback_name: "Lounge".to_string(),
+        }
+    }
+
+    // -- golden corpus --------------------------------------------------------
+
+    #[test]
+    fn golden_spec_examples() {
+        let c = ctx();
+        // `@@game_name@@ ##` → `Apex #3`.
+        assert_eq!(render_str("@@game_name@@ ##", &c), "Apex #3");
+        // `@@nato@@ · @@num@@ <<person/people>>` → `Charlie · 4 people`.
+        assert_eq!(
+            render_str("@@nato@@ · @@num@@ <<person/people>>", &c),
+            "Charlie · 4 people"
+        );
+    }
+
+    #[test]
+    fn golden_table() {
+        let mut c = ctx();
+        c.named_lists.insert(
+            "maps".to_string(),
+            vec!["Kings".to_string(), "Edge".to_string()],
+        );
+        for (template, expected) in [
+            ("##", "#3"),
+            ("$#", "3"),
+            ("$0#", "03"),
+            ("$00#", "003"),
+            ("+#", "III"),
+            ("@@nato@@", "Charlie"),
+            ("@@owner@@", "Ava"),
+            ("@@creator@@", "Ava"),
+            ("@@original_creator@@", "Ava"),
+            ("@@num@@", "4"),
+            ("@@num_others@@", "3"),
+            ("@@num_live@@", "1"),
+            ("@@limit@@", "10"),
+            ("@@slots@@", "6"),
+            ("@@weekday@@", "Tuesday"),
+            ("@@month@@", "September"),
+            ("@@hour@@", "12"),
+            ("<<person/people>>", "people"),
+            ("<<member\\members>>", "members"),
+            ("__Empty/Full__", "Full"),
+            ("plain name", "plain name"),
+            ("@@unknown_token@@", "Lounge"),
+        ] {
+            assert_eq!(render_str(template, &c), expected, "template {template:?}");
+        }
+        // Seed-dependent outcomes: pin determinism, not the value.
+        for template in ["[[x/y]]", "[[list:maps]]"] {
+            let first = render_str(template, &c);
+            assert!(!first.is_empty(), "template {template:?}");
+            assert_eq!(first, render_str(template, &c));
+        }
+    }
+
+    #[test]
+    fn default_template_renders() {
+        let c = ctx();
+        let template = "@@random_emoji@@ @@owner@@'s [[den/crew/lair/hangout/base/club]]";
+        let name = render_str(template, &c);
+        assert!(name.contains("Ava's "), "unexpected {name:?}");
+        assert!(name.chars().count() <= MAX_NAME_LEN);
+        // Stable across renames: same template + seed, changed headcount.
+        let mut renamed = c.clone();
+        renamed.member_count = 7;
+        assert_eq!(name, render_str(template, &renamed));
+    }
+
+    #[test]
+    fn random_picks_stay_stable_when_branches_change() {
+        for seed in 0..100 {
+            let mut c = ctx();
+            c.seed = seed;
+            for template in [
+                "<<[[one/two]]/many>> · [[a/b/c/d/e/f/g]]",
+                "__[[rest/idle]]/in use__ · [[a/b/c/d/e/f/g]]",
+                "<<one/[[many/several]]>> · [[a/b/c/d/e/f/g]]",
+            ] {
+                c.member_count = 0;
+                let empty = render_str(template, &c);
+                c.member_count = 1;
+                let solo = render_str(template, &c);
+                c.member_count = 4;
+                let occupied = render_str(template, &c);
+                let pick = |name: &str| name.rsplit(" · ").next().unwrap().to_string();
+                assert_eq!(pick(&empty), pick(&solo), "seed {seed}, {template}");
+                assert_eq!(pick(&solo), pick(&occupied), "seed {seed}, {template}");
+            }
+        }
+    }
+
+    #[test]
+    fn shared_resting_body_has_one_ast_and_one_random_identity() {
+        fn node_count(template: &Template) -> usize {
+            template
+                .0
+                .iter()
+                .map(|segment| {
+                    1 + match segment {
+                        Segment::Resting {
+                            resting, in_use, ..
+                        } => node_count(resting) + in_use.as_ref().map_or(0, node_count),
+                        Segment::Choice(Choice::Options(options)) => {
+                            options.iter().map(node_count).sum()
+                        }
+                        _ => 0,
+                    }
+                })
+                .sum()
+        }
+        // This 201-byte input used to duplicate its leaf 2^25 times.
+        let input = format!("{}x{}", "__[[".repeat(25), "]]__".repeat(25));
+        let template = parse(&input);
+        assert_eq!(node_count(&template), 51);
+        assert_eq!(random_choice_count(&template), 25);
+        assert_eq!(template.to_string(), input);
+        assert_eq!(template.clone(), template);
+        assert_eq!(render(&template, &ctx(), &PassthroughExtensions), "x");
+
+        let template = parse("__[[a/b]]__ · [[c/d]]");
+        assert_eq!(random_choice_count(&template), 2);
+        for seed in 0..100 {
+            let mut c = ctx();
+            c.seed = seed;
+            c.member_count = 0;
+            let empty = render(&template, &c, &PassthroughExtensions);
+            c.member_count = 4;
+            assert_eq!(empty, render(&template, &c, &PassthroughExtensions));
+        }
+    }
+
+    #[test]
+    fn resting_syntax_is_standalone_only() {
+        let input = "__@@owner@@ idle/@@num@@ busy/playing__ · @@owner@@";
+        let mut c = ctx();
+        c.member_count = 0;
+        assert_eq!(render_str(input, &c), "Ava idle · Ava");
+        c.member_count = 4;
+        assert_eq!(render_str(input, &c), "4 busy/playing · Ava");
+        c.channel_kind = ChannelKind::Temporary;
+        assert_eq!(
+            render_str(input, &c),
+            input.replace(" · @@owner@@", " · Ava")
+        );
+        c.member_count = 0;
+        assert_eq!(
+            render_str(input, &c),
+            input.replace(" · @@owner@@", " · Ava")
+        );
+        assert_eq!(RoomContext::default().channel_kind, ChannelKind::Temporary);
+    }
+
+    #[test]
+    fn tied_parties_preserve_headcounts_and_suppress_three_way_metadata() {
+        let mut c = ctx();
+        c.members_playing = 2;
+        let party = PartyInfo {
+            size: 1,
+            max: Some(5),
+            state: "ready".into(),
+            details: "map".into(),
+        };
+        let tokens = "|@@party_size@@|@@party_state@@|@@party_details@@|";
+        // Missing parties and missing advertised maximum may use the limit.
+        assert_eq!(render_str(tokens, &c), "|10|||");
+        assert_eq!(
+            render_str("@@num_playing@@ <<player|players>>", &c),
+            "2 players"
+        );
+        c.parties.push(PartyInfo {
+            max: None,
+            ..party.clone()
+        });
+        assert_eq!(render_str(tokens, &c), "|10|ready|map|");
+        c.parties[0].max = Some(5);
+        c.parties.push(PartyInfo {
+            state: "other".into(),
+            ..party.clone()
+        });
+        assert_eq!(
+            render_str("@@num_playing@@ <<player|players>>", &c),
+            "1 player"
+        );
+        assert_eq!(render_str(tokens, &c), "|5|ready|map|");
+        c.parties.push(party.clone());
+        assert_eq!(
+            render_str("@@num_playing@@ <<player|players>>", &c),
+            "1 player"
+        );
+        assert_eq!(render_str(tokens, &c), "||||");
+        c.parties.push(party);
+        assert_eq!(render_str(tokens, &c), "||||");
+        c.parties[0].size = 3;
+        assert_eq!(
+            render_str("@@num_playing@@ <<player|players>>", &c),
+            "3 players"
+        );
+        assert_eq!(render_str(tokens, &c), "|5|ready|map|");
+    }
+
+    struct LiveExtensions;
+
+    impl ExtensionPolicy for LiveExtensions {
+        fn conditional(&self, source: &str, evaluation: &mut Evaluation<'_, Self>) -> String {
+            let body = source
+                .strip_prefix("{{LIVE ?? ")
+                .unwrap()
+                .strip_suffix("}}")
+                .unwrap();
+            let (yes, no) = body.rsplit_once(" // ").unwrap();
+            evaluation.evaluate(&parse(if evaluation.context().live_count > 0 {
+                yes
+            } else {
+                no
+            }))
+        }
+
+        fn styled(
+            &self,
+            _modes: &str,
+            body: &Template,
+            _source: &str,
+            evaluation: &mut Evaluation<'_, Self>,
+        ) -> String {
+            evaluation.evaluate(body)
+        }
+    }
+
+    #[test]
+    fn conditional_slots_are_reserved_in_active_and_skipped_bodies() {
+        for input in [
+            "<<{{LIVE ?? [[a/b]] // offline}}/many>> · [[x/y/z]]",
+            "__{{LIVE ?? [[a/b]] // offline}}/many__ · [[x/y/z]]",
+            "{{LIVE ?? [[a/b]] // offline}} · [[x/y/z]]",
+            "<<{{LIVE ?? {{LIVE ?? [[a/b]] // offline}} // offline}}/many>> · [[x/y/z]]",
+            "<<{{LIVE ?? \"\"identity:[[a/b]]\"\" // offline}}/many>> · [[x/y/z]]",
+        ] {
+            let template = parse(input);
+            for seed in 0..100 {
+                let mut c = ctx();
+                c.seed = seed;
+                let mut trailing = None;
+                for members in [0, 1, 2] {
+                    for live in [0, 1] {
+                        c.member_count = members;
+                        c.live_count = live;
+                        let name = render(&template, &c, &LiveExtensions);
+                        let pick = name.rsplit(" · ").next().unwrap().to_string();
+                        if let Some(expected) = &trailing {
+                            assert_eq!(&pick, expected, "seed {seed}, {input}");
+                        }
+                        trailing = Some(pick);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extension_branch_helper_preserves_selected_offsets_and_following_slots() {
+        let branches = [parse("[[a/b]] · [[c/d]]"), parse("[[x/y]]")];
+        for seed in 0..100 {
+            let c = RoomContext { seed, ..ctx() };
+            let mut all = Evaluation::new(&c, &PassthroughExtensions);
+            let expected = [all.evaluate(&branches[0]), all.evaluate(&branches[1])];
+            let next = all.evaluate(&parse("[[e/f/g]]"));
+            for (selected, expected) in expected.iter().enumerate() {
+                let mut evaluation = Evaluation::new(&c, &PassthroughExtensions);
+                assert_eq!(
+                    evaluation.evaluate_selected_branch(&branches, selected),
+                    *expected
+                );
+                assert_eq!(evaluation.evaluate(&parse("[[e/f/g]]")), next);
+            }
+        }
+        // The reservation body inherits outer depth, including mixed syntax.
+        let input = format!(
+            "{}{{{{LIVE ?? [[a/b]] // offline}}}}{}",
+            "<<".repeat(MAX_TEMPLATE_DEPTH - 1),
+            ">>".repeat(MAX_TEMPLATE_DEPTH - 1)
+        );
+        assert_eq!(parse(&input), Template(vec![Segment::Text(input)]));
+    }
+
+    #[test]
+    fn empty_plural_separators_preserve_delimiter_boundaries() {
+        for input in [
+            "<<x>/>>",
+            "<<x/>>",
+            "<<x\\>>",
+            "<<x|>>",
+            "[[<<x>/>>/other]]",
+        ] {
+            let template = parse(input);
+            assert_eq!(template.to_string(), input);
+            let reparsed = parse(&template.to_string());
+            assert_eq!(template, reparsed, "input {input}");
+            for members in [0, 1, 2] {
+                let c = RoomContext {
+                    member_count: members,
+                    ..ctx()
+                };
+                assert_eq!(
+                    render(&template, &c, &PassthroughExtensions),
+                    render(&reparsed, &c, &PassthroughExtensions),
+                    "input {input}, members {members}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn named_list_keys_are_literal_source_payloads() {
+        for key in [
+            "<<x/>>",
+            "@@OWNER@@",
+            "<<x>/>>",
+            "maps/other",
+            "{{LIVE ?? x // y}}",
+        ] {
+            let mut c = ctx();
+            c.named_lists.insert(key.into(), vec!["chosen".into()]);
+            let input = format!("[[list:{key}]]");
+            let template = parse(&input);
+            assert_eq!(
+                template,
+                Template(vec![Segment::Choice(Choice::NamedList(key.into()))])
+            );
+            assert_eq!(template.to_string(), input);
+            assert_eq!(parse(&template.to_string()), template);
+            assert_eq!(render(&template, &c, &PassthroughExtensions), "chosen");
+        }
+    }
+
+    struct BranchExtensions;
+
+    impl ExtensionPolicy for BranchExtensions {
+        fn conditional(&self, source: &str, evaluation: &mut Evaluation<'_, Self>) -> String {
+            let body = source
+                .strip_prefix("{{LIVE ?? ")
+                .unwrap()
+                .strip_suffix("}}")
+                .unwrap();
+            let (yes, no) = body.rsplit_once(" // ").unwrap();
+            let branches = [parse(yes), parse(no)];
+            let selected = usize::from(evaluation.context().live_count == 0);
+            evaluation.evaluate_selected_branch(&branches, selected)
+        }
+
+        fn styled(
+            &self,
+            _modes: &str,
+            body: &Template,
+            _source: &str,
+            evaluation: &mut Evaluation<'_, Self>,
+        ) -> String {
+            evaluation.evaluate(body)
+        }
+    }
+
+    #[test]
+    fn conditional_reservations_parse_each_branch_independently() {
+        for (yes, no) in [
+            ("[[broken", "[[x/y]]"),
+            ("<<broken", "[[x/y]]"),
+            ("__broken", "[[x/y]]"),
+            ("\"\"identity:broken", "[[x/y]]"),
+            ("[[x/y]]", "[[broken"),
+        ] {
+            let branches = [parse(yes), parse(no)];
+            let input = format!("{{{{LIVE ?? {yes} // {no}}}}} · [[x/y]]");
+            let template = parse(&input);
+            // Inactive outer branches must use the same reservation count.
+            let plural = parse(&format!("<<{input}/many>> · [[x/y]]"));
+            for seed in 0..100 {
+                let mut c = RoomContext { seed, ..ctx() };
+                for selected in [0, 1] {
+                    c.live_count = u32::from(selected == 0);
+                    let mut expected = Evaluation::new(&c, &PassthroughExtensions);
+                    let body = expected.evaluate_selected_branch(&branches, selected);
+                    let trailing = expected.evaluate(&parse("[[x/y]]"));
+                    assert_eq!(
+                        render(&template, &c, &BranchExtensions),
+                        format!("{body} · {trailing}"),
+                        "seed {seed}, selected {selected}, {input}"
+                    );
+                    c.member_count = 1;
+                    let active = render(&plural, &c, &BranchExtensions);
+                    c.member_count = 2;
+                    let skipped = render(&plural, &c, &BranchExtensions);
+                    assert_eq!(active.rsplit(" · ").next(), skipped.rsplit(" · ").next());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_styling_preserves_independent_conditional_reservations() {
+        for (yes, no) in [
+            ("\"\"identity:[[a//b]] <<broken", "[[c/d]]"),
+            ("\"\"ident\"ity:[[a//b]]\"\"", "[[c/d]]"),
+            ("\"\"ident\nity:[[a//b]]\"\"", "[[c/d]]"),
+            ("\"\"identity:broken", "\"\"identity:[[a/b]]\"\" [[c/d]]"),
+            (
+                "\"\"identity:broken",
+                "\"\"upper:[[a/b]]\"\" \"\"lower:[[c/d]]\"\"",
+            ),
+            ("\"\"identity:[[a/b]]\"\"", "\"\"identity:broken"),
+            ("\"\"identity:[[a/b]]//text\"\"", "\"\"identity:broken"),
+            ("\"\"identity:[[a/b]]\"\" \"\"upper:[[c/d]]\"\"", "[[e/f]]"),
+            (
+                "\"\"identity:[[a/b]]\"\" text:literal",
+                "\"\"lower:[[c/d]]\"\"",
+            ),
+            ("\"\"identity:a//b\"\"", "[[list:\"\"]] [[c/d]]"),
+            ("[[list:\"\"]] \"\"identity:a//b\"\"", "[[c/d]]"),
+            (
+                "\"\"identity:a//b\"\"",
+                "[[list:\"\"upper:x//y\"\"]] [[c/d]]",
+            ),
+            (
+                "\"\"identity:a//b\"\"",
+                "[[list:\"\"]] \"\"identity:[[c/d]]\"\" [[e/f]]",
+            ),
+            ("[[\"\"identity:a//b\"\"/c]]", "[[list:\"\"]] [[c/d]]"),
+            ("\"\"identity:[[list:\"\"]]tail\"\"", "[[c/d]]"),
+        ] {
+            let inner = format!("LIVE ?? {yes} // {no}");
+            assert_eq!(
+                conditional_branch_sources(&inner),
+                vec![format!(" {yes} "), format!(" {no}")]
+            );
+            let branches = [parse(yes), parse(no)];
+            let conditional = parse(&format!("{{{{{inner}}}}}"));
+            assert_eq!(
+                random_choice_count(&conditional),
+                branches.iter().map(random_choice_count).sum::<u64>()
+            );
+            let template = parse(&format!("<<{{{{{inner}}}}}/many>> · [[x/y]]"));
+            for seed in 0..100 {
+                let mut c = RoomContext { seed, ..ctx() };
+                let mut expected = Evaluation::new(&c, &PassthroughExtensions);
+                expected.evaluate_selected_branch(&branches, 0);
+                let trailing = expected.evaluate(&parse("[[x/y]]"));
+                for members in [0, 1, 2] {
+                    for live in [0, 1] {
+                        c.member_count = members;
+                        c.live_count = live;
+                        let name = render(&template, &c, &BranchExtensions);
+                        assert_eq!(
+                            name.rsplit(" · ").next(),
+                            Some(trailing.as_str()),
+                            "seed {seed}, members {members}, live {live}, {inner}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn separator_style_scans_cover_quote_runs_and_source_limit() {
+        for count in [1, 2, 10, 63, 128, 255] {
+            let yes = format!("{}[[a//b]]", "\"\"identity:".repeat(count));
+            let no = "[[c/d]]";
+            let inner = format!("LIVE ??{yes}//{no}");
+            assert_eq!(conditional_branch_sources(&inner), vec![yes.as_str(), no]);
+            let template = parse(&format!("{{{{{inner}}}}}"));
+            assert_eq!(
+                random_choice_count(&template),
+                random_choice_count(&parse(&yes)) + random_choice_count(&parse(no))
+            );
+            assert_eq!(parse(&template.to_string()), template);
+        }
+        let prefix = "{{LIVE ?? \"\"identity:[[a//b]] ";
+        let suffix = " // [[c/d]]}}";
+        let input = format!(
+            "{prefix}{}{suffix}",
+            "x".repeat(MAX_TEMPLATE_BYTES - prefix.len() - suffix.len())
+        );
+        let template = parse(&input);
+        assert_eq!(random_choice_count(&template), 1);
+        assert_eq!(parse(&template.to_string()), template);
+    }
+
+    #[test]
+    fn nested_styled_delimiters_preserve_skipped_conditional_slots() {
+        let input =
+            "<<{{LIVE ?? <<\"\"identity:>>\"\"/[[a/b]]//more>> // [[c/d]]}}/many>> · [[x/y]]";
+        let template = parse(input);
+        for seed in 0..100 {
+            let mut c = RoomContext {
+                seed,
+                live_count: 1,
+                member_count: 1,
+                ..ctx()
+            };
+            let active = render(&template, &c, &BranchExtensions);
+            c.member_count = 2;
+            let skipped = render(&template, &c, &BranchExtensions);
+            assert_eq!(
+                active.rsplit(" · ").next(),
+                skipped.rsplit(" · ").next(),
+                "seed {seed}: {active:?} versus {skipped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_separators_ignore_balanced_nested_syntax() {
+        for (yes, no) in [
+            ("{{LIVE ?? [[a/b]] // [[c/d]]}}", "[[e/f]]"),
+            ("[[a/b]]", "{{LIVE ?? [[c/d]] // [[e/f]]}}"),
+            ("[[a//b]]", "[[c/d]]"),
+            ("<<a//b>>", "[[c/d]]"),
+            ("__a//b__", "[[c/d]]"),
+            ("\"\"identity:a//b\"\"", "[[c/d]]"),
+            ("<<\"\"identity:>>\"\"/[[a/b]]//more>>", "[[c/d]]"),
+            ("<<[[>>/a]]/[[a/b]]//more>>", "[[c/d]]"),
+            ("[[\"\"identity:]]\"\"/[[a/b]]//more]]", "[[c/d]]"),
+            ("[[<<]]/a>>/[[a/b]]//more]]", "[[c/d]]"),
+            ("<<[[list:>>]]/[[a/b]]//more>>", "[[c/d]]"),
+            ("__\"\"identity:__\"\"/[[a/b]]//more__", "[[c/d]]"),
+            ("\"\"identity:[[broken//more\"\"", "[[c/d]]"),
+            ("é🎮 [[broken", "[[c/d]]"),
+        ] {
+            let inner = format!("LIVE ??{yes}//{no}");
+            assert_eq!(conditional_branch_sources(&inner), vec![yes, no]);
+            let template = parse(&format!("{{{{{inner}}}}}"));
+            assert_eq!(
+                random_choice_count(&template),
+                random_choice_count(&parse(yes)) + random_choice_count(&parse(no)),
+                "{inner}"
+            );
+            assert_eq!(parse(&template.to_string()), template);
+        }
+        assert_eq!(
+            conditional_branch_sources("LIVE ??[[a/b]]"),
+            vec!["[[a/b]]"]
+        );
+        for depth in [32, 500] {
+            let malformed = format!("LIVE ??{}//[[x/y]]", "[[".repeat(depth));
+            let branches = conditional_branch_sources(&malformed);
+            assert_eq!(branches[1], "[[x/y]]");
+            let input = format!("{{{{{malformed}}}}}");
+            if depth > MAX_TEMPLATE_DEPTH {
+                // The global nesting bound still makes the whole input literal.
+                assert_eq!(parse(&input), Template(vec![Segment::Text(input)]));
+            } else {
+                assert_eq!(random_choice_count(&parse(&input)), 1);
+            }
+        }
+    }
+
+    struct AdditionalSyntaxExtensions;
+
+    impl ExtensionPolicy for AdditionalSyntaxExtensions {
+        fn conditional(&self, _source: &str, evaluation: &mut Evaluation<'_, Self>) -> String {
+            evaluation.evaluate(&parse("[[x/y]] · [[x/y]]"))
+        }
+
+        fn styled(
+            &self,
+            _modes: &str,
+            _body: &Template,
+            _source: &str,
+            evaluation: &mut Evaluation<'_, Self>,
+        ) -> String {
+            evaluation.evaluate(&parse("[[x/y]] · [[x/y]]"))
+        }
+    }
+
+    #[test]
+    fn extension_callbacks_never_rewind_consumed_random_slots() {
+        for seed in 0..100 {
+            let c = RoomContext { seed, ..ctx() };
+            let expected = render_str("[[x/y]] · [[x/y]] · [[x/y]]", &c);
+            for input in [
+                "{{LIVE ?? plain}} · [[x/y]]",
+                "\"\"identity:plain\"\" · [[x/y]]",
+            ] {
+                assert_eq!(
+                    render(&parse(input), &c, &AdditionalSyntaxExtensions),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn display_round_trips_without_growing_at_the_source_limit() {
+        for (prefix, suffix) in [
+            ("<<", ">>"),
+            ("<<<<", ">>>>"),
+            ("<<", "/>>"),
+            ("<<", "\\>>"),
+            ("<<", "|>>"),
+            ("[[<<", ">>/other]]"),
+            ("__<<", ">>/busy__"),
+            ("\"\"identity:<<", ">>\"\""),
+        ] {
+            for bytes in [MAX_TEMPLATE_BYTES - 1, MAX_TEMPLATE_BYTES] {
+                let input = format!(
+                    "{prefix}{}{suffix}",
+                    "x".repeat(bytes - prefix.len() - suffix.len())
+                );
+                let template = parse(&input);
+                let text = template.to_string();
+                assert!(text.len() <= input.len(), "{prefix}, {suffix}");
+                let reparsed = parse(&text);
+                assert_eq!(template, reparsed);
+                for members in [0, 1, 4] {
+                    let mut c = ctx();
+                    c.member_count = members;
+                    assert_eq!(
+                        render(&template, &c, &PassthroughExtensions),
+                        render(&reparsed, &c, &PassthroughExtensions)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn roman_expansion_is_compact_without_premature_finalization() {
+        for (n, expected) in [
+            (0, "N"),
+            (3999, "MMMCMXCIX"),
+            (4000, "(IV)"),
+            (4001, "(IV)I"),
+            (1_000_000, "(M)"),
+            (u32::MAX, "(((IV)CCXCIV)CMLXVII)CCXCV"),
+        ] {
+            let numeral = roman(n);
+            // On the old implementation this safely fails after one ~4 MiB
+            // conversion, before the full 2,048-token boundary case is run.
+            assert!(
+                numeral.len() <= 64,
+                "Roman numeral grew to {} bytes",
+                numeral.len()
+            );
+            assert_eq!(numeral, expected);
+        }
+        let c = RoomContext {
+            room_number: u32::MAX,
+            ..ctx()
+        };
+        let input = "+#".repeat(MAX_TEMPLATE_BYTES / 2);
+        let expected = roman(c.room_number).repeat(MAX_TEMPLATE_BYTES / 2);
+        let unfinalized = Evaluation::new(&c, &PassthroughExtensions).evaluate(&parse(&input));
+        assert_eq!(unfinalized, expected);
+        assert!(unfinalized.len() <= 64 * (MAX_TEMPLATE_BYTES / 2));
+        assert_eq!(
+            render_str(&input, &c),
+            truncate_chars(&expected, MAX_NAME_LEN)
+        );
+        assert_eq!(
+            render(&parse("\"\"owner:+#\"\""), &c, &TestExtensions),
+            format!("Ava:{}", roman(c.room_number))
+        );
+    }
+
+    #[test]
+    fn allocation_reports_exhaustion_without_duplicates() {
+        let max = u32::MAX;
+        assert_eq!(allocate_room_number(&[], max), Some(max));
+        assert_eq!(allocate_room_number(&[max - 1], max - 1), Some(max));
+        assert_eq!(allocate_room_number(&[max], max), None);
+        assert_eq!(allocate_room_number(&[max - 1, max], max - 1), None);
+        assert_eq!(allocate_room_number(&[max, max], max), None);
+        assert_eq!(allocate_room_number(&[0], 0), Some(1));
+    }
+
+    struct TestExtensions;
+
+    impl ExtensionPolicy for TestExtensions {
+        fn conditional(&self, source: &str, _evaluation: &mut Evaluation<'_, Self>) -> String {
+            source.into()
+        }
+
+        fn styled(
+            &self,
+            modes: &str,
+            body: &Template,
+            _source: &str,
+            evaluation: &mut Evaluation<'_, Self>,
+        ) -> String {
+            let evaluated = evaluation.evaluate(body);
+            match modes {
+                "remshort" => evaluated
+                    .split_whitespace()
+                    .filter(|word| word.chars().count() > 1)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                "owner" => format!("{}:{evaluated}", evaluation.context().owner_name),
+                _ => evaluated,
+            }
+        }
+    }
+
+    #[test]
+    fn extensions_style_unfinalized_bodies_and_share_random_positions() {
+        let c = ctx();
+        let input = format!("\"\"remshort:{}@@owner@@ winner\"\"", "a ".repeat(100));
+        assert_eq!(render(&parse(&input), &c, &TestExtensions), "Ava winner");
+        // No inner fallback or whitespace trimming, and only the outer render
+        // truncates the result after the extension has seen the whole body.
+        assert_eq!(
+            render(&parse("\"\"owner: @@unknown@@ \"\""), &c, &TestExtensions),
+            "Ava:  ".trim_end()
+        );
+        let mut evaluation = Evaluation::new(&c, &TestExtensions);
+        assert_eq!(evaluation.evaluate(&parse(" @@unknown@@ ")), "  ");
+        assert_eq!(evaluation.evaluate(&parse("@@unknown@@")), "");
+        assert_eq!(evaluation.evaluate(&parse(&"x".repeat(200))).len(), 200);
+
+        for seed in 0..100 {
+            let mut c = ctx();
+            c.seed = seed;
+            let plain = parse("[[a/b/c]] · [[a/b/c]] · [[a/b/c]]");
+            let styled = parse("[[a/b/c]] · \"\"identity:[[a/b/c]]\"\" · [[a/b/c]]");
+            assert_eq!(
+                render(&plain, &c, &TestExtensions),
+                render(&styled, &c, &TestExtensions)
+            );
+            // Inactive styling bodies still reserve their random positions.
+            let branch = parse("<<\"\"identity:[[x/y]]\"\"/many>> · [[a/b/c]]");
+            c.member_count = 1;
+            let solo = render(&branch, &c, &TestExtensions);
+            c.member_count = 4;
+            let busy = render(&branch, &c, &TestExtensions);
+            assert_eq!(solo.rsplit(" · ").next(), busy.rsplit(" · ").next());
+        }
+    }
+
+    #[test]
+    fn malformed_constructs_do_not_reparse_their_suffixes() {
+        for opener in ["<<", "[[", "__[[", "{{", "<<[["] {
+            for count in [1, 4, 16, 32, 50, 64, 100, 500] {
+                let input = opener.repeat(count);
+                assert_eq!(
+                    parse(&input),
+                    Template(vec![Segment::Text(input.clone())]),
+                    "{opener}, {count}"
+                );
+                assert_eq!(
+                    render_str(&input, &ctx()),
+                    truncate_chars(&input, MAX_NAME_LEN)
+                );
+            }
+        }
+        // A valid inner node inside an unclosed parent is retained literally,
+        // rather than reparsed/evaluated during recovery.
+        for input in ["<<[[a/b]]", "[[<<a/b>>", "__[[a/b]]", "<<@@owner@@/[[x/y]]"] {
+            assert_eq!(parse(input), Template(vec![Segment::Text(input.into())]));
+            assert_eq!(render_str(input, &ctx()), input);
+        }
+    }
+
+    #[test]
+    fn parser_resource_bounds_cover_balanced_and_mixed_nesting() {
+        let mut c = ctx();
+        c.member_count = 1;
+        for (open, close) in [("<<", ">>"), ("[[", "]]"), ("{{", "}}")] {
+            for depth in [1, MAX_TEMPLATE_DEPTH, MAX_TEMPLATE_DEPTH + 1, 500] {
+                let input = format!("{}x{}", open.repeat(depth), close.repeat(depth));
+                let template = parse(&input);
+                if depth > MAX_TEMPLATE_DEPTH {
+                    assert_eq!(template, Template(vec![Segment::Text(input.clone())]));
+                } else if open != "{{" {
+                    assert_eq!(render(&template, &c, &PassthroughExtensions), "x");
+                }
+                assert_eq!(parse(&template.to_string()), template);
+                assert_eq!(template.clone(), template);
+            }
+        }
+        // Styling bodies inherit outer depth rather than starting a new budget.
+        let input = format!(
+            "{}\"\"identity:[[x]]\"\"{}",
+            "<<".repeat(MAX_TEMPLATE_DEPTH - 1),
+            ">>".repeat(MAX_TEMPLATE_DEPTH - 1)
+        );
+        assert_eq!(parse(&input), Template(vec![Segment::Text(input.clone())]));
+        for extra in [0, 1] {
+            let input = format!(
+                "@@owner@@{}",
+                "x".repeat(MAX_TEMPLATE_BYTES - "@@owner@@".len() + extra)
+            );
+            let template = parse(&input);
+            if extra == 0 {
+                assert!(matches!(template.0[0], Segment::Token(_)));
+            } else {
+                assert_eq!(template, Template(vec![Segment::Text(input)]));
+            }
+        }
+    }
+
+    // -- numbering ------------------------------------------------------------
+
+    #[test]
+    fn numbering_styles() {
+        let mut c = ctx();
+        for (n, hash, bare, padded, roman_n, nato_n) in [
+            (1u32, "#1", "1", "01", "I", "Alpha"),
+            (4, "#4", "4", "04", "IV", "Delta"),
+            (9, "#9", "9", "09", "IX", "India"),
+            (14, "#14", "14", "14", "XIV", "November"),
+            (26, "#26", "26", "26", "XXVI", "Zulu"),
+            (27, "#27", "27", "27", "XXVII", "Alpha 2"),
+            (52, "#52", "52", "52", "LII", "Zulu 2"),
+            (53, "#53", "53", "53", "LIII", "Alpha 3"),
+        ] {
+            c.room_number = n;
+            assert_eq!(render_str("##", &c), hash, "n={n}");
+            assert_eq!(render_str("$#", &c), bare, "n={n}");
+            assert_eq!(render_str("$0#", &c), padded, "n={n}");
+            assert_eq!(render_str("+#", &c), roman_n, "n={n}");
+            assert_eq!(render_str("@@nato@@", &c), nato_n, "n={n}");
+        }
+    }
+
+    #[test]
+    fn allocate_lowest_free_number() {
+        assert_eq!(allocate_room_number(&[], 1), Some(1));
+        assert_eq!(allocate_room_number(&[1, 2, 4], 1), Some(3));
+        assert_eq!(allocate_room_number(&[2, 3], 1), Some(1));
+        assert_eq!(allocate_room_number(&[5, 6], 5), Some(7));
+        assert_eq!(allocate_room_number(&[1, 1, 2], 1), Some(3));
+    }
+
+    // -- plurals, slots, resting ----------------------------------------------
+
+    #[test]
+    fn plural_counters() {
+        let mut c = ctx();
+        c.member_count = 1;
+        assert_eq!(render_str("<<person/people>>", &c), "person");
+        c.member_count = 0;
+        assert_eq!(render_str("<<person/people>>", &c), "people");
+        // `\` counts excluding the owner (owner present: 1→0, 2→1).
+        c.member_count = 1;
+        assert_eq!(render_str("<<friend\\friends>>", &c), "friends");
+        c.member_count = 2;
+        assert_eq!(render_str("<<friend\\friends>>", &c), "friend");
+        // `|` counts the largest party.
+        c.parties = vec![PartyInfo {
+            size: 1,
+            max: None,
+            state: String::new(),
+            details: String::new(),
+        }];
+        assert_eq!(render_str("<<player|players>>", &c), "player");
+        c.parties[0].size = 3;
+        assert_eq!(render_str("<<player|players>>", &c), "players");
+    }
+
+    #[test]
+    fn slots_blank_when_unlimited_and_clamped() {
+        let mut c = ctx();
+        c.user_limit = 0;
+        assert_eq!(render_str("[@@slots@@]", &c), "[]");
+        c.user_limit = 2;
+        c.member_count = 5;
+        assert_eq!(render_str("[@@slots@@]", &c), "[0]");
+    }
+
+    #[test]
+    fn resting_split_on_first_slash_only() {
+        let c = ctx();
+        assert_eq!(render_str("__Rest/a/b__", &c), "a/b");
+        let mut empty = ctx();
+        empty.member_count = 0;
+        assert_eq!(render_str("__Rest/a/b__", &empty), "Rest");
+    }
+
+    // -- game resolution -------------------------------------------------------
+
+    #[test]
+    fn majority_game_rules() {
+        let opts = GameOptions::default();
+        let games = |names: &[&str]| -> Vec<Option<String>> {
+            names.iter().map(|n| Some(n.to_string())).collect()
+        };
+        assert_eq!(
+            resolve_majority_game(&games(&["Apex", "Apex", "Valorant"]), None, &opts),
+            "Apex"
+        );
+        // Two-way tie shows both, alphabetical.
+        assert_eq!(
+            resolve_majority_game(&games(&["Valorant", "Apex"]), None, &opts),
+            "Apex & Valorant"
+        );
+        // Three-way tie → no-game label.
+        assert_eq!(
+            resolve_majority_game(&games(&["A", "B", "C"]), None, &opts),
+            "General"
+        );
+        // No activity → no-game label.
+        assert_eq!(resolve_majority_game(&[None, None], None, &opts), "General");
+        // force_single prefers the owner's game.
+        let forced = GameOptions {
+            force_single: true,
+            ..GameOptions::default()
+        };
+        assert_eq!(
+            resolve_majority_game(
+                &games(&["Apex", "Apex", "Valorant"]),
+                Some("Valorant"),
+                &forced
+            ),
+            "Valorant"
+        );
+        // Aliases canonicalise before counting.
+        let aliased = GameOptions {
+            aliases: HashMap::from([("APEX".to_string(), "Apex".to_string())]),
+            ..GameOptions::default()
+        };
+        assert_eq!(
+            resolve_majority_game(&games(&["APEX", "Apex"]), None, &aliased),
+            "Apex"
+        );
+        // Idle members swell the leading game, collapsing a two-way tie.
+        let idle_counts = GameOptions {
+            count_idle_toward_majority: true,
+            ..GameOptions::default()
+        };
+        let mut tied: Vec<Option<String>> = games(&["Valorant", "Apex"]);
+        tied.push(None);
+        assert_eq!(resolve_majority_game(&tied, None, &idle_counts), "Apex");
+    }
+
+    // -- parser edge cases -----------------------------------------------------
+
+    #[test]
+    fn parser_edge_cases() {
+        let c = ctx();
+        // Unclosed delimiters and lone sigils stay literal.
+        for raw in [
+            "<<a/b", "[[a/b", "__a/b", "{{a", "\"\"a:b", "@@owner", "@@ @@", "$99", "$0x", "+",
+            "#", "$", "@", "<", "[", "_", "{", "\"",
+        ] {
+            assert_eq!(render_str(raw, &c), raw, "input {raw:?}");
+        }
+        // Token names are case-insensitive.
+        assert_eq!(render_str("@@OWNER@@", &c), "Ava");
+        // Unknown tokens vanish (fallback covers a fully-empty name).
+        assert_eq!(render_str("@@bogus@@", &c), "Lounge");
+        // Empty template → fallback; blank fallback → built-in.
+        assert_eq!(render_str("   ", &c), "Lounge");
+        let mut no_fallback = ctx();
+        no_fallback.fallback_name = String::new();
+        assert_eq!(render_str("@@bogus@@", &no_fallback), "Voice Room");
+        // V5 passthrough leaves extension syntax literal.
+        assert_eq!(
+            render_str("{{PLAYING ?? live // idle}}", &c),
+            "{{PLAYING ?? live // idle}}"
+        );
+        assert_eq!(render_str("\"\"upper:hi\"\"", &c), "\"\"upper:hi\"\"");
+        // Named list missing → empty → fallback.
+        assert_eq!(render_str("[[list:nope]]", &c), "Lounge");
+    }
+
+    #[test]
+    fn output_bounds() {
+        let c = ctx();
+        // Long literals truncate to exactly MAX_NAME_LEN on a char boundary.
+        let long = "x".repeat(500);
+        let out = render_str(&long, &c);
+        assert_eq!(out.chars().count(), MAX_NAME_LEN);
+        // Multibyte truncation never splits a character.
+        let emoji = "🎮".repeat(200);
+        let out = render_str(&emoji, &c);
+        assert_eq!(out.chars().count(), MAX_NAME_LEN);
+        assert!(out.is_char_boundary(out.len()));
+    }
+
+    #[test]
+    fn time_tokens_with_offset() {
+        let mut c = ctx(); // 2026-09-29 12:00 UTC, Tuesday, September.
+        assert_eq!(render_str("@@hour@@", &c), "12");
+        c.tz_offset_minutes = 180; // UTC+3 → 15:00.
+        assert_eq!(render_str("@@hour@@", &c), "15");
+        c.tz_offset_minutes = -720; // UTC-12 → 00:00 same day.
+        assert_eq!(render_str("@@hour@@", &c), "0");
+        c.tz_offset_minutes = -780; // UTC-13 → previous day, Monday 23:00.
+        assert_eq!(render_str("@@weekday@@", &c), "Monday");
+        assert_eq!(render_str("@@hour@@", &c), "23");
+    }
+
+    // -- hand-rolled property tests (seeded, deterministic) ---------------------
+
+    /// Tiny deterministic generator so the "property" runs are reproducible
+    /// without extra dev-dependencies.
+    struct Gen {
+        state: u64,
+    }
+
+    impl Gen {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn next(&mut self) -> u64 {
+            self.state = self
+                .state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.state >> 33
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % (n as u64).max(1)) as usize
+        }
+
+        fn ctx(&mut self) -> RoomContext {
+            let mut c = ctx();
+            c.room_number = self.below(60) as u32;
+            c.member_count = self.below(12) as u32;
+            c.owner_present = self.below(2) == 0;
+            c.user_limit = [0, 2, 5, 10][self.below(4)];
+            c.seed = self.next();
+            c
+        }
+    }
+
+    const FUZZ_ALPHABET: &[&str] = &[
+        "a", "Z", " ", "@", "#", "$", "0", "+", "<", ">", "/", "\\", "|", "[", "]", "_", "{", "}",
+        "\"", ":", "?", ".", "🎮", "é",
+    ];
+
+    fn fuzz_template(gen: &mut Gen, max_pieces: usize) -> String {
+        let mut out = String::new();
+        for _ in 0..gen.below(max_pieces) {
+            // Bias toward delimiter-heavy strings to stress the parser.
+            out.push_str(FUZZ_ALPHABET[gen.below(FUZZ_ALPHABET.len())]);
+        }
+        out
+    }
+
+    #[test]
+    fn prop_parser_never_panics_and_output_bounded() {
+        let mut gen = Gen::new(0xC10C);
+        for _ in 0..20_000 {
+            let input = fuzz_template(&mut gen, 24);
+            let template = parse(&input);
+            let c = gen.ctx();
+            let out = render(&template, &c, &PassthroughExtensions);
+            assert!(!out.is_empty(), "empty output for {input:?}");
+            assert!(
+                out.chars().count() <= MAX_NAME_LEN,
+                "overlong output for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prop_parse_display_round_trip() {
+        let mut gen = Gen::new(0x5EED);
+        for _ in 0..20_000 {
+            let input = fuzz_template(&mut gen, 24);
+            let once = parse(&input);
+            let text = once.to_string();
+            let twice = parse(&text);
+            assert_eq!(once, twice, "unstable round-trip for {input:?}");
+        }
+    }
+
+    #[test]
+    fn prop_render_deterministic() {
+        let mut gen = Gen::new(0xDE7);
+        for _ in 0..5_000 {
+            let input = fuzz_template(&mut gen, 24);
+            let template = parse(&input);
+            let c = gen.ctx();
+            let a = render(&template, &c, &PassthroughExtensions);
+            let b = render(&template, &c, &PassthroughExtensions);
+            assert_eq!(a, b, "nondeterministic render for {input:?}");
+        }
+    }
+
+    #[test]
+    fn prop_literals_pass_through() {
+        // Templates without any opener render unchanged (modulo
+        // trim/truncate/fallback).
+        let mut gen = Gen::new(0x11A7);
+        for _ in 0..5_000 {
+            let mut input = String::new();
+            for _ in 0..gen.below(20) {
+                input.push_str(["a", "Z", " ", "0", ":", "?", ".", "é"][gen.below(8)]);
+            }
+            let mut expected = truncate_chars(input.trim(), MAX_NAME_LEN);
+            expected = expected.trim_end().to_string();
+            if expected.is_empty() {
+                expected = "Lounge".to_string();
+            }
+            assert_eq!(render_str(&input, &ctx()), expected, "input {input:?}");
+        }
+    }
+
+    // -- create/rename wiring (V5b) ------------------------------------------
+
+    #[test]
+    fn wiring_create_renders_template() {
+        let c = ctx();
+        assert_eq!(resolve_room_name("@@owner@@ ##", &c, "Hangout"), "Ava #3");
+        let name = resolve_room_name(DEFAULT_NAME_TEMPLATE, &c, "Hangout");
+        assert!(name.contains("Ava's "), "unexpected {name:?}");
+    }
+
+    #[test]
+    fn wiring_rename_rerenders_and_random_stays_stable() {
+        let template = "@@random_emoji@@ @@num@@ <<person/people>>";
+        let mut c = ctx();
+        c.member_count = 1;
+        let solo = resolve_room_name(template, &c, "old");
+        assert!(solo.ends_with("1 person"), "unexpected {solo:?}");
+        c.member_count = 4;
+        let busy = resolve_room_name(template, &c, "old");
+        assert!(busy.ends_with("4 people"), "unexpected {busy:?}");
+        // Same seed: the emoji pick never re-rolls across renames.
+        assert_eq!(
+            solo.split(' ').next(),
+            busy.split(' ').next(),
+            "random pick re-rolled"
+        );
+    }
+
+    #[test]
+    fn wiring_blank_or_oversized_template_falls_back_raw() {
+        let c = ctx();
+        assert_eq!(resolve_room_name("", &c, "  Hangout  "), "Hangout");
+        assert_eq!(resolve_room_name("   ", &c, "Hangout"), "Hangout");
+        let big = "x".repeat(MAX_TEMPLATE_BYTES + 1);
+        assert_eq!(resolve_room_name(&big, &c, "Hangout"), "Hangout");
+        // At exactly the limit the engine still runs.
+        let edge = format!(
+            "@@owner@@{}",
+            "x".repeat(MAX_TEMPLATE_BYTES - "@@owner@@".len())
+        );
+        let out = resolve_room_name(&edge, &c, "Hangout");
+        assert!(out.starts_with("Ava"), "unexpected {out:?}");
+        assert_eq!(out.chars().count(), MAX_NAME_LEN);
+    }
+
+    #[test]
+    fn wiring_empty_render_falls_back_raw_then_builtin() {
+        let c = ctx();
+        // Unknown token renders empty; the live raw name wins over the
+        // context fallback ("Lounge").
+        assert_eq!(resolve_room_name("@@bogus@@", &c, "Custom"), "Custom");
+        // Blank raw degrades to the built-in default, never empty.
+        assert_eq!(resolve_room_name("@@bogus@@", &c, "   "), "Voice Room");
+        assert_eq!(resolve_room_name("", &c, ""), "Voice Room");
+    }
+
+    #[test]
+    fn wiring_raw_fallback_is_trimmed_and_truncated() {
+        let c = ctx();
+        assert_eq!(resolve_room_name("", &c, "  Hangout  "), "Hangout");
+        let long = "🎮".repeat(500);
+        let out = resolve_room_name("@@bogus@@", &c, &long);
+        assert_eq!(out.chars().count(), MAX_NAME_LEN);
+        assert!(out.is_char_boundary(out.len()));
+    }
+}

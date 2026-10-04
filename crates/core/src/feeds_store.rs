@@ -102,6 +102,30 @@ pub async fn claim_delivery(
     token: &str,
     now_ms: i64,
 ) -> Result<Option<DeliveryClaim>, FeedStoreError> {
+    if let Some(claim) = claim_fresh_delivery(pool, guild_id, post, token, now_ms).await? {
+        return Ok(Some(claim));
+    }
+    let reclaimed = sqlx::query(
+        "UPDATE feed_deliveries d SET claim_token = $3, claimed_at = to_timestamp($4::bigint::double precision / 1000)
+         FROM feed_relays f WHERE d.feed_id = $1 AND d.item_key = $2 AND d.state = 'pending'
+         AND (d.claimed_at IS NULL OR d.claimed_at <= to_timestamp($5::bigint::double precision / 1000))
+         AND f.id = d.feed_id AND f.guild_id = $6 AND f.channel_id = $7 AND f.enabled"
+    ).bind(&post.feed_id).bind(&post.item_key).bind(token).bind(now_ms)
+        .bind(now_ms.saturating_sub(DELIVERY_CLAIM_LEASE_MS)).bind(guild_id).bind(&post.channel_id)
+        .execute(pool).await?.rows_affected();
+    Ok((reclaimed == 1).then_some(DeliveryClaim::Recovered))
+}
+
+/// XML candidates may acquire only never-claimed items. Recovery has its own
+/// bounded oldest-first queue: taking over skipped rows here would rotate their
+/// leases without examining history, starving them behind the same first page.
+pub async fn claim_fresh_delivery(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    post: &FeedPost,
+    token: &str,
+    now_ms: i64,
+) -> Result<Option<DeliveryClaim>, FeedStoreError> {
     if token.is_empty() {
         return Err(FeedStoreError::EmptyClaimToken);
     }
@@ -123,18 +147,47 @@ pub async fn claim_delivery(
     .execute(pool)
     .await?
     .rows_affected();
-    if inserted == 1 {
-        return Ok(Some(DeliveryClaim::Fresh));
-    }
-    let reclaimed = sqlx::query(
-        "UPDATE feed_deliveries d SET claim_token = $3, claimed_at = to_timestamp($4::bigint::double precision / 1000)
-         FROM feed_relays f WHERE d.feed_id = $1 AND d.item_key = $2 AND d.state = 'pending'
-         AND (d.claimed_at IS NULL OR d.claimed_at <= to_timestamp($5::bigint::double precision / 1000))
-         AND f.id = d.feed_id AND f.guild_id = $6 AND f.channel_id = $7 AND f.enabled"
-    ).bind(&post.feed_id).bind(&post.item_key).bind(token).bind(now_ms)
-        .bind(now_ms.saturating_sub(DELIVERY_CLAIM_LEASE_MS)).bind(guild_id).bind(&post.channel_id)
-        .execute(pool).await?.rows_affected();
-    Ok((reclaimed == 1).then_some(DeliveryClaim::Recovered))
+    Ok((inserted == 1).then_some(DeliveryClaim::Fresh))
+}
+
+/// Recovery must not depend on an item remaining in the current feed document.
+/// Oldest leases are examined first; reacquisition moves an unresolved row to
+/// the back of this bounded queue instead of starving later pending claims.
+pub async fn pending_deliveries(
+    pool: &Pool<Postgres>,
+    feed: &FeedRelay,
+    now_ms: i64,
+    limit: u32,
+) -> Result<Vec<FeedPost>, FeedStoreError> {
+    let rows = sqlx::query(
+        "SELECT d.item_key, d.nonce FROM feed_deliveries d
+         JOIN feed_relays f ON f.id = d.feed_id
+         WHERE f.id = $1 AND f.guild_id = $2 AND f.channel_id = $3 AND f.enabled
+         AND d.state = 'pending'
+         AND (d.claimed_at IS NULL OR d.claimed_at <= to_timestamp($4::bigint::double precision / 1000))
+         ORDER BY d.claimed_at NULLS FIRST, d.item_key LIMIT $5",
+    )
+    .bind(&feed.id)
+    .bind(&feed.guild_id)
+    .bind(&feed.channel_id)
+    .bind(now_ms.saturating_sub(DELIVERY_CLAIM_LEASE_MS))
+    .bind(i64::from(limit.min(200)))
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(FeedPost {
+                feed_id: feed.id.clone(),
+                channel_id: feed.channel_id.clone(),
+                item_key: row.try_get("item_key")?,
+                nonce: row.try_get("nonce")?,
+                // Recovered claims only reconcile history; this is never sent.
+                content: String::new(),
+                suppress_mentions: true,
+                enforce_nonce: true,
+            })
+        })
+        .collect()
 }
 
 pub async fn mark_delivered(

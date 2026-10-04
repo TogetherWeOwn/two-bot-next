@@ -85,6 +85,35 @@ class AlertBindingTests(unittest.TestCase):
         config = BASE.replace('KEEPALIVE_SECONDS = "60"\nTWO_GUILD_NAME', "TWO_GUILD_NAME", 1)
         self.assertTrue(any("missing vars ['KEEPALIVE_SECONDS']" in e for e in self.check_config(config)))
 
+    def test_ingress_is_staging_only_and_deployed_dark(self):
+        staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
+        self.assertIn('INTERNAL_ACTIONS_INGRESS = "1"', staging)
+        self.assertEqual(self.check_config(BASE), [])
+        for section in ["vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(f"[{section}]", f'[{section}]\nINTERNAL_ACTIONS_INGRESS = "1"', 1)
+                errors = self.check_config(config)
+                self.assertTrue(any("INTERNAL_ACTIONS_INGRESS is staging-only" in e for e in errors), errors)
+        # Absent from staging is also fine: the route is simply dark.
+        self.assertEqual(
+            self.check_config(BASE.replace('INTERNAL_ACTIONS_INGRESS = "1"\n', "")), []
+        )
+
+    def test_ingress_value_must_be_exactly_one(self):
+        for value in ['"0"', '"true"', '""', '"1 "', "1"]:
+            with self.subTest(value=value):
+                config = BASE.replace('INTERNAL_ACTIONS_INGRESS = "1"', f"INTERNAL_ACTIONS_INGRESS = {value}")
+                self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
+
+    def test_receiver_config_is_never_a_toml_var(self):
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            for key in ["TWO_INTERNAL_KEYS", "TWO_INTERNAL_ACTIONS", "TWO_INTERNAL_BIND"]:
+                with self.subTest(section=section, key=key):
+                    config = BASE.replace(f"[{section}]", f'[{section}]\n{key} = "synthetic-secret"', 1)
+                    errors = self.check_config(config)
+                    self.assertTrue(any(f"{key} is an Operator-set Worker secret" in e for e in errors), errors)
+                    self.assertFalse(any("synthetic-secret" in e for e in errors))
+
 
 if __name__ == "__main__":
     unittest.main()
