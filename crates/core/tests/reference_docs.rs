@@ -23,6 +23,10 @@ guild fences, feature gates and handler checks still apply. See [parity](parity.
 The router publishes one complete set: first definition wins, built-in names\n\
 are reserved, and Discord's 100-command limit applies. Database-backed custom\n\
 commands and optional text triggers are dynamic and are not listed here.\n\n\
+The voice commands publish only while `TWO_VOICE=1`, and `/templateassistant`\n\
+also needs `TWO_ASSISTANT_ENDPOINT`; both are enabled here. The voice `kick`\n\
+loses first-wins to moderation `/kick`, so the `/kick` below is the moderation\n\
+command and the vote-kick shape is not listed.\n\n\
 Bounds below are registry bounds; a dash means no bound is declared there,\n\
 not that handler validation is unlimited. Permissions are Discord default\n\
 member-permission bitfields, not a replacement for runtime authorization.\n\n";
@@ -166,8 +170,8 @@ fn render_commands() -> String {
         automations: true,
         announcements: true,
         moderation: true,
-        voice: false,
-        voice_assistant: false,
+        voice: true,
+        voice_assistant: true,
         tickets: true,
         self_roles: true,
         onboarding_picker: true,
@@ -199,6 +203,7 @@ fn render_commands() -> String {
                 n if n == CommandOptionType::User.as_u8() => "user",
                 n if n == CommandOptionType::Channel.as_u8() => "channel",
                 n if n == CommandOptionType::Role.as_u8() => "role",
+                n if n == CommandOptionType::Attachment.as_u8() => "attachment",
                 n => panic!("document new command option type {n}"),
             };
             let choices = if option.choices.is_empty() {

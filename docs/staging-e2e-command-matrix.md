@@ -68,9 +68,12 @@ UTF-16 units on every moderation row.
 ## Out of scope
 
 - Voice `/create /setup /ping /invite /textchannels /access /reclaim
-  /transfer /logging /export /import /kick` (separate `TWO_VOICE` slice; its
+  /transfer /logging /export /import /position /group /inheritpermissions
+  /defaultlimit /alwaysprivate /kick` (separate `TWO_VOICE` slice; its
   `kick` loses the merge to moderation first-wins — runtime dispatch decides).
-- `/templateassistant` (voice + assistant gates).
+  The published voice set is pinned separately by the `voice` section of
+  `crates/core/tests/fixtures/staging_published_commands.json`.
+- `/templateassistant` (voice + assistant gates; same fixture section).
 - DB-backed custom commands and `!` prefix triggers (dynamic surfaces).
 - Component/modal surfaces (pickers, tickets, self-roles, LFG signup).
 - Dropped `/rota-acknowledge` (parity row 13, never published).

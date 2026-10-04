@@ -92,7 +92,10 @@ For the voice window the target pins:
    definitions at the reviewed head — `create`, `setup`, `ping`, `invite`,
    `textchannels`, `access`, `reclaim`, `transfer`, `logging`, `export`,
    `import`, `position`, `group`, `inheritpermissions`, `defaultlimit`,
-   `alwaysprivate`, `kick` — merged first-wins into the guild registry.
+   `alwaysprivate`, `kick` — merged first-wins into the guild registry by
+   `InteractionRouter::publish_set` (`RouterGates::voice`; the published
+   names and permissions are pinned by the `voice` section of
+   `crates/core/tests/fixtures/staging_published_commands.json`).
    Admin shapes carry Manage Channels, except `export`/`import` which carry
    Manage Guild; member shapes (`setup`, `ping`, `invite`, `reclaim`,
    `transfer`, `kick`) carry no default permission gate. Plus the

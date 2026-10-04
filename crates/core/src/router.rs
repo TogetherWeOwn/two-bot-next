@@ -1392,5 +1392,224 @@ mod tests {
         );
         assert!(!gates.automations && gates.announcements && !gates.moderation);
         assert!(gates.scorecard && !gates.tickets && gates.onboarding_picker);
+        assert!(!gates.voice && !gates.voice_assistant);
+    }
+
+    #[test]
+    fn gates_bridge_carries_the_voice_flags() {
+        let features = FeatureGates::from_map(&HashMap::new()).expect("defaults");
+        let moderation = ModerationGates::from_map(&HashMap::new()).expect("defaults");
+        let gates = RouterGates::from_slices(
+            Some(GUILD),
+            &features,
+            &moderation,
+            SurfaceFlags {
+                voice: true,
+                voice_assistant: true,
+                ..SurfaceFlags::default()
+            },
+        );
+        assert!(gates.voice && gates.voice_assistant);
+    }
+
+    /// The 17 voice names in published order (pinned independently in
+    /// `voice_rooms::tests::voice_command_shapes_and_gates`).
+    const VOICE_NAMES: [&str; 17] = [
+        "create",
+        "setup",
+        "ping",
+        "invite",
+        "textchannels",
+        "access",
+        "reclaim",
+        "transfer",
+        "logging",
+        "export",
+        "import",
+        "position",
+        "group",
+        "inheritpermissions",
+        "defaultlimit",
+        "alwaysprivate",
+        "kick",
+    ];
+
+    fn voice_on() -> RouterGates {
+        RouterGates {
+            voice: true,
+            ..all_on()
+        }
+    }
+
+    fn published(gates: RouterGates) -> Vec<CommandDefinition> {
+        InteractionRouter::new(gates)
+            .publish_set(&[])
+            .expect("set assembles")
+    }
+
+    #[test]
+    fn voice_set_publishes_after_moderation_only_while_gated() {
+        let off = published(all_on());
+        let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(off.len(), 28);
+        for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
+            assert!(
+                !off_names.contains(name),
+                "/{name} leaked with the gate off"
+            );
+        }
+
+        let on = published(voice_on());
+        let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
+        // 28 builtins keep their order; the 16 voice names that survive
+        // first-wins follow in voice order. `kick` is already moderation's.
+        assert_eq!(on.len(), 44);
+        assert_eq!(on_names[..28], off_names[..]);
+        let expected: Vec<_> = VOICE_NAMES
+            .iter()
+            .copied()
+            .filter(|name| *name != "kick")
+            .collect();
+        assert_eq!(on_names[28..], expected[..]);
+        assert!(!on_names.contains(&"templateassistant"));
+        assert!(on.iter().all(|c| !c.dm_permission));
+    }
+
+    #[test]
+    fn voice_kick_loses_first_wins_to_moderation_kick() {
+        use crate::commands::PERM_KICK_MEMBERS;
+        let on = published(voice_on());
+        let kicks: Vec<_> = on.iter().filter(|c| c.name == "kick").collect();
+        assert_eq!(kicks.len(), 1, "one /kick in the registry");
+        assert_eq!(
+            kicks[0].default_member_permissions,
+            Some(PERM_KICK_MEMBERS.to_string()),
+            "the surviving /kick is the moderation shape"
+        );
+        assert!(kicks[0].options.iter().any(|o| o.name == "target"));
+        assert!(!kicks[0].options.iter().any(|o| o.name == "member"));
+
+        // Moderation off merges nothing ahead of it, so the voice vote-kick
+        // shape publishes (runtime dispatch still routes a tracked-room target
+        // to the voice sink before the moderation refusal).
+        let no_moderation = published(RouterGates {
+            moderation: false,
+            ..voice_on()
+        });
+        let kick = no_moderation
+            .iter()
+            .find(|c| c.name == "kick")
+            .expect("voice kick publishes without moderation");
+        assert_eq!(kick.default_member_permissions, None);
+        assert!(kick.options.iter().any(|o| o.name == "member"));
+    }
+
+    #[test]
+    fn templateassistant_needs_both_voice_gates() {
+        use crate::commands::PERM_MANAGE_GUILD;
+        for (voice, assistant, expected) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let set = published(RouterGates {
+                voice,
+                voice_assistant: assistant,
+                ..all_on()
+            });
+            let found = set.iter().any(|c| c.name == "templateassistant");
+            assert_eq!(found, expected, "voice={voice} assistant={assistant}");
+        }
+        let both = published(RouterGates {
+            voice_assistant: true,
+            ..voice_on()
+        });
+        assert_eq!(both.len(), 44);
+        let last = both.last().expect("non-empty");
+        assert_eq!(last.name, "templateassistant");
+        assert_eq!(
+            last.default_member_permissions,
+            Some(PERM_MANAGE_GUILD.to_string())
+        );
+    }
+
+    #[test]
+    fn voice_names_yield_to_the_voice_sink_only_while_gated() {
+        let on = InteractionRouter::new(voice_on());
+        let off = router();
+        for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
+            // The sink owns the whole interaction, so the router stays silent
+            // in the configured guild, other guilds and DMs alike.
+            for (guild, perms) in [(Some(GUILD), Some(u64::MAX)), (Some(1), None), (None, None)] {
+                assert_eq!(
+                    on.route_slash(&ctx(name, guild, perms)),
+                    SlashOutcome::Ignore,
+                    "/{name} must yield while TWO_VOICE is on"
+                );
+            }
+            // Gate off: nothing is published, so the stale-interaction reply
+            // is the unchanged behaviour.
+            assert_eq!(
+                off.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
+                SlashOutcome::Unknown,
+                "/{name} is unchanged with the gate off"
+            );
+        }
+        // `/kick` stays moderation's; the claim check lives in the runtime.
+        assert_eq!(
+            on.route_slash(&ctx("kick", Some(GUILD), Some(u64::MAX))),
+            SlashOutcome::Handled {
+                handler: HandlerId::Moderation(ModerationAction::Kick)
+            }
+        );
+        // `/templateassistant` has no handler yet: the unknown-command reply,
+        // never silence.
+        let assistant = InteractionRouter::new(RouterGates {
+            voice_assistant: true,
+            ..voice_on()
+        });
+        assert_eq!(
+            assistant.route_slash(&ctx("templateassistant", Some(GUILD), Some(u64::MAX))),
+            SlashOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn voice_names_shadow_custom_rows_only_while_gated() {
+        let row = CustomCommand {
+            name: "ping".to_owned(),
+            description: "shadow".to_owned(),
+            enabled: true,
+        };
+        let custom_ctx = || SlashContext {
+            custom_row: Some(true),
+            ..ctx("ping", Some(GUILD), Some(0))
+        };
+
+        // Gate on: the voice `/ping` publishes, the custom row is withheld and
+        // dispatch yields to the sink instead of running the custom handler.
+        let on = InteractionRouter::new(voice_on());
+        let set = on
+            .publish_set(std::slice::from_ref(&row))
+            .expect("assembles");
+        let pings: Vec<_> = set.iter().filter(|c| c.name == "ping").collect();
+        assert_eq!(pings.len(), 1);
+        assert_ne!(pings[0].description, "shadow");
+        assert_eq!(on.route_slash(&custom_ctx()), SlashOutcome::Ignore);
+
+        // Gate off: the name is free, so the custom row publishes and runs.
+        let off = router();
+        let set = off
+            .publish_set(std::slice::from_ref(&row))
+            .expect("assembles");
+        let ping = set.iter().find(|c| c.name == "ping").expect("custom ping");
+        assert_eq!(ping.description, "shadow");
+        assert_eq!(
+            off.route_slash(&custom_ctx()),
+            SlashOutcome::Handled {
+                handler: HandlerId::AutomationCustom
+            }
+        );
     }
 }

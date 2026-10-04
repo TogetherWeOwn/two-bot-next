@@ -9,11 +9,12 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 28 built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 28 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
-//! of moderation), `/templateassistant` (voice + assistant gates), DB-backed
+//! of moderation), `/templateassistant` (voice + assistant gates; both are
+//! pinned by the `voice` section of `staging_published_commands.json`), DB-backed
 //! custom commands and `!` prefix triggers (dynamic), component/modal
 //! surfaces, and the dropped `/rota-acknowledge` row. The human-readable
 //! rendering lives in `docs/staging-e2e-command-matrix.md`; the

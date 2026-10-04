@@ -25,9 +25,15 @@ rollout approval separately.
 The desired set is the compiled builtins enabled by the same publishing gates:
 `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`, `TWO_MODERATION=1` (including its existing
 `TWO_OWEN_USER_ID`/protected-role validation), and `TWO_COMMUNITY_SCORECARD=1`.
-Without them, only the always-enabled core commands are included. Other router
-surfaces have no additional published command definitions here. Invalid feature
-configuration fails before a request.
+`TWO_VOICE=1` adds the temporary-voice set after moderation (16 new names; the
+voice `kick` loses first-wins to moderation `/kick`), and `/templateassistant`
+joins it only when `TWO_ASSISTANT_ENDPOINT` is also configured. The running bot
+publishes the voice set only while its voice sink actually built; this CLI reads
+the same env flags and cannot see that, so a diff against a bot whose voice
+sink failed to start will show the voice commands as extra desired entries.
+Without these gates, only the always-enabled core commands are included. Other
+router surfaces have no additional published command definitions here. Invalid
+feature configuration fails before a request.
 
 **This is a complete replacement, not a per-command patch.** Remote commands
 absent from the desired set are removed, including disabled feature commands,

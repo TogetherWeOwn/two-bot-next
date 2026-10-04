@@ -69,5 +69,35 @@
     "lockdown",
     "unlock",
     "faq"
-  ]
+  ],
+  "voice": {
+    "_comment": "Voice set published beside the 28 builtins when TWO_VOICE=1 (RouterGates::voice), in publish order after moderation, default_member_permissions as Discord decimal bitfields (null = no default gate). The voice vote-kick `kick` is the 17th voice definition but loses first-wins to moderation /kick, so it is listed under shadowed_by_first_wins instead. /templateassistant publishes last, and only when TWO_ASSISTANT_ENDPOINT is also configured (RouterGates::voice_assistant). The drift tests (staging_publish_manifest.rs) fail if InteractionRouter::publish_set differs; regenerate from publish_set output, never hand-edit names. Live publish read-back stays on the staging cards.",
+    "gates": {
+      "voice": true,
+      "voice_assistant": true
+    },
+    "published_after_builtins": [
+      { "name": "create", "default_member_permissions": "16" },
+      { "name": "setup", "default_member_permissions": null },
+      { "name": "ping", "default_member_permissions": null },
+      { "name": "invite", "default_member_permissions": null },
+      { "name": "textchannels", "default_member_permissions": "16" },
+      { "name": "access", "default_member_permissions": "16" },
+      { "name": "reclaim", "default_member_permissions": null },
+      { "name": "transfer", "default_member_permissions": null },
+      { "name": "logging", "default_member_permissions": "16" },
+      { "name": "export", "default_member_permissions": "32" },
+      { "name": "import", "default_member_permissions": "32" },
+      { "name": "position", "default_member_permissions": "16" },
+      { "name": "group", "default_member_permissions": "16" },
+      { "name": "inheritpermissions", "default_member_permissions": "16" },
+      { "name": "defaultlimit", "default_member_permissions": "16" },
+      { "name": "alwaysprivate", "default_member_permissions": "16" }
+    ],
+    "shadowed_by_first_wins": [
+      "kick"
+    ],
+    "shadow_winner_default_member_permissions": "2",
+    "assistant": { "name": "templateassistant", "default_member_permissions": "32" }
+  }
 }

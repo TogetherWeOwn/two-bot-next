@@ -1208,12 +1208,13 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-a891063: a891063 — TOG-3471: reconcile settings, command registry, and source citations
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. List the deployed `/voice` subcommands and temp-voice settings in the staging guild.
-- **Expected:** Registry and settings match TOG-10091’s config/registry golden; no orphan or missing subcommand.
-- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the voice publish pins: the router merge and yield tests in `crates/core/src/router.rs`, the staging manifest drift tests in `crates/core/tests/staging_publish_manifest.rs`, and the generated command reference check in `crates/core/tests/reference_docs.rs`.
+- **Expected:** With `TWO_VOICE=1` the merged publish set carries the 28 builtins then the 16 voice names (voice `kick` loses first-wins to moderation `/kick`), `/templateassistant` only with the assistant gate too, names and default permissions equal the manifest, and none publish with the gate off.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result; fixture proof only. Deployed `/voice` registry read-back and the temp-voice staging scenario stay on [TOG-10119](/TOG/issues/TOG-10119) and are not covered by this row.
 - **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
-- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::voice && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::templateassistant && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test staging_publish_manifest && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs committed_references_match_compiled_metadata
+- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — deployed registry read-back and temp-voice scenario evidence; the offline publish pins above are this row's automated proof.
 
 ### s13-50c3e9f: 50c3e9f — TOG-3471: retain temp-voice provenance after rollback failure
 
