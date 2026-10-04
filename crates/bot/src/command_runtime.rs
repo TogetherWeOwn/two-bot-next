@@ -75,7 +75,7 @@ use two_bot_core::{
     tickets::TicketAction,
     ChannelModerationStore, ComponentHandler, ComponentOutcome, FeatureGates, HandlerId,
     InteractionHandler, InteractionRouter, ModerationGates, RouterGates, RouterRefusal,
-    SlashOutcome, Snowflake, SurfaceFlags,
+    SlashOutcome, SurfaceFlags,
 };
 use two_bot_discord::{
     publish_commands, register_channel_handlers, response_for_slash, route_interaction,
