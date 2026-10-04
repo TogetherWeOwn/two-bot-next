@@ -91,13 +91,21 @@ use two_bot_core::{
         VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError, VoteKickRef,
         VoteKickStatus, VoteKickUpdate, VoteRoomFacts,
     },
-    CommandDefinition, OverwriteTarget, PermissionFinding, PermissionOverwrite as HealthOverwrite,
-    Snowflake, VoicePermission, VoicePermissionScope,
+    AutomodPolicy, CommandDefinition, OverwriteTarget, PermissionFinding,
+    PermissionOverwrite as HealthOverwrite, Snowflake, VoicePermission, VoicePermissionScope,
 };
 use two_bot_cutover::voice_rooms::PgRoomStore;
 use two_bot_discord::voice_rooms::{
     can_enforce_kick, can_manage_room, effective_permissions, RoomChannelAttributes, RoomHttp,
     RoomHttpError,
+};
+
+#[path = "voice_name_panel.rs"]
+mod name_panel;
+pub use name_panel::NameDirectory;
+use name_panel::{
+    handle_name_interaction, name_component_action, name_directory_from_cache, NameCommand,
+    NameInteraction, NameReply,
 };
 
 pub type WriteGuard = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -150,6 +158,21 @@ pub trait RoomPersistence: Send + Sync {
     fn update_ownership(
         &self,
         room: &VoiceRoom,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+    /// Every V3 `/name` custom-name override in the guild, for worker load.
+    /// Rooms on their template name have no entry.
+    fn custom_names(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<Vec<(Snowflake, String)>, StoreError>> + Send;
+    /// Persist a V3 `/name` override on a tracked room, or clear it with
+    /// `None` (restore). Returns `Ok(true)` when the row existed, `Ok(false)`
+    /// when the tracked row has no database counterpart (deleted out-of-band).
+    fn save_custom_name(
+        &self,
+        guild: Snowflake,
+        channel: Snowflake,
+        custom_name: Option<&str>,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
     /// The guild's V10b controls; an unconfigured guild reads as the defaults.
     fn access_controls(
@@ -256,6 +279,21 @@ impl RoomPersistence for PgRoomStore {
         )
         .await
         .map_err(store_error)
+    }
+
+    async fn custom_names(&self, guild: Snowflake) -> Result<Vec<(Snowflake, String)>, StoreError> {
+        self.custom_names(guild).await.map_err(store_error)
+    }
+
+    async fn save_custom_name(
+        &self,
+        guild: Snowflake,
+        channel: Snowflake,
+        custom_name: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        self.set_custom_name(guild, channel, custom_name)
+            .await
+            .map_err(store_error)
     }
 
     async fn access_controls(&self, guild: Snowflake) -> Result<AccessControls, StoreError> {
@@ -372,7 +410,9 @@ fn voice_dead_action(action: &RoomAction) -> &'static str {
         | RoomAction::RevokeCompanionView { .. } => "companion",
         RoomAction::UpdateOwnership { .. } => "ownership",
         RoomAction::KickMember { .. } => "kick",
-        RoomAction::RenameRoom { .. } => "rename",
+        // The override write belongs to the rename family: same feature,
+        // and the bounded `action` label set stays as documented.
+        RoomAction::RenameRoom { .. } | RoomAction::SetCustomName { .. } => "rename",
     }
 }
 
@@ -1092,6 +1132,9 @@ pub struct GuildRoomWorker<S, H> {
     queue: ActionQueue,
     renames: RenameCoalescer,
     desired_names: HashMap<Snowflake, String>,
+    /// V3 `/name` overrides by room: the owner's text as typed, template
+    /// tokens intact. A room without an entry uses its template name.
+    custom_names: HashMap<Snowflake, String>,
     creations: HashMap<u64, Creation>,
     accepted: HashMap<Snowflake, (u64, u64)>,
     moves: HashMap<Snowflake, JoinTicket>,
@@ -1167,6 +1210,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .into_iter()
             .map(|c| (c.room_channel_id, c))
             .collect();
+        let custom_names = store
+            .custom_names(live.guild_id)
+            .await?
+            .into_iter()
+            .collect();
         Ok(Self {
             live,
             store,
@@ -1181,6 +1229,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             queue: ActionQueue::new(),
             renames: RenameCoalescer::new(),
             desired_names: HashMap::new(),
+            custom_names,
             creations: HashMap::new(),
             accepted: HashMap::new(),
             moves: HashMap::new(),
@@ -2338,6 +2387,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 self.moves.remove(&channel_id);
                                 self.uncertain_moves.remove(&channel_id);
                                 self.desired_names.remove(&channel_id);
+                                self.custom_names.remove(&channel_id);
                                 observe_voice_operation("delete", "success");
                                 self.observe_voice_state();
                             }
@@ -2658,6 +2708,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                     Err(error) => self.complete_error(action, channel_id, error),
                 }
+            }
+            RoomAction::SetCustomName {
+                channel_id,
+                custom_name,
+            } => {
+                self.dispatch_custom_name(action, channel_id, custom_name, now_ms, started)
+                    .await;
             }
             RoomAction::RenameRoom { channel_id, name } => {
                 let valid = {
@@ -3062,6 +3119,12 @@ enum ActorCommand {
         member: Snowflake,
         reply: oneshot::Sender<Option<Snowflake>>,
     },
+    /// V3 `/name`: authorize against the room's current owner, then show the
+    /// panel, open the modal, or apply a custom name or a restore.
+    Name {
+        command: NameCommand,
+        reply: oneshot::Sender<NameReply>,
+    },
 }
 
 /// A V2 ownership command from an interaction. `Reclaim` takes the caller's
@@ -3110,6 +3173,8 @@ pub struct VoiceRuntime<S, H> {
     /// hash). Confirm consumes the entry, so a double click cannot apply
     /// twice; Cancel and expiry remove it with no write.
     pending_imports: Mutex<HashMap<(Snowflake, Snowflake, String), PendingImport>>,
+    /// Automod policy every room-name and `/create` name is filtered under.
+    name_policy: Arc<AutomodPolicy>,
 }
 
 impl<S, H> VoiceRuntime<S, H>
@@ -3133,7 +3198,16 @@ where
             actors: Mutex::new(HashMap::new()),
             access_lock: tokio::sync::Mutex::new(()),
             pending_imports: Mutex::new(HashMap::new()),
+            name_policy: Arc::new(AutomodPolicy::default()),
         }
+    }
+
+    /// Filter room names under the guild's configured automod policy. Without
+    /// this the default policy applies (links blocked, no word list).
+    #[must_use]
+    pub fn with_name_policy(mut self, policy: AutomodPolicy) -> Self {
+        self.name_policy = Arc::new(policy);
+        self
     }
 
     fn live_actor(&self, guild: Snowflake) -> Option<GuildActor> {
@@ -3643,6 +3717,9 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         }
         ActorCommand::KickRoomOf { member, reply } => {
             let _ = reply.send(worker.kick_room_of(member));
+        }
+        ActorCommand::Name { command, reply } => {
+            let _ = reply.send(worker.apply_name(command, now_ms));
         }
     }
 }
@@ -4676,6 +4753,9 @@ pub enum VoiceCommand {
         vote_id: Snowflake,
         ballot: VoteBallot,
     },
+    /// V3 `/name`: the owner's panel to set a custom name or restore the
+    /// template name.
+    Name,
 }
 
 /// One `/logging` sub-command. `Invalid` is a malformed or unknown shape; it
@@ -4917,6 +4997,7 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
             target,
             reason: parse_kick_reason(&command.options),
         }),
+        "name" => Some(VoiceCommand::Name),
         _ => None,
     }
 }
@@ -5078,6 +5159,7 @@ impl VoiceCommand {
             // Ballots share the `kick` restriction surface: one role gate
             // covers starting votes and casting them.
             Self::Kick { .. } | Self::Ballot { .. } => "kick",
+            Self::Name => "name",
         }
     }
 }
@@ -5604,11 +5686,42 @@ where
     H: RoomWrites + Send + 'static,
     F: Future<Output = ()> + Send,
 {
+    handle_voice_interaction_full(
+        runtime,
+        interaction,
+        invite_code,
+        inventory,
+        &NameDirectory::default(),
+        reply,
+    )
+    .await
+}
+
+/// [`handle_voice_interaction_with`] plus the display names `/name` renders
+/// `@@owner@@` from, which only the gateway cache knows. An empty directory
+/// renders every member as "member".
+pub async fn handle_voice_interaction_full<S, H, F>(
+    runtime: &VoiceRuntime<S, H>,
+    interaction: &Interaction,
+    invite_code: Option<&str>,
+    inventory: Option<&GuildInventory>,
+    names: &NameDirectory,
+    reply: impl FnOnce(InteractionResponse) -> F + Send,
+) -> bool
+where
+    S: RoomPersistence + Send + 'static,
+    H: RoomWrites + Send + 'static,
+    F: Future<Output = ()> + Send,
+{
     let Some(guild_id) = interaction_guild(interaction) else {
         return false;
     };
     if let Some(action) = voice_import_action(interaction) {
         return handle_import_component(runtime, interaction, guild_id, action, inventory, reply)
+            .await;
+    }
+    if let Some(action) = name_component_action(interaction) {
+        return handle_name_interaction(runtime, interaction, guild_id, names, action, true, reply)
             .await;
     }
     let Some(command) = parse_voice_command(interaction) else {
@@ -6052,6 +6165,18 @@ where
             reply(ephemeral_response(&text)).await;
             true
         }
+        VoiceCommand::Name => {
+            handle_name_interaction(
+                runtime,
+                interaction,
+                guild_id,
+                names,
+                NameInteraction::Panel,
+                false,
+                reply,
+            )
+            .await
+        }
         VoiceCommand::Export => {
             let Some(inventory) = inventory else {
                 reply(ephemeral_response(
@@ -6463,12 +6588,34 @@ where
         Self { runtime, replies }
     }
 
+    /// [`Self::respond_named`] with no display-name directory: every member
+    /// renders as "member" in a `/name` template.
+    #[cfg(test)]
     async fn respond_with(
         runtime: &VoiceRuntime<S, H>,
         replies: &R,
         interaction: &Interaction,
         invite_code: Option<&str>,
         inventory: Option<GuildInventory>,
+    ) {
+        Self::respond_named(
+            runtime,
+            replies,
+            interaction,
+            invite_code,
+            inventory,
+            NameDirectory::default(),
+        )
+        .await;
+    }
+
+    async fn respond_named(
+        runtime: &VoiceRuntime<S, H>,
+        replies: &R,
+        interaction: &Interaction,
+        invite_code: Option<&str>,
+        inventory: Option<GuildInventory>,
+        names: NameDirectory,
     ) {
         // Vote-kick owns its transport. A non-room `/kick` belongs to the
         // moderation path, so return before any acknowledgement and let the
@@ -6526,16 +6673,45 @@ where
             }
             return;
         }
+        if matches!(
+            name_component_action(interaction),
+            Some(NameInteraction::OpenModal { .. })
+        ) {
+            // A modal must be the initial callback; a deferred
+            // acknowledgement cannot open one.
+            let answered: Arc<Mutex<Option<InteractionResponse>>> = Arc::new(Mutex::new(None));
+            let writer = Arc::clone(&answered);
+            handle_voice_interaction_full(
+                runtime,
+                interaction,
+                invite_code,
+                inventory.as_ref(),
+                &names,
+                move |response| async move {
+                    *writer.lock().unwrap() = Some(response);
+                },
+            )
+            .await;
+            let response = answered.lock().unwrap().take();
+            if let Some(response) = response {
+                if let Err(error) = replies.respond(interaction, response).await {
+                    warn!(interaction_id = interaction.id.get(), %error,
+                        "voice name modal response failed; not retried");
+                }
+            }
+            return;
+        }
         if let Err(error) = replies.defer(interaction).await {
             warn!(interaction_id = interaction.id.get(), %error,
                 "voice acknowledgement failed; command not executed");
             return;
         }
-        handle_voice_interaction_with(
+        handle_voice_interaction_full(
             runtime,
             interaction,
             invite_code,
             inventory.as_ref(),
+            &names,
             |response| async move {
                 if let Err(error) = replies.complete(interaction, response).await {
                     warn!(interaction_id = interaction.id.get(), %error,
@@ -6561,6 +6737,7 @@ where
         if let Event::InteractionCreate(created) = event {
             if parse_voice_command(&created.0).is_none()
                 && voice_import_action(&created.0).is_none()
+                && name_component_action(&created.0).is_none()
             {
                 return;
             }
@@ -6568,15 +6745,17 @@ where
             let invite_code = vanity_code_from_cache(cache, &interaction);
             let inventory = interaction_guild(&interaction)
                 .and_then(|guild_id| inventory_from_cache(cache, guild_id));
+            let names = name_directory_from_cache(cache, &interaction);
             let runtime = Arc::clone(&self.runtime);
             let replies = Arc::clone(&self.replies);
             tokio::spawn(async move {
-                Self::respond_with(
+                Self::respond_named(
                     &runtime,
                     &replies,
                     &interaction,
                     invite_code.as_deref(),
                     inventory,
+                    names,
                 )
                 .await;
             });
