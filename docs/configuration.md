@@ -44,6 +44,27 @@ resolved from legacy `TWO_DATABASE_URL` / `DISCORD_GUILD_ID`. Token, database UR
 and guild ID have no embedded deployment value; the listen address defaults to
 `0.0.0.0:8080`. Missing configuration is not proof of readiness.
 
+### Shutdown
+
+SIGTERM/SIGINT flips `/readyz` to 503, stops gateway intake, drains accepted
+dispatches and jobs, commits the gateway checkpoint and closes the pool. The
+whole drain is bounded by `SHUTDOWN_TIMEOUT_SECONDS` (whole seconds, 1–900;
+default 35 = the 30 s dispatch drain plus 5 s margin). Past the bound the process
+logs `shutdown_deadline_exceeded` and exits 1, so the supervisor restarts from the
+last committed checkpoint; a blocking checkpoint writer cannot be abandoned
+safely. A second SIGTERM/SIGINT exits 1 immediately. The Container stop
+grace period (SIGTERM, 15 minutes, SIGKILL) is a wrangler setting and is not
+configured here.
+
+Under the Worker, the Container also receives the reviewed `TWO_*` runtime
+flags in `wrangler/src/container-env.ts` (`FORWARDED_FLAGS`), forwarded
+verbatim when the Worker env defines them as strings. Secrets never pass
+through that allowlist: a Container secret needs its own explicit line in
+`containerEnvVars` (`wrangler/src/index.ts`), like `DISCORD_TOKEN` and
+`DATABASE_URL`. Every other `TWO_*` name the Rust sources mention sits in
+`NOT_FORWARDED` with a reason, and `wrangler/test/container-env.test.ts`
+fails when a name is in neither list.
+
 ## Settings catalog
 
 Default sources (parsed defaults only, not boot wiring): feature/announcement
@@ -51,7 +72,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 117.
+Catalog entries: 121.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
@@ -85,6 +106,8 @@ Catalog entries: 117.
 | `TWO_ANTI_NUKE_SNAPSHOT_PATH` | env_only | Not specified in Next | environment only | Filesystem snapshot destination; never dashboard-selectable. |
 | `TWO_ANTI_NUKE_TRUSTED_USER_IDS` | env_only | Not specified in Next | environment only | Trusted accounts ignored by anti-nuke; environment-only reach boundary. |
 | `TWO_ANTI_NUKE_WINDOW_SECONDS` | hot | Not specified in Next | stored unwired | Aggregation window for anti-nuke heat. |
+| `TWO_ASSISTANT_ENDPOINT` | env_only | Not specified in Next | environment only | Template-assistant OpenAI-compatible endpoint; environment-only destination boundary. |
+| `TWO_ASSISTANT_MODEL` | env_only | Not specified in Next | environment only | Template-assistant model name; environment-only so a web form cannot redirect it. |
 | `TWO_AUTOMATIONS` | cold | `false` | env at boot; stored unwired | Enable automation administration and custom command publication/routing. |
 | `TWO_AUTOMOD` | cold | `false` | env at boot; stored unwired | Enable automod message inspection. |
 | `TWO_AUTOMOD_ALLOWED_DOMAINS` | hot | `[]` | stored unwired | Domains permitted by the external-link matcher. |
@@ -115,7 +138,7 @@ Catalog entries: 117.
 | `TWO_COMMUNITY_STAGING_GUILD_IDS` | hot | `[]` | stored unwired | Staging guilds excluded from human community activity. |
 | `TWO_COMMUNITY_TEST_ACTOR_IDS` | hot | `[]` | stored unwired | Test actors excluded from human community activity. |
 | `TWO_COMMUNITY_WELCOME_CHANNEL_IDS` | hot | Not specified in Next | stored unwired | Welcome-channel classification for community analytics. |
-| `TWO_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Legacy database connection secret; distinct from Container DATABASE_URL. |
+| `TWO_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Administrative/shared admission database credential required for live preflight, cutover and guild-config; must reach the same database as Container DATABASE_URL for the same token. |
 | `TWO_DB_POOL_MAX` | env_only | Not specified in Next | environment only | Legacy database pool maximum read before the settings store exists. |
 | `TWO_FEED_POLL_SECONDS` | cold | `300` | env at boot; stored unwired | Feed polling interval (validated from 60 to 86400 seconds). |
 | `TWO_HEALTH_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy health listener interface; environment-only network bind. |
@@ -129,9 +152,11 @@ Catalog entries: 117.
 | `TWO_INTERNAL_ALLOW_EVENT_READ` | env_only | Not specified in Next | environment only | Capability gate for event reads. |
 | `TWO_INTERNAL_ALLOW_MODERATION` | env_only | Not specified in Next | environment only | Capability gate for internal moderation actions. |
 | `TWO_INTERNAL_ALLOW_SETTINGS` | env_only | Not specified in Next | environment only | Capability gate for internal settings actions. |
-| `TWO_INTERNAL_BIND_HOST` | env_only | Not specified in Next | environment only | Internal-action listener interface; environment-only network bind. |
+| `TWO_INTERNAL_BIND` | env_only | Not specified in Next | environment only | Canonical combined private IP:port for receiver configuration; no default or Container bootstrap wiring. |
+| `TWO_INTERNAL_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy split internal-action listener interface; receiver configuration uses TWO_INTERNAL_BIND instead. |
+| `TWO_INTERNAL_CALLERS` | env_only | Not specified in Next | environment only | Signing-key-to-stable-caller mappings for receiver configuration; environment-only identity boundary, not loaded by Container bootstrap. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | env_only | Not specified in Next | environment only | Logical channel-key allowlist for internal actions. |
-| `TWO_INTERNAL_PORT` | env_only | Not specified in Next | environment only | Internal-action listener port; environment-only network bind. |
+| `TWO_INTERNAL_PORT` | env_only | Not specified in Next | environment only | Legacy split internal-action listener port; receiver configuration uses TWO_INTERNAL_BIND instead. |
 | `TWO_INTERNAL_ROLE_KEYS` | env_only | Not specified in Next | environment only | Logical role-key allowlist for internal actions. |
 | `TWO_JOIN_RISK_THRESHOLD` | hot | Not specified in Next | stored unwired | Join-risk threshold for protection decisions. |
 | `TWO_JOIN_RISK_WINDOW_SECONDS` | hot | Not specified in Next | stored unwired | Aggregation window for join-risk decisions. |

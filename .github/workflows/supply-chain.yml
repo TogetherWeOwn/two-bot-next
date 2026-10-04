@@ -1,0 +1,272 @@
+name: supply-chain
+
+# Folded lightweight gate (TOG-11810): the old `pr-lint.yml` and
+# `secret-scan.yml` workflows each occupied a whole `two-selfhosted` runner
+# slot per PR push. This single workflow runs both checks serially
+# (`gitleaks` needs `pr-lint`, but runs whatever pr-lint concluded), so one
+# PR push costs one slot at a time.
+#
+# Required-check names are pinned: the `protect-main` ruleset requires the
+# `gitleaks` context and the `pr-conventions` ruleset requires the `pr-lint`
+# context, so both job `name:` fields below must stay exactly as they are.
+# (A check-run name is the job name, not the workflow name.)
+#
+# Org convention for every change that lands on main (TogetherWeOwn GitHub standard):
+#   * PR title = Conventional Commits header: `type(scope): summary`, <= 100 chars, no trailing period.
+#     Types: feat fix perf refactor test docs build ci chore revert style security.
+#   * PR body follows .github/pull_request_template.md: Thinking Path, Linked Issues or Issue
+#     Description, What Changed, Verification, Risks, Model Used, Checklist. The rules live in
+#     .github/scripts/pr_standards.py with tests beside it; this job runs both.
+#   * This repo is public. No card reference is required (`REQUIRE_CARD_REF: "false"`), and an
+#     internal tracker ID (a `TOG-` or `PAP-` prefix followed by digits) must not appear in a
+#     title, body, commit subject or branch name. The new body/reference rules warn
+#     (`PR_STANDARDS_MODE: "warn"`); title format and an empty body always fail.
+#   * Repos are squash-merge only and the squash commit title is the PR title, so the history on
+#     main is one conventional commit per PR. The push job below flags any commit that bypasses it
+#     (for example a merge call that passes its own commit_title).
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  # Dispatched by the release workflow (TOG-10035) on release-please branches:
+  # PRs opened with GITHUB_TOKEN trigger no workflows, so the required
+  # `pr-lint` / `gitleaks` checks would never run on the release PR without
+  # this path. The release workflow passes the release PR number; the pr-lint
+  # job fetches the title/body via the API (needs pull-requests: read) and
+  # validates them with the same inline script as the pull_request path.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Release PR number to validate"
+        required: true
+        type: string
+
+permissions: {}
+
+env:
+  # Public repo: the body carries no card reference. New body/reference rules
+  # warn while open PRs migrate to the template, then flip to "error".
+  # Title format and an empty body are errors in both modes.
+  REQUIRE_CARD_REF: "false"
+  PR_STANDARDS_MODE: "warn"
+
+# Superseded PR runs (pushes and title/body edits) cancel the in-flight one.
+# Push-to-main runs key on the commit SHA, so every main commit still gets
+# exactly one pr-lint and one gitleaks run.
+concurrency:
+  group: supply-chain-${{ github.event.pull_request.number || inputs.pr_number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  pr-lint:
+    name: pr-lint
+    permissions:
+      contents: read # Resolve stored overflow notes through the Contents API.
+      pull-requests: read # Fetch and validate the dispatched release PR metadata.
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'pr-lint') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: true
+
+      - name: Resolve PR title/body
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Passed via env (not inlined into the script) so titles/bodies
+          # containing quotes can't break shell parsing.
+          EVENT_TITLE: ${{ github.event.pull_request.title }}
+          EVENT_BODY: ${{ github.event.pull_request.body }}
+          EVENT_AUTHOR: ${{ github.event.pull_request.user.login }}
+          EVENT_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          EVENT_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EVENT_NAME: ${{ github.event_name }}
+        shell: python3 {0}
+        run: |
+          import json, os, subprocess, uuid
+
+          event = os.environ["EVENT_NAME"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          overflow_prefix = ("This release is too large to preview in the pull "
+                             "request body. View the full release notes here: ")
+
+          def resolve_overflow(body, head_ref, head_repo_name, base_ref):
+              # Native overflow PRs carry only a single-line link in the
+              # visible body; the full notes (including the generated footer) live
+              # in release-notes.md on the derived notes branch. Resolve that
+              # file before the body gates, without weakening them: the
+              # link must be the exact native sentence and its branch must be
+              # exactly this PR's own notes branch in this same repository,
+              # targeting main. A non-link body passes through untouched, so
+              # ordinary (including fork) PRs never reach the gates below.
+              lines = (body or "").strip().splitlines()
+              if len(lines) != 1 or not lines[0].startswith(overflow_prefix):
+                  return body
+              from urllib.parse import urlparse
+              parts, overflow_branch = None, ""
+              try:
+                  parts = urlparse(lines[0][len(overflow_prefix):].strip())
+                  chunks = parts.path.split("/blob/", 1)
+                  overflow_branch = (chunks[1].rsplit("/release-notes.md", 1)[0]
+                                     if len(chunks) == 2 and chunks[1].endswith("/release-notes.md")
+                                     else "")
+              except Exception:
+                  parts, overflow_branch = None, ""
+              if (base_ref != "main"
+                      or (head_repo_name or "").lower() != repo.lower()
+                      or not head_ref
+                      or parts is None or not parts.netloc
+                      or overflow_branch != f"{head_ref}--release-notes"):
+                  raise SystemExit("Overflow link must resolve to this PR's notes branch")
+              # Documented Contents boundary
+              # (docs.github.com/rest/repos/contents): object bodies above
+              # 1 MiB arrive as content "" / encoding "none", so a --jq
+              # .content read silently resolves empty notes at that size.
+              # Read the authenticated raw representation instead, which
+              # carries the bytes at any size; an empty body still fails
+              # closed before the body gates.
+              stored = subprocess.check_output([
+                  "gh", "api", f"repos/{repo}/contents/release-notes.md?ref={overflow_branch}",
+                  "-H", "Accept: application/vnd.github.raw",
+              ], text=True)
+              if not stored.strip():
+                  raise SystemExit("Missing stored release notes")
+              return stored
+
+          if event == "workflow_dispatch":
+              number = os.environ["PR_NUMBER"]
+              if not number.isascii() or not number.isdecimal() or int(number) < 1:
+                  raise SystemExit("Expected a positive PR number")
+              pr = json.loads(subprocess.check_output([
+                  "gh", "pr", "view", number, "--repo", repo, "--json",
+                  "title,body,author,state,headRefOid,headRefName,baseRefName,headRepository,headRepositoryOwner",
+              ], text=True))
+              # A green dispatch check must describe this exact open PR head,
+              # not an unrelated, forked, closed, or stale PR's metadata.
+              head_repo = pr.get("headRepository") or {}
+              head_owner = pr.get("headRepositoryOwner") or {}
+              head_name = f"{head_owner.get('login', '')}/{head_repo.get('name', '')}"
+              if (pr["state"] != "OPEN" or pr["baseRefName"] != "main"
+                      or pr["headRefOid"] != os.environ["GITHUB_SHA"]
+                      or f"refs/heads/{pr['headRefName']}" != os.environ["GITHUB_REF"]
+                      or head_name.lower() != repo.lower()):
+                  raise SystemExit("Dispatch ref/SHA must match an open same-repository PR targeting main")
+              title, body, author = pr["title"], pr["body"], pr["author"]["login"]
+              body = resolve_overflow(body, pr["headRefName"], head_name, pr["baseRefName"])
+              head_ref = pr["headRefName"]
+              event = "pull_request"
+          else:
+              title = os.environ.get("EVENT_TITLE", "")
+              body = os.environ.get("EVENT_BODY", "")
+              author = os.environ.get("EVENT_AUTHOR", "")
+              head_ref = os.environ.get("EVENT_HEAD_REF", "")
+              # Ordinary edited/reopened PRs can carry the same native overflow
+              # link; resolve it through the same gates so body lint sees the
+              # full notes instead of failing on the link.
+              body = resolve_overflow(body, os.environ.get("EVENT_HEAD_REF", ""),
+                                      os.environ.get("EVENT_HEAD_REPO", ""),
+                                      os.environ.get("EVENT_BASE_REF", ""))
+
+          # The resolved body travels through a file, never env or step
+          # outputs: stored release notes can exceed the per-string execve
+          # limit, which would keep the next step's process from starting
+          # (E2BIG) before any lint runs. Only the short path crosses outputs.
+          import tempfile
+          body_path = os.path.join(os.environ.get("RUNNER_TEMP", tempfile.gettempdir()), "pr-body.md")
+          with open(body_path, "w", encoding="utf-8") as handle:
+              handle.write(body or "")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              for key, value in {"title": title, "author": author, "event": event,
+                                 "head_ref": head_ref}.items():
+                  delimiter = uuid.uuid4().hex
+                  while delimiter in (value or "").splitlines():
+                      delimiter = uuid.uuid4().hex
+                  output.write(f"{key}<<{delimiter}\n{value}\n{delimiter}\n")
+              delimiter = uuid.uuid4().hex
+              output.write(f"body_file<<{delimiter}\n{body_path}\n{delimiter}\n")
+
+      - name: Unit-test the lint
+        run: python3 -m unittest discover -s .github/scripts -p 'test_pr_standards.py'
+
+      - name: Check title, body, branch and commits
+        env:
+          EVENT: ${{ steps.pr.outputs.event }}
+          TITLE: ${{ steps.pr.outputs.title }}
+          BODY_FILE: ${{ steps.pr.outputs.body_file }}
+          AUTHOR: ${{ steps.pr.outputs.author }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+          COMMITS: ${{ toJSON(github.event.commits) }}
+        shell: python3 {0}
+        run: |
+          import os, sys
+
+          # The body travels as a file, never env or step outputs: stored
+          # release notes can exceed the per-string execve limit (E2BIG) that
+          # would otherwise keep this process from starting at all. The gate
+          # reads env, so bridge the two in-process, where no such limit
+          # applies.
+          root = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
+          sys.path.insert(0, os.path.join(root, ".github/scripts"))
+          import pr_standards
+
+          if os.environ.get("EVENT") == "pull_request":
+              with open(os.environ["BODY_FILE"], encoding="utf-8") as handle:
+                  os.environ["BODY"] = handle.read()
+          sys.exit(pr_standards.main())
+
+  # name pinned equal to the required-check context: `gitleaks` is required
+  # on main. Runs after pr-lint in the same workflow so the pair holds one
+  # runner slot at a time instead of two.
+  #
+  # Full-history gitleaks scan. Uses the gitleaks binary (the gitleaks-action
+  # wrapper needs a paid licence for organizations). --redact so findings
+  # never print the value. A secret that reaches a branch is already leaked:
+  # report it, do not just delete the line.
+  gitleaks:
+    name: gitleaks
+    needs: pr-lint
+    # Never skipped: a skipped job passes a required check. An `edited` run
+    # shares the concurrency group above and can cancel the synchronize run's
+    # scan, so it must rescan the head itself; and a failed pr-lint (e.g. a
+    # bypassed squash title on main) must not leave a commit unscanned.
+    # Only a cancellation by a newer run in the group skips the scan.
+    if: ${{ !cancelled() }}
+    permissions:
+      contents: read
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'gitleaks') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: a secret added and then removed in an earlier commit
+          # on the same branch is still a leak, and a shallow clone hides it.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+          chmod 0755 "$RUNNER_TEMP/gitleaks"
+          "$RUNNER_TEMP/gitleaks" version
+
+      - name: Scan the full history
+        run: |
+          set -euo pipefail
+          # --log-opts=HEAD: scan only history reachable from HEAD, not every fetched branch.
+          "$RUNNER_TEMP/gitleaks" git . --redact --verbose --exit-code 1 --log-opts=HEAD

@@ -7,12 +7,16 @@ use sqlx::postgres::{PgPoolOptions, PgSslMode};
 use sqlx::PgPool;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use two_bot_cutover::legacy_copy::options::guarded_target;
 
 const GUILD: &str = "1545644954272137297";
 const EXPORT: &str = r#"[{"id":"100000000000000001","xp":150},{"id":"100000000000000001","xp":100},{"id":"100000000000000002","xp":200},{"id":"100000000000000003","xp":250},{"id":"100000000000000004","xp":400}]"#;
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+// Parallel tests share one pid and can read the same clock tick.
+static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 
 struct TestDb {
     admin: PgPool,
@@ -26,9 +30,10 @@ struct TestDb {
 impl TestDb {
     async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let name = format!(
-            "two_bot_test_mee6_{}_{}",
+            "two_bot_test_mee6_{}_{}_{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+            NEXT_DB.fetch_add(1, Ordering::Relaxed)
         );
         let url = format!("postgres://agent_test:@agent-testdb:5432/{name}");
         // Never read an application URL or substitute its credentials.
@@ -86,6 +91,7 @@ impl TestDb {
         command
             .env_clear()
             .env("TWO_DATABASE_URL", &self.url)
+            .env("TWO_DATABASE_TLS", "local-only")
             .env("TWO_DB_POOL_MAX", "1")
             .args(args)
             .args(["--guild", GUILD]);

@@ -67,6 +67,11 @@ pub enum RoleSpecError {
     /// Key fails `^[a-z0-9_-]{{1,32}}$` after trim+lowercase; carries the raw field.
     #[error("Invalid LFG role key \"{0}\".")]
     BadKey(String),
+    /// Normalized key equals the reserved leave-action value (`__leave__`);
+    /// carries the normalized key. Legacy `normalizeRoles` throws
+    /// `LFG role key "__leave__" is reserved for leaving the group.`
+    #[error("LFG role key \"{0}\" is reserved for leaving the group.")]
+    ReservedKey(String),
     /// Label empty or longer than 80 chars.
     #[error("LFG role labels must be 1-80 characters.")]
     BadLabel,
@@ -120,6 +125,9 @@ pub fn parse_role_spec(spec: &str) -> Result<Vec<LfgRoleSpec>, RoleSpecError> {
         let key = trim_ecmascript(raw_key).to_lowercase();
         if !valid_role_key(&key) {
             return Err(RoleSpecError::BadKey(raw_key.to_owned()));
+        }
+        if key == LFG_LEAVE_VALUE {
+            return Err(RoleSpecError::ReservedKey(key));
         }
         let label = trim_ecmascript(fields[1]);
         if label.is_empty() || label.encode_utf16().count() > 80 {
@@ -829,6 +837,64 @@ mod tests {
     }
 
     #[test]
+    fn role_spec_refuses_reserved_leave_key() {
+        let reserved = RoleSpecError::ReservedKey(LFG_LEAVE_VALUE.to_owned());
+        // Refused in every position.
+        assert_eq!(parse_role_spec("__leave__:Leave:1"), Err(reserved.clone()));
+        assert_eq!(
+            parse_role_spec("tank:Tank:1,__leave__:Leave:1"),
+            Err(reserved.clone())
+        );
+        assert_eq!(
+            parse_role_spec("tank:Tank:1,__leave__:Leave:1,dps:DPS:1"),
+            Err(reserved.clone())
+        );
+        assert_eq!(
+            parse_role_spec("tank:Tank:1,dps:DPS:1,__leave__:Leave:1"),
+            Err(reserved.clone())
+        );
+        // Case and surrounding-whitespace variants normalize to the sentinel.
+        for raw in [
+            "__LEAVE__",
+            "__Leave__",
+            "__lEaVe__",
+            " __leave__ ",
+            "\t__LEAVE__\n",
+            "\u{feff}__leave__\u{feff}",
+        ] {
+            assert_eq!(
+                parse_role_spec(&format!("{raw}:Leave:1")),
+                Err(reserved.clone()),
+                "{raw:?}"
+            );
+            assert_eq!(
+                parse_role_spec(&format!("tank:Tank:1,{raw}:Leave:1")),
+                Err(reserved.clone()),
+                "{raw:?}"
+            );
+        }
+        // Near-sentinel keys stay valid, keeping the leave action distinct.
+        let roles = parse_role_spec("tank:Tank:1,leave:Leave:1,__leave___:Near:1").expect("parses");
+        assert_eq!(
+            roles
+                .iter()
+                .map(|role| role.key.as_str())
+                .collect::<Vec<_>>(),
+            ["tank", "leave", "__leave___"]
+        );
+        // Duplicate detection is unchanged: plain duplicates still report the
+        // normalized key, and the reserved key refuses before dedup can fire.
+        assert_eq!(
+            parse_role_spec("tank:Tank:1,TANK:Other:1"),
+            Err(RoleSpecError::DuplicateKey("tank".to_owned()))
+        );
+        assert_eq!(
+            parse_role_spec("__leave__:Leave:1,__leave__:Leave:1"),
+            Err(reserved.clone())
+        );
+    }
+
+    #[test]
     fn role_spec_numbers_and_unicode_match_javascript() {
         for number in ["2", "2.0", "2e0", "+2", "0x2", "0X2", "0b10", "0o2"] {
             assert_eq!(
@@ -873,6 +939,10 @@ mod tests {
         assert_eq!(
             RoleSpecError::DuplicateKey("tank".to_owned()).to_string(),
             "Duplicate LFG role key \"tank\"."
+        );
+        assert_eq!(
+            RoleSpecError::ReservedKey(LFG_LEAVE_VALUE.to_owned()).to_string(),
+            "LFG role key \"__leave__\" is reserved for leaving the group."
         );
     }
 

@@ -29,11 +29,12 @@
 //! production guild or tokens.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use twilight_cache_inmemory::{DefaultInMemoryCache, InMemoryCache};
 use twilight_model::gateway::event::Event;
 use twilight_model::util::Timestamp;
+use two_bot_core::automod_runtime::FunnelDisposition;
 use two_bot_core::{
     ChannelClass, ExpectedJoins, FactsSink, FunnelHandlers, FunnelStore, GateClearedInput,
     InviteSnapshotStore, InviteState, InviteTracker, JoinInput, LevelingHook, MessageInput,
@@ -46,6 +47,45 @@ use two_bot_core::{
 #[must_use]
 pub fn legacy_stamp(ts: Timestamp) -> String {
     two_bot_core::format_iso_millis(ts.as_micros().div_euclid(1000))
+}
+
+/// A non-bot member join, handed to a runtime observer after the funnel has
+/// recorded it (legacy `client.ts`: the burst check runs last, "never at the
+/// expense of the join record").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinObservation {
+    pub guild_id: u64,
+    pub member_id: u64,
+    /// The attribution the funnel just recorded (`unknown`, `vanity`, an
+    /// invite, or the web path's expected-join source).
+    pub source: String,
+    /// Discord's `joined_at`, else the gateway receipt time (legacy
+    /// `member.joinedAt?.getTime() ?? Date.now()`).
+    pub joined_at_ms: i64,
+}
+
+/// Receives joins from the serial gateway writer. Implementations must not
+/// block or await: hand the join to a queue and return.
+pub trait JoinObserver: Send + Sync {
+    fn observe_join(&self, join: JoinObservation);
+}
+
+/// A destructive-potential audit-log entry, handed to a runtime observer. No
+/// funnel row: entries are evidence for the containment runtime, which claims
+/// and scores them in its own store.
+#[derive(Debug, Clone)]
+pub struct AuditLogObservation {
+    pub guild_id: u64,
+    pub entry_id: u64,
+    pub action: twilight_model::guild::audit_log::AuditLogEventType,
+    pub executor_id: Option<u64>,
+    pub target_id: Option<u64>,
+}
+
+/// Receives audit-log entries from the serial gateway writer. Implementations
+/// must not block or await: hand the entry to a queue and return.
+pub trait AuditEntryObserver: Send + Sync {
+    fn observe_audit_entry(&self, entry: AuditLogObservation);
 }
 
 use crate::intents::cache_resource_types;
@@ -191,6 +231,13 @@ impl VoiceChains {
     }
 }
 
+/// Eligibility decisions supplied by the upstream message acceptance path.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MessageEligibility {
+    pub is_staff_automation: bool,
+    pub capture_only: bool,
+}
+
 /// The S3 gateway pipeline. `S`/`L`/`F` are the core seams; `I` serves invite
 /// counters; `C` classifies channels. Share via `Arc` between the shard
 /// runner and the HTTP layer (snapshot reads, health).
@@ -211,6 +258,11 @@ pub struct Pipeline<
     voice_chains: VoiceChains,
     /// Guild IDs whose invites carry a vanity URL (for `vanity` attribution).
     vanity_guilds: Mutex<HashSet<Snowflake>>,
+    /// Set once at startup by the runtime that wants joins (raid watch).
+    join_observer: OnceLock<Arc<dyn JoinObserver>>,
+    /// Set once at startup by the runtime that wants audit entries
+    /// (containment).
+    audit_entry_observer: OnceLock<Arc<dyn AuditEntryObserver>>,
 }
 
 impl<S, L, F, I, C, P> std::fmt::Debug for Pipeline<S, L, F, I, C, P> {
@@ -270,7 +322,20 @@ impl<
             classifier,
             voice_chains: VoiceChains::default(),
             vanity_guilds: Mutex::new(HashSet::new()),
+            join_observer: OnceLock::new(),
+            audit_entry_observer: OnceLock::new(),
         }
+    }
+
+    /// Register the join observer. First registration wins; a second call is
+    /// ignored so a late caller can never swap the observer under the writer.
+    pub fn set_join_observer(&self, observer: Arc<dyn JoinObserver>) {
+        let _ = self.join_observer.set(observer);
+    }
+
+    /// Register the audit-entry observer. First registration wins, like joins.
+    pub fn set_audit_entry_observer(&self, observer: Arc<dyn AuditEntryObserver>) {
+        let _ = self.audit_entry_observer.set(observer);
     }
 
     /// Access the core handlers (tracker reads, replay assertions).
@@ -373,9 +438,59 @@ impl<
         self.handle_at(event, &two_bot_core::now_iso());
     }
 
+    /// Shared async orchestration supplies the result after durable claim and
+    /// inspection. `None` keeps cache handling but skips duplicate/pending
+    /// creates; `CaptureOnly` records facts without XP/activity/milestones.
+    /// Updates never award the funnel, regardless of this disposition. Call
+    /// this instead of `handle`, not in addition to it.
+    pub fn handle_with_message_disposition(&self, event: &Event, disposition: FunnelDisposition) {
+        self.handle_at_with_message_disposition(event, &two_bot_core::now_iso(), disposition);
+    }
+
     /// Drive a received event after queueing without changing its occurrence
     /// time. Payload timestamps win; timestamp-less transitions use receipt time.
     pub fn handle_at(&self, event: &Event, observed_at: &str) {
+        self.handle_at_with_eligibility(event, observed_at, MessageEligibility::default());
+    }
+
+    /// The ordered async bridge supplies one processing instant for both halves
+    /// of a voice move and carries the existing automod/staff eligibility gates.
+    pub fn handle_at_with_eligibility(
+        &self,
+        event: &Event,
+        observed_at: &str,
+        eligibility: MessageEligibility,
+    ) {
+        self.handle_inner(event, observed_at, eligibility, true);
+    }
+
+    /// Combine the replay clock with the automod decision without handling twice.
+    pub fn handle_at_with_message_disposition(
+        &self,
+        event: &Event,
+        observed_at: &str,
+        disposition: FunnelDisposition,
+    ) {
+        self.handle_inner(
+            event,
+            observed_at,
+            MessageEligibility {
+                is_staff_automation: false,
+                capture_only: disposition == FunnelDisposition::CaptureOnly,
+            },
+            disposition != FunnelDisposition::None,
+        );
+    }
+
+    /// Shared funnel core. `deliver` is false only for the automod `None`
+    /// disposition: cache handling still runs, message handlers are skipped.
+    fn handle_inner(
+        &self,
+        event: &Event,
+        observed_at: &str,
+        eligibility: MessageEligibility,
+        deliver: bool,
+    ) {
         match event {
             // Fresh session after (re-)identify: first connect starts empty
             // (no-op); a reconnect's open state is unproven and dropped.
@@ -419,6 +534,10 @@ impl<
                 } else {
                     None
                 };
+                let joined_at_ms = add.member.joined_at.map_or_else(
+                    || two_bot_core::parse_iso_millis(observed_at),
+                    |at| Some(at.as_micros().div_euclid(1000)),
+                );
                 let joined_at = add
                     .member
                     .joined_at
@@ -426,6 +545,7 @@ impl<
                 let source_event_id = format!("{guild_id}:{member_id}:{joined_at}");
                 let occurred_at = Some(joined_at);
                 let is_bot = add.user.bot;
+                let observed_source = source.clone();
                 self.cache.update(event);
                 self.handlers.on_join(JoinInput {
                     guild_id,
@@ -446,6 +566,19 @@ impl<
                         is_bot,
                         occurred_at,
                         source: None,
+                    });
+                }
+                // Last, after the funnel rows: an observer problem must never
+                // cost the join record it is reporting on. Bots are never
+                // observed, and an unreadable timestamp is skipped, not guessed.
+                if let (Some(observer), false, Some(joined_at_ms)) =
+                    (self.join_observer.get(), is_bot, joined_at_ms)
+                {
+                    observer.observe_join(JoinObservation {
+                        guild_id,
+                        member_id,
+                        source: observed_source,
+                        joined_at_ms,
                     });
                 }
             }
@@ -497,14 +630,16 @@ impl<
                     is_bot: msg.author.bot,
                     message_id: Some(msg.id.get().to_string()),
                     webhook_id: msg.webhook_id.map(|w| w.get()),
-                    is_staff_automation: false,
+                    is_staff_automation: eligibility.is_staff_automation,
                     channel_id,
                     channel_class: self.classifier.classify(channel_id),
-                    capture_only: false,
+                    capture_only: eligibility.capture_only,
                     occurred_at: Some(legacy_stamp(msg.timestamp)),
                 };
                 self.cache.update(event);
-                self.handlers.on_message(input);
+                if deliver {
+                    self.handlers.on_message(input);
+                }
             }
             Event::VoiceStateUpdate(update) => {
                 let Some(guild_id) = update.guild_id.map(|g| g.get()) else {
@@ -567,9 +702,26 @@ impl<
                 );
                 self.cache.update(event);
             }
+            // Destructive-potential audit entries: evidence for the
+            // containment runtime, claimed and scored in its own store. No
+            // funnel row; an observer problem must never cost the entry.
+            Event::GuildAuditLogEntryCreate(created) => {
+                self.cache.update(event);
+                if let (Some(observer), Some(guild_id)) =
+                    (self.audit_entry_observer.get(), created.guild_id)
+                {
+                    observer.observe_audit_entry(AuditLogObservation {
+                        guild_id: guild_id.get(),
+                        entry_id: created.id.get(),
+                        action: created.action_type,
+                        executor_id: created.user_id.map(|id| id.get()),
+                        target_id: created.target_id.map(|id| id.get()),
+                    });
+                }
+            }
             // Connection lifecycle and S4/S5 surfaces: no funnel row.
-            // (Reactions, audit-log entries, interactions, bans, message
-            // updates/deletes are S4/S5 — parity matrix §§1–3. This match is
+            // (Reactions, interactions, bans, message updates/deletes are
+            // S4/S5 — parity matrix §§1–3. This match is
             // exhaustive-by-construction: new twilight variants land here and
             // must be triaged, never silently swallowed.)
             _ => {

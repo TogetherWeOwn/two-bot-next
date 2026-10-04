@@ -168,28 +168,32 @@ async function simulate(snapshot, {message, file, tagged, bootstrap}) {
   return Object.freeze(content);
 }
 
-const bootstrap = '# Changelog\n\n## 0.2.0\n\n### Added\n\n* generated feature\n\n## Changelog\n\n## Unreleased\n\n### Fixed\n\n- historical repair\n\n### Notes\n\n- historical caveat\n';
+const bootstrap = '# Changelog\n\n## 0.2.0\n\n### Added\n\n* generated feature\n\n## Changelog\n\n## Unreleased\n\n### Fixed\n\n- historical repair\n\n### Security\n\n- historical hardening\n\n### Notes\n\n- historical caveat\n';
 const bootstrapBody = '## 0.2.0\n\n### Added\n\n* generated feature\n';
 assert.throws(() => migrateReleaseNotes(bootstrap.replace('## Changelog\n\n## Unreleased', '## Unreleased'), bootstrapBody), /layout/);
 assert.throws(() => migrateReleaseNotes(bootstrap + '\n## 0.1.0\n', bootstrapBody), /historical release/);
 assert.throws(() => migrateReleaseNotes(bootstrap.replace('### Fixed', '### Unknown'), bootstrapBody), /Unsupported/);
+assert.throws(() => migrateReleaseNotes(bootstrap.replace('### Security', '### Unknown'), bootstrapBody), /Unsupported/);
 assert.throws(() => migrateReleaseNotes(bootstrap, bootstrapBody + bootstrapBody), /Ambiguous/);
 const {Changelog} = require(path.join(library, 'build/src/updaters/changelog'));
 const firstRelease = migrateReleaseNotes(bootstrap, bootstrapBody);
 assert(firstRelease.changelog.includes('### Notes'), 'Migrated changelog must preserve the bootstrap Notes tail');
 assert(firstRelease.body.includes('- historical caveat'), 'Migrated PR body must preserve the bootstrap Notes tail');
+assert(firstRelease.changelog.includes('### Security'), 'Migrated changelog must preserve the bootstrap Security section');
+assert(firstRelease.body.includes('- historical hardening'), 'Migrated PR body must preserve the bootstrap Security section');
 const nextBody = '## 0.3.0\n\n### Fixed\n\n* later repair';
 const nextChangelog = new Changelog({version: Version.parse('0.3.0'), changelogEntry: nextBody}).updateContent(firstRelease.changelog);
 assert.deepEqual(migrateReleaseNotes(nextChangelog, nextBody), {changelog: nextChangelog, body: nextBody});
 assert.equal((nextChangelog.match(/^# Changelog$/gm) || []).length, 1);
 assert.equal(nextChangelog.split('- historical repair').length - 1, 1);
 assert(!nextBody.includes('- historical repair'), 'Later release must not repeat bootstrap notes');
+assert(!nextBody.includes('- historical hardening'), 'Later release must not repeat bootstrap Security');
 assert(!nextBody.includes('- historical caveat'), 'Later release must not repeat bootstrap Notes');
-console.log('PASS 6 bootstrap migration guards: layout, history, section, ambiguous body, notes tail, subsequent release');
+console.log('PASS 7 bootstrap migration guards: layout, history, 2 section, ambiguous body, notes tail, security tail, subsequent release');
 
 // Live 0.3.0 regression: contributors add Unreleased above published 0.2.0,
 // and the pinned native updater keeps that prefix above its generated entry.
-const unreleasedNotes = '### Added\n\n- pending sticky runtime\n\n### Notes\n\n- pending caveat';
+const unreleasedNotes = '### Added\n\n- pending sticky runtime\n\n### Security\n\n- pending hardening\n\n### Notes\n\n- pending caveat';
 const pendingSnapshot = firstRelease.changelog.replace('# Changelog\n\n', `# Changelog\n\n## Unreleased\n\n${unreleasedNotes}\n\n`);
 const pendingChangelog = new Changelog({version: Version.parse('0.3.0'), changelogEntry: nextBody}).updateContent(pendingSnapshot);
 assert(pendingChangelog.startsWith('# Changelog\n\n## Unreleased\n'), 'Native updater must reproduce the live prefix layout');
@@ -198,7 +202,7 @@ const pendingRelease = migrateReleaseNotes(pendingChangelog, pendingBody);
 const publishedHistory = firstRelease.changelog.slice('# Changelog\n\n'.length);
 assert(pendingRelease.changelog.endsWith(publishedHistory), 'Published history must remain byte-for-byte intact');
 assert(!/^## Unreleased$/m.test(pendingRelease.changelog));
-for (const note of ['- pending sticky runtime', '- pending caveat']) {
+for (const note of ['- pending sticky runtime', '- pending hardening', '- pending caveat']) {
   assert.equal(pendingRelease.changelog.split(note).length - 1, 1);
   assert.equal(pendingRelease.body.split(note).length - 1, 1);
 }

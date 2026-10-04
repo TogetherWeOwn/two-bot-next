@@ -1,5 +1,8 @@
 /target/
 .env*
 *.log
+# Operator raid cohort exports and per-account audit evidence are private.
+/data/
 .wrangler/
 node_modules/
+__pycache__/

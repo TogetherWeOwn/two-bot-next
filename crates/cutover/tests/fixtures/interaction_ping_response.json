@@ -1,0 +1,10 @@
+{
+  "type": 4,
+  "data": {
+    "allowed_mentions": {
+      "parse": []
+    },
+    "content": "Pong! 42ms",
+    "flags": 64
+  }
+}

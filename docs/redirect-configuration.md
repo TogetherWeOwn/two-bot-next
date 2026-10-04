@@ -64,3 +64,31 @@ node --import ./test/cloudflare-loader.mjs --test \
 
 All bindings and errors are synthetic. No live endpoint, Discord or database
 probe is part of this verification.
+
+## Staging smoke
+
+`scripts/staging_redirect_smoke.py` exercises the same contracts against the
+staging Worker origin (read-only E2E): exact `/healthz` 200, reserved alias
+404 with no lookup, and unknown slug matching the fallback-or-404 contract;
+any 5xx must carry the bounded fail-closed shape above. It makes three GETs,
+follows no redirects, asserts no known campaign slug (no click side effects),
+sends no credentials and never touches production. The origin comes from
+`$STAGING_WORKER_URL` (the same variable the staging gate reads); anything
+else is refused before a request is sent.
+
+Run it after each staging deploy and keep the passing receipt with the B4
+soak evidence on [TOG-9699](/TOG/issues/TOG-9699): the receipt holds only
+check names, shape tokens and the origin, never response bodies or secrets.
+
+```sh
+STAGING_WORKER_URL=https://two-bot-next-staging.<sub>.workers.dev \
+  python3 scripts/staging_redirect_smoke.py --evidence staging-redirect-smoke-evidence.json
+```
+
+Offline fixtures cover the same assertion logic with no network access:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_staging_redirect_smoke.py -v
+```
+
+CI runs them in the worker job beside the rollout provenance suite.
