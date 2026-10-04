@@ -156,6 +156,11 @@ fn every_retained_command_rechecks_resolved_permissions_before_returning_a_handl
     for row in COMMAND_PERMISSIONS
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
+        // `/votekick` is the documented yield: the core router always returns
+        // `Ignore` and the bot-crate voice sink answers, so the Handled/Refuse
+        // recheck below does not apply. The yield is pinned by
+        // `votekick_publishes_only_with_voice_and_yields_to_the_voice_sink`.
+        .filter(|row| row.command != "votekick")
     {
         let ctx = |actor_permissions| SlashContext {
             name: row.command,
