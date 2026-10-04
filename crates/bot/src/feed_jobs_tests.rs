@@ -12,7 +12,10 @@ use two_bot_core::feeds_connector::{
 use two_bot_core::feeds_http::PublicRequest;
 use two_bot_testsupport::TestDatabase;
 
-use crate::discord_test_common::{MockRest, ScriptedResponse};
+use crate::{
+    activation::fixtures,
+    discord_test_common::{MockRest, ScriptedResponse},
+};
 
 const GUILD: &str = "2222";
 const CHANNEL: &str = "3333";
@@ -272,17 +275,6 @@ async fn registration_parks_off_values_without_constructing_work() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
-/// Identity pairs, written out so a mutated constant cannot move expectations.
-/// The tokens are synthetic first segments for the public application ids.
-const STAGING: (u64, &str) = (
-    1545644954272137297,
-    "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
-);
-const LIVE: (u64, &str) = (
-    326474832151838730,
-    "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature",
-);
-
 fn announcements(value: Option<&str>) -> FeatureGates {
     let mut vars = std::collections::HashMap::new();
     if let Some(value) = value {
@@ -307,23 +299,13 @@ async fn identity_fence_registers_the_poller_only_where_announcements_are_permit
     });
     let on = announcements(Some("1"));
 
-    let activation = BootActivation::from_token(Some(STAGING.0), Some(STAGING.1));
-    let job = register_fenced(on, &activation, action.clone())
+    let job = register_fenced(on, &fixtures::staging(), action.clone())
         .expect("staging identity registers the poller");
     assert_eq!(job.name, "feeds");
     (job.action)().await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-    for (label, guild, token) in [
-        ("live pair", Some(LIVE.0), Some(LIVE.1)),
-        ("unknown guild", Some(1555555555555555555), Some(STAGING.1)),
-        ("staging guild, live token", Some(STAGING.0), Some(LIVE.1)),
-        ("live guild, staging token", Some(LIVE.0), Some(STAGING.1)),
-        ("no guild", None, Some(STAGING.1)),
-        ("unparseable token", Some(STAGING.0), Some("nope")),
-        ("no token", Some(STAGING.0), None),
-    ] {
-        let activation = BootActivation::from_token(guild, token);
+    for (label, activation) in fixtures::refused() {
         assert!(
             register_fenced(on, &activation, action.clone()).is_none(),
             "{label} must not register the poller"
@@ -332,9 +314,10 @@ async fn identity_fence_registers_the_poller_only_where_announcements_are_permit
     assert_eq!(calls.load(Ordering::SeqCst), 1, "refused jobs never run");
 
     // Identity never enables what the environment left off.
-    let activation = BootActivation::from_token(Some(STAGING.0), Some(STAGING.1));
     for value in [None, Some("0")] {
-        assert!(register_fenced(announcements(value), &activation, action.clone()).is_none());
+        assert!(
+            register_fenced(announcements(value), &fixtures::staging(), action.clone()).is_none()
+        );
     }
 }
 

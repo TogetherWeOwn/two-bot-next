@@ -3,7 +3,10 @@ use serde_json::json;
 use two_bot_core::apply_web_contract;
 use two_bot_testsupport::TestDatabase;
 
-use crate::discord_test_common::{MockRest, ScriptedResponse};
+use crate::{
+    activation::fixtures,
+    discord_test_common::{MockRest, ScriptedResponse},
+};
 
 use crate::tracing_capture;
 
@@ -101,11 +104,7 @@ async fn refused_identity_parks_the_posting_jobs_in_the_readyz_status_map() {
     };
     let posting = [scheduled_jobs::NAMES[0], feed_jobs::NAME];
 
-    let staging = BootActivation::from_token(
-        Some(1545644954272137297),
-        Some("MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature"),
-    );
-    let registered = register(&staging);
+    let registered = register(&fixtures::staging());
     let status = registered_statuses(&registered, &[]).await;
     let entries = status.read().await;
     for name in posting {
@@ -116,11 +115,7 @@ async fn refused_identity_parks_the_posting_jobs_in_the_readyz_status_map() {
     }
     drop(entries);
 
-    let live = BootActivation::from_token(
-        Some(326474832151838730),
-        Some("MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature"),
-    );
-    let registered = register(&live);
+    let registered = register(&fixtures::live());
     assert!(registered.is_empty(), "live identity builds no posting job");
     let status = registered_statuses(&registered, &[]).await;
     let entries = status.read().await;
