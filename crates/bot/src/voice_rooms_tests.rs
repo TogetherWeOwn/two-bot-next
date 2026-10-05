@@ -8,6 +8,8 @@ mod delete_guards;
 mod kick;
 #[path = "voice_name_tests.rs"]
 mod name;
+#[path = "voice_private_runtime_tests.rs"]
+mod private;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
 
@@ -127,6 +129,8 @@ struct Store {
     save_logging_error: Option<StoreError>,
     forget_errors: Mutex<VecDeque<StoreError>>,
     companion_errors: Mutex<VecDeque<StoreError>>,
+    privacy: Mutex<BTreeMap<u64, PrivacyRecord>>,
+    save_privacy_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
     after_persist: Option<Hook>,
     config: Arc<Mutex<VoiceConfiguration>>,
@@ -135,6 +139,9 @@ struct Store {
     creators_error: Option<StoreError>,
     custom_names: Mutex<HashMap<u64, String>>,
     save_custom_name_errors: Mutex<VecDeque<StoreError>>,
+    /// V4 audit rows appended so far, in append order.
+    kick_audit: Mutex<Vec<KickAuditRow>>,
+    kick_audit_errors: Mutex<VecDeque<StoreError>>,
 }
 
 impl Store {
@@ -160,6 +167,8 @@ impl Store {
             save_logging_error: None,
             forget_errors: Mutex::new(VecDeque::new()),
             companion_errors: Mutex::new(VecDeque::new()),
+            privacy: Mutex::new(BTreeMap::new()),
+            save_privacy_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
             after_persist: None,
             config: Arc::new(Mutex::new(empty_config())),
@@ -168,6 +177,8 @@ impl Store {
             creators_error: None,
             custom_names: Mutex::new(HashMap::new()),
             save_custom_name_errors: Mutex::new(VecDeque::new()),
+            kick_audit: Mutex::new(Vec::new()),
+            kick_audit_errors: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -365,6 +376,7 @@ impl RoomPersistence for Store {
             return Err(error);
         }
         self.rooms.lock().unwrap().remove(&channel);
+        self.privacy.lock().unwrap().remove(&channel);
         self.owner_intents.lock().unwrap().remove(&channel);
         self.owner_pending.lock().unwrap().remove(&channel);
         Ok(())
@@ -426,6 +438,46 @@ impl RoomPersistence for Store {
             .push(format!("remove_companion:{room}"));
         Ok(self.companions.lock().unwrap().remove(&(guild, room)))
     }
+    async fn record_kick_audit(&self, rows: &[KickAuditRow]) -> Result<(), StoreError> {
+        if let Some(error) = self.kick_audit_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        // Same idempotency as the table's (guild, vote, event) key.
+        let mut stored = self.kick_audit.lock().unwrap();
+        for row in rows {
+            if !stored
+                .iter()
+                .any(|s| (s.guild_id, s.vote_id, s.event) == (row.guild_id, row.vote_id, row.event))
+            {
+                stored.push(row.clone());
+            }
+        }
+        Ok(())
+    }
+    async fn privacy(&self, _: u64) -> Result<BTreeMap<u64, PrivacyRecord>, StoreError> {
+        Ok(self.privacy.lock().unwrap().clone())
+    }
+    async fn save_privacy(
+        &self,
+        _: u64,
+        room: u64,
+        record: &PrivacyRecord,
+    ) -> Result<bool, StoreError> {
+        self.trace.lock().unwrap().push(format!(
+            "save_privacy:{room}:{}:{:?}:{}",
+            record.private,
+            record.join_channel_id,
+            record.blocked.len()
+        ));
+        if let Some(error) = self.save_privacy_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        if !self.rooms.lock().unwrap().contains_key(&room) {
+            return Ok(false);
+        }
+        self.privacy.lock().unwrap().insert(room, record.clone());
+        Ok(true)
+    }
 }
 
 /// Scripted `/import` download queue shared with the harness.
@@ -446,6 +498,11 @@ struct Http {
     rename_errors: Mutex<VecDeque<RoomHttpError>>,
     companion_errors: Mutex<VecDeque<RoomHttpError>>,
     view_errors: Mutex<VecDeque<RoomHttpError>>,
+    /// Scripted failures for the V4 enforcement's Connect deny.
+    kick_errors: Mutex<VecDeque<RoomHttpError>>,
+    overwrite_errors: Mutex<VecDeque<RoomHttpError>>,
+    join_errors: Mutex<VecDeque<RoomHttpError>>,
+    written_overwrites: Mutex<Vec<(u64, PermissionOverwrite)>>,
     notices: Mutex<Vec<(NoticeTarget, String, Option<u64>)>>,
     refused_notices: Mutex<Vec<NoticeTarget>>,
     created_attributes: Mutex<Vec<RoomChannelAttributes>>,
@@ -471,6 +528,10 @@ impl Http {
             rename_errors: Mutex::new(VecDeque::new()),
             companion_errors: Mutex::new(VecDeque::new()),
             view_errors: Mutex::new(VecDeque::new()),
+            kick_errors: Mutex::new(VecDeque::new()),
+            overwrite_errors: Mutex::new(VecDeque::new()),
+            join_errors: Mutex::new(VecDeque::new()),
+            written_overwrites: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             refused_notices: Mutex::new(Vec::new()),
             created_attributes: Mutex::new(Vec::new()),
@@ -593,6 +654,9 @@ impl RoomWrites for Http {
         if !guard() {
             return Err(RoomHttpError::Cancelled);
         }
+        if let Some(error) = self.kick_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
         self.trace
             .lock()
             .unwrap()
@@ -696,6 +760,57 @@ impl RoomWrites for Http {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+    async fn put_overwrite(
+        &self,
+        channel: u64,
+        overwrite: PermissionOverwrite,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace.lock().unwrap().push(format!(
+            "overwrite:{channel}:{}:{:?}",
+            overwrite.id.get(),
+            overwrite.kind
+        ));
+        if let Some(error) = self.overwrite_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        self.written_overwrites
+            .lock()
+            .unwrap()
+            .push((channel, overwrite));
+        Ok(())
+    }
+    async fn create_join_channel(
+        &self,
+        _: u64,
+        name: &str,
+        parent_id: Option<u64>,
+        position: Option<u64>,
+        guard: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("create_join:{name}:{parent_id:?}:{position:?}"));
+        if let Some(error) = self.join_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        let id = {
+            let mut id = self.next_id.lock().unwrap();
+            let next = *id;
+            *id += 1;
+            next
+        };
+        let mut created = channel(id, 2, parent_id);
+        created.name = Some(name.to_owned());
+        Ok(created)
     }
     async fn send_notice(
         &self,
@@ -2272,7 +2387,9 @@ fn voice_command_set_is_gated_on_two_voice() {
             "defaultlimit",
             "alwaysprivate",
             "kick",
-            "name"
+            "name",
+            "private",
+            "public"
         ]
     );
     let off = VoiceGates::from_map(&Default::default());
@@ -7455,47 +7572,61 @@ fn voice_member_in(member_id: u64, channel_id: u64) -> VoiceMember {
     }
 }
 
-#[tokio::test]
-async fn sink_claimed_kick_answers_public_ballot_without_defer() {
-    const VOTER: u64 = 301;
-    const TARGET: u64 = 303;
-    const KICK_ROOM: u64 = 500;
-    let trace = Trace::default();
+const KICK_VOTER: u64 = 301;
+const KICK_TARGET: u64 = 303;
+const KICK_ROOM: u64 = 500;
+const OTHER_ROOM: u64 = 501;
+
+/// A runtime tracking `KICK_ROOM` and `OTHER_ROOM` with the given occupants.
+fn kick_room_runtime(
+    trace: &Trace,
+    enabled: bool,
+    members: Vec<VoiceMember>,
+) -> VoiceRuntime<Store, Http> {
     let runtime = VoiceRuntime::new(
         {
             let trace = trace.clone();
             move || {
                 let store = Store::new(trace.clone());
-                store
-                    .rooms
-                    .lock()
-                    .unwrap()
-                    .insert(KICK_ROOM, room(KICK_ROOM));
+                for channel in [KICK_ROOM, OTHER_ROOM] {
+                    store.rooms.lock().unwrap().insert(channel, room(channel));
+                }
                 (store, Http::new(trace.clone()))
             }
         },
         Duration::from_millis(10),
-        true,
+        enabled,
     );
-    assert!(runtime.publish_snapshot(
-        GUILD,
-        snapshot(
-            &[KICK_ROOM],
-            vec![
-                voice_member_in(VOTER, KICK_ROOM),
-                voice_member_in(TARGET, KICK_ROOM),
-            ],
-        )
-    ));
+    // A disabled runtime spawns no actor, so nothing is published.
+    assert_eq!(
+        runtime.publish_snapshot(GUILD, snapshot(&[KICK_ROOM, OTHER_ROOM], members)),
+        enabled
+    );
+    runtime
+}
+
+#[tokio::test]
+async fn kick_vote_in_a_shared_room_answers_the_public_ballot_without_defer() {
+    let trace = Trace::default();
+    let runtime = kick_room_runtime(
+        &trace,
+        true,
+        vec![
+            voice_member_in(KICK_VOTER, KICK_ROOM),
+            voice_member_in(KICK_TARGET, KICK_ROOM),
+        ],
+    );
     let replies = Replies::new(trace.clone());
-    VoiceResponder::respond_with(
+    let answered = VoiceResponder::start_kick_vote(
         &runtime,
         &replies,
-        &kick_sink_interaction(TARGET, VOTER),
-        None,
-        None,
+        &kick_sink_interaction(KICK_TARGET, KICK_VOTER),
     )
     .await;
+    assert!(
+        answered,
+        "voice owns the callback, so the router stays silent"
+    );
     // No defer: the ballot goes out as the initial public callback, so every
     // occupant can see the buttons and reach quorum.
     assert_eq!(*trace.lock().unwrap(), ["respond"]);
@@ -7513,22 +7644,90 @@ async fn sink_claimed_kick_answers_public_ballot_without_defer() {
     assert_eq!(data.components.as_ref().map_or(0, Vec::len), 1);
 }
 
+// Every decline sends no callback at all: the router answers instead, so a
+// callback here would be a second answer to the same interaction.
 #[tokio::test]
-async fn sink_unclaimed_kick_stays_fully_silent_for_the_router() {
+async fn kick_vote_declines_without_a_callback_unless_the_invoker_shares_the_room() {
+    let occupied = vec![
+        voice_member_in(KICK_VOTER, KICK_ROOM),
+        voice_member_in(KICK_TARGET, KICK_ROOM),
+    ];
+    let cases = [
+        // (case, enabled, occupants)
+        ("no tracked room at all", true, Vec::new()),
+        (
+            "target outside any room",
+            true,
+            vec![voice_member_in(KICK_VOTER, KICK_ROOM)],
+        ),
+        (
+            "invoker outside any room",
+            true,
+            vec![voice_member_in(KICK_TARGET, KICK_ROOM)],
+        ),
+        (
+            "invoker in a different tracked room",
+            true,
+            vec![
+                voice_member_in(KICK_VOTER, OTHER_ROOM),
+                voice_member_in(KICK_TARGET, KICK_ROOM),
+            ],
+        ),
+        ("voice disabled", false, occupied),
+    ];
+    for (case, enabled, members) in cases {
+        let trace = Trace::default();
+        let runtime = kick_room_runtime(&trace, enabled, members);
+        let replies = Replies::new(trace.clone());
+        let answered = VoiceResponder::start_kick_vote(
+            &runtime,
+            &replies,
+            &kick_sink_interaction(KICK_TARGET, KICK_VOTER),
+        )
+        .await;
+        assert!(!answered, "{case}: the router must answer");
+        // Reconcile may still prune an empty tracked room, so look only for
+        // interaction callbacks rather than an empty trace.
+        let calls = trace.lock().unwrap().clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("respond") || call.starts_with("defer")),
+            "{case}: no callback, got {calls:?}"
+        );
+        assert!(replies.completed.lock().unwrap().is_empty(), "{case}");
+    }
+}
+
+// The sink never answers `/kick` on its own account, even for a room
+// occupant: the router decides first (moderation gate, then `kick_vote`).
+#[tokio::test]
+async fn sink_never_answers_kick_without_the_router() {
     let trace = Trace::default();
-    let runtime = test_runtime(trace.clone());
+    let runtime = kick_room_runtime(
+        &trace,
+        true,
+        vec![
+            voice_member_in(KICK_VOTER, KICK_ROOM),
+            voice_member_in(KICK_TARGET, KICK_ROOM),
+        ],
+    );
     let replies = Replies::new(trace.clone());
-    // No actor, no rooms: a moderation-shaped target must produce no ack at
-    // all here, otherwise the defer races (and loses to) the router answer.
     VoiceResponder::respond_with(
         &runtime,
         &replies,
-        &kick_sink_interaction(303, 301),
+        &kick_sink_interaction(KICK_TARGET, KICK_VOTER),
         None,
         None,
     )
     .await;
-    assert!(trace.lock().unwrap().is_empty());
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.starts_with("respond") || call.starts_with("defer")),
+        "no callback, got {calls:?}"
+    );
     assert!(replies.completed.lock().unwrap().is_empty());
 }
 
@@ -7659,6 +7858,7 @@ fn dead_letter_families_cover_every_queue_action_shape() {
             RoomAction::KickMember {
                 channel_id: 500,
                 member_id: MEMBER,
+                vote_id: 7_000,
             },
             "kick",
         ),

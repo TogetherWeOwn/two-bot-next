@@ -12,7 +12,10 @@ use two_bot_core::feeds_connector::{
 use two_bot_core::feeds_http::PublicRequest;
 use two_bot_testsupport::TestDatabase;
 
-use crate::discord_test_common::{MockRest, ScriptedResponse};
+use crate::{
+    activation::fixtures,
+    discord_test_common::{MockRest, ScriptedResponse},
+};
 
 const GUILD: &str = "2222";
 const CHANNEL: &str = "3333";
@@ -270,6 +273,52 @@ async fn registration_parks_off_values_without_constructing_work() {
     assert_eq!(calls.load(Ordering::SeqCst), 0, "registration is lazy");
     (job.action)().await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+fn announcements(value: Option<&str>) -> FeatureGates {
+    let mut vars = std::collections::HashMap::new();
+    if let Some(value) = value {
+        vars.insert("TWO_ANNOUNCEMENTS".to_owned(), value.to_owned());
+    }
+    FeatureGates::from_map(&vars).unwrap()
+}
+
+/// TOG-15758: the poller delivers under the token's identity, so the capability
+/// fence binds it like the announcement verbs. With `TWO_ANNOUNCEMENTS=1` the
+/// staging pair registers; the live pair (announcements uncleared), an unknown
+/// guild, a mismatched pair and a missing or unparseable token build no job.
+#[tokio::test(start_paused = true)]
+async fn identity_fence_registers_the_poller_only_where_announcements_are_permitted() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let action: JobAction = Arc::new({
+        let calls = calls.clone();
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    });
+    let on = announcements(Some("1"));
+
+    let job = register_fenced(on, &fixtures::staging(), action.clone())
+        .expect("staging identity registers the poller");
+    assert_eq!(job.name, "feeds");
+    (job.action)().await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    for (label, activation) in fixtures::refused() {
+        assert!(
+            register_fenced(on, &activation, action.clone()).is_none(),
+            "{label} must not register the poller"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "refused jobs never run");
+
+    // Identity never enables what the environment left off.
+    for value in [None, Some("0")] {
+        assert!(
+            register_fenced(announcements(value), &fixtures::staging(), action.clone()).is_none()
+        );
+    }
 }
 
 struct Active(Arc<AtomicUsize>);

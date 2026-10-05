@@ -1309,13 +1309,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-59965d0: 59965d0 — TOG-5981: serialize same-member voice frames, scope voice idempotency keys by channel
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Replay a same-tick burst of same-member voice frames across two channels through the fixture added by TOG-15277.
-- **Expected:** Frames apply serially per member and idempotency keys are channel-scoped: one session per channel, no cross-channel dedupe.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the voice-frame serialization and same-instant burst fixtures in `crates/discord/tests/funnel_replay.rs`, plus the channel-scoped key and end-then-start fixtures in `crates/core`.
+- **Expected:** Frames for one member apply whole and in order: a second frame waits for the first move's end and start. A one-stamp burst keeps every end `startKnown:true` with `durationSeconds` 0 and every boundary a separate channel-scoped row; a return to the opening channel repeats the opening start key, as in legacy. Not deployed gateway evidence.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result; fixture proof only, not a deployed-gateway soak receipt.
 - **Owner:** [TOG-15277](/TOG/issues/TOG-15277)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib -- funnel::tests::repeatable_key_carries_time_and_voice_channel handlers::tests::voice_move_is_end_then_start_at_same_instant && python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test funnel_replay -- pipeline_serializes_same_member_voice_frames pipeline_same_instant_voice_burst_keeps_every_boundary_as_its_own_row pipeline_same_instant_voice_return_to_origin_dedupes_only_the_repeat_start
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-7da2c15: 7da2c15 — TOG-6123: drop open voice sessions on fresh session (ShardReady) as well as resume
@@ -1474,13 +1473,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-3c3e7e8: 3c3e7e8 — fix(voice): treat malformed leave timestamp as unknown-start (#265)
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Deliver a voice leave with a malformed timestamp, with and without an open session, through the fixture added by TOG-15277.
-- **Expected:** The session is treated as unknown-start, not a fabricated duration, and no leveling XP is awarded.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the malformed-timestamp fixtures in `crates/core/src/voice.rs` and `crates/core/src/handlers.rs`.
+- **Expected:** A leave stamp that does not parse, or a recorded start that does not parse, resolves to `start_known=false` with no `started_at` and no duration. A malformed leave is stamped with processing time, closes the session as one unknown-start end row and awards no voice XP. Not deployed gateway evidence.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result; fixture proof only, not a deployed-gateway soak receipt.
 - **Owner:** [TOG-15277](/TOG/issues/TOG-15277)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib -- voice::tests::resolve_measured_and_unknown voice::tests::malformed_leave_with_open_session_is_unknown_start voice::tests::malformed_open_start_with_valid_leave_is_unknown_start handlers::tests::malformed_leave_with_open_session_writes_one_unknown_start_end_and_no_xp handlers::tests::well_formed_leave_with_open_session_awards_the_measured_seconds
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-c99fec7: c99fec7 — fix(announcements): reclaim crashed feed-delivery claims after 60s lease (#312)

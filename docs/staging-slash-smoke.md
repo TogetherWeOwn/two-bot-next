@@ -44,12 +44,12 @@ block, and transport factories must remain lightweight and local.
 | --- | --- | --- |
 | `/rank` | Checks the compiled publish set and actual router handler; builds the fixture reply with `rank_reply`; runs the shared reply dispatcher | PostgreSQL reads, actual gateway dispatch, deployed reply delivery |
 | `/leaderboard` | Same route/dispatcher path with `leaderboard_reply`; covers populated and empty fixtures and mention suppression | Live leaderboard state or Discord receipt |
-| `/help` | Records `skipped / unsupported-core-command`; no fabricated interaction or fixture call | A built-in `/help` is absent from this revision |
+| `/help` | Records `skipped / covered-by-offline-tests`; no fabricated interaction or fixture call | Live picker listing: `/help` is a compiled core command answered from the live publish set, pinned by offline router and renderer tests rather than this fixture smoke |
 | `/ping` | Records `skipped / voice-command-out-of-scope`; no fixture call | Voice-family ping gates and latency behavior |
 | health/readiness | Classifies local liveness/readiness snapshots; healthy but unready fails | No HTTP endpoint is requested or measured |
 
 Success for the supported fixtures is **`incomplete`**, not PASS, because the
-older plan's help/ping coverage is still missing. Any down, timeout, mismatched
+older plan's help/ping coverage is still not exercised by fixtures. Any down, timeout, mismatched
 fixture or callback failure produces `fail`. Invalid configuration produces
 `refused` with no command entries. The source staging acceptance must resolve
 those scope gaps and obtain real deployed evidence separately.

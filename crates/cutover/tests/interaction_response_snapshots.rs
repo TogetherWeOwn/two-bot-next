@@ -8,10 +8,10 @@
 //! drives the same builders against these fixtures; the live run belongs to
 //! the staging-guild smoke suite.
 //!
-//! The three probes: `rank` (feature success text, ephemeral), `help` (the
-//! unknown-name guidance reply — neither `help` nor `ping` is a slash command
-//! on this tree, so both take the unknown-name path), and `ping` (the latency
-//! line render in the same ephemeral envelope).
+//! The three snapshots: `rank` (feature success text, ephemeral), unknown-name
+//! guidance, and the `ping` latency-line render in the same ephemeral envelope.
+//! These builder snapshots do not exercise slash-command routing; `/help`
+//! discovery is covered by the command runtime and Discord routing fixtures.
 //!
 //! Dev-only: never ships in the release binary.
 
@@ -72,9 +72,9 @@ fn rank_snapshot_matches_pin() {
 }
 
 #[test]
-fn help_snapshot_matches_pin() {
-    // `help` is not a slash command: the router answers `Unknown`, and the
-    // guidance reply tells the member to re-pick from the `/` list.
+fn unknown_command_snapshot_matches_pin() {
+    // The historical help-named fixture pins unknown-name guidance, not the
+    // published `/help` discovery command.
     let response = response_for_slash(&SlashOutcome::Unknown).expect("unknown names answer");
     let json = serde_json::to_value(&response).expect("serializes");
     assert_ack_contract(&json, UNKNOWN_COMMAND_REPLY);

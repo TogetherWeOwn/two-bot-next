@@ -127,6 +127,7 @@ async fn diff_and_publish_default_to_get_only_without_opening_a_database() {
             "compiled hash:",
             "+ 1/rank",
             "+ 1/leaderboard",
+            "+ 1/help",
             "Dry run: no commands written.",
         ] {
             assert!(

@@ -159,8 +159,10 @@ that monitoring is armed.
 ### Metrics alerts
 
 The Container DO pulls the container-internal `/metrics` on every keepalive tick,
-evaluates the rules in `wrangler/src/alert-rules.ts`, and posts one message per
-transition (fire, resolve) to `OPS_ALERT_WEBHOOK_URL`. See
+evaluates the rules in `wrangler/src/alert-rules.ts`, and logs/persists each
+transition (fire, resolve). It posts to `OPS_ALERT_WEBHOOK_URL` only when
+`OPS_ALERT_FORWARDING` is exactly `"on"` (default `"off"`); turning forwarding off
+retains the credential and monitoring. See
 [metrics](metrics.md#off-container-scrape-and-alert-rules). Fetch the live data
 with `curl -H "Authorization: Bearer $METRICS_SCRAPE_TOKEN" "$WORKER_URL/ops/metrics"`.
 
@@ -523,7 +525,11 @@ npm --prefix wrangler run deployments -- list --env staging
 ```
 
 Read the interactive target and confirm the incident's known-good version.
-Do not add `--yes` or override warnings. If Wrangler reports changed secrets,
+Do not add `--yes` or override warnings. Wrangler 4.147 updates Durable Object
+code with `deferred` mode and a 300 s maximum delay by default, so a bare
+rollback can leave the old code serving for up to five minutes. For a manual
+incident rollback add `--durable-objects-code-update-mode immediate`, and expect
+a time-to-ready that includes the restart. If Wrangler reports changed secrets,
 DO lifecycle changes, missing bindings, or an access denial, **stop**; do not
 force the rollback or revive/replace credentials. Escalate the compatibility
 or authorization decision with names and the error code, never secret values.
@@ -543,6 +549,20 @@ ownership, explicitly take over the current epoch under the incident's handoff
 authorization, then repeat health/readiness/log observations. Confirm only one
 gateway session and record version, image, first ready time and remaining
 limitations. None of these examples were a live rollback drill.
+
+**Staging drill.** The manual `staging-rollback-drill` workflow (dispatch from
+`main`, input `target_version`) runs this procedure end to end in the protected
+`staging` environment: fence, one unforced Cloudflare deployment of the target
+with `code_update_strategy: immediate`, epoch-checked takeover, a 2 s
+`/readyz` + `/health` poll, then the same sequence back to the original version.
+Pick the target from the deployment list: a version that already served staging
+traffic, not the serving one, compatible with the current schema (the script
+refuses an unknown or never-deployed id). The job summary and evidence file hold
+the fence, rollback, takeover and first-ready times, the time-to-ready against
+the 60 s budget, probe counts, the container image digest and instance counts.
+Gateway-session count is not observable from probes; read the Worker logs for it.
+If the run stops on a 401/403 it skips the restore: recover with a
+`deploy-staging` dispatch with `release_fence=true` after the binding is fixed.
 
 Cloudflare references:
 [Worker rollbacks and resource limits](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/),
