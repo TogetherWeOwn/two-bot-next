@@ -1707,7 +1707,18 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         for (room, members) in &join_grants {
             match privacy.get_mut(room) {
                 Some(state) if state.private => {
-                    state.granted.extend(members.iter().map(|m| MemberId(*m)));
+                    // A grant witness can outlive a later Block (approve,
+                    // failed revoke, re-private, Block): hydrating it blindly
+                    // would put a blocked member into `granted`, which
+                    // `validate()` refuses and wedges the room. Blocked
+                    // members keep only their revocation.
+                    for member in members {
+                        if state.blocked.contains(&MemberId(*member)) {
+                            pending_revokes.push((*room, *member));
+                        } else {
+                            state.granted.insert(MemberId(*member));
+                        }
+                    }
                 }
                 _ => {
                     for member in members {

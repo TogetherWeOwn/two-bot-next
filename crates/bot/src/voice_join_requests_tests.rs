@@ -1034,3 +1034,59 @@ async fn a_failed_revoke_keeps_its_witness_and_continues_after_a_restart() {
         "the Connect allow is gone"
     );
 }
+
+#[tokio::test]
+async fn a_grant_witness_older_than_a_block_hydrates_cleanly_after_a_restart() {
+    let (mut worker, _trace) = private_room().await;
+    enter(&worker, OUTSIDER, 2_000);
+    worker.reconcile();
+    drain(&mut worker).await;
+    let request = request_of(&worker, OUTSIDER);
+    press(&mut worker, OWNER, JoinDecision::Approve, request.id.0);
+    drain(&mut worker).await;
+    assert_eq!(stored_grants(&worker), [OUTSIDER]);
+    // `/public` with a refused revoke: the room opens but the witness stays.
+    let reply = worker.apply_privacy(OWNER, false, "Ana", PrivacyCommand::Public);
+    assert!(reply.contains("public again"), "{reply}");
+    assert!(worker.dispatch_one(1_000_000).await);
+    worker
+        .http
+        .overwrite_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    drain(&mut worker).await;
+    assert_eq!(stored_grants(&worker), [OUTSIDER]);
+    // Private again, and the same member is now blocked: both the grant
+    // witness and the block row exist for them.
+    let reply = worker.apply_privacy(OWNER, false, "Ana", PrivacyCommand::Private);
+    assert!(reply.contains("private"), "{reply}");
+    drain(&mut worker).await;
+    // The re-created Join channel has a fresh id: meet the member there.
+    let join = worker
+        .join_channel_of(ROOM)
+        .expect("recreated Join channel");
+    worker
+        .live
+        .voice_update_at(OUTSIDER, Some(join), Some(false), 3_000);
+    worker.reconcile();
+    drain(&mut worker).await;
+    let request = request_of(&worker, OUTSIDER);
+    let reply = press(&mut worker, OWNER, JoinDecision::Block, request.id.0);
+    assert!(decided(&reply).contains("Blocked"), "{reply:?}");
+    drain(&mut worker).await;
+    assert_eq!(stored_blocks(&worker), [OUTSIDER]);
+    assert_eq!(stored_grants(&worker), [OUTSIDER]);
+    // The restart must not hydrate a blocked member into `granted` (the core
+    // refuses that intersection and would wedge the room): the grant becomes a
+    // revocation instead, and `/public` still works.
+    let mut after = restarted(&worker).await;
+    assert!(!after.privacy[&ROOM].granted.contains(&MemberId(OUTSIDER)));
+    assert!(after.privacy[&ROOM].blocked.contains(&MemberId(OUTSIDER)));
+    drain(&mut after).await;
+    let reply = after.apply_privacy(OWNER, false, "Ana", PrivacyCommand::Public);
+    assert!(reply.contains("public again"), "{reply}");
+    drain(&mut after).await;
+    assert!(!after.privacy[&ROOM].private);
+    assert_eq!(stored_blocks(&after), [OUTSIDER]);
+}
