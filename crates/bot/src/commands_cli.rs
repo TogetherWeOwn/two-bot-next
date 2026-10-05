@@ -222,6 +222,16 @@ pub async fn dispatch(args: &[String]) -> i32 {
     }
 }
 
+/// Render a boot-sync failure with its cause attached. The staging crash
+/// loop of 2026-10-05 showed the bare line hides the decisive detail (a
+/// send-admission storage failure looks identical to a Discord outage). The
+/// `tracing::error!` call site keeps its exact message so the observability
+/// catalog still matches; the cause rides in the `error` field. The source
+/// is always a Discord executor error display string (status class, no secrets).
+fn boot_sync_error(source: &impl std::fmt::Display) -> String {
+    format!("boot command registry synchronization failed: {source}")
+}
+
 /// Publication did not previously run on boot. Keep it opt-in while the shared
 /// interaction runtime is being wired; the default server remains unchanged.
 /// Live opt-in is separate from boot opt-in and checked before DB or REST I/O.
@@ -245,11 +255,11 @@ pub async fn publish_on_boot(token: &str, guild: u64) -> Result<(), String> {
     let defs = desired_definitions(guild, &vars)?;
     let executor = executor(token, &vars)
         .await
-        .map_err(|_| "cannot configure command REST client")?;
+        .map_err(|error| format!("cannot configure command REST client: {error}"))?;
     let (diff, applied) = executor
         .sync_guild_commands(application, guild, &publish_commands(&defs), true)
         .await
-        .map_err(|_| "boot command registry synchronization failed")?;
+        .map_err(|error| boot_sync_error(&error))?;
     tracing::info!(hash = %diff.compiled_hash, applied, "boot command registry synchronized");
     Ok(())
 }
@@ -346,6 +356,20 @@ mod tests {
             .await
             .unwrap_err()
             .contains("DISCORD_TOKEN"));
+    }
+
+    #[test]
+    fn boot_sync_failure_keeps_message_and_carries_cause() {
+        let rendered =
+            boot_sync_error(&"discord was unreachable: Discord send admission storage unavailable");
+        assert!(
+            rendered.starts_with("boot command registry synchronization failed"),
+            "catalog message preserved, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("Discord send admission storage unavailable"),
+            "cause attached, got: {rendered}"
+        );
     }
 
     #[test]

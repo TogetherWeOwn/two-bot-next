@@ -304,6 +304,10 @@
     "crates/cutover/migrations/0418_voice_join_grants.sql": {
       "sha256": "e0f7419d2526a36b822892b5206619f24684f3edfa0231ac43262c1116fcfb03",
       "justification": "Voice V3 approved Connect grants: durable voice_join_grants witness per approved room member, written before the Discord grant and retired only after revocation, so a restart cannot strand a Connect allow past /public."
+    },
+    "crates/cutover/migrations/0419_send_admission_lease.sql": {
+      "sha256": "40ff7070f9519d6519a4b6da01ceb8f7d6d742b20d132140be8ef14ad8fdbf29",
+      "justification": "Discord send-admission in-flight lease: stamp each take so a dead holder's lane is reclaimable after the lease instead of wedging boot forever; additive column only."
     }
   }
 }
