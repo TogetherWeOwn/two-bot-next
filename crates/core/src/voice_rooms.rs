@@ -796,6 +796,35 @@ pub enum RoomAction {
     SavePrivacy {
         channel_id: Snowflake,
     },
+    /// V3 join request: show the room owner the Approve / Deny / Block buttons
+    /// for one pending request. The dispatch re-checks that the request is
+    /// still pending, so a request answered or withdrawn while this waited
+    /// posts nothing.
+    AskJoinOwner {
+        room_channel_id: Snowflake,
+        member_id: Snowflake,
+        request_id: u64,
+    },
+    /// V3 Approve: allow Connect for this member on the room only, then move
+    /// them in from the Join channel if they are still there. Both writes are
+    /// idempotent, so a retried action is safe.
+    ApproveJoin {
+        room_channel_id: Snowflake,
+        member_id: Snowflake,
+    },
+    /// V3 `/public`: remove the Connect allow an approval wrote for this
+    /// member.
+    RevokeJoinAccess {
+        room_channel_id: Snowflake,
+        member_id: Snowflake,
+    },
+    /// V3: take the buttons off a join-request message in the room's chat
+    /// whose request can no longer be answered. Scoped to its room: once the
+    /// room is deleted the message goes with it, so a pending edit is dropped.
+    RetireJoinPrompt {
+        room_channel_id: Snowflake,
+        message_id: Snowflake,
+    },
 }
 
 /// Queue lane.
@@ -834,6 +863,22 @@ impl RoomAction {
                 ..
             }
             | Self::SetCustomName { channel_id, .. }
+            | Self::AskJoinOwner {
+                room_channel_id: channel_id,
+                ..
+            }
+            | Self::ApproveJoin {
+                room_channel_id: channel_id,
+                ..
+            }
+            | Self::RevokeJoinAccess {
+                room_channel_id: channel_id,
+                ..
+            }
+            | Self::RetireJoinPrompt {
+                room_channel_id: channel_id,
+                ..
+            }
             | Self::GrantCompanionView {
                 room_channel_id: channel_id,
                 ..
@@ -2235,6 +2280,38 @@ mod tests {
             },
         );
         assert_eq!(q.drop_for_channel(GUILD, 500), 2);
+        assert_eq!(q.pending_counts(GUILD), (1, 0));
+    }
+
+    #[test]
+    fn join_request_actions_all_scope_to_their_room() {
+        let actions = [
+            RoomAction::AskJoinOwner {
+                room_channel_id: 500,
+                member_id: 401,
+                request_id: 7,
+            },
+            RoomAction::ApproveJoin {
+                room_channel_id: 500,
+                member_id: 401,
+            },
+            RoomAction::RevokeJoinAccess {
+                room_channel_id: 500,
+                member_id: 401,
+            },
+            // The prompt lives in the room's chat and goes with the room.
+            RoomAction::RetireJoinPrompt {
+                room_channel_id: 500,
+                message_id: 9_001,
+            },
+        ];
+        let q = ActionQueue::new();
+        for action in actions {
+            assert_eq!(action.channel_id(), Some(500));
+            q.enqueue(GUILD, action);
+        }
+        q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 501 });
+        assert_eq!(q.drop_for_channel(GUILD, 500), 4);
         assert_eq!(q.pending_counts(GUILD), (1, 0));
     }
 

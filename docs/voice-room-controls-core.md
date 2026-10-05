@@ -46,8 +46,9 @@ update is performed or verified by this component's tests.
 `/name` is wired: see [`voice-name-panel.md`](voice-name-panel.md). `/private`
 and `/public` are wired with the Join channel: see
 [`voice-private-core.md`](voice-private-core.md#runtime-wiring-private-and-public).
-`/limit`, `/unlimit`, the join-request buttons and the bitrate preference are
-not.
+The join-request buttons are wired too: see
+[`voice-private-core.md`](voice-private-core.md#runtime-wiring-join-requests).
+`/limit`, `/unlimit` and the bitrate preference are not.
 
 ## Hermetic verification
 
