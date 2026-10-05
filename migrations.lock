@@ -308,6 +308,10 @@
     "crates/cutover/migrations/0419_send_admission_lease.sql": {
       "sha256": "40ff7070f9519d6519a4b6da01ceb8f7d6d742b20d132140be8ef14ad8fdbf29",
       "justification": "Discord send-admission in-flight lease: stamp each take so a dead holder's lane is reclaimable after the lease instead of wedging boot forever; additive column only."
+    },
+    "crates/cutover/migrations/0420_send_admission_lease_backfill.sql": {
+      "sha256": "357e82186a067ef3774734cf53425a5dcf6cda039a4679c3439de3b0e84eeb72",
+      "justification": "Fence the production 0419 apply: stamp legacy-held send-admission rows (lease stamp 0) with the apply-time clock so the next admit does not reclaim a live sender; update-only, re-runnable."
     }
   }
 }

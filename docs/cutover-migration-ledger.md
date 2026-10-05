@@ -109,6 +109,7 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0417_voice_vote_kick_audit | up | voice_vote_kick_audit | re-runnable | Drop the table; the vote-kick audit history it holds is not reconstructible. |
 | 0418_voice_join_grants | up | voice_join_grants | re-runnable | Drop the table; approved Connect grants lose their revocation witness (rooms keep their Discord overwrites until `/public` re-derives them). |
 | 0419_send_admission_lease | up | discord_send_admission | re-runnable | Drop column `in_flight_since_ms`; lanes revert to hold-forever (a stuck lane needs the manual release again). |
+| 0420_send_admission_lease_backfill | up | discord_send_admission | re-runnable | Data-only stamp of legacy-held rows; nothing to undo (re-apply only moves rows still at the legacy default). |
 
 ## Notes
 

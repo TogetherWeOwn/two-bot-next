@@ -153,7 +153,11 @@ consciously accepted trade for never wedging boot forever. When the lease
 column itself is absent (build deployed ahead of migration 0419; the runtime
 is DML-only and never self-migrates), `admit` degrades to the pre-lease
 take-or-block lane with a one-per-process warning instead of failing boot;
-the lease activates on its own once the migration lands.
+the lease activates on its own once the migration lands. Fence the production
+0419 apply: pause every send-lane consumer while 0419 lands, or let migration
+0420 stamp legacy-held rows with the apply-time clock first — a legacy stamp of
+0 otherwise reads as older than the 60 s lease and the next admit reclaims a
+live sender.
 
 Indefinite holds require explicitly authorized reconciliation. There is
 intentionally no startup reset or "force send" switch. Before any manual
