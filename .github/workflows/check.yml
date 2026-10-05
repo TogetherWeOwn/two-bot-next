@@ -256,6 +256,11 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         run: python3 scripts/check-docker-manifests.py
 
+      # Fail-closed fixtures for the validator above: stdlib only, no cargo,
+      # so this runs unguarded next to the offline layer-shape check.
+      - name: Docker manifest validator fixtures (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_docker_manifests.py' -v
+
       # Lint lane: its own entry (compile-only artifacts), saved on pushes to main only.
       - name: Restore cargo cache
         if: needs.job-inputs.outputs.rust != 'false'
