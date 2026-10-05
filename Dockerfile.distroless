@@ -64,7 +64,9 @@ COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot
 EXPOSE 8080
 ENV LISTEN_ADDR=0.0.0.0:8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+# Grace covers the measured ~49 s cold boot to ready: a shorter grace marks
+# every slow start unhealthy before the listener can answer.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
     CMD ["/home/nonroot/two-bot", "--healthcheck"]
 
 ENTRYPOINT ["/home/nonroot/two-bot"]
