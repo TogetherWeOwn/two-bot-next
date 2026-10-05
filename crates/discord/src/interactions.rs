@@ -412,6 +412,7 @@ impl InteractionRuntime {
         let reply = match result {
             Ok(reply) => reply,
             Err(LfgError::Invalid(reply)) => reply,
+            Err(busy @ LfgError::Busy) => busy.to_string(),
             Err(LfgError::Uncertain) => {
                 "LFG post acceptance is uncertain; saved state retained for nonce recovery.".into()
             }
