@@ -235,3 +235,58 @@ async fn admit_without_lease_column_falls_back_to_legacy_lane() {
     second.admit().await.unwrap().complete(None).await.unwrap();
     db.close().await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb or CI service"]
+async fn lease_backfill_fences_legacy_held_lane() {
+    // Fence proof for the production 0419 apply: a lane held through the
+    // legacy (pre-lease) path keeps stamp 0, which reads as older than the
+    // 60 s lease. Without the 0420 backfill the next admit reclaims a live
+    // sender; with it the live holder keeps blocking.
+    let db = database().await;
+    // Fenced lane first: legacy-held stamp, then the real 0420 backfill file.
+    let fenced = PgSendAdmission::new(db.pool().clone(), "fenced-token").unwrap();
+    let fenced_permit = fenced.admit().await.unwrap();
+    sqlx::query("UPDATE public.discord_send_admission SET in_flight_since_ms = 0 WHERE in_flight")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../cutover/migrations/0420_send_admission_lease_backfill.sql"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let fenced_next = PgSendAdmission::new(db.pool().clone(), "fenced-token").unwrap();
+    assert!(matches!(
+        fenced_next.admit().await,
+        Err(AdmissionError::Blocked)
+    ));
+    fenced_permit.complete(None).await.unwrap();
+    // The lane is healthy again after release.
+    fenced_next
+        .admit()
+        .await
+        .unwrap()
+        .complete(None)
+        .await
+        .unwrap();
+    // Hazard lane: the same legacy-held state with no backfill is reclaimed,
+    // which in production would be two senders on one Discord token.
+    let hazard = PgSendAdmission::new(db.pool().clone(), "hazard-token").unwrap();
+    let hazard_permit = hazard.admit().await.unwrap();
+    sqlx::query("UPDATE public.discord_send_admission SET in_flight_since_ms = 0 WHERE in_flight")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let hazard_next = PgSendAdmission::new(db.pool().clone(), "hazard-token").unwrap();
+    hazard_next
+        .admit()
+        .await
+        .unwrap()
+        .complete(None)
+        .await
+        .unwrap();
+    drop(hazard_permit);
+    db.close().await.unwrap();
+}
