@@ -107,10 +107,11 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0415_internal_event_keys | up | internal_event_keys | backout-script | Unguarded `CREATE TABLE` fails on re-apply; backout drops the table (event.read loses its key map until upsert re-registers keys). |
 | 0416_voice_room_privacy | up | voice_rooms, voice_room_blocks | backout-script | Unguarded `ADD COLUMN`/`ADD CONSTRAINT` fail on re-apply; backout drops the join-channel constraint, the three privacy columns and the block table (private rooms become public in the store while their Discord overwrite stays; export the block list first). |
 | 0417_voice_vote_kick_audit | up | voice_vote_kick_audit | re-runnable | Drop the table; the vote-kick audit history it holds is not reconstructible. |
+| 0418_voice_join_grants | up | voice_join_grants | re-runnable | Drop the table; approved Connect grants lose their revocation witness (rooms keep their Discord overwrites until `/public` re-derives them). |
 
 ## Notes
 
-- Voice rows (0224-0229, 0412, 0414, 0417) are listed here for completeness; their runtime
+- Voice rows (0224-0229, 0412, 0414, 0417, 0418) are listed here for completeness; their runtime
   rollback disposition belongs to the voice rollback card, not this ledger.
 - Unguarded DDL (`CREATE TABLE` / `ADD COLUMN` without `IF NOT EXISTS`) is
   classed `backout-script` even when the change is additive, because a

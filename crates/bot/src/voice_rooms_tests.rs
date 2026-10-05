@@ -129,6 +129,10 @@ struct Store {
     companion_errors: Mutex<VecDeque<StoreError>>,
     privacy: Mutex<BTreeMap<u64, PrivacyRecord>>,
     save_privacy_errors: Mutex<VecDeque<StoreError>>,
+    /// Durable approved Connect grants, keyed by room then member.
+    join_grants: Mutex<BTreeMap<u64, BTreeSet<u64>>>,
+    save_join_grant_errors: Mutex<VecDeque<StoreError>>,
+    remove_join_grant_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
     after_persist: Option<Hook>,
     config: Arc<Mutex<VoiceConfiguration>>,
@@ -165,6 +169,9 @@ impl Store {
             companion_errors: Mutex::new(VecDeque::new()),
             privacy: Mutex::new(BTreeMap::new()),
             save_privacy_errors: Mutex::new(VecDeque::new()),
+            join_grants: Mutex::new(BTreeMap::new()),
+            save_join_grant_errors: Mutex::new(VecDeque::new()),
+            remove_join_grant_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
             after_persist: None,
             config: Arc::new(Mutex::new(empty_config())),
@@ -366,6 +373,7 @@ impl RoomPersistence for Store {
         }
         self.rooms.lock().unwrap().remove(&channel);
         self.privacy.lock().unwrap().remove(&channel);
+        self.join_grants.lock().unwrap().remove(&channel);
         self.owner_intents.lock().unwrap().remove(&channel);
         self.owner_pending.lock().unwrap().remove(&channel);
         Ok(())
@@ -466,6 +474,41 @@ impl RoomPersistence for Store {
         }
         self.privacy.lock().unwrap().insert(room, record.clone());
         Ok(true)
+    }
+    async fn join_grants(&self, _: u64) -> Result<BTreeMap<u64, BTreeSet<u64>>, StoreError> {
+        Ok(self.join_grants.lock().unwrap().clone())
+    }
+    async fn save_join_grant(&self, _: u64, room: u64, member: u64) -> Result<bool, StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("save_join_grant:{room}:{member}"));
+        if let Some(error) = self.save_join_grant_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        if !self.rooms.lock().unwrap().contains_key(&room) {
+            return Ok(false);
+        }
+        self.join_grants
+            .lock()
+            .unwrap()
+            .entry(room)
+            .or_default()
+            .insert(member);
+        Ok(true)
+    }
+    async fn remove_join_grant(&self, _: u64, room: u64, member: u64) -> Result<(), StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("remove_join_grant:{room}:{member}"));
+        if let Some(error) = self.remove_join_grant_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        if let Some(members) = self.join_grants.lock().unwrap().get_mut(&room) {
+            members.remove(&member);
+        }
+        Ok(())
     }
 }
 

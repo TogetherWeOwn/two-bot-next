@@ -25,15 +25,18 @@
 //! a Connect allow on the room only and moves them in from the Join channel;
 //! Block persists through the privacy record; Deny writes nothing.
 //!
-//! **Restarts.** Pending requests, grants and the posted prompts are runtime
-//! only. Each button binds the numeric core request id to a fresh 128-bit
-//! CSPRNG worker epoch. The worker checks that epoch before deciding, so
-//! resetting the counter or rolling the wall clock back does not revive an
-//! earlier worker's buttons. Legacy buttons without an epoch are refused.
+//! **Restarts.** Pending requests and the posted prompts are runtime only.
+//! Each button binds the numeric core request id to a fresh 128-bit CSPRNG
+//! worker epoch. The worker checks that epoch before deciding, so resetting
+//! the counter or rolling the wall clock back does not revive an earlier
+//! worker's buttons. Legacy buttons without an epoch are refused.
 //!
-//! The grant is a member overwrite that nothing records durably. A restart
-//! forgets which members were approved, so a later `/public` cannot take their
-//! Connect allow back; the block list is durable and unaffected.
+//! Approved grants are durable (`voice_join_grants`): the intent is recorded
+//! before the Connect PUT, a refused grant retires its row so the member can
+//! ask again, and an unknown grant or revoke outcome keeps its row so a retry
+//! or a restart can still revoke. Worker load hydrates private rooms' grants
+//! and re-queues revocations for grants whose room is public or gone. The
+//! block list is durable and unaffected.
 
 use two_bot_core::{
     voice_custom_id::join_custom_id,
@@ -726,6 +729,23 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.queue.mark_succeeded(&action);
             return;
         }
+        // Persist the approval's intent before granting Connect: a crash
+        // between this write and the PUT below must still leave enough state
+        // to revoke, while a grant Discord refuses is never claimed. The row
+        // is idempotent, so a retried intent is a no-op.
+        match self.persist_join_grant(room, member).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // The room row is gone: nothing can hold the grant.
+                self.unwind_grant(room, member);
+                self.queue.mark_succeeded(&action);
+                return;
+            }
+            Err(error) => {
+                self.join_grant_store_failed(action, room, error, now_ms, started);
+                return;
+            }
+        }
         let grant = PermissionOverwrite {
             allow: (allow | Permissions::CONNECT) & !Permissions::MANAGE_ROLES,
             deny,
@@ -769,9 +789,23 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 // A grant that never landed is not claimed, so the member can
                 // ask again. One that landed stays recorded even when the
                 // move failed (a full room, say): they hold the access and
-                // `/public` must still take it back.
+                // `/public` must still take it back. An unknown outcome keeps
+                // its witness: the PUT may have landed, so a retry (or a
+                // restart) can still revoke safely.
                 if !grant_landed {
-                    self.unwind_grant(room, member);
+                    match self.retire_join_grant(room, member).await {
+                        Ok(()) => self.unwind_grant(room, member),
+                        Err(store_error) => {
+                            self.join_grant_store_failed(
+                                action,
+                                room,
+                                store_error,
+                                now_ms,
+                                started,
+                            );
+                            return;
+                        }
+                    }
                 }
                 self.complete_error(action, room, error);
             }
@@ -825,7 +859,63 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
     }
 
-    /// Take an approved member's Connect allow back after `/public`.
+    /// Record the approval's intent before the grant PUT. `Ok(false)` means
+    /// the room has no database row, so the grant would outlive its room.
+    async fn persist_join_grant(
+        &mut self,
+        room: Snowflake,
+        member: Snowflake,
+    ) -> Result<bool, StoreError> {
+        self.store
+            .save_join_grant(self.live.guild_id, room, member)
+            .await
+    }
+
+    /// Retire the witness after a successful revoke (or a refused grant).
+    /// Idempotent: retiring an absent grant is success.
+    async fn retire_join_grant(
+        &mut self,
+        room: Snowflake,
+        member: Snowflake,
+    ) -> Result<(), StoreError> {
+        self.store
+            .remove_join_grant(self.live.guild_id, room, member)
+            .await
+    }
+
+    /// Release `action` after a failed grant-store write: retry through the
+    /// queue budget, or halt when the credential was refused.
+    fn join_grant_store_failed(
+        &mut self,
+        action: QueuedAction,
+        room: Snowflake,
+        error: StoreError,
+        now_ms: u64,
+        started: Instant,
+    ) {
+        self.record(LifecycleFailure::Persistence {
+            channel_id: Some(room),
+            error,
+        });
+        if error == StoreError::CredentialRefused {
+            self.halted = true;
+            self.queue.mark_succeeded(&action);
+        } else {
+            self.mark_failed_observed(
+                action,
+                "voice-room persistence unavailable".to_owned(),
+                elapsed_ms(now_ms, started),
+            );
+        }
+    }
+
+    /// Take an approved member's Connect allow back after `/public`. Only the
+    /// approval's Connect bit moves: every other allow/deny bit the member
+    /// already holds on the room is carried over, because the write replaces
+    /// the whole entry. A vote-kick deny is never lifted here (approvals can
+    /// no longer be granted over one). The witness is retired only after the
+    /// revoke lands; a refused or unknown revoke keeps it so revocation can
+    /// continue after a restart.
     async fn dispatch_revoke(
         &mut self,
         action: QueuedAction,
@@ -851,7 +941,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == member
             });
         let Some(existing) = existing else {
-            self.queue.mark_succeeded(&action);
+            // Nothing to take back: Discord holds no overwrite, so the
+            // witness can retire.
+            match self.retire_join_grant(room, member).await {
+                Ok(()) => {
+                    self.queue.mark_succeeded(&action);
+                }
+                Err(error) => {
+                    self.join_grant_store_failed(action, room, error, now_ms, started);
+                }
+            }
             return;
         };
         let remaining = existing.allow & !Permissions::CONNECT;
@@ -871,9 +970,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 .map(|()| self.note_overwrite(room, &kept))
         };
         match result {
-            Ok(()) => {
-                self.queue.mark_succeeded(&action);
-            }
+            Ok(()) => match self.retire_join_grant(room, member).await {
+                Ok(()) => {
+                    self.queue.mark_succeeded(&action);
+                }
+                Err(error) => {
+                    self.join_grant_store_failed(action, room, error, now_ms, started);
+                }
+            },
             Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
                 self.queue.mark_rate_limited(
                     self.live.guild_id,

@@ -113,6 +113,25 @@ impl RoomPersistence for Arc<Store> {
     ) -> Result<bool, StoreError> {
         self.as_ref().save_privacy(guild, room, record).await
     }
+    async fn join_grants(&self, guild: u64) -> Result<BTreeMap<u64, BTreeSet<u64>>, StoreError> {
+        self.as_ref().join_grants(guild).await
+    }
+    async fn save_join_grant(
+        &self,
+        guild: u64,
+        room: u64,
+        member: u64,
+    ) -> Result<bool, StoreError> {
+        self.as_ref().save_join_grant(guild, room, member).await
+    }
+    async fn remove_join_grant(
+        &self,
+        guild: u64,
+        room: u64,
+        member: u64,
+    ) -> Result<(), StoreError> {
+        self.as_ref().remove_join_grant(guild, room, member).await
+    }
 }
 
 #[derive(Clone, Default)]
