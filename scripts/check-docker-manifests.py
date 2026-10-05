@@ -27,60 +27,75 @@ def _expected_sources(root):
 EXPECTED_SOURCES = _expected_sources(ROOT)
 
 
-def _dependency_layer_lines(docker_text):
-    """Raw dependency-layer lines: after the builder WORKDIR up to `COPY . .`.
+def _layer_instructions(docker_text):
+    """Validated (kind, text) pairs for every instruction before `COPY . .`.
 
-    Scoping the scan this way keeps the pinned preamble (`FROM`, the builder
-    `WORKDIR`) out of the replay while every instruction inside the layer must
-    be an uppercase `COPY`/`RUN`. Anything else (`ADD`, `WORKDIR`, `ENV`,
-    `ARG`, lowercase variants) is left in the returned lines for the callers
-    to reject, so layer drift fails closed instead of passing unchecked.
+    kind is "preamble" (the pinned builder `FROM` / `WORKDIR /app`), "copy",
+    or "run". Blank lines and comments are skipped. The preamble is validated
+    too: `FROM` once, then exactly `WORKDIR /app`, then the layer — so a
+    `COPY`, `RUN` or `ADD` slipped between `FROM` and `WORKDIR`, a second
+    `WORKDIR`, or any other verb (`ENV`, `ARG`, lowercase variants) raises
+    instead of passing unchecked. Dockerfile verbs are case-insensitive, so
+    only the uppercase spellings this validator understands are accepted.
     """
-    lines = docker_text.replace("\\\n", " ").splitlines()
-    start = 0
-    for index, line in enumerate(lines):
-        if line.strip().upper().startswith("WORKDIR "):
-            start = index + 1
+    from_seen = False
+    workdir_seen = False
+    layer_started = False
+    instructions = []
+    for line in docker_text.replace("\\\n", " ").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("COPY . ."):
             break
-    end = len(lines)
-    for index in range(start, len(lines)):
-        if lines[index].strip().startswith("COPY . ."):
-            end = index
-            break
-    return lines[start:end]
-
-
-def _layer_instruction(line):
-    """Split one layer line into (verb, stripped); blank/comment lines give (None, ...)."""
-    stripped = line.strip()
-    if not stripped or stripped.startswith("#"):
-        return None, stripped
-    return stripped.split(None, 1)[0].upper(), stripped
+        upper = stripped.split()[0].upper()
+        if upper == "COPY":
+            assert stripped.startswith("COPY "), \
+                f"dependency layer must use uppercase COPY: {stripped}"
+            assert from_seen and workdir_seen, \
+                f"dependency-layer COPY before the builder preamble: {stripped}"
+            layer_started = True
+            instructions.append(("copy", stripped))
+        elif upper == "RUN":
+            assert stripped.startswith("RUN "), \
+                f"dependency layer must use uppercase RUN: {stripped}"
+            assert from_seen and workdir_seen, \
+                f"dependency-layer RUN before the builder preamble: {stripped}"
+            layer_started = True
+            instructions.append(("run", stripped))
+        elif upper == "FROM":
+            assert stripped.startswith("FROM "), \
+                f"dependency layer must use uppercase FROM: {stripped}"
+            assert not from_seen and not layer_started, \
+                f"unexpected dependency-layer preamble: {stripped}"
+            from_seen = True
+            instructions.append(("preamble", stripped))
+        elif upper == "WORKDIR":
+            assert stripped == "WORKDIR /app", \
+                "dependency-layer WORKDIR must be the pinned builder " \
+                f"directory: {stripped}"
+            assert from_seen and not workdir_seen and not layer_started, \
+                f"unexpected dependency-layer preamble: {stripped}"
+            workdir_seen = True
+            instructions.append(("preamble", stripped))
+        else:
+            raise AssertionError(
+                f"unsupported dependency-layer instruction: {stripped}")
+    return instructions
 
 
 def dependency_sources(docker_text):
     """COPY sources of the dependency layer (everything before `COPY . .`).
 
-    Raises on any layer instruction that is not uppercase `COPY`/`RUN`:
-    Dockerfile verbs are case-insensitive, so a lowercase `copy` or an `ADD`
-    would otherwise add inputs the pin never sees.
+    Raises on any layer or preamble instruction this validator does not
+    understand, so drift anywhere before `COPY . .` fails closed.
     """
     sources = []
-    for line in _dependency_layer_lines(docker_text):
-        verb, stripped = _layer_instruction(line)
-        if verb is None:
+    for kind, stripped in _layer_instructions(docker_text):
+        if kind != "copy":
             continue
-        if verb == "COPY":
-            assert stripped.startswith("COPY "), \
-                f"dependency layer must use uppercase COPY: {stripped}"
-            *srcs, _destination = shlex.split(stripped)[1:]
-            sources.extend(srcs)
-        elif verb == "RUN":
-            assert stripped.startswith("RUN "), \
-                f"dependency layer must use uppercase RUN: {stripped}"
-        else:
-            raise AssertionError(
-                f"unsupported dependency-layer instruction: {stripped}")
+        *srcs, _destination = shlex.split(stripped)[1:]
+        sources.extend(srcs)
     return sources
 
 
@@ -101,21 +116,16 @@ def reconstruct(docker_text, root, dest):
     fail closed instead of passing unchecked.
     """
     fetch_seen = False
-    for line in _dependency_layer_lines(docker_text):
-        verb, stripped = _layer_instruction(line)
-        if verb is None:
+    for kind, stripped in _layer_instructions(docker_text):
+        if kind == "preamble":
             continue
-        if verb == "COPY":
-            assert stripped.startswith("COPY "), \
-                f"dependency layer must use uppercase COPY: {stripped}"
+        if kind == "copy":
             *sources, destination = shlex.split(stripped)[1:]
             target = dest / destination
             target.mkdir(parents=True, exist_ok=True)
             for source in sources:
                 shutil.copyfile(root / source, target / Path(source).name)
-        elif verb == "RUN":
-            assert stripped.startswith("RUN "), \
-                f"dependency layer must use uppercase RUN: {stripped}"
+        elif kind == "run":
             for command in stripped[4:].split("&&"):
                 words = shlex.split(command)
                 if words[:2] == ["mkdir", "-p"]:
@@ -128,9 +138,6 @@ def reconstruct(docker_text, root, dest):
                 else:
                     raise AssertionError(
                         f"unsupported dependency-layer command: {words[0]}")
-        else:
-            raise AssertionError(
-                f"unsupported dependency-layer instruction: {stripped}")
     return fetch_seen
 
 

@@ -43,6 +43,8 @@ version = "0.1.0"
 edition = "2021"
 """
 SYNTHETIC_DOCKER = """\
+FROM rust:1.98-trixie AS builder
+WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates/a/Cargo.toml crates/a/
 RUN mkdir -p src crates/a/src && echo '' > src/lib.rs \\
@@ -141,6 +143,25 @@ class DriftTests(unittest.TestCase):
         mutated = self.docker.replace(
             "COPY . .", "WORKDIR /app/sub\nCOPY . .", 1)
         with self.assertRaisesRegex(AssertionError, "WORKDIR"):
+            self.check(mutated)
+
+    def test_preamble_copy_fails_closed(self):
+        mutated = self.docker.replace(
+            "WORKDIR /app", "COPY preamble-fixture.txt ./\nWORKDIR /app", 1)
+        self.assertNotEqual(mutated, self.docker)
+        with self.assertRaisesRegex(AssertionError, "preamble"):
+            self.check(mutated)
+
+    def test_preamble_add_fails_closed(self):
+        mutated = self.docker.replace(
+            "WORKDIR /app", "ADD preamble-fixture.txt ./\nWORKDIR /app", 1)
+        with self.assertRaisesRegex(AssertionError, "unsupported"):
+            self.check(mutated)
+
+    def test_preamble_run_fails_closed(self):
+        mutated = self.docker.replace(
+            "WORKDIR /app", "RUN echo preamble > preamble.txt\nWORKDIR /app", 1)
+        with self.assertRaisesRegex(AssertionError, "preamble"):
             self.check(mutated)
 
     def test_unsupported_command_fails_closed(self):
