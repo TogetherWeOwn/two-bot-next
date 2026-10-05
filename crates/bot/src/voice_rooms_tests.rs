@@ -2,8 +2,16 @@ use super::*;
 use serde_json::json;
 use std::sync::Mutex;
 
+#[path = "voice_join_requests_tests.rs"]
+mod join;
 #[path = "voice_kick_tests.rs"]
 mod kick;
+#[path = "voice_rooms_limit_tests.rs"]
+mod limit_command;
+#[path = "voice_name_tests.rs"]
+mod name;
+#[path = "voice_private_runtime_tests.rs"]
+mod private;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
 
@@ -66,6 +74,29 @@ fn snapshot(extra: &[u64], members: Vec<VoiceMember>) -> GuildSnapshot {
     }
 }
 
+/// Guild role facts are independent of channel-effective interaction permissions.
+fn command_snapshot() -> GuildSnapshot {
+    let mut guild = snapshot(&[], vec![]);
+    guild.bot.member_roles = vec![Id::new(900)];
+    guild.bot.roles = vec![role(Permissions::empty()), role_with(900, permissions())];
+    for permissions in [
+        Permissions::empty(),
+        Permissions::VIEW_CHANNEL,
+        Permissions::MANAGE_CHANNELS,
+        Permissions::ADMINISTRATOR,
+        Permissions::MANAGE_GUILD,
+        Permissions::VIEW_CHANNEL | Permissions::MANAGE_CHANNELS,
+        Permissions::VIEW_CHANNEL | Permissions::MANAGE_GUILD,
+        Permissions::MANAGE_GUILD | Permissions::MANAGE_CHANNELS,
+    ] {
+        guild
+            .bot
+            .roles
+            .push(role_with(10_000 + permissions.bits(), permissions));
+    }
+    guild
+}
+
 fn room(channel_id: u64) -> VoiceRoom {
     VoiceRoom::from_spec(
         NewRoomSpec {
@@ -83,6 +114,11 @@ struct Store {
     trace: Trace,
     creators: Mutex<Vec<CreatorChannel>>,
     rooms: Mutex<HashMap<u64, VoiceRoom>>,
+    owner_intents: Mutex<HashMap<u64, OwnerGrantIntent>>,
+    owner_pending: Mutex<HashSet<u64>>,
+    owner_revision: AtomicU64,
+    prepare_errors: Mutex<VecDeque<StoreError>>,
+    ownership_errors: Mutex<VecDeque<StoreError>>,
     companions: Mutex<HashMap<(u64, u64), TextCompanion>>,
     persist_error: Option<StoreError>,
     access: Arc<Mutex<AccessControls>>,
@@ -93,11 +129,23 @@ struct Store {
     save_logging_error: Option<StoreError>,
     forget_errors: Mutex<VecDeque<StoreError>>,
     companion_errors: Mutex<VecDeque<StoreError>>,
+    privacy: Mutex<BTreeMap<u64, PrivacyRecord>>,
+    save_privacy_errors: Mutex<VecDeque<StoreError>>,
+    /// Durable approved Connect grants, keyed by room then member.
+    join_grants: Mutex<BTreeMap<u64, BTreeSet<u64>>>,
+    save_join_grant_errors: Mutex<VecDeque<StoreError>>,
+    remove_join_grant_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
     after_persist: Option<Hook>,
     config: Arc<Mutex<VoiceConfiguration>>,
     config_error: Option<StoreError>,
     save_config_error: Option<StoreError>,
+    creators_error: Option<StoreError>,
+    custom_names: Mutex<HashMap<u64, String>>,
+    save_custom_name_errors: Mutex<VecDeque<StoreError>>,
+    /// V4 audit rows appended so far, in append order.
+    kick_audit: Mutex<Vec<KickAuditRow>>,
+    kick_audit_errors: Mutex<VecDeque<StoreError>>,
 }
 
 impl Store {
@@ -106,6 +154,11 @@ impl Store {
             trace,
             creators: Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)]),
             rooms: Mutex::new(HashMap::new()),
+            owner_intents: Mutex::new(HashMap::new()),
+            owner_pending: Mutex::new(HashSet::new()),
+            owner_revision: AtomicU64::new(0),
+            prepare_errors: Mutex::new(VecDeque::new()),
+            ownership_errors: Mutex::new(VecDeque::new()),
             companions: Mutex::new(HashMap::new()),
             persist_error: None,
             access: Arc::new(Mutex::new(AccessControls::default())),
@@ -116,18 +169,31 @@ impl Store {
             save_logging_error: None,
             forget_errors: Mutex::new(VecDeque::new()),
             companion_errors: Mutex::new(VecDeque::new()),
+            privacy: Mutex::new(BTreeMap::new()),
+            save_privacy_errors: Mutex::new(VecDeque::new()),
+            join_grants: Mutex::new(BTreeMap::new()),
+            save_join_grant_errors: Mutex::new(VecDeque::new()),
+            remove_join_grant_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
             after_persist: None,
             config: Arc::new(Mutex::new(empty_config())),
             config_error: None,
             save_config_error: None,
+            creators_error: None,
+            custom_names: Mutex::new(HashMap::new()),
+            save_custom_name_errors: Mutex::new(VecDeque::new()),
+            kick_audit: Mutex::new(Vec::new()),
+            kick_audit_errors: Mutex::new(VecDeque::new()),
         }
     }
 }
 
 impl RoomPersistence for Store {
     async fn creators(&self, _: u64) -> Result<Vec<CreatorChannel>, StoreError> {
-        Ok(self.creators.lock().unwrap().clone())
+        match self.creators_error {
+            Some(error) => Err(error),
+            None => Ok(self.creators.lock().unwrap().clone()),
+        }
     }
     async fn access_controls(&self, _: u64) -> Result<AccessControls, StoreError> {
         match self.access_error {
@@ -209,19 +275,98 @@ impl RoomPersistence for Store {
             .insert(room.channel_id, room.clone());
         Ok(())
     }
-    async fn update_ownership(&self, room: &VoiceRoom) -> Result<bool, StoreError> {
+    async fn pending_owner_grants(&self, _: u64) -> Result<Vec<u64>, StoreError> {
+        Ok(self.owner_pending.lock().unwrap().iter().copied().collect())
+    }
+    async fn prepare_owner_grants(
+        &self,
+        room: &VoiceRoom,
+        previous_owner_id: u64,
+    ) -> Result<OwnerGrantIntent, StoreError> {
+        if let Some(error) = self.prepare_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        let rooms = self.rooms.lock().unwrap();
+        let stored = rooms.get(&room.channel_id).ok_or(StoreError::Conflict)?;
+        let mut intents = self.owner_intents.lock().unwrap();
+        let intent = intents
+            .entry(room.channel_id)
+            .or_insert_with(|| OwnerGrantIntent {
+                revision: String::new(),
+                members: Vec::new(),
+            });
+        for member in [stored.owner_id, previous_owner_id, room.owner_id] {
+            if !intent.members.contains(&member) {
+                intent.members.push(member);
+            }
+        }
+        intent.members.sort_unstable();
+        intent.revision = (self.owner_revision.fetch_add(1, Ordering::Relaxed) + 1).to_string();
+        self.owner_pending.lock().unwrap().insert(room.channel_id);
+        Ok(intent.clone())
+    }
+    async fn update_ownership(&self, room: &VoiceRoom, revision: &str) -> Result<bool, StoreError> {
         self.trace.lock().unwrap().push(format!(
             "update_ownership:{}:{}",
             room.channel_id, room.owner_id
         ));
+        if let Some(error) = self.ownership_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
         let mut rooms = self.rooms.lock().unwrap();
+        let mut intents = self.owner_intents.lock().unwrap();
+        let Some(intent) = intents.get_mut(&room.channel_id) else {
+            return Ok(false);
+        };
+        if intent.revision != revision || !intent.members.contains(&room.owner_id) {
+            return Ok(false);
+        }
         if let Some(stored) = rooms.get_mut(&room.channel_id) {
             stored.owner_id = room.owner_id;
             stored.original_creator_id = room.original_creator_id;
+            intent.members = vec![room.owner_id];
+            self.owner_pending.lock().unwrap().remove(&room.channel_id);
             Ok(true)
         } else {
             Ok(false)
         }
+    }
+    async fn custom_names(&self, _: u64) -> Result<Vec<(u64, String)>, StoreError> {
+        let mut names: Vec<_> = self
+            .custom_names
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(channel, name)| (*channel, name.clone()))
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+    async fn save_custom_name(
+        &self,
+        _: u64,
+        channel: u64,
+        custom_name: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("save_custom_name:{channel}:{custom_name:?}"));
+        if let Some(error) = self.save_custom_name_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        if !self.rooms.lock().unwrap().contains_key(&channel) {
+            return Ok(false);
+        }
+        match custom_name {
+            Some(name) => self
+                .custom_names
+                .lock()
+                .unwrap()
+                .insert(channel, name.to_owned()),
+            None => self.custom_names.lock().unwrap().remove(&channel),
+        };
+        Ok(true)
     }
     async fn forget(&self, _: u64, channel: u64) -> Result<(), StoreError> {
         self.trace.lock().unwrap().push(format!("forget:{channel}"));
@@ -229,6 +374,10 @@ impl RoomPersistence for Store {
             return Err(error);
         }
         self.rooms.lock().unwrap().remove(&channel);
+        self.privacy.lock().unwrap().remove(&channel);
+        self.join_grants.lock().unwrap().remove(&channel);
+        self.owner_intents.lock().unwrap().remove(&channel);
+        self.owner_pending.lock().unwrap().remove(&channel);
         Ok(())
     }
     async fn config_snapshot(&self, _: u64) -> Result<VoiceConfiguration, StoreError> {
@@ -237,9 +386,19 @@ impl RoomPersistence for Store {
             None => Ok(self.config.lock().unwrap().clone()),
         }
     }
-    async fn config_apply(&self, _: u64, config: &VoiceConfiguration) -> Result<(), StoreError> {
+    async fn config_apply(
+        &self,
+        _: u64,
+        config: &VoiceConfiguration,
+        expected: &VoiceConfiguration,
+    ) -> Result<(), StoreError> {
         if let Some(error) = self.save_config_error {
             return Err(error);
+        }
+        // Compare-and-swap like `PgVoiceConfigStore::apply`: a concurrent
+        // change between the Confirm re-read and the write is `Conflict`.
+        if *self.config.lock().unwrap() != *expected {
+            return Err(StoreError::Conflict);
         }
         self.trace.lock().unwrap().push("config_apply".to_owned());
         *self.config.lock().unwrap() = config.clone();
@@ -278,10 +437,109 @@ impl RoomPersistence for Store {
             .push(format!("remove_companion:{room}"));
         Ok(self.companions.lock().unwrap().remove(&(guild, room)))
     }
+    async fn record_kick_audit(&self, rows: &[KickAuditRow]) -> Result<(), StoreError> {
+        if let Some(error) = self.kick_audit_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        // Same idempotency as the table's (guild, vote, event) key.
+        let mut stored = self.kick_audit.lock().unwrap();
+        for row in rows {
+            if !stored
+                .iter()
+                .any(|s| (s.guild_id, s.vote_id, s.event) == (row.guild_id, row.vote_id, row.event))
+            {
+                stored.push(row.clone());
+            }
+        }
+        Ok(())
+    }
+    async fn privacy(&self, _: u64) -> Result<BTreeMap<u64, PrivacyRecord>, StoreError> {
+        Ok(self.privacy.lock().unwrap().clone())
+    }
+    async fn save_privacy(
+        &self,
+        _: u64,
+        room: u64,
+        record: &PrivacyRecord,
+    ) -> Result<bool, StoreError> {
+        self.trace.lock().unwrap().push(format!(
+            "save_privacy:{room}:{}:{:?}:{}",
+            record.private,
+            record.join_channel_id,
+            record.blocked.len()
+        ));
+        if let Some(error) = self.save_privacy_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        if !self.rooms.lock().unwrap().contains_key(&room) {
+            return Ok(false);
+        }
+        self.privacy.lock().unwrap().insert(room, record.clone());
+        Ok(true)
+    }
+    async fn join_grants(&self, _: u64) -> Result<BTreeMap<u64, BTreeSet<u64>>, StoreError> {
+        Ok(self.join_grants.lock().unwrap().clone())
+    }
+    async fn save_join_grant(&self, _: u64, room: u64, member: u64) -> Result<bool, StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("save_join_grant:{room}:{member}"));
+        if let Some(error) = self.save_join_grant_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        if !self.rooms.lock().unwrap().contains_key(&room) {
+            return Ok(false);
+        }
+        self.join_grants
+            .lock()
+            .unwrap()
+            .entry(room)
+            .or_default()
+            .insert(member);
+        Ok(true)
+    }
+    async fn remove_join_grant(&self, _: u64, room: u64, member: u64) -> Result<(), StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("remove_join_grant:{room}:{member}"));
+        if let Some(error) = self.remove_join_grant_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        if let Some(members) = self.join_grants.lock().unwrap().get_mut(&room) {
+            members.remove(&member);
+        }
+        Ok(())
+    }
 }
 
 /// Scripted `/import` download queue shared with the harness.
 type DownloadResults = Arc<Mutex<VecDeque<Result<Vec<u8>, RoomHttpError>>>>;
+
+#[derive(Default)]
+struct OverwriteGate {
+    sent: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+/// Hold one `/limit` PATCH mid-flight: the fake signals `sent` when the
+/// write starts and finishes only after `release`.
+#[derive(Default)]
+struct LimitGate {
+    sent: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+/// One join-request message the fake Discord accepted.
+#[derive(Clone)]
+struct SentPrompt {
+    channel: u64,
+    content: String,
+    mention: Option<u64>,
+    components: Vec<Component>,
+    message: MessageRef,
+}
 
 struct Http {
     trace: Trace,
@@ -289,16 +547,33 @@ struct Http {
     create_errors: Mutex<VecDeque<RoomHttpError>>,
     move_errors: Mutex<VecDeque<RoomHttpError>>,
     delete_errors: Mutex<VecDeque<RoomHttpError>>,
+    delete_channel_errors: Mutex<HashMap<u64, VecDeque<RoomHttpError>>>,
     rename_errors: Mutex<VecDeque<RoomHttpError>>,
+    limit_errors: Mutex<VecDeque<RoomHttpError>>,
     companion_errors: Mutex<VecDeque<RoomHttpError>>,
     view_errors: Mutex<VecDeque<RoomHttpError>>,
+    /// Scripted failures for the V4 enforcement's Connect deny.
+    kick_errors: Mutex<VecDeque<RoomHttpError>>,
+    overwrite_errors: Mutex<VecDeque<RoomHttpError>>,
+    join_errors: Mutex<VecDeque<RoomHttpError>>,
+    written_overwrites: Mutex<Vec<(u64, PermissionOverwrite)>>,
     notices: Mutex<Vec<(NoticeTarget, String, Option<u64>)>>,
     refused_notices: Mutex<Vec<NoticeTarget>>,
+    /// V3 join-request prompts posted in a room's chat, and the scripted
+    /// errors (one per attempt) the next sends fail with.
+    prompts: Mutex<Vec<SentPrompt>>,
+    prompt_errors: Mutex<VecDeque<RoomHttpError>>,
+    next_message: Mutex<u64>,
     created_attributes: Mutex<Vec<RoomChannelAttributes>>,
+    created_names: Mutex<Vec<String>>,
     companion_plans: Mutex<Vec<TextChannelPlan>>,
+    before_create: Option<Hook>,
     after_create: Option<Hook>,
     before_move: Option<Hook>,
     before_delete: Option<Hook>,
+    before_limit: Option<Hook>,
+    overwrites_gate: Option<Arc<OverwriteGate>>,
+    limit_gate: Option<Arc<LimitGate>>,
     downloaded_urls: Mutex<Vec<String>>,
     download_results: DownloadResults,
 }
@@ -311,16 +586,30 @@ impl Http {
             create_errors: Mutex::new(VecDeque::new()),
             move_errors: Mutex::new(VecDeque::new()),
             delete_errors: Mutex::new(VecDeque::new()),
+            delete_channel_errors: Mutex::new(HashMap::new()),
             rename_errors: Mutex::new(VecDeque::new()),
+            limit_errors: Mutex::new(VecDeque::new()),
             companion_errors: Mutex::new(VecDeque::new()),
             view_errors: Mutex::new(VecDeque::new()),
+            kick_errors: Mutex::new(VecDeque::new()),
+            overwrite_errors: Mutex::new(VecDeque::new()),
+            join_errors: Mutex::new(VecDeque::new()),
+            written_overwrites: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             refused_notices: Mutex::new(Vec::new()),
+            prompts: Mutex::new(Vec::new()),
+            prompt_errors: Mutex::new(VecDeque::new()),
+            next_message: Mutex::new(9_000),
             created_attributes: Mutex::new(Vec::new()),
+            created_names: Mutex::new(Vec::new()),
             companion_plans: Mutex::new(Vec::new()),
+            before_create: None,
             after_create: None,
             before_move: None,
             before_delete: None,
+            before_limit: None,
+            overwrites_gate: None,
+            limit_gate: None,
             downloaded_urls: Mutex::new(Vec::new()),
             download_results: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -331,13 +620,17 @@ impl RoomWrites for Http {
     async fn create(
         &self,
         _: u64,
-        _: &str,
+        name: &str,
         attributes: &RoomChannelAttributes,
         guard: WriteGuard,
     ) -> Result<Channel, RoomHttpError> {
+        if let Some(hook) = &self.before_create {
+            hook();
+        }
         if !guard() {
             return Err(RoomHttpError::Cancelled);
         }
+        self.created_names.lock().unwrap().push(name.to_owned());
         self.trace.lock().unwrap().push("create".to_owned());
         if let Some(error) = self.create_errors.lock().unwrap().pop_front() {
             return Err(error);
@@ -358,6 +651,30 @@ impl RoomWrites for Http {
             hook();
         }
         Ok(result)
+    }
+    async fn update_overwrites(
+        &self,
+        channel_id: u64,
+        overwrites: &[PermissionOverwrite],
+        guard: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("overwrites:{channel_id}"));
+        if let Some(error) = self.view_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        let mut updated = channel(channel_id, 2, Some(CATEGORY));
+        updated.permission_overwrites = Some(overwrites.to_vec());
+        if let Some(gate) = &self.overwrites_gate {
+            gate.sent.notify_one();
+            gate.release.notified().await;
+        }
+        Ok(updated)
     }
     async fn move_member(
         &self,
@@ -405,6 +722,9 @@ impl RoomWrites for Http {
         if !guard() {
             return Err(RoomHttpError::Cancelled);
         }
+        if let Some(error) = self.kick_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
         self.trace
             .lock()
             .unwrap()
@@ -419,6 +739,15 @@ impl RoomWrites for Http {
             return Err(RoomHttpError::Cancelled);
         }
         self.trace.lock().unwrap().push(format!("delete:{channel}"));
+        if let Some(error) = self
+            .delete_channel_errors
+            .lock()
+            .unwrap()
+            .get_mut(&channel)
+            .and_then(VecDeque::pop_front)
+        {
+            return Err(error);
+        }
         match self.delete_errors.lock().unwrap().pop_front() {
             Some(error) => Err(error),
             None => Ok(()),
@@ -430,6 +759,31 @@ impl RoomWrites for Http {
             .unwrap()
             .push(format!("rename:{channel}:{name}"));
         match self.rename_errors.lock().unwrap().pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    async fn set_user_limit(
+        &self,
+        channel: u64,
+        user_limit: u32,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if let Some(hook) = &self.before_limit {
+            hook();
+        }
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("limit:{channel}:{user_limit}"));
+        if let Some(gate) = &self.limit_gate {
+            gate.sent.notify_one();
+            gate.release.notified().await;
+        }
+        match self.limit_errors.lock().unwrap().pop_front() {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -509,6 +863,120 @@ impl RoomWrites for Http {
             None => Ok(()),
         }
     }
+    async fn put_overwrite(
+        &self,
+        channel: u64,
+        overwrite: PermissionOverwrite,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace.lock().unwrap().push(format!(
+            "overwrite:{channel}:{}:{:?}",
+            overwrite.id.get(),
+            overwrite.kind
+        ));
+        if let Some(error) = self.overwrite_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        self.written_overwrites
+            .lock()
+            .unwrap()
+            .push((channel, overwrite));
+        Ok(())
+    }
+    async fn create_join_channel(
+        &self,
+        _: u64,
+        name: &str,
+        parent_id: Option<u64>,
+        position: Option<u64>,
+        guard: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("create_join:{name}:{parent_id:?}:{position:?}"));
+        if let Some(error) = self.join_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        let id = {
+            let mut id = self.next_id.lock().unwrap();
+            let next = *id;
+            *id += 1;
+            next
+        };
+        let mut created = channel(id, 2, parent_id);
+        created.name = Some(name.to_owned());
+        Ok(created)
+    }
+    async fn delete_overwrite(
+        &self,
+        channel: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("delete_overwrite:{channel}:{member}"));
+        match self.overwrite_errors.lock().unwrap().pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    async fn send_component_message(
+        &self,
+        channel: u64,
+        content: &str,
+        mention_user: Option<u64>,
+        components: &[Component],
+    ) -> Result<MessageRef, RoomHttpError> {
+        self.trace.lock().unwrap().push(format!("prompt:{channel}"));
+        if let Some(error) = self.prompt_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        let message_id = {
+            let mut id = self.next_message.lock().unwrap();
+            let next = *id;
+            *id += 1;
+            next
+        };
+        let message = MessageRef {
+            channel_id: channel,
+            message_id,
+        };
+        self.prompts.lock().unwrap().push(SentPrompt {
+            channel,
+            content: content.to_owned(),
+            mention: mention_user,
+            components: components.to_vec(),
+            message,
+        });
+        Ok(message)
+    }
+    async fn edit_component_message(
+        &self,
+        message: MessageRef,
+        content: &str,
+        components: &[Component],
+    ) -> Result<(), RoomHttpError> {
+        self.trace.lock().unwrap().push(format!(
+            "edit_prompt:{}:{}:{}:{}",
+            message.channel_id,
+            message.message_id,
+            content,
+            components.len()
+        ));
+        Ok(())
+    }
     async fn send_notice(
         &self,
         target: NoticeTarget,
@@ -543,7 +1011,7 @@ fn join(worker: &mut GuildRoomWorker<Store, Http>, member: u64) -> JoinTicket {
         .live
         .voice_update(member, Some(CREATOR), Some(false))
         .unwrap();
-    assert!(worker.accept_join(ticket, "new room".to_owned(), 7, NOW.to_owned()));
+    assert!(worker.accept_join(ticket, "new room", 7, NOW.to_owned()));
     ticket
 }
 
@@ -573,7 +1041,7 @@ async fn duplicate_voice_frames_and_duplicate_tickets_do_not_create_twice() {
         .live
         .voice_update(MEMBER, Some(CREATOR), None)
         .is_none());
-    assert!(!worker.accept_join(ticket, "duplicate".to_owned(), 8, NOW.to_owned()));
+    assert!(!worker.accept_join(ticket, "duplicate", 8, NOW.to_owned()));
     dispatch(&mut worker, 0).await;
     dispatch(&mut worker, 1).await;
     worker.reconcile();
@@ -648,6 +1116,214 @@ async fn persistence_failure_compensates_the_exact_new_channel_and_never_moves()
     assert_eq!(worker.failures().len(), 1);
 }
 
+/// Worker-level pin for the legacy "only creator channels create rooms" rule
+/// (the core `decide_room_join` test does not exercise `GuildRoomWorker`).
+/// Mutation: drop the `creators.contains_key` gate from `accept_join`.
+#[tokio::test]
+async fn joining_a_channel_that_is_not_a_creator_never_creates_a_room() {
+    const LOBBY: u64 = 777;
+    let (live, store, http, trace) = fixture();
+    live.publish(snapshot(&[LOBBY], vec![]));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // The gateway still hands out a ticket for any voice channel; the worker
+    // is what refuses it.
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(LOBBY), Some(false))
+        .expect("ticket for a joined channel");
+    assert_eq!(ticket.creator_id, LOBBY);
+    assert!(!worker.accept_join(ticket, "lobby room", 7, NOW.to_owned()));
+    assert!(!worker.dispatch_one(0).await);
+    assert!(worker.creations.is_empty());
+    assert!(worker.tracked().is_empty());
+    assert!(worker.failures().is_empty());
+    assert!(trace.lock().unwrap().is_empty());
+    // The configured creator still works for the same member afterwards.
+    worker.live.voice_update(MEMBER, None, Some(false));
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 1).await;
+    assert_eq!(*trace.lock().unwrap(), ["create", "persist:500"]);
+}
+
+/// A guild with no creator row configured creates nothing, even when a member
+/// sits in a voice channel. Mutation: as above.
+#[tokio::test]
+async fn a_guild_without_creator_channels_never_creates_a_room() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap().clear();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .expect("ticket for a joined channel");
+    assert!(!worker.accept_join(ticket, "new room", 7, NOW.to_owned()));
+    assert!(!worker.dispatch_one(0).await);
+    assert!(worker.tracked().is_empty());
+    assert!(worker.failures().is_empty());
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+/// The overwrite/permission preflight (`prepare`) must refuse before the
+/// channel POST, at worker level. Mutation: run `prepare()` after `create`
+/// (the trace then contains `create` for the refused plan).
+#[tokio::test]
+async fn refused_creation_plan_records_a_failure_before_any_channel_is_created() {
+    // Bot lacks Manage Channels on the creator channel.
+    let (live, store, http, trace) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .inner
+        .write()
+        .unwrap()
+        .bot
+        .as_mut()
+        .unwrap()
+        .roles = vec![role(permissions() & !Permissions::MANAGE_CHANNELS)];
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        worker.failures().back(),
+        Some(&LifecycleFailure::MissingPermission {
+            write: RefusedWrite::Create,
+            channel_id: CREATOR,
+            findings: vec![PermissionFinding {
+                permission: VoicePermission::ManageChannels,
+                scope: VoicePermissionScope::Guild,
+                category_id: None,
+                channel_id: None,
+            }],
+        })
+    );
+    assert!(worker.creations.is_empty());
+    assert!(worker.tracked().is_empty());
+    assert!(!worker.dispatch_one(1).await);
+    assert!(trace.lock().unwrap().is_empty());
+
+    // A private-by-default creator without Manage Roles: `plan_room` refuses
+    // instead of silently making a public room.
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].private_default = true;
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .inner
+        .write()
+        .unwrap()
+        .bot
+        .as_mut()
+        .unwrap()
+        .roles = vec![role(permissions() & !Permissions::MANAGE_ROLES)];
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(matches!(
+        worker.failures().back(),
+        Some(LifecycleFailure::MissingPermission {
+            write: RefusedWrite::Create,
+            channel_id: CREATOR,
+            ..
+        })
+    ));
+    assert!(worker.creations.is_empty());
+    assert!(worker.tracked().is_empty());
+    assert!(!worker.dispatch_one(1).await);
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.http.created_attributes.lock().unwrap().is_empty());
+}
+
+/// A failed compensation delete must keep the room (and its provenance)
+/// tracked so a later sweep can remove it, never strand an untracked orphan.
+/// Mutation: drop the room from `rooms` after the refused compensation delete.
+#[tokio::test]
+async fn failed_rollback_keeps_the_room_tracked_until_a_later_sweep_removes_it() {
+    let (live, mut store, http, trace) = fixture();
+    store.persist_error = Some(StoreError::Unavailable);
+    http.delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "delete:500"]
+    );
+    // Retained with its creation provenance and flagged for compensation.
+    let kept = worker.tracked().get(&500).expect("room stays tracked");
+    assert_eq!(kept.owner_id, MEMBER);
+    assert_eq!(kept.original_creator_id, MEMBER);
+    assert_eq!(kept.creator_channel_id, CREATOR);
+    assert!(worker.compensation.contains(&500));
+    assert!(worker.deletes.contains(&500));
+    // The refused delete is not retried against unchanged permissions.
+    for time in [3000, 6000, 10000] {
+        worker.reconcile();
+        assert!(!worker.dispatch_one(time).await);
+    }
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "delete:500"]
+    );
+    assert!(worker.tracked().contains_key(&500));
+    // A permission refresh lets the next sweep retry the delete and forget it.
+    worker.live.publish(snapshot(&[500], vec![]));
+    worker.reconcile();
+    dispatch(&mut worker, 10000).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            "create",
+            "persist:500",
+            "delete:500",
+            "delete:500",
+            "forget:500"
+        ]
+    );
+    assert!(worker.tracked().is_empty());
+    assert!(!worker.compensation.contains(&500));
+    assert!(!worker.deletes.contains(&500));
+}
+
+/// Pending acceptance for the durable half of "retain provenance after a
+/// failed rollback": the exact channel must outlive the worker that created
+/// it. Today the failed persist writes nothing, so the only record is the
+/// creating worker's in-memory `rooms`/`compensation`, and a worker rebuilt
+/// from persisted state cannot rediscover the channel. Run it with
+/// `--ignored` to see the gap; enable it, unedited, once a durable witness
+/// exists. The parity row for the legacy rollback commit stays `carded` until
+/// then.
+#[tokio::test]
+#[ignore = "pending: no durable witness survives a failed persist plus a refused rollback"]
+async fn a_restarted_worker_rediscovers_a_channel_whose_rollback_failed() {
+    let (live, mut store, http, _) = fixture();
+    store.persist_error = Some(StoreError::Unavailable);
+    http.delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert!(worker.tracked().contains_key(&500), "same-worker retention");
+
+    // Restart: a fresh worker, store connection and live snapshot built only
+    // from what the first worker's store persisted. Nothing in memory crosses.
+    let (live, fresh_store, http, _) = fixture();
+    live.publish(snapshot(&[500], vec![]));
+    *fresh_store.rooms.lock().unwrap() = worker.store.rooms.lock().unwrap().clone();
+    drop(worker);
+    let restarted = GuildRoomWorker::load(live, fresh_store, http)
+        .await
+        .unwrap();
+    assert!(
+        restarted.tracked().contains_key(&500) || restarted.compensation.contains(&500),
+        "the channel whose rollback failed must be rediscoverable after a restart"
+    );
+}
+
 #[tokio::test]
 async fn voice_change_during_persistence_compensates_instead_of_moving() {
     let (live, mut store, http, trace) = fixture();
@@ -706,6 +1382,85 @@ async fn stale_move_guard_is_rechecked_after_transport_wait() {
         *trace.lock().unwrap(),
         ["create", "persist:500", "delete:500", "forget:500"]
     );
+    assert!(
+        worker.failures().is_empty(),
+        "a stale ticket is not a permission refusal"
+    );
+}
+
+#[tokio::test]
+async fn missing_permission_final_create_guard_records_the_lost_permission() {
+    let (live, store, mut http, trace) = fixture();
+    let shared = live.clone();
+    http.before_create = Some(Arc::new(move || {
+        shared.upsert_channel(channel_with_overwrites(
+            CREATOR,
+            2,
+            Some(CATEGORY),
+            json!([everyone_overwrite(Permissions::MANAGE_CHANNELS)]),
+        ));
+    }));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(
+        trace.lock().unwrap().is_empty(),
+        "the final guard prevents the create"
+    );
+    assert_eq!(
+        failure_line(worker.failures().back().expect("permission refusal")),
+        "create <#200>: Discord refused creating the room; the permission override on <#200> removes Manage Channels from the bot"
+    );
+    assert!(worker.send_notices(0).await);
+    assert!(sent(&worker)[0].1.contains("Manage Channels"));
+}
+
+#[tokio::test]
+async fn missing_permission_final_move_guard_records_the_lost_permission_and_compensates() {
+    let (live, store, mut http, trace) = fixture();
+    let shared = live.clone();
+    http.before_move = Some(Arc::new(move || {
+        shared.upsert_channel(channel_with_overwrites(
+            500,
+            2,
+            Some(CATEGORY),
+            json!([everyone_overwrite(Permissions::MOVE_MEMBERS)]),
+        ));
+    }));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    for time in 0..3 {
+        dispatch(&mut worker, time).await;
+    }
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "delete:500", "forget:500"]
+    );
+    assert_eq!(
+        failure_line(worker.failures().back().expect("permission refusal")),
+        "move <#500>: Discord refused moving the member into the room; the permission override on <#500> removes Move Members from the bot"
+    );
+    assert!(worker.send_notices(0).await);
+    assert!(sent(&worker)[0].1.contains("<#500> removes Move Members"));
+}
+
+#[tokio::test]
+async fn stale_create_guard_stays_silent_even_when_permissions_also_change() {
+    let (live, store, mut http, trace) = fixture();
+    let shared = live.clone();
+    http.before_create = Some(Arc::new(move || {
+        shared.voice_update(MEMBER, None, None);
+        shared.refresh_bot(BotAccess {
+            roles: vec![role(Permissions::empty())],
+            ..notice_bot(None)
+        });
+    }));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.failures().is_empty());
+    assert!(!worker.send_notices(0).await);
 }
 
 #[tokio::test]
@@ -900,21 +1655,20 @@ async fn reclaim_hands_room_back_to_returned_creator_and_persists() {
     let tracked = worker.tracked().get(&500).expect("tracked room");
     assert_eq!(tracked.owner_id, MEMBER);
     assert_eq!(tracked.original_creator_id, MEMBER);
+    // The succession handoff is still queued, so the reclaim coalesces into
+    // it: one grant rewrite converges on the latest owner, never the stale
+    // caretaker.
     dispatch(&mut worker, 0).await;
-    dispatch(&mut worker, 1).await;
-    assert!(
+    assert!(!worker.dispatch_one(1).await);
+    assert_eq!(
         trace
             .lock()
             .unwrap()
             .iter()
             .filter(|call| call.starts_with("update_ownership"))
-            .count()
-            >= 1
+            .collect::<Vec<_>>(),
+        [&format!("update_ownership:500:{MEMBER}")]
     );
-    assert!(trace
-        .lock()
-        .unwrap()
-        .contains(&format!("update_ownership:500:{MEMBER}")));
 }
 
 #[tokio::test]
@@ -983,6 +1737,321 @@ async fn transfer_hands_room_to_occupant_and_remembers_creator() {
     assert_eq!(tracked.owner_id, 301);
     assert_eq!(tracked.original_creator_id, 301);
     dispatch(&mut worker, 0).await;
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&"update_ownership:500:301".to_owned()));
+}
+
+fn owner_overwrite(member: u64) -> PermissionOverwrite {
+    PermissionOverwrite {
+        id: Id::new(member),
+        kind: PermissionOverwriteType::Member,
+        allow: Permissions::from_bits_retain(OWNER_ALLOW_BITS),
+        deny: Permissions::empty(),
+    }
+}
+
+#[tokio::test]
+async fn transfer_rewrites_only_this_rooms_owner_grants_before_persistence() {
+    let (live, store, http, trace) = owned_room();
+    let unrelated = PermissionOverwrite {
+        id: Id::new(701),
+        kind: PermissionOverwriteType::Role,
+        allow: Permissions::VIEW_CHANNEL,
+        deny: Permissions::CONNECT,
+    };
+    let mut room_channel = channel(500, 2, Some(CATEGORY));
+    let mut former_owner = owner_overwrite(MEMBER);
+    former_owner.allow |= Permissions::EMBED_LINKS;
+    former_owner.deny |= Permissions::SEND_MESSAGES;
+    room_channel.permission_overwrites = Some(vec![former_owner, unrelated]);
+    live.upsert_channel(room_channel);
+    let untouched = channel(501, 2, Some(CATEGORY));
+    live.upsert_channel(untouched.clone());
+    let mut worker = GuildRoomWorker::load(live.clone(), store, http)
+        .await
+        .unwrap();
+    assert!(worker
+        .apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 })
+        .contains("Transferred"));
+    dispatch(&mut worker, 0).await;
+    let state = live.inner.read().unwrap();
+    let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+    let old = overwrites.iter().find(|o| o.id.get() == MEMBER).unwrap();
+    assert_eq!(old.allow, Permissions::EMBED_LINKS);
+    assert_eq!(old.deny, Permissions::SEND_MESSAGES);
+    assert!(overwrites.contains(&unrelated));
+    assert!(overwrites.contains(&owner_overwrite(301)));
+    assert_eq!(state.channels[&501], untouched);
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["overwrites:500", "update_ownership:500:301"]
+    );
+}
+
+#[tokio::test]
+async fn late_owner_overwrite_response_never_replaces_newer_gateway_evidence() {
+    for event in ["update", "delete", "reconnect"] {
+        let (live, store, mut http, _) = owned_room();
+        let mut original = channel(500, 2, Some(CATEGORY));
+        original.permission_overwrites = Some(vec![owner_overwrite(MEMBER)]);
+        live.upsert_channel(original.clone());
+        let gate = Arc::new(OverwriteGate::default());
+        http.overwrites_gate = Some(gate.clone());
+        let mut worker = GuildRoomWorker::load(live.clone(), store, http)
+            .await
+            .unwrap();
+        let deny = PermissionOverwrite {
+            id: Id::new(777),
+            kind: PermissionOverwriteType::Member,
+            allow: Permissions::empty(),
+            deny: Permissions::CONNECT,
+        };
+        let mutation = async {
+            gate.sent.notified().await;
+            match event {
+                "update" => {
+                    let mut newer = original.clone();
+                    newer.permission_overwrites.as_mut().unwrap().push(deny);
+                    newer.name = Some("newer gateway name".to_owned());
+                    live.upsert_channel(newer);
+                }
+                "delete" => live.remove_channel(500),
+                "reconnect" => {
+                    live.disconnect();
+                    let mut refreshed = snapshot(&[500], vec![]);
+                    *refreshed
+                        .channels
+                        .iter_mut()
+                        .find(|c| c.id.get() == 500)
+                        .unwrap() = original.clone();
+                    live.publish(refreshed);
+                }
+                _ => unreachable!(),
+            }
+            gate.release.notify_one();
+        };
+        let (result, ()) = tokio::join!(worker.rewrite_owner_grant(500, &[MEMBER], 301), mutation);
+        assert_eq!(result, Err(RoomHttpError::Cancelled), "{event}");
+        worker.http.overwrites_gate = None;
+        if event == "delete" {
+            assert!(!live.inner.read().unwrap().channels.contains_key(&500));
+            assert_eq!(
+                worker.rewrite_owner_grant(500, &[MEMBER], 301).await,
+                Err(RoomHttpError::NotFound)
+            );
+        } else if event == "reconnect" {
+            assert_eq!(live.inner.read().unwrap().channels[&500], original);
+        } else {
+            worker
+                .rewrite_owner_grant(500, &[MEMBER], 301)
+                .await
+                .unwrap();
+            let state = live.inner.read().unwrap();
+            let newer = &state.channels[&500];
+            assert_eq!(newer.name.as_deref(), Some("newer gateway name"));
+            assert!(newer
+                .permission_overwrites
+                .as_ref()
+                .unwrap()
+                .contains(&deny));
+        }
+    }
+}
+
+#[tokio::test]
+async fn rapid_transfers_revoke_all_former_owners_and_never_grant_a_stale_recipient() {
+    let (live, store, http, trace) = owned_room();
+    let mut room_channel = channel(500, 2, Some(CATEGORY));
+    room_channel.permission_overwrites = Some(vec![owner_overwrite(MEMBER)]);
+    live.upsert_channel(room_channel);
+    live.voice_update_at(302, Some(500), Some(false), 1_000);
+    let mut worker = GuildRoomWorker::load(live.clone(), store, http)
+        .await
+        .unwrap();
+    worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
+    worker.apply_ownership(301, false, OwnershipCommand::Transfer { target_id: 302 });
+    dispatch(&mut worker, 0).await;
+    assert!(!worker.dispatch_one(1).await, "handoffs coalesce per room");
+    let state = live.inner.read().unwrap();
+    let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+    for former in [MEMBER, 301] {
+        assert!(!overwrites.iter().any(|o| o.id.get() == former
+            && o.allow
+                .intersects(Permissions::from_bits_retain(OWNER_ALLOW_BITS))));
+    }
+    assert!(overwrites.contains(&owner_overwrite(302)));
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .contains(&"update_ownership:500:301".to_owned()));
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&"update_ownership:500:302".to_owned()));
+}
+
+#[tokio::test]
+async fn owner_grants_are_never_issued_after_failed_journal_preparation() {
+    let (live, store, http, trace) = owned_room();
+    store
+        .prepare_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::Unavailable);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
+    dispatch(&mut worker, 0).await;
+    assert!(
+        trace.lock().unwrap().is_empty(),
+        "no Discord grant or ownership commit"
+    );
+    assert!(worker.store.owner_pending.lock().unwrap().is_empty());
+    assert_eq!(worker.store.rooms.lock().unwrap()[&500].owner_id, MEMBER);
+}
+
+#[tokio::test]
+async fn failed_owner_commit_reload_and_later_transfer_revoke_every_issued_recipient() {
+    let (live, store, http, trace) = owned_room();
+    let mut original = channel(500, 2, Some(CATEGORY));
+    let independent = PermissionOverwrite {
+        id: Id::new(301),
+        kind: PermissionOverwriteType::Member,
+        allow: Permissions::EMBED_LINKS,
+        deny: Permissions::SEND_MESSAGES,
+    };
+    original.permission_overwrites = Some(vec![owner_overwrite(MEMBER), independent]);
+    live.upsert_channel(original);
+    live.voice_update_at(302, Some(500), Some(false), 1_000);
+    let store = Arc::new(store);
+    store
+        .ownership_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::Unavailable);
+    let mut worker = GuildRoomWorker::load(live.clone(), store.clone(), http)
+        .await
+        .unwrap();
+    worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
+    assert!(worker.dispatch_one(0).await);
+    assert_eq!(store.rooms.lock().unwrap()[&500].owner_id, MEMBER);
+    assert!(store.owner_pending.lock().unwrap().contains(&500));
+    assert_eq!(
+        store.owner_intents.lock().unwrap()[&500].members,
+        [MEMBER, 301]
+    );
+    assert!(live.inner.read().unwrap().channels[&500]
+        .permission_overwrites
+        .as_ref()
+        .unwrap()
+        .iter()
+        .any(|o| o.id.get() == 301 && o.allow.contains(Permissions::MANAGE_CHANNELS)));
+    drop(worker);
+
+    // The ledger owner is still present, so succession does nothing. Recovery
+    // must nevertheless undo the uncommitted recipient grant after reload.
+    let mut restarted = GuildRoomWorker::load(live.clone(), store.clone(), Http::new(trace))
+        .await
+        .unwrap();
+    restarted.reconcile();
+    assert!(restarted.dispatch_one(0).await);
+    assert!(!store.owner_pending.lock().unwrap().contains(&500));
+    assert_eq!(restarted.rooms[&500].owner_id, MEMBER);
+    restarted.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 302 });
+    assert!(restarted.dispatch_one(1).await);
+    assert_eq!(store.rooms.lock().unwrap()[&500].owner_id, 302);
+    let state = live.inner.read().unwrap();
+    let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+    for former in [MEMBER, 301] {
+        assert!(!overwrites.iter().any(|o| o.id.get() == former
+            && o.allow
+                .intersects(Permissions::from_bits_retain(OWNER_ALLOW_BITS))));
+    }
+    assert!(overwrites.contains(&independent));
+    assert!(overwrites.contains(&owner_overwrite(302)));
+}
+
+#[tokio::test]
+async fn exhausted_owner_cleanup_is_retained_and_recovers_after_access_restoration() {
+    for later_handoff in [false, true] {
+        let (live, store, http, _) = owned_room();
+        let mut original = channel(500, 2, Some(CATEGORY));
+        original.permission_overwrites = Some(vec![owner_overwrite(MEMBER)]);
+        live.upsert_channel(original);
+        for member in [302, 303] {
+            live.voice_update_at(member, Some(500), Some(false), 1_000);
+        }
+        let mut worker = GuildRoomWorker::load(live.clone(), store, http)
+            .await
+            .unwrap();
+        worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
+        dispatch(&mut worker, 0).await;
+        let full_access = live.inner.read().unwrap().bot.clone().unwrap();
+        let mut reduced = full_access.clone();
+        for role in &mut reduced.roles {
+            role.permissions &= !Permissions::MANAGE_ROLES;
+        }
+        live.refresh_bot(reduced);
+        worker.apply_ownership(301, false, OwnershipCommand::Transfer { target_id: 302 });
+        let mut now = 100_000;
+        for _ in 0..QUEUE_MAX_ATTEMPTS {
+            dispatch(&mut worker, now).await;
+            now += 100_000;
+        }
+        assert_eq!(worker.queue.failed().len(), 1);
+        assert!(worker.store.owner_pending.lock().unwrap().contains(&500));
+        assert_eq!(worker.store.rooms.lock().unwrap()[&500].owner_id, 301);
+        assert!(
+            !worker.dispatch_one(now).await,
+            "no retry storm while access is absent"
+        );
+        let owner = if later_handoff {
+            worker.apply_ownership(302, false, OwnershipCommand::Transfer { target_id: 303 });
+            dispatch(&mut worker, now).await;
+            now += 100_000;
+            assert_eq!(
+                worker.store.rooms.lock().unwrap()[&500].owner_id,
+                301,
+                "missing immediate predecessor grant cannot hide the earlier grant"
+            );
+            303
+        } else {
+            302
+        };
+        live.refresh_bot(full_access);
+        dispatch(&mut worker, now).await;
+        assert_eq!(worker.store.rooms.lock().unwrap()[&500].owner_id, owner);
+        assert!(!worker.store.owner_pending.lock().unwrap().contains(&500));
+        let state = live.inner.read().unwrap();
+        let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+        assert!(!overwrites.iter().any(|o| o.id.get() == 301
+            && o.allow
+                .intersects(Permissions::from_bits_retain(OWNER_ALLOW_BITS))));
+        assert!(overwrites.contains(&owner_overwrite(owner)));
+    }
+}
+
+#[tokio::test]
+async fn owner_grant_rewrite_rate_limit_retries_before_saving_the_handoff() {
+    let (live, store, http, trace) = owned_room();
+    http.view_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::RateLimited {
+            retry_after_ms: 100,
+            global: false,
+        });
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
+    dispatch(&mut worker, 0).await;
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.starts_with("update_ownership")));
+    assert!(!worker.dispatch_one(99).await);
+    dispatch(&mut worker, 100).await;
     assert!(trace
         .lock()
         .unwrap()
@@ -1129,6 +2198,201 @@ async fn delete_403_suspends_without_a_retry_storm_and_refresh_resumes() {
         *trace.lock().unwrap(),
         ["delete:500", "delete:500", "forget:500"]
     );
+}
+
+/// Prime one eligible delete before reconciling both rooms, so each sweep
+/// visitation order is deterministic despite the tracked-room HashMap.
+async fn two_empty_rooms(
+    first: u64,
+    failures: VecDeque<RoomHttpError>,
+) -> (GuildRoomWorker<Store, Http>, Trace) {
+    let (live, store, http, trace) = fixture();
+    for id in [500, 501] {
+        store.rooms.lock().unwrap().insert(id, room(id));
+        live.upsert_channel(channel(id, 2, Some(CATEGORY)));
+    }
+    http.delete_channel_errors
+        .lock()
+        .unwrap()
+        .insert(500, failures);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.queue_delete(first, false);
+    worker.reconcile();
+    assert_eq!(worker.queue.pending_counts(GUILD), (2, 0));
+    (worker, trace)
+}
+
+#[tokio::test]
+async fn transient_delete_isolated_in_either_sweep_order_and_retried_after_backoff() {
+    for first in [500, 501] {
+        let (mut worker, trace) =
+            two_empty_rooms(first, VecDeque::from([RoomHttpError::UnknownOutcome])).await;
+        dispatch(&mut worker, 0).await;
+        dispatch(&mut worker, 1).await;
+        let expected = if first == 500 {
+            vec!["delete:500", "delete:501", "forget:501"]
+        } else {
+            vec!["delete:501", "forget:501", "delete:500"]
+        };
+        assert_eq!(*trace.lock().unwrap(), expected, "first room {first}");
+        assert_eq!(worker.tracked().get(&500), Some(&room(500)));
+        assert!(!worker.tracked().contains_key(&501));
+        assert_eq!(
+            worker.store.rooms.lock().unwrap().get(&500),
+            Some(&room(500))
+        );
+        assert!(!worker.store.rooms.lock().unwrap().contains_key(&501));
+        assert!(worker
+            .live
+            .inner
+            .read()
+            .unwrap()
+            .channels
+            .contains_key(&500));
+        worker.reconcile();
+        assert_eq!(worker.queue.pending_counts(GUILD), (1, 0));
+        for time in [2, 100, 1_999] {
+            assert!(
+                !worker.dispatch_one(time).await,
+                "retry must wait for its backoff"
+            );
+        }
+        assert_eq!(*trace.lock().unwrap(), expected);
+        dispatch(&mut worker, 3_000).await;
+        assert!(worker.tracked().is_empty());
+        assert!(worker.store.rooms.lock().unwrap().is_empty());
+        assert!(worker.queue.failed().is_empty());
+        assert_eq!(
+            &trace.lock().unwrap()[expected.len()..],
+            ["delete:500", "forget:500"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn transient_delete_dead_letter_retains_provenance_without_requeue_storms() {
+    let (mut worker, trace) = two_empty_rooms(
+        500,
+        VecDeque::from(vec![
+            RoomHttpError::UnknownOutcome;
+            QUEUE_MAX_ATTEMPTS as usize
+        ]),
+    )
+    .await;
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    let mut previous = 0;
+    for attempt in 1..QUEUE_MAX_ATTEMPTS {
+        worker.reconcile();
+        let before_due = previous + two_bot_core::voice_rooms::fail_backoff_ms(attempt) - 1;
+        assert!(!worker.dispatch_one(before_due).await);
+        let due = u64::from(attempt) * 61_000;
+        dispatch(&mut worker, due).await;
+        previous = due;
+    }
+    let failed = worker.queue.failed();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(
+        failed[0].action.action,
+        RoomAction::DeleteRoom { channel_id: 500 }
+    );
+    assert_eq!(failed[0].action.attempts, QUEUE_MAX_ATTEMPTS);
+    assert_eq!(worker.tracked().get(&500), Some(&room(500)));
+    assert_eq!(
+        worker.store.rooms.lock().unwrap().get(&500),
+        Some(&room(500))
+    );
+    assert!(worker
+        .live
+        .inner
+        .read()
+        .unwrap()
+        .channels
+        .contains_key(&500));
+    for time in [previous + 1, previous + 60_000, previous + 600_000] {
+        worker.reconcile();
+        assert!(!worker.dispatch_one(time).await);
+    }
+    assert_eq!(
+        trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| *call == "delete:500")
+            .count(),
+        QUEUE_MAX_ATTEMPTS as usize
+    );
+    assert!(!trace.lock().unwrap().contains(&"forget:500".to_owned()));
+    // A new eligible room still progresses after the earlier failure is terminal.
+    worker.store.rooms.lock().unwrap().insert(502, room(502));
+    worker.rooms.insert(502, room(502));
+    worker.live.upsert_channel(channel(502, 2, Some(CATEGORY)));
+    worker.reconcile();
+    dispatch(&mut worker, previous + 600_001).await;
+    assert!(!worker.tracked().contains_key(&502));
+    assert!(trace.lock().unwrap().contains(&"forget:502".to_owned()));
+    assert_eq!(worker.queue.failed(), failed);
+}
+
+#[tokio::test]
+async fn refused_delete_isolated_in_either_sweep_order_without_retry_storms() {
+    for first in [500, 501] {
+        let (mut worker, trace) =
+            two_empty_rooms(first, VecDeque::from([RoomHttpError::AccessDenied])).await;
+        dispatch(&mut worker, 0).await;
+        dispatch(&mut worker, 1).await;
+        assert_eq!(worker.tracked().get(&500), Some(&room(500)));
+        assert!(!worker.tracked().contains_key(&501));
+        assert!(worker.queue.is_suspended(GUILD, 500));
+        for time in [3_000, 60_000, 600_000] {
+            worker.reconcile();
+            assert!(!worker.dispatch_one(time).await);
+        }
+        let calls = trace.lock().unwrap();
+        assert_eq!(calls.iter().filter(|call| *call == "delete:500").count(), 1);
+        assert!(calls.contains(&"forget:501".to_owned()));
+        assert!(!calls.contains(&"forget:500".to_owned()));
+    }
+}
+
+#[tokio::test]
+async fn transient_delete_retry_rechecks_occupancy_permissions_and_readiness() {
+    for changed in ["occupancy", "permissions", "readiness"] {
+        let (mut worker, trace) =
+            two_empty_rooms(500, VecDeque::from([RoomHttpError::UnknownOutcome])).await;
+        dispatch(&mut worker, 0).await;
+        dispatch(&mut worker, 1).await;
+        match changed {
+            "occupancy" => {
+                worker.live.voice_update(MEMBER, Some(500), Some(false));
+            }
+            "permissions" => {
+                worker
+                    .live
+                    .inner
+                    .write()
+                    .unwrap()
+                    .bot
+                    .as_mut()
+                    .unwrap()
+                    .roles = vec![role(Permissions::VIEW_CHANNEL)];
+            }
+            "readiness" => worker.live.disconnect(),
+            _ => unreachable!(),
+        }
+        // No reconcile is needed to invalidate the previously queued write.
+        // Dispatch and its last-moment guard must recheck current live facts.
+        worker.dispatch_one(3_000).await;
+        assert_eq!(
+            *trace.lock().unwrap(),
+            ["delete:500", "delete:501", "forget:501"]
+        );
+        assert_eq!(worker.tracked().get(&500), Some(&room(500)));
+        assert_eq!(
+            worker.store.rooms.lock().unwrap().get(&500),
+            Some(&room(500))
+        );
+    }
 }
 
 #[tokio::test]
@@ -1311,7 +2575,15 @@ async fn lacking_manage_roles_creates_without_overrides_so_the_room_syncs_to_its
     use twilight_model::channel::permission_overwrite::{
         PermissionOverwrite, PermissionOverwriteType,
     };
-    let (live, store, http, _) = fixture();
+    let (live, store, http, trace) = fixture();
+    let mut creator = channel(CREATOR, 2, Some(CATEGORY));
+    creator.permission_overwrites = Some(vec![PermissionOverwrite {
+        id: Id::new(600),
+        kind: PermissionOverwriteType::Member,
+        allow: Permissions::MANAGE_ROLES,
+        deny: Permissions::empty(),
+    }]);
+    live.upsert_channel(creator);
     let overwrite = PermissionOverwrite {
         id: Id::new(GUILD),
         kind: PermissionOverwriteType::Role,
@@ -1326,11 +2598,193 @@ async fn lacking_manage_roles_creates_without_overrides_so_the_room_syncs_to_its
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
-    // The bot cannot set overrides without Manage Roles: none are sent, so
-    // Discord syncs the new room to the category it is created in.
+    dispatch(&mut worker, 1).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "move:300:500"]
+    );
+    assert!(worker.failures().is_empty());
+    // The bot cannot set overrides without Manage Roles: none are sent, even
+    // if the source grants it to someone else. Discord syncs to the category.
     let created = worker.http.created_attributes.lock().unwrap();
+    assert_eq!(created.len(), 1);
     assert_eq!(created[0].parent_id, Some(CATEGORY));
     assert!(created[0].overwrites.is_empty());
+}
+
+#[tokio::test]
+async fn create_request_strips_inherited_manage_roles_from_every_overwrite() {
+    use twilight_model::channel::permission_overwrite::{
+        PermissionOverwrite, PermissionOverwriteType,
+    };
+    use two_bot_core::voice_permissions::OWNER_ALLOW_BITS;
+
+    for source in [
+        PermissionSource::Creator,
+        PermissionSource::Category,
+        PermissionSource::Channel(700),
+    ] {
+        for private in [false, true] {
+            for inherited_bot in [false, true] {
+                let (live, store, http, trace) = fixture();
+                {
+                    let mut creators = store.creators.lock().unwrap();
+                    creators[0].permission_source = source;
+                    creators[0].permission_channel_id = match source {
+                        PermissionSource::Channel(id) => Some(id),
+                        _ => None,
+                    };
+                    creators[0].private_default = private;
+                    creators[0].validate().unwrap();
+                }
+                let source_id = match source {
+                    PermissionSource::Creator => CREATOR,
+                    PermissionSource::Category => CATEGORY,
+                    PermissionSource::Channel(id) => id,
+                };
+                let mut source_channel = channel(
+                    source_id,
+                    if source_id == CATEGORY { 4 } else { 2 },
+                    if source_id == CATEGORY {
+                        None
+                    } else {
+                        Some(CATEGORY)
+                    },
+                );
+                let mut overwrites: Vec<_> = [
+                    (
+                        GUILD,
+                        PermissionOverwriteType::Role,
+                        Permissions::VIEW_CHANNEL | Permissions::CONNECT,
+                        Permissions::empty(),
+                    ),
+                    (
+                        MEMBER,
+                        PermissionOverwriteType::Member,
+                        Permissions::VIEW_CHANNEL | Permissions::CONNECT,
+                        Permissions::SEND_MESSAGES,
+                    ),
+                    (
+                        600,
+                        PermissionOverwriteType::Role,
+                        Permissions::SPEAK,
+                        Permissions::STREAM,
+                    ),
+                    (
+                        601,
+                        PermissionOverwriteType::Member,
+                        Permissions::SPEAK,
+                        Permissions::MANAGE_ROLES,
+                    ),
+                ]
+                .into_iter()
+                .map(|(id, kind, allow, deny)| PermissionOverwrite {
+                    id: Id::new(id),
+                    kind,
+                    allow: allow | Permissions::MANAGE_ROLES,
+                    deny,
+                })
+                .collect();
+                if inherited_bot {
+                    overwrites.push(PermissionOverwrite {
+                        id: Id::new(999),
+                        kind: PermissionOverwriteType::Member,
+                        allow: Permissions::MANAGE_ROLES,
+                        deny: Permissions::SEND_MESSAGES,
+                    });
+                }
+                source_channel.permission_overwrites = Some(overwrites);
+                live.upsert_channel(source_channel);
+                let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+                join(&mut worker, MEMBER);
+                dispatch(&mut worker, 0).await;
+                assert!(
+                    worker.failures().is_empty(),
+                    "source={source:?}, private={private}, inherited_bot={inherited_bot}: {:?}",
+                    worker.failures()
+                );
+                dispatch(&mut worker, 1).await;
+                assert_eq!(
+                    *trace.lock().unwrap(),
+                    ["create", "persist:500", "move:300:500"]
+                );
+                assert!(worker.failures().is_empty());
+                let created = worker.http.created_attributes.lock().unwrap();
+                assert_eq!(created.len(), 1);
+                let attributes = &created[0];
+                assert_eq!(attributes.parent_id, Some(CATEGORY));
+                assert_eq!(
+                    attributes.overwrites.len(),
+                    if inherited_bot || private { 5 } else { 4 }
+                );
+                for overwrite in &attributes.overwrites {
+                    assert!(
+                        !overwrite.allow.contains(Permissions::MANAGE_ROLES),
+                        "{overwrite:?}"
+                    );
+                    assert!(!overwrite.allow.intersects(overwrite.deny), "{overwrite:?}");
+                }
+                let entry = |id| {
+                    attributes
+                        .overwrites
+                        .iter()
+                        .find(|overwrite| overwrite.id.get() == id)
+                        .unwrap()
+                };
+                let owner = entry(MEMBER);
+                assert_eq!(owner.allow.bits(), OWNER_ALLOW_BITS);
+                assert!(!owner.allow.contains(Permissions::ADMINISTRATOR));
+                assert_eq!(owner.deny, Permissions::SEND_MESSAGES);
+                assert_eq!(entry(600).allow, Permissions::SPEAK);
+                assert_eq!(entry(600).deny, Permissions::STREAM);
+                assert_eq!(entry(601).allow, Permissions::SPEAK);
+                // Manage Roles denies restrict rather than confer it, and stay intact.
+                assert_eq!(entry(601).deny, Permissions::MANAGE_ROLES);
+                let everyone = entry(GUILD);
+                assert_eq!(everyone.deny.contains(Permissions::CONNECT), private);
+                assert!(everyone.allow.contains(Permissions::VIEW_CHANNEL));
+                assert_eq!(everyone.allow.contains(Permissions::CONNECT), !private);
+                if private {
+                    let bot = entry(999);
+                    assert_eq!(bot.allow, permissions() & !Permissions::MANAGE_ROLES);
+                    assert_eq!(
+                        bot.deny,
+                        if inherited_bot {
+                            Permissions::SEND_MESSAGES
+                        } else {
+                            Permissions::empty()
+                        }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn lacking_manage_roles_refuses_a_private_default_before_any_create() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].private_default = true;
+    live.inner.write().unwrap().bot.as_mut().unwrap().roles =
+        vec![role(permissions() & !Permissions::MANAGE_ROLES)];
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(worker.http.created_attributes.lock().unwrap().is_empty());
+    assert!(worker.tracked().is_empty());
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call == "create" || call.starts_with("persist:") || call.starts_with("move:")));
+    assert!(matches!(
+        worker.failures().back(),
+        Some(LifecycleFailure::MissingPermission {
+            write: RefusedWrite::Create,
+            ..
+        })
+    ));
+    assert!(!worker.dispatch_one(60000).await);
 }
 
 #[tokio::test]
@@ -1386,10 +2840,31 @@ fn create_channel_plan_trims_and_validates_names() {
     );
 }
 
+fn name_context() -> NameFilterContext {
+    NameFilterContext {
+        guild_id: GUILD.to_string(),
+        channel_id: CREATOR.to_string(),
+        user_id: MEMBER.to_string(),
+    }
+}
+
+/// Fixture automod policy: one invented term, no real word list.
+fn fixture_policy(words: &[&str]) -> AutomodPolicy {
+    AutomodPolicy {
+        bad_words: words.iter().map(ToString::to_string).collect(),
+        ..AutomodPolicy::default()
+    }
+}
+
 #[test]
 fn room_name_uses_display_plus_suffix_and_truncates() {
-    assert_eq!(room_name("ava"), "ava's room");
-    let named = room_name(&"x".repeat(200));
+    let policy = AutomodPolicy::default();
+    let plain = resolve_room_name("ava", &policy, &name_context()).unwrap();
+    assert_eq!(plain.name, "ava's room");
+    assert!(!plain.username_stripped);
+    let named = resolve_room_name(&"x".repeat(200), &policy, &name_context())
+        .unwrap()
+        .name;
     assert_eq!(named.chars().count(), 100);
     assert!(named.ends_with("'s room"));
 }
@@ -1471,7 +2946,12 @@ fn voice_command_set_is_gated_on_two_voice() {
             "inheritpermissions",
             "defaultlimit",
             "alwaysprivate",
-            "kick"
+            "kick",
+            "name",
+            "private",
+            "public",
+            "limit",
+            "unlimit"
         ]
     );
     let off = VoiceGates::from_map(&Default::default());
@@ -1624,7 +3104,7 @@ async fn wait_trace(trace: &Trace, entry: &str) {
 /// never on the create/move dispatch itself.
 async fn ownership_room_runtime(trace: Trace) -> VoiceRuntime<Store, Http> {
     let runtime = test_runtime(trace.clone());
-    assert!(runtime.publish_snapshot(GUILD, snapshot(&[], vec![])));
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
     assert!(runtime.voice_frame(
         GUILD,
         MEMBER,
@@ -1651,8 +3131,8 @@ fn member_with(permissions: Option<Permissions>) -> PartialMember {
         nick: None,
         permissions,
         premium_since: None,
-        roles: Vec::new(),
-        user: None,
+        roles: permissions.map_or_else(Vec::new, |p| vec![Id::new(10_000 + p.bits())]),
+        user: Some(test_user(MEMBER)),
     }
 }
 
@@ -1730,6 +3210,11 @@ where
     S: RoomPersistence + Send + 'static,
     H: RoomWrites + Send + 'static,
 {
+    // Most command fixtures start after GuildCreate; publish trusted role facts
+    // separately from the interaction payload. Cold-cache tests call the handler directly.
+    if runtime.live_actor(GUILD).is_none() {
+        assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    }
     let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
     let writer = seen.clone();
     let owned = handle_voice_interaction(runtime, interaction, |response| {
@@ -1926,6 +3411,213 @@ async fn handle_transfer_by_owner_hands_room_to_occupant() {
 }
 
 #[tokio::test]
+async fn handle_transfer_replay_by_former_owner_with_channel_manage_channels_is_refused() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let transfer = voice_interaction_as(
+        Some(command_data("transfer", vec![user_option("member", 301)])),
+        None,
+        MEMBER,
+    );
+    let (_, first) = handle_capture(&runtime, &transfer).await;
+    assert!(response_text(&first.unwrap()).contains("Transferred"));
+    let mut replay = voice_interaction_as(
+        Some(command_data(
+            "transfer",
+            vec![user_option("member", MEMBER)],
+        )),
+        Some(Permissions::MANAGE_CHANNELS),
+        MEMBER,
+    );
+    // Discord's source-channel owner overwrite supplies Manage Channels,
+    // but this member has no guild-level role with that permission.
+    replay.member.as_mut().unwrap().roles.clear();
+    let (_, reply) = handle_capture(&runtime, &replay).await;
+    assert!(response_text(&reply.unwrap()).contains("Only the room owner"));
+    wait_trace(&trace, "update_ownership:500:301").await;
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .contains(&format!("update_ownership:500:{MEMBER}")));
+}
+
+#[tokio::test]
+async fn channel_manage_channels_never_bypasses_voice_restrictions_or_configuration_checks() {
+    let runtime = test_runtime(Trace::default());
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    for name in [
+        "create",
+        "access",
+        "logging",
+        "textchannels",
+        "position",
+        "group",
+        "inheritpermissions",
+        "defaultlimit",
+        "alwaysprivate",
+    ] {
+        let mut interaction = voice_interaction(
+            Some(command_data(name, vec![])),
+            Some(Permissions::MANAGE_CHANNELS),
+            true,
+        );
+        interaction.member.as_mut().unwrap().roles.clear();
+        let (_, response) = handle_capture(&runtime, &interaction).await;
+        let text = response_text(&response.unwrap());
+        assert!(text.contains("You need Manage Channels"), "{name}: {text}");
+    }
+    let controls = AccessControls {
+        required_role: Some(9),
+        ..AccessControls::default()
+    };
+    let runtime = gated_runtime(Trace::default(), controls, None);
+    let mut interaction = voice_interaction(
+        Some(command_data("ping", vec![])),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
+    interaction.member.as_mut().unwrap().roles.clear();
+    let (_, response) = handle_capture(&runtime, &interaction).await;
+    assert!(response_text(&response.unwrap()).contains("required role"));
+}
+
+#[tokio::test]
+async fn channel_manage_channels_cannot_select_another_members_room() {
+    let runtime = ownership_room_runtime(Trace::default()).await;
+    runtime.voice_frame(GUILD, MEMBER, Some(600), Some(false), "x".to_owned());
+    let mut interaction = voice_interaction_as(
+        Some(command_data("transfer", vec![user_option("member", 301)])),
+        Some(Permissions::MANAGE_CHANNELS),
+        MEMBER,
+    );
+    interaction.member.as_mut().unwrap().roles.clear();
+    let (_, reply) = handle_capture(&runtime, &interaction).await;
+    assert!(response_text(&reply.unwrap()).contains("isn't a temporary room"));
+}
+
+#[tokio::test]
+async fn channel_manage_channels_does_not_reveal_setup_detail() {
+    let runtime = failing_creators_runtime(Trace::default());
+    let mut interaction = voice_interaction(
+        Some(command_data("setup", Vec::new())),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
+    interaction.member.as_mut().unwrap().roles.clear();
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(text.contains("Voice rooms are running"), "{text}");
+    assert!(!text.contains("Could not load creator channels"), "{text}");
+}
+
+#[tokio::test]
+async fn channel_manage_channels_cannot_bypass_a_per_command_restriction_or_settings_failure() {
+    for (controls, error, refusal) in [
+        (
+            AccessControls {
+                command_roles: [("ping".to_owned(), vec![7])].into_iter().collect(),
+                ..AccessControls::default()
+            },
+            None,
+            "do not have a role",
+        ),
+        (
+            AccessControls::default(),
+            Some(StoreError::Unavailable),
+            "settings are unavailable",
+        ),
+    ] {
+        let runtime = gated_runtime(Trace::default(), controls, error);
+        let mut interaction = voice_interaction(
+            Some(command_data("ping", vec![])),
+            Some(Permissions::MANAGE_CHANNELS),
+            true,
+        );
+        interaction.member.as_mut().unwrap().roles.clear();
+        let (_, reply) = handle_capture(&runtime, &interaction).await;
+        assert!(response_text(&reply.unwrap()).contains(refusal));
+    }
+}
+
+#[tokio::test]
+async fn guild_role_admins_and_owner_pass_without_channel_manage_channels() {
+    let runtime = test_runtime(Trace::default());
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    for (id, roles) in [
+        (
+            MEMBER,
+            vec![Id::new(10_000 + Permissions::MANAGE_CHANNELS.bits())],
+        ),
+        (
+            MEMBER,
+            vec![Id::new(10_000 + Permissions::ADMINISTRATOR.bits())],
+        ),
+        (998, vec![]),
+    ] {
+        let mut interaction = voice_interaction_as(Some(command_data("access", vec![])), None, id);
+        interaction.member.as_mut().unwrap().roles = roles;
+        assert!(is_voice_admin(runtime.guild_permissions(&interaction)));
+        let (_, response) = handle_capture(&runtime, &interaction).await;
+        assert!(!response_text(&response.unwrap()).contains("You need Manage Channels"));
+    }
+}
+
+#[tokio::test]
+async fn refreshed_guild_owner_and_role_permissions_revoke_old_admin_authority() {
+    let runtime = test_runtime(Trace::default());
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    let mut old_owner = voice_interaction_as(Some(command_data("access", vec![])), None, 998);
+    assert!(is_voice_admin(runtime.guild_permissions(&old_owner)));
+    let mut guild = command_snapshot();
+    guild.bot.guild_owner_id = 997;
+    runtime
+        .live_actor(GUILD)
+        .unwrap()
+        .live
+        .refresh_bot(guild.bot.clone());
+    assert!(!is_voice_admin(runtime.guild_permissions(&old_owner)));
+    old_owner.member.as_mut().unwrap().roles =
+        vec![Id::new(10_000 + Permissions::MANAGE_CHANNELS.bits())];
+    assert!(is_voice_admin(runtime.guild_permissions(&old_owner)));
+    guild
+        .bot
+        .roles
+        .iter_mut()
+        .find(|r| r.id.get() == 10_000 + Permissions::MANAGE_CHANNELS.bits())
+        .unwrap()
+        .permissions = Permissions::VIEW_CHANNEL;
+    runtime
+        .live_actor(GUILD)
+        .unwrap()
+        .live
+        .refresh_bot(guild.bot);
+    assert!(!is_voice_admin(runtime.guild_permissions(&old_owner)));
+}
+
+#[tokio::test]
+async fn guild_permission_snapshot_fails_closed_when_missing_incomplete_or_disconnected() {
+    let runtime = test_runtime(Trace::default());
+    let interaction = voice_interaction(
+        Some(command_data("create", vec![])),
+        Some(Permissions::ADMINISTRATOR),
+        true,
+    );
+    assert_eq!(runtime.guild_permissions(&interaction), None);
+    let mut guild = command_snapshot();
+    guild
+        .bot
+        .roles
+        .retain(|role| role.id.get() != 10_000 + Permissions::ADMINISTRATOR.bits());
+    assert!(runtime.publish_snapshot(GUILD, guild));
+    assert_eq!(runtime.guild_permissions(&interaction), None);
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    assert!(is_voice_admin(runtime.guild_permissions(&interaction)));
+    runtime.live_actor(GUILD).unwrap().live.disconnect();
+    assert_eq!(runtime.guild_permissions(&interaction), None);
+}
+
+#[tokio::test]
 async fn handle_transfer_rejects_recipient_outside_room() {
     let trace = Trace::default();
     let runtime = ownership_room_runtime(trace.clone()).await;
@@ -2007,7 +3699,7 @@ async fn creation_switch_off_refuses_new_rooms() {
         .live
         .voice_update(MEMBER, Some(CREATOR), Some(false))
         .unwrap();
-    assert!(!worker.accept_join(ticket, "new room".to_owned(), 7, NOW.to_owned()));
+    assert!(!worker.accept_join(ticket, "new room", 7, NOW.to_owned()));
     assert!(!worker.dispatch_one(0).await);
     assert!(worker.tracked().is_empty());
 }
@@ -2531,7 +4223,7 @@ async fn access_changed_refreshes_a_loaded_worker() {
             .voice_update(MEMBER, Some(CREATOR), Some(false))
             .unwrap();
         assert_eq!(
-            worker.accept_join(ticket, "new room".to_owned(), 7, NOW.to_owned()),
+            worker.accept_join(ticket, "new room", 7, NOW.to_owned()),
             after
         );
     }
@@ -2553,7 +4245,7 @@ async fn access_command_reaches_the_live_actor_without_a_restart() {
     let trace = Trace::default();
     let shared = Arc::new(Mutex::new(AccessControls::default()));
     let runtime = shared_runtime(trace.clone(), shared, None);
-    assert!(runtime.publish_snapshot(GUILD, snapshot(&[], vec![])));
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
     // The actor is loaded once it can answer a status request.
     for _ in 0..500 {
         if runtime.worker_status(GUILD).await.is_some() {
@@ -3611,15 +5303,119 @@ async fn handle_create_blank_name_refuses_before_rest() {
 }
 
 #[tokio::test]
-async fn handle_setup_lists_seeded_creator() {
+async fn handle_setup_lists_seeded_creator_for_admins() {
     let trace = Trace::default();
     let runtime = test_runtime(trace);
-    let interaction = voice_interaction(Some(command_data("setup", Vec::new())), None, true);
+    let interaction = voice_interaction(
+        Some(command_data("setup", Vec::new())),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
     let (owned, response) = handle_capture(&runtime, &interaction).await;
     assert!(owned);
     let text = response_text(response.as_ref().expect("reply"));
     assert!(text.contains("Voice rooms"));
     assert!(text.contains(&format!("<#{CREATOR}>")));
+}
+
+fn failing_creators_runtime(trace: Trace) -> VoiceRuntime<Store, Http> {
+    VoiceRuntime::new(
+        move || {
+            let mut store = Store::new(trace.clone());
+            store.creators_error = Some(StoreError::Unavailable);
+            (store, Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+}
+
+#[tokio::test]
+async fn handle_setup_gives_members_a_generic_status_only() {
+    // A member (or one whose permissions are missing) gets running/paused and
+    // nothing else: no creator ids, no store error class, no Discord detail.
+    for permissions in [
+        Some(Permissions::empty()),
+        Some(Permissions::VIEW_CHANNEL | Permissions::MANAGE_GUILD),
+        None,
+    ] {
+        let runtime = failing_creators_runtime(Trace::default());
+        let interaction =
+            voice_interaction(Some(command_data("setup", Vec::new())), permissions, true);
+        let (owned, response) = handle_capture(&runtime, &interaction).await;
+        assert!(owned);
+        let text = response_text(response.as_ref().expect("reply"));
+        assert!(text.contains("Voice rooms are running"), "{text}");
+        let creator = CREATOR.to_string();
+        for leaked in [
+            "<#",
+            creator.as_str(),
+            "store",
+            "Unavailable",
+            "unavailable",
+            "Could not load",
+            "Creator channels",
+            "Tracked rooms",
+            "failures",
+        ] {
+            assert!(
+                !text.contains(leaked),
+                "{leaked:?} leaked to a member: {text}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn handle_setup_shows_store_errors_to_admins_without_the_variant_name() {
+    for permissions in [Permissions::MANAGE_CHANNELS, Permissions::ADMINISTRATOR] {
+        let runtime = failing_creators_runtime(Trace::default());
+        let interaction = voice_interaction(
+            Some(command_data("setup", Vec::new())),
+            Some(permissions),
+            true,
+        );
+        let (_, response) = handle_capture(&runtime, &interaction).await;
+        let text = response_text(response.as_ref().expect("reply"));
+        assert!(text.contains("Could not load creator channels"), "{text}");
+        assert!(text.contains("the store is unavailable"), "{text}");
+        assert!(!text.contains("Unavailable"), "{text}");
+    }
+}
+
+#[test]
+fn setup_member_panel_is_generic() {
+    let running = setup_member_panel(false, false);
+    assert_eq!(running.title, "Voice rooms");
+    assert_eq!(running.description, "Voice rooms are running.");
+    let attention = setup_member_panel(false, true);
+    assert!(attention
+        .description
+        .starts_with("Voice rooms are running."));
+    assert!(attention.description.contains("Ask a server admin"));
+    let paused = setup_member_panel(true, false);
+    assert!(paused.description.contains("paused"));
+    assert!(paused.description.contains("Ask a server admin"));
+    // The credential detail the admin panel carries stays out of the member view.
+    assert!(!paused.description.contains("token"));
+    assert!(!paused.description.contains("credential"));
+    for panel in [running, attention, paused] {
+        assert!(!panel.description.contains("<#"));
+        assert!(!panel.description.chars().any(|c| c.is_ascii_digit()));
+    }
+}
+
+#[test]
+fn store_errors_read_as_plain_words() {
+    for (error, variant) in [
+        (StoreError::Unavailable, "Unavailable"),
+        (StoreError::CredentialRefused, "CredentialRefused"),
+        (StoreError::Conflict, "Conflict"),
+    ] {
+        let text = error.to_string();
+        assert!(!text.is_empty());
+        assert!(!text.contains(variant), "{text}");
+    }
 }
 
 #[tokio::test]
@@ -3784,6 +5580,7 @@ fn create_interaction() -> Interaction {
 async fn responder_defers_before_any_create_and_completes_once() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
     let replies = Replies::new(trace.clone());
     VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None, None).await;
     assert_eq!(
@@ -3793,6 +5590,18 @@ async fn responder_defers_before_any_create_and_completes_once() {
     let completed = replies.completed.lock().unwrap();
     assert_eq!(completed.len(), 1);
     assert!(response_text(&completed[0]).contains("Created <#500>"));
+}
+
+#[tokio::test]
+async fn responder_without_guild_roles_refuses_channel_permission_claims_without_creating() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let replies = Replies::new(trace.clone());
+    VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None, None).await;
+    assert_eq!(*trace.lock().unwrap(), ["defer", "complete"]);
+    let completed = replies.completed.lock().unwrap();
+    assert_eq!(completed.len(), 1);
+    assert!(response_text(&completed[0]).contains("You need Manage Channels"));
 }
 
 #[tokio::test]
@@ -3823,6 +5632,7 @@ async fn responder_failed_or_ambiguous_ack_never_executes_or_retries() {
 async fn responder_completion_failure_does_not_repeat_channel_creation() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
     let mut replies = Replies::new(trace.clone());
     replies.complete_error = Some(RoomHttpError::UnknownOutcome);
     VoiceResponder::respond_with(&runtime, &replies, &create_interaction(), None, None).await;
@@ -4445,6 +6255,10 @@ fn everyone_overwrite(deny: Permissions) -> serde_json::Value {
     json!({ "id": GUILD.to_string(), "type": 0, "allow": "0", "deny": deny.bits().to_string() })
 }
 
+fn bot_overwrite(allow: Permissions, deny: Permissions) -> serde_json::Value {
+    json!({ "id": "999", "type": 1, "allow": allow.bits().to_string(), "deny": deny.bits().to_string() })
+}
+
 #[test]
 fn health_check_is_clean_when_every_level_grants_the_four_permissions() {
     let live = health_guild(permissions(), vec![], vec![]);
@@ -4522,6 +6336,555 @@ fn health_check_reports_nothing_for_incomplete_data_or_unknown_channels() {
         health_line(&live.permission_findings(&[CREATOR])[0]),
         "health: the bot lacks Manage Roles for the whole server"
     );
+}
+
+/// Worker over a health-check guild: the creator channel and its category
+/// carry the given overwrites, the bot holds `base`.
+async fn health_worker(
+    base: Permissions,
+    category: Vec<serde_json::Value>,
+    creator: Vec<serde_json::Value>,
+) -> (GuildRoomWorker<Store, Http>, Trace) {
+    let trace = Trace::default();
+    let live = health_guild(base, category, creator);
+    let worker = GuildRoomWorker::load(live, Store::new(trace.clone()), Http::new(trace.clone()))
+        .await
+        .unwrap();
+    (worker, trace)
+}
+
+#[tokio::test]
+async fn missing_permission_create_names_manage_channels_and_the_category_override() {
+    // A bot-member deny survives copying the category and the bot's grant;
+    // diagnose those final rows, not the healthy unsynced creator.
+    let (mut worker, trace) = health_worker(
+        permissions(),
+        vec![bot_overwrite(
+            Permissions::empty(),
+            Permissions::MANAGE_CHANNELS,
+        )],
+        vec![],
+    )
+    .await;
+    worker.creators.get_mut(&CREATOR).unwrap().permission_source = PermissionSource::Category;
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(trace.lock().unwrap().is_empty());
+    let failure = worker.failures().back().expect("a recorded failure");
+    assert_eq!(
+        failure_line(failure),
+        "create <#200>: Discord refused creating the room; the permission override on category <#400> removes Manage Channels from the bot"
+    );
+    let notice = notice_text(failure, DetailLevel::Full);
+    assert!(notice.contains("removes Manage Channels from the bot"));
+    assert!(notice.contains("Run /setup"));
+}
+
+#[tokio::test]
+async fn missing_permission_default_brief_notice_names_permission_and_override() {
+    let (mut worker, _) = health_worker(
+        permissions(),
+        vec![bot_overwrite(
+            Permissions::empty(),
+            Permissions::MANAGE_CHANNELS,
+        )],
+        vec![],
+    )
+    .await;
+    worker.creators.get_mut(&CREATOR).unwrap().permission_source = PermissionSource::Category;
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        worker.store.logging.lock().unwrap().level,
+        DetailLevel::Brief
+    );
+    assert!(worker.send_notices(0).await);
+    let notices = sent(&worker);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].0, NoticeTarget::DirectMessage(OWNER));
+    assert!(notices[0]
+        .1
+        .contains("category <#400> removes Manage Channels"));
+    assert!(notices[0].1.contains("/setup"));
+    assert!(notices[0].1.chars().count() <= NOTICE_MAX_CHARS);
+}
+
+#[tokio::test]
+async fn missing_permission_create_names_move_members_and_the_creator_override() {
+    // The cached creator permissions already lack Move Members, so no Discord
+    // write is attempted and the refusal names the override.
+    let (mut worker, trace) = health_worker(
+        permissions(),
+        vec![],
+        vec![everyone_overwrite(Permissions::MOVE_MEMBERS)],
+    )
+    .await;
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(trace.lock().unwrap().is_empty());
+    let failure = worker.failures().back().expect("a recorded failure");
+    assert_eq!(
+        failure_line(failure),
+        "create <#200>: Discord refused creating the room; the permission override on <#200> removes Move Members from the bot"
+    );
+    assert!(notice_text(failure, DetailLevel::Full).contains("removes Move Members from the bot"));
+}
+
+#[tokio::test]
+async fn missing_permission_create_names_a_guild_wide_gap_and_lists_every_missing_permission() {
+    let (mut worker, _) = health_worker(
+        permissions() - Permissions::MANAGE_CHANNELS - Permissions::MOVE_MEMBERS,
+        vec![],
+        vec![],
+    )
+    .await;
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        failure_line(worker.failures().back().unwrap()),
+        "create <#200>: Discord refused creating the room; the bot lacks Manage Channels for the whole server; the bot lacks Move Members for the whole server"
+    );
+}
+
+#[tokio::test]
+async fn missing_permission_setup_status_carries_the_named_line() {
+    let trace = Trace::default();
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            move || (Store::new(trace.clone()), Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    );
+    let mut snap = snapshot(&[], vec![]);
+    snap.bot.roles = vec![role(permissions() - Permissions::MANAGE_CHANNELS)];
+    assert!(runtime.publish_snapshot(GUILD, snap));
+    assert!(runtime.voice_frame(GUILD, MEMBER, Some(CREATOR), Some(false), "ava".to_owned()));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = runtime.worker_status(GUILD).await.expect("live actor");
+        if let Some(line) = status.failures.first() {
+            assert_eq!(
+                line,
+                "create <#200>: Discord refused creating the room; the bot lacks Manage Channels for the whole server"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no failure line before the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!trace.lock().unwrap().iter().any(|entry| entry == "create"));
+}
+
+#[tokio::test]
+async fn missing_permission_unexplained_create_403_still_names_manage_channels() {
+    // A clean cache (stale roles, a missing Connect) leaves no finding, but
+    // the notice must still say what a refused create needs.
+    let (live, store, http, trace) = fixture();
+    http.create_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(*trace.lock().unwrap(), ["create"]);
+    assert_eq!(
+        failure_line(worker.failures().back().unwrap()),
+        "create <#200>: Discord refused creating the room; the bot needs Manage Channels, Move Members, View Channel and Connect on <#200>, so check for a deny override"
+    );
+}
+
+#[tokio::test]
+async fn missing_permission_move_names_move_members() {
+    let (live, store, http, trace) = fixture();
+    http.move_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "move:300:500"]
+    );
+    assert_eq!(
+        failure_line(worker.failures().back().unwrap()),
+        "move <#500>: Discord refused moving the member into the room; the bot needs Manage Channels, Move Members, View Channel and Connect on <#500>, so check for a deny override"
+    );
+}
+
+#[tokio::test]
+async fn missing_permission_move_names_the_room_override_when_the_cache_knows_it() {
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.live.upsert_channel(channel_with_overwrites(
+        500,
+        2,
+        Some(CATEGORY),
+        json!([everyone_overwrite(Permissions::MOVE_MEMBERS)]),
+    ));
+    worker.record_refusal(RefusedWrite::Move, 500, RoomHttpError::AccessDenied);
+    assert_eq!(
+        failure_line(worker.failures().back().unwrap()),
+        "move <#500>: Discord refused moving the member into the room; the permission override on <#500> removes Move Members from the bot"
+    );
+}
+
+#[tokio::test]
+async fn missing_permission_connect_is_not_hidden_by_an_unrelated_manage_roles_gap() {
+    for (base, category, creator, cause) in [
+        (
+            permissions() - Permissions::CONNECT - Permissions::MANAGE_ROLES,
+            vec![],
+            vec![],
+            "the bot lacks Connect for the whole server",
+        ),
+        (
+            permissions() - Permissions::MANAGE_ROLES,
+            vec![],
+            vec![everyone_overwrite(Permissions::CONNECT)],
+            "the permission override on <#200> removes Connect from the bot",
+        ),
+        (
+            permissions() - Permissions::MANAGE_ROLES,
+            vec![everyone_overwrite(Permissions::CONNECT)],
+            vec![],
+            "the permission override on category <#400> removes Connect from the bot",
+        ),
+    ] {
+        let (mut worker, trace) = health_worker(base, category, creator).await;
+        join(&mut worker, MEMBER);
+        dispatch(&mut worker, 0).await;
+        assert!(trace.lock().unwrap().is_empty());
+        let line = failure_line(worker.failures().back().expect("Connect refusal"));
+        assert_eq!(
+            line,
+            format!("create <#200>: Discord refused creating the room; {cause}")
+        );
+        assert!(!line.contains("Manage Roles"));
+        assert!(worker.send_notices(0).await);
+        assert!(sent(&worker)[0].1.contains(cause));
+    }
+}
+
+#[tokio::test]
+async fn missing_permission_chosen_source_refusal_names_source_in_setup_and_notice() {
+    const SOURCE: u64 = 850;
+    for allow in [Permissions::empty(), Permissions::CONNECT] {
+        let (live, store, http, trace) = fixture();
+        live.upsert_channel(channel_with_overwrites(
+            SOURCE,
+            2,
+            None,
+            json!([bot_overwrite(allow, Permissions::CONNECT)]),
+        ));
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        let settings = worker.creators.get_mut(&CREATOR).unwrap();
+        settings.permission_source = PermissionSource::Channel(SOURCE);
+        settings.permission_channel_id = Some(SOURCE);
+        join(&mut worker, MEMBER);
+        dispatch(&mut worker, 0).await;
+        assert!(
+            trace.lock().unwrap().is_empty(),
+            "refused plans send no create"
+        );
+        let failure = worker.failures().back().unwrap();
+        assert_eq!(
+            *failure,
+            LifecycleFailure::MissingPermission {
+                write: RefusedWrite::Create,
+                channel_id: CREATOR,
+                findings: vec![PermissionFinding {
+                    permission: VoicePermission::Connect,
+                    scope: VoicePermissionScope::Channel,
+                    category_id: None,
+                    channel_id: Some(SOURCE),
+                }],
+            }
+        );
+        let setup_line = failure_line(failure);
+        assert_eq!(setup_line, "create <#200>: Discord refused creating the room; the permission override on <#850> removes Connect from the bot");
+        assert!(!setup_line.contains("category <#400>"));
+        assert!(worker.send_notices(0).await);
+        assert!(sent(&worker)[0].1.contains("<#850> removes Connect"));
+        assert!(worker.http.created_names.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn missing_permission_unknown_source_is_not_a_fabricated_permission_gap() {
+    let (live, store, http, trace) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.creators.get_mut(&CREATOR).unwrap().permission_source = PermissionSource::Channel(850);
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        worker.failures().back(),
+        Some(&LifecycleFailure::Discord {
+            channel_id: 850,
+            error: RoomHttpError::NotFound,
+        })
+    );
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn missing_permission_other_refusals_keep_the_plain_discord_line() {
+    let (live, store, http, _) = fixture();
+    http.create_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::UnknownOutcome);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(matches!(
+        worker.failures().back(),
+        Some(LifecycleFailure::Discord {
+            channel_id: CREATOR,
+            error: RoomHttpError::UnknownOutcome
+        })
+    ));
+}
+
+/// Join as `display`, returning whether the create was queued.
+fn join_as(worker: &mut GuildRoomWorker<Store, Http>, member: u64, display: &str) -> bool {
+    let ticket = worker
+        .live
+        .voice_update(member, Some(CREATOR), Some(false))
+        .unwrap();
+    worker.accept_join(ticket, display, 7, NOW.to_owned())
+}
+
+async fn filtering_worker(words: &[&str]) -> (GuildRoomWorker<Store, Http>, Trace) {
+    let (live, store, http, trace) = fixture();
+    let worker = GuildRoomWorker::load(live, store, http)
+        .await
+        .unwrap()
+        .with_name_policy(Arc::new(fixture_policy(words)));
+    (worker, trace)
+}
+
+fn policy_with_invalid_chat_setting(words: &str, key: &str, value: &str) -> AutomodPolicy {
+    let vars: HashMap<String, String> = [
+        ("TWO_AUTOMOD", "0"),
+        ("TWO_AUTOMOD_BAD_WORDS", words),
+        ("TWO_AUTOMOD_ALLOWED_DOMAINS", "Trusted.GG"),
+        (key, value),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+    .collect();
+    assert!(two_bot_core::AutomodConfig::from_map(&vars).is_err());
+    AutomodPolicy::name_policy_from_map(&vars)
+}
+
+#[tokio::test]
+async fn name_filter_preserves_words_with_invalid_chat_config_on_both_create_paths() {
+    for (key, value) in [
+        ("TWO_AUTOMOD_REPEAT_COUNT", "21"),
+        ("TWO_AUTOMOD_SANCTIONS", "1:banhammer"),
+    ] {
+        let policy = policy_with_invalid_chat_setting(" ＢＬＯＲＰ ", key, value);
+        let (live, store, http, _) = fixture();
+        let mut worker = GuildRoomWorker::load(live, store, http)
+            .await
+            .unwrap()
+            .with_name_policy(Arc::new(policy.clone()));
+        assert!(join_as(&mut worker, MEMBER, "Blorp"));
+        dispatch(&mut worker, 0).await;
+        assert_eq!(*worker.http.created_names.lock().unwrap(), ["'s room"]);
+
+        let trace = Trace::default();
+        let runtime = test_runtime(trace.clone()).with_name_policy(policy);
+        let interaction = voice_interaction(
+            Some(command_data(
+                "create",
+                vec![command_option("name", "blorp lobby")],
+            )),
+            Some(Permissions::MANAGE_CHANNELS),
+            true,
+        );
+        let (owned, response) = handle_capture(&runtime, &interaction).await;
+        assert!(owned);
+        assert!(response_text(response.as_ref().unwrap()).contains("not allowed"));
+        assert!(
+            trace.lock().unwrap().is_empty(),
+            "a blocked /create sends no REST call"
+        );
+    }
+}
+
+#[tokio::test]
+async fn name_filter_invalid_chat_config_does_not_unblock_the_bare_template() {
+    let (live, store, http, trace) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http)
+        .await
+        .unwrap()
+        .with_name_policy(Arc::new(policy_with_invalid_chat_setting(
+            "room",
+            "TWO_AUTOMOD_REPEAT_COUNT",
+            "21",
+        )));
+    assert!(!join_as(&mut worker, MEMBER, "Ava"));
+    assert!(!worker.dispatch_one(0).await);
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(failure_line(worker.failures().back().unwrap()).contains("name_blocked"));
+}
+
+#[tokio::test]
+async fn name_filter_passes_clean_display_names_unchanged() {
+    let (mut worker, trace) = filtering_worker(&["blorp"]).await;
+    assert!(join_as(&mut worker, MEMBER, "Ava"));
+    dispatch(&mut worker, 0).await;
+    assert_eq!(*worker.http.created_names.lock().unwrap(), ["Ava's room"]);
+    assert_eq!(trace.lock().unwrap()[0], "create");
+}
+
+#[tokio::test]
+async fn name_filter_retries_a_blocked_display_name_without_the_username() {
+    let (mut worker, trace) = filtering_worker(&["blorp"]).await;
+    assert!(join_as(&mut worker, MEMBER, "Blorp"));
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert_eq!(*worker.http.created_names.lock().unwrap(), ["'s room"]);
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "move:300:500"]
+    );
+    assert!(worker.failures().is_empty());
+}
+
+#[tokio::test]
+async fn name_filter_blocks_invite_links_in_the_display_name() {
+    let (mut worker, _) = filtering_worker(&[]).await;
+    assert!(join_as(&mut worker, MEMBER, "join discord.gg/abc123"));
+    dispatch(&mut worker, 0).await;
+    assert_eq!(*worker.http.created_names.lock().unwrap(), ["'s room"]);
+}
+
+#[tokio::test]
+async fn name_filter_refuses_a_blocked_bare_template_and_never_creates() {
+    // The fixture term is part of the template's own text: even the bare
+    // template is blocked.
+    let (mut worker, trace) = filtering_worker(&["room"]).await;
+    assert!(!join_as(&mut worker, MEMBER, "Ava"));
+    assert!(!worker.dispatch_one(0).await);
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.http.created_names.lock().unwrap().is_empty());
+    assert!(worker.tracked().is_empty());
+    let failure = worker.failures().back().expect("a recorded failure");
+    assert_eq!(
+        *failure,
+        LifecycleFailure::NameBlocked {
+            creator_id: CREATOR,
+            error: NameError::Blocked {
+                filter: two_bot_core::AutomodFilter::BadWords
+            }
+        }
+    );
+    assert_eq!(
+        failure_line(failure),
+        "create <#200>: name_blocked, no room created (the room name template is blocked by the automod name filter: bad words); fix the template or the automod policy"
+    );
+    // The reason carries the stable audit string and never the member's name.
+    assert!(!failure_line(failure).contains("Ava"));
+    assert_eq!(NAME_BLOCKED_AUDIT_REASON, "name_blocked");
+}
+
+#[tokio::test]
+async fn name_filter_default_brief_notice_names_refusal_and_preserves_logging_limits() {
+    let (mut worker, _) = filtering_worker(&["room"]).await;
+    assert!(!join_as(&mut worker, MEMBER, "Ava"));
+    worker.store.logging.lock().unwrap().level = DetailLevel::Off;
+    assert!(!worker.send_notices(0).await);
+    assert!(sent(&worker).is_empty());
+
+    *worker.store.logging.lock().unwrap() = LoggingSettings::default();
+    for step in 1..=3 {
+        assert!(worker.send_notices(step * NOTICE_REPEAT_INTERVAL_MS).await);
+        let notices = sent(&worker);
+        assert_eq!(notices.len(), step as usize);
+        let text = &notices.last().unwrap().1;
+        assert!(text.contains("name_blocked"));
+        assert!(text.contains("bad words"));
+        assert!(!text.contains("Ava"));
+        assert!(text.chars().count() <= NOTICE_MAX_CHARS);
+    }
+    assert!(!worker.send_notices(4 * NOTICE_REPEAT_INTERVAL_MS).await);
+    assert!(worker.http.created_names.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn name_filter_does_not_retry_a_refused_join() {
+    let (mut worker, trace) = filtering_worker(&["room"]).await;
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .unwrap();
+    assert!(!worker.accept_join(ticket, "Ava", 7, NOW.to_owned()));
+    assert!(!worker.accept_join(ticket, "Ava", 8, NOW.to_owned()));
+    assert_eq!(worker.failures().len(), 1);
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn name_filter_applies_the_runtime_policy_in_the_actor() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone()).with_name_policy(fixture_policy(&["room"]));
+    assert!(runtime.publish_snapshot(GUILD, snapshot(&[], vec![])));
+    assert!(runtime.voice_frame(GUILD, MEMBER, Some(CREATOR), Some(false), "Ava".to_owned()));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = runtime.worker_status(GUILD).await.expect("live actor");
+        if let Some(line) = status.failures.first() {
+            assert!(line.contains("name_blocked"), "{line}");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no refusal before the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!trace.lock().unwrap().iter().any(|entry| entry == "create"));
+}
+
+#[tokio::test]
+async fn name_filter_refuses_a_blocked_create_command_name_before_any_rest_call() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone()).with_name_policy(fixture_policy(&["blorp"]));
+    let interaction = voice_interaction(
+        Some(command_data(
+            "create",
+            vec![command_option("name", "blorp lobby")],
+        )),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(text.contains("not allowed"), "{text}");
+    assert!(trace.lock().unwrap().is_empty());
+
+    let allowed = voice_interaction(
+        Some(command_data(
+            "create",
+            vec![command_option("name", "lobby")],
+        )),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
+    let (_, response) = handle_capture(&runtime, &allowed).await;
+    assert!(response_text(response.as_ref().expect("reply")).contains("Created <#500>"));
 }
 
 #[test]
@@ -4683,7 +7046,13 @@ fn with_user(mut interaction: Interaction, id: u64) -> Interaction {
     interaction
 }
 
+/// Manage Server plus Manage Channels: may import files that add creators.
 fn manager() -> Option<Permissions> {
+    Some(Permissions::MANAGE_GUILD | Permissions::MANAGE_CHANNELS)
+}
+
+/// Manage Server alone: the `/export` and `/import` gate, but not `/create`'s.
+fn server_only() -> Option<Permissions> {
     Some(Permissions::MANAGE_GUILD)
 }
 
@@ -4737,6 +7106,9 @@ async fn handle_import_capture(
     interaction: &Interaction,
     inventory: Option<&GuildInventory>,
 ) -> (bool, Option<InteractionResponse>) {
+    if runtime.live_actor(GUILD).is_none() {
+        assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    }
     let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
     let writer = seen.clone();
     let owned = handle_voice_interaction_with(runtime, interaction, None, inventory, |response| {
@@ -5006,6 +7378,33 @@ async fn import_confirm_applies() {
 }
 
 #[tokio::test]
+async fn import_preview_shows_template_text_without_mentions() {
+    let trace = Trace::default();
+    let mut incoming = full_config();
+    incoming.templates[0].name_template = "@everyone lobby".to_owned();
+    let bytes = serde_json::to_vec(&incoming).unwrap();
+    let (runtime, _) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (owned, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    assert!(owned);
+    let preview = preview.expect("preview");
+    let text = response_text(&preview);
+    assert!(
+        text.contains("@everyone lobby"),
+        "preview must show the new template text: {text:?}"
+    );
+    let mentions = preview
+        .data
+        .as_ref()
+        .and_then(|data| data.allowed_mentions.as_ref())
+        .expect("preview disables mentions");
+    assert!(mentions.parse.is_empty());
+    assert!(mentions.users.is_empty());
+    assert!(mentions.roles.is_empty());
+}
+
+#[tokio::test]
 async fn import_skips_unknown_channels_and_confirms_remainder() {
     let trace = Trace::default();
     let mut incoming = full_config();
@@ -5168,6 +7567,26 @@ async fn import_stale_confirm_repreviews_instead_of_applying() {
 }
 
 #[tokio::test]
+async fn config_apply_rejects_stale_expected() {
+    // The test double mirrors `PgVoiceConfigStore::apply`: the write lands
+    // only when the stored configuration still equals the snapshot the
+    // preview was rendered from.
+    let trace = Trace::default();
+    let store = Store::new(trace.clone());
+    *store.config.lock().unwrap() = empty_config();
+    store
+        .config_apply(GUILD, &full_config(), &empty_config())
+        .await
+        .expect("matching expected applies");
+    assert!(applied(&trace));
+    let conflict = store
+        .config_apply(GUILD, &empty_config(), &empty_config())
+        .await;
+    assert_eq!(conflict, Err(StoreError::Conflict));
+    assert_eq!(*store.config.lock().unwrap(), full_config());
+}
+
+#[tokio::test]
 async fn import_confirm_rejects_foreign_member() {
     let trace = Trace::default();
     let bytes = serde_json::to_vec(&full_config()).unwrap();
@@ -5200,6 +7619,132 @@ async fn import_confirm_requires_manage_server() {
     let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
     assert!(owned);
     assert!(response_text(&response.expect("refusal")).contains("Manage Server"));
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+fn positional_array_form(config: &VoiceConfiguration) -> Vec<u8> {
+    let value = serde_json::to_value(config).unwrap();
+    serde_json::to_vec(&json!([
+        value["version"],
+        value["guild_id"],
+        value["creators"],
+        value["templates"],
+        value["aliases"],
+        value["lists"],
+        value["logging"],
+        value["settings"],
+    ]))
+    .unwrap()
+}
+
+#[test]
+fn plan_import_preview_uses_the_strict_decoder() {
+    let positional = positional_array_form(&full_config());
+    // Precondition: plain serde accepts this form, which is the gap.
+    assert_eq!(
+        serde_json::from_slice::<VoiceConfiguration>(&positional).unwrap(),
+        full_config()
+    );
+    let decision = plan_import_preview(&empty_config(), &positional, &config_inventory());
+    let ImportDecision::Refuse { message } = decision else {
+        panic!("positional array must be refused, got {decision:?}");
+    };
+    assert!(
+        message.contains("malformed configuration JSON"),
+        "{message}"
+    );
+    assert!(message.contains("Nothing was changed"), "{message}");
+}
+
+#[test]
+fn plan_import_preview_refuses_unlintable_templates_and_unknown_commands() {
+    let refused = |config: &VoiceConfiguration| match plan_import_preview(
+        &empty_config(),
+        &serde_json::to_vec(config).unwrap(),
+        &config_inventory(),
+    ) {
+        ImportDecision::Refuse { message } => message,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    let mut config = full_config();
+    config.creators[0].name_template = "@@secret_marker@@".to_owned();
+    let message = refused(&config);
+    assert!(message.contains("creators[0].name_template"), "{message}");
+    assert!(!message.contains("secret_marker"), "{message}");
+    assert!(message.contains("Nothing was changed"), "{message}");
+
+    let mut config = full_config();
+    config.templates[0].status_template = Some("[[never closed".to_owned());
+    assert!(refused(&config).contains("templates[0].status_template"));
+
+    let mut config = full_config();
+    config.settings.command_roles = vec![config_codec::CommandRoles {
+        command: "ban".to_owned(),
+        role_ids: Vec::new(),
+    }];
+    assert!(refused(&config).contains("settings.command_roles[0].command"));
+
+    let mut config = full_config();
+    config.aliases[0].alias = "x".repeat(101);
+    assert!(refused(&config).contains("aliases[0]"));
+}
+
+#[tokio::test]
+async fn import_without_manage_channels_cannot_add_creators() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, server_only(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    assert!(owned);
+    let response = response.expect("refusal");
+    assert!(response_text(&response).contains("Manage Channels"));
+    assert!(response_text(&response).contains("Nothing was changed"));
+    // No Confirm button, nothing stored, nothing remembered to confirm.
+    assert!(response
+        .data
+        .as_ref()
+        .and_then(|data| data.components.as_ref())
+        .is_none());
+    assert_eq!(*shared.lock().unwrap(), empty_config());
+    assert!(!applied(&trace));
+}
+
+#[tokio::test]
+async fn import_without_manage_channels_may_edit_existing_creators() {
+    let trace = Trace::default();
+    let mut incoming = full_config();
+    incoming.creators[0].default_limit = 5;
+    let bytes = serde_json::to_vec(&incoming).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), full_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, server_only(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+    let confirm = component_interaction(&confirm_id, server_only(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    assert_eq!(shared.lock().unwrap().creators[0].default_limit, 5);
+    assert!(applied(&trace));
+}
+
+#[tokio::test]
+async fn import_confirm_rechecks_manage_channels_for_added_creators() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+
+    // Manage Channels is gone at confirm time: the creator rows are refused.
+    let confirm = component_interaction(&confirm_id, server_only(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("refusal")).contains("Manage Channels"));
     assert_eq!(*shared.lock().unwrap(), empty_config());
     assert!(!applied(&trace));
 }
@@ -5588,47 +8133,61 @@ fn voice_member_in(member_id: u64, channel_id: u64) -> VoiceMember {
     }
 }
 
-#[tokio::test]
-async fn sink_claimed_kick_answers_public_ballot_without_defer() {
-    const VOTER: u64 = 301;
-    const TARGET: u64 = 303;
-    const KICK_ROOM: u64 = 500;
-    let trace = Trace::default();
+const KICK_VOTER: u64 = 301;
+const KICK_TARGET: u64 = 303;
+const KICK_ROOM: u64 = 500;
+const OTHER_ROOM: u64 = 501;
+
+/// A runtime tracking `KICK_ROOM` and `OTHER_ROOM` with the given occupants.
+fn kick_room_runtime(
+    trace: &Trace,
+    enabled: bool,
+    members: Vec<VoiceMember>,
+) -> VoiceRuntime<Store, Http> {
     let runtime = VoiceRuntime::new(
         {
             let trace = trace.clone();
             move || {
                 let store = Store::new(trace.clone());
-                store
-                    .rooms
-                    .lock()
-                    .unwrap()
-                    .insert(KICK_ROOM, room(KICK_ROOM));
+                for channel in [KICK_ROOM, OTHER_ROOM] {
+                    store.rooms.lock().unwrap().insert(channel, room(channel));
+                }
                 (store, Http::new(trace.clone()))
             }
         },
         Duration::from_millis(10),
-        true,
+        enabled,
     );
-    assert!(runtime.publish_snapshot(
-        GUILD,
-        snapshot(
-            &[KICK_ROOM],
-            vec![
-                voice_member_in(VOTER, KICK_ROOM),
-                voice_member_in(TARGET, KICK_ROOM),
-            ],
-        )
-    ));
+    // A disabled runtime spawns no actor, so nothing is published.
+    assert_eq!(
+        runtime.publish_snapshot(GUILD, snapshot(&[KICK_ROOM, OTHER_ROOM], members)),
+        enabled
+    );
+    runtime
+}
+
+#[tokio::test]
+async fn kick_vote_in_a_shared_room_answers_the_public_ballot_without_defer() {
+    let trace = Trace::default();
+    let runtime = kick_room_runtime(
+        &trace,
+        true,
+        vec![
+            voice_member_in(KICK_VOTER, KICK_ROOM),
+            voice_member_in(KICK_TARGET, KICK_ROOM),
+        ],
+    );
     let replies = Replies::new(trace.clone());
-    VoiceResponder::respond_with(
+    let answered = VoiceResponder::start_kick_vote(
         &runtime,
         &replies,
-        &kick_sink_interaction(TARGET, VOTER),
-        None,
-        None,
+        &kick_sink_interaction(KICK_TARGET, KICK_VOTER),
     )
     .await;
+    assert!(
+        answered,
+        "voice owns the callback, so the router stays silent"
+    );
     // No defer: the ballot goes out as the initial public callback, so every
     // occupant can see the buttons and reach quorum.
     assert_eq!(*trace.lock().unwrap(), ["respond"]);
@@ -5646,22 +8205,90 @@ async fn sink_claimed_kick_answers_public_ballot_without_defer() {
     assert_eq!(data.components.as_ref().map_or(0, Vec::len), 1);
 }
 
+// Every decline sends no callback at all: the router answers instead, so a
+// callback here would be a second answer to the same interaction.
 #[tokio::test]
-async fn sink_unclaimed_kick_stays_fully_silent_for_the_router() {
+async fn kick_vote_declines_without_a_callback_unless_the_invoker_shares_the_room() {
+    let occupied = vec![
+        voice_member_in(KICK_VOTER, KICK_ROOM),
+        voice_member_in(KICK_TARGET, KICK_ROOM),
+    ];
+    let cases = [
+        // (case, enabled, occupants)
+        ("no tracked room at all", true, Vec::new()),
+        (
+            "target outside any room",
+            true,
+            vec![voice_member_in(KICK_VOTER, KICK_ROOM)],
+        ),
+        (
+            "invoker outside any room",
+            true,
+            vec![voice_member_in(KICK_TARGET, KICK_ROOM)],
+        ),
+        (
+            "invoker in a different tracked room",
+            true,
+            vec![
+                voice_member_in(KICK_VOTER, OTHER_ROOM),
+                voice_member_in(KICK_TARGET, KICK_ROOM),
+            ],
+        ),
+        ("voice disabled", false, occupied),
+    ];
+    for (case, enabled, members) in cases {
+        let trace = Trace::default();
+        let runtime = kick_room_runtime(&trace, enabled, members);
+        let replies = Replies::new(trace.clone());
+        let answered = VoiceResponder::start_kick_vote(
+            &runtime,
+            &replies,
+            &kick_sink_interaction(KICK_TARGET, KICK_VOTER),
+        )
+        .await;
+        assert!(!answered, "{case}: the router must answer");
+        // Reconcile may still prune an empty tracked room, so look only for
+        // interaction callbacks rather than an empty trace.
+        let calls = trace.lock().unwrap().clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("respond") || call.starts_with("defer")),
+            "{case}: no callback, got {calls:?}"
+        );
+        assert!(replies.completed.lock().unwrap().is_empty(), "{case}");
+    }
+}
+
+// The sink never answers `/kick` on its own account, even for a room
+// occupant: the router decides first (moderation gate, then `kick_vote`).
+#[tokio::test]
+async fn sink_never_answers_kick_without_the_router() {
     let trace = Trace::default();
-    let runtime = test_runtime(trace.clone());
+    let runtime = kick_room_runtime(
+        &trace,
+        true,
+        vec![
+            voice_member_in(KICK_VOTER, KICK_ROOM),
+            voice_member_in(KICK_TARGET, KICK_ROOM),
+        ],
+    );
     let replies = Replies::new(trace.clone());
-    // No actor, no rooms: a moderation-shaped target must produce no ack at
-    // all here, otherwise the defer races (and loses to) the router answer.
     VoiceResponder::respond_with(
         &runtime,
         &replies,
-        &kick_sink_interaction(303, 301),
+        &kick_sink_interaction(KICK_TARGET, KICK_VOTER),
         None,
         None,
     )
     .await;
-    assert!(trace.lock().unwrap().is_empty());
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.starts_with("respond") || call.starts_with("defer")),
+        "no callback, got {calls:?}"
+    );
     assert!(replies.completed.lock().unwrap().is_empty());
 }
 
@@ -5782,6 +8409,7 @@ fn dead_letter_families_cover_every_queue_action_shape() {
         (
             RoomAction::UpdateOwnership {
                 channel_id: 500,
+                previous_owner_id: 301,
                 owner_id: MEMBER,
                 original_creator_id: MEMBER,
             },
@@ -5791,6 +8419,7 @@ fn dead_letter_families_cover_every_queue_action_shape() {
             RoomAction::KickMember {
                 channel_id: 500,
                 member_id: MEMBER,
+                vote_id: 7_000,
             },
             "kick",
         ),
@@ -5800,6 +8429,20 @@ fn dead_letter_families_cover_every_queue_action_shape() {
                 name: "den".to_owned(),
             },
             "rename",
+        ),
+        (
+            RoomAction::SetCustomName {
+                channel_id: 500,
+                custom_name: Some("den".to_owned()),
+            },
+            "rename",
+        ),
+        (
+            RoomAction::SetUserLimit {
+                channel_id: 500,
+                user_limit: 4,
+            },
+            "limit",
         ),
     ];
     for (action, family) in &cases {

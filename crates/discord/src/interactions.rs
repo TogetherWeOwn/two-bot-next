@@ -20,7 +20,7 @@ use twilight_model::{
         },
         interaction::{Interaction, InteractionData, InteractionType},
     },
-    channel::message::MessageFlags,
+    channel::message::{embed::Embed, MessageFlags},
     guild::Permissions,
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
@@ -117,6 +117,41 @@ pub fn text_response(reply: InteractionReply) -> InteractionResponse {
             } else {
                 MessageFlags::empty()
             }),
+            ..Default::default()
+        }),
+    }
+}
+
+/// One immediate ephemeral discovery reply, preserving every published name.
+/// Large registries use an embed instead of truncating the content at 2000.
+/// <https://docs.discord.com/developers/resources/message#embed-limits>
+#[must_use]
+pub fn help_response(defs: &[CommandDefinition]) -> InteractionResponse {
+    let text = two_bot_core::help::help_text(defs);
+    if two_bot_core::message_safety::text_len(&text) <= two_bot_core::message_safety::CONTENT_LIMIT
+    {
+        return text_response(InteractionReply::new(text, true));
+    }
+    InteractionResponse {
+        kind: InteractionResponseType::ChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            allowed_mentions: Some(Default::default()),
+            embeds: Some(vec![Embed {
+                author: None,
+                color: None,
+                description: Some(text),
+                fields: Vec::new(),
+                footer: None,
+                image: None,
+                kind: "rich".to_owned(),
+                provider: None,
+                thumbnail: None,
+                timestamp: None,
+                title: None,
+                url: None,
+                video: None,
+            }]),
+            flags: Some(MessageFlags::EPHEMERAL),
             ..Default::default()
         }),
     }
@@ -585,4 +620,82 @@ fn option_to_twilight(opt: &two_bot_core::commands::CommandOption) -> CommandOpt
 #[must_use]
 pub fn publish_commands(defs: &[CommandDefinition]) -> Vec<Command> {
     defs.iter().map(command_to_twilight).collect()
+}
+
+#[cfg(test)]
+mod help_response_tests {
+    use super::*;
+    use two_bot_core::commands::{merge_commands, CustomCommand, GUILD_COMMAND_LIMIT};
+    use two_bot_core::message_safety::{text_len, CONTENT_LIMIT, EMBED_DESCRIPTION_LIMIT};
+
+    #[test]
+    fn small_discovery_reply_keeps_the_ephemeral_text_shape() {
+        let defs = merge_commands(&[], &[]).expect("core registry");
+        let safe = crate::message_safety::interaction_response(&help_response(&defs))
+            .expect("sanitized help reply");
+        let wire = serde_json::to_value(safe).expect("serializes");
+        assert_eq!(wire["type"], 4);
+        assert_eq!(wire["data"]["flags"], 64);
+        assert_eq!(
+            wire["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            wire["data"]["content"],
+            two_bot_core::help::help_text(&defs)
+        );
+        assert!(wire["data"]["embeds"].is_null());
+    }
+
+    #[test]
+    fn maximal_discovery_registry_survives_the_executor_sanitizer() {
+        for additional in [
+            Vec::new(),
+            vec![
+                two_bot_core::feature_commands::feature_commands(),
+                two_bot_core::moderation::moderation_commands(),
+            ],
+        ] {
+            let builtins = merge_commands(&additional, &[]).expect("builtins");
+            let custom: Vec<_> = (0..GUILD_COMMAND_LIMIT - builtins.len())
+                .map(|i| CustomCommand {
+                    name: format!("custom_{i:025}"),
+                    description: "Custom command".to_owned(),
+                    enabled: true,
+                })
+                .collect();
+            assert!(custom.iter().all(|cmd| {
+                cmd.name.len() == 32 && two_bot_core::leveling::valid_command_name(&cmd.name)
+            }));
+            let defs = merge_commands(&additional, &custom).expect("full registry");
+            assert_eq!(defs.len(), GUILD_COMMAND_LIMIT);
+            let text = two_bot_core::help::help_text(&defs);
+            assert!(text_len(&text) > CONTENT_LIMIT);
+            assert!(text_len(&text) <= EMBED_DESCRIPTION_LIMIT);
+            let safe = crate::message_safety::interaction_response(&help_response(&defs))
+                .expect("sanitized help reply");
+            let wire = serde_json::to_value(safe).expect("serializes");
+            assert_eq!(wire["type"], 4);
+            assert_eq!(wire["data"]["flags"], 64);
+            assert_eq!(
+                wire["data"]["allowed_mentions"]["parse"],
+                serde_json::json!([])
+            );
+            assert!(wire["data"]["content"].is_null());
+            assert_eq!(wire["data"]["embeds"].as_array().unwrap().len(), 1);
+            let description = wire["data"]["embeds"][0]["description"]
+                .as_str()
+                .expect("embed description");
+            assert_eq!(description, text, "no truncation at the REST boundary");
+            let tokens: Vec<_> = description
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_'))
+                .filter(|token| token.starts_with('/') && token.len() > 1)
+                .collect();
+            assert_eq!(tokens.len(), defs.len());
+            for def in &defs {
+                let token = format!("/{}", def.name);
+                assert_eq!(tokens.iter().filter(|name| **name == token).count(), 1);
+            }
+        }
+    }
 }

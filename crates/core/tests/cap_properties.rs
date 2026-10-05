@@ -45,10 +45,10 @@ proptest! {
 
     #[test]
     fn property_tempban_timeout_wire_caps_enforce_inclusive_edges(value in any::<i64>()) {
-        // Builders advertise only the floor (parity §1); the ceilings live in
-        // runtime validation, so pin both sides of that split here.
+        // Builders and runtime validators share both duration bounds, so pin
+        // each verb's advertised ceiling as well as its runtime edges.
         let definitions = moderation_commands();
-        for name in ["tempban", "timeout"] {
+        for (name, max) in [("tempban", TEMPBAN_MAX), ("timeout", TIMEOUT_MAX)] {
             let definition = definitions
                 .iter()
                 .find(|d| d.name == name)
@@ -60,7 +60,7 @@ proptest! {
                 .expect("duration option published");
             prop_assert_eq!(
                 (duration.min_value, duration.max_value),
-                (Some(DURATION_MIN), None)
+                (Some(DURATION_MIN), Some(max))
             );
         }
         for (action, max) in [

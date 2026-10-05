@@ -49,6 +49,8 @@ mod join_risk_runtime_tests;
 mod lifecycle_tests;
 #[cfg(test)]
 mod log_volume_guard_tests;
+mod member_cli;
+mod member_runtime;
 mod metrics_http;
 mod moderation_cli;
 #[cfg(test)]
@@ -321,6 +323,15 @@ async fn main() {
         }
         _ => None,
     };
+    // ONE member-moderation consumer: gateway command dispatch and the
+    // supervised unban sweep share this Arc. Disabled, invalidly configured
+    // or non-staging guilds leave the verbs and the job unregistered.
+    let member = match (gateway_prerequisites(&config), store.as_ref()) {
+        (Ok((_, _, guild_id)), Some(db)) => {
+            member_runtime::MemberRuntime::from_env(db.pool().clone(), guild_id)
+        }
+        _ => None,
+    };
     // V1 voice rooms: per-guild lifecycle actors fed by the gateway sink.
     // Inert unless TWO_VOICE=1 with token + database present; any failure
     // degrades to voice-off with a warn, never a boot failure.
@@ -336,6 +347,7 @@ async fn main() {
         let state = Arc::clone(&gateway);
         let slot = Arc::clone(&automod_slot);
         let self_roles = self_roles.clone();
+        let member = member.clone();
         let linger_stop = stopping.clone();
         Some(tokio::spawn(async move {
             // A panic is caught only to name it on /readyz; the task still ends
@@ -386,6 +398,7 @@ async fn main() {
                         guild_id,
                         self_roles,
                         gates,
+                        member,
                         &activation,
                     );
                     if let Some(runtime) = &runtime {
@@ -525,15 +538,15 @@ async fn main() {
                         }
                         None => None,
                     };
-                    // V4 `kick` collision: when the voice sink owns a kick
-                    // target (tracked room), the router yields so the vote
-                    // is answered exactly once. Both runtimes exist only
-                    // inside this task, so the claim wires here.
+                    // V4 `kick` collision: the router answers every `/kick`
+                    // and delegates the room vote to the voice sink when
+                    // moderation refuses an occupant. Both runtimes exist
+                    // only inside this task, so the delegate wires here.
                     if let (Some(runtime), Some(voice)) = (runtime.as_ref(), voice.as_ref()) {
                         let voice = Arc::clone(voice);
-                        runtime.set_voice_kick_claim(Arc::new(move |guild, member| {
+                        runtime.set_voice_kick_vote(Arc::new(move |interaction| {
                             let voice = Arc::clone(&voice);
-                            Box::pin(async move { voice.kick_claim_room(guild, member).await })
+                            Box::pin(async move { voice.kick_vote(interaction).await })
                         }));
                     }
 
@@ -606,6 +619,7 @@ async fn main() {
         self_roles,
         automod_slot,
         receiver,
+        member,
     );
     let result = match gateway_task {
         Some(task) => supervise_gateway(task, http, gateway, shutdown).await,

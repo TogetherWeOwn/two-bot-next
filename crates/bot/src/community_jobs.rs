@@ -11,6 +11,11 @@
 //! runs in Postgres, so restarting cannot reset the budget. Inactivity is
 //! read-only by construction: its outcome carries no channel/message/DM field.
 //!
+//! These jobs are outside the live-identity capability fence on purpose
+//! (TOG-15758): none writes to Discord, so there is no capability to narrow. The
+//! presence probe only reads, the scorecard and the sweep touch Postgres alone,
+//! and `community_jobs_have_no_discord_write_path` fails if that changes.
+//!
 //! The presence probe holds a per-process overlap lease (TOG-12142): a
 //! concurrent trigger skips with `presence_probe_overlap_skipped` instead of
 //! duplicating the daily roster scan, and a holder older than

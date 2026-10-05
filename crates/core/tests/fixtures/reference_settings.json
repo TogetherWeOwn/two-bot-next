@@ -102,7 +102,7 @@
   "TWO_REDIRECT_PORT": "Legacy redirect listener port; environment-only network bind.",
   "TWO_REDIRECT_TRUSTED_PROXIES": "Trusted proxy boundaries for redirect request attribution.",
   "TWO_SELF_ROLE_DRY_RUN": "Observe self-role plans without writing roles.",
-  "TWO_SELF_ROLE_PANELS": "Self-role panel catalog; validated by preflight, not read by gateway boot.",
+  "TWO_SELF_ROLE_PANELS": "Self-role panel catalog; preflight runs the same strict parser as gateway boot, which parks self-roles on invalid catalogues.",
   "TWO_STAGING_DATABASE_URL": "Staging database connection secret; never rendered.",
   "TWO_STAGING_RESTART_CONTAINMENT": "Staging restart containment gate; legacy boot input with no Next reader.",
   "TWO_STAGING_RESTART_SYNTHETIC_ACTORS": "Synthetic-actor allowlist for staging restart containment; legacy input with no Next reader.",

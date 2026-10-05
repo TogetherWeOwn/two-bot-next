@@ -14,9 +14,21 @@
 //! paired somewhere. Read-only by construction: [`fetch_voice_halves`] only
 //! SELECTs; the pairing is pure over caller-supplied rows. There is no repair
 //! path (out of scope on TOG-11152).
+//!
+//! Two read-only summaries ride on the same feeds (TOG-5683 / TOG-5684):
+//! [`blind_window_report`] names every gap in the bot's own events write series
+//! (`events.recorded_at`, never the contained presence-probe table) and counts
+//! the `startKnown:false` ends attributed to each, and
+//! [`duration_summary_report`] averages only the known-start durations while
+//! counting the unknown starts it left out. Both are thin shapes over the core
+//! primitives in `two_bot_core::voice`.
 
 use serde::Serialize;
 use two_bot_core::funnel::{format_iso_millis, parse_iso_millis};
+use two_bot_core::voice::{
+    count_unknown_starts_per_window, find_blind_windows, parse_voice_end_metadata,
+    summarize_voice_durations, VoiceDurationRow,
+};
 
 /// One `voice_session_start` row. The channel is the visit being credited.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,31 +468,112 @@ fn parse_end_meta(metadata: Option<&str>) -> (bool, Option<String>, Option<f64>)
     let duration_seconds = match value.get("durationSeconds") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::Number(n)) => n.as_f64(),
-        // Legacy `Number()` coercion on strings: surrounding whitespace is
-        // ignored, and empty/whitespace-only is 0, not missing.
-        Some(serde_json::Value::String(s)) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                Some(0.0)
-            } else {
-                trimmed.parse::<f64>().ok()
-            }
-        }
+        // Legacy `Number()` coercion on strings, form for form.
+        Some(serde_json::Value::String(s)) => js_number(s),
         // Legacy `Number(boolean)`: true is 1, false is 0.
         Some(serde_json::Value::Bool(b)) => Some(if *b { 1.0 } else { 0.0 }),
+        // Accepted divergence: legacy `Number([])` is 0 and `Number([60])` is
+        // 60. A container is not a duration, and reading `[]` as a measured
+        // zero would fabricate time, so it stays unmeasured.
         _ => None,
     };
     (start_known, started_at, duration_seconds)
 }
 
-/// The three feeds the pairing needs. SELECT only: the sweep never writes.
-/// `since` bounds all three feeds (instant comparison); omit it for the
+/// JavaScript `Number(string)` (the `StringToNumber` grammar); `None` is NaN.
+/// Empty or all-whitespace is 0; `0x`/`0o`/`0b` read as unsigned integers;
+/// `Infinity` is infinite (rejected downstream by `usable_duration`, like
+/// NaN). Rust's own `f64` parse is looser in one way (`inf`, `nan`) and
+/// stricter in another (no radix prefixes), so the grammar is checked first.
+fn js_number(raw: &str) -> Option<f64> {
+    let s = raw.trim_matches(is_js_whitespace);
+    if s.is_empty() {
+        return Some(0.0);
+    }
+    match s {
+        "Infinity" | "+Infinity" => return Some(f64::INFINITY),
+        "-Infinity" => return Some(f64::NEG_INFINITY),
+        _ => {}
+    }
+    let radix = match s.as_bytes() {
+        [b'0', b'x' | b'X', ..] => Some(16),
+        [b'0', b'o' | b'O', ..] => Some(8),
+        [b'0', b'b' | b'B', ..] => Some(2),
+        _ => None,
+    };
+    if let Some(radix) = radix {
+        // `to_digit` takes ASCII digits only, and no sign: `-0x10` is NaN.
+        let digits = &s[2..];
+        if digits.is_empty() {
+            return None;
+        }
+        return digits.chars().try_fold(0.0_f64, |acc, c| {
+            Some(acc * f64::from(radix) + f64::from(c.to_digit(radix)?))
+        });
+    }
+    if is_decimal_literal(s) {
+        s.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// ECMAScript `WhiteSpace` and `LineTerminator`, which is what `Number()`
+/// trims. Rust's `char::is_whitespace` is the same set except that it trims
+/// U+0085 (NaN in JavaScript) and keeps U+FEFF (trimmed by JavaScript).
+fn is_js_whitespace(c: char) -> bool {
+    (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}'
+}
+
+/// `[+-] digits [. digits] [e [+-] digits]` with at least one mantissa digit
+/// (`5.` and `.5` are numbers, `.` and `1e` are not).
+fn is_decimal_literal(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = usize::from(matches!(b.first(), Some(b'+' | b'-')));
+    let digits = |i: &mut usize| {
+        let start = *i;
+        while b.get(*i).is_some_and(u8::is_ascii_digit) {
+            *i += 1;
+        }
+        *i - start
+    };
+    let mut mantissa = digits(&mut i);
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        mantissa += digits(&mut i);
+    }
+    if mantissa == 0 {
+        return false;
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(b.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        if digits(&mut i) == 0 {
+            return false;
+        }
+    }
+    i == b.len()
+}
+
+/// The feeds the pairing and the two summaries need. SELECT only: the sweep
+/// never writes. `since` bounds every feed (instant comparison): the three
+/// halves by `occurred_at`, the write series by `recorded_at`. Omit it for the
 /// full-history sweep. `guild` scopes to one server; omit it for every guild
 /// (legacy full sweep reads all guilds).
 pub struct VoiceHalves {
     pub starts: Vec<HalfStart>,
     pub ends: Vec<HalfEnd>,
     pub leaves: Vec<LeaveRow>,
+    /// Every distinct `events.recorded_at` instant (ISO-8601 UTC), oldest
+    /// first: the bot's own write series, one proof of life per instant.
+    pub heartbeats: Vec<String>,
+    /// One row per member-bearing end, read strictly (only a finite JSON number
+    /// or decimal numeric string is a duration), for the average. Reconcile's
+    /// own parse follows legacy `Number()`: it also reads `""`/`false` as 0,
+    /// `true` as 1 and radix strings such as `"0x3c"` as their value.
+    pub duration_rows: Vec<VoiceDurationRow>,
 }
 
 /// One raw `voice_session_end` row from the events feed.
@@ -497,6 +590,12 @@ pub async fn fetch_voice_halves(
     guild: Option<&str>,
     since: Option<&str>,
 ) -> Result<VoiceHalves, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // All feeds describe one snapshot, even if gateway writes commit between
+    // SELECTs. Set both guarantees before the first read fixes that snapshot.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
     let start_rows: Vec<(String, Option<String>, time::OffsetDateTime, String)> = sqlx::query_as(
         "SELECT guild_id, member_id, occurred_at, source FROM events
           WHERE event_type = 'voice_session_start'
@@ -506,7 +605,7 @@ pub async fn fetch_voice_halves(
     )
     .bind(guild)
     .bind(since)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
     let end_rows: Vec<EndRow> = sqlx::query_as(
         "SELECT guild_id, member_id, occurred_at, source, metadata FROM events
@@ -517,7 +616,7 @@ pub async fn fetch_voice_halves(
     )
     .bind(guild)
     .bind(since)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
     let leave_rows: Vec<(String, Option<String>, time::OffsetDateTime)> = sqlx::query_as(
         "SELECT guild_id, member_id, occurred_at FROM events
@@ -528,13 +627,44 @@ pub async fn fetch_voice_halves(
     )
     .bind(guild)
     .bind(since)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    // `recorded_at` (when WE wrote the row), not `occurred_at` (when Discord
+    // says it happened): a backfilled row has a fresh `recorded_at`, so the
+    // series measures bot liveness, not event time. Every event type counts;
+    // the presence-probe table is deliberately not a source (TOG-469).
+    let write_rows: Vec<time::OffsetDateTime> = sqlx::query_scalar(
+        "SELECT DISTINCT recorded_at FROM events
+          WHERE ($1::text IS NULL OR guild_id = $1)
+            AND ($2::timestamptz IS NULL OR recorded_at >= $2::timestamptz)
+          ORDER BY recorded_at",
+    )
+    .bind(guild)
+    .bind(since)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
 
     let iso =
         |t: &time::OffsetDateTime| format_iso_millis((t.unix_timestamp_nanos() / 1_000_000) as i64);
     // Memberless rows never pair (legacy drops them at the read, uncounted).
     let member = |m: Option<String>| m.filter(|m| !m.is_empty());
+    let mut ends = Vec::with_capacity(end_rows.len());
+    let mut duration_rows = Vec::with_capacity(end_rows.len());
+    for (g, m, at, source, metadata) in end_rows {
+        let Some(member_id) = member(m) else { continue };
+        let (start_known, started_at, duration_seconds) = parse_end_meta(metadata.as_deref());
+        duration_rows.push(strict_duration_row(metadata.as_deref()));
+        ends.push(HalfEnd {
+            guild_id: g,
+            member_id,
+            occurred_at: iso(&at),
+            channel: channel_of(&source),
+            start_known,
+            started_at,
+            duration_seconds,
+        });
+    }
     Ok(VoiceHalves {
         starts: start_rows
             .into_iter()
@@ -547,24 +677,7 @@ pub async fn fetch_voice_halves(
                 })
             })
             .collect(),
-        ends: end_rows
-            .into_iter()
-            .filter_map(|(g, m, at, source, metadata)| {
-                member(m).map(|member_id| {
-                    let (start_known, started_at, duration_seconds) =
-                        parse_end_meta(metadata.as_deref());
-                    HalfEnd {
-                        guild_id: g,
-                        member_id,
-                        occurred_at: iso(&at),
-                        channel: channel_of(&source),
-                        start_known,
-                        started_at,
-                        duration_seconds,
-                    }
-                })
-            })
-            .collect(),
+        ends,
         leaves: leave_rows
             .into_iter()
             .filter_map(|(g, m, at)| {
@@ -575,7 +688,17 @@ pub async fn fetch_voice_halves(
                 })
             })
             .collect(),
+        heartbeats: write_rows.iter().map(iso).collect(),
+        duration_rows,
     })
+}
+
+/// The strict read of one end blob for the average: unreadable metadata is a
+/// known start with no duration (never an unknown start), and only a finite
+/// JSON number or decimal numeric string counts as a duration.
+fn strict_duration_row(metadata: Option<&str>) -> VoiceDurationRow {
+    let value: Option<serde_json::Value> = metadata.and_then(|m| serde_json::from_str(m).ok());
+    parse_voice_end_metadata(value.as_ref())
 }
 
 /// Reviewer fixture: seven sessions covering every path, relative to `now_ms`
@@ -608,7 +731,7 @@ pub fn build_seed_halves(now_ms: i64) -> VoiceHalves {
         started_at: started_at.map(&at),
         duration_seconds,
     };
-    VoiceHalves {
+    let mut halves = VoiceHalves {
         starts: vec![
             // m1: healthy pair, ends below as a complete (not listed).
             start("m1", -5 * HOUR, "ch-a"),
@@ -645,6 +768,125 @@ pub fn build_seed_halves(now_ms: i64) -> VoiceHalves {
             member_id: "m3".to_owned(),
             occurred_at: at(-2 * HOUR + 600_000),
         }],
+        // Hourly writes, then a 3.5h silence (-4h to -30min) that swallows the
+        // m2 end (-3h) and, as the latest window start at or before it, the m6
+        // end (-20min); two more writes close the series.
+        heartbeats: [-6 * HOUR, -5 * HOUR, -4 * HOUR, -30 * MIN, -10 * MIN]
+            .into_iter()
+            .map(&at)
+            .collect(),
+        duration_rows: Vec::new(),
+    };
+    halves.duration_rows = halves
+        .ends
+        .iter()
+        .map(|e| VoiceDurationRow {
+            start_known: e.start_known,
+            duration_seconds: e.duration_seconds,
+        })
+        .collect();
+    halves
+}
+
+/// One named gap in the events write series plus the unknown-start ends
+/// attributed to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlindWindowRow {
+    /// The last write before the gap.
+    pub start: String,
+    /// The first write after the gap.
+    pub end: String,
+    pub gap_ms: i64,
+    /// `voice_session_end` rows with `startKnown:false` attributed here. A
+    /// count, never a mean or a duration.
+    pub unknown_starts: usize,
+}
+
+/// Where the blind-window heartbeats come from.
+pub const HEARTBEAT_SOURCE: &str = "events.recorded_at";
+
+const BLIND_WINDOW_NOTE: &str = "gaps are inferred from the events write series, so a quiet \
+    stretch with no writes reads as a gap (tune --max-gap-minutes). Each unknown-start end is \
+    attributed to the latest window starting at or before it: an upper bound on what a gap \
+    cost, never a measured loss. A window needs a write on both sides, so a gap running into \
+    the sweep edge or into now is not named.";
+
+/// The `blindWindows` object of the voice-reconcile report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlindWindowReport {
+    /// Always [`HEARTBEAT_SOURCE`].
+    pub heartbeat_source: &'static str,
+    /// Distinct write instants the windows were found in.
+    pub heartbeats: usize,
+    /// A gap wider than this (milliseconds) is a blind window.
+    pub max_gap_ms: i64,
+    pub windows: Vec<BlindWindowRow>,
+    /// `startKnown:false` ends no window claims (older than every window):
+    /// counted so the per-window numbers never read as the whole total.
+    pub unattributed_unknown_starts: usize,
+    pub note: &'static str,
+}
+
+/// Name every gap in `heartbeats` wider than `max_gap_ms` and count the
+/// unknown-start `ends` per gap (core `find_blind_windows` +
+/// `count_unknown_starts_per_window`). Pure over caller-supplied rows.
+#[must_use]
+pub fn blind_window_report(
+    heartbeats: &[String],
+    ends: &[HalfEnd],
+    max_gap_ms: i64,
+) -> BlindWindowReport {
+    let stamps: Vec<&str> = heartbeats.iter().map(String::as_str).collect();
+    let windows = find_blind_windows(&stamps, max_gap_ms);
+    let end_stamps: Vec<(String, bool)> = ends
+        .iter()
+        .map(|e| (e.occurred_at.clone(), e.start_known))
+        .collect();
+    let counts = count_unknown_starts_per_window(&windows, &end_stamps);
+    let total_unknown = end_stamps.iter().filter(|(_, known)| !known).count();
+    let attributed: usize = counts.iter().map(|c| c.unknown_starts).sum();
+    BlindWindowReport {
+        heartbeat_source: HEARTBEAT_SOURCE,
+        heartbeats: heartbeats.len(),
+        max_gap_ms,
+        windows: counts
+            .into_iter()
+            .map(|c| BlindWindowRow {
+                start: c.window.start,
+                end: c.window.end,
+                gap_ms: c.window.gap_ms,
+                unknown_starts: c.unknown_starts,
+            })
+            .collect(),
+        unattributed_unknown_starts: total_unknown - attributed,
+        note: BLIND_WINDOW_NOTE,
+    }
+}
+
+/// The `durations` object of the voice-reconcile report.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DurationSummaryReport {
+    /// Mean over known-start sessions with a usable duration; null when none.
+    pub average_seconds: Option<f64>,
+    /// Sessions that entered the mean.
+    pub measured: usize,
+    /// `startKnown:false` ends left out of the mean (the flag decides, never a
+    /// null or a number on the row).
+    pub excluded_unknown_starts: usize,
+}
+
+/// Average known-start durations only, counting the unknown starts excluded
+/// (core `summarize_voice_durations`).
+#[must_use]
+pub fn duration_summary_report(rows: &[VoiceDurationRow]) -> DurationSummaryReport {
+    let summary = summarize_voice_durations(rows);
+    DurationSummaryReport {
+        average_seconds: summary.average_seconds,
+        measured: summary.measured,
+        excluded_unknown_starts: summary.excluded_unknown_starts,
     }
 }
 
@@ -1011,6 +1253,237 @@ mod tests {
         assert_eq!(duration, None);
     }
 
+    /// The duration reconcile reads out of `{"durationSeconds": <value>}`.
+    fn meta_duration(value: serde_json::Value) -> Option<f64> {
+        let blob = serde_json::json!({ "durationSeconds": value }).to_string();
+        parse_end_meta(Some(&blob)).2
+    }
+
+    #[test]
+    fn numeric_string_durations_follow_javascript_number() {
+        // What legacy `Number(raw)` yields, string by string (`None` = NaN).
+        // Radix prefixes and the whitespace set are the forms Rust's own
+        // `f64` parse disagrees on.
+        let cases: &[(&str, Option<f64>)] = &[
+            ("60", Some(60.0)),
+            ("600", Some(600.0)),
+            ("6e1", Some(60.0)),
+            ("6E1", Some(60.0)),
+            ("6e+1", Some(60.0)),
+            ("600e-1", Some(60.0)),
+            ("1.5", Some(1.5)),
+            (".5", Some(0.5)),
+            ("5.", Some(5.0)),
+            ("+5", Some(5.0)),
+            ("-5", Some(-5.0)),
+            ("0x3c", Some(60.0)),
+            ("0X3C", Some(60.0)),
+            ("0o74", Some(60.0)),
+            ("0b111100", Some(60.0)),
+            ("0x0", Some(0.0)),
+            // Whitespace: JavaScript's set (NBSP, BOM, line terminators),
+            // not Rust's (U+0085 is NaN there).
+            ("  60  ", Some(60.0)),
+            ("\n\t60\r\n", Some(60.0)),
+            ("\u{a0}60\u{feff}", Some(60.0)),
+            ("\u{2028}60\u{2029}", Some(60.0)),
+            ("\u{85}60", None),
+            // Empty and all-whitespace are 0, not missing.
+            ("", Some(0.0)),
+            ("  \n", Some(0.0)),
+            // NaN forms.
+            ("abc", None),
+            ("6 0", None),
+            ("6_0", None),
+            ("1,5", None),
+            (".", None),
+            ("+", None),
+            ("1e", None),
+            ("e1", None),
+            ("1e+", None),
+            ("--5", None),
+            ("0x", None),
+            ("0xg", None),
+            ("0x+3c", None),
+            ("-0x3c", None),
+            ("+0x3c", None),
+            ("0b102", None),
+            ("0o8", None),
+            ("0x3c ghost", None),
+            ("nan", None),
+            ("NaN", None),
+            ("inf", None),
+            ("infinity", None),
+            ("INFINITY", None),
+            ("Inf", None),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(js_number(raw), *want, "{raw:?}");
+            assert_eq!(meta_duration(serde_json::json!(raw)), *want, "{raw:?}");
+        }
+        // `Infinity` is a real JavaScript number, rejected like NaN once it
+        // reaches `usable_duration`; so is a decimal that overflows.
+        assert_eq!(js_number("Infinity"), Some(f64::INFINITY));
+        assert_eq!(js_number("+Infinity"), Some(f64::INFINITY));
+        assert_eq!(js_number("-Infinity"), Some(f64::NEG_INFINITY));
+        assert_eq!(js_number(" Infinity "), Some(f64::INFINITY));
+        assert_eq!(js_number("1e999"), Some(f64::INFINITY));
+        for raw in ["Infinity", "-Infinity", "1e999", "nan", "NaN", "inf", "-5"] {
+            assert_eq!(usable_duration(js_number(raw)), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn end_metadata_never_fabricates_a_duration() {
+        let d = |raw: &str| parse_end_meta(Some(raw)).2;
+        // Numbers, numeric strings and the legacy boolean coercions.
+        assert_eq!(d(r#"{"durationSeconds":60}"#), Some(60.0));
+        assert_eq!(d(r#"{"durationSeconds":"600"}"#), Some(600.0));
+        assert_eq!(d(r#"{"durationSeconds":"0x3c"}"#), Some(60.0));
+        assert_eq!(d(r#"{"durationSeconds":true}"#), Some(1.0));
+        assert_eq!(d(r#"{"durationSeconds":false}"#), Some(0.0));
+        // Null, missing and unreadable metadata carry no duration.
+        assert_eq!(d(r#"{"durationSeconds":null}"#), None);
+        assert_eq!(d(r#"{}"#), None);
+        assert_eq!(d("not json"), None);
+        assert_eq!(d(r#"{"durationSeconds":"#), None);
+        assert_eq!(parse_end_meta(None).2, None);
+        // Accepted divergence from legacy `Number()`: a container is never a
+        // duration (`Number([])` is 0, `Number([60])` is 60 in JavaScript).
+        for raw in [
+            r#"{"durationSeconds":[]}"#,
+            r#"{"durationSeconds":[60]}"#,
+            r#"{"durationSeconds":["60"]}"#,
+            r#"{"durationSeconds":{}}"#,
+            r#"{"durationSeconds":{"v":60}}"#,
+        ] {
+            assert_eq!(d(raw), None, "{raw}");
+        }
+        // Negative and non-finite values parse, then `usable_duration`
+        // refuses them: reconcile falls back to the row's own start, never
+        // a measured zero.
+        assert_eq!(d(r#"{"durationSeconds":-5}"#), Some(-5.0));
+        assert_eq!(usable_duration(d(r#"{"durationSeconds":-5}"#)), None);
+        assert_eq!(usable_duration(d(r#"{"durationSeconds":"-5"}"#)), None);
+        assert_eq!(usable_duration(d(r#"{"durationSeconds":"nan"}"#)), None);
+        assert_eq!(
+            usable_duration(d(r#"{"durationSeconds":"Infinity"}"#)),
+            None
+        );
+        assert_eq!(
+            usable_duration(d(r#"{"durationSeconds":"0x3c"}"#)),
+            Some(60)
+        );
+        // The start flag is read separately, from the flag only.
+        assert!(!parse_end_meta(Some(r#"{"startKnown":false,"durationSeconds":"600"}"#)).0);
+        assert!(parse_end_meta(Some(r#"{"startKnown":"false"}"#)).0);
+        assert!(parse_end_meta(Some(r#"{"startKnown":null}"#)).0);
+    }
+
+    /// A reconcile end row built the way `fetch_voice_halves` builds it: the
+    /// raw metadata blob through `parse_end_meta`.
+    fn end_with_metadata(member: &str, at: &str, metadata: &str) -> HalfEnd {
+        let (start_known, started_at, duration_seconds) = parse_end_meta(Some(metadata));
+        HalfEnd {
+            guild_id: G.to_owned(),
+            member_id: member.to_owned(),
+            occurred_at: at.to_owned(),
+            channel: "ch-a".to_owned(),
+            start_known,
+            started_at,
+            duration_seconds,
+        }
+    }
+
+    #[test]
+    fn javascript_number_forms_decide_complete_versus_flagged() {
+        // `"0x3c"` is a measured 60 in legacy: a healthy complete session.
+        let r = reconcile_voice_halves(
+            &[],
+            &[end_with_metadata(
+                "m",
+                "2026-09-20T10:30:00.000Z",
+                r#"{"startKnown":true,"durationSeconds":"0x3c"}"#,
+            )],
+            &[],
+        );
+        assert_eq!(r.complete, 1);
+        assert!(r.resolved.is_empty() && r.unresolvable.is_empty());
+        // `"nan"` and `"-5"` are not durations: with nothing else on file the
+        // end is flagged, never counted complete with an invented time.
+        for raw in ["nan", "NaN", "inf", "Infinity", "-5", "abc", "0x", "-0x3c"] {
+            let blob = serde_json::json!({"startKnown": true, "durationSeconds": raw}).to_string();
+            let r = reconcile_voice_halves(
+                &[],
+                &[end_with_metadata("m", "2026-09-20T10:30:00.000Z", &blob)],
+                &[],
+            );
+            assert_eq!(r.complete, 0, "{raw}");
+            assert!(r.resolved.is_empty(), "{raw}");
+            assert_eq!(r.unresolvable.len(), 1, "{raw}");
+            assert_eq!(r.unresolvable[0].reason, UnresolvableReason::BadEndRow);
+        }
+        // The same unusable string recomputes from the row's own `startedAt`.
+        let blob =
+            r#"{"startKnown":true,"startedAt":"2026-09-20T10:00:00.000Z","durationSeconds":"nan"}"#;
+        let r = reconcile_voice_halves(
+            &[],
+            &[end_with_metadata("m", "2026-09-20T10:30:00.000Z", blob)],
+            &[],
+        );
+        assert_eq!(r.resolved.len(), 1);
+        assert_eq!(r.resolved[0].resolution, ResolutionKind::MetadataRecompute);
+        assert_eq!(r.resolved[0].duration_seconds, 1800);
+    }
+
+    #[test]
+    fn multibyte_zone_in_a_timestamp_never_aborts_the_sweep() {
+        // `+1é1` used to panic inside the timestamp parser and abort the
+        // whole report. Legacy `Date.parse` is NaN: the row is unparseable.
+        const BAD: &str = "2026-09-20T12:00:00+1é1";
+        // As the end's own `startedAt`: no recompute, so a bad end row.
+        let r = reconcile_voice_halves(
+            &[],
+            &[end("m", "2026-09-20T12:30:00.000Z", true, Some(BAD), None)],
+            &[],
+        );
+        assert!(r.resolved.is_empty());
+        assert_eq!(r.unresolvable.len(), 1);
+        assert_eq!(r.unresolvable[0].reason, UnresolvableReason::BadEndRow);
+        assert_eq!(r.unresolvable[0].start_at.as_deref(), Some(BAD));
+        // With an earlier start row on file it falls through to that start.
+        let r = reconcile_voice_halves(
+            &[start("m", "2026-09-20T12:00:00.000Z", "ch-a")],
+            &[end("m", "2026-09-20T12:30:00.000Z", true, Some(BAD), None)],
+            &[],
+        );
+        assert!(r.unresolvable.is_empty());
+        assert_eq!(r.resolved.len(), 1);
+        assert_eq!(r.resolved[0].resolution, ResolutionKind::RestartGap);
+        assert_eq!(r.resolved[0].duration_seconds, 1800);
+        // As a row's own `occurred_at`: skipped and counted, never paired.
+        let r = reconcile_voice_halves(
+            &[start("m", BAD, "ch-a")],
+            &[end("m", BAD, true, None, Some(60.0))],
+            &[leave("m", BAD)],
+        );
+        assert_eq!(r.skipped, 3);
+        assert_eq!(r.complete, 0);
+        assert!(r.resolved.is_empty() && r.unresolvable.is_empty());
+        // The same through the metadata blob `fetch_voice_halves` parses.
+        let blob = serde_json::json!({
+            "startKnown": true, "startedAt": BAD, "durationSeconds": null
+        })
+        .to_string();
+        let r = reconcile_voice_halves(
+            &[],
+            &[end_with_metadata("m", "2026-09-20T12:30:00.000Z", &blob)],
+            &[],
+        );
+        assert_eq!(r.unresolvable.len(), 1);
+        assert_eq!(r.unresolvable[0].reason, UnresolvableReason::BadEndRow);
+    }
+
     #[test]
     fn channel_prefix_is_stripped() {
         assert_eq!(channel_of("channel:ch-a"), "ch-a");
@@ -1023,5 +1496,158 @@ mod tests {
         assert_eq!(format_voice_duration_seconds(600), "10m");
         assert_eq!(format_voice_duration_seconds(3600), "1h00m");
         assert_eq!(format_voice_duration_seconds(3720), "1h02m");
+    }
+
+    fn end_at(at: &str, start_known: bool) -> HalfEnd {
+        end("m", at, start_known, None, None)
+    }
+
+    fn hb(stamps: &[&str]) -> Vec<String> {
+        stamps.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    const TWO_HOURS_MS: i64 = 2 * 60 * 60 * 1000;
+
+    #[test]
+    fn blind_windows_come_from_the_write_series_and_count_unknown_starts_only() {
+        let heartbeats = hb(&[
+            "2026-09-20T08:00:00.000Z",
+            "2026-09-20T09:00:00.000Z",
+            "2026-09-20T10:00:00.000Z",
+            "2026-09-20T15:00:00.000Z",
+            "2026-09-20T16:00:00.000Z",
+            "2026-09-20T17:00:00.000Z",
+            "2026-09-20T20:30:00.000Z",
+        ]);
+        let ends = [
+            end_at("2026-09-20T09:30:00.000Z", false), // before every window
+            end_at("2026-09-20T15:05:00.000Z", false), // window 1
+            end_at("2026-09-20T15:10:00.000Z", true),  // known start: never counted
+            end_at("2026-09-20T15:30:00.000Z", false), // window 1
+            end_at("2026-09-20T20:40:00.000Z", false), // window 2
+        ];
+        let report = blind_window_report(&heartbeats, &ends, TWO_HOURS_MS);
+        assert_eq!(report.heartbeat_source, "events.recorded_at");
+        assert_eq!(report.heartbeats, 7);
+        assert_eq!(report.max_gap_ms, TWO_HOURS_MS);
+        assert_eq!(
+            report.windows,
+            vec![
+                BlindWindowRow {
+                    start: "2026-09-20T10:00:00.000Z".to_owned(),
+                    end: "2026-09-20T15:00:00.000Z".to_owned(),
+                    gap_ms: 5 * 3_600_000,
+                    unknown_starts: 2,
+                },
+                BlindWindowRow {
+                    start: "2026-09-20T17:00:00.000Z".to_owned(),
+                    end: "2026-09-20T20:30:00.000Z".to_owned(),
+                    gap_ms: 3 * 3_600_000 + 1_800_000,
+                    unknown_starts: 1,
+                },
+            ]
+        );
+        assert_eq!(report.unattributed_unknown_starts, 1);
+    }
+
+    #[test]
+    fn a_dense_write_series_names_no_window() {
+        let heartbeats = hb(&["2026-09-20T10:00:00.000Z", "2026-09-20T11:30:00.000Z"]);
+        let ends = [end_at("2026-09-20T11:00:00.000Z", false)];
+        let report = blind_window_report(&heartbeats, &ends, TWO_HOURS_MS);
+        assert!(report.windows.is_empty());
+        // The unknown start stays visible: counted, just not blamed on a gap.
+        assert_eq!(report.unattributed_unknown_starts, 1);
+        // A tighter threshold turns the same series into a window.
+        let tight = blind_window_report(&heartbeats, &ends, 60 * 60 * 1000);
+        assert_eq!(tight.windows.len(), 1);
+        assert_eq!(tight.windows[0].unknown_starts, 1);
+        assert_eq!(tight.unattributed_unknown_starts, 0);
+    }
+
+    #[test]
+    fn fewer_than_two_writes_cannot_name_a_window() {
+        let ends = [end_at("2026-09-20T11:00:00.000Z", false)];
+        assert!(blind_window_report(&[], &ends, TWO_HOURS_MS)
+            .windows
+            .is_empty());
+        let one = hb(&["2026-09-20T10:00:00.000Z"]);
+        let report = blind_window_report(&one, &ends, TWO_HOURS_MS);
+        assert!(report.windows.is_empty());
+        assert_eq!(report.heartbeats, 1);
+    }
+
+    #[test]
+    fn seeded_heartbeats_name_one_window_holding_both_unknown_ends() {
+        let halves = build_seed_halves(1_790_000_000_000);
+        let report = blind_window_report(&halves.heartbeats, &halves.ends, TWO_HOURS_MS);
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows[0].gap_ms, 3 * 3_600_000 + 1_800_000);
+        assert_eq!(report.windows[0].unknown_starts, 2);
+        assert_eq!(report.unattributed_unknown_starts, 0);
+    }
+
+    #[test]
+    fn duration_average_excludes_unknown_starts_and_counts_them() {
+        let rows = [
+            VoiceDurationRow {
+                start_known: true,
+                duration_seconds: Some(600.0),
+            },
+            VoiceDurationRow {
+                start_known: true,
+                duration_seconds: Some(1200.0),
+            },
+            // An unknown start carrying a number is still excluded (flag, not
+            // null, decides) and a known start without one is dropped, not
+            // zero-filled.
+            VoiceDurationRow {
+                start_known: false,
+                duration_seconds: Some(99_999.0),
+            },
+            VoiceDurationRow {
+                start_known: true,
+                duration_seconds: None,
+            },
+        ];
+        let summary = duration_summary_report(&rows);
+        assert_eq!(summary.average_seconds, Some(900.0));
+        assert_eq!(summary.measured, 2);
+        assert_eq!(summary.excluded_unknown_starts, 1);
+        let none = duration_summary_report(&[]);
+        assert_eq!(none.average_seconds, None);
+        assert_eq!((none.measured, none.excluded_unknown_starts), (0, 0));
+    }
+
+    #[test]
+    fn strict_duration_row_reads_numbers_and_decimal_strings_only() {
+        let known = strict_duration_row(Some(
+            r#"{"startKnown":true,"startedAt":"x","durationSeconds":300}"#,
+        ));
+        assert!(known.start_known);
+        assert_eq!(known.duration_seconds, Some(300.0));
+        // A decimal numeric string is a measured duration, as in legacy.
+        let stringy = strict_duration_row(Some(r#"{"startKnown":true,"durationSeconds":"300"}"#));
+        assert_eq!(stringy.duration_seconds, Some(300.0));
+        // The JavaScript `Number()` coercions reconcile's own parse accepts
+        // (`""`/`false` -> 0, `true` -> 1) are never measured here.
+        for raw in [
+            r#"{"startKnown":true,"durationSeconds":""}"#,
+            r#"{"startKnown":true,"durationSeconds":false}"#,
+            r#"{"startKnown":true,"durationSeconds":true}"#,
+        ] {
+            let row = strict_duration_row(Some(raw));
+            assert!(row.start_known, "{raw}");
+            assert_eq!(row.duration_seconds, None, "{raw}");
+        }
+        let unknown = strict_duration_row(Some(
+            r#"{"startKnown":false,"startedAt":null,"durationSeconds":null}"#,
+        ));
+        assert!(!unknown.start_known);
+        // Unreadable or missing metadata never claims an unknown start.
+        for raw in [None, Some("not json"), Some("[]")] {
+            let row = strict_duration_row(raw);
+            assert!(row.start_known && row.duration_seconds.is_none());
+        }
     }
 }

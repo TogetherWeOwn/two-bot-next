@@ -67,11 +67,13 @@ class DrillTests(unittest.TestCase):
         self.assertEqual(drill.check_reason("  rehearsal  "), "rehearsal")
 
     def test_lockdown_masks_mirror_core_planner(self):
-        # Clears SEND_MESSAGES from allow, sets it in deny, preserves the rest.
+        # Clears the lockdown bits from allow, sets them in deny, preserves the rest.
+        locked = str(drill.LOCKDOWN_BITS)
+        self.assertEqual(drill.LOCKDOWN_BITS, 2048 | 64 | (1 << 35) | (1 << 36) | (1 << 38))
         allow, deny = drill.plan_lockdown_masks("4096", "0")
-        self.assertEqual((allow, deny), ("4096", "2048"))
+        self.assertEqual((allow, deny), ("4096", locked))
         allow, deny = drill.plan_lockdown_masks("6144", "2048")
-        self.assertEqual((allow, deny), ("4096", "2048"))
+        self.assertEqual((allow, deny), ("4096", locked))
         with self.assertRaises(drill.DrillError):
             drill.plan_lockdown_masks("not-a-mask", "0")
 

@@ -55,13 +55,40 @@ operator misconfiguration to fix, not a member to punish — with the legacy
 `name_blocked` audit reason. Render-level empty and overlong outcomes can never
 reach refusal: the render falls back and truncates first.
 
+## Runtime wiring
+
+The bot's room worker (`crates/bot/src/voice_rooms.rs`) is the caller. On each
+join, `accept_join` renders the V1 template `{username}'s room` through
+`resolve_create_name` under the configured automod policy
+(`AutomodPolicy::name_policy_from_map`, applied whether or not automod enforcement
+is on). This independently loads the word list and allowed domains with the
+same normalization as chat automod; an invalid unrelated count, sanction or
+exemption cannot discard name restrictions. Chat automod's strict configuration
+validation is unchanged. A blocked display name is retried
+without the username; a blocked bare template queues nothing, so no Discord
+create call is made, and the worker records the refusal as `name_blocked` in
+its failure list. That list feeds the operator error notice and the `/setup`
+failure line; it carries only the stable reason and the blocking filter,
+never the member's name. Default Brief notices include the bounded `name_blocked`
+cause or the missing permission and known override, not just a link to `/setup`.
+Logging Off still sends nothing; existing notice size and repeat bounds apply.
+`/create` names run through `filter_channel_name` under the same policy before
+the REST call.
+
+Join-time permission diagnostics use the actual create/move requirements,
+including Connect, rather than treating generic permission health as the cause.
+Planning refusals capture the final normalized/post-grant overrides and their
+configured inheritance source. Category-sync checks instead name the actual
+parent category, and a private default that requires Manage Roles says so.
+The send-time guard retains permission-loss evidence before refusing the write;
+a stale ticket, lost authoritative snapshot or member who left stays a silent
+cancellation. Move compensation, logging limits and write guards are unchanged.
+
 ## Residual parent work
 
-Room caps and claims, Discord creates/moves/deletes, audit rows and logging,
-V5 template expansion, and persistence stay on the voice parent. The caller
-supplies the guild's automod policy, persists the returned name, and audits
-`name_blocked` on refusal. Unit tests establish domain behaviour only, not
-runtime wiring or staging readiness.
+Room caps and claims, audit rows, V5 template expansion (member-requested
+renames are not filtered yet), and persistence stay on the voice parent. Unit
+and worker fixtures establish behaviour only, not staging readiness.
 
 ## Hermetic verification
 
@@ -69,11 +96,13 @@ runtime wiring or staging readiness.
 cargo fmt --all -- --check
 python3 scripts/cargo_cache.py run -- clippy -p two-bot-core --all-targets -- -D warnings
 python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_name_filter
+python3 scripts/cargo_cache.py run -- test -p two-bot --lib voice_rooms::tests::name_filter_
 ```
 
 The fixture has table tests for every rule (sanitize steps, length bounds,
 all three rejecting filters with their exact sentences, neutralised filters,
 render substitution/fallback/truncation, and the create-path retry/refusal),
 plus a proptest that sanitize is a fixed point whose output carries no
-stripped characters. No test uses a database, Redis, Discord or a staging
-identity.
+stripped characters. The `name_filter_` worker fixtures drive the same rules
+through `accept_join` and `/create` with an invented blocked term. No test
+uses a database, Redis, Discord or a staging identity.

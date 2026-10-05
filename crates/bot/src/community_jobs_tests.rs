@@ -17,6 +17,48 @@ fn executor(mock: &MockRest) -> ActionExecutor {
     ActionExecutor::with_proxy("synthetic-job-test-token".to_owned(), Some(mock.origin())).unwrap()
 }
 
+/// TOG-15758 decision: the community jobs sit outside the live-identity
+/// capability fence because none of them writes to Discord. The presence probe
+/// only reads the guild and roster, the scorecard and the inactivity sweep touch
+/// Postgres alone. This pin fails the moment one of them (or the shared reads
+/// they call) gains a Discord write verb: bind that job to a `LiveCapability`
+/// in `activation::BootActivation` before it ships, as the ticker and the feed
+/// poller are.
+#[test]
+fn community_jobs_have_no_discord_write_path() {
+    const WRITE_VERBS: [&str; 17] = [
+        ".post_",
+        ".delete_",
+        ".put_",
+        ".edit_",
+        ".execute_",
+        ".set_",
+        ".ban(",
+        ".unban(",
+        ".kick",
+        ".timeout_",
+        ".purge",
+        ".finish_interaction",
+        ".sync_guild_commands",
+        ".send_request",
+        ".call_once_raw",
+        ".recover_message",
+        ".member_role_ids",
+    ];
+    for (file, source) in [
+        ("community_jobs.rs", include_str!("community_jobs.rs")),
+        ("website_jobs.rs", include_str!("website_jobs.rs")),
+    ] {
+        for verb in WRITE_VERBS {
+            assert!(
+                !source.contains(verb),
+                "{file} calls `{verb}`: a community job with a Discord write path must be \
+                 bound to a LiveCapability before it ships"
+            );
+        }
+    }
+}
+
 fn member(id: u64, bot: bool) -> Value {
     json!({"user": {"id": id.to_string(), "bot": bot}, "roles": []})
 }

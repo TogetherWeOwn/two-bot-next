@@ -27,6 +27,15 @@ predicates in memory:
 
 Each ticker pass claims at most `TICKER_BATCH_LIMIT` (10) rows.
 
+The supervised ticker exists only while `TWO_AUTOMATIONS=1` **and** the boot
+identity permits the `automations` capability (`scheduled_jobs::register` in
+`crates/bot`). The ticker posts under the token's identity, so it obeys the same
+live-identity fence as `/schedule`: the staging guild/application pair may run
+it, the live pair (cleared for `self_roles` only), an unknown or mismatched
+pair and an unparseable token may not. With either gate off no job is built, so
+no row is claimed, posted or audited; the `/readyz` status map lists
+`scheduled_messages` as parked.
+
 ## Acceptance
 
 1. **List order.** `/schedule-list` rows come back in ascending `next_run_at`

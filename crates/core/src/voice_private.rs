@@ -64,6 +64,20 @@ pub struct PrivateRoom {
     pub next_request_id: u64,
 }
 
+/// The durable part of one room's privacy state, as `voice_rooms` and
+/// `voice_room_blocks` hold it: the private flag, the Join channel once it
+/// exists, and the block list. Grants, pending requests and request ids stay
+/// runtime-only: a restart forgets requests (the runtime keeps a pre-restart
+/// button from matching a new request by binding buttons to a fresh worker
+/// epoch) and which members were approved, but never the blocks or the Join
+/// channel, and Discord keeps the approved members' Connect allow.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrivacyRecord {
+    pub private: bool,
+    pub join_channel_id: Option<Snowflake>,
+    pub blocked: BTreeSet<Snowflake>,
+}
+
 /// Discord work for the runtime, in order. Every effect names its target, so
 /// the runtime never has to infer one from the state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +272,45 @@ impl PrivateRoom {
             }
         }
         Ok(())
+    }
+
+    /// The durable subset of this state. A Join channel still being created
+    /// is not durable: the runtime persists it once it reports the channel.
+    #[must_use]
+    pub fn to_record(&self) -> PrivacyRecord {
+        PrivacyRecord {
+            private: self.private,
+            join_channel_id: match &self.join_channel {
+                Some(JoinChannel::Created { id, .. }) => Some(id.0),
+                _ => None,
+            },
+            blocked: self.blocked.iter().map(|member| member.0).collect(),
+        }
+    }
+
+    /// Rebuild a room's state from its stored record. The stored Join
+    /// channel's name is unknown, so it is recorded empty and a later
+    /// `set_owner` renames it once. A corrupt record is refused, never
+    /// repaired.
+    pub fn from_record(
+        room_id: ChannelId,
+        owner_id: MemberId,
+        owner_display: impl Into<String>,
+        record: &PrivacyRecord,
+    ) -> Result<Self, PrivacyError> {
+        let mut room = Self::new(room_id, owner_id, owner_display);
+        room.private = record.private;
+        room.join_channel = record.join_channel_id.map(|id| JoinChannel::Created {
+            id: ChannelId(id),
+            name: String::new(),
+        });
+        room.blocked = record
+            .blocked
+            .iter()
+            .map(|member| MemberId(*member))
+            .collect();
+        room.validate()?;
+        Ok(room)
     }
 
     /// `/private`: deny Connect to @everyone and plan the Join channel.

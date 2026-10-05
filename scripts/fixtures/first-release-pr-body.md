@@ -1,16 +1,49 @@
 :robot: I have created a release *beep* *boop*
 
-## Summary
+## Thinking Path
 
-Publish the next synchronized Rust workspace release through release-please.
+> - two-bot-next is the Together We Own Discord bot, written in Rust, running as one always-on container.
+> - Its workspace ships as one synchronized release with one root changelog and tag.
+> - Each release must carry the generated changes and the preserved bootstrap notes.
+> - The release description also needs the repository's seven completed PR sections without changing native note parsing.
+> - This pull request updates release metadata; it does not authorize production cutover.
 
-## Changes
+## Linked Issues or Issue Description
 
-Update the release manifest, Cargo versions and lockfile, and preserve generated and bootstrap changelog notes.
+- Publish the next synchronized workspace release, replacing the previous metadata and preserving all release and bootstrap notes. No public issue tracks this automated release; the procedure lives in docs/releases.md.
 
-## Testing
+## What Changed
 
-Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publication.cjs`, `python3 scripts/test-release-retry.py` and `python3 scripts/test-pr-lint.py`. Required checks are dispatched on this PR head; their green results and independent review are mandatory before merge.
+- Update the root release manifest, workspace package versions and local dependency pins, Cargo.lock, and CHANGELOG.md through release-please.
+- Complete the seven PR sections before the first native notes delimiter. Keep the generated release-note region and overflow link unchanged.
+- Credit release-please automation and the repository contributors whose changes appear in the notes below.
+
+## Verification
+
+- Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publication.cjs`, `python3 scripts/test-release-retry.py` and `python3 scripts/test-pr-lint.py`. Required checks are dispatched on this PR head; their green results and independent review are mandatory before merge.
+- No local Rust suite, staging E2E, or production tests run for this metadata description. Independent review and publication verification remain pending until the checks report.
+
+## Risks
+
+- Pre-1.0 release publication is not production deployment or cutover approval.
+- Changing native delimiter placement could empty the release payload; the offline parser and publication comparison protect against that regression.
+- Keep the native overflow link and all stored notes. A later regeneration must repeat the seven-section validation before review.
+
+## Model Used
+
+- Repository automation through release-please 17.6.0 generated the versions and release notes from conventional commits; the section text above is the checked-in template. Authorship of any repair or review is recorded in the review, not here.
+
+## Checklist
+
+- [x] I wrote a thinking path that runs from the project to this change
+- [x] I named the model used, with its version
+- [ ] I searched for duplicate or related PRs and linked them above (not required for this generated chore release)
+- [ ] I ran the tests locally and they pass (required checks run on this PR head and must be green before merge)
+- [ ] I added or updated repository tests where applicable (this description changes release metadata only)
+- [x] I updated the release description this change touches
+- [x] No secret, token or credential is in the diff, the title, the body or the branch name
+- [x] No internal ticket id, instance link or private host is in the title, body, commits or branch name
+- [ ] CI is green on the exact head before approval (review handoff is conditional on the dispatched checks)
 ---
 
 
