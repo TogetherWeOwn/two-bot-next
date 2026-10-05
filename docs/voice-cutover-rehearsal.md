@@ -242,7 +242,7 @@ so production voice stays an Operator-approved binding.
 
 - **Order matters.** The voice store reads the migrated voice tables, so the
   staging ledger must already carry the voice migrations (0224-0229,
-  0412-0414 and 0416) before the var ships: apply through `staging-migrate`,
+  0412-0414 and 0416-0418) before the var ships: apply through `staging-migrate`,
   then re-apply the role plan so the runtime role holds the new tables. Merge
   the flip only after a post-apply plan shows no pending migrations.
 - **Permanent channels stay untouched.** `reconcile` iterates the rooms the
