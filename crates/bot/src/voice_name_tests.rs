@@ -685,6 +685,10 @@ async fn override_write_retries_after_a_store_failure_and_halts_on_a_refused_cre
 async fn overrides_load_survive_ownership_changes_and_go_with_the_room() {
     let trace = Trace::default();
     let live = LiveGuild::new(GUILD);
+    // This scenario predates the empty-room grace and asserts immediate
+    // deletion, so it shortens the grace; the grace itself is pinned by the
+    // paused-time guard tests.
+    live.set_empty_grace(Duration::ZERO);
     live.publish(snapshot(&[ROOM], vec![occupant(GUEST, ROOM)]));
     let store = Store::new(trace.clone());
     store.rooms.lock().unwrap().insert(ROOM, room(ROOM));

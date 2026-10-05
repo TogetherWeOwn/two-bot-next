@@ -407,6 +407,50 @@ fn lfg_select(values: Vec<String>) -> Interaction {
     interaction
 }
 
+/// The same interaction as `member` with `permissions`, with its own id/token.
+fn from_member(mut interaction: Interaction, member: u64, permissions: Permissions) -> Interaction {
+    interaction.id = Id::new(member);
+    interaction.token = format!("token-{member}");
+    let resolved = interaction.member.as_mut().expect("guild member");
+    resolved.permissions = Some(permissions);
+    resolved.user = Some(user(member, false));
+    interaction
+}
+
+fn interaction_event(interaction: Interaction) -> Event {
+    Event::InteractionCreate(Box::new(InteractionCreate(interaction)))
+}
+
+/// A router-refused command: the first thing it does is one REST callback, so
+/// a delayed mock reply holds its worker slot without any database.
+fn open_command(member: u64) -> Event {
+    interaction_event(from_member(
+        slash("sticky-remove", Some(CHANNEL), Vec::new()),
+        member,
+        Permissions::empty(),
+    ))
+}
+
+/// `/timeout` from a member who holds `MODERATE_MEMBERS`; moderation is gated
+/// off in `gates`, so the router answers with one refusal callback.
+fn moderator_command(member: u64) -> Event {
+    interaction_event(from_member(
+        slash("timeout", Some(CHANNEL), Vec::new()),
+        member,
+        Permissions::MODERATE_MEMBERS,
+    ))
+}
+
+fn held_callbacks(count: usize) -> Vec<RestResponse> {
+    (0..count)
+        .map(|_| RestResponse {
+            status: 200,
+            body: None,
+            delay: Duration::from_secs(30),
+        })
+        .collect()
+}
+
 fn option(name: &str, value: CommandOptionValue) -> CommandDataOption {
     CommandDataOption {
         name: name.to_owned(),
@@ -1355,29 +1399,15 @@ async fn dispatch_spawns_interaction_work_off_the_shard_loop() {
 
 #[tokio::test]
 async fn bounded_dispatch_keeps_publication_independent_and_cancels_on_gateway_exit() {
-    let (mock, origin) = MockRest::start_script(
-        (0..17)
-            .map(|_| RestResponse {
-                status: 200,
-                body: None,
-                delay: Duration::from_secs(30),
-            })
-            .collect(),
-    )
-    .await;
+    let (mock, origin) = MockRest::start_script(held_callbacks(17)).await;
     let runtime = runtime_without_db(gates(false, false), false, origin);
     let guard = runtime.dispatch_guard();
-    let event = Event::InteractionCreate(Box::new(InteractionCreate(slash(
-        "sticky-remove",
-        Some(CHANNEL),
-        Vec::new(),
-    ))));
-    for _ in 0..16 {
-        assert!(runtime.dispatch(&event));
+    for member in 1..=16 {
+        assert!(runtime.dispatch(&open_command(member)));
     }
-    for _ in 0..100 {
+    for member in 17..117 {
         assert!(
-            !runtime.dispatch(&event),
+            !runtime.dispatch(&open_command(member)),
             "no spawned waiters on saturation"
         );
     }
@@ -1389,16 +1419,193 @@ async fn bounded_dispatch_keeps_publication_independent_and_cancels_on_gateway_e
         !runtime.dispatch(&ready()),
         "overlapping registry sync coalesces"
     );
-    wait_for(|| mock.requests().len() == 17, "all admitted work started").await;
-    assert_eq!(mock.posts_to("/callback").await.len(), 16);
+    wait_for(
+        || {
+            let requests = mock.requests();
+            (1..=16).all(|member| {
+                requests
+                    .iter()
+                    .any(|r| r.path.contains(&format!("/token-{member}/")))
+            }) && requests.iter().any(|r| r.method == "PUT")
+        },
+        "all admitted work started",
+    )
+    .await;
+    wait_for(
+        || {
+            mock.requests()
+                .iter()
+                .any(|r| r.path.contains("/token-17/"))
+        },
+        "a busy reply for the first refused member",
+    )
+    .await;
     drop(guard);
     wait_for(
         || Arc::strong_count(&runtime) == 1,
         "all scoped work cancelled",
     )
     .await;
-    assert!(!runtime.dispatch(&event), "closed scope refuses new work");
-    assert_eq!(mock.requests().len(), 17, "rejected work never sent HTTP");
+    let sent = mock.requests().len();
+    assert!(
+        !runtime.dispatch(&open_command(500)),
+        "closed scope refuses new work"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(mock.requests().len(), sent, "closed scope sent no HTTP");
+    mock.shutdown().await;
+}
+
+fn callback_json(request: &RestRequest) -> serde_json::Value {
+    serde_json::from_slice(&request.body).expect("callback body")
+}
+
+#[tokio::test]
+async fn saturated_interaction_lane_still_answers_a_moderator_command() {
+    // Sixteen members fill the shared interaction lane; each worker is held on
+    // its first callback.
+    let (mock, origin) = MockRest::start_script(held_callbacks(16)).await;
+    let runtime = runtime_without_db(gates(false, false), false, origin);
+    let _guard = runtime.dispatch_guard();
+    for member in 1..=16 {
+        assert!(runtime.dispatch(&open_command(member)));
+    }
+    assert!(
+        !runtime.dispatch(&open_command(17)),
+        "the shared lane is full for open commands"
+    );
+
+    assert!(
+        runtime.dispatch(&moderator_command(900)),
+        "the reserved lane admits a permitted moderator"
+    );
+    wait_for(
+        || {
+            mock.requests()
+                .iter()
+                .any(|r| r.path.contains("/token-900/"))
+        },
+        "moderator callback",
+    )
+    .await;
+    let moderator = mock
+        .requests()
+        .into_iter()
+        .find(|r| r.path.contains("/token-900/"))
+        .expect("moderator callback");
+    let reply = callback_json(&moderator);
+    assert_eq!(reply["type"], 4);
+    assert_eq!(
+        reply["data"]["content"],
+        RouterRefusal::ModerationDisabled.message(),
+        "the router, not admission, answered the command"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn refused_open_command_gets_one_ephemeral_busy_reply() {
+    let (mock, origin) = MockRest::start_script(held_callbacks(16)).await;
+    let runtime = runtime_without_db(gates(false, false), false, origin);
+    let _guard = runtime.dispatch_guard();
+    for member in 1..=16 {
+        assert!(runtime.dispatch(&open_command(member)));
+    }
+    assert!(!runtime.dispatch(&open_command(17)));
+    wait_for(
+        || {
+            mock.requests()
+                .iter()
+                .any(|r| r.path.contains("/token-17/"))
+        },
+        "busy callback",
+    )
+    .await;
+    let busy: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.path.contains("/token-17/"))
+        .collect();
+    assert_eq!(busy.len(), 1, "one callback, no retry loop");
+    let reply = callback_json(&busy[0]);
+    assert_eq!(reply["type"], 4);
+    assert_eq!(reply["data"]["flags"], 64, "ephemeral");
+    assert_eq!(
+        reply["data"]["content"],
+        crate::interaction_admission::BUSY_REPLY
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn one_member_cannot_hold_more_than_their_share_of_the_lane() {
+    let cap = crate::interaction_admission::PER_USER_IN_FLIGHT;
+    let (mock, origin) = MockRest::start_script(held_callbacks(cap + 1)).await;
+    let runtime = runtime_without_db(gates(false, false), false, origin);
+    let _guard = runtime.dispatch_guard();
+    for _ in 0..cap {
+        assert!(runtime.dispatch(&open_command(42)));
+    }
+    assert!(
+        !runtime.dispatch(&open_command(42)),
+        "the member is at their cap while the lane has room"
+    );
+    assert!(
+        runtime.dispatch(&open_command(43)),
+        "another member is unaffected"
+    );
+    wait_for(
+        || {
+            mock.requests()
+                .iter()
+                .filter(|r| r.path.contains("/token-42/"))
+                .count()
+                == cap + 1
+        },
+        "capped member's work plus one busy reply",
+    )
+    .await;
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn reserved_lane_is_not_reachable_without_the_permission() {
+    let (mock, origin) = MockRest::start_script(held_callbacks(16)).await;
+    let runtime = runtime_without_db(gates(false, false), false, origin);
+    let _guard = runtime.dispatch_guard();
+    for member in 1..=16 {
+        assert!(runtime.dispatch(&open_command(member)));
+    }
+    // Same command, same lane pressure, but the invoker lacks MODERATE_MEMBERS.
+    let impostor = interaction_event(from_member(
+        slash("timeout", Some(CHANNEL), Vec::new()),
+        901,
+        Permissions::SEND_MESSAGES,
+    ));
+    assert!(
+        !runtime.dispatch(&impostor),
+        "naming a moderation command is not enough"
+    );
+    wait_for(
+        || {
+            mock.requests()
+                .iter()
+                .any(|r| r.path.contains("/token-901/"))
+        },
+        "busy callback",
+    )
+    .await;
+    let reply = callback_json(
+        &mock
+            .requests()
+            .into_iter()
+            .find(|r| r.path.contains("/token-901/"))
+            .expect("callback"),
+    );
+    assert_eq!(
+        reply["data"]["content"],
+        crate::interaction_admission::BUSY_REPLY
+    );
     mock.shutdown().await;
 }
 

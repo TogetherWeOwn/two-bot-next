@@ -780,6 +780,10 @@ async fn a_not_found_write_invalidates_the_cached_channel() {
 async fn a_delete_overtaking_a_queued_limit_settles_its_waiter() {
     let (live, store, http, trace) = owned_room();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // This scenario predates the ordinary empty-room grace and asserts the
+    // delete runs first: shorten the grace to zero via the fixture-only seam
+    // so reconcile queues the delete immediately. Production keeps the default.
+    worker.live.set_empty_grace(Duration::ZERO);
     // Everyone leaves: reconcile queues the delete ahead of any new command.
     worker
         .live

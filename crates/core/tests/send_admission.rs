@@ -2,7 +2,9 @@
 #![cfg(feature = "db")]
 
 use std::{sync::Arc, time::Duration};
-use two_bot_core::send_admission::{AdmissionError, PgSendAdmission, SendAdmission, SendCooldown};
+use two_bot_core::send_admission::{
+    AdmissionError, PgSendAdmission, SendAdmission, SendCooldown, IN_FLIGHT_LEASE_MS,
+};
 use two_bot_testsupport::TestDatabase;
 
 async fn database() -> TestDatabase {
@@ -153,7 +155,9 @@ async fn stale_completion_cannot_release_a_new_generation_and_finite_hold_expire
     let db = database().await;
     let gate = PgSendAdmission::new(db.pool().clone(), "fixture-token").unwrap();
     let permit = gate.admit().await.unwrap();
-    // Model explicit reconciliation/replacement, not a time-based lease expiry.
+    // Model explicit generation replacement: bumping the generation fences the
+    // old permit even though its holder is fresh (the lease heals only dead
+    // holders, never a live generation).
     sqlx::query("UPDATE public.discord_send_admission SET generation = generation + 1")
         .execute(db.pool())
         .await
@@ -171,5 +175,38 @@ async fn stale_completion_cannot_release_a_new_generation_and_finite_hold_expire
     assert!(matches!(finite.admit().await, Err(AdmissionError::Blocked)));
     tokio::time::sleep(Duration::from_millis(550)).await;
     finite.admit().await.unwrap().complete(None).await.unwrap();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb or CI service"]
+async fn completion_outage_then_next_boot_proceeds() {
+    // Replay of the 2026-10-05 staging wedge: a completion lost to a storage
+    // outage left the single lane row occupied, and every later boot's
+    // admission was refused, so the container never served. The lease must
+    // keep blocking fresh holders yet let the next boot reclaim the dead one.
+    let db = database().await;
+    let outage = db.independent_pool().await.unwrap();
+    let first = PgSendAdmission::new(outage.clone(), "fixture-token").unwrap();
+    let permit = first.admit().await.unwrap();
+    outage.close().await;
+    assert_eq!(permit.complete(None).await, Err(AdmissionError::Storage));
+    let reboot = PgSendAdmission::new(db.pool().clone(), "fixture-token").unwrap();
+    // A just-taken lane still blocks: the lease never steals a live holder.
+    assert!(matches!(reboot.admit().await, Err(AdmissionError::Blocked)));
+    // Stand in for the crashed boot retries without sleeping the real lease:
+    // age the dead holder's stamp just past it on the database clock.
+    sqlx::query(
+        "UPDATE public.discord_send_admission SET in_flight_since_ms = \
+           (extract(epoch FROM clock_timestamp()) * 1000)::bigint - $1 - 1 \
+         WHERE in_flight",
+    )
+    .bind(IN_FLIGHT_LEASE_MS)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    // The next boot proceeds with a fresh generation and releases normally.
+    reboot.admit().await.unwrap().complete(None).await.unwrap();
+    reboot.admit().await.unwrap().complete(None).await.unwrap();
     db.close().await.unwrap();
 }

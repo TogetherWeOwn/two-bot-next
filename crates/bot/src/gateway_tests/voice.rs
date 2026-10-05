@@ -216,11 +216,14 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
     let deletions = writes.0.clone();
     let store = rooms.clone();
     let voice = Arc::new(RecordingVoice {
+        // Real-time reconcile proof: shorten the grace the paused-time guard
+        // tests pin at 60 s.
         runtime: VoiceRuntime::new(
             move || (store.clone(), writes.clone()),
             Duration::from_millis(10),
             true,
-        ),
+        )
+        .with_empty_grace(Duration::ZERO),
         leaves: AtomicU64::new(0),
         disconnects: AtomicU64::new(0),
     });

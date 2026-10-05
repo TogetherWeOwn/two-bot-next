@@ -18,14 +18,14 @@ Built-in commands: 28.
 
 ## `/attendance`
 
-Record a verified human attendee for a Discord event occurrence.
+Check in a verified human attendee for a scheduled event (scorecard)
 
 - Default permissions: ManageEvents (`8589934592`)
 - Available in DMs: false
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-occurrence` | string | true | — | — | 128 | — | Scheduled event id or stable occurrence id. |
+| `event-occurrence` | string | true | — | — | 128 | — | Event id (number in the event URL) or occurrence id, e.g. 12345 or weekly-standup-2026-10-03 |
 | `member` | user | true | — | — | — | — | Human member who attended. |
 
 ## `/ban`
@@ -146,8 +146,8 @@ Post a raid/LFG signup with role slots
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `title` | string | true | — | — | — | — | Event or group title |
-| `starts-at` | string | true | — | — | — | — | ISO-8601 start time |
-| `roles` | string | true | — | — | — | — | tank:Tank:2,healer:Healer:2,dps:DPS:6 |
+| `starts-at` | string | true | — | — | — | — | ISO-8601 start time, e.g. 2026-10-04T18:00:00Z |
+| `roles` | string | true | — | — | — | — | Role slots as role:Label:count, comma-separated, e.g. tank:Tank:2,dps:DPS:6 |
 
 ## `/lfg-close`
 
@@ -158,7 +158,7 @@ Close a raid/LFG signup
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `id` | string | true | — | — | — | — | LFG id |
+| `id` | string | true | — | — | — | — | LFG id from the posted signup |
 
 ## `/lockdown`
 
@@ -203,19 +203,19 @@ RSVP to a Discord scheduled event
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-id` | string | true | — | — | — | — | Discord scheduled event id |
+| `event-id` | string | true | — | — | — | — | Discord scheduled event id (number in the event URL), e.g. 12345 |
 | `status` | string | true | — | — | — | Going = `"going"`; Interested = `"interested"`; Declined = `"declined"` | Your response |
 
 ## `/rsvp-attendance`
 
-Show Owen RSVP totals for a scheduled event
+Show RSVP totals for a scheduled event
 
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-id` | string | true | — | — | — | — | Discord scheduled event id |
+| `event-id` | string | true | — | — | — | — | Discord scheduled event id (number in the event URL), e.g. 12345 |
 
 ## `/schedule`
 

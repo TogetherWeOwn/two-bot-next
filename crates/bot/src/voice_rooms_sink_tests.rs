@@ -256,11 +256,14 @@ impl RoomWrites for GatedHttp {
 type Runtime = VoiceRuntime<Arc<Store>, GatedHttp>;
 
 fn runtime(store: Arc<Store>, http: GatedHttp) -> Runtime {
+    // These races predate the empty-room grace and run in real time, so they
+    // shorten it; the grace itself is pinned by the paused-time guard tests.
     VoiceRuntime::new(
         move || (store.clone(), http.clone()),
         Duration::from_millis(10),
         true,
     )
+    .with_empty_grace(Duration::ZERO)
 }
 
 fn ready_event() -> Event {
