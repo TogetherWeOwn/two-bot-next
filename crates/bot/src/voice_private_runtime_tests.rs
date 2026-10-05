@@ -23,10 +23,12 @@ fn parts() -> (LiveGuild, Store, Http, Trace) {
 
 async fn worker() -> (Worker, Trace) {
     let (live, store, http, trace) = parts();
-    (
-        GuildRoomWorker::load(live, store, http).await.unwrap(),
-        trace,
-    )
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // These scenarios predate the empty-room grace and assert immediate
+    // deletion, so they shorten it; the grace itself is pinned by the
+    // paused-time guard tests.
+    worker.live.set_empty_grace(Duration::ZERO);
+    (worker, trace)
 }
 
 /// Run every queued write to completion; each tick jumps past any backoff, so
