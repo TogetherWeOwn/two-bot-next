@@ -232,9 +232,12 @@ controller's bounded cache pool was missing at implementation time.
 
 Chosen path: the Container Durable Object (the only caller that can reach the
 container-internal listener) pulls `/metrics` via `containerFetch` on every
-keepalive tick, evaluates the checked-in rules and posts transitions to the
-optional `OPS_ALERT_WEBHOOK_URL` Discord-compatible webhook. No Prometheus
-server, no new infrastructure.
+keepalive tick, evaluates the checked-in rules and records structured transitions
+in logs and DO storage. Forwarding to the optional `OPS_ALERT_WEBHOOK_URL` Discord
+webhook requires exactly `OPS_ALERT_FORWARDING = "on"`; the default is `"off"`.
+Both readiness and metrics share the [Discord-only destination validator and
+non-destructive disable switch](container-readiness.md#threshold-and-notifications).
+No Prometheus server, no new infrastructure.
 
 - Authenticated pull: `GET /ops/metrics` on the Worker with
   `Authorization: Bearer <METRICS_SCRAPE_TOKEN>`. The token is an optional

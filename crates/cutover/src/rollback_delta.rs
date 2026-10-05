@@ -109,6 +109,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // DB instant that advanced the mark, so its maximum is the row's last write.
     TableSpec { table: "internal_clock_high_water", measure: TableMeasure::Columns(&["observed_at"]) },
     TableSpec { table: "internal_discord_events", measure: TableMeasure::Columns(&["claimed_at"]) },
+    // Re-mapped keys rewrite updated_at without touching created_at, so the
+    // maximum across both is the row's last write (same shape as tickets).
+    TableSpec { table: "internal_event_keys", measure: TableMeasure::Columns(&["created_at", "updated_at"]) },
     TableSpec { table: "internal_idempotency", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "internal_nonces", measure: TableMeasure::Columns(&["burned_at"]) },
     // Retirements rewrite disabled_at without touching created_at, so the
@@ -201,13 +204,18 @@ pub const TABLE_SPECS: &[TableSpec] = &[
             "no timestamp column; creator configuration is upserted in place (see PgRoomStore::add_creator)",
         ),
     },
+    // V3 block list (0416): one row per blocked member, stamped on insert; an
+    // unblock deletes the row, so only additions are measurable.
+    TableSpec { table: "voice_room_blocks", measure: TableMeasure::Columns(&["created_at"]) },
     // Insert-once creation snapshot plus V2 ownership handoffs, whose
-    // timestamp lives in `owner_touched_at` (migration 0412), plus V3 `/name`
-    // custom-name changes, stamped in `name_touched_at` (migration 0414).
+    // timestamp lives in `owner_touched_at` (migration 0412), V3 `/name`
+    // custom-name changes, stamped in `name_touched_at` (migration 0414), and V3
+    // privacy writes, stamped in `privacy_touched_at` (migration 0416).
     TableSpec {
         table: "voice_rooms",
-        measure: TableMeasure::Columns(&["created_at", "owner_touched_at", "name_touched_at"]),
+        measure: TableMeasure::Columns(&["created_at", "owner_touched_at", "name_touched_at", "privacy_touched_at"]),
     },
+    TableSpec { table: "voice_owner_grants", measure: TableMeasure::Columns(&["touched_at"]) },
     // Same insert-once shape as voice_rooms (PgRoomStore::add_companion never
     // overwrites the creation snapshot).
     TableSpec { table: "voice_text_companions", measure: TableMeasure::Columns(&["created_at"]) },
@@ -265,6 +273,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
             "mutable per-guild settings row with no timestamp column; no member IDs",
         ),
     },
+    // Append-only vote-kick audit rows (migration 0417); `occurred_at` is the
+    // event time, written once per row.
+    TableSpec { table: "voice_vote_kick_audit", measure: TableMeasure::Columns(&["occurred_at"]) },
     TableSpec {
         table: "web_contract_meta",
         measure: TableMeasure::Unmeasurable("singleton contract row with no timestamp column"),

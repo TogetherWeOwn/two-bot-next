@@ -12,12 +12,25 @@ use serde::de::{value::MapAccessDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
+use crate::voice_access::is_voice_command;
+use crate::voice_alias::{is_refused_control, AliasError, AliasTable};
+use crate::voice_naming::PassthroughExtensions;
+use crate::voice_template_lint::lint;
+
 pub const VOICE_CONFIG_VERSION: u32 = 1;
 
 /// Largest accepted import payload in bytes. Oversized uploads fail before
 /// parsing, so a huge document can never partially apply. Real configurations
 /// are a few kilobytes; the cap is headroom, not a target.
 pub const MAX_IMPORT_BYTES: usize = 256 * 1024;
+
+/// Most random lists one guild may import.
+pub const MAX_LISTS: usize = 100;
+/// Most choices one random list may import.
+pub const MAX_LIST_CHOICES: usize = 100;
+/// Longest list name or choice, in Unicode scalar values. Choices end up in
+/// channel names, which Discord caps at 100 characters.
+pub const MAX_LIST_TEXT_CHARS: usize = 100;
 
 /// Snowflakes are decimal strings on the wire to preserve all 64 bits in JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,13 +212,24 @@ pub fn import_configuration(
     json: &[u8],
     inventory: &GuildInventory,
 ) -> Result<VoiceConfiguration, VoiceConfigError> {
+    let config = decode_configuration(json)?;
+    validate_configuration(&config, inventory)?;
+    Ok(config)
+}
+
+/// Strict decode only: size cap, an object at the document and every nested
+/// DTO boundary (no positional arrays), no duplicate keys, no trailing data.
+/// It does not validate against an inventory, so callers that must report and
+/// skip unknown channels can decode first and revalidate the remainder.
+/// Uploaded bytes must never reach `serde_json::from_slice` directly: the
+/// derived top-level decoder also accepts the positional-array form.
+pub fn decode_configuration(json: &[u8]) -> Result<VoiceConfiguration, VoiceConfigError> {
     if json.len() > MAX_IMPORT_BYTES {
         return Err(invalid("document", "exceeds the import size limit"));
     }
     let mut deserializer = serde_json::Deserializer::from_slice(json);
     let config = object(&mut deserializer)?;
     deserializer.end()?;
-    validate_configuration(&config, inventory)?;
     Ok(config)
 }
 
@@ -246,6 +270,10 @@ pub fn validate_configuration(
             &creator.channel_id,
             &format!("{path}.channel_id"),
         )?;
+        template(&creator.name_template, &format!("{path}.name_template"))?;
+        if let Some(status) = &creator.status_template {
+            template(status, &format!("{path}.status_template"))?;
+        }
         if creator.default_limit > 99 {
             return Err(invalid(&format!("{path}.default_limit"), "must be 0..=99"));
         }
@@ -266,15 +294,22 @@ pub fn validate_configuration(
             )?;
         }
     }
-    for (i, template) in config.templates.iter().enumerate() {
+    for (i, template_row) in config.templates.iter().enumerate() {
         let path = format!("templates[{i}].channel_id");
         channel(
-            &template.channel_id,
+            &template_row.channel_id,
             &path,
             inventory,
             &[ChannelKind::Voice, ChannelKind::Stage],
         )?;
-        unique(&mut channels, &template.channel_id, &path)?;
+        unique(&mut channels, &template_row.channel_id, &path)?;
+        template(
+            &template_row.name_template,
+            &format!("templates[{i}].name_template"),
+        )?;
+        if let Some(status) = &template_row.status_template {
+            template(status, &format!("templates[{i}].status_template"))?;
+        }
     }
     let mut games = BTreeSet::new();
     for (i, alias) in config.aliases.iter().enumerate() {
@@ -283,16 +318,33 @@ pub fn validate_configuration(
         nonempty(&alias.alias, &format!("{path}.alias"))?;
         unique(&mut games, &alias.game, &format!("{path}.game"))?;
     }
+    // Hold imported aliases to the table the runtime loads them into: count and
+    // length bounds, no control characters, case-folded keys, no chains.
+    let mut table = AliasTable::new();
+    for (i, alias) in config.aliases.iter().enumerate() {
+        table
+            .add(&alias.game, &alias.alias)
+            .map_err(|error| invalid(&format!("aliases[{i}]"), alias_reason(&error)))?;
+    }
+    if config.lists.len() > MAX_LISTS {
+        return Err(invalid("lists", "exceeds the list limit"));
+    }
     let mut lists = BTreeSet::new();
     for (i, list) in config.lists.iter().enumerate() {
         let path = format!("lists[{i}]");
-        nonempty(&list.name, &format!("{path}.name"))?;
+        list_text(&list.name, &format!("{path}.name"))?;
         unique(&mut lists, &list.name, &format!("{path}.name"))?;
         if list.choices.is_empty() {
             return Err(invalid(&format!("{path}.choices"), "must contain a choice"));
         }
+        if list.choices.len() > MAX_LIST_CHOICES {
+            return Err(invalid(
+                &format!("{path}.choices"),
+                "exceeds the choice limit",
+            ));
+        }
         for (j, choice) in list.choices.iter().enumerate() {
-            nonempty(choice, &format!("{path}.choices[{j}]"))?;
+            list_text(choice, &format!("{path}.choices[{j}]"))?;
         }
     }
     if let Some(logging) = &config.logging {
@@ -335,7 +387,12 @@ pub fn validate_configuration(
     let mut commands = BTreeSet::new();
     for (i, restriction) in settings.command_roles.iter().enumerate() {
         let path = format!("settings.command_roles[{i}]");
-        nonempty(&restriction.command, &format!("{path}.command"))?;
+        if !is_voice_command(&restriction.command) {
+            return Err(invalid(
+                &format!("{path}.command"),
+                "must be a restrictable voice command",
+            ));
+        }
         unique(
             &mut commands,
             &restriction.command,
@@ -417,6 +474,43 @@ fn snowflake(id: &str, field: &str) -> Result<(), VoiceConfigError> {
 fn nonempty(value: &str, field: &str) -> Result<(), VoiceConfigError> {
     if value.trim().is_empty() {
         return Err(invalid(field, "must not be blank"));
+    }
+    Ok(())
+}
+
+/// Lint a name or status template source. Only lint errors (an unclosed
+/// construct, an unknown `@@token@@`, over-long or over-deep source) refuse;
+/// warnings such as an empty render stay valid because V5 falls back to a
+/// default name. The lint is pure and bounded, and never echoes the source.
+fn template(source: &str, field: &str) -> Result<(), VoiceConfigError> {
+    if lint(source, &PassthroughExtensions).has_errors() {
+        return Err(invalid(field, "is not a valid template"));
+    }
+    Ok(())
+}
+
+fn alias_reason(error: &AliasError) -> &'static str {
+    match error {
+        AliasError::Empty(_) => "must not be blank",
+        AliasError::TooLong { .. } => "exceeds the length limit",
+        AliasError::ControlCharacter(_) => "must not contain control characters",
+        AliasError::TableFull { .. } => "exceeds the alias limit",
+        AliasError::DuplicateKey { .. } => "duplicate entry",
+        AliasError::UnknownKey { .. } => "has no matching alias",
+        AliasError::TargetIsKey { .. } | AliasError::KeyIsTarget { .. } => {
+            "chains to another alias"
+        }
+    }
+}
+
+/// A list name or choice: nonblank, bounded, and free of control characters.
+fn list_text(value: &str, field: &str) -> Result<(), VoiceConfigError> {
+    nonempty(value, field)?;
+    if value.chars().count() > MAX_LIST_TEXT_CHARS {
+        return Err(invalid(field, "exceeds the length limit"));
+    }
+    if value.chars().any(is_refused_control) {
+        return Err(invalid(field, "must not contain control characters"));
     }
     Ok(())
 }

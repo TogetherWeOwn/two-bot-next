@@ -53,6 +53,9 @@ storage = "sqlite"
 # REDIRECT_FALLBACK_CODE is the invite code for `/` and DB outages.
 REDIRECT_FALLBACK_CODE = ""
 REDIRECT_MAPPINGS_JSON = "[]"
+# Worker-only paging switch: installing a webhook secret alone never sends.
+# Vars are non-inheritable, so every environment explicitly defaults to off.
+OPS_ALERT_FORWARDING = "off"
 # Container HTTP port (must match the Rust LISTEN_ADDR port).
 BOT_PORT = "8080"
 # Keepalive tick: the DO schedule() below re-arms itself this often; each
@@ -97,6 +100,9 @@ storage = "sqlite"
 # S1 lands the shared DB (vars are not inherited, so this must be repeated).
 REDIRECT_FALLBACK_CODE = ""
 REDIRECT_MAPPINGS_JSON = "[]"
+# Worker-only paging switch: installing a webhook secret alone never sends.
+# Vars are non-inheritable, so every environment explicitly defaults to off.
+OPS_ALERT_FORWARDING = "off"
 # Container HTTP port (must match the Rust LISTEN_ADDR port).
 BOT_PORT = "8080"
 # Keepalive tick: renews the activity timeout so the gateway WebSocket
@@ -158,6 +164,9 @@ storage = "sqlite"
 # B3 (TOG-9696) redirect snapshot placeholder (see staging block above).
 REDIRECT_FALLBACK_CODE = ""
 REDIRECT_MAPPINGS_JSON = "[]"
+# Worker-only paging switch: installing a webhook secret alone never sends.
+# Vars are non-inheritable, so every environment explicitly defaults to off.
+OPS_ALERT_FORWARDING = "off"
 BOT_PORT = "8080"
 KEEPALIVE_SECONDS = "60"
 TWO_GUILD_NAME = "TogetherWeOwn"

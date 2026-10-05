@@ -4,8 +4,14 @@ Owner priority (2026-09-29): full temporary voice-room support in two-bot-next,
 built from this behaviour spec. It is an original implementation: write it from
 this document only, and don't copy code from any other project.
 
-Commands are slash commands with ephemeral replies. "Admin" means the member has
-Manage Channels unless a row says otherwise. Room state and per-guild settings
+Commands are slash commands with ephemeral replies. "Admin" means the guild owner
+or a member with guild-level Manage Channels or Administrator role permissions,
+unless a row says otherwise. Interaction `member.permissions` includes source-channel
+overwrites and is never an admin credential: owning a room does not authorize
+another room or guild-wide settings. Missing guild-role snapshots fail closed.
+See [Discord's member definition](https://docs.discord.com/developers/resources/guild#guild-member-object)
+and [base permission calculation](https://docs.discord.com/developers/topics/permissions#permission-hierarchy).
+Room state and per-guild settings
 are stored in Postgres (sqlx, bot migration range 0001–0999). Tests never touch
 production; DB tests run on agent-testdb.
 
@@ -50,8 +56,23 @@ library code with no Discord dependency and can start immediately.
   still there. It also lets a member claim a room whose owner has left.
 - `/transfer member`: hands the room to a member who is in it. The recipient also
   becomes the original creator.
-- Owner-only commands refuse everyone else. Admins may use owner commands in any
-  room.
+- Owner-only commands refuse everyone else. Guild admins may use owner commands
+  in any tracked room; channel-scoped grants never provide that override.
+- Succession, reclaim and transfer persist a room-scoped recipient journal before
+  issuing any owner grant. The overwrite rewrite removes owner-grant bits from
+  all recorded former recipients and installs the current owner's grant; unrelated
+  overwrites and denies remain. Ownership SQL and revision-fenced cleanup
+  acknowledgement commit atomically only after the rewrite is confirmed.
+- Failed ownership SQL leaves cleanup pending across restart. Recovery converges
+  to the persisted ledger owner even while that owner remains in the room; an
+  uncommitted transfer is not promised after restart. Exhausted queue retries
+  retain pending cleanup and replay in bounded cohorts with a one-minute cooldown,
+  only with authoritative live evidence and restored overwrite access. Rapid
+  handoffs coalesce per room without forgetting any issued recipient.
+- Late overwrite responses cannot replace newer gateway channel updates/deletion
+  or evidence from another connection generation. Follow-up rewrites preserve
+  newly observed unrelated ACLs. Rooms created without Manage Roles stay
+  category-synced rather than gaining a grant the bot cannot write.
 - **Accept when:**
   - The caretaker is chosen by earliest join time.
   - `/transfer` rejects a target who is not in the room.
@@ -83,7 +104,13 @@ library code with no Discord dependency and can start immediately.
 
 ## V4: Vote-kick
 
-- `/kick member [reason]`: any occupant can start a vote.
+- `/kick member [reason]`: any occupant can start a vote. The shared router
+  answers every `/kick`. A moderator who passes the guild fence, the moderation
+  gate and the Kick Members check always gets the moderation kick, so sitting in
+  a room never shields a member from a moderator. Only a `/kick` the router
+  refuses (moderation off, or the invoker lacks Kick Members) reaches the vote,
+  and only when the invoker shares the target's room; everyone else gets the
+  router's refusal.
 - It passes with a strict majority of the occupants other than the target.
   Progress shows as required/total. Votes are cast with buttons; not voting
   counts as No. The vote expires after 2 minutes.

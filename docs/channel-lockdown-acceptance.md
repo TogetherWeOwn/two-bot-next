@@ -10,13 +10,17 @@ Planner: `two_bot_core::channel_moderation`; runtime contract:
 2. `validate_slowmode_seconds` enforces `0..=21600` inclusive (`0` disables);
    missing or out-of-range values refuse with `seconds` bounds `0..=21600`.
 3. `require_channel_reason` refuses empty/blank reasons and trims valid input.
-4. `plan_lockdown` moves only `SEND_MESSAGES` (2048): clears it from allow,
-   sets it in deny, preserves unrelated bits, and records the live prior masks
+4. `plan_lockdown` moves only `LOCKDOWN_BITS` (`SEND_MESSAGES` 2048,
+   `SEND_MESSAGES_IN_THREADS`, `CREATE_PUBLIC_THREADS`, `CREATE_PRIVATE_THREADS`
+   and `ADD_REACTIONS`): clears them from allow, sets them in deny, preserves
+   unrelated bits, and records the live prior masks
    (`None` → absent seed `"0"/"0"`). Repeated lockdown preserves the seed while
    the live deny remains set; otherwise the store refreshes seed and generation.
 5. `plan_unlock` requires recorded state **and a fresh live overwrite**. It
-   restores only the recorded `SEND_MESSAGES` allow/deny bits, keeping every
-   other live bit. A prior send deny stays denied. It refuses an untracked
+   restores only the recorded lockdown allow/deny bits, keeping every other
+   live bit: `SEND_MESSAGES` always, and each thread or reaction bit only while
+   it still holds the locked state (a bit a moderator changed since stays as
+   they set it). A prior send deny stays denied. It refuses an untracked
    channel, unreadable masks, a missing live entry, or send-bit drift (send
    newly allowed or no longer denied). The runtime gives a clear refusal and
    keeps recovery state; it does not silently restore the old snapshot.

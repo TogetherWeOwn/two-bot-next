@@ -351,12 +351,12 @@ mod tests {
     #[test]
     fn desired_registry_uses_existing_feature_gates() {
         let mut env = vars();
-        assert_eq!(desired_definitions(2222, &env).unwrap().len(), 2);
+        assert_eq!(desired_definitions(2222, &env).unwrap().len(), 3);
         env.insert("TWO_AUTOMATIONS".into(), "1".into());
         env.insert("TWO_ANNOUNCEMENTS".into(), "1".into());
         env.insert("TWO_COMMUNITY_SCORECARD".into(), "1".into());
         env.insert("TWO_MODERATION".into(), "1".into());
         env.insert("TWO_OWEN_USER_ID".into(), "123456789012345678".into());
-        assert_eq!(desired_definitions(2222, &env).unwrap().len(), 27);
+        assert_eq!(desired_definitions(2222, &env).unwrap().len(), 28);
     }
 }

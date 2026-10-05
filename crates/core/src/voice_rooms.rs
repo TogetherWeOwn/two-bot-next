@@ -740,11 +740,12 @@ pub enum RoomAction {
     DeleteRoom {
         channel_id: Snowflake,
     },
-    /// V2 caretaker succession: persist an ownership handoff the worker
-    /// already applied to its tracked row. No Discord write; rename, privacy
-    /// and Join-channel follow-ups belong to later slices.
+    /// Rewrite the room-scoped owner grant, then persist the handoff.
+    /// Keep the previous owner even for stale handoffs so rapid transfers
+    /// cannot strand a former owner's grant.
     UpdateOwnership {
         channel_id: Snowflake,
+        previous_owner_id: Snowflake,
         owner_id: Snowflake,
         original_creator_id: Snowflake,
     },
@@ -762,10 +763,67 @@ pub enum RoomAction {
     },
     /// V4 enforcement for a passed vote: deny the member Connect on this room
     /// channel only, then disconnect them. Both writes are idempotent, so a
-    /// retried action is safe.
+    /// retried action is safe. `vote_id` is the initiating interaction ID of
+    /// the passed vote, so the audit row for the outcome names its vote.
     KickMember {
         channel_id: Snowflake,
         member_id: Snowflake,
+        vote_id: Snowflake,
+    },
+    /// V3 `/private` (`deny`) and `/public` (`!deny`): set or clear the
+    /// @everyone Connect deny on a room. View Channel is never touched and
+    /// the write is idempotent. The worker flips the room's privacy state and
+    /// plans the Join channel only after it lands.
+    SetEveryoneConnect {
+        channel_id: Snowflake,
+        deny: bool,
+    },
+    /// V3: create the "⇩ Join ‹owner›" voice channel next to a private room.
+    CreateJoinChannel {
+        room_channel_id: Snowflake,
+        name: String,
+    },
+    /// V3: delete a room's Join channel. Carries its target and scopes to no
+    /// room, like `CreateRoom`: a room deleted meanwhile must not drop the
+    /// delete and leak the channel. The dispatch refuses an id the worker
+    /// does not hold as a bot-created Join channel.
+    DeleteJoinChannel {
+        room_channel_id: Snowflake,
+        channel_id: Snowflake,
+    },
+    /// V3: persist the room's current privacy record. Reads the worker's row
+    /// at dispatch time, so a retry never writes stale state.
+    SavePrivacy {
+        channel_id: Snowflake,
+    },
+    /// V3 join request: show the room owner the Approve / Deny / Block buttons
+    /// for one pending request. The dispatch re-checks that the request is
+    /// still pending, so a request answered or withdrawn while this waited
+    /// posts nothing.
+    AskJoinOwner {
+        room_channel_id: Snowflake,
+        member_id: Snowflake,
+        request_id: u64,
+    },
+    /// V3 Approve: allow Connect for this member on the room only, then move
+    /// them in from the Join channel if they are still there. Both writes are
+    /// idempotent, so a retried action is safe.
+    ApproveJoin {
+        room_channel_id: Snowflake,
+        member_id: Snowflake,
+    },
+    /// V3 `/public`: remove the Connect allow an approval wrote for this
+    /// member.
+    RevokeJoinAccess {
+        room_channel_id: Snowflake,
+        member_id: Snowflake,
+    },
+    /// V3: take the buttons off a join-request message in the room's chat
+    /// whose request can no longer be answered. Scoped to its room: once the
+    /// room is deleted the message goes with it, so a pending edit is dropped.
+    RetireJoinPrompt {
+        room_channel_id: Snowflake,
+        message_id: Snowflake,
     },
 }
 
@@ -803,12 +861,36 @@ impl RoomAction {
     #[must_use]
     pub fn channel_id(&self) -> Option<Snowflake> {
         match self {
-            Self::CreateRoom { .. } | Self::CreateCompanion { .. } => None,
+            Self::CreateRoom { .. }
+            | Self::CreateCompanion { .. }
+            | Self::DeleteJoinChannel { .. } => None,
             Self::MoveMember { channel_id, .. }
             | Self::DeleteRoom { channel_id }
             | Self::UpdateOwnership { channel_id, .. }
             | Self::RenameRoom { channel_id, .. }
+            | Self::SetEveryoneConnect { channel_id, .. }
+            | Self::SavePrivacy { channel_id }
+            | Self::CreateJoinChannel {
+                room_channel_id: channel_id,
+                ..
+            }
             | Self::SetCustomName { channel_id, .. }
+            | Self::AskJoinOwner {
+                room_channel_id: channel_id,
+                ..
+            }
+            | Self::ApproveJoin {
+                room_channel_id: channel_id,
+                ..
+            }
+            | Self::RevokeJoinAccess {
+                room_channel_id: channel_id,
+                ..
+            }
+            | Self::RetireJoinPrompt {
+                room_channel_id: channel_id,
+                ..
+            }
             | Self::GrantCompanionView {
                 room_channel_id: channel_id,
                 ..
@@ -1500,6 +1582,14 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
             "name",
             "Set a custom name for your temporary voice room, or restore the template name",
         ),
+        CommandDefinition::new(
+            "private",
+            "Deny new members from joining your voice room and open a Join channel",
+        ),
+        CommandDefinition::new(
+            "public",
+            "Let anyone join your voice room again and remove its Join channel",
+        ),
     ]
 }
 
@@ -1774,6 +1864,7 @@ mod tests {
             GUILD,
             RoomAction::UpdateOwnership {
                 channel_id: 501,
+                previous_owner_id: 301,
                 owner_id: MEMBER,
                 original_creator_id: MEMBER,
             },
@@ -1786,6 +1877,7 @@ mod tests {
             }),
             Some(RoomAction::UpdateOwnership {
                 channel_id: 501,
+                previous_owner_id: 301,
                 owner_id: MEMBER,
                 original_creator_id: MEMBER,
             })
@@ -1796,6 +1888,7 @@ mod tests {
             GUILD,
             RoomAction::UpdateOwnership {
                 channel_id: 502,
+                previous_owner_id: 301,
                 owner_id: MEMBER,
                 original_creator_id: MEMBER,
             },
@@ -2332,6 +2425,81 @@ mod tests {
     }
 
     #[test]
+    fn privacy_actions_scope_to_their_room_except_the_join_delete() {
+        assert_eq!(
+            RoomAction::SetEveryoneConnect {
+                channel_id: 500,
+                deny: true
+            }
+            .channel_id(),
+            Some(500)
+        );
+        assert_eq!(
+            RoomAction::SavePrivacy { channel_id: 500 }.channel_id(),
+            Some(500)
+        );
+        assert_eq!(
+            RoomAction::CreateJoinChannel {
+                room_channel_id: 500,
+                name: "⇩ Join Ana".to_owned()
+            }
+            .channel_id(),
+            Some(500)
+        );
+        // The Join delete names its own target and scopes to no room, so a
+        // room deleted meanwhile cannot drop it and leak the channel.
+        let delete = RoomAction::DeleteJoinChannel {
+            room_channel_id: 500,
+            channel_id: 700,
+        };
+        assert_eq!(delete.channel_id(), None);
+        let q = ActionQueue::new();
+        q.enqueue(GUILD, delete);
+        q.enqueue(GUILD, RoomAction::SavePrivacy { channel_id: 500 });
+        q.enqueue(
+            GUILD,
+            RoomAction::SetEveryoneConnect {
+                channel_id: 500,
+                deny: false,
+            },
+        );
+        assert_eq!(q.drop_for_channel(GUILD, 500), 2);
+        assert_eq!(q.pending_counts(GUILD), (1, 0));
+    }
+
+    #[test]
+    fn join_request_actions_all_scope_to_their_room() {
+        let actions = [
+            RoomAction::AskJoinOwner {
+                room_channel_id: 500,
+                member_id: 401,
+                request_id: 7,
+            },
+            RoomAction::ApproveJoin {
+                room_channel_id: 500,
+                member_id: 401,
+            },
+            RoomAction::RevokeJoinAccess {
+                room_channel_id: 500,
+                member_id: 401,
+            },
+            // The prompt lives in the room's chat and goes with the room.
+            RoomAction::RetireJoinPrompt {
+                room_channel_id: 500,
+                message_id: 9_001,
+            },
+        ];
+        let q = ActionQueue::new();
+        for action in actions {
+            assert_eq!(action.channel_id(), Some(500));
+            q.enqueue(GUILD, action);
+        }
+        q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 501 });
+        assert_eq!(q.drop_for_channel(GUILD, 500), 4);
+        assert_eq!(q.pending_counts(GUILD), (1, 0));
+    }
+
+    #[test]
     fn voice_command_shapes_and_gates() {
         let defs = voice_commands();
         assert_eq!(
@@ -2354,7 +2522,9 @@ mod tests {
                 "defaultlimit",
                 "alwaysprivate",
                 "kick",
-                "name"
+                "name",
+                "private",
+                "public"
             ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
@@ -2537,6 +2707,14 @@ mod tests {
         assert_eq!(defs[7].options[0].name, "member");
         assert_eq!(defs[7].options[0].kind, CommandOptionType::User as u8);
         assert!(defs[7].options[0].required == Some(true));
+        // `/private` and `/public` take no options and are not permission
+        // gated here: the handler allows only the room owner or an admin.
+        assert_eq!(defs[18].name, "private");
+        assert_eq!(defs[19].name, "public");
+        for def in &defs[18..20] {
+            assert_eq!(def.default_member_permissions, None);
+            assert!(def.options.is_empty());
+        }
         // Merges cleanly alongside the other slices, first-wins.
         // Moderation's `kick` sorts before the voice one, so the shared
         // merge keeps the moderation definition; runtime dispatch (not the
@@ -2555,6 +2733,8 @@ mod tests {
         assert!(merged.iter().any(|d| d.name == "reclaim"));
         assert!(merged.iter().any(|d| d.name == "transfer"));
         assert!(merged.iter().any(|d| d.name == "logging"));
+        assert!(merged.iter().any(|d| d.name == "private"));
+        assert!(merged.iter().any(|d| d.name == "public"));
 
         assert!(!VoiceGates::from_map(&Default::default()).enabled);
         let vars: HashMap<String, String> = [("TWO_VOICE".to_owned(), "1".to_owned())]

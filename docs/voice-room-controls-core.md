@@ -43,9 +43,12 @@ gates (owner-only commands, admin override), persistence of the decided limit
 `/name`, and Discord writes (user limit, bitrate, renames). No live channel
 update is performed or verified by this component's tests.
 
-`/name` is wired: see [`voice-name-panel.md`](voice-name-panel.md). `/limit`,
-`/unlimit`, `/private`, `/public`, the Join channel and the bitrate preference
-are not.
+`/name` is wired: see [`voice-name-panel.md`](voice-name-panel.md). `/private`
+and `/public` are wired with the Join channel: see
+[`voice-private-core.md`](voice-private-core.md#runtime-wiring-private-and-public).
+The join-request buttons are wired too: see
+[`voice-private-core.md`](voice-private-core.md#runtime-wiring-join-requests).
+`/limit`, `/unlimit` and the bitrate preference are not.
 
 ## Hermetic verification
 

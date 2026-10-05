@@ -125,7 +125,10 @@ Feed commands are delivered by PR #116. The managed poller slice registers a
 `feeds` job in the existing website/community job supervisor and uses that
 context's executor/pool. It does not introduce a dispatcher, client, detached
 interval, gateway REST/DB work, migration, or activation. `TWO_ANNOUNCEMENTS=1`
-is required; absent/off parks the job. The validated 60–86400-second interval
+is required and the boot identity must permit the `announcements` capability
+(`feed_jobs::register_fenced`, the same live-identity fence as the announcement
+verbs: the live guild/application pair, an unknown or mismatched pair and an
+unparseable token never register the poller); absent/off/refused parks the job. The validated 60–86400-second interval
 still defaults to 300, with no startup jitter. `FeedPollSchedule` is guarded so
 normal return, panic, timeout or cancellation finishes the pass. Existing job
 ownership skips busy deadlines and cancels/joins active work during shutdown;

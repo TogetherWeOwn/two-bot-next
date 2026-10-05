@@ -14,7 +14,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 27.
+Built-in commands: 28.
 
 ## `/attendance`
 
@@ -105,6 +105,15 @@ Remove a feed relay
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `id` | string | true | — | — | — | — | Feed id |
+
+## `/help`
+
+Show this server's live commands, grouped by who can use them.
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
 
 ## `/kick`
 
@@ -284,7 +293,7 @@ Temporarily ban a member
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `target` | user | true | — | — | — | — | Member to moderate |
-| `duration_seconds` | integer | true | 60 | — | — | — | Duration in seconds |
+| `duration_seconds` | integer | true | 60 | 31536000 | — | — | Duration in seconds |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
 
 ## `/timeout`
@@ -297,7 +306,7 @@ Timeout a member
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `target` | user | true | — | — | — | — | Member to moderate |
-| `duration_seconds` | integer | true | 60 | — | — | — | Duration in seconds |
+| `duration_seconds` | integer | true | 60 | 2419200 | — | — | Duration in seconds |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
 
 ## `/unlock`

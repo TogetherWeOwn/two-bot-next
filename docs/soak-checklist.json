@@ -2333,20 +2333,19 @@
           "[287d00e](https://github.com/TogetherWeOwn/two-bot/commit/287d00eebc7af189f3d1f0c5a666470c0417d6de)",
           "`src/index.ts/`, `src/tempVoice/`",
           "TOG-3052: name the missing permission instead of asking for a retry",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
         "TOG-10093",
         "TOG-10119"
       ],
-      "status": "waived",
-      "action": "In TOG-10093’s mock-Discord fixture, deny the bot’s Manage Channels/Move Members permission and trigger a create.",
-      "expected": "The reply names the missing permission instead of asking for a retry; no partial room remains.",
-      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "status": "automated",
+      "action": "Run the worker-level refused-create and refused-move fixtures in `crates/bot/src/voice_rooms_tests.rs`: deny the bot Manage Channels or Move Members (guild, category or creator-channel scope) and trigger a join-time create; also a 403 the permission cache cannot explain.",
+      "expected": "The recorded failure, the error notice and the `/setup` failure line name the missing permission and, when known, the category or channel override that removes it (or, with a clean cache, the permission the refused write needs); no partial room remains.",
+      "evidence": "Attach the exact-head fixture command and PASS/NEEDS WORK result; fixture proof only (the worker fixtures run against mock Discord/store doubles), not a deployed-network soak receipt. Staging acceptance stays on TOG-10119.",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
-      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib voice_rooms::tests::missing_permission_"
     },
     {
       "id": "s13-847fbf8",
@@ -2481,18 +2480,19 @@
           "[78e7c2d](https://github.com/TogetherWeOwn/two-bot/commit/78e7c2d3fddfc978f7dfa7e44ae0316fe7aa4244)",
           "`src/tempVoice/`",
           "TOG-3471: renumber temp-voice migrations to 0036/0037; filter create-path names through automod",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
         "TOG-10093",
         "TOG-10119"
       ],
-      "status": "manual",
-      "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Create a room whose requested name contains a configured automod-blocked fixture term.",
-      "expected": "The create path filters or refuses the name through automod; temp-voice migrations come from TOG-10091’s test-container receipt, not staging SQL.",
-      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
-      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+      "status": "automated",
+      "action": "Run the worker-level create-path name-filter fixtures in `crates/bot/src/voice_rooms_tests.rs` with a fixture automod policy (invented blocked term, no real word list): a display name containing the term, an invite link, and a template that is itself blocked; also the `/create` name.",
+      "expected": "A blocked name is retried without the username; when even the bare template is blocked the join is refused with the `name_blocked` reason and no Discord create call is made. A blocked `/create` name is refused before any REST call.",
+      "evidence": "Attach the exact-head fixture command and PASS/NEEDS WORK result; fixture proof only (mock Discord/store doubles), not a deployed-network soak receipt. Temp-voice migrations come from the test-container receipt and staging acceptance stays on TOG-10119.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib voice_rooms::tests::name_filter_"
     },
     {
       "id": "s13-e2a3f37",
@@ -2603,19 +2603,18 @@
           "[59965d0](https://github.com/TogetherWeOwn/two-bot/commit/59965d0c0f9370dc9b19add3712a3acf64fb30ed)",
           "`src/core/`, `src/discord/`",
           "TOG-5981: serialize same-member voice frames, scope voice idempotency keys by channel",
-          "gap"
+          "ported"
         ]
       },
       "owner": [
         "TOG-15277"
       ],
-      "status": "waived",
-      "action": "Replay a same-tick burst of same-member voice frames across two channels through the fixture added by TOG-15277.",
-      "expected": "Frames apply serially per member and idempotency keys are channel-scoped: one session per channel, no cross-channel dedupe.",
-      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "automated",
+      "action": "Run the voice-frame serialization and same-instant burst fixtures in `crates/discord/tests/funnel_replay.rs`, plus the channel-scoped key and end-then-start fixtures in `crates/core`.",
+      "expected": "Frames for one member apply whole and in order: a second frame waits for the first move's end and start. A one-stamp burst keeps every end `startKnown:true` with `durationSeconds` 0 and every boundary a separate channel-scoped row; a return to the opening channel repeats the opening start key, as in legacy. Not deployed gateway evidence.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result; fixture proof only, not a deployed-gateway soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib -- funnel::tests::repeatable_key_carries_time_and_voice_channel handlers::tests::voice_move_is_end_then_start_at_same_instant && python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test funnel_replay -- pipeline_serializes_same_member_voice_frames pipeline_same_instant_voice_burst_keeps_every_boundary_as_its_own_row pipeline_same_instant_voice_return_to_origin_dedupes_only_the_repeat_start",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
     },
     {
       "id": "s13-7da2c15",
@@ -2667,7 +2666,7 @@
           "[6928f11](https://github.com/TogetherWeOwn/two-bot/commit/6928f113e3bff2b1396408f50cea60266fbd29d4)",
           "`src/core/`, `src/store/`",
           "TOG-6817: guard so backfill gate_cleared never feeds time-to-clear",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -2688,7 +2687,7 @@
           "[37afd80](https://github.com/TogetherWeOwn/two-bot/commit/37afd809f940d1cf36f1df3e87d7a14873ccd099)",
           "`src/discord/`, `src/jobs/`",
           "feat(presence): cap probe scan cost and window trend reads (#236)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -2709,18 +2708,17 @@
           "[3f513ed](https://github.com/TogetherWeOwn/two-bot/commit/3f513ed3d8d5238c21f927a8664c194af266540b)",
           "`src/automod/`, `src/backfill/`",
           "test(qa): fixture-driven acceptance for roster, moderation, backfill, automod, dashboard (#218)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
-        "TOG-9882"
+        "TOG-15759"
       ],
-      "status": "waived",
-      "action": "Run TOG-9882’s roster, moderation, backfill, automod and dashboard acceptance fixtures on test containers.",
-      "expected": "Each fixture contract passes; the automod export runs on demand only, not as a scheduled job.",
-      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "automated",
+      "action": "Run the message-scan accounting unit fixtures, the automod validator unit fixtures, the welcome byte-identity unit fixtures, the inactivity empty-window DB fixture and the ladder second-pass DB fixture on disposable test databases.",
+      "expected": "Rerun-identical ladders, zero-scan zeros, malformed rows counted and never laddered; empty automod export valid with null/scalar refused and validation repeat-identical with extra fields passing through; legacy/session/anchor welcome bytes and Post content byte-identical; empty-window sweep writes zero events; second write pass over the same ladder inserts zero events while an older re-scan pulls the milestone back.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the `#[ignore]` DB scenarios need the disposable agent-testdb URL and run in the `check.yml` cutover-reward-ladder lib step and the community-db inactivity step. Fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib message_scan::tests && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib message_scan_write_tests -- --ignored && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib automod::tests::export && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib welcome_copy_is_byte_identical_to_the_pure_renderers welcome_effects_post_the_renderer_bytes_unchanged && python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --lib inactivity_store"
     },
     {
       "id": "s13-b948b89",
@@ -2751,19 +2749,17 @@
           "[7f90492](https://github.com/TogetherWeOwn/two-bot/commit/7f904926891c2d97fd3f0765a2b2c34993c69f67)",
           "`src/core/`, `src/internal/`",
           "feat(events): add gated event.read mapped-event verifier (#266)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
-        "TOG-10862",
-        "TOG-10603"
+        "TOG-15757"
       ],
-      "status": "waived",
-      "action": "Send signed `event.read` calls for mapped and unmapped event keys through TOG-10862’s executor and TOG-10603’s receiver fixtures.",
-      "expected": "The gated verifier returns the mapped event and refuses unmapped keys without Discord writes.",
-      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "automated",
+      "action": "Send signed keyless `event.read` calls for mapped and unmapped event keys, with the flag on and off, through the receiver fixtures with a loopback Discord double.",
+      "expected": "The gated verifier returns the mapped event with the 7-field read result and refuses unmapped keys, a disabled flag, replayed nonces and forged signatures without Discord writes.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib event_key_names_a_key_never_a_snowflake && python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test internal_action_store event_key_map && python3 scripts/cargo_cache.py run -- test -p two-bot event_read"
     },
     {
       "id": "s13-dc2b507",
@@ -2794,7 +2790,7 @@
           "[860557f](https://github.com/TogetherWeOwn/two-bot/commit/860557fcfcb122717b0f84b189e57c9c0fb9c3d3)",
           "`src/backfill/`",
           "test(backfill): refuse malformed export rows without throwing (#289)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -2899,18 +2895,17 @@
           "[673cd13](https://github.com/TogetherWeOwn/two-bot/commit/673cd13005499ab1289760e81f67f868118c3e0c)",
           "`src/moderation/`",
           "fix(moderation): report truncated only when rows were actually cut (#307)",
-          "gap"
+          "ported"
         ]
       },
       "owner": [
         "TOG-15281"
       ],
-      "status": "waived",
-      "action": "Run the disable-guard report fixture with owed ids exactly at and just above the 10-id naming limit (TOG-15281).",
-      "expected": "`+N more` appears only when ids were actually left unnamed; counts stay exact.",
-      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "automated",
+      "action": "Run the disable-preflight report fixtures in `crates/core/src/disable_preflight.rs` with exactly 10 and exactly 11 owed ids in each of the unban, running-claim, lockdown and scheduled-message sections.",
+      "expected": "Exactly 10 ids are all named with the exact count and no `+N more`; 11 ids name the first 10, end in `+1 more` and keep the exact count 11. Truncation is reported only when ids were actually cut.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with the sanitized report lines for 10 and 11 ids; fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib disable_preflight::tests"
     },
     {
       "id": "s13-df990c9",
@@ -2962,19 +2957,18 @@
           "[3c3e7e8](https://github.com/TogetherWeOwn/two-bot/commit/3c3e7e86f1e12ce2061add989da36882aa06e05a)",
           "`src/core/`, `src/leveling/`",
           "fix(voice): treat malformed leave timestamp as unknown-start (#265)",
-          "gap"
+          "ported"
         ]
       },
       "owner": [
         "TOG-15277"
       ],
-      "status": "waived",
-      "action": "Deliver a voice leave with a malformed timestamp, with and without an open session, through the fixture added by TOG-15277.",
-      "expected": "The session is treated as unknown-start, not a fabricated duration, and no leveling XP is awarded.",
-      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "automated",
+      "action": "Run the malformed-timestamp fixtures in `crates/core/src/voice.rs` and `crates/core/src/handlers.rs`.",
+      "expected": "A leave stamp that does not parse, or a recorded start that does not parse, resolves to `start_known=false` with no `started_at` and no duration. A malformed leave is stamped with processing time, closes the session as one unknown-start end row and awards no voice XP. Not deployed gateway evidence.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result; fixture proof only, not a deployed-gateway soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib -- voice::tests::resolve_measured_and_unknown voice::tests::malformed_leave_with_open_session_is_unknown_start voice::tests::malformed_open_start_with_valid_leave_is_unknown_start handlers::tests::malformed_leave_with_open_session_writes_one_unknown_start_end_and_no_xp handlers::tests::well_formed_leave_with_open_session_awards_the_measured_seconds",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
     },
     {
       "id": "s13-c99fec7",
@@ -3026,18 +3020,17 @@
           "[cad94b6](https://github.com/TogetherWeOwn/two-bot/commit/cad94b6db5dc21869d9ca9cd112c497a070556ab)",
           "`src/moderation/`",
           "fix(moderation): name stranded running unban claims with hand-release steps (#320)",
-          "gap"
+          "ported"
         ]
       },
       "owner": [
         "TOG-15281"
       ],
-      "status": "waived",
-      "action": "Run the disable-guard fixture with a running unban claim left by a stopped worker (TOG-15281).",
-      "expected": "The refusal tags each running claim and gives the supported release steps.",
-      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "automated",
+      "action": "With `TWO_TEST_DATABASE_URL` set to the disposable agent-testdb or CI service (an unset URL skips the DB cases), run the disable-preflight fixtures: a `running` unban left by a stopped worker, and a pending-only refusal.",
+      "expected": "The refusal and `two-bot moderation preflight [--json]` list the stranded claim in a `[running]` section with the recovery pointer, and add `running_unbans` beside the unchanged `pending_unbans`; a pending-only refusal has neither the tag nor the pointer. Exit codes are unchanged and the claim token is never reported. The close is the documented claim-token-fenced store call; no operator command for it exists.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with the sanitized report lines and `running_unbans` array; fixture proof only, not a deployed-network soak receipt or a recovery rehearsal.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib disable_preflight::tests && python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test disable_preflight_db && python3 scripts/cargo_cache.py run -- test -p two-bot --test moderation_preflight_cli"
     },
     {
       "id": "s13-db84b22",
@@ -3068,7 +3061,7 @@
           "[9ee2e89](https://github.com/TogetherWeOwn/two-bot/commit/9ee2e8969e21159d8b30aea94b98ddbaecf38cbd)",
           "`src/store/`",
           "feat(backup): cover all bot-owned tables in dump and restore (#330)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3089,11 +3082,11 @@
           "[2f386e8](https://github.com/TogetherWeOwn/two-bot/commit/2f386e81096385c37abcd4045221a570470d096b)",
           "`src/automations/`",
           "test(scheduler): prove disabled scheduler fires zero jobs (#335)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
-        "TOG-10081"
+        "TOG-15758"
       ],
       "status": "waived",
       "action": "Run TOG-10081’s scheduler fixture with the scheduled-message scheduler disabled and due jobs present.",
@@ -3110,7 +3103,7 @@
           "[298f3a4](https://github.com/TogetherWeOwn/two-bot/commit/298f3a4f234b8b8520eebd091b789de89f6666bb)",
           "`src/selfRoles/`",
           "fix(selfrole): reject reaction panels over Discord's 20-reaction cap (#336)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3151,7 +3144,7 @@
           "[f9fbf5c](https://github.com/TogetherWeOwn/two-bot/commit/f9fbf5cd762c4af456cdab5c097d9babf82597c7)",
           "`src/redirect/`",
           "fix(redirect): refuse reserved healthz slug at campaign add time (#340)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3170,7 +3163,7 @@
           "[6433578](https://github.com/TogetherWeOwn/two-bot/commit/64335788c597b176a2d3eadacda4de1fd2ca783e)",
           "`src/redirect/`",
           "fix(redirect): validate port and fallback code at startup (#341)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3191,7 +3184,7 @@
           "[b3d8d97](https://github.com/TogetherWeOwn/two-bot/commit/b3d8d9757a413c295081eaf9e92c6a34cae00293)",
           "`src/selfRoles/`",
           "fix(selfrole): reject button custom_ids over Discord's 100-char limit (#338)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3251,7 +3244,7 @@
           "[ce3c0e2](https://github.com/TogetherWeOwn/two-bot/commit/ce3c0e2a381a22c8b98b979efb4c8ff24ad3a9ae)",
           "`src/backfill/`",
           "test(backfill): extend malformed-row coverage, fix 3 probe-found bugs (#356)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3272,7 +3265,7 @@
           "[b62ff28](https://github.com/TogetherWeOwn/two-bot/commit/b62ff28f7d9f215e3dc8ab1149dbb5aaae19e7c2)",
           "`src/redirect/`",
           "fix(redirect): log slug and error class on lookup failure (#355)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3354,7 +3347,7 @@
           "[7df2a95](https://github.com/TogetherWeOwn/two-bot/commit/7df2a95106feb48cb032c31a4cd3de52a24bf9e6)",
           "`src/leveling/`",
           "fix(leveling): honor configured command guild fence (#394)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3416,7 +3409,7 @@
           "[1e64035](https://github.com/TogetherWeOwn/two-bot/commit/1e640352aff1996348306543cf9d2cc4de37ff82)",
           "`src/jobs/`",
           "fix(presence): bound repeated truncated roster scans (#400)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3478,7 +3471,7 @@
           "[218e469](https://github.com/TogetherWeOwn/two-bot/commit/218e469ce94d4c9f423a15efc5c892ba7e842647)",
           "`src/store/`",
           "fix(dump): validate non-table record shapes before declaring a backup verified (#416)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3499,7 +3492,7 @@
           "[1d64196](https://github.com/TogetherWeOwn/two-bot/commit/1d6419662573084a83bcd195807747c2f83ed1e1)",
           "`src/jobs/`",
           "fix(scorecard): retry failed weekly runs within bounded schedule (#413)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3560,7 +3553,7 @@
           "[f5edc70](https://github.com/TogetherWeOwn/two-bot/commit/f5edc70d6920d2981e1275f62281923f109444fb)",
           "`src/leveling/`",
           "fix(leveling): show absent members as unranked (#429)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
@@ -3641,7 +3634,7 @@
           "[3676c1d](https://github.com/TogetherWeOwn/two-bot/commit/3676c1d15f94bf6fd17c909f6ddea5d030bb4326)",
           "`src/selfRoles/`",
           "fix(self-role): reject button labels over Discord's 80-char limit (#337)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [

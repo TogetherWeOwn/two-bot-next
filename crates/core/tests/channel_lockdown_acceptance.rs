@@ -12,7 +12,7 @@
 use two_bot_core::channel_moderation::{
     moderation_result_text, plan_lockdown, plan_unlock, require_channel_reason,
     validate_purge_count, validate_slowmode_seconds, ChannelOutcome, EveryoneOverwrite,
-    LockdownRecord, UnlockError, UnlockPlan,
+    LockdownRecord, UnlockError, UnlockPlan, LOCKDOWN_BITS,
 };
 
 fn overwrite(allow: &str, deny: &str) -> EveryoneOverwrite {
@@ -95,18 +95,22 @@ fn lockdown_preserves_unrelated_bits_and_records_seed() {
         assert_eq!(plan.seed.prior_allow, original.allow);
         assert_eq!(plan.seed.prior_deny, original.deny);
         assert!(plan.seed.prior_exists);
-        // Only SEND_MESSAGES (2048) moves: cleared from allow, set in deny.
+        // Only the lockdown bits move (SEND_MESSAGES 2048 plus the thread and
+        // reaction bits): cleared from allow, set in deny.
         assert_eq!(
             plan.write,
-            overwrite(&(allow & !2048).to_string(), &(deny | 2048).to_string(),)
+            overwrite(
+                &(allow & !LOCKDOWN_BITS).to_string(),
+                &(deny | LOCKDOWN_BITS).to_string(),
+            )
         );
         // Unrelated bits survive verbatim.
         let write_allow: u64 = plan.write.allow.parse().expect("decimal allow");
         let write_deny: u64 = plan.write.deny.parse().expect("decimal deny");
-        assert_eq!(write_allow & !2048, allow & !2048);
-        assert_eq!(write_deny & !2048, deny & !2048);
-        assert_eq!(write_allow & 2048, 0);
-        assert_ne!(write_deny & 2048, 0);
+        assert_eq!(write_allow & !LOCKDOWN_BITS, allow & !LOCKDOWN_BITS);
+        assert_eq!(write_deny & !LOCKDOWN_BITS, deny & !LOCKDOWN_BITS);
+        assert_eq!(write_allow & LOCKDOWN_BITS, 0);
+        assert_eq!(write_deny & LOCKDOWN_BITS, LOCKDOWN_BITS);
     }
 }
 
@@ -116,7 +120,7 @@ fn lockdown_without_overwrite_seeds_absent_record() {
     assert_eq!(plan.seed.prior_allow, "0");
     assert_eq!(plan.seed.prior_deny, "0");
     assert!(!plan.seed.prior_exists);
-    assert_eq!(plan.write, overwrite("0", "2048"));
+    assert_eq!(plan.write, overwrite("0", &LOCKDOWN_BITS.to_string()));
 }
 
 #[test]

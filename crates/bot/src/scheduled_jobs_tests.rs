@@ -5,7 +5,10 @@ use two_bot_testsupport::TestDatabase;
 
 use super::*;
 
-use crate::discord_test_common::{MockRest, ScriptedResponse};
+use crate::{
+    activation::fixtures,
+    discord_test_common::{MockRest, ScriptedResponse},
+};
 
 const GUILD: &str = "3333";
 const CHANNEL: &str = "4444";
@@ -101,6 +104,133 @@ fn the_job_runs_every_fifteen_seconds_with_bounded_jitter() {
     assert!(job.startup_jitter <= Duration::from_secs(5));
     assert!(job.timeout > Duration::from_secs(10 * 5 * 2));
     assert_eq!(random_nonce().len(), 24, "inside Discord's 25-char ceiling");
+}
+
+fn gates(automations: Option<&str>) -> FeatureGates {
+    let mut vars = std::collections::HashMap::new();
+    if let Some(value) = automations {
+        vars.insert("TWO_AUTOMATIONS".to_owned(), value.to_owned());
+    }
+    FeatureGates::from_map(&vars).expect("gates parse")
+}
+
+/// Legacy `startScheduler(.., { enabled: false })` (commit 2f386e8): a disabled
+/// scheduler executes zero jobs. Here that means no supervised job exists, so
+/// nothing can ever call the ticker. Only the exact value `1` builds one, and
+/// building is lazy.
+#[tokio::test]
+async fn registration_builds_no_job_while_automations_are_off() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let action: JobAction = Arc::new({
+        let calls = calls.clone();
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    });
+    for value in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("true"),
+        Some("yes"),
+        Some(" 1"),
+    ] {
+        assert!(
+            register_gated(gates(value), action.clone()).is_none(),
+            "TWO_AUTOMATIONS={value:?} must not register the ticker"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let job = register_gated(gates(Some("1")), action).expect("enabled gate registers");
+    assert_eq!(job.name, "scheduled_messages");
+    assert_eq!(job.cadence, Duration::from_secs(15));
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "registration is lazy");
+    (job.action)().await.expect("action runs");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// TOG-15758: the ticker posts under the token's identity, so the capability
+/// fence binds it like the `/schedule` verbs. With `TWO_AUTOMATIONS=1` the
+/// staging pair registers; the live pair (automations uncleared), an unknown
+/// guild, a mismatched pair and a missing or unparseable token build no job.
+#[tokio::test]
+async fn identity_fence_registers_the_ticker_only_where_automations_are_permitted() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let action: JobAction = Arc::new({
+        let calls = calls.clone();
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    });
+    let on = gates(Some("1"));
+
+    let job = register_fenced(on, &fixtures::staging(), action.clone())
+        .expect("staging identity registers the ticker");
+    assert_eq!(job.name, "scheduled_messages");
+    (job.action)().await.expect("staging action runs");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    for (label, activation) in fixtures::refused() {
+        assert!(
+            register_fenced(on, &activation, action.clone()).is_none(),
+            "{label} must not register the ticker"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "refused jobs never run");
+
+    // Identity never enables what the environment left off.
+    for value in [None, Some("0")] {
+        assert!(register_fenced(gates(value), &fixtures::staging(), action.clone()).is_none());
+    }
+}
+
+/// The same legacy row against a database with a due row: the disabled
+/// registration leaves the row unclaimed, unposted and unaudited, while the
+/// enabled control with the same action posts it once.
+#[tokio::test]
+async fn disabled_scheduler_leaves_a_due_row_untouched_and_the_enabled_control_posts_it() {
+    let Some(fixture) = fixture().await else {
+        return;
+    };
+    let pool = fixture.pool().clone();
+    seed(&pool, "due", T0 - 1_000, None).await;
+    let before = row(&pool, "due").await;
+    let mock = MockRest::start(vec![posted()], ScriptedResponse::status(500)).await;
+    let rest = executor(&mock);
+    let action: JobAction = {
+        let (pool, rest) = (pool.clone(), rest.clone());
+        Arc::new(move || {
+            let (pool, rest) = (pool.clone(), rest.clone());
+            Box::pin(async move { tick(&pool, &rest, GUILD, || T0).await })
+        })
+    };
+
+    assert!(register_gated(gates(None), action.clone()).is_none());
+    assert!(register_gated(gates(Some("0")), action.clone()).is_none());
+    assert!(
+        posts(&mock).is_empty(),
+        "a disabled scheduler posts nothing"
+    );
+    let untouched = row(&pool, "due").await;
+    assert_eq!(untouched.next_run_at, before.next_run_at);
+    assert!(untouched.enabled);
+    assert_eq!(untouched.claim_token, None);
+    assert_eq!(untouched.last_run_at, None);
+    assert!(audits(&pool, "due").await.is_empty());
+
+    let job = register_gated(gates(Some("1")), action).expect("enabled control registers");
+    (job.action)().await.expect("enabled tick");
+    assert_eq!(posts(&mock).len(), 1, "the control posts the due row once");
+    assert_eq!(audits(&pool, "due").await, [audit("ok", None)]);
+    mock.shutdown().await;
+    fixture.close().await.unwrap();
 }
 
 #[tokio::test]

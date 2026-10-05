@@ -1,12 +1,15 @@
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use two_bot_core::commands::OCCURRENCE_ID_MAX_CHARS;
+use two_bot_core::commands::{CommandDefinition, HELP_DESCRIPTION, OCCURRENCE_ID_MAX_CHARS};
 use two_bot_core::router::{InteractionRouter, RouterGates};
 
 pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("rsvp-attendance", "docs/parity.md §1 #12 / #25"),
     ("rota-acknowledge", "docs/parity.md §1 #13 / §9 drop 1"),
     ("attendance", "docs/parity.md §1 #12 bound"),
+    ("help", "docs/parity.md §1 help"),
+    ("tempban", "docs/parity.md §1 #4 duration ceiling"),
+    ("timeout", "docs/parity.md §1 #6 duration ceiling"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -60,11 +63,37 @@ pub fn expected_registry() -> Value {
         .find(|c| c["name"] == "attendance" && c["options"][0]["name"] == "event-occurrence")
         .expect(INTENTIONAL_DIFFERENCES[2].1);
     scorecard["options"][0]["max_length"] = json!(OCCURRENCE_ID_MAX_CHARS);
+    // Duration exceptions add ONLY the service ceiling to each picker option;
+    // preserve the frozen legacy payload and compare every other field strictly.
+    for (name, max, reference) in [
+        ("tempban", 31_536_000_i64, INTENTIONAL_DIFFERENCES[3].1),
+        ("timeout", 2_419_200_i64, INTENTIONAL_DIFFERENCES[4].1),
+    ] {
+        let command = commands
+            .iter_mut()
+            .find(|c| c["name"] == name)
+            .expect(reference);
+        let duration = command["options"]
+            .as_array_mut()
+            .expect("legacy options array")
+            .iter_mut()
+            .find(|o| o["name"] == "duration_seconds")
+            .expect(reference);
+        assert_eq!(duration["min_value"], json!(60));
+        assert!(duration["max_value"].is_null());
+        duration["max_value"] = json!(max);
+    }
     let rota = commands
         .iter()
         .position(|c| c["name"] == INTENTIONAL_DIFFERENCES[1].0)
         .expect(INTENTIONAL_DIFFERENCES[1].1);
     commands.remove(rota);
+    // Next-only `/help` discovery surface: no legacy counterpart. Insert at
+    // the publish position (third, after the leveling core) as the exact
+    // published definition, so parity pins its shape too.
+    let help = serde_json::to_value(CommandDefinition::new("help", HELP_DESCRIPTION))
+        .expect("help serializes");
+    commands.insert(2, help);
     canonical_registry(json!(commands))
 }
 

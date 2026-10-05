@@ -13,8 +13,8 @@
 //! - policy/executor (`MemberModerationService::execute`): the permission bit,
 //!   target protection (self, guild owner, Owen, the bot, other bots, staff
 //!   roles) and bot-then-actor hierarchy, each refusal carrying its exact
-//!   user-facing copy. A refused tempban never touches Discord, never writes an
-//!   audit row and never stages an unban.
+//!   user-facing copy. A policy-refused tempban writes a denied audit without
+//!   touching Discord, claiming the idempotency key or staging an unban.
 //! - audit + unban queue: a successful tempban writes exactly one
 //!   `moderation_audit` row (`moderation.tempban` / `temporarily_banned`, trimmed
 //!   reason, duration and first ban-attempt generation in the metadata),
@@ -114,7 +114,7 @@ fn tempban_execution(duration_seconds: i64) -> MemberExecution {
         guild_id: GUILD_ID.to_owned(),
         actor: actor_with(PERM_BAN_MEMBERS, 50),
         target: Some(plain_target(10)),
-        bot_highest_role_position: Some(100),
+        bot_highest_role_position: 100,
         reason: "spam in #general".to_owned(),
         duration_seconds: Some(duration_seconds),
         request_id: REQUEST_ID.to_owned(),
@@ -129,11 +129,9 @@ fn service_with(
     MemberModerationService::new(discord, store, policy(), || NOW_MS)
 }
 
-/// Nothing a refused tempban may leave behind: no Discord call, no audit row,
-/// no staged (or any other) unban job for the request.
-fn assert_no_side_effects(discord: &MockMemberDiscord, store: &MemMemberStore, request_id: &str) {
+/// A refused tempban sends no Discord call and prepares no ban or unban.
+fn assert_no_effects(discord: &MockMemberDiscord, store: &MemMemberStore, request_id: &str) {
     assert!(discord.calls().is_empty(), "refusal reached Discord");
-    assert!(store.audits().is_empty(), "refusal wrote an audit row");
     assert_eq!(
         store.unban_state(request_id),
         None,
@@ -143,6 +141,34 @@ fn assert_no_side_effects(discord: &MockMemberDiscord, store: &MemMemberStore, r
         store.ban_attempt(request_id),
         None,
         "refusal prepared a ban attempt"
+    );
+}
+
+/// Malformed duration refusals remain unaudited.
+fn assert_no_side_effects(discord: &MockMemberDiscord, store: &MemMemberStore, request_id: &str) {
+    assert_no_effects(discord, store, request_id);
+    assert!(store.audits().is_empty(), "refusal wrote an audit row");
+}
+
+fn assert_policy_denial(
+    discord: &MockMemberDiscord,
+    store: &MemMemberStore,
+    exec: &MemberExecution,
+) {
+    assert_no_effects(discord, store, &exec.request_id);
+    let audits = store.audits();
+    assert_eq!(audits.len(), 1);
+    let row = &audits[0];
+    assert_eq!(row.action, "moderation.tempban");
+    assert_eq!(row.outcome, "denied");
+    assert_eq!(row.request_id, format!("{}:denied", exec.request_id));
+    assert_eq!(row.idempotency_key, exec.idempotency_key);
+    assert_eq!(row.reason, "Member moderation policy refused the request");
+    let metadata: serde_json::Value =
+        serde_json::from_str(&row.metadata_json).expect("audit metadata is JSON");
+    assert_eq!(
+        metadata,
+        serde_json::json!({ "stage": "policy", "request_id": exec.request_id })
     );
 }
 
@@ -328,7 +354,7 @@ async fn tempban_permission_refusal_wins_over_a_bad_duration() {
         ))
     );
     assert_eq!(err.to_string(), TEMPBAN_POLICY_DENIED_COPY);
-    assert_no_side_effects(&discord, &store, REQUEST_ID);
+    assert_policy_denial(&discord, &store, &exec);
 }
 
 /// One refusal case: mutate the request, then the expected error and its
@@ -366,7 +392,7 @@ fn policy_refusal_cases() -> Vec<RefusalCase> {
                 exec.target.as_mut().expect("target").user_id = ACTOR_ID.to_owned()
             },
             PolicyError::TargetSelf,
-            "You cannot moderate yourself",
+            "This target cannot be moderated",
         ),
         (
             "guild owner",
@@ -374,7 +400,7 @@ fn policy_refusal_cases() -> Vec<RefusalCase> {
                 exec.target.as_mut().expect("target").is_guild_owner = true
             },
             PolicyError::TargetGuildOwner,
-            "The guild owner is protected",
+            "This target cannot be moderated",
         ),
         (
             "Owen's user id",
@@ -382,7 +408,7 @@ fn policy_refusal_cases() -> Vec<RefusalCase> {
                 exec.target.as_mut().expect("target").user_id = OWEN_ID.to_owned()
             },
             PolicyError::TargetOwen,
-            "Owen is protected",
+            "This target cannot be moderated",
         ),
         (
             "the bot's own user id",
@@ -390,13 +416,13 @@ fn policy_refusal_cases() -> Vec<RefusalCase> {
                 exec.target.as_mut().expect("target").user_id = BOT_ID.to_owned()
             },
             PolicyError::TargetOwen,
-            "Owen is protected",
+            "This target cannot be moderated",
         ),
         (
             "another bot",
             |exec: &mut MemberExecution| exec.target.as_mut().expect("target").is_bot = true,
             PolicyError::TargetBot,
-            "Bots are protected",
+            "This target cannot be moderated",
         ),
         (
             "staff role",
@@ -404,7 +430,7 @@ fn policy_refusal_cases() -> Vec<RefusalCase> {
                 exec.target.as_mut().expect("target").role_ids = vec![STAFF_ROLE_ID.to_owned()]
             },
             PolicyError::TargetStaffRole,
-            "Staff roles are protected",
+            "This target cannot be moderated",
         ),
         (
             "target at the invoker's rank",
@@ -424,14 +450,14 @@ fn policy_refusal_cases() -> Vec<RefusalCase> {
         ),
         (
             "target at Owen's rank",
-            |exec: &mut MemberExecution| exec.bot_highest_role_position = Some(10),
+            |exec: &mut MemberExecution| exec.bot_highest_role_position = 10,
             PolicyError::BotHierarchy,
             BOT_HIERARCHY_COPY,
         ),
         (
             "both hierarchies fail: the bot refusal wins",
             |exec: &mut MemberExecution| {
-                exec.bot_highest_role_position = Some(10);
+                exec.bot_highest_role_position = 10;
                 exec.target.as_mut().expect("target").highest_role_position = 60;
             },
             PolicyError::BotHierarchy,
@@ -443,16 +469,16 @@ fn policy_refusal_cases() -> Vec<RefusalCase> {
                 let target = exec.target.as_mut().expect("target");
                 target.is_guild_owner = true;
                 target.highest_role_position = 60;
-                exec.bot_highest_role_position = Some(10);
+                exec.bot_highest_role_position = 10;
             },
             PolicyError::TargetGuildOwner,
-            "The guild owner is protected",
+            "This target cannot be moderated",
         ),
     ]
 }
 
 #[tokio::test]
-async fn tempban_policy_refusals_name_the_protection_and_leave_no_trace() {
+async fn tempban_policy_refusals_pin_the_copy_and_audit_without_effects() {
     for (label, mutate, expect, copy) in policy_refusal_cases() {
         let discord = MockMemberDiscord::new();
         let store = MemMemberStore::new();
@@ -465,7 +491,7 @@ async fn tempban_policy_refusals_name_the_protection_and_leave_no_trace() {
             .expect_err("refused tempban must not execute");
         assert_eq!(err, MemberError::Policy(expect), "{label}");
         assert_eq!(err.to_string(), copy, "{label}");
-        assert_no_side_effects(&discord, &store, REQUEST_ID);
+        assert_policy_denial(&discord, &store, &exec);
 
         // The refusal happened before any claim, so the same key succeeds once
         // the request is eligible again.
@@ -475,6 +501,17 @@ async fn tempban_policy_refusals_name_the_protection_and_leave_no_trace() {
             .unwrap_or_else(|err| panic!("{label}: retry after fix failed: {err:?}"));
         assert_eq!(result.outcome, MemberOutcome::TemporarilyBanned, "{label}");
         assert!(!result.replayed, "{label}");
+        let audits = store.audits();
+        assert_eq!(audits.len(), 2, "{label}");
+        assert_eq!(
+            audits[0].request_id,
+            format!("{REQUEST_ID}:denied"),
+            "{label}"
+        );
+        assert_eq!(audits[0].outcome, "denied", "{label}");
+        assert_eq!(audits[1].request_id, REQUEST_ID, "{label}");
+        assert_eq!(audits[1].outcome, "temporarily_banned", "{label}");
+        assert_eq!(audits[1].reason, "spam in #general", "{label}");
     }
 }
 

@@ -296,6 +296,23 @@ pub fn builtin_command_names() -> HashSet<String> {
         .collect()
 }
 
+/// Names a custom command may not be *written* under: every builtin plus the
+/// voice-room set. The voice sink dispatches by name, so a custom command named
+/// `setup` or `export` would reach the voice handlers the moment `TWO_VOICE`
+/// turns on, even if it was created while voice was off. This guards writes
+/// only (`/command`, imports). Dispatch keeps [`builtin_command_names`], so a
+/// stored row that predates the reservation keeps running while voice is off.
+#[must_use]
+pub fn reserved_command_names() -> HashSet<String> {
+    let mut names = builtin_command_names();
+    names.extend(
+        super::voice_rooms::voice_commands()
+            .into_iter()
+            .map(|def| def.name),
+    );
+    names
+}
+
 /// Refuse unless automations are on. Registered with `false`, the handler
 /// refuses instead of executing — the half of disable a deregister cannot
 /// cover, because an interaction can already be in flight when the DELETE
@@ -786,6 +803,37 @@ mod tests {
                 validate_put_input(&input, &builtins),
                 Err(CommandError::ReservedName(reserved.to_owned())),
                 "{reserved} reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_reservation_stays_free_of_voice_names() {
+        // Only writes reserve voice names. A stored row under one keeps running
+        // while voice is off, so dispatch must not treat the name as builtin.
+        let dispatch = builtin_command_names();
+        let reserved = reserved_command_names();
+        let voice = crate::voice_rooms::voice_commands();
+        assert!(dispatch.is_subset(&reserved));
+        assert!(!dispatch.contains("setup"));
+        assert!(voice.iter().all(|def| reserved.contains(&def.name)));
+    }
+
+    #[test]
+    fn put_validation_refuses_every_voice_room_name() {
+        // The voice sink matches by name, so a custom command named after a
+        // voice command would reach the voice handlers.
+        let builtins = reserved_command_names();
+        let voice = crate::voice_rooms::voice_commands();
+        assert!(voice.iter().any(|def| def.name == "setup"));
+        for def in &voice {
+            let mut input = put_input(&def.name);
+            input.text_trigger = None;
+            assert_eq!(
+                validate_put_input(&input, &builtins),
+                Err(CommandError::ReservedName(def.name.clone())),
+                "{} reserved",
+                def.name
             );
         }
     }

@@ -539,7 +539,11 @@ where
     H: RoomWrites + Send + 'static,
     F: Future<Output = ()> + Send,
 {
-    let Some((actor_id, is_admin)) = interaction_actor(interaction) else {
+    // The admin override comes from guild-level role facts, never from the
+    // channel-scoped interaction permissions a room owner's own grant inflates.
+    let guild_permissions = runtime.guild_permissions(interaction);
+    let is_admin = is_voice_admin(guild_permissions);
+    let Some(actor_id) = invoker_member_id(interaction) else {
         reply(ephemeral_response(
             "I couldn't tell who invoked /name — try again.",
         ))
@@ -548,7 +552,7 @@ where
     };
     let (store, _) = runtime.make_pair();
     if gated {
-        let member = access_member(interaction);
+        let member = access_member(interaction, guild_permissions);
         if let Some(denial) = command_gate(&store, guild_id, &member, "name").await {
             reply(denial).await;
             return true;

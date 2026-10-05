@@ -48,7 +48,7 @@ use two_bot_core::funnel::now_millis_for_test;
 use two_bot_core::sticky::{store, ActivityOutcome};
 use two_bot_core::{
     RouterGates, RouterRefusal, ANNOUNCEMENTS_DISABLED_REPLY, AUTOMATIONS_DISABLED_REPLY,
-    MANAGE_EVENTS_REQUIRED, MANAGE_SERVER_REQUIRED,
+    MANAGE_EVENTS_REQUIRED, MANAGE_SERVER_REQUIRED, MODERATION_DISABLED_REPLY,
 };
 use two_bot_discord::ActionExecutor;
 
@@ -56,6 +56,7 @@ use crate::command_runtime::{
     actor_id, ephemeral, feed_add_options, feed_remove_option, new_id, router_with_commands,
     sticky_options, CommandRuntime, RegistrySyncError,
 };
+use crate::member_runtime::MemberRuntime;
 use crate::schedule_runtime::{schedule_options, schedule_remove_option};
 
 const GUILD: u64 = 2222;
@@ -512,6 +513,7 @@ fn activation_runtime(guild: u64, token: &str, origin: String) -> Arc<CommandRun
         requested,
         None,
         None,
+        None,
         two_bot_core::OnboardingGates {
             mode: two_bot_core::OnboardingMode::Legacy,
             dry_run: false,
@@ -660,7 +662,7 @@ async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
                 .collect();
             assert_eq!(
                 names,
-                vec!["rank", "leaderboard"],
+                vec!["rank", "leaderboard", "help"],
                 "unrelated core commands remain; uncleared surfaces are replaced"
             );
         }
@@ -759,6 +761,7 @@ async fn activation_boot_from_env_fixture() {
             mode: two_bot_core::OnboardingMode::Legacy,
             dry_run: false,
         },
+        None,
         &activation,
     );
     if expected == "invalid" {
@@ -772,7 +775,7 @@ async fn activation_boot_from_env_fixture() {
     let defs = runtime.router().publish_set(&[]).unwrap();
     let names: Vec<_> = defs.iter().map(|def| def.name.as_str()).collect();
     if expected == "narrowed" {
-        assert_eq!(names, ["rank", "leaderboard"]);
+        assert_eq!(names, ["rank", "leaderboard", "help"]);
         assert!(!runtime.router().gates().moderation);
         assert!(!runtime.router().gates().automations);
         assert!(!runtime.router().gates().announcements);
@@ -874,6 +877,67 @@ async fn refused_interaction_is_answered_ephemerally_via_executor() {
 }
 
 #[tokio::test]
+async fn unconfirmed_help_does_not_invent_a_live_registry() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    assert!(runtime.published_commands().is_none());
+    runtime
+        .on_interaction(&slash("help", Some(CHANNEL), Vec::new()))
+        .await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1);
+    let reply: serde_json::Value = serde_json::from_slice(&callbacks[0].body).unwrap();
+    assert_eq!(reply["type"], 4);
+    assert_eq!(reply["data"]["flags"], 64);
+    assert_eq!(
+        reply["data"]["content"],
+        "The command list is still refreshing. Try /help again shortly."
+    );
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "no publication or store work from help"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn help_answers_immediately_from_the_live_publish_set() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    // All feature gates on: the reply must equal the rendered live set.
+    let router_gates = RouterGates {
+        scorecard: true,
+        moderation: true,
+        ..gates(true, true)
+    };
+    let runtime = runtime_without_db(router_gates, true, origin);
+    assert!(runtime.published_commands().is_none());
+    runtime.publish_registry_checked(Some(1111)).await.unwrap();
+    assert!(runtime.published_commands().is_some());
+    runtime
+        .on_interaction(&slash("help", Some(CHANNEL), Vec::new()))
+        .await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1, "one immediate callback, no defer");
+    let reply: serde_json::Value =
+        serde_json::from_slice(&callbacks[0].body).expect("callback json");
+    assert_eq!(reply["type"], 4, "immediate response, not a defer");
+    assert_eq!(reply["data"]["flags"], 64, "ephemeral");
+    let content = reply["data"]["content"].as_str().expect("content");
+    let defs = router_with_commands(router_gates)
+        .publish_set(&[])
+        .expect("live set");
+    assert_eq!(content, two_bot_core::help_text(&defs));
+    assert!(content.contains("/help"), "lists itself");
+    assert!(content.contains("/ban"), "lists gated commands");
+    assert!(
+        content.contains("needs Ban Members"),
+        "marks the gate: {content}"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn published_unwired_commands_reply_without_defer_or_store_work() {
     for router_gates in [
         gates(false, false),
@@ -913,11 +977,13 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "schedule-list"
                         | "rank"
                         | "leaderboard"
+                        | "help"
                 )
             })
             .collect();
         assert!(!unwired.contains(&"rank"));
         assert!(!unwired.contains(&"leaderboard"));
+        assert!(!unwired.contains(&"help"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }
@@ -987,6 +1053,197 @@ async fn unwired_commands_preserve_disabled_and_permission_refusals() {
     mock.shutdown().await;
 }
 
+// ---------------------------------------------------------------------------
+// Member-moderation router-to-executor wiring (member runtime slice)
+// ---------------------------------------------------------------------------
+
+/// Runtime with the member-moderation consumer attached over a never-used
+/// lazy pool — for the routing paths that return before any DB work.
+fn runtime_with_member(
+    router_gates: RouterGates,
+    origin: String,
+    pool: PgPool,
+) -> Arc<CommandRuntime> {
+    let automations = router_gates.automations;
+    let executor =
+        ActionExecutor::with_proxy("test-token".to_owned(), Some(origin)).expect("mock executor");
+    let member = MemberRuntime::for_test(pool.clone(), GUILD_S);
+    CommandRuntime::new_with_member(
+        pool,
+        executor,
+        router_with_commands(router_gates),
+        GUILD,
+        automations,
+        member,
+    )
+}
+
+fn member_gates() -> RouterGates {
+    RouterGates {
+        moderation: true,
+        ..gates(true, true)
+    }
+}
+
+fn lazy_pool() -> PgPool {
+    PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool")
+}
+
+/// Member verb with full actor permission and a target + reason, as the
+/// router hands it to the member consumer.
+fn member_slash(name: &str) -> Interaction {
+    let mut interaction = slash(
+        name,
+        Some(CHANNEL),
+        vec![
+            option("target", CommandOptionValue::User(Id::new(3333))),
+            option("reason", CommandOptionValue::String("wiring".to_owned())),
+        ],
+    );
+    interaction.member.as_mut().unwrap().permissions = Some(Permissions::all());
+    interaction
+}
+
+#[tokio::test]
+async fn member_verbs_reach_executor_facts_then_fail_closed_without_db() {
+    // Every member verb routes through the shared router into the member
+    // consumer, which reads live guild facts over REST before touching the
+    // ledger. The mock fails that first read, so each verb must fail closed
+    // with exactly three wire calls (defer, guild read, reply edit) and never
+    // reach the connectionless lazy pool.
+    for name in ["ban", "tempban", "kick", "timeout", "warn"] {
+        let (mock, origin) = MockRest::start(vec![200, 500, 200]).await;
+        let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+        runtime.on_interaction(&member_slash(name)).await;
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 3, "{name}: defer, guild read, reply edit");
+        assert_eq!(requests[1].method, "GET");
+        assert_eq!(requests[1].path, format!("/api/v10/guilds/{GUILD_S}"));
+        let reply = mock.deferred_reply();
+        assert!(
+            reply
+                .to_string()
+                .contains("Moderation command failed; try again."),
+            "{name}: fail-closed reply, got {reply}"
+        );
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
+    for name in ["ban", "tempban", "kick", "timeout", "warn"] {
+        let json_response = |body: serde_json::Value| RestResponse {
+            status: 200,
+            body: Some(body.to_string()),
+            delay: Duration::ZERO,
+        };
+        let (mock, origin) = MockRest::start_script(vec![
+            RestResponse::status(200),
+            json_response(serde_json::json!({
+                "owner_id": "5555",
+                "roles": [{"id": GUILD_S, "position": 0}],
+            })),
+            json_response(serde_json::json!({"user": {"id": "3333", "bot": false}, "roles": []})),
+            json_response(serde_json::to_value(user(4444, true)).unwrap()),
+            json_response(serde_json::json!({"user": {"id": "4444"}, "roles": ["missing-role"]})),
+            RestResponse::status(200),
+        ])
+        .await;
+        let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+        runtime.on_interaction(&member_slash(name)).await;
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            6,
+            "{name}: facts only, no mutation or DB claim"
+        );
+        assert!(requests[1..5].iter().all(|request| request.method == "GET"));
+        assert_eq!(
+            requests[4].path,
+            format!("/api/v10/guilds/{GUILD_S}/members/4444")
+        );
+        assert!(mock.deferred_reply()["content"]
+            .as_str()
+            .unwrap()
+            .contains("Moderation command failed"));
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn member_verbs_share_actor_cooldown_before_role_reads() {
+    let (mock, origin) = MockRest::start(vec![200, 500, 200]).await;
+    let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+    runtime.on_interaction(&member_slash("ban")).await;
+    for (index, name) in ["tempban", "kick", "timeout", "warn"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut interaction = member_slash(name);
+        interaction.id = Id::new(100 + index as u64);
+        runtime.on_interaction(&interaction).await;
+        let requests = mock.requests();
+        let reply: serde_json::Value =
+            serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+        assert_eq!(
+            reply["content"],
+            "Wait 5 seconds before using another member moderation command."
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "GET")
+                .count(),
+            1
+        );
+    }
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn member_verbs_refuse_when_moderation_gate_off() {
+    // Gate-off keeps the verbs closed even with the consumer attached: one
+    // immediate refusal, no defer, no other REST.
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_with_member(gates(true, true), origin, lazy_pool());
+    runtime.on_interaction(&member_slash("ban")).await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1, "one refusal callback");
+    let reply: serde_json::Value = serde_json::from_slice(&callbacks[0].body).expect("reply json");
+    assert_eq!(reply["type"], 4);
+    assert_eq!(reply["data"]["content"], MODERATION_DISABLED_REPLY);
+    assert_eq!(mock.requests().len(), 1, "no other REST effects");
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn member_ban_refuses_without_ban_permission() {
+    // Moderation on, but the actor holds only MANAGE_GUILD: the shared router
+    // refuses before any defer, DB or REST work.
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+    let interaction = slash("ban", Some(CHANNEL), Vec::new());
+    assert_eq!(
+        interaction.member.as_ref().unwrap().permissions,
+        Some(Permissions::MANAGE_GUILD),
+        "fixture actor lacks BAN_MEMBERS"
+    );
+    runtime.on_interaction(&interaction).await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1, "one refusal callback");
+    let reply: serde_json::Value = serde_json::from_slice(&callbacks[0].body).expect("reply json");
+    assert_eq!(reply["type"], 4);
+    assert_eq!(
+        reply["data"]["content"],
+        "You need the Ban Members permission to use /ban. Ask a server moderator or admin to grant it."
+    );
+    assert_eq!(mock.requests().len(), 1, "no other REST effects");
+    mock.shutdown().await;
+}
+
 #[tokio::test]
 async fn unknown_command_replies_ephemerally_without_other_effects() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
@@ -1027,6 +1284,33 @@ async fn foreign_non_moderation_commands_remain_silent() {
         }
     }
     assert!(mock.requests().is_empty(), "router Ignore stays silent");
+    mock.shutdown().await;
+}
+
+/// The inner leveling fence (legacy 7df2a95, `registerLeveling`): a foreign or
+/// missing guild returns `Ok(false)` before the profile or leaderboard read.
+/// The pool here is a never-used lazy connection to a closed port, so a read
+/// moved ahead of the fence would fail this test instead of passing silently.
+#[tokio::test]
+async fn leveling_interaction_fence_precedes_any_store_read() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    let leveling = runtime.leveling();
+    for (name, handler) in [
+        ("rank", two_bot_core::HandlerId::Rank),
+        ("leaderboard", two_bot_core::HandlerId::Leaderboard),
+    ] {
+        for guild in [Some(Id::new(9999)), None] {
+            let mut interaction = slash(name, Some(CHANNEL), Vec::new());
+            interaction.guild_id = guild;
+            let handled = leveling
+                .handle_interaction(&interaction, handler)
+                .await
+                .expect("the guild fence returns before any store read");
+            assert!(!handled, "{name} in guild {guild:?} is not handled");
+        }
+    }
+    assert!(mock.requests().is_empty(), "no foreign-guild effects");
     mock.shutdown().await;
 }
 
@@ -1363,6 +1647,7 @@ async fn production_build_requires_authoritative_custom_rows_before_full_publica
             leveling,
             GUILD,
             custom_commands,
+            None,
             None,
         );
         runtime.set_identity(1111, 1111);
@@ -3646,59 +3931,137 @@ async fn sticky_and_feed_slices_share_one_runtime() {
     db.close().await;
 }
 
-fn kick_slash() -> Interaction {
+fn kick_as(permissions: Permissions, guild: u64) -> Interaction {
     let mut interaction = slash(
         "kick",
         Some(CHANNEL),
         vec![option("member", CommandOptionValue::User(Id::new(303)))],
     );
-    interaction.member.as_mut().unwrap().permissions = Some(Permissions::all());
+    interaction.member.as_mut().unwrap().permissions = Some(permissions);
+    interaction.guild_id = Some(Id::new(guild));
     interaction
 }
 
-fn moderation_gates() -> RouterGates {
+fn kick_gates(moderation: bool) -> RouterGates {
     RouterGates {
         configured_guild: Some(GUILD),
-        moderation: true,
+        moderation,
         ..gates(false, false)
     }
 }
 
-#[tokio::test]
-async fn claimed_kick_stays_silent_for_the_voice_sink() {
-    let (mock, origin) = MockRest::start(Vec::new()).await;
-    let runtime = runtime_without_db(moderation_gates(), false, origin);
-    // Claimed (target in a tracked room): the voice sink answers the vote,
-    // so the router sends no callback at all.
-    runtime.set_voice_kick_claim(Arc::new(|_, _| Box::pin(async move { Some(500u64) })));
-    runtime.on_interaction(&kick_slash()).await;
-    assert!(
-        mock.posts_to("/callback").await.is_empty(),
-        "claimed kick sends no router callback"
-    );
-    assert!(mock.requests().is_empty(), "no other REST effects");
-    mock.shutdown().await;
+/// Wire a voice delegate that counts its calls and answers `claims`. The
+/// stub never sends a callback itself, so a `true` answer must leave the
+/// router silent and a `false` answer must leave exactly one router reply.
+fn wire_kick_vote(runtime: &CommandRuntime, claims: bool) -> Arc<AtomicU64> {
+    let calls = Arc::new(AtomicU64::new(0));
+    let observed = Arc::clone(&calls);
+    runtime.set_voice_kick_vote(Arc::new(move |_| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move { claims })
+    }));
+    calls
 }
 
-#[tokio::test]
-async fn unclaimed_kick_keeps_the_moderation_path() {
-    let (mock, origin) = MockRest::start(Vec::new()).await;
-    let runtime = runtime_without_db(moderation_gates(), false, origin.clone());
-    // No claim wired: pre-existing behavior, one unavailable callback.
-    runtime.on_interaction(&kick_slash()).await;
-    // Claim wired but target outside any tracked room: same path.
-    runtime.set_voice_kick_claim(Arc::new(|_, _| Box::pin(async move { None })));
-    runtime.on_interaction(&kick_slash()).await;
+async fn sole_ephemeral_reply(mock: &MockRest, case: &str) -> String {
     let callbacks = mock.posts_to("/callback").await;
-    assert_eq!(callbacks.len(), 2, "both unclaimed kicks answer");
-    for callback in callbacks {
-        let reply: serde_json::Value = serde_json::from_slice(&callback.body).unwrap();
-        assert_eq!(reply["type"], 4, "immediate response, not a defer");
-        assert_eq!(reply["data"]["flags"], 64);
-        assert_eq!(
-            reply["data"]["content"],
-            "This command is not available in this build yet."
-        );
+    assert_eq!(callbacks.len(), 1, "{case} answers exactly once");
+    let reply: serde_json::Value = serde_json::from_slice(&callbacks[0].body).unwrap();
+    assert_eq!(reply["type"], 4, "{case}: immediate reply, not a defer");
+    assert_eq!(reply["data"]["flags"], 64, "{case}: ephemeral reply");
+    assert_eq!(mock.requests().len(), 1, "{case}: no other REST effects");
+    reply["data"]["content"].as_str().unwrap().to_owned()
+}
+
+// The router is the only answerer of `/kick`. A passing moderation gate or the
+// guild fence decides the interaction before the voice delegate is consulted,
+// so sitting in a voice room never shields a member from a moderator and a
+// foreign guild never reaches the vote path.
+#[tokio::test]
+async fn kick_moderation_outcomes_never_consult_the_voice_delegate() {
+    let cases = [
+        (
+            "moderator",
+            Permissions::all(),
+            true,
+            GUILD,
+            "This command is not available in this build yet.".to_owned(),
+        ),
+        (
+            "foreign guild",
+            Permissions::all(),
+            true,
+            9999,
+            RouterRefusal::GuildRestricted.message(),
+        ),
+    ];
+    for (case, permissions, moderation, guild, expected) in cases {
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        let runtime = runtime_without_db(kick_gates(moderation), false, origin);
+        // A delegate that would claim every interaction must still not run.
+        let calls = wire_kick_vote(&runtime, true);
+        runtime.on_interaction(&kick_as(permissions, guild)).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "{case} skips voice");
+        assert_eq!(sole_ephemeral_reply(&mock, case).await, expected, "{case}");
+        mock.shutdown().await;
     }
-    mock.shutdown().await;
+}
+
+// Moderation off, or the invoker lacking Kick Members, still serves the V4
+// vote for room occupants: the delegate is asked once and, when it answers
+// the interaction, the router stays silent.
+#[tokio::test]
+async fn refused_kick_hands_the_interaction_to_the_voice_delegate() {
+    let cases = [
+        ("missing permission", Permissions::empty(), true),
+        ("moderation disabled", Permissions::all(), false),
+    ];
+    for (case, permissions, moderation) in cases {
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        let runtime = runtime_without_db(kick_gates(moderation), false, origin);
+        let calls = wire_kick_vote(&runtime, true);
+        runtime.on_interaction(&kick_as(permissions, GUILD)).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "{case} asks voice once");
+        assert!(
+            mock.posts_to("/callback").await.is_empty(),
+            "{case}: voice owns the callback, the router sends none"
+        );
+        assert!(mock.requests().is_empty(), "{case}: no other REST effects");
+        mock.shutdown().await;
+    }
+}
+
+// Voice declines (the invoker is not in the target's room, the target left
+// between reads, or voice is off): the router refusal is the single reply.
+// The same holds with no delegate wired at all.
+#[tokio::test]
+async fn declined_kick_gets_the_router_refusal_exactly_once() {
+    let cases = [
+        (
+            "missing permission",
+            Permissions::empty(),
+            true,
+            RouterRefusal::ModerationPermission(two_bot_core::ModerationAction::Kick).message(),
+        ),
+        (
+            "moderation disabled",
+            Permissions::all(),
+            false,
+            RouterRefusal::ModerationDisabled.message(),
+        ),
+    ];
+    for (case, permissions, moderation, expected) in cases {
+        for wired in [true, false] {
+            let case = format!("{case} (delegate wired: {wired})");
+            let (mock, origin) = MockRest::start(Vec::new()).await;
+            let runtime = runtime_without_db(kick_gates(moderation), false, origin);
+            let calls = wired.then(|| wire_kick_vote(&runtime, false));
+            runtime.on_interaction(&kick_as(permissions, GUILD)).await;
+            if let Some(calls) = calls {
+                assert_eq!(calls.load(Ordering::Relaxed), 1, "{case} asks voice once");
+            }
+            assert_eq!(sole_ephemeral_reply(&mock, &case).await, expected, "{case}");
+            mock.shutdown().await;
+        }
+    }
 }
