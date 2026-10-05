@@ -119,6 +119,17 @@ test("the existing 4 Container vars are unchanged and cannot be overridden", () 
   }
 });
 
+test("configured voice infrastructure IDs reach the Container unchanged", () => {
+  const vars = {
+    DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID: "600",
+    TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID: "201",
+    TWO_TEMP_VOICE_CATEGORY_ID: "401",
+    TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS: "700, 701",
+  };
+  assert.deepEqual(containerEnv(vars), { ...vars, LISTEN_ADDR: "0.0.0.0:8080" });
+  assert.equal(containerEnv({}).DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID, undefined);
+});
+
 test("the allowlist is explicit, non-secret and disjoint from NOT_FORWARDED", () => {
   assert.equal(new Set(FORWARDED_FLAGS).size, FORWARDED_FLAGS.length, "duplicate allowlist name");
   for (const name of FORWARDED_FLAGS) {
