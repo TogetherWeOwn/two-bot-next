@@ -97,15 +97,19 @@ use two_bot_core::{
     voice_utilities::{invite_render, ping_render},
     voice_vote_kick::{
         VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError, VoteKickRef,
-        VoteKickStatus, VoteKickUpdate, VoteRoomFacts,
+        VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts,
+    },
+    voice_vote_kick_audit::{
+        refusal_outcome, result_outcome, EnforcementOutcome, KickAuditEvent, KickAuditRow,
+        OUTCOME_EVIDENCE_UNAVAILABLE, OUTCOME_NOT_A_ROOM, OUTCOME_STARTED,
     },
     AutomodPolicy, CommandDefinition, OverwriteTarget, PermissionFinding,
     PermissionOverwrite as HealthOverwrite, Snowflake, VoicePermission, VoicePermissionScope,
 };
 use two_bot_cutover::voice_rooms::{OwnerGrantIntent, PgRoomStore};
 use two_bot_discord::voice_rooms::{
-    can_enforce_kick, can_manage_room, effective_permissions, RoomChannelAttributes, RoomHttp,
-    RoomHttpError,
+    can_enforce_kick, can_manage_room, effective_permissions, MessageRef, RoomChannelAttributes,
+    RoomHttp, RoomHttpError,
 };
 
 #[path = "voice_name_panel.rs"]
@@ -262,6 +266,13 @@ pub trait RoomPersistence: Send + Sync {
         guild: Snowflake,
         room: Snowflake,
     ) -> impl Future<Output = Result<Option<TextCompanion>, StoreError>> + Send;
+    /// Append V4 vote-kick audit rows in one transaction. Idempotent per
+    /// (guild, vote, event): a replayed row is dropped, never overwritten, so
+    /// the worker may retry a flush whose outcome it did not see.
+    fn record_kick_audit(
+        &self,
+        rows: &[KickAuditRow],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
     /// V3 privacy records for the guild's rooms that are not public with an
     /// empty block list; every other room reads as the default.
     fn privacy(
@@ -425,6 +436,10 @@ impl RoomPersistence for PgRoomStore {
             .map_err(store_error)
     }
 
+    async fn record_kick_audit(&self, rows: &[KickAuditRow]) -> Result<(), StoreError> {
+        self.add_kick_audit(rows).await.map_err(store_error)
+    }
+
     async fn privacy(
         &self,
         guild: Snowflake,
@@ -494,7 +509,11 @@ fn voice_dead_action(action: &RoomAction) -> &'static str {
         RoomAction::SetEveryoneConnect { .. }
         | RoomAction::CreateJoinChannel { .. }
         | RoomAction::DeleteJoinChannel { .. }
-        | RoomAction::SavePrivacy { .. } => "other",
+        | RoomAction::SavePrivacy { .. }
+        | RoomAction::AskJoinOwner { .. }
+        | RoomAction::ApproveJoin { .. }
+        | RoomAction::RevokeJoinAccess { .. }
+        | RoomAction::RetireJoinPrompt { .. } => "other",
         RoomAction::SetUserLimit { .. } => "limit",
     }
 }
@@ -649,6 +668,41 @@ pub trait RoomWrites: Send + Sync {
         let _ = (guild, name, parent_id, position, guard);
         async { Err(RoomHttpError::InvalidRequest) }
     }
+    /// V3 join request: delete one member's overwrite on a room channel.
+    /// Deleting an absent overwrite is success. The default refuses.
+    fn delete_overwrite(
+        &self,
+        channel: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send {
+        let _ = (channel, member, guard);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
+    /// V3 join request: post a message with buttons to a room's chat. Only
+    /// `mention_user` can be pinged. The default refuses, so a writer that
+    /// cannot post fails closed.
+    fn send_component_message(
+        &self,
+        channel: Snowflake,
+        content: &str,
+        mention_user: Option<Snowflake>,
+        components: &[Component],
+    ) -> impl Future<Output = Result<MessageRef, RoomHttpError>> + Send {
+        let _ = (channel, content, mention_user, components);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
+    /// V3 join request: replace the text and buttons of a message this bot
+    /// posted (no buttons when `components` is empty). The default refuses.
+    fn edit_component_message(
+        &self,
+        message: MessageRef,
+        content: &str,
+        components: &[Component],
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send {
+        let _ = (message, content, components);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
     /// V10 error notice. `mention_role` is pinged on channel targets only.
     /// The default refuses, so a writer that cannot post notices fails closed
     /// (the worker counts the attempt and moves on) instead of dropping them
@@ -791,6 +845,36 @@ impl RoomWrites for RoomHttp {
     ) -> Result<Channel, RoomHttpError> {
         self.create_join_voice_channel(guild, name, parent_id, position, move || guard())
             .await
+    }
+
+    async fn delete_overwrite(
+        &self,
+        channel: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.delete_member_overwrite(channel, member, move || guard())
+            .await
+    }
+
+    async fn send_component_message(
+        &self,
+        channel: Snowflake,
+        content: &str,
+        mention_user: Option<Snowflake>,
+        components: &[Component],
+    ) -> Result<MessageRef, RoomHttpError> {
+        self.post_component_message(channel, content, mention_user, components)
+            .await
+    }
+
+    async fn edit_component_message(
+        &self,
+        message: MessageRef,
+        content: &str,
+        components: &[Component],
+    ) -> Result<(), RoomHttpError> {
+        RoomHttp::edit_component_message(self, message, content, components).await
     }
 
     async fn send_notice(
@@ -1443,6 +1527,10 @@ pub struct GuildRoomWorker<S, H> {
     /// Join channel ids this worker created or loaded from its own store:
     /// the only ones a `DeleteJoinChannel` may delete.
     join_deletable: HashSet<Snowflake>,
+    /// V3 join-request bookkeeping that is runtime-only by design: this
+    /// worker's request-id epoch, Join-channel entries already handled and
+    /// the posted prompts. See [`join_requests`].
+    join: join_requests::JoinRequests,
     failures: VecDeque<LifecycleFailure>,
     notices: Vec<NoticeState>,
     halted: bool,
@@ -1452,6 +1540,16 @@ pub struct GuildRoomWorker<S, H> {
     /// from the payload.
     vote_refs: HashMap<Snowflake, VoteKickRef>,
     active_votes: Vec<VoteKickRef>,
+    /// Who started each vote this session, by vote ID. The vote core binds the
+    /// target but not the initiator, and every audit row names both.
+    vote_initiators: HashMap<Snowflake, Snowflake>,
+    /// V4 audit rows not yet appended, oldest first. Appended off the actor's
+    /// synchronous vote path by [`GuildRoomWorker::flush_kick_audit`]; a failed
+    /// flush keeps them (the append is idempotent) up to
+    /// `KICK_AUDIT_BUFFER_MAX`.
+    kick_audit: VecDeque<KickAuditRow>,
+    /// Earliest actor time the next flush may run after a failed one.
+    kick_audit_retry_ms: u64,
     /// Automod policy the create-path name filter runs under. The default
     /// policy still blocks invite and external links; the runtime installs the
     /// configured word list through [`GuildRoomWorker::with_name_policy`].
@@ -1469,6 +1567,37 @@ pub enum KickRefusal {
     Vote(VoteKickError),
 }
 
+/// Audit code for a refused `/kick` start.
+fn kick_refusal_outcome(refusal: KickRefusal) -> &'static str {
+    match refusal {
+        KickRefusal::Unavailable => OUTCOME_EVIDENCE_UNAVAILABLE,
+        KickRefusal::NotARoom => OUTCOME_NOT_A_ROOM,
+        KickRefusal::Vote(error) => refusal_outcome(error),
+    }
+}
+
+/// One V4 audit row, stamped with the worker's wall clock. Snowflakes and
+/// fixed codes only: never an interaction token, a name or free text.
+fn kick_audit_row(
+    event: KickAuditEvent,
+    vote: VoteKickRef,
+    initiator_id: Snowflake,
+    outcome: &'static str,
+    progress: Option<VoteProgress>,
+) -> KickAuditRow {
+    KickAuditRow {
+        guild_id: vote.guild_id,
+        room_id: vote.room_id,
+        vote_id: vote.id,
+        initiator_id,
+        target_id: vote.target_id,
+        event,
+        outcome,
+        progress,
+        occurred_at: now_iso(),
+    }
+}
+
 /// Monotonic actor time handed to the vote core.
 struct ActorClock(u64);
 
@@ -1484,6 +1613,17 @@ const NOTICE_REPEAT_INTERVAL_MS: u64 = 15 * 60 * 1000;
 
 /// Longest notice body; Discord's message limit is 2000 characters.
 const NOTICE_MAX_CHARS: usize = 1500;
+
+/// Audit rows held while the store is unreachable. Past this the oldest row is
+/// dropped and a persistence failure is recorded, so a long outage cannot grow
+/// the worker without bound.
+const KICK_AUDIT_BUFFER_MAX: usize = 256;
+
+/// Rows appended per flush (one transaction).
+const KICK_AUDIT_BATCH: usize = 32;
+
+/// Pause after a failed flush before the next attempt.
+const KICK_AUDIT_RETRY_MS: u64 = 5_000;
 
 const OWNER_REPAIR_COOLDOWN_MS: u64 = 60_000;
 
@@ -1558,12 +1698,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             privacy,
             privacy_dirty: HashSet::new(),
             join_deletable,
+            join: join_requests::JoinRequests::new(),
             failures: VecDeque::new(),
             notices: Vec::new(),
             halted: false,
             votes: VoteKickCore::new(),
             vote_refs: HashMap::new(),
             active_votes: Vec::new(),
+            vote_initiators: HashMap::new(),
+            kick_audit: VecDeque::new(),
+            kick_audit_retry_ms: 0,
             name_policy: Arc::new(AutomodPolicy::default()),
         })
     }
@@ -1841,6 +1985,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
         drop(live);
         self.reconcile_privacy();
+        self.scan_join_entries();
         let delete_enqueued = empty.len() as u64;
         for channel in empty {
             self.queue_delete(channel, false);
@@ -2062,6 +2207,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     }
 
     fn queue_owner_handoff(&mut self, channel_id: Snowflake, previous_owner_id: Snowflake) {
+        // Requests raised to the previous owner can no longer be answered.
+        self.join_owner_changed(channel_id);
         self.ownership_repairs.entry(channel_id).or_insert(0);
         if self.ownership_queued.insert(channel_id) {
             let room = &self.rooms[&channel_id];
@@ -2287,12 +2434,28 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         ))
     }
 
-    /// Fold a vote update into worker state: forget finished votes and queue the
-    /// room-scoped enforcement exactly once (the core emits the decision only on
-    /// the first transition to passed).
+    /// Fold a vote update into worker state: forget finished votes, audit the
+    /// result once, and queue the room-scoped enforcement exactly once (the
+    /// core emits the decision only on the first transition to passed).
     fn settle_vote(&mut self, update: VoteKickUpdate) -> VoteKickUpdate {
         if update.status != VoteKickStatus::Active {
+            // A finished vote answers later ballots with its terminal status;
+            // only the pass that still held it active records the result.
+            let was_active = self
+                .active_votes
+                .iter()
+                .any(|vote| vote.id == update.vote.id);
             self.active_votes.retain(|vote| vote.id != update.vote.id);
+            if let (true, Some(outcome)) = (was_active, result_outcome(update.status)) {
+                let initiator_id = self.vote_initiator(update.vote.id);
+                self.push_kick_audit(kick_audit_row(
+                    KickAuditEvent::VoteResult,
+                    update.vote,
+                    initiator_id,
+                    outcome,
+                    Some(update.progress),
+                ));
+            }
         }
         if let Some(kick) = update.kick {
             self.queue.enqueue(
@@ -2300,15 +2463,126 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 RoomAction::KickMember {
                     channel_id: kick.room_id,
                     member_id: kick.target_id,
+                    vote_id: update.vote.id,
                 },
             );
         }
         update
     }
 
+    /// Who started a vote this session. Every vote the core knows began in
+    /// [`Self::kick_start`], so the fallback is unreachable.
+    fn vote_initiator(&self, vote_id: Snowflake) -> Snowflake {
+        self.vote_initiators.get(&vote_id).copied().unwrap_or(0)
+    }
+
+    /// Queue one audit row for the next flush. A full buffer drops its oldest
+    /// row and records the loss on `/setup` instead of growing.
+    fn push_kick_audit(&mut self, row: KickAuditRow) {
+        if self.kick_audit.len() >= KICK_AUDIT_BUFFER_MAX {
+            self.kick_audit.pop_front();
+            self.record(LifecycleFailure::Persistence {
+                channel_id: None,
+                error: StoreError::Unavailable,
+            });
+        }
+        self.kick_audit.push_back(row);
+    }
+
+    /// Audit the terminal outcome of a passed vote's room-scoped enforcement.
+    fn audit_enforcement(
+        &mut self,
+        vote_id: Snowflake,
+        channel_id: Snowflake,
+        member_id: Snowflake,
+        outcome: EnforcementOutcome,
+    ) {
+        let vote = VoteKickRef {
+            id: vote_id,
+            guild_id: self.live.guild_id,
+            room_id: channel_id,
+            target_id: member_id,
+        };
+        let initiator_id = self.vote_initiator(vote_id);
+        self.push_kick_audit(kick_audit_row(
+            KickAuditEvent::Enforcement,
+            vote,
+            initiator_id,
+            outcome.as_str(),
+            None,
+        ));
+    }
+
+    /// Append buffered audit rows, one batch per call. Driven by the actor's
+    /// timer, off the synchronous vote path. A failure keeps the rows and
+    /// waits `KICK_AUDIT_RETRY_MS`; it never halts the worker, because a
+    /// refused credential on this table (a grant not yet applied) must not
+    /// stop room management. Returns whether a batch was appended.
+    pub async fn flush_kick_audit(&mut self, now_ms: u64) -> bool {
+        if self.kick_audit.is_empty() || now_ms < self.kick_audit_retry_ms {
+            return false;
+        }
+        let batch: Vec<KickAuditRow> = self
+            .kick_audit
+            .iter()
+            .take(KICK_AUDIT_BATCH)
+            .cloned()
+            .collect();
+        match self.store.record_kick_audit(&batch).await {
+            Ok(()) => {
+                self.kick_audit.drain(..batch.len());
+                true
+            }
+            Err(error) => {
+                self.kick_audit_retry_ms = now_ms.saturating_add(KICK_AUDIT_RETRY_MS);
+                self.record(LifecycleFailure::Persistence {
+                    channel_id: None,
+                    error,
+                });
+                false
+            }
+        }
+    }
+
     /// Start a vote in `room_id`. `vote_id` must be the unique initiating
-    /// interaction ID. Starting casts no ballot.
+    /// interaction ID. Starting casts no ballot. Every start that reaches the
+    /// worker leaves one audit row: `vote_started`, or `vote_refused` with the
+    /// refusal code.
     pub fn kick_start(
+        &mut self,
+        vote_id: Snowflake,
+        room_id: Snowflake,
+        initiator_id: Snowflake,
+        target_id: Snowflake,
+        now_ms: u64,
+    ) -> Result<VoteKickUpdate, KickRefusal> {
+        let started = self.begin_vote(vote_id, room_id, initiator_id, target_id, now_ms);
+        let row = match &started {
+            Ok(update) => kick_audit_row(
+                KickAuditEvent::VoteStarted,
+                update.vote,
+                initiator_id,
+                OUTCOME_STARTED,
+                Some(update.progress),
+            ),
+            Err(refusal) => kick_audit_row(
+                KickAuditEvent::VoteRefused,
+                VoteKickRef {
+                    id: vote_id,
+                    guild_id: self.live.guild_id,
+                    room_id,
+                    target_id,
+                },
+                initiator_id,
+                kick_refusal_outcome(*refusal),
+                None,
+            ),
+        };
+        self.push_kick_audit(row);
+        started
+    }
+
+    fn begin_vote(
         &mut self,
         vote_id: Snowflake,
         room_id: Snowflake,
@@ -2329,6 +2603,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .start(vote_id, facts, initiator_id, target_id, &ActorClock(now_ms))
             .map_err(KickRefusal::Vote)?;
         self.vote_refs.insert(vote_id, update.vote);
+        self.vote_initiators.insert(vote_id, initiator_id);
         self.active_votes.push(update.vote);
         Ok(self.settle_vote(update))
     }
@@ -3267,6 +3542,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             RoomAction::KickMember {
                 channel_id,
                 member_id,
+                vote_id,
             } => {
                 let permissions = self
                     .live
@@ -3274,12 +3550,20 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     .read()
                     .expect("live voice lock")
                     .permissions(self.live.guild_id, channel_id);
+                // What a clean `Ok` below means; each skip or partial write
+                // overrides it so the audit row says what Discord was asked.
+                let mut applied = EnforcementOutcome::ConnectDeniedAndDisconnected;
                 let result = if self.rooms.get(&channel_id).is_none_or(|room| {
                     member_id == room.owner_id || member_id == room.original_creator_id
                 }) {
                     // Either the room is gone and its overwrites went with it, or
                     // ownership changed after the vote passed and the target is now
                     // the owner or original creator: write nothing.
+                    applied = if self.rooms.contains_key(&channel_id) {
+                        EnforcementOutcome::SkippedTargetProtected
+                    } else {
+                        EnforcementOutcome::SkippedRoomGone
+                    };
                     Ok(())
                 } else if !can_enforce_kick(permissions) {
                     Err(RoomHttpError::AccessDenied)
@@ -3303,7 +3587,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         {
                             // The target left or moved on since the deny landed:
                             // nothing to disconnect.
-                            Err(RoomHttpError::Cancelled) => Ok(()),
+                            Err(RoomHttpError::Cancelled) => {
+                                applied = EnforcementOutcome::ConnectDeniedTargetAbsent;
+                                Ok(())
+                            }
                             other => other,
                         },
                         Err(error) => Err(error),
@@ -3312,6 +3599,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 match result {
                     Ok(()) => {
                         self.queue.mark_succeeded(&action);
+                        self.audit_enforcement(vote_id, channel_id, member_id, applied);
                     }
                     Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
                         self.queue.mark_rate_limited(
@@ -3322,14 +3610,32 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         );
                     }
                     Err(RoomHttpError::UnknownOutcome) => {
-                        // Both writes are idempotent, so a retry is safe.
-                        self.mark_failed_observed(
+                        // Both writes are idempotent, so a retry is safe. Only
+                        // the attempt that exhausts the budget is terminal.
+                        let exhausted = action.attempts.saturating_add(1) >= QUEUE_MAX_ATTEMPTS;
+                        let released = self.mark_failed_observed(
                             action,
                             "Discord kick outcome unknown".to_owned(),
                             elapsed_ms(now_ms, started),
                         );
+                        if exhausted && released {
+                            self.audit_enforcement(
+                                vote_id,
+                                channel_id,
+                                member_id,
+                                EnforcementOutcome::GaveUp,
+                            );
+                        }
                     }
-                    Err(error) => self.complete_error(action, channel_id, error),
+                    Err(error) => {
+                        let outcome = match error {
+                            RoomHttpError::AccessDenied => EnforcementOutcome::PermissionMissing,
+                            RoomHttpError::Cancelled => EnforcementOutcome::SkippedRoomGone,
+                            _ => EnforcementOutcome::DiscordError,
+                        };
+                        self.complete_error(action, channel_id, error);
+                        self.audit_enforcement(vote_id, channel_id, member_id, outcome);
+                    }
                 }
             }
             RoomAction::SetUserLimit {
@@ -3351,6 +3657,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             | RoomAction::DeleteJoinChannel { .. }
             | RoomAction::SavePrivacy { .. } => {
                 self.dispatch_privacy(action, now_ms, started).await;
+            }
+            RoomAction::AskJoinOwner { .. }
+            | RoomAction::ApproveJoin { .. }
+            | RoomAction::RevokeJoinAccess { .. }
+            | RoomAction::RetireJoinPrompt { .. } => {
+                self.dispatch_join(action, now_ms, started).await;
             }
             RoomAction::RenameRoom { channel_id, name } => {
                 let valid = {
@@ -3755,18 +4067,20 @@ pub trait VoiceEventSink: Send + Sync {
     /// A cold RESUME has replayed durably but cannot populate a fresh cache.
     /// The supervisor must IDENTIFY after committing RESUMED, not before replay.
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool;
-    /// Resolve the tracked room a member is currently in, if any. The shared
-    /// router asks this for `/kick`: a tracked-room target means the voice
-    /// sink owns the interaction (vote-kick) and the router must stay silent;
-    /// anything else keeps the existing moderation path. Boxed (not `impl
-    /// Future`) so the trait stays object-safe behind `Arc<dyn _>`.
-    fn kick_claim_room(
+    /// Start a room vote-kick for a `/kick` the shared router has already
+    /// refused for moderation (moderation off, or the invoker lacks Kick
+    /// Members). The router is the only answerer of `/kick`; this is its
+    /// delegate for room occupants. `true` means this sink answered the
+    /// interaction itself (sent or failed, never retried), so the router must
+    /// not; `false` means no callback was attempted and the router answers.
+    /// Boxed (not `impl Future`) so the trait stays object-safe behind
+    /// `Arc<dyn _>`.
+    fn kick_vote(
         &self,
-        guild: Snowflake,
-        member: Snowflake,
-    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
-        let _ = (guild, member);
-        Box::pin(async { None })
+        interaction: Interaction,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        let _ = interaction;
+        Box::pin(async { false })
     }
 }
 
@@ -3849,6 +4163,12 @@ enum ActorCommand {
     Name {
         command: NameCommand,
         reply: oneshot::Sender<NameReply>,
+    },
+    /// V3 Approve / Deny / Block button: the worker decides against the
+    /// room's current owner and the request's current state.
+    JoinDecision {
+        decision: JoinDecisionCommand,
+        reply: oneshot::Sender<JoinReply>,
     },
 }
 
@@ -4407,14 +4727,6 @@ where
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
         self.enabled && cache.current_user().is_none()
     }
-
-    fn kick_claim_room(
-        &self,
-        guild: Snowflake,
-        member: Snowflake,
-    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
-        Box::pin(self.kick_room_of(guild, member))
-    }
 }
 
 async fn run_actor<S: RoomPersistence, H: RoomWrites>(
@@ -4450,9 +4762,13 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
                 // behind a 64-write burst either.
                 worker.dispatch_one(now_ms).await;
                 worker.send_notices(now_ms).await;
+                worker.flush_kick_audit(now_ms).await;
             }
         }
     }
+    // Inbox closed: append what is left (one failed batch ends it) so a clean
+    // shutdown keeps the trail.
+    while worker.flush_kick_audit(u64::MAX).await {}
 }
 
 fn apply_command<S: RoomPersistence, H: RoomWrites>(
@@ -4539,6 +4855,9 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         }
         ActorCommand::Name { command, reply } => {
             let _ = reply.send(worker.apply_name(command, now_ms));
+        }
+        ActorCommand::JoinDecision { decision, reply } => {
+            let _ = reply.send(worker.apply_join_decision(decision));
         }
     }
 }
@@ -6626,6 +6945,9 @@ where
         return handle_name_interaction(runtime, interaction, guild_id, names, action, true, reply)
             .await;
     }
+    if let Some(click) = join_component_action(interaction) {
+        return handle_join_interaction(runtime, interaction, guild_id, click, reply).await;
+    }
     let Some(command) = parse_voice_command(interaction) else {
         return false;
     };
@@ -7613,54 +7935,26 @@ where
         inventory: Option<GuildInventory>,
         names: NameDirectory,
     ) {
-        // Vote-kick owns its transport. A non-room `/kick` belongs to the
-        // moderation path, so return before any acknowledgement and let the
-        // router answer: deferring here would race it and hang on "thinking".
-        if let Some(VoiceCommand::Kick { target, .. }) = parse_voice_command(interaction) {
-            let Some(guild) = interaction_guild(interaction) else {
-                return;
-            };
-            if runtime.kick_room_of(guild, target).await.is_none() {
-                return;
-            }
-            let answered: Arc<Mutex<Option<InteractionResponse>>> = Arc::new(Mutex::new(None));
-            let writer = Arc::clone(&answered);
-            handle_voice_interaction_with(
-                runtime,
-                interaction,
-                invite_code,
-                inventory.as_ref(),
-                move |response| async move {
-                    *writer.lock().unwrap() = Some(response);
-                },
-            )
-            .await;
-            let response = answered.lock().unwrap().take();
-            if let Some(response) = response {
-                if let Err(error) = replies.respond(interaction, response).await {
-                    warn!(interaction_id = interaction.id.get(), %error,
-                        "voice vote response failed; not retried");
-                }
-            }
+        // `/kick` is answered by the shared router alone (moderation first,
+        // then `kick_vote` for the occupants it refused). Acknowledging here
+        // would race it and could answer twice.
+        if matches!(
+            parse_voice_command(interaction),
+            Some(VoiceCommand::Kick { .. })
+        ) {
             return;
         }
-        if let Some(VoiceCommand::Ballot { .. }) = parse_voice_command(interaction) {
-            // Ballots update the public message in place (type 7). The
-            // defer + PATCH path would edit each voter's own ephemeral
-            // followup instead, so answer with the initial callback.
-            let answered: Arc<Mutex<Option<InteractionResponse>>> = Arc::new(Mutex::new(None));
-            let writer = Arc::clone(&answered);
-            handle_voice_interaction_with(
-                runtime,
-                interaction,
-                invite_code,
-                inventory.as_ref(),
-                move |response| async move {
-                    *writer.lock().unwrap() = Some(response);
-                },
-            )
-            .await;
-            let response = answered.lock().unwrap().take();
+        if matches!(
+            parse_voice_command(interaction),
+            Some(VoiceCommand::Ballot { .. })
+        ) || join_component_action(interaction).is_some()
+        {
+            // Ballots and join-request decisions update the public message in
+            // place (type 7). The defer + PATCH path would edit each
+            // presser's own ephemeral followup instead, so answer with the
+            // initial callback.
+            let response =
+                Self::capture_response(runtime, interaction, invite_code, inventory.as_ref()).await;
             if let Some(response) = response {
                 if let Err(error) = replies.respond(interaction, response).await {
                     warn!(interaction_id = interaction.id.get(), %error,
@@ -7717,6 +8011,69 @@ where
         )
         .await;
     }
+
+    /// Start the V4 room vote for a `/kick` the router refused for moderation.
+    /// The vote exists only for an invoker who shares a tracked room with the
+    /// target; anyone else gets the router's refusal, which also keeps a
+    /// stranger from learning that the target sits in a room. Returns `true`
+    /// once this sink owns the callback (a failed send is logged, never
+    /// retried) and `false` when no callback was attempted.
+    async fn start_kick_vote(
+        runtime: &VoiceRuntime<S, H>,
+        replies: &R,
+        interaction: &Interaction,
+    ) -> bool {
+        if !runtime.enabled {
+            return false;
+        }
+        let Some(VoiceCommand::Kick { target, .. }) = parse_voice_command(interaction) else {
+            return false;
+        };
+        let (Some(guild), Some(initiator)) = (
+            interaction_guild(interaction),
+            interaction.author_id().map(|id| id.get()),
+        ) else {
+            return false;
+        };
+        let Some(room) = runtime.kick_room_of(guild, target).await else {
+            return false;
+        };
+        if runtime.kick_room_of(guild, initiator).await != Some(room) {
+            return false;
+        }
+        let Some(response) = Self::capture_response(runtime, interaction, None, None).await else {
+            return false;
+        };
+        if let Err(error) = replies.respond(interaction, response).await {
+            warn!(interaction_id = interaction.id.get(), %error,
+                "voice vote response failed; not retried");
+        }
+        true
+    }
+
+    /// Run the voice handler and keep its single response instead of sending
+    /// it, for commands that answer through the initial callback.
+    async fn capture_response(
+        runtime: &VoiceRuntime<S, H>,
+        interaction: &Interaction,
+        invite_code: Option<&str>,
+        inventory: Option<&GuildInventory>,
+    ) -> Option<InteractionResponse> {
+        let answered: Arc<Mutex<Option<InteractionResponse>>> = Arc::new(Mutex::new(None));
+        let writer = Arc::clone(&answered);
+        handle_voice_interaction_with(
+            runtime,
+            interaction,
+            invite_code,
+            inventory,
+            move |response| async move {
+                *writer.lock().unwrap() = Some(response);
+            },
+        )
+        .await;
+        let mut slot = answered.lock().unwrap();
+        slot.take()
+    }
 }
 
 impl<S, H, R> VoiceEventSink for VoiceResponder<S, H, R>
@@ -7731,9 +8088,15 @@ where
             return;
         }
         if let Event::InteractionCreate(created) = event {
-            if parse_voice_command(&created.0).is_none()
+            let command = parse_voice_command(&created.0);
+            // The shared router answers `/kick`; see `kick_vote`.
+            if matches!(command, Some(VoiceCommand::Kick { .. })) {
+                return;
+            }
+            if command.is_none()
                 && voice_import_action(&created.0).is_none()
                 && name_component_action(&created.0).is_none()
+                && join_component_action(&created.0).is_none()
             {
                 return;
             }
@@ -7766,13 +8129,13 @@ where
         self.runtime.needs_bootstrap(cache)
     }
 
-    fn kick_claim_room(
+    fn kick_vote(
         &self,
-        guild: Snowflake,
-        member: Snowflake,
-    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
+        interaction: Interaction,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
         let runtime = Arc::clone(&self.runtime);
-        Box::pin(async move { runtime.kick_room_of(guild, member).await })
+        let replies = Arc::clone(&self.replies);
+        Box::pin(async move { Self::start_kick_vote(&runtime, &replies, &interaction).await })
     }
 }
 
@@ -7781,6 +8144,11 @@ mod limit;
 pub use limit::{LimitArg, LimitCommand};
 mod private_runtime;
 pub use private_runtime::PrivacyCommand;
+
+mod join_requests;
+use join_requests::{
+    handle_join_interaction, join_component_action, JoinDecisionCommand, JoinReply,
+};
 
 #[cfg(test)]
 #[path = "voice_rooms_tests.rs"]

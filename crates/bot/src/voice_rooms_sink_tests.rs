@@ -99,6 +99,9 @@ impl RoomPersistence for Arc<Store> {
     ) -> Result<Option<TextCompanion>, StoreError> {
         self.as_ref().remove_companion(guild, room).await
     }
+    async fn record_kick_audit(&self, rows: &[KickAuditRow]) -> Result<(), StoreError> {
+        self.as_ref().record_kick_audit(rows).await
+    }
     async fn privacy(&self, guild: u64) -> Result<BTreeMap<u64, PrivacyRecord>, StoreError> {
         self.as_ref().privacy(guild).await
     }

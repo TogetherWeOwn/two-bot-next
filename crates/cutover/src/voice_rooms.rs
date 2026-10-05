@@ -16,6 +16,7 @@ use two_bot_core::voice_private::PrivacyRecord;
 use two_bot_core::voice_rooms::{
     CreatorChannel, PermissionSource, RoomPosition, TextCompanion, VoiceRoom,
 };
+use two_bot_core::voice_vote_kick_audit::KickAuditRow;
 use two_bot_core::{format_iso_millis, parse_iso_millis, Snowflake};
 
 use super::voice_config_store::PgVoiceConfigStore;
@@ -391,6 +392,50 @@ impl PgRoomStore {
         .iter()
         .map(|row| Ok((decode_id(row, "channel_id")?, row.try_get("custom_name")?)))
         .collect()
+    }
+
+    /// Append V4 vote-kick audit rows in one transaction. Idempotent per
+    /// (guild, vote, event): a replayed row is dropped, never overwritten, so
+    /// a flush retried after an unknown outcome cannot duplicate or rewrite
+    /// history. A timestamp that does not parse falls back to the database
+    /// clock rather than wedging the batch.
+    pub async fn add_kick_audit(&self, rows: &[KickAuditRow]) -> Result<(), sqlx::Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for row in rows {
+            let occurred_at = parse_iso_millis(&row.occurred_at)
+                .and_then(|millis| {
+                    OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000).ok()
+                })
+                .unwrap_or_else(OffsetDateTime::now_utc);
+            let count = |value: usize| i32::try_from(value).unwrap_or(i32::MAX);
+            let progress = row
+                .progress
+                .map(|p| (count(p.yes), count(p.required), count(p.total)));
+            sqlx::query(
+                "INSERT INTO voice_vote_kick_audit
+                 (guild_id, vote_id, event, room_id, initiator_id, target_id, outcome,
+                  yes_votes, votes_required, voters_total, occurred_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                 ON CONFLICT (guild_id, vote_id, event) DO NOTHING",
+            )
+            .bind(row.guild_id.to_string())
+            .bind(row.vote_id.to_string())
+            .bind(row.event.as_str())
+            .bind(row.room_id.to_string())
+            .bind(row.initiator_id.to_string())
+            .bind(row.target_id.to_string())
+            .bind(row.outcome)
+            .bind(progress.map(|p| p.0))
+            .bind(progress.map(|p| p.1))
+            .bind(progress.map(|p| p.2))
+            .bind(occurred_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await
     }
 
     /// V3 privacy records for the guild's rooms that differ from the default

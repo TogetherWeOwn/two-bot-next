@@ -1,12 +1,13 @@
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use two_bot_core::commands::OCCURRENCE_ID_MAX_CHARS;
+use two_bot_core::commands::{CommandDefinition, HELP_DESCRIPTION, OCCURRENCE_ID_MAX_CHARS};
 use two_bot_core::router::{InteractionRouter, RouterGates};
 
 pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("rsvp-attendance", "docs/parity.md §1 #12 / #25"),
     ("rota-acknowledge", "docs/parity.md §1 #13 / §9 drop 1"),
     ("attendance", "docs/parity.md §1 #12 bound"),
+    ("help", "docs/parity.md §1 help"),
     ("tempban", "docs/parity.md §1 #4 duration ceiling"),
     ("timeout", "docs/parity.md §1 #6 duration ceiling"),
 ];
@@ -87,6 +88,12 @@ pub fn expected_registry() -> Value {
         .position(|c| c["name"] == INTENTIONAL_DIFFERENCES[1].0)
         .expect(INTENTIONAL_DIFFERENCES[1].1);
     commands.remove(rota);
+    // Next-only `/help` discovery surface: no legacy counterpart. Insert at
+    // the publish position (third, after the leveling core) as the exact
+    // published definition, so parity pins its shape too.
+    let help = serde_json::to_value(CommandDefinition::new("help", HELP_DESCRIPTION))
+        .expect("help serializes");
+    commands.insert(2, help);
     canonical_registry(json!(commands))
 }
 

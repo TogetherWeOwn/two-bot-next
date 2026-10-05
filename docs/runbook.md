@@ -159,8 +159,10 @@ that monitoring is armed.
 ### Metrics alerts
 
 The Container DO pulls the container-internal `/metrics` on every keepalive tick,
-evaluates the rules in `wrangler/src/alert-rules.ts`, and posts one message per
-transition (fire, resolve) to `OPS_ALERT_WEBHOOK_URL`. See
+evaluates the rules in `wrangler/src/alert-rules.ts`, and logs/persists each
+transition (fire, resolve). It posts to `OPS_ALERT_WEBHOOK_URL` only when
+`OPS_ALERT_FORWARDING` is exactly `"on"` (default `"off"`); turning forwarding off
+retains the credential and monitoring. See
 [metrics](metrics.md#off-container-scrape-and-alert-rules). Fetch the live data
 with `curl -H "Authorization: Bearer $METRICS_SCRAPE_TOKEN" "$WORKER_URL/ops/metrics"`.
 

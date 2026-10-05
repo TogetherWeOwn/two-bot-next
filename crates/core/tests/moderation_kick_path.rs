@@ -16,7 +16,8 @@
 //! Synthetic fixtures only: literal permission bits, synthetic snowflake ids,
 //! in-memory Discord double and store. No Discord, no network, no database,
 //! no guild dependency. Member `kick` keeps the pre-existing moderation path;
-//! the voice vote-kick claim owns only interactions carrying a kick target.
+//! the router answers every `/kick` and delegates to the voice vote only after
+//! moderation refuses an invoker who shares the target's room.
 
 use std::collections::HashSet;
 

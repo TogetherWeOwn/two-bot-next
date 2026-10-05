@@ -18,7 +18,10 @@ const MISSING = "missing (an inherited top-level block does not count)";
 
 type Toggle = { enabled?: unknown; head_sampling_rate?: unknown; invocation_logs?: unknown };
 type Observability = Toggle & { logs?: Toggle; traces?: Toggle };
-type RawConfig = { env?: Record<string, { observability?: Observability }> };
+type RawConfig = {
+  vars?: Record<string, unknown>;
+  env?: Record<string, { observability?: Observability; vars?: Record<string, unknown> }>;
+};
 
 function observabilityErrors(raw: RawConfig): string[] {
   const errors: string[] = [];
@@ -58,6 +61,15 @@ function parseFixture(toml: string): RawConfig {
   writeFileSync(path, toml);
   return experimental_readRawConfig({ config: path }).rawConfig as RawConfig;
 }
+
+test("every environment explicitly defaults ops alert forwarding to off", () => {
+  const raw = experimental_readRawConfig({ config: CONFIG }).rawConfig as RawConfig;
+  assert.equal(raw.vars?.OPS_ALERT_FORWARDING, "off", "default environment");
+  for (const name of new Set([...REQUIRED_ENVS, ...Object.keys(raw.env ?? {})])) {
+    assert.equal(raw.env?.[name]?.vars?.OPS_ALERT_FORWARDING, "off", name);
+    assert.equal(unstable_readConfig({ config: CONFIG, env: name }).vars.OPS_ALERT_FORWARDING, "off", name);
+  }
+});
 
 test("every named env declares unsampled Workers Logs", () => {
   const raw = experimental_readRawConfig({ config: CONFIG }).rawConfig as RawConfig;
