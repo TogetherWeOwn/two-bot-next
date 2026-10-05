@@ -314,8 +314,9 @@ async fn populated_and_empty_fixtures_use_compiled_routes_and_real_reply_builder
         assert!(report.mock);
         assert!(!report.live_execution);
         assert_eq!(report.transport, "local-fixtures");
-        // Supported fixtures passed, but source-plan /help and /ping are not
-        // core commands. This must never become a complete staging PASS.
+        // Supported fixtures passed, but /help is exercised by offline router
+        // and renderer tests and /ping is not a core command. This must never
+        // become a complete staging PASS.
         assert_eq!(report.verdict, OfflineVerdict::Incomplete);
         assert_eq!(
             report
@@ -333,7 +334,7 @@ async fn populated_and_empty_fixtures_use_compiled_routes_and_real_reply_builder
                 (
                     "/help",
                     StepResult::Skipped,
-                    Observation::UnsupportedCoreCommand
+                    Observation::CoveredByOfflineTests
                 ),
                 (
                     "/ping",
@@ -503,17 +504,15 @@ async fn wrong_fixture_type_and_foreign_rank_model_fail_without_rank_reply() {
 }
 
 #[test]
-fn skipped_plan_names_are_not_compiled_core_commands() {
+fn help_is_core_but_unfixtured_and_ping_is_not_core() {
     let commands = two_bot_core::commands::core_commands();
-    for name in ["rank", "leaderboard"] {
+    for name in ["rank", "leaderboard", "help"] {
         assert!(commands.iter().any(|command| command.name == name));
     }
-    for name in ["help", "ping"] {
-        assert!(
-            !commands.iter().any(|command| command.name == name),
-            "core scope changed; add the fixture before claiming coverage"
-        );
-    }
+    assert!(
+        !commands.iter().any(|command| command.name == "ping"),
+        "core scope changed; add the fixture before claiming coverage"
+    );
     assert!(!SmokeConfig::default().live_execution);
 }
 

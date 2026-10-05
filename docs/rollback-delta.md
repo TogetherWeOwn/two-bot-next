@@ -85,8 +85,11 @@ by the named alternate evidence, which the rollback operator attaches to
 the window record. The trigger still fires on an export-cap refusal (any
 table over the 50,000-row cap) or an incomplete journal capture, exactly
 as the trigger document states. The measured voice tables (`voice_rooms`
-via `created_at`/`owner_touched_at`/`name_touched_at`, `voice_text_companions` via
-`created_at`) need no disposition: their counts are the evidence.
+via `created_at`/`owner_touched_at`/`name_touched_at`/`privacy_touched_at`,
+`voice_room_blocks` via `created_at`, `voice_text_companions` via
+`created_at`, and the append-only `voice_vote_kick_audit` via `occurred_at`) need no
+disposition: their counts are the evidence. A block removed after the freeze deletes
+its row, so `voice_room_blocks` measures additions only.
 
 Read access does **not** authorize execution against real databases for
 tests. Acceptance uses only the disposable test service below. Operational

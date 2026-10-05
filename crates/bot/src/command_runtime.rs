@@ -28,6 +28,9 @@
 //! - leveling (`/rank [member]`, `/leaderboard`): one immediate callback,
 //!   ephemeral rank and public mention-suppressed top ten. The ordered gateway
 //!   award path shares this runtime's pool, executor and onboarding gates.
+//! - discovery (`/help`): one immediate ephemeral callback rendered from the
+//!   live publish set, grouped with permission hints; never deferred, never
+//!   stored.
 //!
 //! Registry publication runs here too: every `Event::Ready` publishes the
 //! router's ONE merged publish set (`set_guild_commands` is idempotent, so a
@@ -43,7 +46,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, PoisonError, RwLock,
     },
 };
 
@@ -74,12 +77,13 @@ use two_bot_core::{
     },
     tickets::TicketAction,
     ChannelModerationStore, ComponentHandler, ComponentOutcome, FeatureGates, HandlerId,
-    InteractionHandler, InteractionRouter, ModerationGates, RouterGates, SlashOutcome, Snowflake,
-    SurfaceFlags,
+    InteractionHandler, InteractionRouter, ModerationGates, RouterGates, RouterRefusal,
+    SlashOutcome, SurfaceFlags,
 };
 use two_bot_discord::{
-    publish_commands, register_channel_handlers, response_for_slash, route_interaction,
-    ActionExecutor, ChannelModerationRuntime, LevelingRuntime, RoutedInteraction,
+    help_response, publish_commands, register_channel_handlers, response_for_slash,
+    route_interaction, ActionExecutor, ChannelModerationRuntime, LevelingRuntime,
+    RoutedInteraction,
 };
 
 use crate::activation::BootActivation;
@@ -123,34 +127,15 @@ impl InteractionHandler for SliceHandler {
     }
 }
 
-/// Voice vote-kick claim check: resolves the tracked room a member is
-/// currently in, if any. Wired from the voice sink in `main`; `None` until
-/// then, which keeps every `/kick` on the pre-existing router path.
-pub type VoiceKickClaim = Arc<
-    dyn Fn(
-            Snowflake,
-            Snowflake,
-        ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + 'static>>
-        + Send
-        + Sync,
->;
-
-/// The vote target of a `/kick` slash interaction, if the published shape
-/// carries one. Accepts both the voice `member` option and the moderation
-/// `target` option; `None` keeps the existing router path untouched.
-fn kick_target_user(interaction: &Interaction) -> Option<Snowflake> {
-    let twilight_model::application::interaction::InteractionData::ApplicationCommand(data) =
-        interaction.data.as_ref()?
-    else {
-        return None;
-    };
-    data.options.iter().find_map(|option| match &option.value {
-        CommandOptionValue::User(id) if option.name == "member" || option.name == "target" => {
-            Some(id.get())
-        }
-        _ => None,
-    })
-}
+/// Voice vote-kick delegate (V4 `kick` collision). After the moderation path
+/// refuses a `/kick`, the router hands the interaction to the voice runtime,
+/// which starts a room vote when the invoker shares a tracked room with the
+/// target. `true` means voice answered the interaction itself, so the router
+/// must not; `false` means voice sent no callback and the router answers.
+/// Wired from the voice sink in `main`; `None` until then, which keeps every
+/// `/kick` answered by the router alone.
+pub type VoiceKickVote =
+    Arc<dyn Fn(Interaction) -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> + Send + Sync>;
 
 /// Separate admission budgets prevent message bursts or registry pacing from
 /// consuming interaction acknowledgement capacity. No queued/spawned waiters.
@@ -187,6 +172,9 @@ pub struct CommandRuntime {
     executor: ActionExecutor,
     interactions: two_bot_discord::interactions::InteractionRuntime,
     custom_commands: Option<Vec<two_bot_core::CustomCommand>>,
+    /// Confirmed publication for the non-DB/fallback publisher. Production
+    /// discovery reads the custom-command publisher's shared snapshot instead.
+    published_commands: RwLock<Option<Arc<[two_bot_core::CommandDefinition]>>>,
     application_id: AtomicU64,
     /// Bootstrapped custom-command execution seam (dynamic dispatch, prefix
     /// triggers, serialized republication). Shares the interaction runtime's
@@ -212,10 +200,10 @@ pub struct CommandRuntime {
     /// Monotonic attempt ids: one value mints both the DB claim token
     /// (`s{n:x}`, ≤25 chars) and the numeric post nonce for dedupe.
     attempts: AtomicU64,
-    /// Voice vote-kick claim (V4 `kick` collision): when set and the target
-    /// sits in a tracked room, the voice sink owns the interaction and the
-    /// router must stay silent so the vote is answered exactly once.
-    voice_kick_claim: Mutex<Option<VoiceKickClaim>>,
+    /// Voice vote-kick delegate (V4 `kick` collision). The router is the only
+    /// answerer of `/kick`: moderation first, then this delegate for room
+    /// occupants the moderation path refused.
+    voice_kick_vote: Mutex<Option<VoiceKickVote>>,
 }
 
 // Each in-flight LFG execution holds up to two connections of the shared pool;
@@ -280,6 +268,7 @@ impl CommandRuntime {
             executor,
             interactions,
             custom_commands,
+            published_commands: RwLock::new(None),
             application_id: AtomicU64::new(0),
             gateway_commands: tokio::sync::OnceCell::new(),
             channel,
@@ -292,8 +281,18 @@ impl CommandRuntime {
             automations,
             registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
-            voice_kick_claim: Mutex::new(None),
+            voice_kick_vote: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn published_commands(&self) -> Option<Arc<[two_bot_core::CommandDefinition]>> {
+        if let Some(custom) = self.gateway_commands.get() {
+            return custom.published_commands();
+        }
+        self.published_commands
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn set_identity(&self, bot_user_id: u64, application_id: u64) {
@@ -581,10 +580,10 @@ impl CommandRuntime {
         self.leveling.clone()
     }
 
-    /// Wire the voice vote-kick claim after boot composes both runtimes.
+    /// Wire the voice vote-kick delegate after boot composes both runtimes.
     /// Called once from `main`; the `None` default keeps router behavior.
-    pub fn set_voice_kick_claim(&self, claim: VoiceKickClaim) {
-        *self.voice_kick_claim.lock().expect("voice claim lock") = Some(claim);
+    pub fn set_voice_kick_vote(&self, vote: VoiceKickVote) {
+        *self.voice_kick_vote.lock().expect("voice vote lock") = Some(vote);
     }
 
     #[cfg(test)]
@@ -889,6 +888,11 @@ impl CommandRuntime {
             .publish_guild_commands(application_id, self.guild_id, &commands)
             .await
             .map_err(|_| RegistrySyncError::Publish)?;
+        let snapshot: Arc<[two_bot_core::CommandDefinition]> = defs.into();
+        *self
+            .published_commands
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(snapshot);
         *synced = true;
         Ok(())
     }
@@ -967,23 +971,29 @@ impl CommandRuntime {
         let RoutedInteraction::Slash { name, outcome } = routed else {
             return;
         };
-        // V4 `kick` collision: the voice sink owns interactions whose target
-        // sits in a tracked room (it answers the vote exactly once). Yield
-        // those here so the router never double-answers; every other `kick`
-        // keeps the pre-existing moderation path bit-for-bit.
-        if name == "kick" {
-            if let Some(target) = kick_target_user(interaction) {
-                if let Some(guild) = interaction.guild_id.map(|id| id.get()) {
-                    let claim = self
-                        .voice_kick_claim
-                        .lock()
-                        .expect("voice claim lock")
-                        .clone();
-                    if let Some(claim) = claim {
-                        if claim(guild, target).await.is_some() {
-                            return;
-                        }
-                    }
+        // V4 `kick` collision: this router is the only answerer. The guild
+        // fence, the moderation gate and the Kick Members check run first, and
+        // a moderator who passes them is never turned into a voter (a target
+        // sitting in a room is no shield). Only a refusal that the V4 vote
+        // contract can still serve reaches the voice runtime: moderation off,
+        // or the invoker lacking Kick Members. The guild fence never does.
+        if name == "kick"
+            && matches!(
+                outcome,
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::ModerationDisabled
+                        | RouterRefusal::ModerationPermission(_),
+                }
+            )
+        {
+            let vote = self
+                .voice_kick_vote
+                .lock()
+                .expect("voice vote lock")
+                .clone();
+            if let Some(vote) = vote {
+                if vote(interaction.clone()).await {
+                    return;
                 }
             }
         }
@@ -1002,7 +1012,18 @@ impl CommandRuntime {
             }
             return;
         }
+        if handler == HandlerId::Help {
+            // Read the actual confirmed publication, including DB-backed
+            // custom rows and successful add/remove refreshes. No store wait.
+            let response = match self.published_commands() {
+                Some(defs) => help_response(&defs),
+                None => ephemeral("The command list is still refreshing. Try /help again shortly."),
+            };
+            self.answer(interaction, response).await;
+            return;
+        }
         let owner = match name.as_str() {
+            "help" => Some(HandlerId::Help),
             "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
                 Some(HandlerId::AutomationAdmin)
             }
@@ -1783,6 +1804,9 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     for id in [HandlerId::Rank, HandlerId::Leaderboard] {
         router.register(Box::new(SliceHandler(id)));
     }
+    // `/help` discovery is never activation-fenced either: it renders from
+    // the live publish set, so gated-off features simply do not appear.
+    router.register(Box::new(SliceHandler(HandlerId::Help)));
     router
 }
 
