@@ -246,6 +246,7 @@ jobs:
           --skip list_is_guild_scoped_selector_shaped_and_read_only
           --skip real_sqlx_runner_cases
           --skip database::actions_persist_rows_and_preserve_other_events_and_guilds
+          --skip a_restarted_worker_rediscovers_a_channel_whose_rollback_failed
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
