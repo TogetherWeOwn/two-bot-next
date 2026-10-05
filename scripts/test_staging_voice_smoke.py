@@ -163,7 +163,59 @@ class VoiceSmokeTests(unittest.TestCase):
         code, out = self.run_main(["--guild-id", STAGING_GUILD, "--staging-url", ""],
                                   self.routes(commands))
         self.assertEqual(code, 1)
-        self.assertIn("FAIL kick-ballot: /kick registered without its required member option", out)
+        self.assertIn("FAIL kick-ballot: /kick registered with neither the voice nor the moderation shape", out)
+
+    def test_moderation_shaped_kick_passes_the_ballot_probe(self):
+        # Moderation's /kick (required `target`) wins the first-wins merge;
+        # the ballot then runs only after an eligible moderation refusal.
+        commands = command_list(FULL_NAMES)
+        for command in commands:
+            if command["name"] == "kick":
+                command["options"] = [
+                    {"name": "target", "description": "Member to moderate",
+                     "type": 6, "required": True},
+                    {"name": "reason", "description": "Mandatory audit reason",
+                     "type": 3, "required": True, "max_length": 512},
+                ]
+        code, out = self.run_main(["--guild-id", STAGING_GUILD, "--staging-url", ""],
+                                  self.routes(commands))
+        self.assertEqual(code, 0)
+        self.assertIn("PASS kick:", out)
+        self.assertIn("PASS kick-ballot: /kick is moderation's (target option, first-wins);", out)
+
+    def test_present_but_wrong_command_stays_fail(self):
+        # A list entry whose resource disagrees is a registration defect,
+        # not a pending registration: FAIL, never SKIP.
+        commands = command_list(FULL_NAMES)
+        routes = self.routes(commands)
+        create = next(c for c in commands if c["name"] == "create")
+        app_url = f"{smoke.API}/applications/{STAGING_APP}/guilds/{STAGING_GUILD}/commands"
+        impostor = dict(create, name="other")
+        routes[f"{app_url}/{create['id']}"] = self.body(impostor)
+        code, out = self.run_main(["--guild-id", STAGING_GUILD, "--staging-url", ""],
+                                  routes)
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL create: command resource disagrees with the list entry", out)
+        self.assertIn("FAIL creator-create: /create is registered but its resource did not read clean", out)
+        self.assertIn("FAIL room-cleanup: /create is registered but its resource did not read clean", out)
+        self.assertNotIn("awaiting voice command registration; empty-room", out)
+
+    def test_mock_ignores_staging_url(self):
+        def worker_fetch(origin):
+            raise AssertionError(f"mock mode must not fetch the Worker: {origin}")
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = smoke.main(["--mock", "--staging-url", WORKER_URL,
+                                   "--evidence", self.evidence],
+                                  worker_fetch=worker_fetch)
+        self.assertEqual(code, 0)
+        self.assertIn("SKIP worker: no staging Worker URL given; registry-only run",
+                      out.getvalue())
+        receipt = self.read_evidence()
+        self.assertEqual(receipt["transport"], smoke.MOCK_TRANSPORT)
+        self.assertIsNone(receipt["worker_url"])
 
     def test_worker_failure_blocks_before_registry(self):
         def worker_fetch(origin):

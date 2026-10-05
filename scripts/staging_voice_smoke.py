@@ -21,7 +21,9 @@ Phases, in order:
     join-move        needs /create; voice-state join/move itself needs a
                      second human account in the staging voice channel, so
                      this probe attests scaffolding readiness only.
-    kick-ballot      needs /kick; shape-checks its required member option.
+    kick-ballot      needs /kick in its voice (member) or moderation
+                     (target, first-wins) shape; the ballot runs only after
+                     an eligible moderation refusal in the latter case.
     room-cleanup     needs /create; attests the empty-room reconcile
                      expectation the full smoke will verify in the client.
 
@@ -132,7 +134,7 @@ def staging_origin(url):
     try:
         port = parts.port
     except ValueError:
-        port = "invalid"
+        raise SmokeError("refusing: not the two-bot-next-staging workers.dev origin")
     if (parts.scheme != "https" or port is not None or parts.username or parts.password
             or not STAGING_HOST.fullmatch(parts.hostname or "")
             or parts.path not in ("", "/") or parts.query or parts.fragment):
@@ -208,11 +210,17 @@ def check_identity(fetch_fn):
     return me["id"]
 
 
+# Fixed vocabulary for the one registry outcome that is a SKIP for voice
+# surfaces: the list entry is absent (registration pending). Every other
+# FAIL (no id, disagreeing resource, wrong guild scope) is a real defect.
+NOT_REGISTERED = "not registered in the staging guild"
+
+
 def check_command(fetch_fn, app_id, guild_id, entries, name):
     """Read one command's registration: list entry plus its own resource."""
     entry = next((c for c in entries if isinstance(c, dict) and c.get("name") == name), None)
     if entry is None:
-        return Result(name, "fail", "not registered in the staging guild"), None
+        return Result(name, "fail", NOT_REGISTERED), None
     command_id = entry.get("id")
     if not isinstance(command_id, str) or not command_id:
         return Result(name, "fail", "registered entry carries no command id"), None
@@ -312,17 +320,29 @@ def check_worker(origin):
                      if isinstance(report.get("build_revision"), str) else None}
 
 
-def lifecycle_probes(details_by_name):
-    """Evaluate the four scaffolding probes against the registry result (no I/O)."""
+def lifecycle_probes(details_by_name, present_names):
+    """Evaluate the four scaffolding probes against the registry result (no I/O).
+
+    `present_names` carries every command the list entry named, whether or
+    not its resource read succeeded; `details_by_name` carries only the
+    resources that read clean. A present-but-unreadable command is a FAIL in
+    the registry phase, so the lifecycle probes must not report it as
+    merely awaiting registration.
+    """
     probes = []
 
     def registered(name):
-        return name in details_by_name
+        return name in present_names
 
+    # A present-but-unreadable command (registry FAIL above) fails its
+    # lifecycle probes too: scaffolding is not ready until the registry is.
+    unreadable = "is registered but its resource did not read clean; see the registry phase"
     # 1. creator-channel create: needs /create with its required name option.
     if not registered("create"):
         probes.append(Result("creator-create", "skip",
                              f"/create {AWAITING_REGISTRATION}; full smoke reruns on arrival"))
+    elif "create" not in details_by_name:
+        probes.append(Result("creator-create", "fail", f"/create {unreadable}"))
     else:
         option = option_named(details_by_name["create"], "name", 3)
         if option is not None and option.get("required") is True:
@@ -337,27 +357,40 @@ def lifecycle_probes(details_by_name):
     if not registered("create"):
         probes.append(Result("join-move", "skip",
                              f"/create {AWAITING_REGISTRATION}; join/move needs a second human account"))
+    elif "create" not in details_by_name:
+        probes.append(Result("join-move", "fail", f"/create {unreadable}"))
     else:
         probes.append(Result("join-move", "pass",
                              "scaffolding ready (/create present); live join/move needs a second human account"))
 
-    # 3. kick vote-ballot: needs /kick with its required member option.
+    # 3. kick vote-ballot: needs /kick in either known shape. Moderation's
+    # /kick (required `target`) wins the first-wins merge, so the registered
+    # command is moderation's whenever moderation publishes; the voice ballot
+    # then runs only after an eligible moderation refusal (router-first).
     if not registered("kick"):
         probes.append(Result("kick-ballot", "skip",
                              f"/kick {AWAITING_REGISTRATION}; ballot scaffolding reruns on arrival"))
     else:
-        option = option_named(details_by_name["kick"], "member", 6)
-        if option is not None and option.get("required") is True:
+        detail = details_by_name.get("kick")
+        voice = option_named(detail, "member", 6)
+        moderation = option_named(detail, "target", 6)
+        if voice is not None and voice.get("required") is True:
             probes.append(Result("kick-ballot", "pass",
-                                 "/kick shape ready (required member option); ballot scaffolding reruns on arrival"))
+                                 "/kick shape ready (voice member option); ballot scaffolding reruns on arrival"))
+        elif moderation is not None and moderation.get("required") is True:
+            probes.append(Result("kick-ballot", "pass",
+                                 "/kick is moderation's (target option, first-wins); "
+                                 "ballot runs after an eligible moderation refusal"))
         else:
             probes.append(Result("kick-ballot", "fail",
-                                 "/kick registered without its required member option"))
+                                 "/kick registered with neither the voice nor the moderation shape"))
 
     # 4. room cleanup: empty-room reconcile once rooms exist; needs /create.
     if not registered("create"):
         probes.append(Result("room-cleanup", "skip",
                              f"/create {AWAITING_REGISTRATION}; empty-room reconcile reruns on arrival"))
+    elif "create" not in details_by_name:
+        probes.append(Result("room-cleanup", "fail", f"/create {unreadable}"))
     else:
         probes.append(Result("room-cleanup", "pass",
                              "scaffolding ready (/create present); empty-room reconcile reruns in the full smoke"))
@@ -421,7 +454,6 @@ def run(guild_id, token, fetch_fn, worker_url=None, worker_fetch=None):
         except SmokeError as error:
             return None, [Result("worker-origin", "fail", str(error))]
         if worker_fetch is not None:
-            global fetch_worker
             worker_results, worker_info = worker_fetch(origin)
         else:
             worker_results, worker_info = check_worker(origin)
@@ -445,10 +477,15 @@ def run(guild_id, token, fetch_fn, worker_url=None, worker_fetch=None):
             raise SmokeError("command list answered 200 without a list")
         command_results = []
         details_by_name = {}
+        present_names = set()
         for name in (CONTROL_COMMAND, *VOICE_COMMANDS, *EXTENDED_COMMANDS):
             result, detail = check_command(fetch, app_id, guild, entries, name)
-            # Voice surfaces are pending registration: absent is SKIP, not FAIL.
-            if result.verdict == "fail" and name != CONTROL_COMMAND:
+            if result.reason != NOT_REGISTERED:
+                present_names.add(name)
+            # Voice surfaces are pending registration: only the absent entry
+            # is a SKIP. A present-but-wrong registration stays a FAIL.
+            if (result.verdict == "fail" and name != CONTROL_COMMAND
+                    and result.reason == NOT_REGISTERED):
                 result = Result(name, "skip", f"{result.reason} ({AWAITING_REGISTRATION})")
             command_results.append(result)
             if detail is not None:
@@ -456,7 +493,7 @@ def run(guild_id, token, fetch_fn, worker_url=None, worker_fetch=None):
     except SmokeError as error:
         return None, worker_results + [Result("interactions", "fail", str(error))]
     return ({"application_id": app_id, "guild_id": guild, "worker": worker_info},
-            worker_results + command_results + lifecycle_probes(details_by_name))
+            worker_results + command_results + lifecycle_probes(details_by_name, present_names))
 
 
 def evidence_shape(results):
@@ -474,7 +511,8 @@ def parse_args(argv):
                         default=os.environ.get("STAGING_WORKER_URL"),
                         help="staging Worker origin (default: $STAGING_WORKER_URL; omit for registry-only)")
     parser.add_argument("--mock", action="store_true",
-                        help="drive the endpoint shape against local fixtures (no network, no token)")
+                        help="drive the endpoint shape against local fixtures "
+                             "(no network, no token; ignores --staging-url)")
     parser.add_argument("--evidence", default="staging-voice-smoke-evidence.json",
                         help="receipt path written when the fetch phase completes")
     return parser.parse_args(argv)
@@ -484,9 +522,11 @@ def main(argv=None, fetch_fn=None, worker_fetch=None):
     args = parse_args(argv)
     token = os.environ.get("DISCORD_STAGING_BOT_TOKEN", "")
     if args.mock:
+        # Mock mode is fully offline: --staging-url is ignored so the
+        # evidence label never covers live Worker GETs.
         fetch = fetch_fn if fetch_fn is not None else fixture_fetch()
         origin, results = run(args.guild_id or STAGING_GUILD_ID, "mock", fetch,
-                              args.staging_url, worker_fetch)
+                              None, None)
         transport = MOCK_TRANSPORT
     else:
         if fetch_fn is None and not token:
@@ -505,11 +545,12 @@ def main(argv=None, fetch_fn=None, worker_fetch=None):
         # Fence, credential or endpoint refusal: nothing to attest.
         fence = any(r.name in ("guild-fence", "worker-origin") for r in results)
         return 2 if fence else 1
+    worker_url = None if args.mock else (args.staging_url or None)
     receipt = {"application_id": origin["application_id"],
                "guild_id": origin["guild_id"],
                "transport": transport,
                "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-               "worker_url": args.staging_url or None,
+               "worker_url": worker_url,
                "checks": evidence_shape(results),
                "result": "pass" if not failed else "fail"}
     try:
