@@ -10,7 +10,7 @@
 //! (gated on `TWO_VOICE=1` by the binary).
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
     sync::{
@@ -82,7 +82,7 @@ use two_bot_core::{
         RoomMember, RoomOwnership,
     },
     voice_permissions::OWNER_ALLOW_BITS,
-    voice_private::{PrivacyRecord, PrivateRoom},
+    voice_private::{MemberId, PrivacyRecord, PrivateRoom},
     voice_rooms::{
         category_full_message, is_usable_channel_name, voice_commands, ActionQueue, CreatorChannel,
         NewRoomSpec, PermissionSource, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction,
@@ -287,6 +287,30 @@ pub trait RoomPersistence: Send + Sync {
         room: Snowflake,
         record: &PrivacyRecord,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+    /// V3 approved Connect grants for the guild's rooms, keyed by room
+    /// channel. One entry is one member the worker approved and Discord may
+    /// still hold a Connect allow for; a room absent from the map holds none.
+    fn join_grants(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<BTreeMap<Snowflake, BTreeSet<Snowflake>>, StoreError>> + Send;
+    /// Record an approval's intent before granting Connect. Idempotent; a
+    /// retried intent is a no-op. `Ok(false)` when the room has no database
+    /// row, so a grant never outlives its room.
+    fn save_join_grant(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+    /// Retire a grant after its revocation landed (or its grant was refused).
+    /// Idempotent: retiring an absent grant is success.
+    fn remove_join_grant(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
 impl RoomPersistence for PgRoomStore {
@@ -454,6 +478,35 @@ impl RoomPersistence for PgRoomStore {
         record: &PrivacyRecord,
     ) -> Result<bool, StoreError> {
         PgRoomStore::save_privacy(self, guild, room, record)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn join_grants(
+        &self,
+        guild: Snowflake,
+    ) -> Result<BTreeMap<Snowflake, BTreeSet<Snowflake>>, StoreError> {
+        self.join_grants_in_guild(guild).await.map_err(store_error)
+    }
+
+    async fn save_join_grant(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        member: Snowflake,
+    ) -> Result<bool, StoreError> {
+        self.save_join_grant(guild, room, member)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn remove_join_grant(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        member: Snowflake,
+    ) -> Result<(), StoreError> {
+        self.remove_join_grant(guild, room, member)
             .await
             .map_err(store_error)
     }
@@ -1663,14 +1716,45 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .into_iter()
             .map(|channel| (channel, 0))
             .collect();
-        let (privacy, join_deletable) =
+        let (mut privacy, join_deletable) =
             Self::load_privacy(&rooms, store.privacy(live.guild_id).await?);
+        let join_grants = store.join_grants(live.guild_id).await?;
+        // Hydrate approved Connect grants: a private room remembers its
+        // approvals so a later `/public` revokes them; a grant whose room is
+        // public or gone still needs its revocation, which the queue lost on
+        // restart, so it is re-queued here. The witness is retired only by a
+        // successful revoke (or a refused grant), never by this hydration.
+        let mut pending_revokes = Vec::new();
+        for (room, members) in &join_grants {
+            match privacy.get_mut(room) {
+                Some(state) if state.private => {
+                    // A grant witness can outlive a later Block (approve,
+                    // failed revoke, re-private, Block): hydrating it blindly
+                    // would put a blocked member into `granted`, which
+                    // `validate()` refuses and wedges the room. Blocked
+                    // members keep only their revocation.
+                    for member in members {
+                        if state.blocked.contains(&MemberId(*member)) {
+                            pending_revokes.push((*room, *member));
+                        } else {
+                            state.granted.insert(MemberId(*member));
+                        }
+                    }
+                }
+                _ => {
+                    for member in members {
+                        pending_revokes.push((*room, *member));
+                    }
+                }
+            }
+        }
         let custom_names = store
             .custom_names(live.guild_id)
             .await?
             .into_iter()
             .collect();
-        Ok(Self {
+        let guild_id = live.guild_id;
+        let worker = Self {
             live,
             store,
             http,
@@ -1709,7 +1793,17 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             kick_audit: VecDeque::new(),
             kick_audit_retry_ms: 0,
             name_policy: Arc::new(AutomodPolicy::default()),
-        })
+        };
+        for (room, member) in pending_revokes {
+            worker.queue.enqueue(
+                guild_id,
+                RoomAction::RevokeJoinAccess {
+                    room_channel_id: room,
+                    member_id: member,
+                },
+            );
+        }
+        Ok(worker)
     }
 
     /// Run the create-path name filter under `policy` from here on.

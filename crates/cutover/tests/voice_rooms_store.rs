@@ -278,6 +278,7 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
             .is_err()
     );
     verify_privacy(&store, pool).await?;
+    verify_join_grants(&store, pool).await?;
     verify_access_controls(&store, pool).await?;
     verify_logging_settings(&store, pool).await?;
     verify_kick_audit(&store, pool).await
@@ -393,6 +394,81 @@ async fn verify_privacy(store: &PgRoomStore, pool: &PgPool) -> TestResult {
     .await?;
     assert_eq!(blocks, 0);
     assert!(store.privacy_in_guild(100).await?.is_empty());
+    Ok(())
+}
+
+/// V3 approved Connect grants (0418): the intent round-trips per room, is
+/// idempotent, is refused a zero member, never outlives its room, and dies
+/// with the room row.
+async fn verify_join_grants(store: &PgRoomStore, pool: &PgPool) -> TestResult {
+    let room = VoiceRoom {
+        guild_id: 100,
+        channel_id: 520,
+        creator_channel_id: 200,
+        owner_id: 310,
+        original_creator_id: 310,
+        name_seed: 1,
+        created_at: "2026-09-30T02:00:00.000Z".to_owned(),
+    };
+    assert!(store.add_room(&room).await?);
+    // No grants yet.
+    assert!(store.join_grants_in_guild(100).await?.is_empty());
+    assert!(store.join_grants_in_guild(101).await?.is_empty());
+    // Intent is idempotent: a retry is a no-op.
+    assert!(store.save_join_grant(100, 520, 901).await?);
+    assert!(store.save_join_grant(100, 520, 901).await?);
+    assert!(store.save_join_grant(100, 520, u64::MAX).await?);
+    assert_eq!(
+        store.join_grants_in_guild(100).await?,
+        BTreeMap::from([(520, BTreeSet::from([901, u64::MAX]))])
+    );
+    // Another guild never sees it.
+    assert!(store.join_grants_in_guild(101).await?.is_empty());
+    // A grant never outlives its room.
+    assert!(!store.save_join_grant(100, 599, 902).await?);
+    let orphans: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM voice_join_grants WHERE room_channel_id = '599'")
+            .fetch_one(pool)
+            .await?;
+    assert_eq!(orphans, 0);
+    // The schema refuses a zero member id.
+    assert!(store.save_join_grant(100, 520, 0).await.is_err());
+    assert!(sqlx::query(
+        "INSERT INTO voice_join_grants (guild_id, room_channel_id, member_id)
+             VALUES ('100', '520', '0')"
+    )
+    .execute(pool)
+    .await
+    .is_err());
+    assert!(
+        sqlx::query(
+            "INSERT INTO voice_join_grants (guild_id, room_channel_id, member_id)
+             VALUES ('100', '598', '902')"
+        )
+        .execute(pool)
+        .await
+        .is_err(),
+        "a grant row needs its room"
+    );
+    // Retiring is idempotent: a replayed revoke succeeds.
+    store.remove_join_grant(100, 520, 901).await?;
+    store.remove_join_grant(100, 520, 901).await?;
+    assert_eq!(
+        store.join_grants_in_guild(100).await?,
+        BTreeMap::from([(520, BTreeSet::from([u64::MAX]))])
+    );
+    // The grants die with the room.
+    assert_eq!(
+        store.remove_room(100, 520).await?.map(|r| r.channel_id),
+        Some(520)
+    );
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM voice_join_grants WHERE guild_id = '100' AND room_channel_id = '520'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(remaining, 0);
+    assert!(store.join_grants_in_guild(100).await?.is_empty());
     Ok(())
 }
 
