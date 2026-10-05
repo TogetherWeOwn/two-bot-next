@@ -50,6 +50,9 @@ impl RoomWrites for DeleteOnly {
     async fn rename(&self, _: u64, _: &str) -> Result<(), RoomHttpError> {
         panic!("reconciliation must not rename a room");
     }
+    async fn set_user_limit(&self, _: u64, _: u32, _: WriteGuard) -> Result<(), RoomHttpError> {
+        panic!("reconciliation must not change a room limit");
+    }
     async fn download_attachment(&self, _: &str, _: usize) -> Result<Vec<u8>, RoomHttpError> {
         panic!("reconciliation must not download an import file");
     }

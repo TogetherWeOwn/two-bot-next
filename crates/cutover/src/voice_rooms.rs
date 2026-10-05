@@ -545,6 +545,89 @@ impl PgRoomStore {
         Ok(true)
     }
 
+    /// V3 approved Connect grants for the guild's rooms, keyed by room channel.
+    /// One row is one member the worker approved and Discord may still hold a
+    /// Connect allow for: it is written before the grant PUT and retired only
+    /// after the revocation PUT lands (or the grant is definitively refused).
+    /// A room absent from the map holds no approved grants.
+    pub async fn join_grants_in_guild(
+        &self,
+        guild_id: Snowflake,
+    ) -> Result<BTreeMap<Snowflake, BTreeSet<Snowflake>>, sqlx::Error> {
+        let mut grants: BTreeMap<Snowflake, BTreeSet<Snowflake>> = BTreeMap::new();
+        for row in sqlx::query(
+            "SELECT room_channel_id, member_id FROM voice_join_grants
+             WHERE guild_id = $1",
+        )
+        .bind(guild_id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        {
+            grants
+                .entry(decode_id(&row, "room_channel_id")?)
+                .or_default()
+                .insert(decode_id(&row, "member_id")?);
+        }
+        Ok(grants)
+    }
+
+    /// Record an approval's intent before granting Connect. Idempotent: a
+    /// retried intent is a no-op. Returns false (writing nothing) when no row
+    /// tracks the room, so a grant can never outlive its room.
+    pub async fn save_join_grant(
+        &self,
+        guild_id: Snowflake,
+        channel_id: Snowflake,
+        member_id: Snowflake,
+    ) -> Result<bool, sqlx::Error> {
+        if member_id == 0 {
+            return Err(invalid_argument("join grant member must be nonzero"));
+        }
+        let exists: bool = sqlx::query_scalar(
+            "SELECT count(*) > 0 FROM voice_rooms
+             WHERE guild_id = $1 AND channel_id = $2",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        if !exists {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO voice_join_grants (guild_id, room_channel_id, member_id)
+             VALUES ($1, $2, $3)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(member_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
+    }
+
+    /// Retire a grant after its revocation landed (or its grant was refused).
+    /// Idempotent: retiring an absent row is success, so a retried revoke
+    /// whose outcome was unknown cannot leave a duplicate or fail.
+    pub async fn remove_join_grant(
+        &self,
+        guild_id: Snowflake,
+        channel_id: Snowflake,
+        member_id: Snowflake,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "DELETE FROM voice_join_grants
+             WHERE guild_id = $1 AND room_channel_id = $2 AND member_id = $3",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(member_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn room_for(
         &self,
         guild_id: Snowflake,

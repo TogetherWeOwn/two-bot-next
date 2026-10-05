@@ -135,8 +135,19 @@ fn stored_blocks(worker: &Worker) -> Vec<u64> {
         .unwrap_or_default()
 }
 
+fn stored_grants(worker: &Worker) -> Vec<u64> {
+    worker
+        .store
+        .join_grants
+        .lock()
+        .unwrap()
+        .get(&ROOM)
+        .map(|members| members.iter().copied().collect())
+        .unwrap_or_default()
+}
+
 /// A worker for the same guild after a restart: same Discord, same stored
-/// room and privacy record, nothing else remembered.
+/// room, privacy record and grant witness, nothing else remembered.
 async fn restarted(worker: &Worker) -> Worker {
     let trace = Trace::default();
     let store = Store::new(trace.clone());
@@ -152,6 +163,13 @@ async fn restarted(worker: &Worker) -> Worker {
             .cloned()
             .expect("persisted privacy"),
     );
+    for (room, members) in worker.store.join_grants.lock().unwrap().iter() {
+        store
+            .join_grants
+            .lock()
+            .unwrap()
+            .insert(*room, members.clone());
+    }
     let http = Http::new(trace);
     *http.next_id.lock().unwrap() = JOIN + 50;
     GuildRoomWorker::load(worker.live.clone(), store, http)
@@ -288,6 +306,7 @@ async fn approve_grants_connect_on_the_room_only_and_moves_the_member_in() {
     assert_eq!(
         calls(&trace),
         [
+            format!("save_join_grant:{ROOM}:{OUTSIDER}"),
             format!("overwrite:{ROOM}:{OUTSIDER}:Member"),
             format!("move:{OUTSIDER}:{ROOM}"),
         ]
@@ -304,7 +323,7 @@ async fn approve_grants_connect_on_the_room_only_and_moves_the_member_in() {
     let again = press(&mut worker, OWNER, JoinDecision::Approve, request.id.0);
     assert!(refused(&again).contains("no longer pending"), "{again:?}");
     drain(&mut worker).await;
-    assert_eq!(calls(&trace).len(), 2);
+    assert_eq!(calls(&trace).len(), 3);
 }
 
 #[tokio::test]
@@ -324,7 +343,10 @@ async fn approve_does_not_move_a_member_who_left_the_join_channel() {
     drain(&mut worker).await;
     assert_eq!(
         calls(&trace),
-        [format!("overwrite:{ROOM}:{OUTSIDER}:Member")]
+        [
+            format!("save_join_grant:{ROOM}:{OUTSIDER}"),
+            format!("overwrite:{ROOM}:{OUTSIDER}:Member"),
+        ]
     );
 }
 
@@ -698,8 +720,10 @@ async fn a_failed_approval_write_is_not_claimed_so_the_member_can_ask_again() {
     let reply = press(&mut worker, OWNER, JoinDecision::Approve, request.id.0);
     assert!(decided(&reply).contains("Approved"), "{reply:?}");
     drain(&mut worker).await;
-    // Discord refused the grant, so the state stops claiming it.
+    // Discord refused the grant, so the state stops claiming it and the
+    // witness retires with it: nothing survives for `/public` to revoke.
     assert!(worker.privacy[&ROOM].granted.is_empty());
+    assert!(stored_grants(&worker).is_empty());
     assert!(!worker.failures().is_empty());
     leave(&worker, OUTSIDER, 3_000);
     worker.reconcile();
@@ -731,6 +755,7 @@ async fn a_failed_move_keeps_the_grant_that_landed() {
     assert_eq!(
         calls(&trace),
         [
+            format!("save_join_grant:{ROOM}:{OUTSIDER}"),
             format!("overwrite:{ROOM}:{OUTSIDER}:Member"),
             format!("move:{OUTSIDER}:{ROOM}"),
         ]
@@ -863,4 +888,209 @@ fn a_decision_replaces_the_prompt_in_place_without_buttons_or_pings() {
     assert_eq!(data.components, Some(Vec::new()));
     assert_eq!(data.allowed_mentions, Some(AllowedMentions::default()));
     assert_eq!(data.flags, None);
+}
+
+#[tokio::test]
+async fn a_grant_survives_a_restart_and_public_revokes_only_its_connect_bit() {
+    let (mut worker, trace) = private_room().await;
+    // The member already holds unrelated bits on the room: an extra allow and
+    // an unrelated deny. The approval must carry those over untouched.
+    let mut overwrites = worker.live_overwrites(ROOM).unwrap();
+    overwrites.push(PermissionOverwrite {
+        allow: Permissions::SPEAK,
+        deny: Permissions::MUTE_MEMBERS,
+        id: Id::new(OUTSIDER),
+        kind: PermissionOverwriteType::Member,
+    });
+    let mut channel = channel(ROOM, 2, Some(CATEGORY));
+    channel.permission_overwrites = Some(overwrites);
+    worker.live.upsert_channel(channel);
+    enter(&worker, OUTSIDER, 2_000);
+    worker.reconcile();
+    drain(&mut worker).await;
+    trace.lock().unwrap().clear();
+    let request = request_of(&worker, OUTSIDER);
+    press(&mut worker, OWNER, JoinDecision::Approve, request.id.0);
+    drain(&mut worker).await;
+    // The intent is persisted before the PUT (trace order), and the PUT keeps
+    // the unrelated bits.
+    let log = calls(&trace);
+    assert_eq!(
+        log[0],
+        format!("save_join_grant:{ROOM}:{OUTSIDER}"),
+        "{log:?}"
+    );
+    let grant = worker
+        .http
+        .written_overwrites
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("grant written");
+    assert_eq!(grant.1.allow, Permissions::CONNECT | Permissions::SPEAK);
+    assert_eq!(grant.1.deny, Permissions::MUTE_MEMBERS);
+    assert_eq!(stored_grants(&worker), [OUTSIDER]);
+    // A restart forgets the prompts and the request ids but hydrates the
+    // approval, so `/public` still knows whose Connect bit to take back.
+    let mut after = restarted(&worker).await;
+    assert!(after.privacy[&ROOM].granted.contains(&MemberId(OUTSIDER)));
+    assert!(pending(&after).is_empty());
+    let reply = after.apply_privacy(OWNER, false, "Ana", PrivacyCommand::Public);
+    assert!(reply.contains("public again"), "{reply}");
+    drain(&mut after).await;
+    // Only the approval's Connect bit moved: the extra allow and the unrelated
+    // deny are still on the member's entry, and the witness is retired.
+    let kept = after
+        .live_overwrites(ROOM)
+        .unwrap()
+        .into_iter()
+        .find(|overwrite| {
+            overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == OUTSIDER
+        })
+        .expect("member entry kept");
+    assert!(!kept.allow.contains(Permissions::CONNECT));
+    assert!(kept.allow.contains(Permissions::SPEAK));
+    assert_eq!(kept.deny, Permissions::MUTE_MEMBERS);
+    assert!(after.privacy[&ROOM].granted.is_empty());
+    assert_eq!(
+        after
+            .store
+            .join_grants
+            .lock()
+            .unwrap()
+            .get(&ROOM)
+            .map(|members| members.len())
+            .unwrap_or(0),
+        0
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_grant_outcome_keeps_its_witness() {
+    let (mut worker, _trace) = private_room().await;
+    enter(&worker, OUTSIDER, 2_000);
+    worker.reconcile();
+    drain(&mut worker).await;
+    let request = request_of(&worker, OUTSIDER);
+    // Every attempt reports an unknown outcome: the PUT may have landed, so
+    // the witness must survive even after the queue gives up. Unknown outcomes
+    // are retried without a `/setup` failure line; only the witness matters.
+    for _ in 0..40 {
+        worker
+            .http
+            .overwrite_errors
+            .lock()
+            .unwrap()
+            .push_back(RoomHttpError::UnknownOutcome);
+    }
+    press(&mut worker, OWNER, JoinDecision::Approve, request.id.0);
+    drain(&mut worker).await;
+    assert!(worker.privacy[&ROOM].granted.contains(&MemberId(OUTSIDER)));
+    assert_eq!(stored_grants(&worker), [OUTSIDER]);
+}
+
+#[tokio::test]
+async fn a_failed_revoke_keeps_its_witness_and_continues_after_a_restart() {
+    let (mut worker, _trace) = private_room().await;
+    enter(&worker, OUTSIDER, 2_000);
+    worker.reconcile();
+    drain(&mut worker).await;
+    let request = request_of(&worker, OUTSIDER);
+    press(&mut worker, OWNER, JoinDecision::Approve, request.id.0);
+    drain(&mut worker).await;
+    assert_eq!(stored_grants(&worker), [OUTSIDER]);
+    // `/public` lands its own write first; fail only the revoke that follows.
+    let reply = worker.apply_privacy(OWNER, false, "Ana", PrivacyCommand::Public);
+    assert!(reply.contains("public again"), "{reply}");
+    assert!(worker.dispatch_one(1_000_000).await);
+    worker
+        .http
+        .overwrite_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    drain(&mut worker).await;
+    // Discord refused the revoke, so the witness stays: the member still holds
+    // Connect and a restart must still know to take it back.
+    assert_eq!(stored_grants(&worker), [OUTSIDER]);
+    assert!(!worker.failures().is_empty());
+    let mut after = restarted(&worker).await;
+    // The room is public now, so load re-queued the revocation on its own.
+    drain(&mut after).await;
+    assert!(
+        after
+            .store
+            .join_grants
+            .lock()
+            .unwrap()
+            .get(&ROOM)
+            .is_none_or(|members| members.is_empty()),
+        "retried revokes retire the witness"
+    );
+    assert!(
+        !after
+            .live_overwrites(ROOM)
+            .unwrap()
+            .iter()
+            .any(|overwrite| overwrite.id.get() == OUTSIDER
+                && overwrite.allow.contains(Permissions::CONNECT)),
+        "the Connect allow is gone"
+    );
+}
+
+#[tokio::test]
+async fn a_grant_witness_older_than_a_block_hydrates_cleanly_after_a_restart() {
+    let (mut worker, _trace) = private_room().await;
+    enter(&worker, OUTSIDER, 2_000);
+    worker.reconcile();
+    drain(&mut worker).await;
+    let request = request_of(&worker, OUTSIDER);
+    press(&mut worker, OWNER, JoinDecision::Approve, request.id.0);
+    drain(&mut worker).await;
+    assert_eq!(stored_grants(&worker), [OUTSIDER]);
+    // `/public` with a refused revoke: the room opens but the witness stays.
+    let reply = worker.apply_privacy(OWNER, false, "Ana", PrivacyCommand::Public);
+    assert!(reply.contains("public again"), "{reply}");
+    assert!(worker.dispatch_one(1_000_000).await);
+    worker
+        .http
+        .overwrite_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    drain(&mut worker).await;
+    assert_eq!(stored_grants(&worker), [OUTSIDER]);
+    // Private again, and the same member is now blocked: both the grant
+    // witness and the block row exist for them.
+    let reply = worker.apply_privacy(OWNER, false, "Ana", PrivacyCommand::Private);
+    assert!(reply.contains("private"), "{reply}");
+    drain(&mut worker).await;
+    // The re-created Join channel has a fresh id: meet the member there.
+    let join = worker
+        .join_channel_of(ROOM)
+        .expect("recreated Join channel");
+    worker
+        .live
+        .voice_update_at(OUTSIDER, Some(join), Some(false), 3_000);
+    worker.reconcile();
+    drain(&mut worker).await;
+    let request = request_of(&worker, OUTSIDER);
+    let reply = press(&mut worker, OWNER, JoinDecision::Block, request.id.0);
+    assert!(decided(&reply).contains("Blocked"), "{reply:?}");
+    drain(&mut worker).await;
+    assert_eq!(stored_blocks(&worker), [OUTSIDER]);
+    assert_eq!(stored_grants(&worker), [OUTSIDER]);
+    // The restart must not hydrate a blocked member into `granted` (the core
+    // refuses that intersection and would wedge the room): the grant becomes a
+    // revocation instead, and `/public` still works.
+    let mut after = restarted(&worker).await;
+    assert!(!after.privacy[&ROOM].granted.contains(&MemberId(OUTSIDER)));
+    assert!(after.privacy[&ROOM].blocked.contains(&MemberId(OUTSIDER)));
+    drain(&mut after).await;
+    let reply = after.apply_privacy(OWNER, false, "Ana", PrivacyCommand::Public);
+    assert!(reply.contains("public again"), "{reply}");
+    drain(&mut after).await;
+    assert!(!after.privacy[&ROOM].private);
+    assert_eq!(stored_blocks(&after), [OUTSIDER]);
 }

@@ -1,0 +1,114 @@
+name: staging-container-drill
+
+# Manual, staging-only reviewed-image container backout/restore drill
+# (docs/runbook.md "Container-image backout/restore drill"). Never runs
+# automatically and has no production path. One dispatch backouts staging to
+# a previously reviewed Rust source/image pair and restores the baseline
+# through the FULL container rollout path: fence, full `wrangler deploy` of
+# the pinned pre-built image (never a rebuild of old source, never a
+# Worker-versions-only rollback), epoch-checked ownership takeover, exact
+# rollout plus runtime verification, then the same sequence back to the
+# baseline. It reads only the `staging` environment's existing
+# ownership-control pair and Cloudflare token; it creates or changes no
+# credential and never prints a body, an identifier, a token or a secret.
+# Shares the deploy-staging concurrency group so a push-triggered deploy
+# cannot interleave with a drill.
+on:
+  workflow_dispatch:
+    inputs:
+      backout_source_sha:
+        description: 40-hex Rust source SHA of a reviewed staging pair; never "latest"
+        type: string
+        required: true
+      backout_build_id:
+        description: Build id baked into that image (RUN_ID-RUN_ATTEMPT)
+        type: string
+        required: true
+      backout_image:
+        description: Digest-pinned registry image of that pair (registry...@sha256:...)
+        type: string
+        required: true
+      backout_worker_version:
+        description: Worker version UUID that served staging with that pair
+        type: string
+        required: true
+      backout_rollout_id:
+        description: Prior completed staging rollout id that served that image
+        type: string
+        required: true
+      backout_review_ref:
+        description: Exact review/CI evidence for the pair (format per runbook)
+        type: string
+        required: true
+      backout_staging_run_id:
+        description: Prior successful staging deployment run that served that pair
+        type: string
+        required: true
+      compatibility_note:
+        description: Retained schema/DO/bindings/flags assessment id (format per runbook)
+        type: string
+        required: true
+      session_attestation:
+        description: Optional operator log-count attestation JSON (counts and windows only)
+        type: string
+        required: false
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  container-drill:
+    name: staging container backout/restore drill
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read # checkout only; the drill authenticates with `staging` environment secrets
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'container-drill') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    environment: staging
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - run: npm ci
+        working-directory: wrangler
+      - name: Run the staging container backout/restore drill
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          BACKOUT_SOURCE_SHA: ${{ inputs.backout_source_sha }}
+          BACKOUT_BUILD_ID: ${{ inputs.backout_build_id }}
+          BACKOUT_IMAGE: ${{ inputs.backout_image }}
+          BACKOUT_WORKER_VERSION: ${{ inputs.backout_worker_version }}
+          BACKOUT_ROLLOUT_ID: ${{ inputs.backout_rollout_id }}
+          BACKOUT_REVIEW_REF: ${{ inputs.backout_review_ref }}
+          BACKOUT_STAGING_RUN_ID: ${{ inputs.backout_staging_run_id }}
+          COMPATIBILITY_NOTE: ${{ inputs.compatibility_note }}
+          SESSION_ATTESTATION: ${{ inputs.session_attestation }}
+        run: |
+          set -euo pipefail
+          python3 scripts/staging_container_drill.py \
+            --backout-source-sha "$BACKOUT_SOURCE_SHA" \
+            --backout-build-id "$BACKOUT_BUILD_ID" \
+            --backout-image "$BACKOUT_IMAGE" \
+            --backout-worker-version "$BACKOUT_WORKER_VERSION" \
+            --backout-rollout-id "$BACKOUT_ROLLOUT_ID" \
+            --backout-review-ref "$BACKOUT_REVIEW_REF" \
+            --backout-staging-run-id "$BACKOUT_STAGING_RUN_ID" \
+            --compatibility-note "$COMPATIBILITY_NOTE" \
+            --session-attestation "$SESSION_ATTESTATION" \
+            --evidence "$RUNNER_TEMP/staging-container-drill-evidence.json" \
+            --deploy-config "$RUNNER_TEMP/staging-container-deploy.json" \
+            --wrangler-bin "$GITHUB_WORKSPACE/wrangler/node_modules/.bin/wrangler" \
+            --wrangler-dir "$GITHUB_WORKSPACE/wrangler"

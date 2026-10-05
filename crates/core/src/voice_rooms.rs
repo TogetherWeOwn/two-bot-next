@@ -753,6 +753,14 @@ pub enum RoomAction {
         channel_id: Snowflake,
         name: String,
     },
+    /// V3 `/limit` and `/unlimit`: set the room channel's user limit
+    /// (`0` is unlimited, at most [`MAX_USER_LIMIT`]). The worker has already
+    /// decided the value with the pure room-controls core; the write is
+    /// idempotent, so a retried action is safe.
+    SetUserLimit {
+        channel_id: Snowflake,
+        user_limit: u32,
+    },
     /// V3 `/name`: persist the worker's custom-name override for a tracked
     /// room (`None` after a restore). No Discord write: the rename itself
     /// rides [`RoomAction::RenameRoom`] on the deferred lane. A stale action
@@ -856,6 +864,7 @@ impl RoomAction {
             | Self::DeleteRoom { channel_id }
             | Self::UpdateOwnership { channel_id, .. }
             | Self::RenameRoom { channel_id, .. }
+            | Self::SetUserLimit { channel_id, .. }
             | Self::SetEveryoneConnect { channel_id, .. }
             | Self::SavePrivacy { channel_id }
             | Self::CreateJoinChannel {
@@ -1151,21 +1160,37 @@ impl ActionQueue {
     }
 
     /// Drop every pending action touching the channel (room deleted by hand
-    /// or forgotten by reconcile). Returns the dropped count.
-    pub fn drop_for_channel(&self, guild_id: Snowflake, channel_id: Snowflake) -> usize {
+    /// or forgotten by reconcile). Returns the dropped actions' ids so
+    /// callers can settle their waiters instead of leaving them orphaned.
+    pub fn drain_for_channel(&self, guild_id: Snowflake, channel_id: Snowflake) -> Vec<u64> {
         let mut inner = self.inner.lock().expect("queue lock");
-        let mut dropped = 0;
-        if let Some(queue) = inner.urgent.get_mut(&guild_id) {
-            let before = queue.len();
-            queue.retain(|q| q.action.channel_id() != Some(channel_id));
-            dropped += before - queue.len();
-        }
-        if let Some(queue) = inner.deferred.get_mut(&guild_id) {
-            let before = queue.len();
-            queue.retain(|q| q.action.channel_id() != Some(channel_id));
-            dropped += before - queue.len();
+        let mut dropped = Vec::new();
+        for lane in [true, false] {
+            let queue = if lane {
+                inner.urgent.get_mut(&guild_id)
+            } else {
+                inner.deferred.get_mut(&guild_id)
+            };
+            let Some(queue) = queue else {
+                continue;
+            };
+            let mut kept = VecDeque::with_capacity(queue.len());
+            for queued in queue.drain(..) {
+                if queued.action.channel_id() == Some(channel_id) {
+                    dropped.push(queued.id);
+                } else {
+                    kept.push_back(queued);
+                }
+            }
+            *queue = kept;
         }
         dropped
+    }
+
+    /// Drop every pending action touching the channel (room deleted by hand
+    /// or forgotten by reconcile). Returns the dropped count.
+    pub fn drop_for_channel(&self, guild_id: Snowflake, channel_id: Snowflake) -> usize {
+        self.drain_for_channel(guild_id, channel_id).len()
     }
 
     /// Pending (urgent, deferred) counts for the guild. Diagnostics/tests.
@@ -1552,6 +1577,17 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
             "public",
             "Let anyone join your voice room again and remove its Join channel",
         ),
+        CommandDefinition::new(
+            "limit",
+            "Set your room's user limit (no number locks it at the current headcount)",
+        )
+        .options(vec![CommandOption::new(
+            "count",
+            "Limit 0-99 (0 is unlimited; leave empty to lock at who is here now)",
+            CommandOptionType::Integer,
+        )
+        .int_range(0, MAX_USER_LIMIT)]),
+        CommandDefinition::new("unlimit", "Remove your room's user limit"),
     ]
 }
 
@@ -2037,6 +2073,36 @@ mod tests {
     }
 
     #[test]
+    fn user_limit_actions_are_urgent_and_scoped_to_their_room() {
+        let q = ActionQueue::new();
+        q.enqueue(
+            GUILD,
+            RoomAction::RenameRoom {
+                channel_id: 500,
+                name: "slow".to_owned(),
+            },
+        );
+        let limit = RoomAction::SetUserLimit {
+            channel_id: 500,
+            user_limit: 4,
+        };
+        q.enqueue(GUILD, limit.clone());
+        assert_eq!(limit.channel_id(), Some(500));
+        // The urgent lane drains before the pending rename.
+        assert_eq!(q.pending_counts(GUILD), (1, 1));
+        assert_eq!(q.pop_due(GUILD, 0).map(|a| a.action), Some(limit));
+        // A suspended room holds its limit write; forgetting the room drops it.
+        let again = RoomAction::SetUserLimit {
+            channel_id: 501,
+            user_limit: 0,
+        };
+        q.enqueue(GUILD + 1, again);
+        q.suspend(GUILD + 1, 501);
+        assert_eq!(q.pop_due(GUILD + 1, 0), None);
+        assert_eq!(q.drop_for_channel(GUILD + 1, 501), 1);
+    }
+
+    #[test]
     fn backoff_preserves_lifecycle_order() {
         let q = ActionQueue::new();
         let first = q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 500 });
@@ -2340,7 +2406,9 @@ mod tests {
                 "kick",
                 "name",
                 "private",
-                "public"
+                "public",
+                "limit",
+                "unlimit"
             ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
@@ -2490,6 +2558,19 @@ mod tests {
         );
         assert_eq!(kick.options[0].required, Some(true));
         assert_eq!(kick.options[1].required, None);
+        // `/limit` and `/unlimit` are owner commands the worker gates: open in
+        // the definition, with one optional 0-99 count and no options.
+        let limit = defs.iter().find(|def| def.name == "limit").unwrap();
+        assert_eq!(limit.default_member_permissions, None);
+        assert_eq!(limit.options.len(), 1);
+        assert_eq!(limit.options[0].name, "count");
+        assert_eq!(limit.options[0].kind, CommandOptionType::Integer.as_u8());
+        assert_eq!(limit.options[0].required, None);
+        assert_eq!(limit.options[0].min_value, Some(0));
+        assert_eq!(limit.options[0].max_value, Some(MAX_USER_LIMIT));
+        let unlimit = defs.iter().find(|def| def.name == "unlimit").unwrap();
+        assert_eq!(unlimit.default_member_permissions, None);
+        assert!(unlimit.options.is_empty());
         // `/name` is open to every member with no options: the panel and modal
         // carry the name, and the worker refuses everyone but the owner or an
         // admin.

@@ -8,6 +8,8 @@ mod delete_guards;
 mod join;
 #[path = "voice_kick_tests.rs"]
 mod kick;
+#[path = "voice_rooms_limit_tests.rs"]
+mod limit_command;
 #[path = "voice_name_tests.rs"]
 mod name;
 #[path = "voice_private_runtime_tests.rs"]
@@ -133,6 +135,10 @@ struct Store {
     companion_errors: Mutex<VecDeque<StoreError>>,
     privacy: Mutex<BTreeMap<u64, PrivacyRecord>>,
     save_privacy_errors: Mutex<VecDeque<StoreError>>,
+    /// Durable approved Connect grants, keyed by room then member.
+    join_grants: Mutex<BTreeMap<u64, BTreeSet<u64>>>,
+    save_join_grant_errors: Mutex<VecDeque<StoreError>>,
+    remove_join_grant_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
     after_persist: Option<Hook>,
     config: Arc<Mutex<VoiceConfiguration>>,
@@ -171,6 +177,9 @@ impl Store {
             companion_errors: Mutex::new(VecDeque::new()),
             privacy: Mutex::new(BTreeMap::new()),
             save_privacy_errors: Mutex::new(VecDeque::new()),
+            join_grants: Mutex::new(BTreeMap::new()),
+            save_join_grant_errors: Mutex::new(VecDeque::new()),
+            remove_join_grant_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
             after_persist: None,
             config: Arc::new(Mutex::new(empty_config())),
@@ -379,6 +388,7 @@ impl RoomPersistence for Store {
         }
         self.rooms.lock().unwrap().remove(&channel);
         self.privacy.lock().unwrap().remove(&channel);
+        self.join_grants.lock().unwrap().remove(&channel);
         self.owner_intents.lock().unwrap().remove(&channel);
         self.owner_pending.lock().unwrap().remove(&channel);
         Ok(())
@@ -480,6 +490,41 @@ impl RoomPersistence for Store {
         self.privacy.lock().unwrap().insert(room, record.clone());
         Ok(true)
     }
+    async fn join_grants(&self, _: u64) -> Result<BTreeMap<u64, BTreeSet<u64>>, StoreError> {
+        Ok(self.join_grants.lock().unwrap().clone())
+    }
+    async fn save_join_grant(&self, _: u64, room: u64, member: u64) -> Result<bool, StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("save_join_grant:{room}:{member}"));
+        if let Some(error) = self.save_join_grant_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        if !self.rooms.lock().unwrap().contains_key(&room) {
+            return Ok(false);
+        }
+        self.join_grants
+            .lock()
+            .unwrap()
+            .entry(room)
+            .or_default()
+            .insert(member);
+        Ok(true)
+    }
+    async fn remove_join_grant(&self, _: u64, room: u64, member: u64) -> Result<(), StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("remove_join_grant:{room}:{member}"));
+        if let Some(error) = self.remove_join_grant_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        if let Some(members) = self.join_grants.lock().unwrap().get_mut(&room) {
+            members.remove(&member);
+        }
+        Ok(())
+    }
 }
 
 /// Scripted `/import` download queue shared with the harness.
@@ -487,6 +532,14 @@ type DownloadResults = Arc<Mutex<VecDeque<Result<Vec<u8>, RoomHttpError>>>>;
 
 #[derive(Default)]
 struct OverwriteGate {
+    sent: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+/// Hold one `/limit` PATCH mid-flight: the fake signals `sent` when the
+/// write starts and finishes only after `release`.
+#[derive(Default)]
+struct LimitGate {
     sent: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -508,6 +561,7 @@ struct Http {
     move_errors: Mutex<VecDeque<RoomHttpError>>,
     delete_errors: Mutex<VecDeque<RoomHttpError>>,
     rename_errors: Mutex<VecDeque<RoomHttpError>>,
+    limit_errors: Mutex<VecDeque<RoomHttpError>>,
     companion_errors: Mutex<VecDeque<RoomHttpError>>,
     view_errors: Mutex<VecDeque<RoomHttpError>>,
     /// Scripted failures for the V4 enforcement's Connect deny.
@@ -529,7 +583,9 @@ struct Http {
     after_create: Option<Hook>,
     before_move: Option<Hook>,
     before_delete: Option<Hook>,
+    before_limit: Option<Hook>,
     overwrites_gate: Option<Arc<OverwriteGate>>,
+    limit_gate: Option<Arc<LimitGate>>,
     downloaded_urls: Mutex<Vec<String>>,
     download_results: DownloadResults,
 }
@@ -543,6 +599,7 @@ impl Http {
             move_errors: Mutex::new(VecDeque::new()),
             delete_errors: Mutex::new(VecDeque::new()),
             rename_errors: Mutex::new(VecDeque::new()),
+            limit_errors: Mutex::new(VecDeque::new()),
             companion_errors: Mutex::new(VecDeque::new()),
             view_errors: Mutex::new(VecDeque::new()),
             kick_errors: Mutex::new(VecDeque::new()),
@@ -561,7 +618,9 @@ impl Http {
             after_create: None,
             before_move: None,
             before_delete: None,
+            before_limit: None,
             overwrites_gate: None,
+            limit_gate: None,
             downloaded_urls: Mutex::new(Vec::new()),
             download_results: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -702,6 +761,31 @@ impl RoomWrites for Http {
             .unwrap()
             .push(format!("rename:{channel}:{name}"));
         match self.rename_errors.lock().unwrap().pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    async fn set_user_limit(
+        &self,
+        channel: u64,
+        user_limit: u32,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if let Some(hook) = &self.before_limit {
+            hook();
+        }
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("limit:{channel}:{user_limit}"));
+        if let Some(gate) = &self.limit_gate {
+            gate.sent.notify_one();
+            gate.release.notified().await;
+        }
+        match self.limit_errors.lock().unwrap().pop_front() {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -1032,6 +1116,214 @@ async fn persistence_failure_compensates_the_exact_new_channel_and_never_moves()
         ["create", "persist:500", "delete:500", "forget:500"]
     );
     assert_eq!(worker.failures().len(), 1);
+}
+
+/// Worker-level pin for the legacy "only creator channels create rooms" rule
+/// (the core `decide_room_join` test does not exercise `GuildRoomWorker`).
+/// Mutation: drop the `creators.contains_key` gate from `accept_join`.
+#[tokio::test]
+async fn joining_a_channel_that_is_not_a_creator_never_creates_a_room() {
+    const LOBBY: u64 = 777;
+    let (live, store, http, trace) = fixture();
+    live.publish(snapshot(&[LOBBY], vec![]));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // The gateway still hands out a ticket for any voice channel; the worker
+    // is what refuses it.
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(LOBBY), Some(false))
+        .expect("ticket for a joined channel");
+    assert_eq!(ticket.creator_id, LOBBY);
+    assert!(!worker.accept_join(ticket, "lobby room", 7, NOW.to_owned()));
+    assert!(!worker.dispatch_one(0).await);
+    assert!(worker.creations.is_empty());
+    assert!(worker.tracked().is_empty());
+    assert!(worker.failures().is_empty());
+    assert!(trace.lock().unwrap().is_empty());
+    // The configured creator still works for the same member afterwards.
+    worker.live.voice_update(MEMBER, None, Some(false));
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 1).await;
+    assert_eq!(*trace.lock().unwrap(), ["create", "persist:500"]);
+}
+
+/// A guild with no creator row configured creates nothing, even when a member
+/// sits in a voice channel. Mutation: as above.
+#[tokio::test]
+async fn a_guild_without_creator_channels_never_creates_a_room() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap().clear();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .expect("ticket for a joined channel");
+    assert!(!worker.accept_join(ticket, "new room", 7, NOW.to_owned()));
+    assert!(!worker.dispatch_one(0).await);
+    assert!(worker.tracked().is_empty());
+    assert!(worker.failures().is_empty());
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+/// The overwrite/permission preflight (`prepare`) must refuse before the
+/// channel POST, at worker level. Mutation: run `prepare()` after `create`
+/// (the trace then contains `create` for the refused plan).
+#[tokio::test]
+async fn refused_creation_plan_records_a_failure_before_any_channel_is_created() {
+    // Bot lacks Manage Channels on the creator channel.
+    let (live, store, http, trace) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .inner
+        .write()
+        .unwrap()
+        .bot
+        .as_mut()
+        .unwrap()
+        .roles = vec![role(permissions() & !Permissions::MANAGE_CHANNELS)];
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        worker.failures().back(),
+        Some(&LifecycleFailure::MissingPermission {
+            write: RefusedWrite::Create,
+            channel_id: CREATOR,
+            findings: vec![PermissionFinding {
+                permission: VoicePermission::ManageChannels,
+                scope: VoicePermissionScope::Guild,
+                category_id: None,
+                channel_id: None,
+            }],
+        })
+    );
+    assert!(worker.creations.is_empty());
+    assert!(worker.tracked().is_empty());
+    assert!(!worker.dispatch_one(1).await);
+    assert!(trace.lock().unwrap().is_empty());
+
+    // A private-by-default creator without Manage Roles: `plan_room` refuses
+    // instead of silently making a public room.
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].private_default = true;
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .inner
+        .write()
+        .unwrap()
+        .bot
+        .as_mut()
+        .unwrap()
+        .roles = vec![role(permissions() & !Permissions::MANAGE_ROLES)];
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(matches!(
+        worker.failures().back(),
+        Some(LifecycleFailure::MissingPermission {
+            write: RefusedWrite::Create,
+            channel_id: CREATOR,
+            ..
+        })
+    ));
+    assert!(worker.creations.is_empty());
+    assert!(worker.tracked().is_empty());
+    assert!(!worker.dispatch_one(1).await);
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.http.created_attributes.lock().unwrap().is_empty());
+}
+
+/// A failed compensation delete must keep the room (and its provenance)
+/// tracked so a later sweep can remove it, never strand an untracked orphan.
+/// Mutation: drop the room from `rooms` after the refused compensation delete.
+#[tokio::test]
+async fn failed_rollback_keeps_the_room_tracked_until_a_later_sweep_removes_it() {
+    let (live, mut store, http, trace) = fixture();
+    store.persist_error = Some(StoreError::Unavailable);
+    http.delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "delete:500"]
+    );
+    // Retained with its creation provenance and flagged for compensation.
+    let kept = worker.tracked().get(&500).expect("room stays tracked");
+    assert_eq!(kept.owner_id, MEMBER);
+    assert_eq!(kept.original_creator_id, MEMBER);
+    assert_eq!(kept.creator_channel_id, CREATOR);
+    assert!(worker.compensation.contains(&500));
+    assert!(worker.deletes.contains(&500));
+    // The refused delete is not retried against unchanged permissions.
+    for time in [3000, 6000, 10000] {
+        worker.reconcile();
+        assert!(!worker.dispatch_one(time).await);
+    }
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "delete:500"]
+    );
+    assert!(worker.tracked().contains_key(&500));
+    // A permission refresh lets the next sweep retry the delete and forget it.
+    worker.live.publish(snapshot(&[500], vec![]));
+    worker.reconcile();
+    dispatch(&mut worker, 10000).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            "create",
+            "persist:500",
+            "delete:500",
+            "delete:500",
+            "forget:500"
+        ]
+    );
+    assert!(worker.tracked().is_empty());
+    assert!(!worker.compensation.contains(&500));
+    assert!(!worker.deletes.contains(&500));
+}
+
+/// Pending acceptance for the durable half of "retain provenance after a
+/// failed rollback": the exact channel must outlive the worker that created
+/// it. Today the failed persist writes nothing, so the only record is the
+/// creating worker's in-memory `rooms`/`compensation`, and a worker rebuilt
+/// from persisted state cannot rediscover the channel. Run it with
+/// `--ignored` to see the gap; enable it, unedited, once a durable witness
+/// exists. The parity row for the legacy rollback commit stays `carded` until
+/// then.
+#[tokio::test]
+#[ignore = "pending: no durable witness survives a failed persist plus a refused rollback"]
+async fn a_restarted_worker_rediscovers_a_channel_whose_rollback_failed() {
+    let (live, mut store, http, _) = fixture();
+    store.persist_error = Some(StoreError::Unavailable);
+    http.delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert!(worker.tracked().contains_key(&500), "same-worker retention");
+
+    // Restart: a fresh worker, store connection and live snapshot built only
+    // from what the first worker's store persisted. Nothing in memory crosses.
+    let (live, fresh_store, http, _) = fixture();
+    live.publish(snapshot(&[500], vec![]));
+    *fresh_store.rooms.lock().unwrap() = worker.store.rooms.lock().unwrap().clone();
+    drop(worker);
+    let restarted = GuildRoomWorker::load(live, fresh_store, http)
+        .await
+        .unwrap();
+    assert!(
+        restarted.tracked().contains_key(&500) || restarted.compensation.contains(&500),
+        "the channel whose rollback failed must be rediscoverable after a restart"
+    );
 }
 
 #[tokio::test]
@@ -2472,7 +2764,9 @@ fn voice_command_set_is_gated_on_two_voice() {
             "kick",
             "name",
             "private",
-            "public"
+            "public",
+            "limit",
+            "unlimit"
         ]
     );
     let off = VoiceGates::from_map(&Default::default());
@@ -7958,6 +8252,13 @@ fn dead_letter_families_cover_every_queue_action_shape() {
                 custom_name: Some("den".to_owned()),
             },
             "rename",
+        ),
+        (
+            RoomAction::SetUserLimit {
+                channel_id: 500,
+                user_limit: 4,
+            },
+            "limit",
         ),
     ];
     for (action, family) in &cases {
