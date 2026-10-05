@@ -116,6 +116,9 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_rooms",
     // V3 block list: references voice_rooms, so it restores after it.
     "voice_room_blocks",
+    // V3 approved Connect grants (0418): references voice_rooms, so it
+    // restores after it, beside the block list it complements.
+    "voice_join_grants",
     "voice_owner_grants",
     "voice_text_companions",
     "voice_access_controls",
@@ -132,6 +135,8 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_guild_settings",
     "voice_command_roles",
     "voice_command_role_members",
+    // V4 vote-kick audit trail (0417): append-only, guild-keyed, no foreign keys.
+    "voice_vote_kick_audit",
 ];
 
 /// Covered tables not created by the current cutover migration set, if any.

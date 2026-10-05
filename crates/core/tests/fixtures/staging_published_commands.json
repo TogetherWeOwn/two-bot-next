@@ -9,6 +9,7 @@
   "builtins_in_publish_order": [
     "rank",
     "leaderboard",
+    "help",
     "attendance",
     "command",
     "command-remove",
@@ -41,6 +42,7 @@
   "expected_with_example_dynamic_in_publish_order": [
     "rank",
     "leaderboard",
+    "help",
     "attendance",
     "command",
     "command-remove",

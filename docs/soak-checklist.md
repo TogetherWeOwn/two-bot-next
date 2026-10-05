@@ -1167,11 +1167,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-f114c44: f114c44 — TOG-3052: temp-voice generator (join-to-create), staging only
 
-- **Method:** `manual` (not an execution verdict).
+- **Method:** `automated` (not an execution verdict).
 - **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Join the configured creator channel as a disposable member, then leave.
 - **Expected:** Exactly one owned room is created and the member moved; the empty room is removed; outside the allowlisted guild nothing is created.
-- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.
-- **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
+- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference. Fixture half: the offline `verification` command at the exact head; the staging half above is unchanged.
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- joining_a_channel_that_is_not_a_creator_never_creates_a_room a_guild_without_creator_channels_never_creates_a_room
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-681dc29: 681dc29 — TOG-3052: mutation harness proving the delete guards are real
@@ -1200,8 +1201,9 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Method:** `manual` (not an execution verdict).
 - **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Have two disposable members join the creator channel together; take the overwrite-preflight refusal from TOG-10093’s fixture.
 - **Expected:** Each member gets one distinct room with no duplicate reservation; a create whose overwrites exceed bot permissions is refused before any channel exists.
-- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.
-- **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
+- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference. Partial offline fixture evidence, not a PASS: the `verification` command covers only the two refusal cases (missing Manage Channels; private default without Manage Roles) and sequential distinct-room dispatch. The capped durable guild reservation and the general overwrite-bit permission preflight are unverified.
+- **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-15336](/TOG/issues/TOG-15336), [TOG-10119](/TOG/issues/TOG-10119)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- refused_creation_plan_records_a_failure_before_any_channel_is_created two_simultaneous_members_get_distinct_persisted_rooms
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-a891063: a891063 — TOG-3471: reconcile settings, command registry, and source citations
@@ -1215,13 +1217,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-50c3e9f: 50c3e9f — TOG-3471: retain temp-voice provenance after rollback failure
 
-- **Method:** `waived` (not an execution verdict).
+- **Method:** `manual` (not an execution verdict).
 - **Action:** In TOG-10093’s mock-Discord fixture, fail a create and then its rollback.
 - **Expected:** The room keeps its provenance so a later sweep removes it; no unmanaged orphan channel.
-- **Evidence:** Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
-- **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
-- **Reason:** Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Evidence:** Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. No live fault injection, staging/production SQL or credentials. Partial offline fixture evidence, not a PASS: the `verification` command covers same-worker, in-memory retention only. Durable provenance, fresh-worker restart recovery, attachment retry, missing-channel cleanup and cap accounting retained until a guarded delete or 404 are unverified (the `#[ignore]`d restart test states the missing behaviour; it is skipped in CI until a durable witness exists).
+- **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-15336](/TOG/issues/TOG-15336), [TOG-10119](/TOG/issues/TOG-10119)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- failed_rollback_keeps_the_room_tracked_until_a_later_sweep_removes_it
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-984175d: 984175d — TOG-3471: serialize and journal temp-voice ownership changes
@@ -1309,13 +1310,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-59965d0: 59965d0 — TOG-5981: serialize same-member voice frames, scope voice idempotency keys by channel
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Replay a same-tick burst of same-member voice frames across two channels through the fixture added by TOG-15277.
-- **Expected:** Frames apply serially per member and idempotency keys are channel-scoped: one session per channel, no cross-channel dedupe.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the voice-frame serialization and same-instant burst fixtures in `crates/discord/tests/funnel_replay.rs`, plus the channel-scoped key and end-then-start fixtures in `crates/core`.
+- **Expected:** Frames for one member apply whole and in order: a second frame waits for the first move's end and start. A one-stamp burst keeps every end `startKnown:true` with `durationSeconds` 0 and every boundary a separate channel-scoped row; a return to the opening channel repeats the opening start key, as in legacy. Not deployed gateway evidence.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result; fixture proof only, not a deployed-gateway soak receipt.
 - **Owner:** [TOG-15277](/TOG/issues/TOG-15277)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib -- funnel::tests::repeatable_key_carries_time_and_voice_channel handlers::tests::voice_move_is_end_then_start_at_same_instant && python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test funnel_replay -- pipeline_serializes_same_member_voice_frames pipeline_same_instant_voice_burst_keeps_every_boundary_as_its_own_row pipeline_same_instant_voice_return_to_origin_dedupes_only_the_repeat_start
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-7da2c15: 7da2c15 — TOG-6123: drop open voice sessions on fresh session (ShardReady) as well as resume
@@ -1474,13 +1474,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-3c3e7e8: 3c3e7e8 — fix(voice): treat malformed leave timestamp as unknown-start (#265)
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Deliver a voice leave with a malformed timestamp, with and without an open session, through the fixture added by TOG-15277.
-- **Expected:** The session is treated as unknown-start, not a fabricated duration, and no leveling XP is awarded.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the malformed-timestamp fixtures in `crates/core/src/voice.rs` and `crates/core/src/handlers.rs`.
+- **Expected:** A leave stamp that does not parse, or a recorded start that does not parse, resolves to `start_known=false` with no `started_at` and no duration. A malformed leave is stamped with processing time, closes the session as one unknown-start end row and awards no voice XP. Not deployed gateway evidence.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result; fixture proof only, not a deployed-gateway soak receipt.
 - **Owner:** [TOG-15277](/TOG/issues/TOG-15277)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib -- voice::tests::resolve_measured_and_unknown voice::tests::malformed_leave_with_open_session_is_unknown_start voice::tests::malformed_open_start_with_valid_leave_is_unknown_start handlers::tests::malformed_leave_with_open_session_writes_one_unknown_start_end_and_no_xp handlers::tests::well_formed_leave_with_open_session_awards_the_measured_seconds
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-c99fec7: c99fec7 — fix(announcements): reclaim crashed feed-delivery claims after 60s lease (#312)
@@ -1660,14 +1659,13 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-cc27351: cc27351 — fix(tempvoice): isolate per-channel sweep failures (#393)
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** In TOG-10093’s mock-Discord fixture, fail one room’s delete during a sweep.
-- **Expected:** The other empty rooms are still removed and the single failure is logged.
-- **Evidence:** Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
-- **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
-- **Reason:** Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
-- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the offline voice worker and queue fixtures: inject a transient delete failure into either visitation order of two empty tracked rooms, then test successful recovery, terminal retry exhaustion, 403 suspension and changed live guards.
+- **Expected:** Both empty rooms receive an attempt; only successful cleanup is forgotten. The failed room retains provenance and its own bounded backoff, dead-letters after ten attempts without a requeue storm, and does not starve unrelated rooms. Same-room follow-ups, serial guild writes, urgent 429 holds and live readiness/occupancy/permission guards remain enforced; the bounded terminal-failure family reports once.
+- **Evidence:** Hosted CI job 111446631290 passed workspace clippy, unit/binary and integration steps on 57267902bdc8b778a813012eebb39836c375f1dd, including the new voice fixtures. Attach the exact final-head CI/review receipt before closing the repair. Local Cargo admission was refused; no local Rust pass or staging acceptance is claimed. Mock Discord and CI disposable services only; no live fault injection, staging/production SQL or credentials.
+- **Owner:** [TOG-15674](/TOG/issues/TOG-15674), [TOG-10119](/TOG/issues/TOG-10119)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot voice_rooms::tests && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib voice_rooms::tests
+- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — the separate exact-SHA voice receipt remains required; automated fixture evidence is not B4 or production acceptance.
 
 ### s13-d3d9afe: d3d9afe — fix(onboarding): withhold invisible fallback destinations (#398)
 

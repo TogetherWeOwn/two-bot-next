@@ -24,6 +24,10 @@ JOB_INVENTORY = {
     "release.yml": {"release-please", "dispatch-checks", "sbom-target", "release-sbom",
                     "attach-sbom"},
     "staging-migrate.yml": {"plan", "claim", "apply"},
+    # TOG-14008: manual staging-only Worker rollback drill; pinned shape below.
+    "staging-rollback-drill.yml": {"drill"},
+    # Container-image backout/restore drill: manual, staging-only, pinned shape below.
+    "staging-container-drill.yml": {"container-drill"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
     # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
     # `image` builds/scans the untrusted ref with pinned actions only; `verify`
@@ -321,6 +325,190 @@ def staging_migrate_errors(workflow):
     return errors
 
 
+ROLLBACK_DRILL_ENV = {
+    "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+    "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+    "CLOUDFLARE_API_TOKEN": "${{ secrets.CLOUDFLARE_API_TOKEN }}",
+    "CLOUDFLARE_ACCOUNT_ID": "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}",
+    "TARGET_VERSION": "${{ inputs.target_version }}",
+}
+
+
+def staging_rollback_drill_errors(workflow):
+    """Manual staging-only Worker-version rollback drill (TOG-14008).
+
+    Dispatch-only with the single required `target_version` input. One job runs
+    from main through the `staging` environment and shares the deploy-staging
+    concurrency group (never cancelling), so a push deploy cannot interleave.
+    Exactly three steps: pinned checkout, pinned setup-node, and one Run step
+    that passes the dispatch input through the environment (never an inline
+    expression) to the reviewed script. The four existing staging bindings are
+    scoped to that step alone. No wrangler CLI or action: the rollback is the
+    script's one unforced Cloudflare deployment POST, so a changed-secret
+    target is refused instead of being auto-confirmed.
+    """
+    name = "staging-rollback-drill.yml"
+    errors = []
+    on = workflow.get("on") or {}
+    if set(on) != {"workflow_dispatch"}:
+        errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
+    dispatch = on.get("workflow_dispatch") or {}
+    inputs = dispatch.get("inputs") or {}
+    if set(dispatch) != {"inputs"} or set(inputs) != {"target_version"}:
+        errors.append(f"{name}: workflow_dispatch must carry exactly the target_version input")
+    else:
+        field = inputs["target_version"] or {}
+        if (field.get("type") != "string" or str(field.get("required")).lower() != "true"
+                or "default" in field):
+            errors.append(f"{name}: target_version must be a required string with no default (never latest)")
+    if workflow.get("concurrency") != {"group": "deploy-staging", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must share the deploy-staging group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"drill"}:
+        errors.append(f"{name}: jobs must be exactly drill")
+        return errors
+    job = jobs["drill"]
+    if job.get("environment") != "staging":
+        errors.append(f"{name}:drill: must stay scoped to the staging environment")
+    if job.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:drill: must run only from main")
+    if not runner_allowed("drill", job.get("runs-on")):
+        errors.append(f"{name}:drill: must use the routed runner expression for job 'drill'")
+    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        if key in job:
+            errors.append(f"{name}:drill: must not set {key} (bindings stay on the single Run step)")
+    text = str(job).lower()
+    for marker in ("wrangler", "force", "production", "toJSON(secrets".lower(), "secrets["):
+        if marker in text.replace(" ", ""):
+            errors.append(f"{name}:drill: must not contain {marker!r} (script-only, unforced, staging-only)")
+    steps = job.get("steps") or []
+    if len(steps) != 3 or any(key in step for step in steps for key in ("if", "continue-on-error")):
+        errors.append(f"{name}:drill: must run exactly checkout, setup-node and the drill, unconditionally")
+        return errors
+    checkout, node, run = steps
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or (checkout.get("with") or {}).get("persist-credentials") != "false":
+        errors.append(f"{name}:drill: checkout must be pinned and must not persist credentials")
+    if not str(node.get("uses", "")).startswith("actions/setup-node@"):
+        errors.append(f"{name}:drill: second step must be the pinned setup-node")
+    command = str(run.get("run", ""))
+    if run.get("env") != ROLLBACK_DRILL_ENV:
+        errors.append(f"{name}:drill: Run step must bind exactly the four staging bindings plus TARGET_VERSION")
+    if ("scripts/staging_rollback_drill.py" not in command or '--target-version "$TARGET_VERSION"' not in command
+            or "${{" in command or "uses" in run):
+        errors.append(f"{name}:drill: Run step must call the script with the input via the environment only")
+    return errors
+
+
+CONTAINER_DRILL_ENV = {
+    "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+    "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+    "CLOUDFLARE_API_TOKEN": "${{ secrets.CLOUDFLARE_API_TOKEN }}",
+    "CLOUDFLARE_ACCOUNT_ID": "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}",
+    "BACKOUT_SOURCE_SHA": "${{ inputs.backout_source_sha }}",
+    "BACKOUT_BUILD_ID": "${{ inputs.backout_build_id }}",
+    "BACKOUT_IMAGE": "${{ inputs.backout_image }}",
+    "BACKOUT_WORKER_VERSION": "${{ inputs.backout_worker_version }}",
+    "BACKOUT_ROLLOUT_ID": "${{ inputs.backout_rollout_id }}",
+    "BACKOUT_REVIEW_REF": "${{ inputs.backout_review_ref }}",
+    "BACKOUT_STAGING_RUN_ID": "${{ inputs.backout_staging_run_id }}",
+    "COMPATIBILITY_NOTE": "${{ inputs.compatibility_note }}",
+    "SESSION_ATTESTATION": "${{ inputs.session_attestation }}",
+}
+# Dispatch input names are the full binding names lowercased
+# (BACKOUT_SOURCE_SHA <- inputs.backout_source_sha, and so on).
+CONTAINER_DRILL_INPUTS = {key.lower() for key in CONTAINER_DRILL_ENV if key not in
+                          ("STAGING_WORKER_URL", "OWNERSHIP_CONTROL_TOKEN",
+                           "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID")}
+
+
+def staging_container_drill_errors(workflow):
+    """Manual staging-only reviewed-image container backout/restore drill.
+
+    Dispatch-only with seven required backout pins, one required compatibility
+    note and one optional session attestation. One job runs from main through the `staging`
+    environment and shares the deploy-staging concurrency group (never
+    cancelling), so a push deploy cannot interleave. Exactly four steps:
+    pinned checkout, pinned setup-node, `npm ci` in wrangler/ (the repo-pinned
+    wrangler binary the reviewed script drives for the full-container
+    deploy), and one Run step that passes every dispatch input through the
+    environment (never an inline expression) to the reviewed script. All
+    thirteen bindings are scoped to that step alone. No wrangler action, no
+    inline deploy command, no force flag: the only deploy route is the
+    script's pinned-binary full-container deploy of the validated image pin.
+    """
+    name = "staging-container-drill.yml"
+    errors = []
+    on = workflow.get("on") or {}
+    if set(on) != {"workflow_dispatch"}:
+        errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
+    dispatch = on.get("workflow_dispatch") or {}
+    inputs = dispatch.get("inputs") or {}
+    if set(dispatch) != {"inputs"} or set(inputs) != CONTAINER_DRILL_INPUTS:
+        errors.append(f"{name}: workflow_dispatch must carry exactly the backout pins, note and attestation")
+    else:
+        for key, field in inputs.items():
+            field = field or {}
+            if key == "session_attestation":
+                if (field.get("type") != "string" or str(field.get("required")).lower() != "false"
+                        or field.get("default") != ""):
+                    errors.append(f"{name}: session_attestation must be optional with an empty default")
+            elif (field.get("type") != "string" or str(field.get("required")).lower() != "true"
+                    or "default" in field):
+                errors.append(f"{name}: {key} must be a required string with no default (never latest)")
+    if workflow.get("concurrency") != {"group": "deploy-staging", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must share the deploy-staging group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"container-drill"}:
+        errors.append(f"{name}: jobs must be exactly container-drill")
+        return errors
+    job = jobs["container-drill"]
+    if job.get("environment") != "staging":
+        errors.append(f"{name}:container-drill: must stay scoped to the staging environment")
+    if job.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:container-drill: must run only from main")
+    if not runner_allowed("container-drill", job.get("runs-on")):
+        errors.append(f"{name}:container-drill: must use the routed runner expression for job 'container-drill'")
+    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        if key in job:
+            errors.append(f"{name}:container-drill: must not set {key} (bindings stay on the single Run step)")
+    steps = job.get("steps") or []
+    if len(steps) != 4 or any(key in step for step in steps for key in ("if", "continue-on-error")):
+        errors.append(f"{name}:container-drill: must run exactly checkout, setup-node, npm ci and the drill")
+        return errors
+    checkout, node, install, run = steps
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or (checkout.get("with") or {}).get("persist-credentials") != "false":
+        errors.append(f"{name}:container-drill: checkout must be pinned and must not persist credentials")
+    if not str(node.get("uses", "")).startswith("actions/setup-node@"):
+        errors.append(f"{name}:container-drill: second step must be the pinned setup-node")
+    if install.get("run") != "npm ci" or install.get("working-directory") != "wrangler" \
+            or "uses" in install:
+        errors.append(f"{name}:container-drill: third step must be the repo-pinned wrangler install only")
+    command = str(run.get("run", ""))
+    if run.get("env") != CONTAINER_DRILL_ENV:
+        errors.append(f"{name}:container-drill: Run step must bind exactly the staging bindings plus the pins")
+    expected_flags = ['--backout-source-sha "$BACKOUT_SOURCE_SHA"',
+                      '--backout-build-id "$BACKOUT_BUILD_ID"',
+                      '--backout-image "$BACKOUT_IMAGE"',
+                      '--backout-worker-version "$BACKOUT_WORKER_VERSION"',
+                      '--backout-rollout-id "$BACKOUT_ROLLOUT_ID"',
+                      '--backout-review-ref "$BACKOUT_REVIEW_REF"',
+                      '--backout-staging-run-id "$BACKOUT_STAGING_RUN_ID"',
+                      '--compatibility-note "$COMPATIBILITY_NOTE"',
+                      '--session-attestation "$SESSION_ATTESTATION"']
+    if ("scripts/staging_container_drill.py" not in command
+            or any(flag not in command for flag in expected_flags)
+            or "${{" in command or "uses" in run):
+        errors.append(f"{name}:container-drill: Run step must call the script with the inputs via the environment only")
+    text = str(steps).lower()
+    for marker in ("wrangler-action", "wrangler deploy", "wrangler publish", "force",
+                   "production", "tojson(secrets", "secrets["):
+        if marker in text.replace(" ", ""):
+            errors.append(f"{name}:container-drill: must not contain {marker!r} (script-only, unforced, staging-only)")
+    return errors
+
+
 def production_errors(workflow):
     """deploy-production is the one live route: dispatch-only, human-gated, chained to staging."""
     name = "deploy-production.yml"
@@ -393,6 +581,17 @@ def workflow_policy_errors(workflows):
         if name == "deploy-staging.yml":
             errors.extend(staging_dispatch_errors(workflow))
             errors.extend(staging_active_errors(workflow))
+        if name == "staging-rollback-drill.yml":
+            # Manual drill (TOG-14008): pinned shape above; the generic
+            # environment/marker scan below would flag its staging binding.
+            errors.extend(staging_rollback_drill_errors(workflow))
+            continue
+        if name == "staging-container-drill.yml":
+            # Manual container drill: pinned shape above; the generic
+            # environment/marker scan below would flag its staging binding
+            # and the wrangler binary path the reviewed script drives.
+            errors.extend(staging_container_drill_errors(workflow))
+            continue
         if name == "staging-migrate.yml":
             # Manual runner (TOG-11572): pinned shape above, not the
             # staging-deploy policy. The generic environment/marker scan
@@ -730,6 +929,107 @@ class WorkflowTests(unittest.TestCase):
                 def change(w, job_id=job_id, permissions=permissions):
                     w["jobs"][job_id]["permissions"] = permissions
                 self.assertTrue(mutated(change))
+
+    def test_staging_rollback_drill_shape_is_pinned(self):
+        workflows = self.workflows
+        self.assertEqual(staging_rollback_drill_errors(workflows["staging-rollback-drill.yml"]), [])
+
+        def mutate(change):
+            copy = deepcopy(workflows["staging-rollback-drill.yml"])
+            change(copy)
+            return staging_rollback_drill_errors(copy)
+
+        def job(copy):
+            return copy["jobs"]["drill"]
+
+        changes = {
+            "push trigger": lambda w: w["on"].update({"push": {"branches": ["main"]}}),
+            "extra input": lambda w: w["on"]["workflow_dispatch"]["inputs"].update({"force": {"type": "boolean"}}),
+            "target default": lambda w: w["on"]["workflow_dispatch"]["inputs"]["target_version"].update(
+                {"default": "latest"}),
+            "optional target": lambda w: w["on"]["workflow_dispatch"]["inputs"]["target_version"].update(
+                {"required": "false"}),
+            "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
+            "own concurrency group": lambda w: w["concurrency"].update({"group": "staging-rollback-drill"}),
+            "second job": lambda w: w["jobs"].update({"again": deepcopy(w["jobs"]["drill"])}),
+            "production environment": lambda w: job(w).update({"environment": "production"}),
+            "no environment": lambda w: job(w).pop("environment"),
+            "branch condition removed": lambda w: job(w).pop("if"),
+            "any branch": lambda w: job(w).update({"if": "github.ref != ''"}),
+            "unrouted runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
+            "job-level secret": lambda w: job(w).update({"env": {"T": "${{ secrets.CLOUDFLARE_API_TOKEN }}"}}),
+            "wrangler action": lambda w: job(w)["steps"].insert(
+                2, {"uses": "cloudflare/wrangler-action@pinned"}),
+            "step condition": lambda w: job(w)["steps"][2].update({"if": "always()"}),
+            "continue on error": lambda w: job(w)["steps"][2].update({"continue-on-error": "true"}),
+            "persisted credentials": lambda w: job(w)["steps"][0]["with"].update({"persist-credentials": "true"}),
+            "extra binding": lambda w: job(w)["steps"][2]["env"].update(
+                {"X": "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"}),
+            "inline expression": lambda w: job(w)["steps"][2].update(
+                {"run": 'python3 scripts/staging_rollback_drill.py --target-version "${{ inputs.target_version }}"'}),
+            "forced rollback": lambda w: job(w)["steps"][2].update(
+                {"run": 'python3 scripts/staging_rollback_drill.py --target-version "$TARGET_VERSION" --force'}),
+            "other script": lambda w: job(w)["steps"][2].update(
+                {"run": 'python3 scripts/other.py --target-version "$TARGET_VERSION"'}),
+        }
+        for label, change in changes.items():
+            with self.subTest(change=label):
+                self.assertTrue(mutate(change))
+        # The inventory pin fails closed if the workflow disappears or gains a job.
+        missing = deepcopy(workflows)
+        del missing["staging-rollback-drill.yml"]
+        self.assertTrue(workflow_policy_errors(missing))
+        self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_staging_container_drill_shape_is_pinned(self):
+        workflows = self.workflows
+        self.assertEqual(staging_container_drill_errors(workflows["staging-container-drill.yml"]), [])
+
+        def mutate(change):
+            copy = deepcopy(workflows["staging-container-drill.yml"])
+            change(copy)
+            return staging_container_drill_errors(copy)
+
+        def job(copy):
+            return copy["jobs"]["container-drill"]
+
+        changes = {
+            "push trigger": lambda w: w["on"].update({"push": {"branches": ["main"]}}),
+            "extra input": lambda w: w["on"]["workflow_dispatch"]["inputs"].update({"force": {"type": "boolean"}}),
+            "pin default": lambda w: w["on"]["workflow_dispatch"]["inputs"]["backout_image"].update(
+                {"default": "latest"}),
+            "optional pin": lambda w: w["on"]["workflow_dispatch"]["inputs"]["backout_image"].update(
+                {"required": "false"}),
+            "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
+            "own concurrency group": lambda w: w["concurrency"].update({"group": "staging-container-drill"}),
+            "second job": lambda w: w["jobs"].update({"again": deepcopy(w["jobs"]["container-drill"])}),
+            "production environment": lambda w: job(w).update({"environment": "production"}),
+            "no environment": lambda w: job(w).pop("environment"),
+            "branch condition removed": lambda w: job(w).pop("if"),
+            "any branch": lambda w: job(w).update({"if": "github.ref != ''"}),
+            "unrouted runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
+            "job-level secret": lambda w: job(w).update({"env": {"T": "${{ secrets.CLOUDFLARE_API_TOKEN }}"}}),
+            "wrangler action": lambda w: job(w)["steps"].insert(
+                2, {"uses": "cloudflare/wrangler-action@pinned"}),
+            "step condition": lambda w: job(w)["steps"][3].update({"if": "always()"}),
+            "continue on error": lambda w: job(w)["steps"][3].update({"continue-on-error": "true"}),
+            "persisted credentials": lambda w: job(w)["steps"][0]["with"].update({"persist-credentials": "true"}),
+            "extra binding": lambda w: job(w)["steps"][3]["env"].update(
+                {"X": "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"}),
+            "inline expression": lambda w: job(w)["steps"][3].update(
+                {"run": 'python3 scripts/staging_container_drill.py --backout-image "${{ inputs.backout_image }}"'}),
+            "other script": lambda w: job(w)["steps"][3].update(
+                {"run": 'python3 scripts/other.py --backout-image "$BACKOUT_IMAGE"'}),
+            "dropped npm ci": lambda w: job(w)["steps"].__delitem__(2),
+        }
+        for label, change in changes.items():
+            with self.subTest(change=label):
+                self.assertTrue(mutate(change))
+        # The inventory pin fails closed if the workflow disappears or gains a job.
+        missing = deepcopy(workflows)
+        del missing["staging-container-drill.yml"]
+        self.assertTrue(workflow_policy_errors(missing))
+        self.assertEqual(workflow_policy_errors(workflows), [])
 
     def test_check_toolchains_match_the_repository_pin(self):
         channel = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]

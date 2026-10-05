@@ -104,7 +104,13 @@ library code with no Discord dependency and can start immediately.
 
 ## V4: Vote-kick
 
-- `/kick member [reason]`: any occupant can start a vote.
+- `/kick member [reason]`: any occupant can start a vote. The shared router
+  answers every `/kick`. A moderator who passes the guild fence, the moderation
+  gate and the Kick Members check always gets the moderation kick, so sitting in
+  a room never shields a member from a moderator. Only a `/kick` the router
+  refuses (moderation off, or the invoker lacks Kick Members) reaches the vote,
+  and only when the invoker shares the target's room; everyone else gets the
+  router's refusal.
 - It passes with a strict majority of the occupants other than the target.
   Progress shows as required/total. Votes are cast with buttons; not voting
   counts as No. The vote expires after 2 minutes.

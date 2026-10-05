@@ -432,3 +432,324 @@ async fn actor_kick_room_of_answers_through_the_inbox() {
         None
     );
 }
+
+// --- V4 audit trail --------------------------------------------------------
+
+/// Everything appended so far, as (event, outcome) in append order.
+fn audit_trail(worker: &GuildRoomWorker<Store, Http>) -> Vec<(KickAuditEvent, &'static str)> {
+    worker
+        .store
+        .kick_audit
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|row| (row.event, row.outcome))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_passed_vote_audits_start_result_and_enforcement_with_every_id() {
+    let (mut worker, _trace) = setup().await;
+    pass_vote(&mut worker);
+    dispatch(&mut worker, 3).await;
+    assert!(worker.flush_kick_audit(4).await);
+    assert_eq!(
+        audit_trail(&worker),
+        [
+            (KickAuditEvent::VoteStarted, "started"),
+            (KickAuditEvent::VoteResult, "passed"),
+            (
+                KickAuditEvent::Enforcement,
+                "connect_denied_and_disconnected"
+            ),
+        ]
+    );
+    let rows = worker.store.kick_audit.lock().unwrap().clone();
+    for row in &rows {
+        assert_eq!(
+            (
+                row.guild_id,
+                row.room_id,
+                row.vote_id,
+                row.initiator_id,
+                row.target_id
+            ),
+            (GUILD, ROOM, VOTE, VOTER_A, TARGET),
+            "{row:?}"
+        );
+        assert!(
+            two_bot_core::parse_iso_millis(&row.occurred_at).is_some(),
+            "{row:?}"
+        );
+    }
+    let progress: Vec<_> = rows
+        .iter()
+        .map(|row| row.progress.map(|p| (p.yes, p.required, p.total)))
+        .collect();
+    assert_eq!(progress, [Some((0, 3, 4)), Some((3, 3, 4)), None]);
+    // Replaying a settled vote adds nothing.
+    worker.kick_cast(VOTE, VOTER_C, VoteBallot::Yes, 5).unwrap();
+    assert!(!worker.flush_kick_audit(6).await);
+    assert_eq!(rows.len(), worker.store.kick_audit.lock().unwrap().len());
+}
+
+#[tokio::test]
+async fn refused_starts_are_audited_with_their_refusal_code() {
+    let (mut worker, _trace) = setup().await;
+    assert!(start(&mut worker, VOTER_A, OWNER).is_err());
+    assert!(worker
+        .kick_start(VOTE + 1, ROOM, VOTER_A, VOTER_A, 0)
+        .is_err());
+    assert!(worker
+        .kick_start(VOTE + 2, ROOM + 1, VOTER_A, TARGET, 0)
+        .is_err());
+    assert!(worker.kick_start(VOTE + 3, ROOM, 999, TARGET, 0).is_err());
+    worker.live.disconnect();
+    assert!(worker
+        .kick_start(VOTE + 4, ROOM, VOTER_A, TARGET, 0)
+        .is_err());
+    assert!(worker.flush_kick_audit(1).await);
+    assert_eq!(
+        audit_trail(&worker),
+        [
+            (KickAuditEvent::VoteRefused, "protected_target"),
+            (KickAuditEvent::VoteRefused, "self_target"),
+            (KickAuditEvent::VoteRefused, "not_a_room"),
+            (KickAuditEvent::VoteRefused, "initiator_not_occupant"),
+            (KickAuditEvent::VoteRefused, "evidence_unavailable"),
+        ]
+    );
+    let rows = worker.store.kick_audit.lock().unwrap().clone();
+    // The refused row names the attempt, never a vote that did not start.
+    assert_eq!(
+        rows.iter().map(|r| r.vote_id).collect::<Vec<_>>(),
+        [VOTE, VOTE + 1, VOTE + 2, VOTE + 3, VOTE + 4]
+    );
+    assert_eq!(rows[0].initiator_id, VOTER_A);
+    assert_eq!(rows[0].target_id, OWNER);
+    assert!(rows.iter().all(|row| row.progress.is_none()));
+}
+
+#[tokio::test]
+async fn a_second_vote_for_one_target_is_audited_as_refused_next_to_the_first() {
+    let (mut worker, _trace) = setup().await;
+    start(&mut worker, VOTER_A, TARGET).unwrap();
+    assert!(worker
+        .kick_start(VOTE + 1, ROOM, VOTER_B, TARGET, 1)
+        .is_err());
+    assert!(worker.flush_kick_audit(2).await);
+    assert_eq!(
+        audit_trail(&worker),
+        [
+            (KickAuditEvent::VoteStarted, "started"),
+            (KickAuditEvent::VoteRefused, "active_vote_exists"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn expiry_and_cancellation_audit_one_result_each_and_no_enforcement() {
+    let (mut worker, _trace) = setup().await;
+    start(&mut worker, VOTER_A, TARGET).unwrap();
+    assert_eq!(worker.kick_refresh(VOTE_KICK_TTL_MS).len(), 1);
+    // A late ballot and another refresh restate the terminal status only.
+    worker
+        .kick_cast(VOTE, VOTER_B, VoteBallot::Yes, VOTE_KICK_TTL_MS + 1)
+        .unwrap();
+    assert!(worker.kick_refresh(VOTE_KICK_TTL_MS + 2).is_empty());
+    worker
+        .kick_start(VOTE + 1, ROOM, VOTER_B, VOTER_C, VOTE_KICK_TTL_MS + 3)
+        .unwrap();
+    worker.live.voice_update(VOTER_C, None, Some(false));
+    assert_eq!(worker.kick_refresh(VOTE_KICK_TTL_MS + 4).len(), 1);
+    assert!(worker.flush_kick_audit(VOTE_KICK_TTL_MS + 5).await);
+    assert_eq!(
+        audit_trail(&worker),
+        [
+            (KickAuditEvent::VoteStarted, "started"),
+            (KickAuditEvent::VoteResult, "expired"),
+            (KickAuditEvent::VoteStarted, "started"),
+            (KickAuditEvent::VoteResult, "cancelled_target_left"),
+        ]
+    );
+    let rows = worker.store.kick_audit.lock().unwrap().clone();
+    assert_eq!(
+        (rows[3].vote_id, rows[3].initiator_id, rows[3].target_id),
+        (VOTE + 1, VOTER_B, VOTER_C)
+    );
+}
+
+/// Pass a vote, apply `change` to the worker, dispatch the enforcement, flush
+/// and return the enforcement outcome code.
+async fn enforcement_outcome(
+    mut worker: GuildRoomWorker<Store, Http>,
+    change: impl FnOnce(&mut GuildRoomWorker<Store, Http>),
+) -> &'static str {
+    pass_vote(&mut worker);
+    change(&mut worker);
+    dispatch(&mut worker, 3).await;
+    assert!(worker.flush_kick_audit(4).await);
+    let rows = worker.store.kick_audit.lock().unwrap().clone();
+    let enforcement: Vec<_> = rows
+        .iter()
+        .filter(|row| row.event == KickAuditEvent::Enforcement)
+        .collect();
+    assert_eq!(enforcement.len(), 1, "exactly one enforcement row");
+    assert_eq!(enforcement[0].vote_id, VOTE);
+    enforcement[0].outcome
+}
+
+#[tokio::test]
+async fn enforcement_rows_say_what_discord_was_asked_never_a_kick() {
+    let (worker, _) = setup().await;
+    assert_eq!(
+        enforcement_outcome(worker, |_| {}).await,
+        "connect_denied_and_disconnected"
+    );
+    let (worker, _) = setup().await;
+    assert_eq!(
+        enforcement_outcome(worker, |w| {
+            w.live.voice_update(TARGET, None, Some(false));
+        })
+        .await,
+        "connect_denied_target_absent"
+    );
+    let (worker, _) = setup().await;
+    assert_eq!(
+        enforcement_outcome(worker, |w| w.rooms.get_mut(&ROOM).unwrap().owner_id =
+            TARGET)
+        .await,
+        "skipped_target_protected"
+    );
+    let (worker, _) = setup().await;
+    assert_eq!(
+        enforcement_outcome(worker, |w| {
+            w.rooms.remove(&ROOM);
+        })
+        .await,
+        "skipped_room_gone"
+    );
+}
+
+#[tokio::test]
+async fn enforcement_refused_for_permissions_or_by_discord_is_audited_once() {
+    let mut snap = snapshot(&[ROOM], roster());
+    snap.bot.roles = vec![role(permissions().difference(Permissions::MANAGE_ROLES))];
+    let (worker, _) = setup_with(snap).await;
+    assert_eq!(
+        enforcement_outcome(worker, |_| {}).await,
+        "permission_missing"
+    );
+    let (worker, _) = setup().await;
+    assert_eq!(
+        enforcement_outcome(worker, |w| {
+            w.http
+                .kick_errors
+                .lock()
+                .unwrap()
+                .push_back(RoomHttpError::Rejected {
+                    status: 400,
+                    code: 50_035,
+                });
+        })
+        .await,
+        "discord_error"
+    );
+}
+
+#[tokio::test]
+async fn a_retryable_enforcement_failure_is_audited_only_when_it_gives_up() {
+    let (mut worker, _trace) = setup().await;
+    pass_vote(&mut worker);
+    {
+        let mut errors = worker.http.kick_errors.lock().unwrap();
+        for _ in 0..QUEUE_MAX_ATTEMPTS {
+            errors.push_back(RoomHttpError::UnknownOutcome);
+        }
+    }
+    let mut now = 3;
+    for attempt in 1..=QUEUE_MAX_ATTEMPTS {
+        now += 10_000_000;
+        assert!(worker.dispatch_one(now).await, "attempt {attempt}");
+        worker.flush_kick_audit(now).await;
+        let enforcement = audit_trail(&worker)
+            .iter()
+            .filter(|(event, _)| *event == KickAuditEvent::Enforcement)
+            .count();
+        assert_eq!(
+            enforcement,
+            usize::from(attempt == QUEUE_MAX_ATTEMPTS),
+            "attempt {attempt}"
+        );
+    }
+    assert_eq!(audit_trail(&worker).last().unwrap().1, "gave_up");
+}
+
+#[tokio::test]
+async fn a_failed_flush_keeps_the_rows_backs_off_and_never_halts_the_worker() {
+    let (mut worker, _trace) = setup().await;
+    start(&mut worker, VOTER_A, TARGET).unwrap();
+    for error in [StoreError::Unavailable, StoreError::CredentialRefused] {
+        worker
+            .store
+            .kick_audit_errors
+            .lock()
+            .unwrap()
+            .push_back(error);
+    }
+    assert!(!worker.flush_kick_audit(0).await);
+    assert!(worker.store.kick_audit.lock().unwrap().is_empty());
+    assert!(worker.failures().iter().any(|failure| matches!(
+        failure,
+        LifecycleFailure::Persistence {
+            channel_id: None,
+            error: StoreError::Unavailable
+        }
+    )));
+    // Inside the backoff nothing is attempted, so the second scripted error
+    // is still queued.
+    assert!(!worker.flush_kick_audit(KICK_AUDIT_RETRY_MS - 1).await);
+    assert_eq!(worker.store.kick_audit_errors.lock().unwrap().len(), 1);
+    // A refused credential (a grant not applied yet) must not halt rooms.
+    assert!(!worker.flush_kick_audit(KICK_AUDIT_RETRY_MS).await);
+    assert!(!worker.halted());
+    assert!(worker.flush_kick_audit(KICK_AUDIT_RETRY_MS * 2).await);
+    assert_eq!(
+        audit_trail(&worker),
+        [(KickAuditEvent::VoteStarted, "started")]
+    );
+    assert!(!worker.flush_kick_audit(KICK_AUDIT_RETRY_MS * 3).await);
+}
+
+#[tokio::test]
+async fn the_audit_buffer_is_bounded_and_drops_the_oldest_row() {
+    let (mut worker, _trace) = setup().await;
+    for vote in 0..=KICK_AUDIT_BUFFER_MAX as u64 {
+        worker
+            .kick_start(VOTE + vote, ROOM, VOTER_A, OWNER, 0)
+            .unwrap_err();
+    }
+    assert_eq!(worker.kick_audit.len(), KICK_AUDIT_BUFFER_MAX);
+    assert_eq!(
+        worker.kick_audit.front().map(|row| row.vote_id),
+        Some(VOTE + 1),
+        "the oldest row went first"
+    );
+    assert!(worker.failures().iter().any(|failure| matches!(
+        failure,
+        LifecycleFailure::Persistence {
+            channel_id: None,
+            ..
+        }
+    )));
+    // Flushing drains in batches.
+    let mut flushes = 0;
+    while worker.flush_kick_audit(1).await {
+        flushes += 1;
+    }
+    assert_eq!(flushes, KICK_AUDIT_BUFFER_MAX.div_ceil(KICK_AUDIT_BATCH));
+    assert_eq!(
+        worker.store.kick_audit.lock().unwrap().len(),
+        KICK_AUDIT_BUFFER_MAX
+    );
+}

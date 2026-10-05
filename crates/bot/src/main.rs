@@ -537,15 +537,15 @@ async fn main() {
                         }
                         None => None,
                     };
-                    // V4 `kick` collision: when the voice sink owns a kick
-                    // target (tracked room), the router yields so the vote
-                    // is answered exactly once. Both runtimes exist only
-                    // inside this task, so the claim wires here.
+                    // V4 `kick` collision: the router answers every `/kick`
+                    // and delegates the room vote to the voice sink when
+                    // moderation refuses an occupant. Both runtimes exist
+                    // only inside this task, so the delegate wires here.
                     if let (Some(runtime), Some(voice)) = (runtime.as_ref(), voice.as_ref()) {
                         let voice = Arc::clone(voice);
-                        runtime.set_voice_kick_claim(Arc::new(move |guild, member| {
+                        runtime.set_voice_kick_vote(Arc::new(move |interaction| {
                             let voice = Arc::clone(&voice);
-                            Box::pin(async move { voice.kick_claim_room(guild, member).await })
+                            Box::pin(async move { voice.kick_vote(interaction).await })
                         }));
                     }
 

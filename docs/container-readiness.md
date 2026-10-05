@@ -42,17 +42,34 @@ signal, not a readiness sample or proof that a successor has been scheduled.
   subsequent ready sample produces one `container_unready_recovery` log; a
   new failure streak can then trigger a new alert. A short streak that recovers
   below the threshold produces no alert or recovery notification.
-- Optional **Worker secret binding** `OPS_ALERT_WEBHOOK_URL` enables a single
-  Discord-compatible JSON webhook POST for each alert and recovery. Without it,
-  monitoring is log-only; it is not a required deployment binding. The URL must
-  be HTTPS without userinfo. Redirects are rejected, requests time out after six
-  seconds, and `allowed_mentions.parse` is empty. Messages contain no mentions,
-  credentials, guild/user identifiers or probe response bodies. The binding is
-  not forwarded into the Rust Container.
+- Optional **Worker secret binding** `OPS_ALERT_WEBHOOK_URL` supplies the Discord
+  destination, but installing it alone never sends. Plain Worker var
+  `OPS_ALERT_FORWARDING` must equal exactly `"on"` for either readiness or metrics
+  forwarding. The checked-in default is `"off"` in every environment; absent or
+  any other runtime value is log-only. Neither binding is forwarded into the
+  Rust Container, and neither is required for structured monitoring.
+- Both senders accept only literal `https://discord.com/api/webhooks/<id>/<token>`
+  URLs: a numeric webhook ID and a nonempty token of letters, digits, `_` or `-`.
+  An explicit default port `:443` is allowed. Other hosts/ports/paths, userinfo,
+  query/fragment delimiters (even empty), whitespace, encoded paths and normalized
+  aliases are rejected before fetch. A valid URL is not proof of approved channel
+  ACLs or webhook ownership; the operator must verify those separately. Redirects
+  are rejected, requests time out after six seconds, and `allowed_mentions.parse`
+  is empty. Messages contain no mentions, credentials, guild/user identifiers or
+  probe response bodies.
 - Only the operator creates/configures the webhook and per-environment Worker
   secret. Never put the URL in `wrangler.toml`, a plain var, a PR or a log.
   `wrangler/scripts/check-env-bindings.py` rejects plaintext use of this binding
   and validates optional threshold vars, without requiring the secret.
+
+To disable forwarding non-destructively, the operator sets that environment's
+`OPS_ALERT_FORWARDING` var to `"off"` through its authorized deployment path,
+retaining the webhook secret. Enabling or disabling the var changes the Worker
+version and still requires normal version/ownership preflight and transfer; it
+is not an in-place toggle or permission to bypass the fence. Structured logs,
+readiness/metrics state and keepalive scheduling continue while forwarding is off.
+Re-enabling does not replay muted transitions: only future transitions can send.
+This switch is not authorization to install a credential, deploy or run a live page.
 
 The streak and notification latch survive Container restarts and Durable Object
 eviction. Each transition is persisted **before** logging/posting to suppress

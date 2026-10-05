@@ -99,6 +99,9 @@ impl RoomPersistence for Arc<Store> {
     ) -> Result<Option<TextCompanion>, StoreError> {
         self.as_ref().remove_companion(guild, room).await
     }
+    async fn record_kick_audit(&self, rows: &[KickAuditRow]) -> Result<(), StoreError> {
+        self.as_ref().record_kick_audit(rows).await
+    }
     async fn privacy(&self, guild: u64) -> Result<BTreeMap<u64, PrivacyRecord>, StoreError> {
         self.as_ref().privacy(guild).await
     }
@@ -109,6 +112,25 @@ impl RoomPersistence for Arc<Store> {
         record: &PrivacyRecord,
     ) -> Result<bool, StoreError> {
         self.as_ref().save_privacy(guild, room, record).await
+    }
+    async fn join_grants(&self, guild: u64) -> Result<BTreeMap<u64, BTreeSet<u64>>, StoreError> {
+        self.as_ref().join_grants(guild).await
+    }
+    async fn save_join_grant(
+        &self,
+        guild: u64,
+        room: u64,
+        member: u64,
+    ) -> Result<bool, StoreError> {
+        self.as_ref().save_join_grant(guild, room, member).await
+    }
+    async fn remove_join_grant(
+        &self,
+        guild: u64,
+        room: u64,
+        member: u64,
+    ) -> Result<(), StoreError> {
+        self.as_ref().remove_join_grant(guild, room, member).await
     }
 }
 
@@ -184,6 +206,14 @@ impl RoomWrites for GatedHttp {
     }
     async fn rename(&self, channel: u64, name: &str) -> Result<(), RoomHttpError> {
         self.http.rename(channel, name).await
+    }
+    async fn set_user_limit(
+        &self,
+        channel: u64,
+        user_limit: u32,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.http.set_user_limit(channel, user_limit, guard).await
     }
     async fn download_attachment(
         &self,
