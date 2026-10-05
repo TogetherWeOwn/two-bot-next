@@ -108,8 +108,8 @@ use two_bot_core::{
 };
 use two_bot_cutover::voice_rooms::{OwnerGrantIntent, PgRoomStore};
 use two_bot_discord::voice_rooms::{
-    can_enforce_kick, can_manage_room, effective_permissions, RoomChannelAttributes, RoomHttp,
-    RoomHttpError,
+    can_enforce_kick, can_manage_room, effective_permissions, MessageRef, RoomChannelAttributes,
+    RoomHttp, RoomHttpError,
 };
 
 #[path = "voice_name_panel.rs"]
@@ -509,7 +509,11 @@ fn voice_dead_action(action: &RoomAction) -> &'static str {
         RoomAction::SetEveryoneConnect { .. }
         | RoomAction::CreateJoinChannel { .. }
         | RoomAction::DeleteJoinChannel { .. }
-        | RoomAction::SavePrivacy { .. } => "other",
+        | RoomAction::SavePrivacy { .. }
+        | RoomAction::AskJoinOwner { .. }
+        | RoomAction::ApproveJoin { .. }
+        | RoomAction::RevokeJoinAccess { .. }
+        | RoomAction::RetireJoinPrompt { .. } => "other",
     }
 }
 
@@ -655,6 +659,41 @@ pub trait RoomWrites: Send + Sync {
         let _ = (guild, name, parent_id, position, guard);
         async { Err(RoomHttpError::InvalidRequest) }
     }
+    /// V3 join request: delete one member's overwrite on a room channel.
+    /// Deleting an absent overwrite is success. The default refuses.
+    fn delete_overwrite(
+        &self,
+        channel: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send {
+        let _ = (channel, member, guard);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
+    /// V3 join request: post a message with buttons to a room's chat. Only
+    /// `mention_user` can be pinged. The default refuses, so a writer that
+    /// cannot post fails closed.
+    fn send_component_message(
+        &self,
+        channel: Snowflake,
+        content: &str,
+        mention_user: Option<Snowflake>,
+        components: &[Component],
+    ) -> impl Future<Output = Result<MessageRef, RoomHttpError>> + Send {
+        let _ = (channel, content, mention_user, components);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
+    /// V3 join request: replace the text and buttons of a message this bot
+    /// posted (no buttons when `components` is empty). The default refuses.
+    fn edit_component_message(
+        &self,
+        message: MessageRef,
+        content: &str,
+        components: &[Component],
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send {
+        let _ = (message, content, components);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
     /// V10 error notice. `mention_role` is pinged on channel targets only.
     /// The default refuses, so a writer that cannot post notices fails closed
     /// (the worker counts the attempt and moves on) instead of dropping them
@@ -787,6 +826,36 @@ impl RoomWrites for RoomHttp {
     ) -> Result<Channel, RoomHttpError> {
         self.create_join_voice_channel(guild, name, parent_id, position, move || guard())
             .await
+    }
+
+    async fn delete_overwrite(
+        &self,
+        channel: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.delete_member_overwrite(channel, member, move || guard())
+            .await
+    }
+
+    async fn send_component_message(
+        &self,
+        channel: Snowflake,
+        content: &str,
+        mention_user: Option<Snowflake>,
+        components: &[Component],
+    ) -> Result<MessageRef, RoomHttpError> {
+        self.post_component_message(channel, content, mention_user, components)
+            .await
+    }
+
+    async fn edit_component_message(
+        &self,
+        message: MessageRef,
+        content: &str,
+        components: &[Component],
+    ) -> Result<(), RoomHttpError> {
+        RoomHttp::edit_component_message(self, message, content, components).await
     }
 
     async fn send_notice(
@@ -1437,6 +1506,10 @@ pub struct GuildRoomWorker<S, H> {
     /// Join channel ids this worker created or loaded from its own store:
     /// the only ones a `DeleteJoinChannel` may delete.
     join_deletable: HashSet<Snowflake>,
+    /// V3 join-request bookkeeping that is runtime-only by design: this
+    /// worker's request-id epoch, Join-channel entries already handled and
+    /// the posted prompts. See [`join_requests`].
+    join: join_requests::JoinRequests,
     failures: VecDeque<LifecycleFailure>,
     notices: Vec<NoticeState>,
     halted: bool,
@@ -1603,6 +1676,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             privacy,
             privacy_dirty: HashSet::new(),
             join_deletable,
+            join: join_requests::JoinRequests::new(),
             failures: VecDeque::new(),
             notices: Vec::new(),
             halted: false,
@@ -1889,6 +1963,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
         drop(live);
         self.reconcile_privacy();
+        self.scan_join_entries();
         let delete_enqueued = empty.len() as u64;
         for channel in empty {
             self.queue_delete(channel, false);
@@ -2110,6 +2185,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     }
 
     fn queue_owner_handoff(&mut self, channel_id: Snowflake, previous_owner_id: Snowflake) {
+        // Requests raised to the previous owner can no longer be answered.
+        self.join_owner_changed(channel_id);
         self.ownership_repairs.entry(channel_id).or_insert(0);
         if self.ownership_queued.insert(channel_id) {
             let room = &self.rooms[&channel_id];
@@ -3546,6 +3623,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             | RoomAction::SavePrivacy { .. } => {
                 self.dispatch_privacy(action, now_ms, started).await;
             }
+            RoomAction::AskJoinOwner { .. }
+            | RoomAction::ApproveJoin { .. }
+            | RoomAction::RevokeJoinAccess { .. }
+            | RoomAction::RetireJoinPrompt { .. } => {
+                self.dispatch_join(action, now_ms, started).await;
+            }
             RoomAction::RenameRoom { channel_id, name } => {
                 let valid = {
                     let live = self.live.inner.read().expect("live voice lock");
@@ -4036,6 +4119,12 @@ enum ActorCommand {
     Name {
         command: NameCommand,
         reply: oneshot::Sender<NameReply>,
+    },
+    /// V3 Approve / Deny / Block button: the worker decides against the
+    /// room's current owner and the request's current state.
+    JoinDecision {
+        decision: JoinDecisionCommand,
+        reply: oneshot::Sender<JoinReply>,
     },
 }
 
@@ -4714,6 +4803,9 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         }
         ActorCommand::Name { command, reply } => {
             let _ = reply.send(worker.apply_name(command, now_ms));
+        }
+        ActorCommand::JoinDecision { decision, reply } => {
+            let _ = reply.send(worker.apply_join_decision(decision));
         }
     }
 }
@@ -6790,6 +6882,9 @@ where
         return handle_name_interaction(runtime, interaction, guild_id, names, action, true, reply)
             .await;
     }
+    if let Some(click) = join_component_action(interaction) {
+        return handle_join_interaction(runtime, interaction, guild_id, click, reply).await;
+    }
     let Some(command) = parse_voice_command(interaction) else {
         return false;
     };
@@ -7764,10 +7859,15 @@ where
         ) {
             return;
         }
-        if let Some(VoiceCommand::Ballot { .. }) = parse_voice_command(interaction) {
-            // Ballots update the public message in place (type 7). The
-            // defer + PATCH path would edit each voter's own ephemeral
-            // followup instead, so answer with the initial callback.
+        if matches!(
+            parse_voice_command(interaction),
+            Some(VoiceCommand::Ballot { .. })
+        ) || join_component_action(interaction).is_some()
+        {
+            // Ballots and join-request decisions update the public message in
+            // place (type 7). The defer + PATCH path would edit each
+            // presser's own ephemeral followup instead, so answer with the
+            // initial callback.
             let response =
                 Self::capture_response(runtime, interaction, invite_code, inventory.as_ref()).await;
             if let Some(response) = response {
@@ -7911,6 +8011,7 @@ where
             if command.is_none()
                 && voice_import_action(&created.0).is_none()
                 && name_component_action(&created.0).is_none()
+                && join_component_action(&created.0).is_none()
             {
                 return;
             }
@@ -7955,6 +8056,11 @@ where
 
 mod private_runtime;
 pub use private_runtime::PrivacyCommand;
+
+mod join_requests;
+use join_requests::{
+    handle_join_interaction, join_component_action, JoinDecisionCommand, JoinReply,
+};
 
 #[cfg(test)]
 #[path = "voice_rooms_tests.rs"]
