@@ -1201,6 +1201,22 @@ class OrchestrationTests(OfflineTestCase):
         self.assert_no_evidence()
         self.assert_no_secret_saved_or_printed()
 
+    def test_out_of_band_worker_version_fails_fast_instead_of_timing_out(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        pending = completed_row()
+        pending["status"] = "progressing"
+        client.api_routes[DETAIL_PATH] = [pending]
+        churned = deployment()
+        churned["deployments"][0]["versions"] = [{"version_id": OLD_VERSION, "percentage": 100}]
+        client.api_routes[DEPLOYMENTS_PATH] = [deployment(), churned]
+        self.assert_gate("worker_version_not_active", rollout.verify, self.args, client)
+        # Failed on the second poll, long before the faked 110s deadline.
+        self.assertEqual(self.clock.sleeps, [5])
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
     def test_eventual_rollout_arrival_and_progress_keep_same_pinned_identity(self):
         self.prepare_baseline()
         self.write_deploy_output()
