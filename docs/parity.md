@@ -79,6 +79,11 @@ golden exception or a claim of whole-baseline registry parity.
 | `timeout` | docs/parity.md §1 #6 duration ceiling | Advertise only `max_value` 2419200 on `duration_seconds`, matching Discord's 28-day cap; every other field stays legacy-identical. |
 | `rota-acknowledge` | docs/parity.md §1 #13 / §9 drop 1 | Remove the staging-only command; no replacement. |
 | `help` | docs/parity.md §1 help | Add the Next-only `/help` discovery command (no legacy counterpart): always published, open to everyone, guild-only, no options. Answers from the live publish set with grouped permission hints. |
+| `attendance` | docs/parity.md §1 #12 copy | Picker copy only: description names the scorecard check-in, and `event-occurrence` says where to find the id with an example. Options, bounds and permissions stay legacy-identical. |
+| `rsvp` | docs/parity.md §1 #24 copy | Picker copy only: `event-id` says where to find the id with an example. Options, bounds and permissions stay legacy-identical. |
+| `rsvp-attendance` | docs/parity.md §1 #25 copy | Picker copy only: description drops the legacy bot name, and `event-id` says where to find the id with an example. Options, bounds and permissions stay legacy-identical. |
+| `lfg` | docs/parity.md §1 #26 copy | Picker copy only: `starts-at` shows an ISO-8601 example and `roles` documents the `role:Label:count` format with an example. Options, bounds and permissions stay legacy-identical. |
+| `lfg-close` | docs/parity.md §1 #27 copy | Picker copy only: `id` says it comes from the posted signup. Options, bounds and permissions stay legacy-identical. |
 
 These are the complete behavioural exceptions, mirrored by the test allowlist.
 Only equivalent guild-API representation defaults are canonicalized: omitted
