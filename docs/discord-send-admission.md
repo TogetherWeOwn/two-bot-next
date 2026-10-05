@@ -141,8 +141,15 @@ as `StaleClaim` instead of releasing the new holder; fresh holders still
 block, and indefinite/finite-cooldown holds never reclaim. The lease exists
 because a storage outage during completion wedged staging boot forever in
 October 2026: every restart's admission was refused and the container never
-served. One admitted attempt holds the lane for a single HTTP exchange only,
-so 60 s is generous headroom for any live holder.
+served. The 60 s value is load-bearing, not arbitrary: one admitted attempt
+holds the lane for a single HTTP exchange, and every in-process retry loop is
+bounded (5 tries at 5 s plus 500/1000/2000/4000 ms backoffs: under 35 s
+all-in), so the same process can never retry the same intent across the lease
+boundary. Only a new process past 60 s can reclaim, and those carry new
+intents — except the idempotent boot registry PUT and effect-claim-governed
+resume paths, which own intent safety at their own layer (nonces, idempotent
+verbs, claim fences). Cross-restart resend of an uncertain mutation is the
+consciously accepted trade for never wedging boot forever.
 
 Indefinite holds require explicitly authorized reconciliation. There is
 intentionally no startup reset or "force send" switch. Before any manual

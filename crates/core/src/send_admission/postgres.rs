@@ -53,8 +53,14 @@ fn finite_delay(cooldown: Option<SendCooldown>) -> Option<i64> {
 
 /// A held lane self-heals past this age (database clock, ms). One admitted
 /// attempt holds the lane for a single HTTP exchange (5 s wire plus 5 s body
-/// budgets and receipt validation), so 60 s is generous headroom for any live
-/// holder and heals a dead holder within about two boot intervals. Indefinite
+/// budgets and receipt validation), and every in-process retry loop is bounded
+/// (5 tries, 5 s each, 500/1000/2000/4000 ms backoffs: under 35 s all-in), so
+/// 60 s can never be consumed by the same process retrying the same intent.
+/// Only a new process past 60 s can reclaim, and those carry new intents,
+/// except the idempotent boot registry PUT and effect-claim-governed resume
+/// paths, which own intent safety at their own layer (nonces, idempotent verbs,
+/// claim fences). Cross-restart resend of an uncertain mutation is therefore
+/// the consciously accepted trade for never wedging boot forever. Indefinite
 /// and finite-cooldown holds never heal: they are deliberate pacing, not dead
 /// holders. Reclaiming bumps the generation, so the dead holder's late
 /// completion lands as `StaleClaim` and cannot release the new holder.
