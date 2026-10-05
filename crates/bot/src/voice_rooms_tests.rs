@@ -6,6 +6,8 @@ use std::sync::Mutex;
 mod join;
 #[path = "voice_kick_tests.rs"]
 mod kick;
+#[path = "voice_rooms_limit_tests.rs"]
+mod limit_command;
 #[path = "voice_name_tests.rs"]
 mod name;
 #[path = "voice_private_runtime_tests.rs"]
@@ -478,6 +480,14 @@ struct OverwriteGate {
     release: tokio::sync::Notify,
 }
 
+/// Hold one `/limit` PATCH mid-flight: the fake signals `sent` when the
+/// write starts and finishes only after `release`.
+#[derive(Default)]
+struct LimitGate {
+    sent: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
 /// One join-request message the fake Discord accepted.
 #[derive(Clone)]
 struct SentPrompt {
@@ -495,6 +505,7 @@ struct Http {
     move_errors: Mutex<VecDeque<RoomHttpError>>,
     delete_errors: Mutex<VecDeque<RoomHttpError>>,
     rename_errors: Mutex<VecDeque<RoomHttpError>>,
+    limit_errors: Mutex<VecDeque<RoomHttpError>>,
     companion_errors: Mutex<VecDeque<RoomHttpError>>,
     view_errors: Mutex<VecDeque<RoomHttpError>>,
     /// Scripted failures for the V4 enforcement's Connect deny.
@@ -516,7 +527,9 @@ struct Http {
     after_create: Option<Hook>,
     before_move: Option<Hook>,
     before_delete: Option<Hook>,
+    before_limit: Option<Hook>,
     overwrites_gate: Option<Arc<OverwriteGate>>,
+    limit_gate: Option<Arc<LimitGate>>,
     downloaded_urls: Mutex<Vec<String>>,
     download_results: DownloadResults,
 }
@@ -530,6 +543,7 @@ impl Http {
             move_errors: Mutex::new(VecDeque::new()),
             delete_errors: Mutex::new(VecDeque::new()),
             rename_errors: Mutex::new(VecDeque::new()),
+            limit_errors: Mutex::new(VecDeque::new()),
             companion_errors: Mutex::new(VecDeque::new()),
             view_errors: Mutex::new(VecDeque::new()),
             kick_errors: Mutex::new(VecDeque::new()),
@@ -548,7 +562,9 @@ impl Http {
             after_create: None,
             before_move: None,
             before_delete: None,
+            before_limit: None,
             overwrites_gate: None,
+            limit_gate: None,
             downloaded_urls: Mutex::new(Vec::new()),
             download_results: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -689,6 +705,31 @@ impl RoomWrites for Http {
             .unwrap()
             .push(format!("rename:{channel}:{name}"));
         match self.rename_errors.lock().unwrap().pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    async fn set_user_limit(
+        &self,
+        channel: u64,
+        user_limit: u32,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if let Some(hook) = &self.before_limit {
+            hook();
+        }
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("limit:{channel}:{user_limit}"));
+        if let Some(gate) = &self.limit_gate {
+            gate.sent.notify_one();
+            gate.release.notified().await;
+        }
+        match self.limit_errors.lock().unwrap().pop_front() {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -2659,7 +2700,9 @@ fn voice_command_set_is_gated_on_two_voice() {
             "kick",
             "name",
             "private",
-            "public"
+            "public",
+            "limit",
+            "unlimit"
         ]
     );
     let off = VoiceGates::from_map(&Default::default());
@@ -8144,6 +8187,13 @@ fn dead_letter_families_cover_every_queue_action_shape() {
                 custom_name: Some("den".to_owned()),
             },
             "rename",
+        ),
+        (
+            RoomAction::SetUserLimit {
+                channel_id: 500,
+                user_limit: 4,
+            },
+            "limit",
         ),
     ];
     for (action, family) in &cases {

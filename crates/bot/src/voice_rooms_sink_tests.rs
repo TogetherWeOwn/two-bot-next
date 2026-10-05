@@ -188,6 +188,14 @@ impl RoomWrites for GatedHttp {
     async fn rename(&self, channel: u64, name: &str) -> Result<(), RoomHttpError> {
         self.http.rename(channel, name).await
     }
+    async fn set_user_limit(
+        &self,
+        channel: u64,
+        user_limit: u32,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.http.set_user_limit(channel, user_limit, guard).await
+    }
     async fn download_attachment(
         &self,
         url: &str,

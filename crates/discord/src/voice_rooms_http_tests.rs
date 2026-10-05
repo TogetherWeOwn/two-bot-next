@@ -352,6 +352,59 @@ async fn rename_429_returns_to_the_queue_instead_of_delaying_room_deletion() {
 }
 
 #[tokio::test]
+async fn set_room_user_limit_patches_only_the_limit() {
+    let mock = Mock::start(vec![
+        response(200, created_channel()),
+        response(200, created_channel()),
+    ])
+    .await;
+    mock.api.set_room_user_limit(600, 7, || true).await.unwrap();
+    // Unlimited is the Discord value 0, never an omitted field.
+    mock.api.set_room_user_limit(600, 0, || true).await.unwrap();
+    let requests = mock.state.recorded.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, Method::PATCH);
+    assert_eq!(requests[0].body, json!({"user_limit": 7}));
+    assert_eq!(requests[1].body, json!({"user_limit": 0}));
+}
+
+#[tokio::test]
+async fn set_room_user_limit_refuses_out_of_range_before_any_request() {
+    let mock = Mock::start(Vec::new()).await;
+    assert_eq!(
+        mock.api.set_room_user_limit(600, 100, || true).await,
+        Err(RoomHttpError::InvalidRequest)
+    );
+    assert_eq!(
+        mock.api.set_room_user_limit(600, u32::MAX, || true).await,
+        Err(RoomHttpError::InvalidRequest)
+    );
+    assert_eq!(
+        mock.api.set_room_user_limit(0, 5, || true).await,
+        Err(RoomHttpError::InvalidRequest)
+    );
+    assert!(mock.state.recorded.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn set_room_user_limit_429_returns_to_the_queue() {
+    let mock = Mock::start(vec![ScriptedResponse {
+        status: 429,
+        body: json!({"retry_after": 2.5, "global": false}),
+        headers: vec![("retry-after", "2.5"), ("x-ratelimit-scope", "shared")],
+    }])
+    .await;
+    assert_eq!(
+        mock.api.set_room_user_limit(600, 3, || true).await,
+        Err(RoomHttpError::RateLimited {
+            retry_after_ms: 2500,
+            global: false
+        })
+    );
+    assert_eq!(mock.state.recorded.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn global_retry_after_is_shared_across_clones_and_occupancy_is_checked_after_waiting() {
     let mock = Mock::start(vec![
         ScriptedResponse {
