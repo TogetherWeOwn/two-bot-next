@@ -255,7 +255,7 @@ pub async fn publish_on_boot(token: &str, guild: u64) -> Result<(), String> {
     let defs = desired_definitions(guild, &vars)?;
     let executor = executor(token, &vars)
         .await
-        .map_err(|_| "cannot configure command REST client")?;
+        .map_err(|error| format!("cannot configure command REST client: {error}"))?;
     let (diff, applied) = executor
         .sync_guild_commands(application, guild, &publish_commands(&defs), true)
         .await
