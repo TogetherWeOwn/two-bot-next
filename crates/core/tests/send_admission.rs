@@ -210,3 +210,28 @@ async fn completion_outage_then_next_boot_proceeds() {
     reboot.admit().await.unwrap().complete(None).await.unwrap();
     db.close().await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb or CI service"]
+async fn admit_without_lease_column_falls_back_to_legacy_lane() {
+    // Replay of the 2026-10-05 staging outage: the build shipped lease-stamped
+    // SQL while the ledger still ended at 0418, so every boot admission failed
+    // with a storage error and the container never served. The runtime is
+    // DML-only, so a missing lease column must degrade to the pre-lease
+    // take-or-block lane instead of failing boot.
+    let db = database().await;
+    sqlx::query("ALTER TABLE public.discord_send_admission DROP COLUMN in_flight_since_ms")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let gate = PgSendAdmission::new(db.pool().clone(), "fixture-token").unwrap();
+    // First admit takes the free lane through the legacy path.
+    let permit = gate.admit().await.unwrap();
+    // A live holder still blocks; no reclaim is attempted without the column.
+    let second = PgSendAdmission::new(db.pool().clone(), "fixture-token").unwrap();
+    assert!(matches!(second.admit().await, Err(AdmissionError::Blocked)));
+    permit.complete(None).await.unwrap();
+    // After release the lane admits again.
+    second.admit().await.unwrap().complete(None).await.unwrap();
+    db.close().await.unwrap();
+}

@@ -149,7 +149,11 @@ boundary. Only a new process past 60 s can reclaim, and those carry new
 intents — except the idempotent boot registry PUT and effect-claim-governed
 resume paths, which own intent safety at their own layer (nonces, idempotent
 verbs, claim fences). Cross-restart resend of an uncertain mutation is the
-consciously accepted trade for never wedging boot forever.
+consciously accepted trade for never wedging boot forever. When the lease
+column itself is absent (build deployed ahead of migration 0419; the runtime
+is DML-only and never self-migrates), `admit` degrades to the pre-lease
+take-or-block lane with a one-per-process warning instead of failing boot;
+the lease activates on its own once the migration lands.
 
 Indefinite holds require explicitly authorized reconciliation. There is
 intentionally no startup reset or "force send" switch. Before any manual

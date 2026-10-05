@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use super::*;
 use crate::metrics;
 use sqlx::{PgPool, Row};
@@ -66,6 +68,33 @@ fn finite_delay(cooldown: Option<SendCooldown>) -> Option<i64> {
 /// completion lands as `StaleClaim` and cannot release the new holder.
 pub const IN_FLIGHT_LEASE_MS: i64 = 60_000;
 
+/// Postgres `undefined_column`: the build was deployed ahead of its migration
+/// (staging 2026-10-05 ran lease-stamped SQL while the ledger still ended at
+/// 0418, so every boot admission failed and the container never served). The
+/// runtime is DML-only and never self-migrates, so a missing lease column must
+/// degrade to the pre-lease lane, not fail boot; the lease activates on its
+/// own once the migration lands, with no restart-gated cache to invalidate.
+const UNDEFINED_COLUMN: &str = "42703";
+
+fn is_undefined_column(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(db) if db.code().as_deref() == Some(UNDEFINED_COLUMN)
+    )
+}
+
+/// One loud warning per process: every later admit takes the same legacy path.
+static LEGACY_LANE_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn warn_legacy_lane() {
+    if !LEGACY_LANE_WARNED.swap(true, Ordering::SeqCst) {
+        tracing::warn!(
+            "Discord send admission lacks in_flight_since_ms; \
+             lease self-heal disabled until the pending migration lands"
+        );
+    }
+}
+
 impl SendAdmission for PgSendAdmission {
     fn token_key(&self) -> &TokenKey {
         &self.key
@@ -96,12 +125,19 @@ impl SendAdmission for PgSendAdmission {
             )
             .bind(&self.key.0)
             .fetch_optional(&self.pool)
-            .await
-            .map_err(|_| {
-                metrics::global().db_error("admission");
-                metrics::global().send_admission("storage_error");
-                AdmissionError::Storage
-            })?;
+            .await;
+            let row = match row {
+                Ok(row) => row,
+                Err(error) if is_undefined_column(&error) => {
+                    warn_legacy_lane();
+                    return self.admit_legacy().await;
+                }
+                Err(_) => {
+                    metrics::global().db_error("admission");
+                    metrics::global().send_admission("storage_error");
+                    return Err(AdmissionError::Storage);
+                }
+            };
             if let Some(row) = row {
                 let generation: i64 = row.try_get("generation").map_err(|_| {
                     metrics::global().db_error("admission");
@@ -157,6 +193,49 @@ impl SendAdmission for PgSendAdmission {
                 generation,
                 "Discord send admission reclaimed a stale in-flight lane"
             );
+            metrics::global().send_admission("admitted");
+            Ok(AdmissionPermit::new(Box::new(PgCompletion {
+                gate: self.clone(),
+                generation,
+            })))
+        })
+    }
+}
+
+impl PgSendAdmission {
+    /// Pre-lease take-or-block: a free lane is taken, a held lane is refused,
+    /// and no reclaim is attempted. Only reached when the lease column is
+    /// absent (build deployed ahead of its migration); behavior matches the
+    /// lane exactly as it was before the lease change.
+    fn admit_legacy(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+        Box::pin(async move {
+            let row = sqlx::query(
+                "INSERT INTO public.discord_send_admission (token_key, in_flight, generation) \
+                 VALUES ($1, TRUE, 1) ON CONFLICT (token_key) DO UPDATE SET \
+                   in_flight = TRUE, generation = discord_send_admission.generation + 1 \
+                 WHERE NOT discord_send_admission.in_flight \
+                   AND NOT discord_send_admission.indefinite \
+                   AND discord_send_admission.hold_until_ms <= \
+                     (extract(epoch FROM clock_timestamp()) * 1000)::bigint \
+                 RETURNING generation",
+            )
+            .bind(&self.key.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| {
+                metrics::global().db_error("admission");
+                metrics::global().send_admission("storage_error");
+                AdmissionError::Storage
+            })?;
+            let Some(row) = row else {
+                metrics::global().send_admission("blocked");
+                return Err(AdmissionError::Blocked);
+            };
+            let generation: i64 = row.try_get("generation").map_err(|_| {
+                metrics::global().db_error("admission");
+                metrics::global().send_admission("storage_error");
+                AdmissionError::Storage
+            })?;
             metrics::global().send_admission("admitted");
             Ok(AdmissionPermit::new(Box::new(PgCompletion {
                 gate: self.clone(),
