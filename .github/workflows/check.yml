@@ -64,11 +64,19 @@ jobs:
     with:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
+  # CI lanes. The old single `check` job ran the offline guards, fmt, clippy, every
+  # non-ignored test target and ~30 serial `--ignored` database steps in one
+  # container (p50 ~16 min). It is now four jobs that start together once
+  # `job-inputs` finishes: `check` (lint), `rust-tests` (unit, integration, doc)
+  # and two database lanes (`ignored-db-stores`, `ignored-db-runtime`). Every
+  # lane is gated by `ci-ok` and `required-checks`: a lane missing from their
+  # `needs:` and gated lists would be a false gate (see scripts/ci/test_required_checks.py).
+
   check:
     name: check
     permissions:
       contents: read
-    needs: [self-role-store, supply-chain, parity-docs, job-inputs]
+    needs: [job-inputs]
     # Failed, skipped or cancelled dependencies must not make check appear green.
     if: ${{ always() }}
     # Runner routing (TOG-12339). Every job in every workflow uses this
@@ -83,54 +91,16 @@ jobs:
     #   by deleting CI_OVERFLOW_RUNNER. Hosted minutes then come from the
     #   included allowance; an rbx1 guard reverts at 45k.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'check') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
-    timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
-    # Self-hosted runners share one Docker host, so a published 5432 collides
-    # across concurrent jobs. A job container gets its own network namespace:
-    # the service resolves as agent-testdb:5432 and loopback is job-private.
+    timeout-minutes: 30
     container:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
       CARGO_TERM_COLOR: always
-      TWO_CUSTOM_COMMAND_TEST_CI: "1"
-      TWO_AUTOMATION_TRANSFER_TEST_CI: "1"
-      # Disk hygiene for hosted overflow runners (TOG-12134): the integration
-      # link step (`cargo test --workspace --test '*'`) links ~70 test
-      # binaries and exhausted the job-container overlay (98 MB left, rust-lld
-      # bus error on two consecutive main heads). Line tables keep failure
-      # backtraces useful while cutting binary size; codegen, debug
-      # assertions and test semantics are unchanged. `cargo test` compiles
-      # under the `test` profile, so both profiles are pinned.
+      # Disk hygiene (same pins as the test lanes): smaller binaries, no incremental artifacts.
       CARGO_PROFILE_DEV_DEBUG: 'line-tables-only'
       CARGO_PROFILE_TEST_DEBUG: 'line-tables-only'
-      # Incremental artifacts multiply with ~70 linked test binaries; a cold
-      # CI link does not reuse them, so skip writing them (TOG-12134).
       CARGO_PROFILE_DEV_INCREMENTAL: 'false'
       CARGO_PROFILE_TEST_INCREMENTAL: 'false'
-      TWO_LFG_TESTDB_CI: '1'
-      TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
-      # CI service hosts only; deployed processes default to `required`
-      # (docs/database-tls.md).
-      TWO_DATABASE_TLS: local-only
-    services:
-      agent-testdb:
-        image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
-        env:
-          POSTGRES_USER: agent_test
-          POSTGRES_DB: agent_test
-          # Ephemeral CI service only; tests explicitly use an empty password.
-          # Slice scratch databases are created in the prepare step below.
-          POSTGRES_HOST_AUTH_METHOD: trust
-        # PG18 places data and WAL below this volume. Isolate disposable fixture
-        # checkpoint I/O from shared-host disk; keep PostgreSQL defaults intact.
-        # Tmpfs counts against the 2GiB service cap; do not spill it into swap.
-        options: >-
-          --tmpfs /var/lib/postgresql:rw,size=1073741824
-          --memory 2147483648
-          --memory-swap 2147483648
-          --health-cmd "test $(stat -f -c %T $PGDATA) = tmpfs && pg_isready -U agent_test -d agent_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -138,21 +108,15 @@ jobs:
           # The migration guard reads PR base/push-before blobs, including the lock.
           fetch-depth: 0
 
-      - name: Job-container prerequisites (loopback forward to agent-testdb)
+      - name: Job-container prerequisites (python only)
         run: |
-          # On hosted/overflow runners the job container's root does not own the
-          # runner-owned checkout, so Git refuses it as dubious ownership.
+          # The hosted job container's root does not own the runner-owned
+          # checkout, so Git refuses it as dubious ownership.
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           apt-get update -qq
-          apt-get install -y -qq --no-install-recommends python3 python3-pip postgresql-client socat >/dev/null
-          # Disk hygiene for hosted overflow runners (TOG-12134): the package
-          # lists stay on the job-container overlay otherwise.
+          apt-get install -y -qq --no-install-recommends python3 python3-pip >/dev/null
+          # Keep the package lists off the job-container overlay.
           rm -rf /var/lib/apt/lists/*
-          # Tests that pin 127.0.0.1/localhost:5432 reach the service through
-          # this job-private forward.
-          nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
-          for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
-          exit 1
 
       - name: Selection note (dependency-aware skip)
         env:
@@ -171,18 +135,6 @@ jobs:
       # selector from turning skips into false greens.
       - name: require job inputs selection to pass
         if: needs.job-inputs.result != 'success'
-        run: exit 1
-
-      - name: require parity docs to pass
-        if: needs.parity-docs.result != 'success' && needs.job-inputs.outputs.parity != 'false'
-        run: exit 1
-
-      - name: require self-role store tests to pass
-        if: needs.self-role-store.result != 'success' && needs.job-inputs.outputs.rust != 'false'
-        run: exit 1
-
-      - name: require supply-chain gate to pass
-        if: needs.supply-chain.result != 'success' && needs.job-inputs.outputs.supply != 'false'
         run: exit 1
 
       - name: Check migration numbering and immutability
@@ -237,6 +189,7 @@ jobs:
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v
+
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_probe.py' -v
 
       - name: soak evidence parser (offline, fixtures only)
@@ -268,7 +221,150 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
-          toolchain: stable
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          components: rustfmt, clippy
+
+      # Fail-fast (TOG-12055): cheap lint/format/guard checks run before the
+      # ~4 GiB cargo cache restore, so a failure skips the big download. The
+      # Docker layer check is split: the offline shape check fails fast here;
+      # the real locked `cargo fetch` stays after the restore (below) so it
+      # reuses the warm registry cache instead of fetching cold.
+      - name: cargo fmt --check
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo fmt --all -- --check
+
+      - name: Prevent raw secrets under derived Debug
+        run: |
+          python3 scripts/check-secret-debug.py --test
+          python3 scripts/check-secret-debug.py
+
+      - name: Verify Docker dependency layer (offline)
+        run: python3 scripts/test-docker-deps.py
+
+      - name: Docker dependency-layer manifests (offline)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: python3 scripts/check-docker-manifests.py
+
+      # Lint lane: its own entry (compile-only artifacts), saved on pushes to main only.
+      - name: Restore cargo cache
+        if: needs.job-inputs.outputs.rust != 'false'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: ${{ runner.os }}-cargo
+          shared-key: lint
+          save-if: ${{ github.event_name == 'push' }}
+
+      # Real locked fetch: needs the warm registry cache restored above, so it
+      # stays here. The offline layer-shape check already ran before the
+      # restore (TOG-12055), so a drifted Dockerfile fails before any download.
+      - name: Verify Docker dependency layer (locked fetch)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: python3 scripts/test-docker-deps.py --cargo
+
+      # TOG-12134: cheap static guard, adopted from main. The fmt and
+      # secret-Debug checks already ran before the restore (TOG-12055), so
+      # main's post-restore duplicates of them are dropped here — no coverage
+      # change, same steps run once and earlier.
+      - name: Verify check job disk hygiene
+        run: python3 scripts/test-check-disk-hygiene.py
+
+      # Compile optional stores and run their safety and scratch-DB tests too.
+      # Onboarding/sticky live tests remain explicitly ignored by default.
+      - name: cargo clippy -D warnings
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: channel moderation store clippy
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
+
+      # NOTE: cargo-deny runs before the toolchain install and every compile
+      # step (disk hygiene); do not re-add it later in this job.
+
+  rust-tests:
+    name: rust tests
+    permissions:
+      contents: read
+    needs: [job-inputs]
+    # Skip when the selector sees no Rust inputs (docs-only, worker-UI-only PRs);
+    # `ci-ok` only accepts the skip when the selector deselected the job.
+    if: needs.job-inputs.outputs.rust != 'false'
+    # Runner routing: see the note on `check`.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'rust-tests') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
+    # Self-hosted runners share one Docker host, so a published 5432 collides
+    # across concurrent jobs. A job container gets its own network namespace:
+    # the service resolves as agent-testdb:5432 and loopback is job-private.
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    env:
+      CARGO_TERM_COLOR: always
+      TWO_CUSTOM_COMMAND_TEST_CI: "1"
+      TWO_AUTOMATION_TRANSFER_TEST_CI: "1"
+      # Disk hygiene for hosted overflow runners (TOG-12134): the integration
+      # link step (`cargo test --workspace --test '*'`) links ~70 test
+      # binaries and exhausted the job-container overlay (98 MB left, rust-lld
+      # bus error on two consecutive main heads). Line tables keep failure
+      # backtraces useful while cutting binary size; codegen, debug
+      # assertions and test semantics are unchanged. `cargo test` compiles
+      # under the `test` profile, so both profiles are pinned.
+      CARGO_PROFILE_DEV_DEBUG: 'line-tables-only'
+      CARGO_PROFILE_TEST_DEBUG: 'line-tables-only'
+      # Incremental artifacts multiply with ~70 linked test binaries; a cold
+      # CI link does not reuse them, so skip writing them (TOG-12134).
+      CARGO_PROFILE_DEV_INCREMENTAL: 'false'
+      CARGO_PROFILE_TEST_INCREMENTAL: 'false'
+      TWO_LFG_TESTDB_CI: '1'
+      TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
+      # CI service hosts only; deployed processes default to `required`
+      # (docs/database-tls.md).
+      TWO_DATABASE_TLS: local-only
+    services:
+      agent-testdb:
+        image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          # Ephemeral CI service only; tests explicitly use an empty password.
+          # Slice scratch databases are created in the prepare step below.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        # PG18 places data and WAL below this volume. Isolate disposable fixture
+        # checkpoint I/O from shared-host disk; keep PostgreSQL defaults intact.
+        # Tmpfs counts against the 2GiB service cap; do not spill it into swap.
+        options: >-
+          --tmpfs /var/lib/postgresql:rw,size=1073741824
+          --memory 2147483648
+          --memory-swap 2147483648
+          --health-cmd "test $(stat -f -c %T $PGDATA) = tmpfs && pg_isready -U agent_test -d agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Job-container prerequisites (loopback forward to agent-testdb)
+        run: |
+          # On hosted/overflow runners the job container's root does not own the
+          # runner-owned checkout, so Git refuses it as dubious ownership.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 python3-pip postgresql-client socat >/dev/null
+          # Disk hygiene for hosted overflow runners (TOG-12134): the package
+          # lists stay on the job-container overlay otherwise.
+          rm -rf /var/lib/apt/lists/*
+          # Tests that pin 127.0.0.1/localhost:5432 reach the service through
+          # this job-private forward.
+          nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
+          for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
+          exit 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
+        with:
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
 
       - name: Pin native tests to one CPU (loaded-runner validation)
@@ -313,59 +409,17 @@ jobs:
           print('cpu pressure:', pathlib.Path('/proc/pressure/cpu').read_text().strip())
           PY
 
-      # Fail-fast (TOG-12055): cheap lint/format/guard checks run before the
-      # ~4 GiB cargo cache restore, so a failure skips the big download. The
-      # Docker layer check is split: the offline shape check fails fast here;
-      # the real locked `cargo fetch` stays after the restore (below) so it
-      # reuses the warm registry cache instead of fetching cold.
-      - name: cargo fmt --check
-        if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo fmt --all -- --check
-
-      - name: Prevent raw secrets under derived Debug
-        run: |
-          python3 scripts/check-secret-debug.py --test
-          python3 scripts/check-secret-debug.py
-
-      - name: Verify Docker dependency layer (offline)
-        run: python3 scripts/test-docker-deps.py
-
-      # TOG-11810: dependency build cache. The raw ~4 GiB target/ upload
-      # blew the 30-minute PR timeout (#147); rust-cache stores ~/.cargo and
-      # the dependency builds in target/, stripping workspace crates, so
-      # restore/save stay small. The key includes the job id (no shared-key),
-      # so this job's entry is separate from `tickets postgres`. Restore on
-      # every run; save only on pushes to main (a PR-scoped entry is
-      # unreadable by other PRs, so a PR upload is pure waste).
+      # Dependency build cache, saved on pushes to main only. `shared-key: check` keeps
+      # the pre-split entry key so the test-profile dependency cache stays warm; the
+      # three Rust test lanes share this one entry instead of each storing a copy.
       - name: Restore cargo cache
-        if: needs.job-inputs.outputs.rust != 'false'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: ${{ runner.os }}-cargo
+          shared-key: check
           save-if: ${{ github.event_name == 'push' }}
 
-      # Real locked fetch: needs the warm registry cache restored above, so it
-      # stays here. The offline layer-shape check already ran before the
-      # restore (TOG-12055), so a drifted Dockerfile fails before any download.
-      - name: Verify Docker dependency layer (locked fetch)
-        if: needs.job-inputs.outputs.rust != 'false'
-        run: python3 scripts/test-docker-deps.py --cargo
-
-      # TOG-12134: cheap static guard, adopted from main. The fmt and
-      # secret-Debug checks already ran before the restore (TOG-12055), so
-      # main's post-restore duplicates of them are dropped here — no coverage
-      # change, same steps run once and earlier.
-      - name: Verify check job disk hygiene
-        run: python3 scripts/test-check-disk-hygiene.py
-
-      # Compile optional stores and run their safety and scratch-DB tests too.
-      # Onboarding/sticky live tests remain explicitly ignored by default.
-      - name: cargo clippy -D warnings
-        if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-
       - name: Prepare isolated test databases
-        if: needs.job-inputs.outputs.rust != 'false'
         run: |
           createdb -h agent-testdb -U agent_test two_bot_test_ci
           createdb -h agent-testdb -U agent_test two_next_backup_ci
@@ -373,7 +427,6 @@ jobs:
           printf 'PAPERCLIP_RUN_SCRATCH_DIR=%s/two-bot-check-scratch\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: Verify disposable Postgres defaults
-        if: needs.job-inputs.outputs.rust != 'false'
         run: |
           python3 - <<'PY'
           import json
@@ -405,7 +458,6 @@ jobs:
       # Preserve cargo test's default unit/binary, integration and doc targets.
       # Migrated suites create/drop unique databases; this bootstrap is not reset.
       - name: cargo test (unit and binary, including RSVP store)
-        if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test --workspace --lib --bins --features two-bot-core/db --locked
@@ -413,7 +465,6 @@ jobs:
       # The standalone backup fixture has its own scratch-only URL guard.
       # Supplying it here executes the round trip rather than its local skip.
       - name: cargo test (integration, including website acceptance and backup round trip)
-        if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
           TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_ci
@@ -422,8 +473,185 @@ jobs:
         # in the dedicated step below; never feed it the round-trip fixture URL.
         run: cargo test --workspace --test '*' --features two-bot-core/db --locked -- --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump
 
+      # Reuse the exact feature/target graph above so this measures execution,
+      # not a second compilation. Property tests are pure fixtures (64 cases).
+      - name: property tests stay under 30 seconds
+        run: |
+          start=$SECONDS
+          cargo test --workspace --lib --bins --test '*' --features two-bot-core/db --locked property_
+          elapsed=$((SECONDS - start))
+          printf 'Property suite: %s seconds (budget <30)\n' "$elapsed"
+          test "$elapsed" -lt 30
+
+      - name: cargo test (docs)
+        run: cargo test --workspace --doc --features two-bot-core/db --locked
+
+      - name: Measure metrics RSS (local fixtures only)
+        run: cargo run -p two-bot-core --example metrics_rss --locked
+
+  ignored-db-stores:
+    name: ignored db (stores)
+    permissions:
+      contents: read
+    needs: [job-inputs]
+    # Skip when the selector sees no Rust inputs (docs-only, worker-UI-only PRs);
+    # `ci-ok` only accepts the skip when the selector deselected the job.
+    if: needs.job-inputs.outputs.rust != 'false'
+    # Runner routing: see the note on `check`.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'ignored-db-stores') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
+    # Self-hosted runners share one Docker host, so a published 5432 collides
+    # across concurrent jobs. A job container gets its own network namespace:
+    # the service resolves as agent-testdb:5432 and loopback is job-private.
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    env:
+      # Same env as `rust-tests`: disk hygiene pins and CI-service-only settings.
+      CARGO_TERM_COLOR: always
+      TWO_CUSTOM_COMMAND_TEST_CI: "1"
+      TWO_AUTOMATION_TRANSFER_TEST_CI: "1"
+      CARGO_PROFILE_DEV_DEBUG: 'line-tables-only'
+      CARGO_PROFILE_TEST_DEBUG: 'line-tables-only'
+      CARGO_PROFILE_DEV_INCREMENTAL: 'false'
+      CARGO_PROFILE_TEST_INCREMENTAL: 'false'
+      TWO_LFG_TESTDB_CI: '1'
+      TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
+      TWO_DATABASE_TLS: local-only
+    services:
+      agent-testdb:
+        image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          # Ephemeral CI service only; tests explicitly use an empty password.
+          # Slice scratch databases are created in the prepare step below.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        # PG18 places data and WAL below this volume. Isolate disposable fixture
+        # checkpoint I/O from shared-host disk; keep PostgreSQL defaults intact.
+        # Tmpfs counts against the 2GiB service cap; do not spill it into swap.
+        options: >-
+          --tmpfs /var/lib/postgresql:rw,size=1073741824
+          --memory 2147483648
+          --memory-swap 2147483648
+          --health-cmd "test $(stat -f -c %T $PGDATA) = tmpfs && pg_isready -U agent_test -d agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Job-container prerequisites (loopback forward to agent-testdb)
+        run: |
+          # On hosted/overflow runners the job container's root does not own the
+          # runner-owned checkout, so Git refuses it as dubious ownership.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 python3-pip postgresql-client socat >/dev/null
+          # Disk hygiene for hosted overflow runners (TOG-12134): the package
+          # lists stay on the job-container overlay otherwise.
+          rm -rf /var/lib/apt/lists/*
+          # Tests that pin 127.0.0.1/localhost:5432 reach the service through
+          # this job-private forward.
+          nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
+          for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
+          exit 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
+        with:
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          components: rustfmt, clippy
+
+      - name: Pin native tests to one CPU (loaded-runner validation)
+        if: github.event_name == 'workflow_dispatch' && inputs.single_core_tests
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+          import tempfile
+
+          taskset = shutil.which('taskset')
+          if taskset is None:
+              raise SystemExit('single-core validation requires taskset')
+          affinity = sorted(os.sched_getaffinity(0))
+          threads = os.environ.get('RUST_TEST_THREADS')
+          source = 'explicit RUST_TEST_THREADS'
+          if threads is None:
+              # Ask Rust before pinning: available_parallelism also honors CPU
+              # quotas, unlike simply counting the original affinity mask.
+              source = 'unpinned Rust available_parallelism'
+              with tempfile.TemporaryDirectory() as directory:
+                  probe = str(pathlib.Path(directory) / 'test-parallelism')
+                  subprocess.run(['rustc', '-', '--crate-name', 'test_parallelism', '-o', probe],
+                                 input='fn main() { println!("{}", std::thread::available_parallelism().unwrap().get()); }',
+                                 text=True, check=True)
+                  threads = subprocess.check_output([probe], text=True).strip()
+          if not threads.isascii() or not threads.isdecimal() or int(threads) < 1:
+              raise SystemExit('single-core validation requires a positive RUST_TEST_THREADS')
+          cpu = min(affinity)
+          subprocess.run([taskset, '-c', str(cpu), 'true'], check=True)
+          version = subprocess.check_output(['rustc', '-vV'], text=True)
+          host = next(line.removeprefix('host: ') for line in version.splitlines() if line.startswith('host: '))
+          key = 'CARGO_TARGET_' + host.upper().replace('-', '_') + '_RUNNER'
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'RUST_TEST_THREADS={threads}\n')
+              env.write(f'{key}={taskset} -c {cpu}\n')
+          print(f'libtest threads: {threads} ({source}); unpinned affinity: {affinity}; explicit --test-threads still wins')
+          print(f'Native Rust test binaries: {taskset} -c {cpu}; revision {os.environ["GITHUB_SHA"]}')
+          print('loadavg:', pathlib.Path('/proc/loadavg').read_text().strip())
+          print('cpu pressure:', pathlib.Path('/proc/pressure/cpu').read_text().strip())
+          PY
+
+      # Restore-only: the entry is written by the `rust-tests` lane.
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: ${{ runner.os }}-cargo
+          shared-key: check
+          save-if: false
+
+      - name: Prepare isolated test databases
+        run: |
+          createdb -h agent-testdb -U agent_test two_bot_test_ci
+          createdb -h agent-testdb -U agent_test two_next_backup_ci
+          createdb -h agent-testdb -U agent_test two_next_backup_publication_ci
+          printf 'PAPERCLIP_RUN_SCRATCH_DIR=%s/two-bot-check-scratch\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Verify disposable Postgres defaults
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          if any(name.startswith('PG') for name in os.environ):
+              raise SystemExit('unset ambient libpq PG* configuration before probing the test service')
+          expected = {
+              'data_directory': '/var/lib/postgresql/18/docker',
+              'fsync': 'on',
+              'full_page_writes': 'on',
+              'synchronous_commit': 'on',
+          }
+          fields = ', '.join(f"'{key}', current_setting('{key}')" for key in expected)
+          settings = json.loads(subprocess.check_output([
+              'psql', 'postgres://agent_test:@agent-testdb:5432/two_bot_test_ci',
+              '-X', '-w', '-At', '-v', 'ON_ERROR_STOP=1',
+              '-c', f'SELECT json_build_object({fields})',
+          ], text=True, env=os.environ | {
+              'PGPASSFILE': '/dev/null', 'PGSSLMODE': 'disable',
+              'PGOPTIONS': '-c statement_timeout=5000',
+          }))
+          if settings != expected:
+              raise SystemExit('disposable Postgres data path or durability defaults changed')
+          print('Disposable Postgres defaults:', json.dumps(settings, sort_keys=True))
+          PY
+
       - name: Backup publication faults (actual CLI, dedicated CI service database)
-        if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_publication_ci
           TWO_BOT_TEST_BACKUP_BIN: ${{ github.workspace }}/target/debug/two-bot
@@ -433,7 +661,6 @@ jobs:
           cargo test -p two-bot-core --features db --locked --test backup_dump_publication -- --nocapture
 
       - name: Native v3 and real backup CLI regressions (CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
         run: |
           export PAPERCLIP_RUN_SCRATCH_DIR
           PAPERCLIP_RUN_SCRATCH_DIR=$(mktemp -d "$RUNNER_TEMP/backup-regressions.XXXXXX")
@@ -448,123 +675,295 @@ jobs:
           export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
           cargo test -p two-bot-core --features db --test backup_schema_roundtrip --locked shipped_backup_and_restore_drill -- --nocapture --test-threads=1
 
-      # Reuse the exact feature/target graph above so this measures execution,
-      # not a second compilation. Property tests are pure fixtures (64 cases).
-      - name: property tests stay under 30 seconds
-        if: needs.job-inputs.outputs.rust != 'false'
-        run: |
-          start=$SECONDS
-          cargo test --workspace --lib --bins --test '*' --features two-bot-core/db --locked property_
-          elapsed=$((SECONDS - start))
-          printf 'Property suite: %s seconds (budget <30)\n' "$elapsed"
-          test "$elapsed" -lt 30
-
-      - name: cargo test (docs)
-        if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo test --workspace --doc --features two-bot-core/db --locked
-
-      - name: Measure metrics RSS (local fixtures only)
-        if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo run -p two-bot-core --example metrics_rss --locked
-
       - name: audit database regressions (CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-core --features db --test audit_store --test audit_service --test containment_store --test join_risk_store --locked -- --ignored
 
       - name: LFG store regressions (CI service container only)
-        if: needs.job-inputs.outputs.rust != 'false'
         run: >-
           cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
 
       - name: LFG actual-router and mock-Discord regressions
-        if: needs.job-inputs.outputs.rust != 'false'
         run: >-
           cargo test -p two-bot-discord --features db --locked --test lfg_interactions -- --ignored --test-threads=1
 
       - name: leveling gateway and interaction integration (CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test leveling_runtime -- --ignored --test-threads=1
 
       - name: onboarding prompt store regressions (CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-core --features db --test onboarding_store --locked -- --ignored
 
-      - name: onboarding shared runtime acceptance (mock Discord and CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo test -p two-bot --locked onboarding_ -- --include-ignored
-
-      - name: raid runtime acceptance (mock Discord and CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo test -p two-bot --locked raid_runtime_ -- --include-ignored
-
-      - name: join-risk runtime acceptance (mock Discord and CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo test -p two-bot --locked join_risk_runtime_ -- --include-ignored
-
-      - name: containment runtime acceptance (mock Discord and CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo test -p two-bot --locked containment_runtime_ -- --include-ignored
-
       - name: automod durable dedupe (CI service container only)
-        if: needs.job-inputs.outputs.rust != 'false'
         env:
           AUTOMOD_CI_TESTDB: '1'
         run: cargo test -p two-bot-core --features db --locked --test automod_store --test automod_preserved_replay -- --ignored
 
       - name: leveling Postgres parity tests
-        if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_LEVELING_TEST_CI: '1'
         run: cargo test -p two-bot-core --features db --locked --test leveling_store -- --ignored
 
+      - name: Store Postgres integration (isolated CI schemas)
+        env:
+          TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/postgres
+        run: cargo test -p two-bot-store --locked --test postgres --test journal --test membership_pg -- --ignored
+
+      - name: sticky live store regressions (CI service container only)
+        run: cargo test -p two-bot-core --features db --locked --test sticky_store_live -- --ignored
+
+      # Only this slice's tests activate their test-container guard here.
+      - name: channel moderation domain and store tests
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-core --features db --locked channel_moderation -- --include-ignored
+
+      - name: channel moderation shared-router REST acceptance (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: >-
+          env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS cargo test -p two-bot-discord
+          --features db --locked --test channel_moderation_runtime -- --include-ignored
+
+      - name: Internal channel moderation executor (mock REST and CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-discord --features db --locked --test internal_channel_moderation -- --include-ignored
+
+      - name: Internal-member durable store regressions (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test internal_member_store -- --ignored
+
+      - name: Internal member moderation executor (mock REST and CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test internal_member_moderation -- --include-ignored
+
+      - name: Internal event executor mirror acceptance (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-discord --features db --locked --test internal_events -- --include-ignored
+
+      - name: custom-command Postgres proof
+        run: cargo test -p two-bot-core --features db --locked --test custom_command_store -- --ignored
+
+      - name: automations import/export Postgres proof
+        run: cargo test -p two-bot-core --features db --locked --test automation_transfer -- --ignored
+
+      - name: custom-command routed runtime proof (mock Discord and CI Postgres only)
+        run: cargo test -p two-bot-discord --features db --locked --test custom_command_runtime -- --include-ignored
+
+      - name: Durable Discord send admission (isolated DBs and mock HTTP only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: |
+          cargo test -p two-bot-core --features db --test send_admission --locked -- --ignored
+          cargo test -p two-bot-discord --features db-tests --lib --locked admission_ -- --ignored
+          cargo test -p two-bot-cutover --test send_admission --locked -- --ignored
+
+  ignored-db-runtime:
+    name: ignored db (runtime)
+    permissions:
+      contents: read
+    needs: [job-inputs]
+    # Skip when the selector sees no Rust inputs (docs-only, worker-UI-only PRs);
+    # `ci-ok` only accepts the skip when the selector deselected the job.
+    if: needs.job-inputs.outputs.rust != 'false'
+    # Runner routing: see the note on `check`.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'ignored-db-runtime') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
+    # Self-hosted runners share one Docker host, so a published 5432 collides
+    # across concurrent jobs. A job container gets its own network namespace:
+    # the service resolves as agent-testdb:5432 and loopback is job-private.
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    env:
+      # Same env as `rust-tests`: disk hygiene pins and CI-service-only settings.
+      CARGO_TERM_COLOR: always
+      TWO_CUSTOM_COMMAND_TEST_CI: "1"
+      TWO_AUTOMATION_TRANSFER_TEST_CI: "1"
+      CARGO_PROFILE_DEV_DEBUG: 'line-tables-only'
+      CARGO_PROFILE_TEST_DEBUG: 'line-tables-only'
+      CARGO_PROFILE_DEV_INCREMENTAL: 'false'
+      CARGO_PROFILE_TEST_INCREMENTAL: 'false'
+      TWO_LFG_TESTDB_CI: '1'
+      TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
+      TWO_DATABASE_TLS: local-only
+    services:
+      agent-testdb:
+        image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          # Ephemeral CI service only; tests explicitly use an empty password.
+          # Slice scratch databases are created in the prepare step below.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        # PG18 places data and WAL below this volume. Isolate disposable fixture
+        # checkpoint I/O from shared-host disk; keep PostgreSQL defaults intact.
+        # Tmpfs counts against the 2GiB service cap; do not spill it into swap.
+        options: >-
+          --tmpfs /var/lib/postgresql:rw,size=1073741824
+          --memory 2147483648
+          --memory-swap 2147483648
+          --health-cmd "test $(stat -f -c %T $PGDATA) = tmpfs && pg_isready -U agent_test -d agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Job-container prerequisites (loopback forward to agent-testdb)
+        run: |
+          # On hosted/overflow runners the job container's root does not own the
+          # runner-owned checkout, so Git refuses it as dubious ownership.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 python3-pip postgresql-client socat >/dev/null
+          # Disk hygiene for hosted overflow runners (TOG-12134): the package
+          # lists stay on the job-container overlay otherwise.
+          rm -rf /var/lib/apt/lists/*
+          # Tests that pin 127.0.0.1/localhost:5432 reach the service through
+          # this job-private forward.
+          nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
+          for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
+          exit 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
+        with:
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          components: rustfmt, clippy
+
+      - name: Pin native tests to one CPU (loaded-runner validation)
+        if: github.event_name == 'workflow_dispatch' && inputs.single_core_tests
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+          import tempfile
+
+          taskset = shutil.which('taskset')
+          if taskset is None:
+              raise SystemExit('single-core validation requires taskset')
+          affinity = sorted(os.sched_getaffinity(0))
+          threads = os.environ.get('RUST_TEST_THREADS')
+          source = 'explicit RUST_TEST_THREADS'
+          if threads is None:
+              # Ask Rust before pinning: available_parallelism also honors CPU
+              # quotas, unlike simply counting the original affinity mask.
+              source = 'unpinned Rust available_parallelism'
+              with tempfile.TemporaryDirectory() as directory:
+                  probe = str(pathlib.Path(directory) / 'test-parallelism')
+                  subprocess.run(['rustc', '-', '--crate-name', 'test_parallelism', '-o', probe],
+                                 input='fn main() { println!("{}", std::thread::available_parallelism().unwrap().get()); }',
+                                 text=True, check=True)
+                  threads = subprocess.check_output([probe], text=True).strip()
+          if not threads.isascii() or not threads.isdecimal() or int(threads) < 1:
+              raise SystemExit('single-core validation requires a positive RUST_TEST_THREADS')
+          cpu = min(affinity)
+          subprocess.run([taskset, '-c', str(cpu), 'true'], check=True)
+          version = subprocess.check_output(['rustc', '-vV'], text=True)
+          host = next(line.removeprefix('host: ') for line in version.splitlines() if line.startswith('host: '))
+          key = 'CARGO_TARGET_' + host.upper().replace('-', '_') + '_RUNNER'
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'RUST_TEST_THREADS={threads}\n')
+              env.write(f'{key}={taskset} -c {cpu}\n')
+          print(f'libtest threads: {threads} ({source}); unpinned affinity: {affinity}; explicit --test-threads still wins')
+          print(f'Native Rust test binaries: {taskset} -c {cpu}; revision {os.environ["GITHUB_SHA"]}')
+          print('loadavg:', pathlib.Path('/proc/loadavg').read_text().strip())
+          print('cpu pressure:', pathlib.Path('/proc/pressure/cpu').read_text().strip())
+          PY
+
+      # Restore-only: the entry is written by the `rust-tests` lane.
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: ${{ runner.os }}-cargo
+          shared-key: check
+          save-if: false
+
+      - name: Prepare isolated test databases
+        run: |
+          createdb -h agent-testdb -U agent_test two_bot_test_ci
+          createdb -h agent-testdb -U agent_test two_next_backup_ci
+          createdb -h agent-testdb -U agent_test two_next_backup_publication_ci
+          printf 'PAPERCLIP_RUN_SCRATCH_DIR=%s/two-bot-check-scratch\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Verify disposable Postgres defaults
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          if any(name.startswith('PG') for name in os.environ):
+              raise SystemExit('unset ambient libpq PG* configuration before probing the test service')
+          expected = {
+              'data_directory': '/var/lib/postgresql/18/docker',
+              'fsync': 'on',
+              'full_page_writes': 'on',
+              'synchronous_commit': 'on',
+          }
+          fields = ', '.join(f"'{key}', current_setting('{key}')" for key in expected)
+          settings = json.loads(subprocess.check_output([
+              'psql', 'postgres://agent_test:@agent-testdb:5432/two_bot_test_ci',
+              '-X', '-w', '-At', '-v', 'ON_ERROR_STOP=1',
+              '-c', f'SELECT json_build_object({fields})',
+          ], text=True, env=os.environ | {
+              'PGPASSFILE': '/dev/null', 'PGSSLMODE': 'disable',
+              'PGOPTIONS': '-c statement_timeout=5000',
+          }))
+          if settings != expected:
+              raise SystemExit('disposable Postgres data path or durability defaults changed')
+          print('Disposable Postgres defaults:', json.dumps(settings, sort_keys=True))
+          PY
+
+      - name: onboarding shared runtime acceptance (mock Discord and CI service only)
+        run: cargo test -p two-bot --locked onboarding_ -- --include-ignored
+
+      - name: raid runtime acceptance (mock Discord and CI service only)
+        run: cargo test -p two-bot --locked raid_runtime_ -- --include-ignored
+
+      - name: join-risk runtime acceptance (mock Discord and CI service only)
+        run: cargo test -p two-bot --locked join_risk_runtime_ -- --include-ignored
+
+      - name: containment runtime acceptance (mock Discord and CI service only)
+        run: cargo test -p two-bot --locked containment_runtime_ -- --include-ignored
+
       - name: Raid cohort query (CI service container only)
-        if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-cutover --test raid_list_db --locked -- --ignored
 
       - name: Reengagement list query (CI service container only)
-        if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-cutover --test reengagement_list_db --locked -- --ignored
 
       - name: settings database regressions (CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
 
       - name: voice room store regressions (CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-cutover --test voice_rooms_store --locked -- --ignored
 
       - name: Voice configuration store (CI service container only)
-        if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-cutover --test voice_config_store --locked -- --ignored
 
-      - name: Docker dependency-layer manifests (offline)
-        if: needs.job-inputs.outputs.rust != 'false'
-        run: python3 scripts/check-docker-manifests.py
-
-      - name: Store Postgres integration (isolated CI schemas)
-        if: needs.job-inputs.outputs.rust != 'false'
-        env:
-          TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/postgres
-        run: cargo test -p two-bot-store --locked --test postgres --test journal --test membership_pg -- --ignored
-
       - name: legacy copy acceptance (two owned databases on CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-cutover --test legacy_copy_db --locked -- --ignored
 
       - name: Legacy verification acceptance (two disposable CI databases)
-        if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-cutover --test legacy_verify_db --locked -- --ignored
 
       - name: Staging migration runner acceptance (real SQLx, disposable CI database)
-        if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-cutover --test staging_migrate_db --locked -- --ignored
@@ -575,109 +974,31 @@ jobs:
       # it rewrites committed files and must only run as an explicit manual
       # regen, never in CI.
       - name: invite store atomicity (CI service container only)
-        if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-cutover --locked --test invite_store -- --ignored
 
       - name: cutover reward ladder lib regression (CI service container only)
-        if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-cutover --locked --lib -- --ignored
 
-      - name: sticky live store regressions (CI service container only)
-        if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo test -p two-bot-core --features db --locked --test sticky_store_live -- --ignored
-
-      - name: channel moderation store clippy
-        if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
-
-      # Only this slice's tests activate their test-container guard here.
-      - name: channel moderation domain and store tests
-        if: needs.job-inputs.outputs.rust != 'false'
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
-        run: cargo test -p two-bot-core --features db --locked channel_moderation -- --include-ignored
-
-      - name: channel moderation shared-router REST acceptance (CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
-        run: >-
-          env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS cargo test -p two-bot-discord
-          --features db --locked --test channel_moderation_runtime -- --include-ignored
-
-      - name: Internal channel moderation executor (mock REST and CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
-        run: cargo test -p two-bot-discord --features db --locked --test internal_channel_moderation -- --include-ignored
-
-      - name: Internal-member durable store regressions (CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot-discord --features db --locked --test internal_member_store -- --ignored
-
-      - name: Internal member moderation executor (mock REST and CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot-discord --features db --locked --test internal_member_moderation -- --include-ignored
-
-      - name: Internal event executor mirror acceptance (CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
-        run: cargo test -p two-bot-discord --features db --locked --test internal_events -- --include-ignored
-
       - name: Gateway restart and transaction tests (CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
 
-      - name: custom-command Postgres proof
-        if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo test -p two-bot-core --features db --locked --test custom_command_store -- --ignored
-
-      - name: automations import/export Postgres proof
-        if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo test -p two-bot-core --features db --locked --test automation_transfer -- --ignored
-
-      - name: custom-command routed runtime proof (mock Discord and CI Postgres only)
-        if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo test -p two-bot-discord --features db --locked --test custom_command_runtime -- --include-ignored
-
-      - name: Durable Discord send admission (isolated DBs and mock HTTP only)
-        if: needs.job-inputs.outputs.rust != 'false'
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: |
-          cargo test -p two-bot-core --features db --test send_admission --locked -- --ignored
-          cargo test -p two-bot-discord --features db-tests --lib --locked admission_ -- --ignored
-          cargo test -p two-bot-cutover --test send_admission --locked -- --ignored
-
       - name: Command runtime acceptance tests (sticky, feeds and leveling, CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked command_runtime_tests -- --ignored --test-threads=1
 
       - name: Managed feed poller acceptance (CI service and REST doubles only)
-        if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked feed_jobs -- --ignored --test-threads=1
 
       - name: Real binary lifecycle acceptance (CI service only, under 60 s)
-        if: needs.job-inputs.outputs.rust != 'false'
         run: timeout 60s cargo test -p two-bot --locked --test alive -- --ignored --nocapture
 
       - name: Consecutive retained restore drills (actual CLI, CI service only)
-        if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked --test restore_drill -- --ignored --nocapture
-
-      # NOTE: cargo-deny runs earlier in this job (TOG-12134 disk hygiene);
-      # do not re-add it here.
 
   moderation-db:
     name: moderation db
@@ -712,7 +1033,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         if: needs.job-inputs.outputs.rust != 'false'
         with:
-          toolchain: stable
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
@@ -788,7 +1109,7 @@ jobs:
           fetch-depth: 1
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
-          toolchain: stable
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
       - name: Restore cargo cache
@@ -910,6 +1231,7 @@ jobs:
           printf 'build=%s\n' "$build" >>"$GITHUB_OUTPUT"
 
   container:
+    # ci-ok: exempt Advisory image smoke (up to 30 min); supply-chain gates image security.
     name: container smoke
     permissions:
       contents: read
@@ -1012,7 +1334,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
-          toolchain: stable
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
@@ -1062,7 +1384,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
-          toolchain: stable
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
@@ -1108,7 +1430,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
         with:
-          toolchain: stable
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
       # TOG-11810: dependency build cache, as in the `check` job. The key
       # includes the job id, so this job keeps its own entry (it builds a
       # different dependency set); saved only on pushes to main.
@@ -1188,6 +1510,10 @@ jobs:
       # pins this step with no `if:` (test_required_worker_ci_runs_this_offline_suite).
       - name: Verify staging rollout provenance (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollout.py -v
+      - name: Verify staging rollback drill (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollback_drill.py -v
+      - name: Verify staging container backout/restore drill (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill.py -v
       - name: Verify staging ownership-takeover retry (offline fixtures)
         run: node --test scripts/test-ownership-control.mjs
       - name: Verify staging redirect smoke (offline fixtures)
@@ -1217,111 +1543,20 @@ jobs:
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release.cjs
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release-publication.cjs
 
-  # Always-run aggregator for the path-filtered matrix. GitHub counts a
-  # skipped job as passing for required checks, and leaves a required context
-  # pending forever when its workflow never starts (a `paths:`/`branches:`
-  # filter on the trigger). Every selector-gated job reports through this
-  # job: it runs on every PR (no selector `if:`, only `always()`), and fails
-  # when any needed conclusion is failure or cancelled, or when the selector
-  # itself did not succeed (fail-closed, so a broken selector cannot turn
-  # skipped jobs into a false green). `skipped` is accepted only when the
-  # selector explicitly deselected that job. The container image smoke is
-  # intentionally not in `needs:`: it is not a correctness gate and builds up
-  # to 30 minutes; it stays independently visible. Ruleset enforcement still
-  # points at `check` and `worker check` in this slice; the operator flips the
-  # required context to `ci-ok` (the CI standard name, TOG-14881) separately,
-  # after which this legacy `required-checks` job is removed.
-  required-checks:
-    name: required checks
-    permissions:
-      contents: read
-    needs: [job-inputs, supply-chain, check, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db]
-    # A skipped or cancelled dependency must not read as green.
-    if: ${{ always() }}
-    # Runner routing: see the note on the first job above.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'required-checks') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
-    timeout-minutes: 5
-    steps:
-      - name: Aggregate required conclusions
-        env:
-          JOB_INPUTS_RESULT: ${{ needs.job-inputs.result }}
-          RUST_SELECTED: ${{ needs.job-inputs.outputs.rust }}
-          WORKER_SELECTED: ${{ needs.job-inputs.outputs.worker }}
-          PARITY_SELECTED: ${{ needs.job-inputs.outputs.parity }}
-          SUPPLY_SELECTED: ${{ needs.job-inputs.outputs.supply }}
-          SUPPLY_CHAIN_RESULT: ${{ needs.supply-chain.result }}
-          CHECK_RESULT: ${{ needs.check.result }}
-          WORKER_RESULT: ${{ needs.worker.result }}
-          PARITY_DOCS_RESULT: ${{ needs.parity-docs.result }}
-          SELF_ROLE_RESULT: ${{ needs.self-role-store.result }}
-          COMMUNITY_DB_RESULT: ${{ needs.community-db.result }}
-          FEEDS_DB_RESULT: ${{ needs.feeds-db.result }}
-          TICKETS_RESULT: ${{ needs.tickets-postgres.result }}
-          MODERATION_DB_RESULT: ${{ needs.moderation-db.result }}
-        run: |
-          python3 - <<'PY'
-          import os
-          import sys
-
-          failures = []
-
-          def selected(name):
-              # The selector shell defaults undecidable diffs to true and the
-              # outputs fall back to true, so a missing output with a
-              # successful selector is treated as selected (fail-closed).
-              return os.environ.get(name, "") != "false"
-
-          if os.environ.get("JOB_INPUTS_RESULT") != "success":
-              failures.append(
-                  "job-inputs did not succeed "
-                  f"(result={os.environ.get('JOB_INPUTS_RESULT')!r}); "
-                  "refusing to trust skips")
-          else:
-              gated = [
-                  ("worker", "WORKER_RESULT", "WORKER_SELECTED"),
-                  ("parity-docs", "PARITY_DOCS_RESULT", "PARITY_SELECTED"),
-                  ("supply-chain", "SUPPLY_CHAIN_RESULT", "SUPPLY_SELECTED"),
-                  ("self-role-store", "SELF_ROLE_RESULT", "RUST_SELECTED"),
-                  ("community-db", "COMMUNITY_DB_RESULT", "RUST_SELECTED"),
-                  ("feeds-db", "FEEDS_DB_RESULT", "RUST_SELECTED"),
-                  ("tickets-postgres", "TICKETS_RESULT", "RUST_SELECTED"),
-                  ("moderation-db", "MODERATION_DB_RESULT", "RUST_SELECTED"),
-              ]
-              for job, result_var, sel_var in gated:
-                  result = os.environ.get(result_var, "")
-                  if result == "success":
-                      continue
-                  if result == "skipped" and not selected(sel_var):
-                      continue
-                  failures.append(f"{job}: result={result!r} selected={selected(sel_var)}")
-              for job, var in (("check", "CHECK_RESULT"),):
-                  result = os.environ.get(var, "")
-                  if result != "success":
-                      failures.append(f"{job}: result={result!r} (always-run gate)")
-
-          if failures:
-              print("required checks FAILED:")
-              for failure in failures:
-                  print(f"  - {failure}")
-              sys.exit(1)
-          print("required checks passed")
-          PY
-
-  # CI standard aggregator (TOG-14877 rule 3, adopted TOG-14881): the single
-  # required check. Passes when every needed job succeeded or was skipped
-  # (`if: always()` so gating can never leave the PR without a verdict).
-  # Identical needs/logic to `required-checks`, which stays until the
-  # `protect-main` ruleset flips from `check`/`worker check` to `ci-ok`
-  # (ruleset writes are human-admin-only; see the Operator follow-up). The
-  # container image smoke stays out of `needs:` on purpose: it is not a
-  # correctness gate and takes up to 30 minutes; it stays independently
-  # visible. Branch protection will require only `ci-ok` (plus `pr-lint`
-  # and `gitleaks` from supply-chain.yml), so gating can never block merges.
+  # Single always-run aggregator for the path-filtered matrix. GitHub counts
+  # a skipped job as passing and leaves a required context pending when its
+  # workflow never starts. `always()` ensures a verdict even when a needed
+  # job fails or is cancelled. A broken selector cannot turn skips green:
+  # `skipped` is accepted only when selection explicitly deselected that job.
+  # Both selectors and lint are always-run gates. Container smoke remains
+  # independently visible, with its exemption documented on that job.
+  # Main's rules require `ci-ok`, `pr-lint` and `gitleaks`; there is no legacy
+  # duplicate aggregate or ruleset transition left to perform.
   ci-ok:
     name: ci-ok
     permissions:
       contents: read
-    needs: [job-inputs, supply-chain, check, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db]
+    needs: [job-inputs, container-inputs, supply-chain, check, rust-tests, ignored-db-stores, ignored-db-runtime, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db]
     # A skipped or cancelled dependency must not read as green.
     if: ${{ always() }}
     # Runner routing: see the note on the first job above.
@@ -1331,12 +1566,16 @@ jobs:
       - name: Aggregate CI verdict
         env:
           JOB_INPUTS_RESULT: ${{ needs.job-inputs.result }}
+          CONTAINER_INPUTS_RESULT: ${{ needs.container-inputs.result }}
           RUST_SELECTED: ${{ needs.job-inputs.outputs.rust }}
           WORKER_SELECTED: ${{ needs.job-inputs.outputs.worker }}
           PARITY_SELECTED: ${{ needs.job-inputs.outputs.parity }}
           SUPPLY_SELECTED: ${{ needs.job-inputs.outputs.supply }}
           SUPPLY_CHAIN_RESULT: ${{ needs.supply-chain.result }}
           CHECK_RESULT: ${{ needs.check.result }}
+          RUST_TESTS_RESULT: ${{ needs.rust-tests.result }}
+          IGNORED_DB_STORES_RESULT: ${{ needs.ignored-db-stores.result }}
+          IGNORED_DB_RUNTIME_RESULT: ${{ needs.ignored-db-runtime.result }}
           WORKER_RESULT: ${{ needs.worker.result }}
           PARITY_DOCS_RESULT: ${{ needs.parity-docs.result }}
           SELF_ROLE_RESULT: ${{ needs.self-role-store.result }}
@@ -1372,6 +1611,9 @@ jobs:
                   ("feeds-db", "FEEDS_DB_RESULT", "RUST_SELECTED"),
                   ("tickets-postgres", "TICKETS_RESULT", "RUST_SELECTED"),
                   ("moderation-db", "MODERATION_DB_RESULT", "RUST_SELECTED"),
+                  ("rust-tests", "RUST_TESTS_RESULT", "RUST_SELECTED"),
+                  ("ignored-db-stores", "IGNORED_DB_STORES_RESULT", "RUST_SELECTED"),
+                  ("ignored-db-runtime", "IGNORED_DB_RUNTIME_RESULT", "RUST_SELECTED"),
               ]
               for job, result_var, sel_var in gated:
                   result = os.environ.get(result_var, "")
@@ -1380,7 +1622,8 @@ jobs:
                   if result == "skipped" and not selected(sel_var):
                       continue
                   failures.append(f"{job}: result={result!r} selected={selected(sel_var)}")
-              for job, var in (("check", "CHECK_RESULT"),):
+              for job, var in (("check", "CHECK_RESULT"),
+                               ("container-inputs", "CONTAINER_INPUTS_RESULT")):
                   result = os.environ.get(var, "")
                   if result != "success":
                       failures.append(f"{job}: result={result!r} (always-run gate)")

@@ -3,7 +3,10 @@ use serde_json::json;
 use two_bot_core::apply_web_contract;
 use two_bot_testsupport::TestDatabase;
 
-use crate::discord_test_common::{MockRest, ScriptedResponse};
+use crate::{
+    activation::fixtures,
+    discord_test_common::{MockRest, ScriptedResponse},
+};
 
 use crate::tracing_capture;
 
@@ -70,6 +73,54 @@ async fn recovery_registration_does_not_unpark_unavailable_jobs() {
     assert!(!entries[RECOVERY_JOB_NAME].parked);
     for name in NAMES.into_iter().chain(community_jobs::NAMES) {
         assert!(entries[name].parked);
+        assert!(!entries[name].running);
+    }
+}
+
+/// TOG-15758: a job the identity fence refuses is absent from the supervised
+/// set, so `/readyz` lists it parked and never running, while the staging pair
+/// with the same environment unparks both posting jobs.
+#[tokio::test]
+async fn refused_identity_parks_the_posting_jobs_in_the_readyz_status_map() {
+    let gates = two_bot_core::FeatureGates::from_map(&std::collections::HashMap::from([
+        ("TWO_AUTOMATIONS".to_owned(), "1".to_owned()),
+        ("TWO_ANNOUNCEMENTS".to_owned(), "1".to_owned()),
+    ]))
+    .unwrap();
+    let action: jobs::JobAction = Arc::new(|| Box::pin(async { Ok(()) }));
+    let register = |activation: &BootActivation| {
+        let mut registered = Vec::new();
+        registered.extend(scheduled_jobs::register_fenced(
+            gates,
+            activation,
+            action.clone(),
+        ));
+        registered.extend(feed_jobs::register_fenced(
+            gates,
+            activation,
+            action.clone(),
+        ));
+        registered
+    };
+    let posting = [scheduled_jobs::NAMES[0], feed_jobs::NAME];
+
+    let registered = register(&fixtures::staging());
+    let status = registered_statuses(&registered, &[]).await;
+    let entries = status.read().await;
+    for name in posting {
+        assert!(
+            !entries[name].parked,
+            "{name} registers on the staging pair"
+        );
+    }
+    drop(entries);
+
+    let registered = register(&fixtures::live());
+    assert!(registered.is_empty(), "live identity builds no posting job");
+    let status = registered_statuses(&registered, &[]).await;
+    let entries = status.read().await;
+    for name in posting {
+        assert!(entries[name].parked, "{name} is parked on the live pair");
         assert!(!entries[name].running);
     }
 }

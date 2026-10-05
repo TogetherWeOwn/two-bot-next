@@ -154,7 +154,7 @@ pub fn moderation_commands() -> Vec<CommandDefinition> {
                     CommandOptionType::Integer,
                 )
                 .required()
-                .min_value(TEMPBAN_DURATION_MIN_SECONDS),
+                .int_range(TEMPBAN_DURATION_MIN_SECONDS, TEMPBAN_DURATION_MAX_SECONDS),
                 CommandOption::reason(),
             ]),
         CommandDefinition::new("kick", "Kick a member")
@@ -170,7 +170,7 @@ pub fn moderation_commands() -> Vec<CommandDefinition> {
                     CommandOptionType::Integer,
                 )
                 .required()
-                .min_value(TIMEOUT_DURATION_MIN_SECONDS),
+                .int_range(TIMEOUT_DURATION_MIN_SECONDS, TIMEOUT_DURATION_MAX_SECONDS),
                 CommandOption::reason(),
             ]),
         CommandDefinition::new("warn", "Record a warning for a member")
@@ -246,7 +246,8 @@ pub struct ModerationRequest {
     pub action: ModerationAction,
     pub actor: ModerationActor,
     pub target: Option<ModerationTarget>,
-    pub bot_highest_role_position: Option<i64>,
+    /// Resolved bot hierarchy. Callers must refuse an unknown position.
+    pub bot_highest_role_position: i64,
     pub reason: String,
     pub duration_seconds: Option<u64>,
     pub count: Option<u64>,
@@ -271,15 +272,15 @@ pub enum TargetProtection {
 pub enum PolicyError {
     #[error("Missing required permission for {0}")]
     ActorMissingPermission(ModerationAction),
-    #[error("You cannot moderate yourself")]
+    #[error("This target cannot be moderated")]
     TargetSelf,
-    #[error("The guild owner is protected")]
+    #[error("This target cannot be moderated")]
     TargetGuildOwner,
-    #[error("Owen is protected")]
+    #[error("This target cannot be moderated")]
     TargetOwen,
-    #[error("Bots are protected")]
+    #[error("This target cannot be moderated")]
     TargetBot,
-    #[error("Staff roles are protected")]
+    #[error("This target cannot be moderated")]
     TargetStaffRole,
     #[error("The target is equal to or above your highest role")]
     ActorHierarchy,
@@ -344,10 +345,7 @@ pub fn assert_moderation_allowed(
         Some(TargetProtection::StaffRole) => return Err(PolicyError::TargetStaffRole),
         None => {}
     }
-    if request
-        .bot_highest_role_position
-        .is_some_and(|bot| bot <= target.highest_role_position)
-    {
+    if request.bot_highest_role_position <= target.highest_role_position {
         return Err(PolicyError::BotHierarchy);
     }
     if request.actor.highest_role_position <= target.highest_role_position {
@@ -383,8 +381,7 @@ pub fn require_moderation_reason(value: &str) -> Result<String, ReasonError> {
 /// Cap refusal for bounded numeric inputs (parity §1 +
 /// `docs/property-tests.md`): tempban 60–365d, timeout 60–28d, schedule
 /// 1–525600 / 60–525600 minutes, sticky debounce 1–300 seconds. The builders
-/// above advertise minima (tempban/timeout expose no `max_value` per legacy
-/// parity); these validators enforce the runtime ceilings. Error text names
+/// advertise the same bounds as the runtime validators. Error text names
 /// the field and both bounds and never echoes the caller-supplied value.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("\"{field}\" must be an integer between {min} and {max}")]
@@ -580,7 +577,7 @@ mod tests {
             } else {
                 None
             },
-            bot_highest_role_position: Some(BOT_POS),
+            bot_highest_role_position: BOT_POS,
             reason: "test audit reason".to_owned(),
             duration_seconds: None,
             count: None,
@@ -608,15 +605,15 @@ mod tests {
     fn full_registry_merges_without_collision() {
         let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
             .expect("slices 1-3 merge cleanly");
-        // 2 core + 16 slice-2 + 9 moderation.
-        assert_eq!(merged.len(), 27);
+        // 3 core + 16 slice-2 + 9 moderation.
+        assert_eq!(merged.len(), 28);
         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(&names[..3], ["rank", "leaderboard", "attendance"]);
+        assert_eq!(&names[..4], ["rank", "leaderboard", "help", "attendance"]);
         assert_eq!(
-            &names[18..23],
+            &names[19..24],
             ["ban", "tempban", "kick", "timeout", "warn"]
         );
-        assert_eq!(&names[23..], ["purge", "slowmode", "lockdown", "unlock"]);
+        assert_eq!(&names[24..], ["purge", "slowmode", "lockdown", "unlock"]);
         assert!(merged.iter().all(|d| !d.dm_permission));
     }
 
@@ -665,13 +662,19 @@ mod tests {
             assert_eq!(reason.required, Some(true));
             assert_eq!(reason.max_length, Some(512));
         }
-        // Durations: required, min 60, no max (legacy sets no max).
-        for name in ["tempban", "timeout"] {
+        // Durations advertise the same inclusive bounds as validation.
+        for (name, max) in [
+            ("tempban", TEMPBAN_DURATION_MAX_SECONDS),
+            ("timeout", TIMEOUT_DURATION_MAX_SECONDS),
+        ] {
             let duration = get(name).options[1].clone();
             assert_eq!(duration.name, "duration_seconds");
             assert_eq!(duration.kind, CommandOptionType::Integer.as_u8());
             assert_eq!(duration.required, Some(true));
-            assert_eq!((duration.min_value, duration.max_value), (Some(60), None));
+            assert_eq!(
+                (duration.min_value, duration.max_value),
+                (Some(60), Some(max))
+            );
         }
         // Purge count 1–100, slowmode seconds 0–21600, both required.
         let count = get("purge").options[0].clone();
@@ -696,7 +699,14 @@ mod tests {
         assert_eq!(json[0]["default_member_permissions"], "4");
         assert_eq!(json[1]["options"][1]["name"], "duration_seconds");
         assert_eq!(json[1]["options"][1]["min_value"], 60);
-        assert!(json[1]["options"][1].get("max_value").is_none());
+        assert_eq!(
+            json[1]["options"][1]["max_value"],
+            TEMPBAN_DURATION_MAX_SECONDS
+        );
+        assert_eq!(
+            json[3]["options"][1]["max_value"],
+            TIMEOUT_DURATION_MAX_SECONDS
+        );
         assert_eq!(json[5]["options"][0]["max_value"], 100);
         assert_eq!(json[7]["name"], "lockdown");
         assert_eq!(json[7]["options"].as_array().expect("array").len(), 1);
@@ -762,18 +772,31 @@ mod tests {
         );
         // Hierarchy: equal-or-above refused on both sides.
         let mut req = request(ModerationAction::Ban);
-        req.bot_highest_role_position = Some(10);
+        req.bot_highest_role_position = 10;
         assert_eq!(
             assert_moderation_allowed(&req, &policy()),
             Err(PolicyError::BotHierarchy)
         );
         let mut req = request(ModerationAction::Ban);
-        req.bot_highest_role_position = None;
         req.target.as_mut().expect("target").highest_role_position = 50;
         assert_eq!(
             assert_moderation_allowed(&req, &policy()),
             Err(PolicyError::ActorHierarchy)
         );
+    }
+
+    #[test]
+    fn protected_target_refusals_do_not_disclose_the_class() {
+        let errors = [
+            PolicyError::TargetSelf,
+            PolicyError::TargetGuildOwner,
+            PolicyError::TargetOwen,
+            PolicyError::TargetBot,
+            PolicyError::TargetStaffRole,
+        ];
+        for error in errors {
+            assert_eq!(error.to_string(), "This target cannot be moderated");
+        }
     }
 
     #[test]

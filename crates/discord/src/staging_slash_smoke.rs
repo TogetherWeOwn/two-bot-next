@@ -129,7 +129,7 @@ pub enum Observation {
     FixtureMismatch,
     RouterMismatch,
     ReplyTransportFailed,
-    UnsupportedCoreCommand,
+    CoveredByOfflineTests,
     VoiceCommandOutOfScope,
 }
 
@@ -242,9 +242,12 @@ async fn exercise<T: SmokeTransports, S: SmokeFixtures>(
     fixtures: &S,
     transports: &T,
 ) -> Observation {
-    // These older smoke-plan names must not turn into invented interactions.
+    // /help is a compiled core command now, but it needs no fixture: offline
+    // router and renderer tests pin it, so this fixture-driven smoke records it
+    // as skipped rather than inventing an interaction. /ping is still not a
+    // core command.
     if step == SmokeStep::Help {
-        return Observation::UnsupportedCoreCommand;
+        return Observation::CoveredByOfflineTests;
     }
     if step == SmokeStep::Ping {
         return Observation::VoiceCommandOutOfScope;
@@ -365,7 +368,7 @@ pub async fn run_offline<T: SmokeTransports, S: SmokeFixtures>(
         .unwrap_or(Observation::Timeout);
         let result = match actual {
             Observation::ReplyValidated | Observation::HealthReady => StepResult::Pass,
-            Observation::UnsupportedCoreCommand | Observation::VoiceCommandOutOfScope => {
+            Observation::CoveredByOfflineTests | Observation::VoiceCommandOutOfScope => {
                 StepResult::Skipped
             }
             _ => StepResult::Fail,

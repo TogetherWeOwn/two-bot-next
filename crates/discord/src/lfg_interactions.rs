@@ -31,6 +31,8 @@ pub enum LfgError {
     Discord(#[from] DiscordError),
     #[error("LFG acceptance is uncertain; durable state retained for nonce recovery")]
     Uncertain,
+    #[error("LFG is busy right now; try again in a few seconds.")]
+    Busy,
 }
 
 /// LFG executions allowed to hold a pool connection at once, per process.
@@ -42,11 +44,31 @@ pub enum LfgError {
 /// find a free connection. Waiters queue here before `begin()`, holding none.
 pub const LFG_MAX_IN_FLIGHT: usize = 1;
 
+/// Executions allowed to queue behind the running one, per process.
+///
+/// Every queued execution occupies one slot of the gateway's shared interaction
+/// lane while it waits. Past this bound a request is refused with
+/// [`LfgError::Busy`] instead of queueing, so a burst of sign-ups cannot fill
+/// the lane and starve unrelated commands.
+pub const LFG_MAX_WAITING: usize = 8;
+
 /// Store-backed feature service. The shared interaction runtime owns routing and replies.
 #[derive(Debug)]
 pub struct LfgInteractions {
     pool: sqlx::PgPool,
     in_flight: tokio::sync::Semaphore,
+    /// Executions that are running or queued for the permit.
+    admitted: std::sync::atomic::AtomicUsize,
+}
+
+/// One admitted execution; releases its place in the queue on drop, including
+/// when the owning task is aborted.
+struct Admission<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 impl LfgInteractions {
@@ -54,7 +76,25 @@ impl LfgInteractions {
         Self {
             pool,
             in_flight: tokio::sync::Semaphore::new(LFG_MAX_IN_FLIGHT),
+            admitted: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Take a place in the bounded queue, then wait for the execution permit.
+    /// Refuses immediately, holding nothing, when the queue is full.
+    async fn admit(&self) -> Result<(Admission<'_>, tokio::sync::SemaphorePermit<'_>), LfgError> {
+        use std::sync::atomic::Ordering;
+        let place = self.admitted.fetch_add(1, Ordering::AcqRel);
+        let admission = Admission(&self.admitted);
+        if place >= LFG_MAX_IN_FLIGHT + LFG_MAX_WAITING {
+            return Err(LfgError::Busy);
+        }
+        let permit = self
+            .in_flight
+            .acquire()
+            .await
+            .expect("LFG semaphore is never closed");
+        Ok((admission, permit))
     }
 
     pub async fn execute(
@@ -76,12 +116,9 @@ impl LfgInteractions {
             ) => post_id.clone(),
         };
         // Cap pool use before taking a connection: blocked lock waiters must not
-        // starve the lock holder or the gateway checkpoint writer.
-        let _permit = self
-            .in_flight
-            .acquire()
-            .await
-            .expect("LFG semaphore is never closed");
+        // starve the lock holder or the gateway checkpoint writer. The queue is
+        // bounded too, so waiters cannot fill the shared interaction lane.
+        let _admitted = self.admit().await?;
         // Serialize store changes + refresh across runtime instances. This key is
         // distinct from the capacity/close lock taken by the domain store.
         let mut guard = self.pool.begin().await?;
@@ -350,4 +387,85 @@ pub fn message_payload(post: &LfgPost, roles: &[LfgRole], signups: &[LfgSignup])
         "components": components,
         "allowed_mentions": { "parse": [] }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{atomic::Ordering, Arc};
+
+    fn service() -> Arc<LfgInteractions> {
+        // Never connects: admission happens before any pool use.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        Arc::new(LfgInteractions::new(pool))
+    }
+
+    /// Whether a request got through; its place and permit drop on return.
+    async fn admitted(service: Arc<LfgInteractions>) -> bool {
+        let result = service.admit().await;
+        result.is_ok()
+    }
+
+    #[tokio::test]
+    async fn queue_is_bounded_and_refuses_instead_of_waiting() {
+        let service = service();
+        let running = service.admit().await.expect("first request runs");
+        let waiting: Vec<_> = (0..LFG_MAX_WAITING)
+            .map(|_| {
+                let service = Arc::clone(&service);
+                tokio::spawn(admitted(service))
+            })
+            .collect();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while service.admitted.load(Ordering::Acquire) < LFG_MAX_IN_FLIGHT + LFG_MAX_WAITING {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiters queue behind the running request");
+
+        let refused = tokio::time::timeout(std::time::Duration::from_secs(1), service.admit())
+            .await
+            .expect("a full queue refuses immediately");
+        assert!(matches!(refused, Err(LfgError::Busy)));
+        assert_eq!(
+            service.admitted.load(Ordering::Acquire),
+            LFG_MAX_IN_FLIGHT + LFG_MAX_WAITING,
+            "a refused request leaves no place held"
+        );
+
+        drop(running);
+        for waiter in waiting {
+            assert!(waiter.await.expect("waiter task"), "queued work proceeds");
+        }
+        assert_eq!(service.admitted.load(Ordering::Acquire), 0);
+        assert!(service.admit().await.is_ok(), "the queue drains fully");
+    }
+
+    #[tokio::test]
+    async fn aborted_waiter_gives_up_its_place() {
+        let service = service();
+        let running = service.admit().await.expect("first request runs");
+        let waiter = {
+            let service = Arc::clone(&service);
+            tokio::spawn(admitted(service))
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while service.admitted.load(Ordering::Acquire) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiter queues");
+        waiter.abort();
+        let _ = waiter.await;
+        drop(running);
+        assert_eq!(
+            service.admitted.load(Ordering::Acquire),
+            0,
+            "gateway shutdown cancels queued work without leaking places"
+        );
+    }
 }

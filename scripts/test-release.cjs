@@ -392,8 +392,9 @@ async function migrationGrowthOverflowLifecycle() {
   const content = {...snapshot};
   // Calibrated so the real native body lands just under the 65,536-char
   // limit while the migrated body (native notes + bootstrap RSVP notes)
-  // crosses it: 351 commits at this padding yield ~65.3k chars in-suite.
-  const pad = i => `feat: scoped release item ${String(i).padStart(3, '0')} ${'x'.repeat(56)}`;
+  // crosses it: 351 commits at this padding yield ~65.2k chars in-suite with
+  // the seven-section configured header (3,183 chars).
+  const pad = i => `feat: scoped release item ${String(i).padStart(3, '0')} ${'x'.repeat(48)}`;
   const github = {
     repository: {owner: 'fixture', repo: 'two-bot-next'},
     async getFileJson(file) { return JSON.parse(content[file]); },

@@ -238,7 +238,9 @@ pub const PERM_MANAGE_CHANNELS: u64 = 16;
 pub const PERM_MANAGE_GUILD: u64 = 32;
 pub const PERM_MANAGE_EVENTS: u64 = 8589934592;
 
-/// Always-published core commands (two-bot `CORE_COMMAND_DATA` = leveling).
+/// Always-published core commands (two-bot `CORE_COMMAND_DATA` = leveling,
+/// plus the Next-only `/help` discovery surface — legacy has no help command,
+/// see the `help` row in the registry golden exceptions).
 #[must_use]
 pub fn core_commands() -> Vec<CommandDefinition> {
     vec![
@@ -246,8 +248,12 @@ pub fn core_commands() -> Vec<CommandDefinition> {
             CommandOption::new("member", "Show another member.", CommandOptionType::User),
         ]),
         CommandDefinition::new("leaderboard", "Show the server XP leaderboard."),
+        CommandDefinition::new("help", HELP_DESCRIPTION),
     ]
 }
+
+/// Discovery reply entry point, shared by the registry golden fixture.
+pub const HELP_DESCRIPTION: &str = "Show this server's live commands, grouped by who can use them.";
 
 /// Merge the authoritative guild command set.
 ///
@@ -349,8 +355,8 @@ mod tests {
             let definitions = crate::moderation::moderation_commands().into_iter()
                 .chain(crate::feature_commands::automation_commands()).collect::<Vec<_>>();
             for (command, option, min, max, required) in [
-                ("tempban", "duration_seconds", 60, None, true),
-                ("timeout", "duration_seconds", 60, None, true),
+                ("tempban", "duration_seconds", 60, Some(31_536_000), true),
+                ("timeout", "duration_seconds", 60, Some(2_419_200), true),
                 ("purge", "count", 1, Some(100), true),
                 ("slowmode", "seconds", 0, Some(21_600), true),
                 ("schedule", "in-minutes", 1, Some(525_600), false),
@@ -363,8 +369,8 @@ mod tests {
                 prop_assert_eq!(published.required, required.then_some(true));
                 prop_assert_eq!(published.min_value, Some(min));
                 prop_assert_eq!(published.max_value, max);
-                // Duration builders deliberately have no max; runtime validators
-                // enforce the separate Discord/service caps in internal_actions.
+                // Next advertises the service duration caps as well as the
+                // legacy registry minima captured in parity section one.
                 for n in [min - 1, min, max.unwrap_or(i64::MAX), value] {
                     let advertised = published.min_value.is_none_or(|lower| n >= lower)
                         && published.max_value.is_none_or(|upper| n <= upper);
@@ -409,8 +415,10 @@ mod tests {
                 }
             }
             let actual = merge_commands(&[builtins, duplicates], &custom);
-            if builtin_count + 2 > 100 {
-                prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 2)));
+            // 3 core (rank, leaderboard, help) plus the generated builtins;
+            // the duplicated slice adds no new names.
+            if builtin_count + 3 > 100 {
+                prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 3)));
             } else if expected.len() > 100 {
                 prop_assert_eq!(actual, Err(RegistryError::TotalLimit(expected.len())));
             } else {
@@ -428,16 +436,21 @@ mod tests {
     #[test]
     fn core_commands_match_legacy_names() {
         let core = core_commands();
-        assert_eq!(core.len(), 2);
+        assert_eq!(core.len(), 3);
         assert_eq!(core[0].name, "rank");
         assert_eq!(core[1].name, "leaderboard");
+        assert_eq!(core[2].name, "help");
         // Guild-only, DM off (legacy `setDMPermission(false)`).
         assert!(core.iter().all(|c| !c.dm_permission));
-        // `rank` has one optional `member` user option; `leaderboard` none.
+        // `rank` has one optional `member` user option; `leaderboard` and the
+        // Next-only `help` take none; `help` is open to everyone.
         assert_eq!(core[0].options.len(), 1);
         assert_eq!(core[0].options[0].kind, 6);
         assert!(core[0].options[0].required.is_none());
         assert!(core[1].options.is_empty());
+        assert!(core[2].options.is_empty());
+        assert_eq!(core[2].description, HELP_DESCRIPTION);
+        assert!(core[2].default_member_permissions.is_none());
     }
 
     #[test]
@@ -453,7 +466,7 @@ mod tests {
         }];
         let merged = merge_commands(&[extra], &custom).expect("merges");
         let names: Vec<_> = merged.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "rsvp", "faq"]);
+        assert_eq!(names, ["rank", "leaderboard", "help", "rsvp", "faq"]);
     }
 
     #[test]
@@ -466,8 +479,8 @@ mod tests {
         )];
         let rsvp_totals = vec![CommandDefinition::new("attendance", "Show RSVP totals")];
         let merged = merge_commands(&[scorecard, rsvp_totals], &[]).expect("merges");
-        assert_eq!(merged.len(), 3); // rank, leaderboard, attendance×1
-        assert_eq!(merged[2].description, "Record a verified attendee");
+        assert_eq!(merged.len(), 4); // rank, leaderboard, help, attendance×1
+        assert_eq!(merged[3].description, "Record a verified attendee");
     }
 
     #[test]
@@ -496,12 +509,13 @@ mod tests {
         ];
         let merged = merge_commands(&[], &custom).expect("merges");
         let names: Vec<_> = merged.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "faq"]);
+        assert_eq!(names, ["rank", "leaderboard", "help", "faq"]);
     }
 
     #[test]
     fn builtin_limit_enforced() {
-        let extra: Vec<CommandDefinition> = (0..99)
+        // 3 core + 98 fillers = 101: one past the ceiling.
+        let extra: Vec<CommandDefinition> = (0..98)
             .map(|i| CommandDefinition::new(&format!("cmd-{i}"), "filler"))
             .collect();
         let err = merge_commands(&[extra], &[]).expect_err("must exceed 100");

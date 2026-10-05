@@ -15,8 +15,20 @@ uses `HandlerId::Moderation`; no second router, registry or HTTP client exists.
 The shared router adjudicates the configured guild, feature gate and runtime
 permissions. The invoking channel is authoritative. The channel domain validates
 required reasons, purge 1–100 and slowmode 0–21600. Lockdown changes only the
-@everyone SendMessages bit; unlock requires the recorded recovery seed and
-restores exact original masks or deletes an originally absent overwrite.
+@everyone lockdown bits: SendMessages, SendMessagesInThreads, CreatePublicThreads,
+CreatePrivateThreads and AddReactions. A role- or member-specific overwrite that
+allows sending still wins; lockdown does not edit it. Unlock requires the
+recorded recovery seed and restores exact original masks or deletes an
+originally absent overwrite.
+
+Purge lists the newest `count` messages, then bulk-deletes those under 14 days
+old and deletes older ones one by one, because Discord rejects the whole bulk
+call when any message is older. It never deletes pinned messages or this bot's
+own posts (ticket, sticky and LFG panels), so it can delete fewer than `count`;
+the reply reports the number actually deleted. A message that vanished after
+the listing is skipped. If a later delete is refused or rate limited after some
+messages are gone, the purge stops and reports the count so far. An ambiguous
+failure (5xx, timeout) keeps the claim and lane for reconciliation.
 
 READY publishes the router's complete gated registry, including the other
 builtin slices. RESUMED-only startup resolves the application through the same
@@ -24,11 +36,21 @@ executor and synchronizes once per process. Failed publication remains retryable
 on a later connection event. The current registry has no custom-command store;
 when that slice lands, its reader must join the shared full-set publication.
 
-Gateway dispatch admits tasks synchronously into three independently bounded
-lanes: 16 message workers, 16 interaction workers and one registry worker. It
-never waits for command SQL/REST or creates queued/spawned waiters. At saturation,
-events are not admitted and cannot cause effects. Overlapping READY/RESUMED syncs
-coalesce while publication is in progress. A scope guard aborts admitted work
+Gateway dispatch admits tasks synchronously into five independently bounded
+lanes: 16 message workers, 16 interaction workers, one registry worker, eight
+reserved interaction workers and eight busy-reply workers. It never waits for
+command SQL/REST or creates queued/spawned waiters. At saturation, events are not
+admitted and cannot cause effects.
+
+Interaction admission has three rules (`interaction_admission.rs`). One member
+holds at most three admitted interactions. A built-in slash command whose
+permission row requires guild permissions, invoked by a member whose resolved
+permission bits satisfy that row, tries the reserved lane first and may spill into
+the shared one; open commands, custom commands and component selects never enter
+the reserved lane, so a burst of them cannot starve moderation. A refused member
+or a full lane gets one ephemeral "busy, try again" callback on the busy-reply
+lane; if that lane is full too the event is dropped with a log line only.
+Overlapping READY/RESUMED syncs coalesce while publication is in progress. A scope guard aborts admitted work
 when the shard exits or its supervisor cancels it. Interrupted channel work
 retains durable uncertainty; cancellation never releases an ambiguous effect.
 

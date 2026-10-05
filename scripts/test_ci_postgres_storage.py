@@ -14,7 +14,11 @@ from unittest import mock
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/check.yml"
 WORKFLOW_TEXT = WORKFLOW.read_text()
-SERVICE = WORKFLOW_TEXT.split("      agent-testdb:\n", 1)[1].split("    steps:\n", 1)[0]
+# The three Rust test lanes (rust-tests, ignored-db-stores, ignored-db-runtime)
+# each run their own copy of this service; the first one in the file is the
+# reference and the others must match it exactly.
+SERVICES = [part.split("    steps:\n", 1)[0] for part in WORKFLOW_TEXT.split("      agent-testdb:\n")[1:]]
+SERVICE = SERVICES[0]
 TOKENS = shlex.split(SERVICE.split("        options: >-\n", 1)[1])
 OPTIONS = dict(zip(TOKENS[::2], TOKENS[1::2]))
 STEP = WORKFLOW_TEXT.split("      - name: Verify disposable Postgres defaults\n", 1)[1].split(
@@ -30,13 +34,19 @@ EXPECTED = {
 
 
 class PostgresStorageTests(unittest.TestCase):
-    def test_only_main_check_service_gets_bounded_pg18_storage(self):
+    def test_only_the_rust_test_lanes_get_bounded_pg18_storage(self):
         self.assertEqual(len(TOKENS), len(OPTIONS) * 2)
         self.assertIn("image: postgres:18.6@sha256:", SERVICE)
         self.assertEqual(OPTIONS["--tmpfs"], "/var/lib/postgresql:rw,size=1073741824")
         self.assertEqual(OPTIONS["--memory"], "2147483648")
         self.assertEqual(OPTIONS["--memory-swap"], OPTIONS["--memory"])
-        self.assertEqual(WORKFLOW_TEXT.count("--tmpfs /var/lib/postgresql:"), 1)
+        # One bounded service per lane, byte-identical: the lanes must keep
+        # sharing the config the single `check` job had.
+        self.assertEqual(WORKFLOW_TEXT.count("--tmpfs /var/lib/postgresql:"), 3)
+        self.assertEqual(WORKFLOW_TEXT.count("image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722"), 3)
+        bounded = [service for service in SERVICES if "--tmpfs" in service]
+        self.assertEqual(len(bounded), 3)
+        self.assertEqual(len(set(bounded)), 1, "the lanes' Postgres services drifted apart")
         self.assertNotIn("/var/lib/postgresql/data", SERVICE)
         self.assertNotIn("PGDATA:", SERVICE)
         self.assertNotIn("POSTGRES_INITDB_ARGS:", SERVICE)

@@ -56,8 +56,20 @@ impl RoomPersistence for Arc<Store> {
             .save_custom_name(guild, channel, custom_name)
             .await
     }
-    async fn update_ownership(&self, room: &VoiceRoom) -> Result<bool, StoreError> {
-        self.as_ref().update_ownership(room).await
+    async fn pending_owner_grants(&self, guild: u64) -> Result<Vec<u64>, StoreError> {
+        self.as_ref().pending_owner_grants(guild).await
+    }
+    async fn prepare_owner_grants(
+        &self,
+        room: &VoiceRoom,
+        previous_owner_id: u64,
+    ) -> Result<OwnerGrantIntent, StoreError> {
+        self.as_ref()
+            .prepare_owner_grants(room, previous_owner_id)
+            .await
+    }
+    async fn update_ownership(&self, room: &VoiceRoom, revision: &str) -> Result<bool, StoreError> {
+        self.as_ref().update_ownership(room, revision).await
     }
     async fn forget(&self, guild: u64, channel: u64) -> Result<(), StoreError> {
         self.as_ref().forget(guild, channel).await
@@ -69,8 +81,9 @@ impl RoomPersistence for Arc<Store> {
         &self,
         guild: u64,
         config: &VoiceConfiguration,
+        expected: &VoiceConfiguration,
     ) -> Result<(), StoreError> {
-        self.as_ref().config_apply(guild, config).await
+        self.as_ref().config_apply(guild, config, expected).await
     }
 
     async fn companions(&self, guild: u64) -> Result<Vec<TextCompanion>, StoreError> {
@@ -85,6 +98,39 @@ impl RoomPersistence for Arc<Store> {
         room: u64,
     ) -> Result<Option<TextCompanion>, StoreError> {
         self.as_ref().remove_companion(guild, room).await
+    }
+    async fn record_kick_audit(&self, rows: &[KickAuditRow]) -> Result<(), StoreError> {
+        self.as_ref().record_kick_audit(rows).await
+    }
+    async fn privacy(&self, guild: u64) -> Result<BTreeMap<u64, PrivacyRecord>, StoreError> {
+        self.as_ref().privacy(guild).await
+    }
+    async fn save_privacy(
+        &self,
+        guild: u64,
+        room: u64,
+        record: &PrivacyRecord,
+    ) -> Result<bool, StoreError> {
+        self.as_ref().save_privacy(guild, room, record).await
+    }
+    async fn join_grants(&self, guild: u64) -> Result<BTreeMap<u64, BTreeSet<u64>>, StoreError> {
+        self.as_ref().join_grants(guild).await
+    }
+    async fn save_join_grant(
+        &self,
+        guild: u64,
+        room: u64,
+        member: u64,
+    ) -> Result<bool, StoreError> {
+        self.as_ref().save_join_grant(guild, room, member).await
+    }
+    async fn remove_join_grant(
+        &self,
+        guild: u64,
+        room: u64,
+        member: u64,
+    ) -> Result<(), StoreError> {
+        self.as_ref().remove_join_grant(guild, room, member).await
     }
 }
 
@@ -161,6 +207,14 @@ impl RoomWrites for GatedHttp {
     async fn rename(&self, channel: u64, name: &str) -> Result<(), RoomHttpError> {
         self.http.rename(channel, name).await
     }
+    async fn set_user_limit(
+        &self,
+        channel: u64,
+        user_limit: u32,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.http.set_user_limit(channel, user_limit, guard).await
+    }
     async fn download_attachment(
         &self,
         url: &str,
@@ -202,11 +256,14 @@ impl RoomWrites for GatedHttp {
 type Runtime = VoiceRuntime<Arc<Store>, GatedHttp>;
 
 fn runtime(store: Arc<Store>, http: GatedHttp) -> Runtime {
+    // These races predate the empty-room grace and run in real time, so they
+    // shorten it; the grace itself is pinned by the paused-time guard tests.
     VoiceRuntime::new(
         move || (store.clone(), http.clone()),
         Duration::from_millis(10),
         true,
     )
+    .with_empty_grace(Duration::ZERO)
 }
 
 fn ready_event() -> Event {
@@ -414,13 +471,18 @@ async fn create_notifies_existing_actor_before_next_join() {
     let pipeline = MemPipeline::for_replay();
     bootstrap(&runtime, &pipeline, &[]);
     status(&runtime).await;
-    let interaction = voice_interaction(
-        Some(command_data(
-            "create",
-            vec![command_option("name", "new creator")],
-        )),
-        Some(Permissions::MANAGE_CHANNELS),
-        true,
+    // This guild grants Manage Channels through @everyone; the invoker has
+    // no additional role IDs, especially none missing from the guild cache.
+    let interaction = with_roles(
+        voice_interaction(
+            Some(command_data(
+                "create",
+                vec![command_option("name", "new creator")],
+            )),
+            Some(Permissions::MANAGE_CHANNELS),
+            true,
+        ),
+        &[],
     );
     let seen = Arc::new(Mutex::new(None));
     let writer = seen.clone();

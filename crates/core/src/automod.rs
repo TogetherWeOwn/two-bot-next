@@ -207,6 +207,26 @@ pub struct AutomodMessage {
 }
 
 impl AutomodPolicy {
+    /// Load only the content restrictions used for channel names. Invalid
+    /// chat counts, sanctions or exemptions must not discard configured words
+    /// or domains. This is not a validated chat-moderation configuration.
+    #[must_use]
+    pub fn name_policy_from_map(vars: &HashMap<String, String>) -> Self {
+        let get = |key: &str| vars.get(key).map(String::as_str);
+        Self {
+            bad_words: csv(get("TWO_AUTOMOD_BAD_WORDS"))
+                .into_iter()
+                .map(|word| normalize_content(&word))
+                .filter(|word| !word.is_empty())
+                .collect(),
+            allowed_domains: csv(get("TWO_AUTOMOD_ALLOWED_DOMAINS"))
+                .into_iter()
+                .map(|domain| domain.to_lowercase())
+                .collect(),
+            ..Self::default()
+        }
+    }
+
     /// Service-level exemptions, pure and unit-testable (legacy
     /// `AutomodService.inspect` early returns): bots, exempt channels, and
     /// bypass-role holders are never inspected.
@@ -748,11 +768,6 @@ impl AutomodConfig {
     pub fn from_map(vars: &HashMap<String, String>) -> Result<Self, AutomodGateError> {
         let get = |key: &str| vars.get(key).map(String::as_str);
         let policy = AutomodPolicy {
-            bad_words: csv(get("TWO_AUTOMOD_BAD_WORDS"))
-                .into_iter()
-                .map(|w| normalize_content(&w))
-                .filter(|w| !w.is_empty())
-                .collect(),
             blocked_attachment_extensions: {
                 let raw = get("TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS");
                 let list = if raw.is_none_or(|s| s.is_empty()) {
@@ -767,10 +782,6 @@ impl AutomodConfig {
                     .map(|v| v.to_lowercase().trim_start_matches('.').to_owned())
                     .collect()
             },
-            allowed_domains: csv(get("TWO_AUTOMOD_ALLOWED_DOMAINS"))
-                .into_iter()
-                .map(|d| d.to_lowercase())
-                .collect(),
             repeated_message_count: integer(
                 get("TWO_AUTOMOD_REPEAT_COUNT"),
                 3,
@@ -801,6 +812,7 @@ impl AutomodConfig {
                 "TWO_AUTOMOD_EXEMPT_CHANNEL_IDS",
             )?,
             sanctions: parse_sanctions(get("TWO_AUTOMOD_SANCTIONS"))?,
+            ..AutomodPolicy::name_policy_from_map(vars)
         };
         Ok(Self {
             enabled: vars.get("TWO_AUTOMOD").is_some_and(|v| v == "1"),
@@ -811,11 +823,14 @@ impl AutomodConfig {
 }
 
 /// One validated export rule: `id` + `name` are required, everything else
-/// passes through (legacy `AutomodExportRule`).
+/// passes through (legacy `AutomodExportRule`, whose index signature keeps
+/// every extra field). `raw` is the rule object unchanged, so a validated
+/// export written back out is byte-faithful to what Discord returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutomodExportRule {
     pub id: String,
     pub name: String,
+    pub raw: serde_json::Value,
 }
 
 /// Unusable export payload (legacy `AutomodExportError`): every bad row, not
@@ -868,6 +883,7 @@ pub fn validate_automod_rules(
         out.push(AutomodExportRule {
             id: rule["id"].as_str().expect("checked").to_owned(),
             name: rule["name"].as_str().expect("checked").to_owned(),
+            raw: raw.clone(),
         });
     }
     if problems.is_empty() {
@@ -1250,6 +1266,44 @@ mod tests {
     }
 
     #[test]
+    fn name_policy_preserves_normalized_content_rules_when_chat_config_is_invalid() {
+        let vars: HashMap<String, String> = [
+            ("TWO_AUTOMOD", "0"),
+            (
+                "TWO_AUTOMOD_BAD_WORDS",
+                " ＢＬＯＲＰ , blocked   phrase , , ",
+            ),
+            ("TWO_AUTOMOD_ALLOWED_DOMAINS", " Trusted.GG , , "),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        let expected = AutomodPolicy::name_policy_from_map(&vars);
+        assert_eq!(expected.bad_words, ["blorp", "blocked phrase"]);
+        assert_eq!(expected.allowed_domains, ["trusted.gg"]);
+        let validated = AutomodConfig::from_map(&vars).unwrap();
+        assert_eq!(validated.policy.bad_words, expected.bad_words);
+        assert_eq!(validated.policy.allowed_domains, expected.allowed_domains);
+        for (key, value) in [
+            ("TWO_AUTOMOD_REPEAT_COUNT", "21"),
+            ("TWO_AUTOMOD_REPEAT_WINDOW_SECONDS", "0"),
+            ("TWO_AUTOMOD_MENTION_LIMIT", "0"),
+            ("TWO_AUTOMOD_SANCTIONS", "1:banhammer"),
+            ("TWO_AUTOMOD_BYPASS_ROLE_IDS", "nope"),
+            ("TWO_AUTOMOD_EXEMPT_CHANNEL_IDS", "nope"),
+        ] {
+            let mut invalid = vars.clone();
+            invalid.insert(key.to_owned(), value.to_owned());
+            assert!(AutomodConfig::from_map(&invalid).is_err(), "{key}");
+            assert_eq!(
+                AutomodPolicy::name_policy_from_map(&invalid),
+                expected,
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
     fn gates_default_to_disabled_dry_run() {
         let config = AutomodConfig::from_map(&HashMap::new()).expect("defaults");
         assert!(!config.enabled);
@@ -1320,11 +1374,57 @@ mod tests {
         let ok = serde_json::json!([{"id": "123456789012345678", "name": "spam rule"}]);
         let rules = validate_automod_rules(&ok).expect("valid");
         assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, "123456789012345678");
+        assert_eq!(rules[0].name, "spam rule");
         assert_eq!(
             validate_automod_rules(&serde_json::json!({"nope": true}))
                 .expect_err("object")
                 .problems,
             vec!["export must be an array of rules"]
         );
+    }
+
+    #[test]
+    fn export_validation_accepts_empty_and_refuses_non_arrays() {
+        // An empty guild export is usable: zero rules, no problems.
+        let rules = validate_automod_rules(&serde_json::json!([])).expect("empty is valid");
+        assert!(rules.is_empty());
+        // `null` and scalar payloads are refused, not treated as zero rules.
+        for payload in [
+            serde_json::json!(null),
+            serde_json::json!("rules"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+        ] {
+            assert_eq!(
+                validate_automod_rules(&payload)
+                    .expect_err("must fail")
+                    .problems,
+                vec!["export must be an array of rules"],
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_validation_keeps_extra_fields_and_repeats_identically() {
+        let payload = serde_json::json!([
+            {
+                "id": "123456789012345678",
+                "name": "spam rule",
+                "event_type": 1,
+                "trigger_metadata": {"keyword_filter": ["spam"]},
+                "actions": [{"type": 1}],
+            },
+            {"id": "223456789012345678", "name": "invite rule"},
+        ]);
+        let first = validate_automod_rules(&payload).expect("valid");
+        assert_eq!(first.len(), 2);
+        // The extra fields pass through: the raw rule is unchanged.
+        assert_eq!(first[0].raw, payload[0]);
+        assert_eq!(first[1].raw, payload[1]);
+        // Repeated validation is identical — the validator is a pure check.
+        let second = validate_automod_rules(&payload).expect("valid again");
+        assert_eq!(first, second);
     }
 }
