@@ -658,9 +658,10 @@ async fn a_newer_gateway_update_survives_a_late_rest_completion() {
     .await;
     assert_eq!(ack, Some(LimitAck::Applied));
     assert!(text.contains("limited to 5 people"), "{text}");
-    let live = worker.live.inner.read().unwrap();
-    assert_eq!(live.channels.get(&500).unwrap().user_limit, Some(8));
-    drop(live);
+    {
+        let live = worker.live.inner.read().unwrap();
+        assert_eq!(live.channels.get(&500).unwrap().user_limit, Some(8));
+    }
     // ...so asking for 5 again still writes instead of falsely skipping.
     let (text, ack) = run_once(
         &mut worker,
@@ -756,14 +757,13 @@ async fn a_not_found_write_invalidates_the_cached_channel() {
     }));
     // The cached channel is gone: a command matching the old cached value
     // must refuse, never report Applied without a write.
-    assert!(worker
+    assert!(!worker
         .live
         .inner
         .read()
         .unwrap()
         .channels
-        .get(&500)
-        .is_none());
+        .contains_key(&500));
     let (text, ack) = run_once(
         &mut worker,
         MEMBER,
