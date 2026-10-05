@@ -8190,7 +8190,23 @@ async fn kick_vote_in_a_shared_room_answers_the_public_ballot_without_defer() {
     );
     // No defer: the ballot goes out as the initial public callback, so every
     // occupant can see the buttons and reach quorum.
-    assert_eq!(*trace.lock().unwrap(), ["respond"]);
+    // Reconcile may still prune the empty OTHER_ROOM, so look only for
+    // interaction callbacks rather than an exact trace.
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.as_str() == "defer" || call.as_str() == "complete"),
+        "no defer, got {calls:?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.as_str() == "respond")
+            .count(),
+        1,
+        "one public ballot, got {calls:?}"
+    );
     let completed = replies.completed.lock().unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(
