@@ -1113,21 +1113,37 @@ impl ActionQueue {
     }
 
     /// Drop every pending action touching the channel (room deleted by hand
-    /// or forgotten by reconcile). Returns the dropped count.
-    pub fn drop_for_channel(&self, guild_id: Snowflake, channel_id: Snowflake) -> usize {
+    /// or forgotten by reconcile). Returns the dropped actions' ids so
+    /// callers can settle their waiters instead of leaving them orphaned.
+    pub fn drain_for_channel(&self, guild_id: Snowflake, channel_id: Snowflake) -> Vec<u64> {
         let mut inner = self.inner.lock().expect("queue lock");
-        let mut dropped = 0;
-        if let Some(queue) = inner.urgent.get_mut(&guild_id) {
-            let before = queue.len();
-            queue.retain(|q| q.action.channel_id() != Some(channel_id));
-            dropped += before - queue.len();
-        }
-        if let Some(queue) = inner.deferred.get_mut(&guild_id) {
-            let before = queue.len();
-            queue.retain(|q| q.action.channel_id() != Some(channel_id));
-            dropped += before - queue.len();
+        let mut dropped = Vec::new();
+        for lane in [true, false] {
+            let queue = if lane {
+                inner.urgent.get_mut(&guild_id)
+            } else {
+                inner.deferred.get_mut(&guild_id)
+            };
+            let Some(queue) = queue else {
+                continue;
+            };
+            let mut kept = VecDeque::with_capacity(queue.len());
+            for queued in queue.drain(..) {
+                if queued.action.channel_id() == Some(channel_id) {
+                    dropped.push(queued.id);
+                } else {
+                    kept.push_back(queued);
+                }
+            }
+            *queue = kept;
         }
         dropped
+    }
+
+    /// Drop every pending action touching the channel (room deleted by hand
+    /// or forgotten by reconcile). Returns the dropped count.
+    pub fn drop_for_channel(&self, guild_id: Snowflake, channel_id: Snowflake) -> usize {
+        self.drain_for_channel(guild_id, channel_id).len()
     }
 
     /// Pending (urgent, deferred) counts for the guild. Diagnostics/tests.

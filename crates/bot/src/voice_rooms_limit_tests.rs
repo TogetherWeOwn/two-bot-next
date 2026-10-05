@@ -620,3 +620,263 @@ async fn the_per_command_role_gate_covers_limit_and_unlimit() {
     assert!(text.contains("limited to 5 people"), "{text}");
     assert_eq!(limit_writes(&trace), ["limit:500:5"]);
 }
+
+// --- concurrency regressions (independent review) -------------------------------
+
+fn room_members() -> Vec<VoiceMember> {
+    vec![
+        VoiceMember {
+            member_id: MEMBER,
+            channel_id: 500,
+            bot: Some(false),
+        },
+        VoiceMember {
+            member_id: 301,
+            channel_id: 500,
+            bot: Some(false),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_newer_gateway_update_survives_a_late_rest_completion() {
+    let (live, store, mut http, trace) = owned_room();
+    // The gateway republishes the room (still limit 8) while the PATCH for 5
+    // is in flight: the revision moves, so the completion must not roll the
+    // cache back to the just-written value.
+    let gateway = live.clone();
+    http.before_limit = Some(Arc::new(move || {
+        gateway.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    }));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let (text, ack) = run_once(
+        &mut worker,
+        MEMBER,
+        false,
+        LimitCommand::Limit(LimitArg::Value(5)),
+    )
+    .await;
+    assert_eq!(ack, Some(LimitAck::Applied));
+    assert!(text.contains("limited to 5 people"), "{text}");
+    let live = worker.live.inner.read().unwrap();
+    assert_eq!(live.channels.get(&500).unwrap().user_limit, Some(8));
+    drop(live);
+    // ...so asking for 5 again still writes instead of falsely skipping.
+    let (text, ack) = run_once(
+        &mut worker,
+        MEMBER,
+        false,
+        LimitCommand::Limit(LimitArg::Value(5)),
+    )
+    .await;
+    assert_eq!(ack, Some(LimitAck::Applied));
+    assert!(text.contains("limited to 5 people"), "{text}");
+    assert_eq!(limit_writes(&trace), ["limit:500:5", "limit:500:5"]);
+}
+
+#[tokio::test]
+async fn a_disconnect_republication_survives_a_late_rest_completion() {
+    let (live, store, mut http, trace) = owned_room();
+    // A disconnect plus a fresh snapshot lands while the PATCH for 5 is in
+    // flight: the generation moves, so the completion must not overwrite the
+    // republished evidence.
+    let gateway = live.clone();
+    http.before_limit = Some(Arc::new(move || {
+        gateway.disconnect();
+        assert!(gateway.publish(snapshot(&[500], room_members())));
+    }));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let (text, ack) = run_once(
+        &mut worker,
+        MEMBER,
+        false,
+        LimitCommand::Limit(LimitArg::Value(5)),
+    )
+    .await;
+    assert_eq!(ack, Some(LimitAck::Applied));
+    assert!(text.contains("limited to 5 people"), "{text}");
+    assert_eq!(limit_writes(&trace), ["limit:500:5"]);
+    let live = worker.live.inner.read().unwrap();
+    assert_eq!(live.channels.get(&500).unwrap().user_limit, Some(8));
+}
+
+#[tokio::test]
+async fn a_transient_guard_loss_requeues_instead_of_retiring() {
+    let (live, store, mut http, trace) = owned_room();
+    // The disconnect lands after the pre-write state check but before the
+    // adapter's final guard: the room and channel are still tracked.
+    let gateway = live.clone();
+    http.before_limit = Some(Arc::new(move || {
+        gateway.disconnect();
+    }));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let LimitReply::Queued { ack, .. } =
+        worker.apply_limit(MEMBER, false, LimitCommand::Limit(LimitArg::Value(5)))
+    else {
+        panic!("the limit must queue");
+    };
+    assert!(worker.dispatch_one(0).await);
+    // Resumable, not retired: the caller is told it is queued, nothing was
+    // written, and the action waits for the reconnect without a failure.
+    assert_eq!(ack.await.ok(), Some(LimitAck::Delayed));
+    assert!(limit_writes(&trace).is_empty());
+    assert_eq!(worker.queue.pending_counts(GUILD), (1, 0));
+    assert!(worker.failures().is_empty());
+    // The reconnect retries the same write to completion.
+    worker.http.before_limit = None;
+    worker.live.publish(snapshot(&[500], room_members()));
+    assert!(worker.dispatch_one(0).await);
+    assert_eq!(limit_writes(&trace), ["limit:500:5"]);
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
+    let live = worker.live.inner.read().unwrap();
+    assert_eq!(live.channels.get(&500).unwrap().user_limit, Some(5));
+}
+
+#[tokio::test]
+async fn a_not_found_write_invalidates_the_cached_channel() {
+    let (live, store, http, trace) = owned_room();
+    http.limit_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::NotFound);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let (text, ack) = run_once(
+        &mut worker,
+        MEMBER,
+        false,
+        LimitCommand::Limit(LimitArg::Value(3)),
+    )
+    .await;
+    assert_eq!(ack, Some(LimitAck::Refused(RoomHttpError::NotFound)));
+    assert!(text.contains("no longer exists"), "{text}");
+    assert_eq!(limit_writes(&trace), ["limit:500:3"]);
+    assert!(worker.failures().contains(&LifecycleFailure::Discord {
+        channel_id: 500,
+        error: RoomHttpError::NotFound,
+    }));
+    // The cached channel is gone: a command matching the old cached value
+    // must refuse, never report Applied without a write.
+    assert!(worker
+        .live
+        .inner
+        .read()
+        .unwrap()
+        .channels
+        .get(&500)
+        .is_none());
+    let (text, ack) = run_once(
+        &mut worker,
+        MEMBER,
+        false,
+        LimitCommand::Limit(LimitArg::Value(8)),
+    )
+    .await;
+    assert_eq!(ack, None);
+    assert!(!text.contains("limited to 8"), "{text}");
+    assert_eq!(limit_writes(&trace), ["limit:500:3"], "no second write");
+}
+
+#[tokio::test]
+async fn a_delete_overtaking_a_queued_limit_settles_its_waiter() {
+    let (live, store, http, trace) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Everyone leaves: reconcile queues the delete ahead of any new command.
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 1_000);
+    worker.live.voice_update_at(301, None, Some(false), 1_000);
+    worker.reconcile();
+    // The owner briefly rejoins and queues a limit behind the delete, then
+    // leaves before anything dispatches.
+    worker
+        .live
+        .voice_update_at(MEMBER, Some(500), Some(false), 2_000);
+    let LimitReply::Queued { limit, ack } =
+        worker.apply_limit(MEMBER, false, LimitCommand::Limit(LimitArg::Value(5)))
+    else {
+        panic!("the limit must queue behind the delete");
+    };
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 3_000);
+    assert!(worker.dispatch_one(4_000).await, "the delete runs first");
+    // The delete discarded the limit: its waiter ends obsolete with no
+    // queued-success wording, and nothing is retained.
+    assert_eq!(ack.await.ok(), Some(LimitAck::Obsolete));
+    assert!(worker.limit_acks.is_empty());
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
+    assert_eq!(
+        outcome_text(
+            LimitCommand::Limit(LimitArg::Value(5)),
+            limit,
+            Some(LimitAck::Obsolete)
+        ),
+        "That room is gone or has changed, so nothing was changed."
+    );
+    assert!(limit_writes(&trace).is_empty());
+}
+
+#[tokio::test]
+async fn a_held_actor_still_answers_within_the_reply_budget() {
+    let trace = Trace::default();
+    let gate = Arc::new(LimitGate::default());
+    let make_trace = trace.clone();
+    let factory_gate = gate.clone();
+    let access = open_access();
+    let runtime = VoiceRuntime::new(
+        move || {
+            let mut store = Store::new(make_trace.clone());
+            store.access = access.clone();
+            let mut http = Http::new(make_trace.clone());
+            http.limit_gate = Some(factory_gate.clone());
+            (store, http)
+        },
+        Duration::from_millis(10),
+        true,
+    );
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    assert!(runtime.voice_frame(
+        GUILD,
+        MEMBER,
+        Some(CREATOR),
+        Some(false),
+        "ava's room".to_owned(),
+    ));
+    wait_trace(&trace, "persist:500").await;
+    assert!(runtime.voice_frame(GUILD, MEMBER, Some(500), Some(false), "x".to_owned()));
+    assert!(runtime.voice_frame(GUILD, 301, Some(500), Some(false), "x".to_owned()));
+    // The first command queues and its write blocks in the fake, holding the
+    // actor across ticks. The second command must answer unconfirmed within
+    // the reply budget instead of waiting on actor acceptance.
+    let interaction = limit_interaction(MEMBER, vec![int_option("count", 5)]);
+    let first = handle_capture(&runtime, &interaction);
+    let second = async {
+        gate.sent.notified().await;
+        runtime
+            .run_limit(
+                GUILD,
+                MEMBER,
+                false,
+                LimitCommand::Limit(LimitArg::Value(3)),
+            )
+            .await
+    };
+    let ((owned, response), unconfirmed) = tokio::join!(first, second);
+    assert!(owned);
+    let queued = response_text(response.as_ref().expect("reply"));
+    assert!(queued.contains("Discord is busy"), "{queued}");
+    let unconfirmed = unconfirmed.expect("reply");
+    assert!(unconfirmed.contains("couldn't confirm"), "{unconfirmed}");
+    // Releasing the held write still lands it: the budget never cancels work.
+    gate.release.notify_one();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while limit_writes(&trace).is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "held write never ran: {:?}",
+            trace.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(limit_writes(&trace), ["limit:500:5"]);
+}

@@ -2938,7 +2938,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         match self.store.forget(self.live.guild_id, channel_id).await {
                             Ok(()) => {
                                 self.queue.mark_succeeded(&action);
-                                self.queue.drop_for_channel(self.live.guild_id, channel_id);
+                                // A limit queued behind this delete never
+                                // dispatches: settle its acknowledgement as
+                                // obsolete now instead of leaving the sender
+                                // orphaned until the next limit command.
+                                let dropped =
+                                    self.queue.drain_for_channel(self.live.guild_id, channel_id);
+                                self.settle_dropped_limits(dropped);
                                 self.forget_privacy(channel_id);
                                 self.rooms.remove(&channel_id);
                                 self.companions.remove(&channel_id);

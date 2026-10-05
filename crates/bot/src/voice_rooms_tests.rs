@@ -457,6 +457,14 @@ struct OverwriteGate {
     release: tokio::sync::Notify,
 }
 
+/// Hold one `/limit` PATCH mid-flight: the fake signals `sent` when the
+/// write starts and finishes only after `release`.
+#[derive(Default)]
+struct LimitGate {
+    sent: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
 struct Http {
     trace: Trace,
     next_id: Mutex<u64>,
@@ -479,7 +487,9 @@ struct Http {
     after_create: Option<Hook>,
     before_move: Option<Hook>,
     before_delete: Option<Hook>,
+    before_limit: Option<Hook>,
     overwrites_gate: Option<Arc<OverwriteGate>>,
+    limit_gate: Option<Arc<LimitGate>>,
     downloaded_urls: Mutex<Vec<String>>,
     download_results: DownloadResults,
 }
@@ -508,7 +518,9 @@ impl Http {
             after_create: None,
             before_move: None,
             before_delete: None,
+            before_limit: None,
             overwrites_gate: None,
+            limit_gate: None,
             downloaded_urls: Mutex::new(Vec::new()),
             download_results: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -656,6 +668,9 @@ impl RoomWrites for Http {
         user_limit: u32,
         guard: WriteGuard,
     ) -> Result<(), RoomHttpError> {
+        if let Some(hook) = &self.before_limit {
+            hook();
+        }
         if !guard() {
             return Err(RoomHttpError::Cancelled);
         }
@@ -663,6 +678,10 @@ impl RoomWrites for Http {
             .lock()
             .unwrap()
             .push(format!("limit:{channel}:{user_limit}"));
+        if let Some(gate) = &self.limit_gate {
+            gate.sent.notify_one();
+            gate.release.notified().await;
+        }
         match self.limit_errors.lock().unwrap().pop_front() {
             Some(error) => Err(error),
             None => Ok(()),

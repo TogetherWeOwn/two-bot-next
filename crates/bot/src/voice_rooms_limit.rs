@@ -187,6 +187,16 @@ fn tell(ack: Option<oneshot::Sender<LimitAck>>, outcome: LimitAck) {
 }
 
 impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
+    /// Settle waiters whose actions were dropped with their room (a delete
+    /// that overtook them): discarded work ends obsolete, never queued.
+    pub(super) fn settle_dropped_limits(&mut self, ids: Vec<u64>) {
+        for id in ids {
+            tell(self.limit_acks.remove(&id), LimitAck::Obsolete);
+        }
+    }
+}
+
+impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// Resolve, authorize, decide and queue one `/limit` or `/unlimit`. Acts on
     /// the caller's current room only: an admin may use it in any managed room
     /// they are standing in. Refusals change nothing and queue nothing.
@@ -279,6 +289,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         started: Instant,
     ) {
         let ack = self.limit_acks.remove(&action.id);
+        // The generation and channel revision fence the post-write cache
+        // publication below: gateway evidence that lands while the PATCH is
+        // in flight is newer and must survive.
         let state = {
             let live = self.live.inner.read().expect("live voice lock");
             match (
@@ -288,11 +301,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 (true, Some(channel)) => Some((
                     channel.user_limit.unwrap_or(0),
                     can_manage_room(live.permissions(self.live.guild_id, channel_id)),
+                    live.generation,
+                    live.channel_revisions.get(&channel_id).copied(),
                 )),
                 _ => None,
             }
         };
-        let Some((current, permitted)) = state else {
+        let Some((current, permitted, generation, revision)) = state else {
             self.queue.mark_succeeded(&action);
             tell(ack, LimitAck::Obsolete);
             return;
@@ -314,15 +329,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         {
             Ok(()) => {
                 self.queue.mark_succeeded(&action);
-                if let Some(channel) = self
-                    .live
-                    .inner
-                    .write()
-                    .expect("live voice lock")
-                    .channels
-                    .get_mut(&channel_id)
                 {
-                    channel.user_limit = Some(user_limit);
+                    let mut live = self.live.inner.write().expect("live voice lock");
+                    // A gateway update, disconnect or republication that landed
+                    // while the PATCH was in flight is newer evidence: keep it
+                    // instead of rolling the cache back to the just-written
+                    // value, or a later command for that value would falsely
+                    // skip its write.
+                    let fresh = live.ready
+                        && live.generation == generation
+                        && live.channel_revisions.get(&channel_id) == revision.as_ref();
+                    if fresh {
+                        if let Some(channel) = live.channels.get_mut(&channel_id) {
+                            channel.user_limit = Some(user_limit);
+                        }
+                    }
                 }
                 tell(ack, LimitAck::Applied);
             }
@@ -344,9 +365,32 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 tell(ack, LimitAck::Delayed);
             }
             Err(RoomHttpError::Cancelled) => {
-                // The room channel vanished while the write was in flight.
-                self.queue.mark_succeeded(&action);
-                tell(ack, LimitAck::Obsolete);
+                // The write guard failed mid-flight. When the room and its
+                // channel are still tracked the failure is transient (a
+                // disconnect during backoff): requeue without consuming the
+                // failure budget so a reconnect retries it. A room that is
+                // truly gone stays gone.
+                let still_tracked = {
+                    let live = self.live.inner.read().expect("live voice lock");
+                    self.rooms.contains_key(&channel_id) && live.channels.contains_key(&channel_id)
+                };
+                if still_tracked {
+                    self.queue
+                        .mark_rate_limited(self.live.guild_id, 0, now_ms, action);
+                    tell(ack, LimitAck::Delayed);
+                } else {
+                    self.queue.mark_succeeded(&action);
+                    tell(ack, LimitAck::Obsolete);
+                }
+            }
+            Err(RoomHttpError::NotFound) => {
+                // Discord says the channel is gone: drop the cached evidence
+                // so a later command cannot acknowledge the stale limit, and
+                // let reconcile converge the tracked room through the normal
+                // delete path.
+                self.live.remove_channel(channel_id);
+                self.complete_error(action, channel_id, RoomHttpError::NotFound);
+                tell(ack, LimitAck::Refused(RoomHttpError::NotFound));
             }
             Err(error) => {
                 self.complete_error(action, channel_id, error);
@@ -383,10 +427,26 @@ where
                 reply,
             })
             .ok()?;
-        match inbox.await.ok()? {
+        // Actor acceptance shares the reply budget with the queued write: a
+        // prior operation holding the actor must not push the reply past
+        // Discord's interaction window. An unaccepted command queued nothing
+        // through us, so its outcome is unconfirmed, never applied.
+        let start = Instant::now();
+        let reply = match tokio::time::timeout(LIMIT_ACK_WAIT, inbox).await {
+            Ok(Ok(reply)) => reply,
+            _ => {
+                return Some(
+                    "I couldn't confirm the change. Check the room's limit, then try \
+                     again."
+                        .to_owned(),
+                );
+            }
+        };
+        match reply {
             LimitReply::Done(text) => Some(text),
             LimitReply::Queued { limit, ack } => {
-                let outcome = match tokio::time::timeout(LIMIT_ACK_WAIT, ack).await {
+                let remaining = LIMIT_ACK_WAIT.saturating_sub(start.elapsed());
+                let outcome = match tokio::time::timeout(remaining, ack).await {
                     Ok(Ok(outcome)) => Some(outcome),
                     // The worker dropped the write unanswered (it halted, or
                     // the room was forgotten): we cannot say it landed.
@@ -395,7 +455,7 @@ where
                             "I couldn't confirm the change. Check the room's limit, then try \
                              again."
                                 .to_owned(),
-                        )
+                        );
                     }
                     Err(_) => None,
                 };
