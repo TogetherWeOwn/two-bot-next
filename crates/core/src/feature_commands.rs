@@ -51,7 +51,7 @@ pub fn scorecard_attendance_command() -> CommandDefinition {
     .options(vec![
         CommandOption::new(
             "event-occurrence",
-            "Scheduled event id (number in the event URL) or stable occurrence id, e.g. 12345 or weekly-standup-2026-10-03",
+            "Event id (number in the event URL) or occurrence id, e.g. 12345 or weekly-standup-2026-10-03",
             CommandOptionType::String,
         )
         .required()

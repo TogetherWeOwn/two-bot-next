@@ -60,7 +60,7 @@
       "options": [
         {
           "name": "event-occurrence",
-          "description": "Scheduled event id (number in the event URL) or stable occurrence id, e.g. 12345 or weekly-standup-2026-10-03",
+          "description": "Event id (number in the event URL) or occurrence id, e.g. 12345 or weekly-standup-2026-10-03",
           "type": "string",
           "required": true,
           "min_value": null,

@@ -111,7 +111,7 @@ pub fn expected_registry() -> Value {
         (
             "attendance",
             "/options/0/description",
-            "Scheduled event id (number in the event URL) or stable occurrence id, e.g. 12345 or weekly-standup-2026-10-03",
+            "Event id (number in the event URL) or occurrence id, e.g. 12345 or weekly-standup-2026-10-03",
         ),
         (
             "rsvp",

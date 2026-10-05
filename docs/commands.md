@@ -25,7 +25,7 @@ Check in a verified human attendee for a scheduled event (scorecard)
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-occurrence` | string | true | — | — | 128 | — | Scheduled event id (number in the event URL) or stable occurrence id, e.g. 12345 or weekly-standup-2026-10-03 |
+| `event-occurrence` | string | true | — | — | 128 | — | Event id (number in the event URL) or occurrence id, e.g. 12345 or weekly-standup-2026-10-03 |
 | `member` | user | true | — | — | — | — | Human member who attended. |
 
 ## `/ban`
