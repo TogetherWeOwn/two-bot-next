@@ -51,6 +51,10 @@ fn voice_channel(id: u64, name: &str) -> Channel {
 async fn private_room() -> (Worker, Trace) {
     let (live, store, http, trace) = parts();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // This scenario predates the empty-room grace and asserts immediate
+    // deletion, so it shortens it; the grace itself is pinned by the
+    // paused-time guard tests.
+    worker.live.set_empty_grace(Duration::ZERO);
     worker.apply_privacy(OWNER, false, "Ana", PrivacyCommand::Private);
     drain(&mut worker).await;
     assert_eq!(worker.join_channel_of(ROOM), Some(JOIN));
