@@ -5,15 +5,17 @@ name: check
 
 on:
   pull_request:
-    # Deduplicated PR surface: a bare trigger ran the whole matrix on every
-    # PR activity type, so label, assignment, review-request and close events
-    # each burned a full run without changing code or the title. Checks report
-    # per head SHA and every new SHA arrives via opened or synchronize, so the
-    # kept runs already cover the gate. Keep only code- and title-relevant
-    # events, the same five the supply-chain lint workflow uses: edited covers
-    # title, body and base retargets (the migration guard reads the PR base
-    # SHA), and reopened/ready_for_review preserve lint coverage.
-    types: [opened, edited, synchronize, reopened, ready_for_review]
+    # Pinned minimal PR surface: with no `types`, GitHub fires only on
+    # opened/synchronize/reopened (label, assignment, review-request and
+    # close events never run this workflow), so the explicit list below is
+    # identical to the bare trigger. It is written out so the offline trigger
+    # test can lock it: check.yml never reads the PR title or body, so
+    # `edited` would only re-run (and, via cancel-in-progress, restart) the
+    # full matrix on an unchanged SHA, and `ready_for_review` would re-run
+    # the same SHA with no draft gating. Every new head SHA arrives via
+    # opened or synchronize, so the gate always reports. Title re-lint on
+    # `edited` lives in supply-chain.yml, where it belongs.
+    types: [opened, synchronize, reopened]
   push:
     branches: [main]
   # Weekly full run (CI standard rule 6, TOG-14881): the supply-chain

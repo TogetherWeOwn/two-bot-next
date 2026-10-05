@@ -1,19 +1,18 @@
-"""Lock the check workflow's deduplicated pull_request trigger surface.
+"""Lock the check workflow's minimal pull_request trigger surface.
 
-check.yml once used a bare `pull_request:` trigger, so every PR activity type
-(label, assignment, review request, close, ...) ran the full matrix without
-changing code or the title. Checks report per head SHA and every new SHA
-arrives via opened or synchronize, so those runs were pure duplicates.
+With no `types`, GitHub fires `pull_request` only on opened/synchronize/
+reopened: label, assignment, review-request and close events never run this
+workflow, so there is no label-event waste to remove. The list is written out
+explicitly (identical to the bare-trigger default) so this test can lock it:
+check.yml never reads the PR title or body, so adding `edited` would re-run
+(and, via cancel-in-progress, restart) the full matrix on an unchanged SHA,
+and adding `ready_for_review` would re-run the same SHA with no draft gating.
+Title re-lint on `edited` lives in supply-chain.yml, where it belongs.
 
 Guards (indentation aware, stdlib only, hermetic, no GitHub needed):
-- pull_request fires only on opened/edited/synchronize/reopened/
-  ready_for_review: the same five code- and title-relevant events the
-  supply-chain lint workflow uses.
-- opened and synchronize stay: every new head SHA arrives through one of
-  them, so the required checks always report on the merge head.
-- edited stays: title/body edits and base retargets refresh the gate (the
-  migration guard reads the PR base SHA).
-- reopened and ready_for_review stay: lint coverage parity with supply-chain.
+- pull_request fires exactly on opened/synchronize/reopened and nothing
+  else: no `edited` (title/body edits cannot change a result here) and no
+  `ready_for_review` (same SHA, no draft gating).
 - no paths/branches filter on the trigger: a filtered trigger leaves
   required checks pending (see scripts/ci/test_required_checks.py).
 - push to main, the weekly schedule and the release dispatch are untouched.
@@ -27,7 +26,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/check.yml"
 
-REQUIRED_PR_TYPES = ["opened", "edited", "synchronize", "reopened", "ready_for_review"]
+REQUIRED_PR_TYPES = ["opened", "synchronize", "reopened"]
+# Same-SHA metadata events that must never re-run the matrix here.
+BANNED_PR_TYPES = {"edited", "ready_for_review"}
 # A paths/branches filter on the trigger leaves required checks pending.
 PENDING_FILTERS = {"paths", "paths-ignore", "branches", "branches-ignore"}
 
@@ -61,7 +62,7 @@ class CheckTriggerSurfaceTests(unittest.TestCase):
         on_block, _ = section_lines(self.text, "on:", 0)
         return on_block
 
-    def test_pull_request_types_cover_only_code_and_title_events(self):
+    def pr_types(self):
         on_block = self.on_block()
         pr_line = next(line for line in on_block if re.match(r"^\s*pull_request:\s*$", line))
         pr_indent = len(pr_line) - len(pr_line.lstrip())
@@ -69,20 +70,22 @@ class CheckTriggerSurfaceTests(unittest.TestCase):
             line for line in on_block
             if len(line) - len(line.lstrip()) > pr_indent and line.strip().startswith("types:")
         )
-        self.assertEqual(flow_list(types_line.split("types:", 1)[1]), REQUIRED_PR_TYPES)
+        return flow_list(types_line.split("types:", 1)[1])
+
+    def test_pull_request_types_are_the_minimal_default_triple(self):
+        self.assertEqual(self.pr_types(), REQUIRED_PR_TYPES)
+
+    def test_same_sha_metadata_events_do_not_rerun_the_matrix(self):
+        # `edited` and `ready_for_review` keep the head SHA and check.yml
+        # reads neither the title nor the body, so those runs can only burn
+        # minutes and, via cancel-in-progress, delay time-to-green.
+        self.assertFalse(set(self.pr_types()) & BANNED_PR_TYPES)
 
     def test_new_head_sha_events_are_covered(self):
         # Required checks report per head SHA; a new SHA that triggers no run
         # leaves the gate pending. Every new SHA arrives via opened (new PR)
         # or synchronize (new push), so both must stay.
-        on_block = self.on_block()
-        pr_line = next(line for line in on_block if re.match(r"^\s*pull_request:\s*$", line))
-        pr_indent = len(pr_line) - len(pr_line.lstrip())
-        types_line = next(
-            line for line in on_block
-            if len(line) - len(line.lstrip()) > pr_indent and line.strip().startswith("types:")
-        )
-        types = flow_list(types_line.split("types:", 1)[1])
+        types = self.pr_types()
         self.assertIn("opened", types)
         self.assertIn("synchronize", types)
 
