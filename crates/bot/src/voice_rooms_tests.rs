@@ -2234,6 +2234,11 @@ async fn two_empty_rooms(
         .unwrap()
         .insert(500, failures);
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // These scenarios predate the ordinary empty-room grace and assert the
+    // delete is queued at once: shorten the grace to zero via the
+    // fixture-only seam so reconcile behaves as on main. Production keeps
+    // the 60 s default.
+    worker.live.set_empty_grace(Duration::ZERO);
     worker.queue_delete(first, false);
     worker.reconcile();
     assert_eq!(worker.queue.pending_counts(GUILD), (2, 0));
