@@ -122,8 +122,13 @@ the Join channel. The join-request flow is in
   one that is not is forgotten and the forgetting persisted. The room stays
   private; `/private` plans a new Join channel. Nothing is forgotten without an
   authoritative snapshot that still shows the room.
-- **Not yet.** Renaming the Join channel when ownership or the owner's name
-  changes (`set_owner`), and persisting grants.
+- **Grants are durable.** Approved members' Connect allows are witnessed in
+  `voice_join_grants` (one row per room member, written before the grant PUT
+  and retired only after the revoke lands or the grant is refused), so a
+  restart cannot strand a Connect allow past `/public`. Worker load hydrates
+  private rooms' grants and re-queues revocations for grants whose room is
+  public or gone. Revocation clears only the Connect bit and keeps every other
+  allow/deny bit, including vote-kick denies.
 
 ## Runtime wiring: join requests
 
@@ -170,9 +175,11 @@ the Join channel. The join-request flow is in
   so a reset counter or a repeated/backward wall clock cannot revive an old
   button. Epochs are collision-resistant, not clock-based; ids remain within
   Discord's 100-character limit even with maximum-width numeric fields.
-- **Not yet.** Grants are not durable: a restart forgets which members were
-  approved, so a later `/public` cannot take back their Connect allow (Discord
-  keeps it). Persisting grants needs a table of its own.
+- **Grants are durable.** The approval intent is recorded in
+  `voice_join_grants` before the Connect PUT; a refused grant retires its row
+  so the member can ask again, while an unknown grant or revoke outcome keeps
+  its row so a retry or a restart can still revoke. Only a successful revoke
+  (or a refused grant) retires the witness.
 
 ## Residual parent work
 

@@ -116,6 +116,9 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_rooms",
     // V3 block list: references voice_rooms, so it restores after it.
     "voice_room_blocks",
+    // V3 approved Connect grants (0418): references voice_rooms, so it
+    // restores after it, beside the block list it complements.
+    "voice_join_grants",
     "voice_owner_grants",
     "voice_text_companions",
     "voice_access_controls",

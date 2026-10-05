@@ -207,6 +207,10 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // V3 block list (0416): one row per blocked member, stamped on insert; an
     // unblock deletes the row, so only additions are measurable.
     TableSpec { table: "voice_room_blocks", measure: TableMeasure::Columns(&["created_at"]) },
+    // V3 approved Connect grants (0418): one row per approved member, stamped
+    // on intent; a revocation or refused grant deletes the row, so only
+    // approvals are measurable.
+    TableSpec { table: "voice_join_grants", measure: TableMeasure::Columns(&["created_at"]) },
     // Insert-once creation snapshot plus V2 ownership handoffs, whose
     // timestamp lives in `owner_touched_at` (migration 0412), V3 `/name`
     // custom-name changes, stamped in `name_touched_at` (migration 0414), and V3

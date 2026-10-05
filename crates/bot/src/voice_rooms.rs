@@ -10,7 +10,7 @@
 //! (gated on `TWO_VOICE=1` by the binary).
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
     sync::{
@@ -82,7 +82,7 @@ use two_bot_core::{
         RoomMember, RoomOwnership,
     },
     voice_permissions::OWNER_ALLOW_BITS,
-    voice_private::{PrivacyRecord, PrivateRoom},
+    voice_private::{MemberId, PrivacyRecord, PrivateRoom},
     voice_rooms::{
         category_full_message, is_usable_channel_name, voice_commands, ActionQueue, CreatorChannel,
         NewRoomSpec, PermissionSource, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction,
@@ -287,6 +287,30 @@ pub trait RoomPersistence: Send + Sync {
         room: Snowflake,
         record: &PrivacyRecord,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+    /// V3 approved Connect grants for the guild's rooms, keyed by room
+    /// channel. One entry is one member the worker approved and Discord may
+    /// still hold a Connect allow for; a room absent from the map holds none.
+    fn join_grants(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<BTreeMap<Snowflake, BTreeSet<Snowflake>>, StoreError>> + Send;
+    /// Record an approval's intent before granting Connect. Idempotent; a
+    /// retried intent is a no-op. `Ok(false)` when the room has no database
+    /// row, so a grant never outlives its room.
+    fn save_join_grant(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+    /// Retire a grant after its revocation landed (or its grant was refused).
+    /// Idempotent: retiring an absent grant is success.
+    fn remove_join_grant(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
 impl RoomPersistence for PgRoomStore {
@@ -457,6 +481,35 @@ impl RoomPersistence for PgRoomStore {
             .await
             .map_err(store_error)
     }
+
+    async fn join_grants(
+        &self,
+        guild: Snowflake,
+    ) -> Result<BTreeMap<Snowflake, BTreeSet<Snowflake>>, StoreError> {
+        self.join_grants_in_guild(guild).await.map_err(store_error)
+    }
+
+    async fn save_join_grant(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        member: Snowflake,
+    ) -> Result<bool, StoreError> {
+        self.save_join_grant(guild, room, member)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn remove_join_grant(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        member: Snowflake,
+    ) -> Result<(), StoreError> {
+        self.remove_join_grant(guild, room, member)
+            .await
+            .map_err(store_error)
+    }
 }
 
 fn store_error(error: sqlx::Error) -> StoreError {
@@ -514,6 +567,7 @@ fn voice_dead_action(action: &RoomAction) -> &'static str {
         | RoomAction::ApproveJoin { .. }
         | RoomAction::RevokeJoinAccess { .. }
         | RoomAction::RetireJoinPrompt { .. } => "other",
+        RoomAction::SetUserLimit { .. } => "limit",
     }
 }
 
@@ -599,6 +653,14 @@ pub trait RoomWrites: Send + Sync {
         &self,
         channel: Snowflake,
         name: &str,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// V3 `/limit` and `/unlimit`: set the room channel's user limit (`0` is
+    /// unlimited, at most 99). Idempotent; a 429 returns to the queue.
+    fn set_user_limit(
+        &self,
+        channel: Snowflake,
+        user_limit: u32,
+        guard: WriteGuard,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
     /// Download a Discord-hosted `/import` file, capped at `max_bytes`
     /// (the caller checks the attachment size before asking).
@@ -767,6 +829,16 @@ impl RoomWrites for RoomHttp {
 
     async fn rename(&self, channel: Snowflake, name: &str) -> Result<(), RoomHttpError> {
         self.rename_room(channel, name).await
+    }
+
+    async fn set_user_limit(
+        &self,
+        channel: Snowflake,
+        user_limit: u32,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.set_room_user_limit(channel, user_limit, move || guard())
+            .await
     }
 
     async fn download_attachment(
@@ -1487,6 +1559,8 @@ pub struct GuildRoomWorker<S, H> {
     ownership_queued: HashSet<Snowflake>,
     renames: RenameCoalescer,
     desired_names: HashMap<Snowflake, String>,
+    /// Callers waiting on a queued `/limit` write, by queue action id.
+    limit_acks: HashMap<u64, oneshot::Sender<limit::LimitAck>>,
     /// V3 `/name` overrides by room: the owner's text as typed, template
     /// tokens intact. A room without an entry uses its template name.
     custom_names: HashMap<Snowflake, String>,
@@ -1642,14 +1716,45 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .into_iter()
             .map(|channel| (channel, 0))
             .collect();
-        let (privacy, join_deletable) =
+        let (mut privacy, join_deletable) =
             Self::load_privacy(&rooms, store.privacy(live.guild_id).await?);
+        let join_grants = store.join_grants(live.guild_id).await?;
+        // Hydrate approved Connect grants: a private room remembers its
+        // approvals so a later `/public` revokes them; a grant whose room is
+        // public or gone still needs its revocation, which the queue lost on
+        // restart, so it is re-queued here. The witness is retired only by a
+        // successful revoke (or a refused grant), never by this hydration.
+        let mut pending_revokes = Vec::new();
+        for (room, members) in &join_grants {
+            match privacy.get_mut(room) {
+                Some(state) if state.private => {
+                    // A grant witness can outlive a later Block (approve,
+                    // failed revoke, re-private, Block): hydrating it blindly
+                    // would put a blocked member into `granted`, which
+                    // `validate()` refuses and wedges the room. Blocked
+                    // members keep only their revocation.
+                    for member in members {
+                        if state.blocked.contains(&MemberId(*member)) {
+                            pending_revokes.push((*room, *member));
+                        } else {
+                            state.granted.insert(MemberId(*member));
+                        }
+                    }
+                }
+                _ => {
+                    for member in members {
+                        pending_revokes.push((*room, *member));
+                    }
+                }
+            }
+        }
         let custom_names = store
             .custom_names(live.guild_id)
             .await?
             .into_iter()
             .collect();
-        Ok(Self {
+        let guild_id = live.guild_id;
+        let worker = Self {
             live,
             store,
             http,
@@ -1665,6 +1770,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             ownership_queued: HashSet::new(),
             renames: RenameCoalescer::new(),
             desired_names: HashMap::new(),
+            limit_acks: HashMap::new(),
             custom_names,
             creations: HashMap::new(),
             accepted: HashMap::new(),
@@ -1687,7 +1793,17 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             kick_audit: VecDeque::new(),
             kick_audit_retry_ms: 0,
             name_policy: Arc::new(AutomodPolicy::default()),
-        })
+        };
+        for (room, member) in pending_revokes {
+            worker.queue.enqueue(
+                guild_id,
+                RoomAction::RevokeJoinAccess {
+                    room_channel_id: room,
+                    member_id: member,
+                },
+            );
+        }
+        Ok(worker)
     }
 
     /// Run the create-path name filter under `policy` from here on.
@@ -3191,7 +3307,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         match self.store.forget(self.live.guild_id, channel_id).await {
                             Ok(()) => {
                                 self.queue.mark_succeeded(&action);
-                                self.queue.drop_for_channel(self.live.guild_id, channel_id);
+                                // A limit queued behind this delete never
+                                // dispatches: settle its acknowledgement as
+                                // obsolete now instead of leaving the sender
+                                // orphaned until the next limit command.
+                                let dropped =
+                                    self.queue.drain_for_channel(self.live.guild_id, channel_id);
+                                self.settle_dropped_limits(dropped);
                                 self.forget_privacy(channel_id);
                                 self.rooms.remove(&channel_id);
                                 self.companions.remove(&channel_id);
@@ -3609,6 +3731,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         self.audit_enforcement(vote_id, channel_id, member_id, outcome);
                     }
                 }
+            }
+            RoomAction::SetUserLimit {
+                channel_id,
+                user_limit,
+            } => {
+                self.dispatch_set_user_limit(action, channel_id, user_limit, now_ms, started)
+                    .await;
             }
             RoomAction::SetCustomName {
                 channel_id,
@@ -4081,6 +4210,15 @@ enum ActorCommand {
         is_admin: bool,
         command: OwnershipCommand,
         reply: oneshot::Sender<String>,
+    },
+    /// V3 `/limit` and `/unlimit`: the worker resolves the caller's room,
+    /// decides, queues the Discord write and replies with the text (or a
+    /// pending acknowledgement for the queued write).
+    Limit {
+        actor_id: Snowflake,
+        is_admin: bool,
+        command: LimitCommand,
+        reply: oneshot::Sender<limit::LimitReply>,
     },
     /// V3 owner command (`/private`, `/public`): the worker resolves the
     /// caller's current room, gates on owner-or-admin, queues the @everyone
@@ -4770,6 +4908,14 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             reply,
         } => {
             let _ = reply.send(worker.apply_ownership(actor_id, is_admin, command));
+        }
+        ActorCommand::Limit {
+            actor_id,
+            is_admin,
+            command,
+            reply,
+        } => {
+            let _ = reply.send(worker.apply_limit(actor_id, is_admin, command));
         }
         ActorCommand::Privacy {
             actor_id,
@@ -5877,6 +6023,11 @@ pub enum VoiceCommand {
         vote_id: Snowflake,
         ballot: VoteBallot,
     },
+    /// V3 `/limit [count]`: set the room's user limit, or lock it at the
+    /// current headcount when no count is given.
+    Limit(LimitArg),
+    /// V3 `/unlimit`: remove the room's user limit.
+    Unlimit,
     /// V3 `/name`: the owner's panel to set a custom name or restore the
     /// template name.
     Name,
@@ -6123,6 +6274,10 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
             target,
             reason: parse_kick_reason(&command.options),
         }),
+        "limit" => Some(VoiceCommand::Limit(limit::parse_limit_arg(
+            &command.options,
+        ))),
+        "unlimit" => Some(VoiceCommand::Unlimit),
         "name" => Some(VoiceCommand::Name),
         _ => None,
     }
@@ -6282,6 +6437,8 @@ impl VoiceCommand {
             // Ballots share the `kick` restriction surface: one role gate
             // covers starting votes and casting them.
             Self::Kick { .. } | Self::Ballot { .. } => "kick",
+            Self::Limit(_) => "limit",
+            Self::Unlimit => "unlimit",
             Self::Name => "name",
         }
     }
@@ -7329,6 +7486,28 @@ where
             )
             .await
         }
+        VoiceCommand::Limit(arg) => {
+            limit::handle_limit(
+                runtime,
+                interaction,
+                guild_id,
+                member.is_admin,
+                LimitCommand::Limit(arg),
+                reply,
+            )
+            .await
+        }
+        VoiceCommand::Unlimit => {
+            limit::handle_limit(
+                runtime,
+                interaction,
+                guild_id,
+                member.is_admin,
+                LimitCommand::Unlimit,
+                reply,
+            )
+            .await
+        }
         VoiceCommand::Private | VoiceCommand::Public => {
             let (command, name) = if matches!(command, VoiceCommand::Private) {
                 (PrivacyCommand::Private, "private")
@@ -8054,6 +8233,9 @@ where
     }
 }
 
+#[path = "voice_rooms_limit.rs"]
+mod limit;
+pub use limit::{LimitArg, LimitCommand};
 mod private_runtime;
 pub use private_runtime::PrivacyCommand;
 
