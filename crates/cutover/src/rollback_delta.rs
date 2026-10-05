@@ -273,6 +273,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
             "mutable per-guild settings row with no timestamp column; no member IDs",
         ),
     },
+    // Append-only vote-kick audit rows (migration 0417); `occurred_at` is the
+    // event time, written once per row.
+    TableSpec { table: "voice_vote_kick_audit", measure: TableMeasure::Columns(&["occurred_at"]) },
     TableSpec {
         table: "web_contract_meta",
         measure: TableMeasure::Unmeasurable("singleton contract row with no timestamp column"),

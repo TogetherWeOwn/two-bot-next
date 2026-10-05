@@ -148,6 +148,7 @@ pub mod voice_template_lint;
 pub mod voice_text_channel;
 pub mod voice_utilities;
 pub mod voice_vote_kick;
+pub mod voice_vote_kick_audit;
 #[cfg(feature = "db")]
 pub mod website_store;
 

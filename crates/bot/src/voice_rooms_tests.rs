@@ -135,6 +135,9 @@ struct Store {
     creators_error: Option<StoreError>,
     custom_names: Mutex<HashMap<u64, String>>,
     save_custom_name_errors: Mutex<VecDeque<StoreError>>,
+    /// V4 audit rows appended so far, in append order.
+    kick_audit: Mutex<Vec<KickAuditRow>>,
+    kick_audit_errors: Mutex<VecDeque<StoreError>>,
 }
 
 impl Store {
@@ -168,6 +171,8 @@ impl Store {
             creators_error: None,
             custom_names: Mutex::new(HashMap::new()),
             save_custom_name_errors: Mutex::new(VecDeque::new()),
+            kick_audit: Mutex::new(Vec::new()),
+            kick_audit_errors: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -420,6 +425,22 @@ impl RoomPersistence for Store {
             .push(format!("remove_companion:{room}"));
         Ok(self.companions.lock().unwrap().remove(&(guild, room)))
     }
+    async fn record_kick_audit(&self, rows: &[KickAuditRow]) -> Result<(), StoreError> {
+        if let Some(error) = self.kick_audit_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        // Same idempotency as the table's (guild, vote, event) key.
+        let mut stored = self.kick_audit.lock().unwrap();
+        for row in rows {
+            if !stored
+                .iter()
+                .any(|s| (s.guild_id, s.vote_id, s.event) == (row.guild_id, row.vote_id, row.event))
+            {
+                stored.push(row.clone());
+            }
+        }
+        Ok(())
+    }
     async fn privacy(&self, _: u64) -> Result<BTreeMap<u64, PrivacyRecord>, StoreError> {
         Ok(self.privacy.lock().unwrap().clone())
     }
@@ -464,6 +485,8 @@ struct Http {
     rename_errors: Mutex<VecDeque<RoomHttpError>>,
     companion_errors: Mutex<VecDeque<RoomHttpError>>,
     view_errors: Mutex<VecDeque<RoomHttpError>>,
+    /// Scripted failures for the V4 enforcement's Connect deny.
+    kick_errors: Mutex<VecDeque<RoomHttpError>>,
     overwrite_errors: Mutex<VecDeque<RoomHttpError>>,
     join_errors: Mutex<VecDeque<RoomHttpError>>,
     written_overwrites: Mutex<Vec<(u64, PermissionOverwrite)>>,
@@ -492,6 +515,7 @@ impl Http {
             rename_errors: Mutex::new(VecDeque::new()),
             companion_errors: Mutex::new(VecDeque::new()),
             view_errors: Mutex::new(VecDeque::new()),
+            kick_errors: Mutex::new(VecDeque::new()),
             overwrite_errors: Mutex::new(VecDeque::new()),
             join_errors: Mutex::new(VecDeque::new()),
             written_overwrites: Mutex::new(Vec::new()),
@@ -616,6 +640,9 @@ impl RoomWrites for Http {
     ) -> Result<(), RoomHttpError> {
         if !guard() {
             return Err(RoomHttpError::Cancelled);
+        }
+        if let Some(error) = self.kick_errors.lock().unwrap().pop_front() {
+            return Err(error);
         }
         self.trace
             .lock()
@@ -7809,6 +7836,7 @@ fn dead_letter_families_cover_every_queue_action_shape() {
             RoomAction::KickMember {
                 channel_id: 500,
                 member_id: MEMBER,
+                vote_id: 7_000,
             },
             "kick",
         ),

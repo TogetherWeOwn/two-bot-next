@@ -763,10 +763,12 @@ pub enum RoomAction {
     },
     /// V4 enforcement for a passed vote: deny the member Connect on this room
     /// channel only, then disconnect them. Both writes are idempotent, so a
-    /// retried action is safe.
+    /// retried action is safe. `vote_id` is the initiating interaction ID of
+    /// the passed vote, so the audit row for the outcome names its vote.
     KickMember {
         channel_id: Snowflake,
         member_id: Snowflake,
+        vote_id: Snowflake,
     },
     /// V3 `/private` (`deny`) and `/public` (`!deny`): set or clear the
     /// @everyone Connect deny on a room. View Channel is never touched and
