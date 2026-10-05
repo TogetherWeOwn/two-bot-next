@@ -126,7 +126,7 @@ old/external programs or databases deliberately configured as a second authority
 
 ## Cancellation, crash, unavailable storage and recovery
 
-Permits have **no TTL and no drop-release**. The database does not hold a
+Permits have **no drop-release**. The database does not hold a
 transaction/connection across HTTP. Dropping/cancelling a send, losing the
 process, an uncertain exchange, or losing completion storage leaves durable
 occupancy. A failed completion cannot silently open another lane: its single
@@ -134,15 +134,25 @@ statement either installs the hold and clears occupancy together, or the old
 occupied row remains. A lost completion acknowledgement does not justify
 replaying the effect. Unknown or old generations are not execution leases.
 
-Indefinite holds and abandoned claims require explicitly authorized
-reconciliation. There is intentionally no automatic expiry, startup reset, or
-"force send" switch. Before any manual release, fence **all** credential users,
-prove the old send cannot continue, reconcile the effect/provider cooldown,
-and record evidence for the exact generation. Do not delete/reset the lane,
-rotate a credential, or release an indefinite hold merely because a process is
-old or a receiver idempotency claim is stale. Those operations are not authorized
-by this implementation. Persist this table across restarts and authority
-failover; a blank replacement database is not recovery evidence.
+A held lane carries a 60 s self-heal lease (`in_flight_since_ms`, migration
+0419, constant `IN_FLIGHT_LEASE_MS`). The next `admit` past the lease reclaims
+the lane with a fresh generation, so the dead holder's late completion lands
+as `StaleClaim` instead of releasing the new holder; fresh holders still
+block, and indefinite/finite-cooldown holds never reclaim. The lease exists
+because a storage outage during completion wedged staging boot forever in
+October 2026: every restart's admission was refused and the container never
+served. One admitted attempt holds the lane for a single HTTP exchange only,
+so 60 s is generous headroom for any live holder.
+
+Indefinite holds require explicitly authorized reconciliation. There is
+intentionally no startup reset or "force send" switch. Before any manual
+release, fence **all** credential users, prove the old send cannot continue,
+reconcile the effect/provider cooldown, and record evidence for the exact
+generation. Do not delete/reset the lane, rotate a credential, or release an
+indefinite hold merely because a process is old or a receiver idempotency
+claim is stale. Those operations are not authorized by this implementation.
+Persist this table across restarts and authority failover; a blank replacement
+database is not recovery evidence.
 
 The existing receiver HMAC provisioning, staging/production deployment and
 activation holds remain unchanged.

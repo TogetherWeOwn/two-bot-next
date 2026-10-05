@@ -51,6 +51,15 @@ fn finite_delay(cooldown: Option<SendCooldown>) -> Option<i64> {
     }
 }
 
+/// A held lane self-heals past this age (database clock, ms). One admitted
+/// attempt holds the lane for a single HTTP exchange (5 s wire plus 5 s body
+/// budgets and receipt validation), so 60 s is generous headroom for any live
+/// holder and heals a dead holder within about two boot intervals. Indefinite
+/// and finite-cooldown holds never heal: they are deliberate pacing, not dead
+/// holders. Reclaiming bumps the generation, so the dead holder's late
+/// completion lands as `StaleClaim` and cannot release the new holder.
+pub const IN_FLIGHT_LEASE_MS: i64 = 60_000;
+
 impl SendAdmission for PgSendAdmission {
     fn token_key(&self) -> &TokenKey {
         &self.key
@@ -61,10 +70,18 @@ impl SendAdmission for PgSendAdmission {
             // One autocommitted statement, not a transaction held over HTTP.
             // Commit precedes sending. Losing/cancelling this query can only
             // leave a durable occupied row; it cannot grant another sender.
+            // Each take stamps the database clock so a dead holder's lane is
+            // reclaimable past the lease (second statement below).
             let row = sqlx::query(
-                "INSERT INTO public.discord_send_admission (token_key, in_flight, generation) \
-                 VALUES ($1, TRUE, 1) ON CONFLICT (token_key) DO UPDATE SET \
-                   in_flight = TRUE, generation = discord_send_admission.generation + 1 \
+                "INSERT INTO public.discord_send_admission \
+                   (token_key, in_flight, generation, in_flight_since_ms) \
+                 VALUES ($1, TRUE, 1, \
+                   (extract(epoch FROM clock_timestamp()) * 1000)::bigint) \
+                 ON CONFLICT (token_key) DO UPDATE SET \
+                   in_flight = TRUE, \
+                   generation = discord_send_admission.generation + 1, \
+                   in_flight_since_ms = \
+                     (extract(epoch FROM clock_timestamp()) * 1000)::bigint \
                  WHERE NOT discord_send_admission.in_flight \
                    AND NOT discord_send_admission.indefinite \
                    AND discord_send_admission.hold_until_ms <= \
@@ -72,6 +89,48 @@ impl SendAdmission for PgSendAdmission {
                  RETURNING generation",
             )
             .bind(&self.key.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| {
+                metrics::global().db_error("admission");
+                metrics::global().send_admission("storage_error");
+                AdmissionError::Storage
+            })?;
+            if let Some(row) = row {
+                let generation: i64 = row.try_get("generation").map_err(|_| {
+                    metrics::global().db_error("admission");
+                    metrics::global().send_admission("storage_error");
+                    AdmissionError::Storage
+                })?;
+                metrics::global().send_admission("admitted");
+                return Ok(AdmissionPermit::new(Box::new(PgCompletion {
+                    gate: self.clone(),
+                    generation,
+                })));
+            }
+            // The lane is held. A fresh holder still blocks, but a holder dead
+            // past the lease (crashed process, or a completion lost to a
+            // storage outage) is reclaimed here: the generation bump turns the
+            // dead holder's late completion into `StaleClaim`, and the fresh
+            // stamp gives the new holder its own full lease. The reclaim is
+            // one atomic statement, so racing reclaimers elect exactly one
+            // winner. Indefinite and finite-cooldown holds never reclaim.
+            let row = sqlx::query(
+                "UPDATE public.discord_send_admission SET \
+                   in_flight = TRUE, \
+                   generation = generation + 1, \
+                   in_flight_since_ms = \
+                     (extract(epoch FROM clock_timestamp()) * 1000)::bigint \
+                 WHERE token_key = $1 AND in_flight \
+                   AND NOT indefinite \
+                   AND hold_until_ms <= \
+                     (extract(epoch FROM clock_timestamp()) * 1000)::bigint \
+                   AND in_flight_since_ms <= \
+                     (extract(epoch FROM clock_timestamp()) * 1000)::bigint - $2 \
+                 RETURNING generation",
+            )
+            .bind(&self.key.0)
+            .bind(IN_FLIGHT_LEASE_MS)
             .fetch_optional(&self.pool)
             .await
             .map_err(|_| {
@@ -88,6 +147,10 @@ impl SendAdmission for PgSendAdmission {
                 metrics::global().send_admission("storage_error");
                 AdmissionError::Storage
             })?;
+            tracing::warn!(
+                generation,
+                "Discord send admission reclaimed a stale in-flight lane"
+            );
             metrics::global().send_admission("admitted");
             Ok(AdmissionPermit::new(Box::new(PgCompletion {
                 gate: self.clone(),
