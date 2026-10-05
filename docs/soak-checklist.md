@@ -1659,14 +1659,13 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-cc27351: cc27351 — fix(tempvoice): isolate per-channel sweep failures (#393)
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** In TOG-10093’s mock-Discord fixture, fail one room’s delete during a sweep.
-- **Expected:** The other empty rooms are still removed and the single failure is logged.
-- **Evidence:** Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
-- **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
-- **Reason:** Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
-- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the offline voice worker and queue fixtures: inject a transient delete failure into either visitation order of two empty tracked rooms, then test successful recovery, terminal retry exhaustion, 403 suspension and changed live guards.
+- **Expected:** Both empty rooms receive an attempt; only successful cleanup is forgotten. The failed room retains provenance and its own bounded backoff, dead-letters after ten attempts without a requeue storm, and does not starve unrelated rooms. Same-room follow-ups, serial guild writes, urgent 429 holds and live readiness/occupancy/permission guards remain enforced; the bounded terminal-failure family reports once.
+- **Evidence:** Hosted CI job 111446631290 passed workspace clippy, unit/binary and integration steps on 57267902bdc8b778a813012eebb39836c375f1dd, including the new voice fixtures. Attach the exact final-head CI/review receipt before closing the repair. Local Cargo admission was refused; no local Rust pass or staging acceptance is claimed. Mock Discord and CI disposable services only; no live fault injection, staging/production SQL or credentials.
+- **Owner:** [TOG-15674](/TOG/issues/TOG-15674), [TOG-10119](/TOG/issues/TOG-10119)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot voice_rooms::tests && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib voice_rooms::tests
+- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — the separate exact-SHA voice receipt remains required; automated fixture evidence is not B4 or production acceptance.
 
 ### s13-d3d9afe: d3d9afe — fix(onboarding): withhold invisible fallback destinations (#398)
 
