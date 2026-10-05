@@ -23,11 +23,18 @@ WRANGLER = "4.147.0"
 VERSION_PROBES = (["--version"], ["-v"])
 LIMIT = 100
 MAX_BODY = 2 * 1024 * 1024
+# Cloudflare rejects the default "Python-urllib/x.y" agent at the edge with 403 (error 1010),
+# so an explicit agent is required for the gate to see the Worker at all.
+USER_AGENT = "two-bot-next-staging-rollout/1.0"
 # Consecutive fully-passing verify passes required before a completed rollout
-# whose only deviation is the control-plane `active` counter still reading 0
-# (with `healthy` at 1) is accepted. Each pass re-checks every identity and
+# whose only deviation is a `LAG_COUNTS` instance-counter shape is accepted. Each pass re-checks every identity and
 # runtime probe; any non-passing poll resets the streak.
 ACTIVE_LAG_CONFIRMATIONS = 2
+# Polls (5s apart) tolerated while a completed rollout's target image is not
+# yet reflected by the application listing. The listing is read separately from
+# the rollout record and can trail it right after a deploy; a persistent
+# mismatch still fails closed as `application_image_drift`.
+APPLICATION_IMAGE_STALE_POLLS = 12
 TOKEN = re.compile(r"[a-z0-9_]{1,32}")
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 IMAGE = rf"registry\.cloudflare\.com/[^/@\s]+/{APPLICATION}@sha256:[0-9a-f]{{64}}"
@@ -100,7 +107,7 @@ class Client:
     def request(self, url, authenticated=False):
         timeout = 10 if self.deadline is None else min(10, self.deadline - time.monotonic())
         require(timeout > 0, "rollout_timeout")
-        headers = {"Cache-Control": "no-cache"}
+        headers = {"Cache-Control": "no-cache", "User-Agent": USER_AGENT}
         if authenticated:
             headers["Authorization"] = f"Bearer {self.token}"
         try:
@@ -341,18 +348,27 @@ def converged(row, image, target_version):
             and progress_ok)
 
 
+# Control-plane counter shapes that differ from `converged` only in how Cloudflare
+# reports one serving instance: `active` still reading 0 right after the rollout,
+# or, under durable_object scheduling, the in-use instance counted `active` but
+# not `healthy` (observed steady state while the exact build served ready).
+LAG_COUNTS = (
+    {"active": 0, "healthy": 1, "failed": 0, "starting": 0, "scheduling": 0},
+    {"active": 1, "healthy": 0, "failed": 0, "starting": 0, "scheduling": 0},
+)
+
+
 def active_lag(row, image, target_version):
-    """A completed rollout identical to `converged` except the control-plane
-    `active` counter still reads 0 while `healthy` reads 1. Only `verify`
-    consults this, and only as a provisional pass that still needs consecutive
-    fully-passing exact-version runtime probes before acceptance.
+    """A completed rollout identical to `converged` except for one of the
+    `LAG_COUNTS` counter shapes. Only `verify` consults this, and only as a
+    provisional pass that still needs consecutive fully-passing exact-version
+    runtime probes before acceptance.
     """
     shape = _rollout_shape(row, image, target_version)
     if shape is None:
         return False
     counts, progress_ok = shape
-    return (counts == {"active": 0, "healthy": 1, "failed": 0, "starting": 0, "scheduling": 0}
-            and progress_ok)
+    return counts in LAG_COUNTS and progress_ok
 
 
 def worker_namespace(client, version):
@@ -509,6 +525,43 @@ def receipt(args, client=None):
     print("wrangler deploy receipt accepted")
 
 
+def image_drift_detail(client, app, row, image):
+    """Fixed-vocabulary diagnostic for `application_image_drift`.
+
+    Says where the application listing's image points relative to the pinned
+    rollout (`target`, its pre-deploy `baseline`, or `other`) and whether a
+    rollout created after the pinned one exists, with its target class. Tokens
+    and integers only; digests, configurations and ids never reach the log.
+    Returns None rather than raising, so it cannot mask the gate failure.
+    """
+    def kind(candidate, before):
+        return ("target" if candidate == image
+                else "baseline" if candidate is not None and candidate == before else "other")
+
+    try:
+        before = mapping(row.get("current_configuration")).get("image")
+        parts = [f"listing_image={kind(mapping(app.get('configuration')).get('image'), before)}"]
+        version = app.get("version")
+        target = number(row.get("target_version"))
+        if type(version) is int:
+            parts.append("app_version=" + ("equal" if version == target
+                                            else "ahead" if version > target else "behind"))
+        later = [mapping(item) for item in rollouts(client, app["id"])
+                 if mapping(item).get("id") != row.get("id")
+                 and timestamp(mapping(item).get("created_at")) > timestamp(row.get("created_at"))]
+        parts.append(f"later_rollouts={len(later)}")
+        if later:
+            newest = max(later, key=lambda item: timestamp(item.get("created_at")))
+            status = newest.get("status")
+            parts.append("latest_later="
+                         + (status if status in ("pending", "progressing", "completed", "replaced",
+                                                 "reverted") else "unknown")
+                         + ":" + kind(mapping(newest.get("target_configuration")).get("image"), before))
+        return " ".join(parts)
+    except Exception:
+        return None
+
+
 def verify(args, client):
     baseline = mapping(decode(Path(args.receipt).read_bytes()))
     version = deploy_version(read_records(args.output), baseline["started"])
@@ -517,6 +570,7 @@ def verify(args, client):
     url = staging_url()
     pinned = None
     lag_streak = 0
+    image_stale = 0
     while time.monotonic() < client.deadline:
         probed = False
         passed = False
@@ -532,8 +586,15 @@ def verify(args, client):
             complete = converged(row, image, number(pinned.get("target_version")))
             lag = False if complete else active_lag(row, image, number(pinned.get("target_version")))
             client.observation = rollout_observation(row)
-            if complete or lag:
-                require(mapping(app.get("configuration")).get("image") == image, "application_image_drift")
+            stale = (complete or lag) and mapping(app.get("configuration")).get("image") != image
+            if stale:
+                image_stale += 1
+                client.observation += f" application_image=stale polls={image_stale}"
+                if image_stale > APPLICATION_IMAGE_STALE_POLLS:
+                    raise GateError("application_image_drift", image_drift_detail(client, app, row, image))
+            else:
+                image_stale = 0
+            if (complete or lag) and not stale:
                 active_worker(client, version)
                 status, headers, body = client.request(url + "/readyz")
                 probed = True
@@ -549,17 +610,20 @@ def verify(args, client):
                         active_worker(client, version)
                         final = client.api(f"/containers/applications/{app['id']}/rollouts/{pinned['id']}")
                         require(mapping(final).get("id") == pinned["id"], "rollout_identity_drift")
-                        if complete:
-                            require(converged(final, image, pinned["target_version"]),
-                                    "rollout_not_converged")
-                        else:
-                            require(active_lag(final, image, pinned["target_version"]),
-                                    "rollout_not_converged")
+                        # The instance counters can wobble between the `converged`
+                        # and lag shapes while the exact build keeps serving, so
+                        # either completed shape passes the re-read; identity,
+                        # steps and failed/starting/scheduling stay exact.
+                        require(converged(final, image, pinned["target_version"])
+                                or active_lag(final, image, pinned["target_version"]),
+                                "rollout_not_converged")
                         final_app = application(client)
-                        require(final_app["id"] == app["id"]
+                        if not (final_app["id"] == app["id"]
                                 and final_app["durable_objects"]["namespace_id"] == baseline["namespace_id"]
-                                and mapping(final_app.get("configuration")).get("image") == image,
-                                "application_image_drift")
+                                and mapping(final_app.get("configuration")).get("image") == image):
+                            client.observation += " application_image=final_mismatch"
+                            raise GateError("application_image_drift",
+                                            image_drift_detail(client, final_app, row, image))
                         if complete or lag_streak + 1 >= ACTIVE_LAG_CONFIRMATIONS:
                             evidence = {"worker_version": version, "application_id": app["id"],
                                         "rollout_id": pinned["id"],
@@ -606,8 +670,9 @@ def main():
         print(f"staging rollout gate failed: {error}")
         if error.detail:
             print(f"staging rollout diagnostic: {error.detail}")
-        if str(error) == "rollout_timeout" and client is not None and client.observation:
-            print(f"last observation before timeout: {client.observation}")
+        if client is not None and client.observation:
+            print(f"last observation before {'timeout' if str(error) == 'rollout_timeout' else 'failure'}: "
+                  f"{client.observation}")
         return 1
     except Exception:
         # No traceback: filesystem, SDK receipt and JSON errors may carry data.

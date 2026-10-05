@@ -60,18 +60,32 @@ pub async fn record_reading(
     Ok(inserted == 1)
 }
 
-/// The whole series for a guild, oldest first (legacy `readSeries`).
+/// The whole series for a guild, oldest first (legacy `readSeries` with no
+/// `since` bound). Prefer [`read_series_since`] for a windowed trend read.
 pub async fn read_series(
     pool: &Pool<Postgres>,
     guild_id: &str,
 ) -> Result<Vec<PresenceReading>, PresenceStoreError> {
+    read_series_since(pool, guild_id, None).await
+}
+
+/// The series for a guild from `since` (an ISO-8601 UTC lower bound, inclusive)
+/// onward, oldest first. The bound is applied in the query, as legacy
+/// `readSeries(db, guildId, { since })` does, so a windowed trend report does
+/// not pull every hourly row ever collected. `None` reads the whole series.
+pub async fn read_series_since(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    since: Option<&str>,
+) -> Result<Vec<PresenceReading>, PresenceStoreError> {
     let rows: Vec<(String, i32, Option<i32>)> = sqlx::query_as(
         "SELECT observed_at, approximate_presence_count, bot_floor
            FROM presence_probe
-          WHERE guild_id = $1
+          WHERE guild_id = $1 AND ($2::text IS NULL OR observed_at >= $2)
           ORDER BY observed_at ASC",
     )
     .bind(guild_id)
+    .bind(since)
     .fetch_all(pool)
     .await?;
     let mut out = Vec::with_capacity(rows.len());
@@ -327,6 +341,72 @@ mod tests {
             read_series(&pool, "guild-a").await.unwrap()[0].bot_floor,
             None
         );
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// Legacy `test/unit.presenceprobecost.test.ts` "the trend window reads 15
+    /// days, not two years": a two-year series read with a 14-day `since` bound
+    /// returns the window rows only, and the unbounded read still returns all.
+    #[tokio::test]
+    async fn windowed_series_read_returns_only_rows_inside_the_bound() {
+        let Some((pool, schema)) = test_pool("tog_15738_trend")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping presence_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // Every 12th hour for two years from 2024-08-26: 1460 rows.
+        let start = super::super::funnel::parse_iso_millis("2024-08-26T00:00:00.000Z")
+            .expect("start parses");
+        for slot in 0..1460_i64 {
+            sqlx::query(
+                "INSERT INTO presence_probe (guild_id, observed_at, approximate_presence_count)
+                 VALUES ($1, $2, 27)",
+            )
+            .bind("guild-a")
+            .bind(super::super::funnel::format_iso_millis(
+                start + slot * 12 * 3_600_000,
+            ))
+            .execute(&pool)
+            .await
+            .expect("seed row");
+        }
+        sqlx::query(
+            "INSERT INTO presence_probe (guild_id, observed_at, approximate_presence_count)
+             VALUES ('guild-b', '2026-08-20T00:00:00.000Z', 5)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed other guild");
+
+        let end = start + 730 * 24 * 3_600_000;
+        let since = super::super::funnel::format_iso_millis(end - 14 * 86_400_000);
+        let windowed = read_series_since(&pool, "guild-a", Some(&since))
+            .await
+            .expect("windowed read");
+        let whole = read_series(&pool, "guild-a").await.expect("whole read");
+        assert_eq!(whole.len(), 1460);
+        // 14 days x 2 readings a day, lower bound inclusive.
+        assert_eq!(windowed.len(), 28);
+        assert!(windowed
+            .iter()
+            .all(|reading| reading.observed_at_ms >= end - 14 * 86_400_000));
+        assert!(windowed
+            .windows(2)
+            .all(|w| w[0].observed_at_ms < w[1].observed_at_ms));
+        // The other guild's row sits inside the window: it is neither in
+        // guild-a's 28 rows nor hidden from its own read, and an absent bound
+        // is the old whole-series read.
+        for bound in [None, Some(since.as_str())] {
+            assert_eq!(
+                read_series_since(&pool, "guild-b", bound)
+                    .await
+                    .expect("other guild")
+                    .len(),
+                1
+            );
+        }
         drop_schema(&pool, &schema).await;
     }
 

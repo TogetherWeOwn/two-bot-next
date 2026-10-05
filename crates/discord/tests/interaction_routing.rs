@@ -309,7 +309,7 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
     });
     let events = audit.0.lock().unwrap();
     assert_eq!(events.len(), restricted.len() * 3);
-    for (row, events) in restricted.iter().zip(events.chunks_exact(3)) {
+    for (row, events) in restricted.iter().zip(events.as_chunks::<3>().0) {
         for event in events {
             assert_eq!(event["message"], "command_permission_denied");
             assert_eq!(event["target"], "two_bot_core::command_permissions");

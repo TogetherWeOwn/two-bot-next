@@ -130,7 +130,14 @@ BEGIN
       INSERT INTO voice_rooms
         (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at)
         VALUES (g, 'v-' || k, 'vc-' || g, u, u, '7', '2026-10-01T00:00:00Z');
+      INSERT INTO voice_room_blocks (guild_id, room_channel_id, blocked_member_id)
+        VALUES (g, 'v-' || k, u);
+      INSERT INTO voice_owner_grants (guild_id, channel_id, member_id, revision, pending)
+        VALUES (g, 'v-' || k, u, 'fixture-owner-revision', TRUE);
       INSERT INTO voice_logging_mention_members (guild_id, member_id) VALUES (g, u);
+      INSERT INTO voice_vote_kick_audit
+        (guild_id, vote_id, event, room_id, initiator_id, target_id, outcome, occurred_at)
+        VALUES (g, 'vk-' || k, 'vote_started', 'v-' || k, u, u, 'started', '2026-10-01T00:00:00Z');
       -- Explicit exceptions are seeded too: erasure must not change safety policy.
       INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
         VALUES (g, 'fixture_' || u, to_jsonb(u), 1, u);

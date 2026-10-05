@@ -56,8 +56,9 @@ Create a B4 evidence manifest before scheduling:
   migration plan's TypeScript/no-copy assumptions are not evidence for the Rust
   schema: resolve actual table compatibility before moving data.
 - [ ] Candidate is merged, independently reviewed on its exact head, and
-  `check` (fmt, clippy `-D warnings`, tests, cargo-deny), `worker check`, `pr-lint`
-  and `gitleaks` are green on that head. Pin the resulting deployment digest.
+  `ci-ok` (the full verdict over lint, worker checks and all selected Rust/DB
+  test lanes), `worker check`, `pr-lint` and `gitleaks` are green on that head.
+  A green lint-only `check` is not enough. Pin the resulting deployment digest.
 - [ ] Each tool required below is merged into that candidate; its argument
   parsing, safety behavior and rollback have been rehearsed with disposable
   fixtures. Inspect source before invoking any help flag: in this baseline,
@@ -181,8 +182,9 @@ env -u TWO_RESTORE_URL two-bot restore fixture.ndjson.gz --dry-run
 Use a disposable fixture for a test. Missing/tampered file or nonzero exit means
 FAIL; on a real restore require exit 0 and `RESTORE VERIFIED`, then separately
 verify canonical content and required table coverage. A v4 dump covers every
-table that `crates/cutover/migrations` creates, except `xp_cooldowns` and the
-migration ledgers ([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L117)),
+table that either migration chain creates, except `xp_cooldowns`, the store
+chain's `rollback_journal`/`rollback_watermarks` and the migration ledgers
+([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L141)),
 plus retired legacy tables when the source still has them
 ([`DUMP_TABLES`](../crates/core/src/backup/dump_file.rs#L44)). Restore needs a
 target migrated to the dump's schema, and refuses before any write when a

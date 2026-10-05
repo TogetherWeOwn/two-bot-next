@@ -315,4 +315,38 @@ mod tests {
         assert_eq!(count.0, 1);
         drop_schema(&pool, &schema).await;
     }
+
+    #[tokio::test]
+    async fn sweep_with_empty_window_writes_no_events() {
+        let Some((pool, schema)) = test_pool("tog_15759_inactivity_empty")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping inactivity_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // Nobody is quiet: one recently active member and one bot. The legacy
+        // `flagInactive` still selects zero rows and writes zero events — an
+        // empty window is a successful no-op, not an error.
+        seed_member(
+            &pool,
+            "active",
+            "2026-07-01T00:00:00.000Z",
+            Some("2026-09-06T00:00:00.000Z"),
+            false,
+            None,
+        )
+        .await;
+        seed_member(&pool, "bot", "2026-07-01T00:00:00.000Z", None, true, None).await;
+        let outcome = run_sweep(&pool, "2026-09-07T00:00:00.000Z", 14)
+            .await
+            .expect("empty sweep");
+        assert!(outcome.flagged.is_empty());
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .expect("event count");
+        assert_eq!(count.0, 0);
+        drop_schema(&pool, &schema).await;
+    }
 }

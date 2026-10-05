@@ -1,9 +1,9 @@
 //! Dedicated cap-refusal enforcement for moderation durations and
 //! schedule/sticky bounds (TOG-11718).
 //!
-//! Builders advertise minima (tempban/timeout expose no `max_value` per legacy
-//! parity §1); the validators in `crate::moderation` enforce the runtime
-//! ceilings. This suite pins every inclusive edge plus the adjacent refusal,
+//! Builders advertise the same duration minima and maxima enforced by the
+//! validators in `crate::moderation`. This suite pins every inclusive edge
+//! plus the adjacent refusal,
 //! missing/non-integer refusal, and the no-echo error-text rule. Synthetic
 //! fixtures only: no Discord, network, or database.
 
@@ -240,7 +240,10 @@ fn sticky_debounce_enforces_inclusive_edges() {
 #[test]
 fn builders_advertise_the_documented_parity_bounds() {
     let definitions = moderation_commands();
-    for name in ["tempban", "timeout"] {
+    for (name, max) in [
+        ("tempban", TEMPBAN_DURATION_MAX_SECONDS),
+        ("timeout", TIMEOUT_DURATION_MAX_SECONDS),
+    ] {
         let definition = definitions
             .iter()
             .find(|d| d.name == name)
@@ -250,11 +253,11 @@ fn builders_advertise_the_documented_parity_bounds() {
             .iter()
             .find(|o| o.name == "duration_seconds")
             .expect("duration option published");
-        // Parity §1: floor advertised, no max on the wire.
+        // Next's picker mirrors the service ceiling as well as the legacy floor.
         assert_eq!(
             (duration.min_value, duration.max_value),
-            (Some(60), None),
-            "{name} builder must advertise min 60 with no max"
+            (Some(60), Some(max)),
+            "{name} builder must advertise inclusive bounds 60..={max}"
         );
     }
 

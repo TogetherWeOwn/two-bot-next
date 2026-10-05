@@ -249,6 +249,26 @@
       "sha256": "9dfe6648848bc7d42ba7534b710eab36473ac57ad5c4eee26d88d3f453d60b2f",
       "justification": "Voice V2 ownership handoff stamp so the rollback delta keeps measuring rooms whose owner_id changes in place."
     },
+    "crates/cutover/migrations/0413_voice_owner_grants.sql": {
+      "sha256": "08abf240948ea282757a3bd45158f3af83c20a5025c1f4315e9579775371b7f1",
+      "justification": "Persist room-scoped owner-grant recipients and revision-fenced cleanup before Discord writes; retain interrupted and exhausted handoffs for recovery."
+    },
+    "crates/cutover/migrations/0414_voice_rooms_custom_name.sql": {
+      "sha256": "a0c811fdde11f483bd2eab9cbb55677fff60585063e6b2f608fc4f4b3b5e9f6d",
+      "justification": "Voice V3 /name per-room custom-name override plus a change stamp so the rollback delta keeps measuring rooms renamed in place."
+    },
+    "crates/cutover/migrations/0415_internal_event_keys.sql": {
+      "sha256": "9f205bf43ab1fd5069baf32b1db8d53a5e0a7cf2ac98c5199af093ded7c667f0",
+      "justification": "Guild-fenced website event-key to Discord scheduled-event ID map for the signed event.read verifier (TOG-15757); unmapped keys refuse before any Discord call."
+    },
+    "crates/cutover/migrations/0416_voice_room_privacy.sql": {
+      "sha256": "339abf52f877b7ee310ef73f5abfa204918219503a8a6f01c4b9c29c20db4637",
+      "justification": "Voice V3 owner privacy persistence: private flag, Join channel id and the per-room block list; additive column and table only."
+    },
+    "crates/cutover/migrations/0417_voice_vote_kick_audit.sql": {
+      "sha256": "ce40e510fe70b0435c519bb4dd578a8d832395c732f5800c12ec716a1c9a7500",
+      "justification": "Voice V4 vote-kick audit trail: append-only voice_vote_kick_audit rows for vote start, refusal, result and room-scoped enforcement; kept apart from moderation_audit so a voice disconnect is never read as a member kick."
+    },
     "crates/store/migrations/0400_initial.sql": {
       "sha256": "49c7136827484e0625cad889208a03e48026acb854282de3a0a9c5aa4d951b00",
       "justification": "Add unpublished S6 funnel foundation for TOG-9811 under an unused workspace number; preserve proposed SQL bytes."

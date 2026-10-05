@@ -157,6 +157,28 @@ class CardAndInternalRefs(unittest.TestCase):
             f = ps.evaluate(env(BODY=clean, REPO_PRIVATE="false", PR_STANDARDS_MODE=mode, HEAD_REF="TOG-9-x"))
             self.assertEqual([(level, "Internal reference")], levels(f), mode)
 
+    def test_public_branch_ids_match_in_any_case_and_nested_paths(self):
+        clean = GOOD_BODY.replace("Refs: TOG-1234", "Fixes #12")
+        for ref in ("TOG-123-x", "tog-123-x", "Tog-123-x", "qa/tog-123-example", "test/pap-123-example",
+                    "fix/Papa-7-slug", "feat/area/PAP-9-slug", "fix/slug-tog-5"):
+            f = ps.evaluate(env(BODY=clean, REPO_PRIVATE="false", PR_STANDARDS_MODE="warn", HEAD_REF=ref))
+            self.assertEqual([("warning", "Internal reference")], levels(f), ref)
+            self.assertIn("branch name", f[0].message, ref)
+
+    def test_public_branch_look_alikes_and_clean_slugs_pass(self):
+        clean = GOOD_BODY.replace("Refs: TOG-1234", "Fixes #12")
+        for ref in ("fix/refresh-signing-key", "feat/voice/tog-roster", "fix/pap-smear", "fix/stog-123",
+                    "fix/utf-8-input", "chore/tog_123"):
+            f = ps.evaluate(env(BODY=clean, REPO_PRIVATE="false", HEAD_REF=ref))
+            self.assertEqual([], f, ref)
+
+    def test_private_repo_allows_lowercase_ids_in_branch(self):
+        self.assertEqual([], ps.evaluate(env(HEAD_REF="qa/tog-123-example")))
+
+    def test_public_prose_ticket_ids_stay_case_sensitive(self):
+        body = GOOD_BODY.replace("Refs: TOG-1234", "Fixes #12. The tog-123 spelling is plain text here.")
+        self.assertEqual([], ps.evaluate(env(BODY=body, REPO_PRIVATE="false")))
+
     def test_public_repo_catches_instance_links_and_hosts(self):
         for leak in ("see /TOG/issues/TOG-1", "agent://abc", "http://localhost:3100/x", "http://10.0.0.5/x",
                      "http://192.168.1.4", "https://box.tail1234.ts.net/x", "https://workforce.infextion.net/x"):

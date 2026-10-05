@@ -293,7 +293,7 @@ Temporarily ban a member
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `target` | user | true | — | — | — | — | Member to moderate |
-| `duration_seconds` | integer | true | 60 | — | — | — | Duration in seconds |
+| `duration_seconds` | integer | true | 60 | 31536000 | — | — | Duration in seconds |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
 
 ## `/timeout`
@@ -306,7 +306,7 @@ Timeout a member
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `target` | user | true | — | — | — | — | Member to moderate |
-| `duration_seconds` | integer | true | 60 | — | — | — | Duration in seconds |
+| `duration_seconds` | integer | true | 60 | 2419200 | — | — | Duration in seconds |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
 
 ## `/unlock`

@@ -431,19 +431,123 @@ async fn ticket_staff_role_and_category_fail_closed() {
     partial_mock.shutdown().await;
 }
 
+/// Strict-parser self-role IDs (17-20 digit snowflakes). Small fixture IDs
+/// like 5555/6666 fail `parse_self_role_panels`, so these carry the catalogue
+/// while the shared CHANNEL/TARGET_ROLE fixtures keep the other suites intact.
+const SELF_ROLE_CHANNEL: u64 = 10_000_000_000_000_007;
+const SELF_ROLE_MESSAGE: u64 = 10_000_000_000_000_008;
+const SELF_ROLE_ROLE: u64 = 10_000_000_000_000_004;
+
+fn self_role_channel() -> Value {
+    json!({"id": SELF_ROLE_CHANNEL.to_string(), "guild_id": GUILD.to_string(), "name": TOKEN, "type": 0, "permission_overwrites": []})
+}
+
+fn self_role_panels() -> String {
+    json!([{
+        "id": "games", "channelId": SELF_ROLE_CHANNEL.to_string(),
+        "messageId": SELF_ROLE_MESSAGE.to_string(), "mode": "button",
+        "options": [{
+            "key": "chess", "label": "Chess",
+            "roleId": SELF_ROLE_ROLE.to_string(), "permissions": "0",
+        }],
+    }])
+    .to_string()
+}
+
+fn self_role_script(target_position: u64, managed: bool) -> Vec<ScriptedResponse> {
+    let bodies = vec![
+        user(),
+        json!({"id": BOT.to_string(), "name": TOKEN, "description": "", "bot_public": true,
+            "bot_require_code_grant": false, "verify_key": "fixture", "flags": 1 << 15}),
+        json!({"user": user(), "roles": [BOT_ROLE.to_string()], "deaf": false, "mute": false, "flags": 0}),
+        json!([
+            role(GUILD, Permissions::empty(), 0, false),
+            role(BOT_ROLE, permissions(), 10, true),
+            role(
+                SELF_ROLE_ROLE,
+                Permissions::empty(),
+                target_position,
+                managed
+            )
+        ]),
+        json!([]),
+        self_role_channel(),
+    ];
+    bodies
+        .into_iter()
+        .map(|body| ScriptedResponse::json(200, body))
+        .collect()
+}
+
 #[tokio::test]
 async fn self_role_catalogue_collects_roles_and_panel_channels() {
-    let panels = json!([{"channelId": CHANNEL.to_string(), "options": [{"roleId": TARGET_ROLE.to_string()}]}]).to_string();
-    let mock = mock(script(permissions(), 1 << 15, 11, false, channel())).await;
+    let panels = self_role_panels();
+    let mock = mock(self_role_script(11, false)).await;
     let output = cli(&mock, &["--json"], &[("TWO_SELF_ROLE_PANELS", &panels)]).await;
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(report["checks"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|check| check["check"] == "role 5555" && check["status"] == "FAIL"));
+        .any(
+            |check| check["check"] == format!("role {SELF_ROLE_ROLE}") && check["status"] == "FAIL"
+        ));
     mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn self_role_catalogue_rejects_boot_refused_bounds_before_rest() {
+    let reaction_many = (0..21)
+        .map(|i| {
+            json!({
+                "key": format!("k{i:02}"), "label": "Chess",
+                "roleId": format!("10000000000000{:04}", 100 + i),
+                "permissions": "0", "emoji": format!("e{i:02}"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let too_many = json!([{
+        "id": "react", "channelId": SELF_ROLE_CHANNEL.to_string(),
+        "messageId": SELF_ROLE_MESSAGE.to_string(), "mode": "reaction",
+        "options": reaction_many,
+    }])
+    .to_string();
+    let oversized_id = json!([{
+        "id": "p".repeat(60), "channelId": SELF_ROLE_CHANNEL.to_string(),
+        "messageId": SELF_ROLE_MESSAGE.to_string(), "mode": "button",
+        "options": [{
+            "key": "k".repeat(26), "label": "Chess",
+            "roleId": SELF_ROLE_ROLE.to_string(), "permissions": "0",
+        }],
+    }])
+    .to_string();
+    let oversized_label = json!([{
+        "id": "games", "channelId": SELF_ROLE_CHANNEL.to_string(),
+        "messageId": SELF_ROLE_MESSAGE.to_string(), "mode": "button",
+        "options": [{
+            "key": "chess", "label": "a".repeat(81),
+            "roleId": SELF_ROLE_ROLE.to_string(), "permissions": "0",
+        }],
+    }])
+    .to_string();
+    for raw in [too_many, oversized_id, oversized_label] {
+        let probe = mock(vec![]).await;
+        let output = cli(&probe, &["--json"], &[("TWO_SELF_ROLE_PANELS", &raw)]).await;
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(probe.requests().is_empty());
+        probe.shutdown().await;
+    }
 }
 
 #[tokio::test]

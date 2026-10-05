@@ -20,6 +20,9 @@
 //! canonical — the test re-canonicalizes both sides before comparing).
 
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use twilight_model::{
     channel::message::{MessageFlags, MessageType},
@@ -37,10 +40,13 @@ use twilight_model::{
     voice::VoiceState,
 };
 use two_bot_core::{
-    ChannelClass, FunnelHandlers, GateClearedInput, InviteState, JoinInput, MemStore, MessageInput,
-    StoredRow, VoiceInput, WEB_ONE_CLICK_SOURCE,
+    ChannelClass, FactsSink, FunnelHandlers, GateClearedInput, InviteState, JoinInput, MemStore,
+    MemberJoinFact, MessageFact, MessageInput, NoopLeveling, RulesAcceptedFact, StoredRow,
+    VoiceEndedFact, VoiceInput, VoiceStartedFact, WEB_ONE_CLICK_SOURCE,
 };
-use two_bot_discord::{JoinObservation, JoinObserver, MemPipeline, NoClassification};
+use two_bot_discord::{
+    JoinObservation, JoinObserver, MemPipeline, NoClassification, Pipeline, ScriptedInvites,
+};
 
 const GUILD: u64 = 100_000_000_000_000_001;
 const A: u64 = 900_000_000_000_001_111;
@@ -50,6 +56,7 @@ const BOT: u64 = 900_000_000_000_000_099;
 const CH_TEXT: u64 = 200_000_000_000_000_001;
 const CH_VOICE_A: u64 = 300_000_000_000_000_001;
 const CH_VOICE_B: u64 = 300_000_000_000_000_002;
+const CH_VOICE_C: u64 = 300_000_000_000_000_003;
 const INVITER: u64 = 900_000_000_000_000_099;
 
 fn stamp(s: &str) -> String {
@@ -851,6 +858,56 @@ fn pipeline_voice_boundaries_and_reconnect_drop() {
     }));
 }
 
+/// A fresh session (READY after re-identify, not RESUMED) also drops open
+/// voice sessions (legacy 7da2c15): the leave that follows an outage ends
+/// unknown-start instead of spanning the gap. A first connect has nothing to
+/// drop and writes no rows.
+#[test]
+fn pipeline_fresh_session_ready_drops_open_voice_sessions() {
+    let ready = Event::Ready(
+        serde_json::from_value(serde_json::json!({
+            "v": 10,
+            "user": {"id": "999", "username": "mock-bot", "discriminator": "0", "bot": true, "mfa_enabled": false},
+            "session_id": "fresh-session",
+            "resume_gateway_url": "wss://gateway.discord.gg",
+            "guilds": [{"id": GUILD.to_string(), "unavailable": true}],
+            "application": {"id": "1111", "flags": 0}
+        }))
+        .expect("ready fixture"),
+    );
+    let open_sessions = |pipeline: &MemPipeline| {
+        pipeline
+            .handlers()
+            .voice_sessions
+            .lock()
+            .expect("lock")
+            .open_count()
+    };
+
+    let pipeline = MemPipeline::for_replay();
+    pipeline.handle(&ready);
+    assert_eq!(open_sessions(&pipeline), 0, "first READY is a no-op");
+    assert!(pipeline.handlers().store().rows().is_empty());
+
+    pipeline.handle(&voice_event(A, Some(CH_VOICE_A)));
+    assert_eq!(open_sessions(&pipeline), 1);
+    pipeline.handle(&ready);
+    assert_eq!(open_sessions(&pipeline), 0, "READY drops the open session");
+
+    pipeline.handle(&voice_event(A, None));
+    let rows = pipeline.handlers().store().rows();
+    let end = rows
+        .iter()
+        .find(|r| r.event_type == two_bot_core::EventType::VoiceSessionEnd)
+        .expect("leave after READY writes an unknown-start end");
+    let metadata = end.metadata.as_ref().expect("end metadata");
+    assert_eq!(metadata["startKnown"], false);
+    assert!(
+        metadata["durationSeconds"].is_null(),
+        "no duration is invented across the reconnect: {metadata}"
+    );
+}
+
 /// Server leave closes the open voice session first (TOG-6122).
 #[test]
 fn pipeline_leave_closes_voice_first() {
@@ -872,6 +929,413 @@ fn pipeline_leave_closes_voice_first() {
             && r.member_id == Some(A)),
         "leave row recorded"
     );
+}
+
+/// Voice boundary rows (start/end only) in insert order.
+fn voice_boundaries(pipeline: &MemPipeline) -> Vec<StoredRow> {
+    pipeline
+        .handlers()
+        .store()
+        .rows()
+        .into_iter()
+        .filter(|r| {
+            matches!(
+                r.event_type,
+                two_bot_core::EventType::VoiceSessionStart
+                    | two_bot_core::EventType::VoiceSessionEnd
+            )
+        })
+        .collect()
+}
+
+/// Legacy `59965d0`, same-tick burst: three frames for one member that all
+/// carry ONE processing stamp. Every end resolves against the start the
+/// previous frame just wrote (`startKnown:true`, zero seconds), and the
+/// channel-scoped keys keep each boundary a row of its own instead of letting
+/// the same-instant end(A)/end(B) pair collapse.
+#[test]
+fn pipeline_same_instant_voice_burst_keeps_every_boundary_as_its_own_row() {
+    let pipeline = MemPipeline::for_replay();
+    let at = stamp("12:00:00");
+    for channel in [CH_VOICE_A, CH_VOICE_B, CH_VOICE_C] {
+        pipeline.handle_at(&voice_event(A, Some(channel)), &at);
+    }
+
+    let rows = voice_boundaries(&pipeline);
+    let boundaries: Vec<_> = rows
+        .iter()
+        .map(|r| (r.event_type, r.source.as_str()))
+        .collect();
+    let (start, end) = (
+        two_bot_core::EventType::VoiceSessionStart,
+        two_bot_core::EventType::VoiceSessionEnd,
+    );
+    assert_eq!(
+        boundaries,
+        [
+            (start, format!("channel:{CH_VOICE_A}").as_str()),
+            (end, format!("channel:{CH_VOICE_A}").as_str()),
+            (start, format!("channel:{CH_VOICE_B}").as_str()),
+            (end, format!("channel:{CH_VOICE_B}").as_str()),
+            (start, format!("channel:{CH_VOICE_C}").as_str()),
+        ]
+    );
+    let keys: std::collections::HashSet<_> = rows.iter().map(|r| &r.idempotency_key).collect();
+    assert_eq!(keys.len(), rows.len(), "no two boundaries share a key");
+    for row in &rows {
+        assert_eq!(row.occurred_at, at, "the whole burst is one instant");
+        if row.event_type == end {
+            assert_eq!(
+                row.metadata,
+                Some(serde_json::json!({
+                    "startKnown": true,
+                    "startedAt": at,
+                    "durationSeconds": 0,
+                })),
+                "end on {} is measured, not unknown-start",
+                row.source
+            );
+        }
+    }
+    let sessions = pipeline.handlers().voice_sessions.lock().expect("lock");
+    assert_eq!(sessions.open_count(), 1);
+    assert_eq!(
+        sessions.peek(GUILD, A).map(|s| s.channel_id),
+        Some(CH_VOICE_C)
+    );
+}
+
+/// Same burst, but the member comes back to the channel they started in:
+/// join A, move to B, move back to A at ONE instant. Both ends are measured
+/// and land as separate rows (their keys differ by channel). The return
+/// start(A) shares its key with the opening start(A) (same member, instant and
+/// channel; the key has no session component, as in legacy), so the store
+/// keeps the first row and the tracker still opens the new session.
+#[test]
+fn pipeline_same_instant_voice_return_to_origin_dedupes_only_the_repeat_start() {
+    let pipeline = MemPipeline::for_replay();
+    let at = stamp("12:00:00");
+    for channel in [CH_VOICE_A, CH_VOICE_B, CH_VOICE_A] {
+        pipeline.handle_at(&voice_event(A, Some(channel)), &at);
+    }
+
+    let rows = voice_boundaries(&pipeline);
+    let (start, end) = (
+        two_bot_core::EventType::VoiceSessionStart,
+        two_bot_core::EventType::VoiceSessionEnd,
+    );
+    let ends: Vec<_> = rows.iter().filter(|r| r.event_type == end).collect();
+    assert_eq!(ends.len(), 2, "end(A) and end(B) both land");
+    assert_ne!(ends[0].idempotency_key, ends[1].idempotency_key);
+    assert_eq!(
+        ends.iter().map(|r| r.source.as_str()).collect::<Vec<_>>(),
+        [
+            format!("channel:{CH_VOICE_A}").as_str(),
+            format!("channel:{CH_VOICE_B}").as_str()
+        ]
+    );
+    for row in ends {
+        assert_eq!(
+            row.metadata,
+            Some(serde_json::json!({
+                "startKnown": true,
+                "startedAt": at,
+                "durationSeconds": 0,
+            }))
+        );
+    }
+    let starts: Vec<_> = rows
+        .iter()
+        .filter(|r| r.event_type == start)
+        .map(|r| r.source.as_str())
+        .collect();
+    assert_eq!(
+        starts,
+        [
+            format!("channel:{CH_VOICE_A}").as_str(),
+            format!("channel:{CH_VOICE_B}").as_str()
+        ],
+        "the return start(A) repeats the opening start(A) key"
+    );
+    let sessions = pipeline.handlers().voice_sessions.lock().expect("lock");
+    assert_eq!(
+        sessions.peek(GUILD, A).map(|s| s.channel_id),
+        Some(CH_VOICE_A),
+        "the member is tracked in A again"
+    );
+}
+
+/// Facts double that freezes the first voice end mid-move (the tracker has
+/// closed A, start(B) has not run) until another frame reaches the same hook
+/// or `GRACE` lapses. Rendezvous waits are bounded and cancelled when either
+/// frame exits, including a panic before the hook.
+struct MoveGate {
+    ends: AtomicUsize,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+    state: Mutex<MoveGateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct MoveGateState {
+    arrivals: usize,
+    cancelled: bool,
+    overlap: bool,
+}
+
+struct CancelMoveOnExit<'a>(&'a MoveGate);
+
+impl Drop for CancelMoveOnExit<'_> {
+    fn drop(&mut self) {
+        // Cleanup must also wake the peer when a panic poisoned the mutex.
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.cancelled = true;
+        self.0.changed.notify_all();
+    }
+}
+
+impl MoveGate {
+    const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Long enough for a runnable thread to reach the hook; the lock-held path
+    /// waits it out in full. This is not a timing-free mutation proof.
+    const GRACE: Duration = Duration::from_millis(400);
+
+    fn new() -> Self {
+        Self {
+            ends: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+            state: Mutex::new(MoveGateState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn cancel_on_exit(&self) -> CancelMoveOnExit<'_> {
+        CancelMoveOnExit(self)
+    }
+
+    fn wait_for_waiting_peer(&self) {
+        let state = self.state.lock().expect("move gate");
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, Self::RENDEZVOUS_TIMEOUT, |s| {
+                s.arrivals == 0 && !s.cancelled
+            })
+            .expect("move gate");
+        assert_eq!(state.arrivals, 1, "peer reached its rendezvous wait");
+    }
+
+    fn rendezvous(&self, timeout: Duration) -> Result<(), &'static str> {
+        let mut state = self.state.lock().expect("move gate");
+        if state.cancelled {
+            return Err("voice move rendezvous cancelled");
+        }
+        state.arrivals += 1;
+        self.changed.notify_all();
+        let (mut state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |s| s.arrivals < 2 && !s.cancelled)
+            .expect("move gate");
+        if state.arrivals == 2 {
+            // Once both arrived, a later frame exit does not undo the handshake.
+            Ok(())
+        } else if state.cancelled {
+            Err("voice move rendezvous cancelled")
+        } else {
+            state.cancelled = true;
+            self.changed.notify_all();
+            Err("voice move rendezvous timed out")
+        }
+    }
+}
+
+impl FactsSink for &MoveGate {
+    fn record_member_join(&self, _: MemberJoinFact<'_>) {}
+    fn record_rules_accepted(&self, _: RulesAcceptedFact<'_>) {}
+    fn record_message(&self, _: MessageFact<'_>) {}
+    fn record_voice_started(&self, _: VoiceStartedFact<'_>) -> Option<String> {
+        None
+    }
+    fn record_voice_ended(&self, _: VoiceEndedFact<'_>) {
+        let nth = self.ends.fetch_add(1, Ordering::SeqCst);
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        if nth == 0 {
+            // Mid-move: release the competing frame, then hold the window open.
+            self.rendezvous(MoveGate::RENDEZVOUS_TIMEOUT)
+                .expect("first move rendezvous");
+            let state = self.state.lock().expect("move gate");
+            drop(
+                self.changed
+                    .wait_timeout_while(state, MoveGate::GRACE, |s| !s.overlap && !s.cancelled)
+                    .expect("move gate"),
+            );
+        } else {
+            let mut state = self.state.lock().expect("move gate");
+            state.overlap = true;
+            self.changed.notify_all();
+        }
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn move_gate_cancels_when_first_frame_exits_before_the_hook() {
+    for panic_before_hook in [false, true] {
+        let gate = MoveGate::new();
+        let pipeline = Pipeline::new(
+            MemStore::new(),
+            Some(NoopLeveling),
+            Some(&gate),
+            ScriptedInvites::new(),
+            NoClassification,
+        );
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let _cancel = gate.cancel_on_exit();
+                gate.wait_for_waiting_peer();
+                if panic_before_hook {
+                    panic!("first frame exited before its voice-end hook");
+                }
+            });
+            let second = scope.spawn(|| {
+                let _cancel = gate.cancel_on_exit();
+                gate.rendezvous(MoveGate::RENDEZVOUS_TIMEOUT)?;
+                pipeline.handle_at(&voice_event(A, Some(CH_VOICE_C)), &stamp("12:00:20"));
+                Ok(())
+            });
+            assert_eq!(first.join().is_err(), panic_before_hook);
+            assert_eq!(
+                second.join().expect("competing frame joins"),
+                Err("voice move rendezvous cancelled")
+            );
+        });
+        assert!(pipeline.handlers().store().rows().is_empty());
+        assert_eq!(gate.ends.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn move_gate_cancels_when_competing_frame_exits_before_rendezvous() {
+    for panic_before_rendezvous in [false, true] {
+        let gate = MoveGate::new();
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let _cancel = gate.cancel_on_exit();
+                gate.rendezvous(MoveGate::RENDEZVOUS_TIMEOUT)
+            });
+            let second = scope.spawn(|| {
+                let _cancel = gate.cancel_on_exit();
+                gate.wait_for_waiting_peer();
+                if panic_before_rendezvous {
+                    panic!("competing frame exited before rendezvous");
+                }
+            });
+            assert_eq!(second.join().is_err(), panic_before_rendezvous);
+            assert_eq!(
+                first.join().expect("first frame joins"),
+                Err("voice move rendezvous cancelled")
+            );
+        });
+    }
+}
+
+#[test]
+fn move_gate_times_out_without_a_peer_and_cancels_late_arrivals() {
+    let gate = MoveGate::new();
+    assert_eq!(
+        gate.rendezvous(Duration::from_millis(20)),
+        Err("voice move rendezvous timed out")
+    );
+    assert_eq!(
+        gate.rendezvous(MoveGate::RENDEZVOUS_TIMEOUT),
+        Err("voice move rendezvous cancelled")
+    );
+}
+
+/// Legacy `59965d0`, the per-member serial chain (`VoiceChains`). Frame 1
+/// (A to B) is frozen between its end(A) and start(B); only then does a second
+/// frame for the SAME member (B to C) start. With the chain, frame 2 waits for
+/// frame 1 to finish, so its end(B) finds the start frame 1 wrote. Without it,
+/// frame 2 runs inside frame 1's window, finds the tracker empty and writes an
+/// unknown-start end (and the two frames overlap in the hook).
+#[test]
+fn pipeline_serializes_same_member_voice_frames() {
+    let gate = MoveGate::new();
+    let pipeline = Pipeline::new(
+        MemStore::new(),
+        Some(NoopLeveling),
+        Some(&gate),
+        ScriptedInvites::new(),
+        NoClassification,
+    );
+    pipeline.handle_at(&voice_event(A, Some(CH_VOICE_A)), &stamp("12:00:00"));
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _cancel = gate.cancel_on_exit();
+            pipeline.handle_at(&voice_event(A, Some(CH_VOICE_B)), &stamp("12:00:10"));
+        });
+        scope.spawn(|| {
+            let _cancel = gate.cancel_on_exit();
+            // Released from inside frame 1's hook: frame 1 is provably mid-move.
+            gate.rendezvous(MoveGate::RENDEZVOUS_TIMEOUT)
+                .expect("competing frame rendezvous");
+            pipeline.handle_at(&voice_event(A, Some(CH_VOICE_C)), &stamp("12:00:20"));
+        });
+    });
+
+    assert_eq!(
+        gate.max_in_flight.load(Ordering::SeqCst),
+        1,
+        "two frames for one member were inside the voice critical section at once"
+    );
+    let rows = pipeline.handlers().store().rows();
+    let boundaries: Vec<_> = rows
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.event_type,
+                two_bot_core::EventType::VoiceSessionStart
+                    | two_bot_core::EventType::VoiceSessionEnd
+            )
+        })
+        .map(|r| (r.event_type, r.source.clone(), r.occurred_at.clone()))
+        .collect();
+    let (start, end) = (
+        two_bot_core::EventType::VoiceSessionStart,
+        two_bot_core::EventType::VoiceSessionEnd,
+    );
+    assert_eq!(
+        boundaries,
+        [
+            (start, format!("channel:{CH_VOICE_A}"), stamp("12:00:00")),
+            (end, format!("channel:{CH_VOICE_A}"), stamp("12:00:10")),
+            (start, format!("channel:{CH_VOICE_B}"), stamp("12:00:10")),
+            (end, format!("channel:{CH_VOICE_B}"), stamp("12:00:20")),
+            (start, format!("channel:{CH_VOICE_C}"), stamp("12:00:20")),
+        ],
+        "frames apply whole and in order"
+    );
+    for row in rows.iter().filter(|r| r.event_type == end) {
+        assert_eq!(
+            row.metadata
+                .as_ref()
+                .and_then(|m| m.get("startKnown"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "end on {} lost its start to an interleaved frame",
+            row.source
+        );
+        assert_eq!(
+            row.metadata
+                .as_ref()
+                .and_then(|m| m.get("durationSeconds"))
+                .and_then(serde_json::Value::as_i64),
+            Some(10)
+        );
+    }
 }
 
 /// InviteCreate seeds the baseline so the next join measures growth.

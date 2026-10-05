@@ -613,6 +613,21 @@ class ActiveLagTests(OfflineTestCase):
         self.assertFalse(rollout.converged(lag_row(), IMAGE, 8))
         self.assertTrue(rollout.active_lag(lag_row(), IMAGE, 8))
 
+    def test_in_use_singleton_counted_active_not_healthy_is_lag_not_converged(self):
+        # durable_object scheduling: the serving instance reads active=1, healthy=0.
+        row = completed_row()
+        row["health"]["instances"].update(active=1, healthy=0)
+        self.assertFalse(rollout.converged(row, IMAGE, 8))
+        self.assertTrue(rollout.active_lag(row, IMAGE, 8))
+        for key in ["failed", "starting", "scheduling"]:
+            with self.subTest(key=key):
+                bad = completed_row()
+                bad["health"]["instances"].update(active=1, healthy=0, **{key: 1})
+                self.assertFalse(rollout.active_lag(bad, IMAGE, 8))
+        idle = completed_row()
+        idle["health"]["instances"].update(active=0, healthy=0)
+        self.assertFalse(rollout.active_lag(idle, IMAGE, 8))
+
     def test_pending_and_progressing_are_never_lag(self):
         for status in ["pending", "progressing"]:
             with self.subTest(status=status):
@@ -1094,6 +1109,51 @@ class OrchestrationTests(OfflineTestCase):
         self.assert_no_evidence()
         self.assert_no_secret_saved_or_printed()
 
+    def fresh_baseline(self):
+        # `prepare` refuses a stale deploy output, so loops reset the fixtures.
+        Path(self.args.output).unlink(missing_ok=True)
+        self.prepare_baseline()
+        self.write_deploy_output()
+
+    def test_final_reread_accepts_counters_that_wobble_between_completed_shapes(self):
+        # First read lag, final read converged (and the reverse): the exact
+        # build served ready both times, so a counter wobble must not fail.
+        for first, final, active_lag_expected in [
+            (lag_row(), completed_row(), True),
+            (completed_row(), lag_row(), False),
+        ]:
+            with self.subTest(first_is_lag=active_lag_expected):
+                self.fresh_baseline()
+                client = verify_client()
+                client.api_routes[ROWS_PATH] = [[old_row(), first]]
+                client.api_routes[DETAIL_PATH] = [first, final]
+                if active_lag_expected:
+                    client.api_routes[DETAIL_PATH] = [first, first, first, final]
+                    client.request_routes[URL + "/readyz"] = [ready_response()]
+                    client.deadline = 130
+                rollout.verify(self.args, client)
+                evidence = json.loads(Path(self.args.evidence).read_text())
+                self.assertEqual(evidence.get("active_lag", False), active_lag_expected)
+                Path(self.args.evidence).unlink()
+
+    def test_final_reread_still_rejects_failed_starting_or_idle_counters(self):
+        for key, value in [("failed", 1), ("starting", 1), ("scheduling", 1)]:
+            with self.subTest(key=key):
+                self.fresh_baseline()
+                client = verify_client()
+                bad = completed_row()
+                bad["health"]["instances"][key] = value
+                client.api_routes[DETAIL_PATH] = [completed_row(), bad]
+                self.assert_gate("rollout_not_converged", rollout.verify, self.args, client)
+                self.assert_no_evidence()
+        idle = completed_row()
+        idle["health"]["instances"].update(active=0, healthy=0)
+        self.fresh_baseline()
+        client = verify_client()
+        client.api_routes[DETAIL_PATH] = [completed_row(), idle]
+        self.assert_gate("rollout_not_converged", rollout.verify, self.args, client)
+        self.assert_no_evidence()
+
     def test_lag_without_exact_runtime_never_succeeds(self):
         self.prepare_baseline()
         self.write_deploy_output()
@@ -1338,7 +1398,7 @@ class OrchestrationTests(OfflineTestCase):
             "components=process:ready,gateway:down identity=match "
             "gateway_failure=durable_gateway:milestones_load_failed"])
 
-    def test_main_prints_last_observation_only_for_rollout_timeout(self):
+    def test_main_prints_last_observation_for_timeout_and_omits_it_before_any_poll(self):
         self.prepare_baseline()
         self.write_deploy_output()
         argv = ["staging_rollout.py", "verify", "--receipt", self.args.receipt,
@@ -1391,11 +1451,134 @@ class OrchestrationTests(OfflineTestCase):
                                  ("configuration", {"image": OLD_IMAGE}, "application_image_drift")]:
             with self.subTest(key=key):
                 client = verify_client()
+                client.deadline = 400  # long enough to exhaust the stale-image tolerance
                 changed = app()
                 changed[key] = value
                 client.api_routes[APP_PATH] = [[changed]]
                 self.assert_gate(code, rollout.verify, self.args, client)
                 self.assert_no_evidence()
+
+    def test_application_listing_trailing_the_completed_rollout_is_tolerated(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        stale = app()
+        stale["configuration"] = {"image": OLD_IMAGE}
+        client.api_routes[APP_PATH] = [[stale], [stale], [app()]]
+        client.deadline = 400
+        rollout.verify(self.args, client)
+        evidence = json.loads(Path(self.args.evidence).read_text())
+        self.assertEqual(evidence["image"], IMAGE)
+        self.assertNotIn("active_lag", evidence)
+        # Stale polls never count toward acceptance: two waits, then the fresh pass.
+        self.assertEqual(self.clock.sleeps[:2], [5, 5])
+        self.assert_no_secret_saved_or_printed()
+
+    def test_stale_application_image_is_reported_and_never_accepted(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        stale = app()
+        stale["configuration"] = {"image": OLD_IMAGE}
+        client.api_routes[APP_PATH] = [[stale]]
+        client.deadline = 100 + 5 * 3  # times out before the tolerance runs out
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertIn("application_image=stale", client.observation)
+        self.assert_no_evidence()
+
+    def test_persistent_stale_application_image_fails_as_drift_after_the_tolerance(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        stale = app()
+        stale["configuration"] = {"image": OLD_IMAGE}
+        client.api_routes[APP_PATH] = [[stale]]
+        client.deadline = 1000
+        self.assert_gate("application_image_drift", rollout.verify, self.args, client)
+        self.assertEqual(client.calls.count(("api", APP_PATH)), rollout.APPLICATION_IMAGE_STALE_POLLS + 1)
+        self.assert_no_evidence()
+
+    def drift_error(self, client):
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.verify(self.args, client)
+        self.assertEqual(str(caught.exception), "application_image_drift")
+        return caught.exception
+
+    def test_persistent_stale_image_drift_reports_where_the_listing_points(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        stale = app(OLD_IMAGE)
+        stale["version"] = 7
+        client.api_routes[APP_PATH] = [[stale]]
+        client.deadline = 1000
+        error = self.drift_error(client)
+        self.assertEqual(error.detail, "listing_image=baseline app_version=behind later_rollouts=0")
+        polls = rollout.APPLICATION_IMAGE_STALE_POLLS + 1
+        self.assertIn(f"application_image=stale polls={polls}", client.observation)
+        self.assert_no_secret_saved_or_printed()
+
+    def test_image_drift_detail_names_a_later_reverting_rollout_without_leaking_it(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+        reverting = completed_row()
+        reverting.update(id="reverting_rollout", created_at=date(1))
+        reverting["target_configuration"]["image"] = OLD_IMAGE
+        client.api_routes[ROWS_PATH] = [[old_row(), completed_row()],
+                                        [old_row(), completed_row(), reverting]]
+        client.deadline = 1000
+        error = self.drift_error(client)
+        self.assertEqual(error.detail, "listing_image=baseline later_rollouts=1 latest_later=completed:baseline")
+        for leaked in (OLD_IMAGE, IMAGE, SENTINEL, "reverting_rollout"):
+            self.assertNotIn(leaked, error.detail)
+
+    def test_image_drift_detail_classifies_an_unrelated_listing_image(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[app(REPOSITORY + "@sha256:" + "f" * 64)]]
+        client.deadline = 1000
+        self.assertEqual(self.drift_error(client).detail, "listing_image=other later_rollouts=0")
+
+    def test_final_image_mismatch_carries_the_same_detail_and_observation(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[app()], [app(OLD_IMAGE)]]
+        error = self.drift_error(client)
+        self.assertEqual(error.detail, "listing_image=baseline later_rollouts=0")
+        self.assertIn("application_image=final_mismatch", client.observation)
+
+    def test_image_drift_detail_failure_never_masks_the_gate_error(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+        client.api_routes[ROWS_PATH] = [[old_row(), completed_row()], RuntimeError(SENTINEL)]
+        client.deadline = 1000
+        self.assertIsNone(self.drift_error(client).detail)
+
+    def test_main_prints_the_drift_detail_and_last_observation(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        argv = ["staging_rollout.py", "verify", "--receipt", self.args.receipt,
+                "--output", self.args.output, "--evidence", self.args.evidence]
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+        client.deadline = 1000
+        self.stdout.seek(0)
+        self.stdout.truncate()
+        with patch.object(sys, "argv", argv), patch.object(rollout, "Client", return_value=client):
+            self.assertEqual(rollout.main(), 1)
+        polls = rollout.APPLICATION_IMAGE_STALE_POLLS + 1
+        self.assertEqual(self.stdout.getvalue().splitlines(), [
+            "staging rollout gate failed: application_image_drift",
+            "staging rollout diagnostic: listing_image=baseline later_rollouts=0",
+            f"last observation before failure: rollout=completed instances=active:1,healthy:1,failed:0,"
+            f"starting:0,scheduling:0 application_image=stale polls={polls}"])
+        self.assert_no_secret_saved_or_printed()
 
     def test_final_application_id_namespace_and_image_are_rechecked(self):
         self.prepare_baseline()
@@ -1602,6 +1785,32 @@ class OrchestrationTests(OfflineTestCase):
                 with patch.dict(os.environ, {"STAGING_URL": url}):
                     self.assert_gate("invalid_staging_url", rollout.verify, self.args, verify_client())
                 self.assert_no_evidence()
+
+
+class UserAgentTests(unittest.TestCase):
+    def test_requests_send_an_explicit_user_agent(self):
+        seen = []
+
+        class Response(io.BytesIO):
+            status = 200
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class Opener:
+            def open(self, request, timeout):
+                seen.append(request.get_header("User-agent"))
+                return Response(b"ok")
+
+        client = rollout.Client("0" * 32, "token")
+        client.opener = Opener()
+        client.request("https://example.invalid/readyz")
+        self.assertEqual(seen, [rollout.USER_AGENT])
+        self.assertFalse(seen[0].startswith("Python-urllib"))
 
 
 if __name__ == "__main__":

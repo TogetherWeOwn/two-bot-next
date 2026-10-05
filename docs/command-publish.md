@@ -105,6 +105,17 @@ can precede a later database/session/shard startup failure; those failures do
 not roll the registry back. Use the explicit CLI dry run to inspect removals
 before opting into this boot behavior.
 
+**Staging** opts in from `wrangler.toml` (`[env.staging.vars]`):
+`TWO_COMMANDS_PUBLISH_ON_BOOT = "1"` plus the staging bot's public
+`DISCORD_APPLICATION_ID`. The container publishes with its own send-admission
+database, so an operator CLI run needs no second database credential, and the
+live-guild fence stays on. `scripts/check-env-bindings.py` rejects the opt-in
+at top level and in production; production publication stays an
+Operator-approved Worker binding. The staging guild's registry is a full
+replacement on every boot where the hashes differ: do not keep a separate
+dynamic registry there. Rollback: delete both lines and redeploy, then publish
+the reduced set with the CLI if commands must be removed.
+
 Each enabled boot fetches the full registry, including localizations, and
 compares canonical SHA-256 hashes. A matching fetched hash skips PUT. This
 fetch-and-compare approach needs no DB publication-hash table, works across
