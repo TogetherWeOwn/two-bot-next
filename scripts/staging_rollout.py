@@ -586,6 +586,11 @@ def verify(args, client):
             complete = converged(row, image, number(pinned.get("target_version")))
             lag = False if complete else active_lag(row, image, number(pinned.get("target_version")))
             client.observation = rollout_observation(row)
+            if not (complete or lag):
+                # An out-of-band Worker version (secret put outside the deploy)
+                # invalidates the ownership record, so this rollout can never
+                # converge: fail fast instead of burning the verify budget.
+                active_worker(client, version)
             stale = (complete or lag) and mapping(app.get("configuration")).get("image") != image
             if stale:
                 image_stale += 1
