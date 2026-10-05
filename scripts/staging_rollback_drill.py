@@ -53,6 +53,25 @@ AUTH_STATUSES = ("401", "403")
 class DrillClient(rollout.Client):
     """The gate's read-only client plus the one authenticated deployment POST."""
 
+    def request(self, url, authenticated=False):
+        if not authenticated:
+            return super().request(url)
+        timeout = 10 if self.deadline is None else min(10, self.deadline - time.monotonic())
+        require(timeout > 0, "rollout_timeout")
+        request = Request(url, headers={"Authorization": f"Bearer {self.token}",
+                                        "Cache-Control": "no-cache", "User-Agent": rollout.USER_AGENT})
+        try:
+            with self.opener.open(request, timeout=timeout) as response:
+                require(response.status == 200, "api_http_failure", f"status={response.status}")
+                body = response.read(rollout.MAX_BODY + 1)
+                require(len(body) <= rollout.MAX_BODY, "response_too_large")
+                return response.status, response.headers, body
+        except HTTPError as error:
+            # Keep the numeric status, never the URL, reason, headers or body.
+            raise GateError("api_http_failure", f"status={error.code}") from None
+        except (URLError, TimeoutError, OSError):
+            raise GateError("api_transport_failure") from None
+
     def post(self, path, body):
         request = Request(
             self.base + path, data=json.dumps(body).encode(), method="POST",
@@ -108,11 +127,17 @@ def serving_version(client):
     return current
 
 
+def authentication_failure(error):
+    return str(error) == "ownership_auth_failed" or (
+        str(error) == "api_http_failure" and
+        any(f"status={status}" in (error.detail or "") for status in AUTH_STATUSES))
+
+
 def container_snapshot(client):
     """Best-effort image digest and instance counts of the newest container rollout.
 
     A Worker rollback does not change the container image, so this records what
-    kept serving. Never fails the drill: evidence only.
+    kept serving. Evidence only, unless authentication fails: that stops the run.
     """
     try:
         app = rollout.application(client)
@@ -121,7 +146,11 @@ def container_snapshot(client):
         image = rollout.mapping(latest.get("target_configuration")).get("image")
         digest = image.rsplit("@", 1)[1] if isinstance(image, str) and re.fullmatch(rollout.IMAGE, image) else None
         return {"image_digest": digest, "rollout": rollout.rollout_observation(latest)}
-    except (GateError, ValueError):
+    except GateError as error:
+        if authentication_failure(error):
+            raise
+        return {"unavailable": True}
+    except ValueError:
         return {"unavailable": True}
 
 
@@ -262,8 +291,7 @@ class Drill:
 
     def failed(self, phase, error):
         code = str(error)
-        if code == "ownership_auth_failed" or (code == "api_http_failure" and
-                                               any(f"status={s}" in (error.detail or "") for s in AUTH_STATUSES)):
+        if authentication_failure(error):
             self.auth_failed = True
         detail = f" ({error.detail})" if error.detail else ""
         self.log(f"{phase} failed: {code}{detail}")
@@ -278,8 +306,11 @@ def ownership_control(token, url, actor, root=None):
         command = ["node", str(root / "wrangler/scripts/ownership-control.mjs"), action]
         if epoch is not None:
             command.append(str(epoch))
-        env = {**os.environ, "STAGING_WORKER_URL": url, "OWNERSHIP_CONTROL_TOKEN": token,
-               "OWNERSHIP_ACTOR": actor, "OWNERSHIP_RELEASE_FENCE": "true" if release_fence else "false"}
+        # PATH locates setup-node's runtime. No other inherited variables are needed;
+        # in particular, exclude Cloudflare credentials and Node loader options.
+        env = {"PATH": os.environ.get("PATH", os.defpath), "STAGING_WORKER_URL": url,
+               "OWNERSHIP_CONTROL_TOKEN": token, "OWNERSHIP_ACTOR": actor,
+               "OWNERSHIP_RELEASE_FENCE": "true" if release_fence else "false"}
         try:
             result = subprocess.run(command, env=env, capture_output=True, timeout=90, text=True)
         except (OSError, subprocess.SubprocessError):

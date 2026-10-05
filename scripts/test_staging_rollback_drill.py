@@ -5,11 +5,12 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 spec = importlib.util.spec_from_file_location(
     "staging_rollback_drill", Path(__file__).with_name("staging_rollback_drill.py"))
@@ -41,6 +42,7 @@ class World:
         self.reject_post = None
         self.fail_control = {}  # (action, nth call) -> error to raise
         self.never_ready = set()  # versions whose Worker never reports ready
+        self.events = []  # ordered API and ownership calls for the transport fixtures
 
     def tick(self, seconds):
         self.t += seconds
@@ -83,11 +85,49 @@ class FakeClient:
         return (200 if up else 503), {"x-two-worker-version": version}, body.encode()
 
 
+class WorldOpener:
+    """Exercise the real authenticated client against the offline singleton."""
+
+    def __init__(self, world, refusal, status):
+        self.world, self.refusal, self.status = world, refusal, status
+        self.counts = {}
+        self.refused_at = None
+
+    def open(self, request, timeout):
+        path = request.full_url.removeprefix(f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}")
+        method = request.get_method()
+        self.world.events.append((method, path))
+        key = (method, path)
+        self.counts[key] = self.counts.get(key, 0) + 1
+        if (path, self.counts[key]) == self.refusal and method == "GET":
+            self.refused_at = len(self.world.events)
+            raise HTTPError(request.full_url + SENTINEL, self.status, SENTINEL,
+                            {"x-secret": SENTINEL}, io.BytesIO(SENTINEL.encode()))
+        fake = FakeClient(self.world)
+        if method == "POST":
+            result = fake.post(path, json.loads(request.data))
+        elif path == "/containers/applications":
+            result = [{"id": "app1", "name": drill.rollout.APPLICATION,
+                       "durable_objects": {"namespace_id": "n1"}}]
+        elif path.startswith("/containers/applications/app1/rollouts"):
+            result = [{"created_at": "2026-10-04T22:00:00Z", "status": "completed",
+                       "target_configuration": {}, "health": {"instances": {}}}]
+        else:
+            result = fake.api(path)
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.status = 200
+        response.headers = {}
+        response.read.return_value = json.dumps({"success": True, "result": result}).encode()
+        return response
+
+
 def make_control(world):
     def control(action, epoch=None, release_fence=False):
         world.tick(1)
         count = sum(1 for call in world.calls if call[0] == action) + 1
         world.calls.append((action, epoch, release_fence))
+        world.events.append(("control", action))
         failure = world.fail_control.get((action, count))
         if failure:
             raise failure
@@ -253,6 +293,50 @@ class FailureRecoveryTests(unittest.TestCase):
         self.assertEqual(failures, ["drill:api_http_failure", "restore_skipped_after_auth_failure"])
         self.assertEqual(len(world.posts), 1)
 
+    def test_authenticated_get_refusal_stops_every_later_control_and_deployment(self):
+        # Deployment reads before/after each POST, plus both best-effort snapshot reads.
+        cases = [
+            ("drill", DEPLOYMENTS_PATH, 3, 0, "fenced"),
+            ("drill", DEPLOYMENTS_PATH, 4, 1, "fenced"),
+            ("restore", DEPLOYMENTS_PATH, 5, 1, "fenced"),
+            ("restore", DEPLOYMENTS_PATH, 6, 2, "fenced"),
+            ("drill", "/containers/applications", 1, 1, "active"),
+            ("restore", "/containers/applications", 2, 2, "active"),
+            ("drill", "/containers/applications/app1/rollouts?limit=100", 1, 1, "active"),
+            ("restore", "/containers/applications/app1/rollouts?limit=100", 2, 2, "active"),
+        ]
+        for status in (401, 403):
+            for phase, path, nth, posts, owner_phase in cases:
+                with self.subTest(status=status, phase=phase, path=path, nth=nth):
+                    world, logs = World(), []
+                    client = drill.DrillClient(ACCOUNT, SENTINEL)
+                    opener = client.opener = WorldOpener(world, (path, nth), status)
+                    # Keep real Cloudflare GET/POST handling, but no live readiness probes.
+                    authenticated_request = client.request
+
+                    def request(url, authenticated=False):
+                        if authenticated:
+                            return authenticated_request(url, authenticated=True)
+                        return FakeClient(world).request(url)
+
+                    with patch.object(client, "request", side_effect=request):
+                        instance = drill.Drill(client, make_control(world), URL, "123456",
+                                               now=lambda: world.t, sleep=world.tick, log=logs.append)
+                        failures = instance.run(TARGET)
+                    expected = [f"{phase}:api_http_failure"]
+                    if phase == "drill":
+                        expected.append("restore_skipped_after_auth_failure")
+                    self.assertEqual(failures, expected)
+                    self.assertTrue(instance.auth_failed)
+                    self.assertIsNotNone(opener.refused_at)
+                    self.assertEqual(world.events[opener.refused_at:], [])
+                    self.assertEqual(len(world.posts), posts)
+                    self.assertEqual(world.phase, owner_phase)
+                    self.assertIn(f"status={status}", "\n".join(logs))
+                    for text in ("\n".join(logs), json.dumps(instance.evidence),
+                                 drill.summary(instance.evidence, failures)):
+                        self.assertNotIn(SENTINEL, text)
+
     def test_unexpected_exception_still_attempts_the_restore_without_a_traceback(self):
         world = World()
         world.fail_control[("deployment-takeover", 1)] = KeyError(SENTINEL)
@@ -315,6 +399,76 @@ class ClientAndControlTests(unittest.TestCase):
     def client(self):
         return drill.DrillClient(ACCOUNT, SENTINEL)
 
+    def test_get_auth_error_keeps_status_but_never_reads_or_echoes_upstream_data(self):
+        for status in (401, 403):
+            with self.subTest(status=status):
+                client = self.client()
+                body = MagicMock()
+                error = HTTPError("https://api.cloudflare.com/" + SENTINEL, status, SENTINEL,
+                                  {"x-secret": SENTINEL}, body)
+                client.opener = MagicMock()
+                client.opener.open.side_effect = error
+                with self.assertRaises(GateError) as caught:
+                    client.api(DEPLOYMENTS_PATH)
+                self.assertEqual(str(caught.exception), "api_http_failure")
+                self.assertEqual(caught.exception.detail, f"status={status}")
+                body.read.assert_not_called()
+                self.assertNotIn(SENTINEL, repr(caught.exception.detail))
+
+    def test_get_diagnostics_do_not_change_other_rollout_clients_or_probes(self):
+        for status in (401, 403):
+            for client_type in (drill.DrillClient, drill.rollout.Client):
+                with self.subTest(status=status, client=client_type.__name__):
+                    client = client_type(ACCOUNT, SENTINEL)
+                    client.opener = MagicMock()
+                    client.opener.open.side_effect = HTTPError(URL, status, SENTINEL, {}, io.BytesIO(b""))
+                    self.assertEqual(client.request(URL + "/readyz"), (status, {}, b""))
+                    if client_type is drill.rollout.Client:
+                        with self.assertRaises(GateError) as caught:
+                            client.api(DEPLOYMENTS_PATH)
+                        self.assertIsNone(caught.exception.detail)
+
+    def test_authenticated_get_preserves_transport_and_redirect_refusals(self):
+        for error, code in ((URLError(SENTINEL), "api_transport_failure"),
+                            (TimeoutError(SENTINEL), "api_transport_failure"),
+                            (GateError("unexpected_redirect"), "unexpected_redirect")):
+            with self.subTest(code=code):
+                client = self.client()
+                client.opener = MagicMock()
+                client.opener.open.side_effect = error
+                with self.assertRaises(GateError) as caught:
+                    client.api(DEPLOYMENTS_PATH)
+                self.assertEqual(str(caught.exception), code)
+                self.assertIsNone(caught.exception.detail)
+
+    def test_authenticated_get_keeps_deadline_headers_and_body_limit(self):
+        client = self.client()
+        client.deadline = 12
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.status = 200
+        response.headers = {}
+        response.read.return_value = b'{"success": true, "result": {}}'
+        client.opener = MagicMock()
+        client.opener.open.return_value = response
+        with patch.object(drill.time, "monotonic", return_value=10):
+            self.assertEqual(client.api(DEPLOYMENTS_PATH), {})
+        request = client.opener.open.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"), f"Bearer {SENTINEL}")
+        self.assertEqual(request.get_header("User-agent"), drill.rollout.USER_AGENT)
+        self.assertEqual(request.get_header("Cache-control"), "no-cache")
+        self.assertEqual(client.opener.open.call_args.kwargs["timeout"], 2)
+        response.read.assert_called_once_with(drill.rollout.MAX_BODY + 1)
+        response.read.return_value = b"x" * (drill.rollout.MAX_BODY + 1)
+        with patch.object(drill.time, "monotonic", return_value=10), self.assertRaises(GateError) as caught:
+            client.api(DEPLOYMENTS_PATH)
+        self.assertEqual(str(caught.exception), "response_too_large")
+        client.opener.reset_mock()
+        with patch.object(drill.time, "monotonic", return_value=12), self.assertRaises(GateError) as caught:
+            client.api(DEPLOYMENTS_PATH)
+        self.assertEqual(str(caught.exception), "rollout_timeout")
+        client.opener.open.assert_not_called()
+
     def test_post_error_keeps_only_status_and_integer_codes(self):
         client = self.client()
         envelope = json.dumps({"errors": [{"code": 10220, "message": SENTINEL},
@@ -364,6 +518,35 @@ class ClientAndControlTests(unittest.TestCase):
         with patch.object(drill.subprocess, "run", return_value=done) as run:
             control("deployment-takeover", release_fence=True)
         self.assertEqual(run.call_args.kwargs["env"]["OWNERSHIP_RELEASE_FENCE"], "true")
+
+    def test_child_environment_keeps_only_path_and_explicit_ownership_inputs(self):
+        inherited = {"PATH": "/runtime/bin:/usr/bin", "CLOUDFLARE_API_TOKEN": SENTINEL,
+                     "GH_TOKEN": SENTINEL, "DATABASE_URL": SENTINEL, "UNRELATED_SECRET": SENTINEL,
+                     "NODE_OPTIONS": SENTINEL, "NODE_PATH": SENTINEL, "LD_PRELOAD": SENTINEL,
+                     "HTTPS_PROXY": SENTINEL, "HOME": SENTINEL, "STAGING_WORKER_URL": SENTINEL,
+                     "OWNERSHIP_CONTROL_TOKEN": "wrong", "OWNERSHIP_ACTOR": "wrong",
+                     "OWNERSHIP_RELEASE_FENCE": "true"}
+        done = subprocess.CompletedProcess([], 0, stdout='{"configured": true}', stderr="")
+        actor = "github-actions:1:rollback-drill"
+        control = drill.ownership_control(SENTINEL, URL, actor, root="/repo")
+        for runtime in ({"PATH": inherited["PATH"]}, {}):
+            with self.subTest(path_present=bool(runtime)):
+                parent = {key: value for key, value in inherited.items() if key != "PATH"}
+                with patch.dict(os.environ, {**parent, **runtime}, clear=True), \
+                        patch.object(drill.subprocess, "run", return_value=done) as run:
+                    self.assertEqual(control("preflight"), {"configured": True})
+                self.assertEqual(run.call_args.kwargs["env"], {
+                    "PATH": runtime.get("PATH", os.defpath), "STAGING_WORKER_URL": URL,
+                    "OWNERSHIP_CONTROL_TOKEN": SENTINEL, "OWNERSHIP_ACTOR": actor,
+                    "OWNERSHIP_RELEASE_FENCE": "false"})
+                self.assertNotIn(SENTINEL, " ".join(run.call_args.args[0]))
+
+    @unittest.skipUnless(shutil.which("node"), "Node runtime not installed")
+    def test_minimal_child_environment_runs_node_preflight_without_network(self):
+        with patch.dict(os.environ, {"NODE_OPTIONS": "--invalid-synthetic-node-option",
+                                     "CLOUDFLARE_API_TOKEN": SENTINEL, "UNRELATED_SECRET": SENTINEL}):
+            control = drill.ownership_control(SENTINEL, URL, "github-actions:1:rollback-drill")
+            self.assertEqual(control("preflight"), {"configured": True})
 
     def test_control_failures_echo_only_known_fixed_lines(self):
         control = drill.ownership_control(SENTINEL, URL, "github-actions:1:rollback-drill", root="/repo")
