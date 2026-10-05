@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -81,6 +82,13 @@ class PinnedTreeTests(unittest.TestCase):
         self.assertEqual(set(manifests.dependency_sources(docker)),
                          set(manifests.EXPECTED_SOURCES))
 
+    def test_expected_sources_follow_workspace_members(self):
+        manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
+        derived = {"Cargo.toml", "Cargo.lock",
+                   *(f"{m}/Cargo.toml"
+                     for m in manifest["workspace"]["members"])}
+        self.assertEqual(set(manifests.EXPECTED_SOURCES), derived)
+
     def test_refused_locked_fetch_fails_closed(self):
         docker = (ROOT / "Dockerfile").read_text()
 
@@ -115,6 +123,24 @@ class DriftTests(unittest.TestCase):
         mutated = self.docker.replace(
             "COPY . .", "COPY extra-fixture.txt ./\nCOPY . .", 1)
         with self.assertRaisesRegex(AssertionError, "extra-fixture.txt"):
+            self.check(mutated)
+
+    def test_add_instruction_fails_closed(self):
+        mutated = self.docker.replace(
+            "COPY . .", "ADD rust-toolchain.toml ./\nCOPY . .", 1)
+        with self.assertRaisesRegex(AssertionError, "ADD"):
+            self.check(mutated)
+
+    def test_lowercase_copy_fails_closed(self):
+        mutated = self.docker.replace(
+            "COPY . .", "copy rust-toolchain.toml ./\nCOPY . .", 1)
+        with self.assertRaisesRegex(AssertionError, "uppercase COPY"):
+            self.check(mutated)
+
+    def test_unexpected_workdir_fails_closed(self):
+        mutated = self.docker.replace(
+            "COPY . .", "WORKDIR /app/sub\nCOPY . .", 1)
+        with self.assertRaisesRegex(AssertionError, "WORKDIR"):
             self.check(mutated)
 
     def test_unsupported_command_fails_closed(self):

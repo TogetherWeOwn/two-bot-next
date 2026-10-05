@@ -10,39 +10,85 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Pinned dependency-layer inputs: every COPY source before `COPY . .` in the
-# Dockerfile. The validator fails closed when the layer gains or loses an
-# input, so Dockerfile drift this script does not understand can never pass
-# silently. Update this set alongside the Dockerfile; the fixtures in
-# `scripts/test_check_docker_manifests.py` pin the same tree.
-EXPECTED_SOURCES = frozenset({
-    "Cargo.toml",
-    "Cargo.lock",
-    "crates/core/Cargo.toml",
-    "crates/discord/Cargo.toml",
-    "crates/bot/Cargo.toml",
-    "crates/cutover/Cargo.toml",
-    "crates/store/Cargo.toml",
-    "crates/testsupport/Cargo.toml",
-})
+# Pinned dependency-layer inputs, derived from the workspace members so the
+# pin can never drift from `Cargo.toml`: every COPY source before `COPY . .`
+# must be exactly this set. The validator fails closed when the layer gains
+# or loses an input, or carries an instruction it does not understand, so
+# Dockerfile drift this script does not understand can never pass silently.
+def _expected_sources(root):
+    manifest = tomllib.loads((root / "Cargo.toml").read_text())
+    return frozenset({
+        "Cargo.toml",
+        "Cargo.lock",
+        *(f"{member}/Cargo.toml" for member in manifest["workspace"]["members"]),
+    })
+
+
+EXPECTED_SOURCES = _expected_sources(ROOT)
+
+
+def _dependency_layer_lines(docker_text):
+    """Raw dependency-layer lines: after the builder WORKDIR up to `COPY . .`.
+
+    Scoping the scan this way keeps the pinned preamble (`FROM`, the builder
+    `WORKDIR`) out of the replay while every instruction inside the layer must
+    be an uppercase `COPY`/`RUN`. Anything else (`ADD`, `WORKDIR`, `ENV`,
+    `ARG`, lowercase variants) is left in the returned lines for the callers
+    to reject, so layer drift fails closed instead of passing unchecked.
+    """
+    lines = docker_text.replace("\\\n", " ").splitlines()
+    start = 0
+    for index, line in enumerate(lines):
+        if line.strip().upper().startswith("WORKDIR "):
+            start = index + 1
+            break
+    end = len(lines)
+    for index in range(start, len(lines)):
+        if lines[index].strip().startswith("COPY . ."):
+            end = index
+            break
+    return lines[start:end]
+
+
+def _layer_instruction(line):
+    """Split one layer line into (verb, stripped); blank/comment lines give (None, ...)."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None, stripped
+    return stripped.split(None, 1)[0].upper(), stripped
 
 
 def dependency_sources(docker_text):
-    """COPY sources of the dependency layer (everything before `COPY . .`)."""
+    """COPY sources of the dependency layer (everything before `COPY . .`).
+
+    Raises on any layer instruction that is not uppercase `COPY`/`RUN`:
+    Dockerfile verbs are case-insensitive, so a lowercase `copy` or an `ADD`
+    would otherwise add inputs the pin never sees.
+    """
     sources = []
-    for line in docker_text.replace("\\\n", " ").splitlines():
-        if line.startswith("COPY . ."):
-            break
-        if line.startswith("COPY "):
-            *srcs, _destination = shlex.split(line)[1:]
+    for line in _dependency_layer_lines(docker_text):
+        verb, stripped = _layer_instruction(line)
+        if verb is None:
+            continue
+        if verb == "COPY":
+            assert stripped.startswith("COPY "), \
+                f"dependency layer must use uppercase COPY: {stripped}"
+            *srcs, _destination = shlex.split(stripped)[1:]
             sources.extend(srcs)
+        elif verb == "RUN":
+            assert stripped.startswith("RUN "), \
+                f"dependency layer must use uppercase RUN: {stripped}"
+        else:
+            raise AssertionError(
+                f"unsupported dependency-layer instruction: {stripped}")
     return sources
 
 
-def check_sources(sources):
-    """Fail closed when the layer drifts from the pinned input set."""
-    missing = EXPECTED_SOURCES - set(sources)
-    extra = set(sources) - EXPECTED_SOURCES
+def check_sources(sources, root=ROOT):
+    """Fail closed when the layer drifts from the workspace-derived input set."""
+    expected = _expected_sources(root)
+    missing = expected - set(sources)
+    extra = set(sources) - expected
     assert not missing, f"dependency layer lost pinned inputs: {sorted(missing)}"
     assert not extra, f"dependency layer gained unpinned inputs: {sorted(extra)}"
 
@@ -55,17 +101,22 @@ def reconstruct(docker_text, root, dest):
     fail closed instead of passing unchecked.
     """
     fetch_seen = False
-    for line in docker_text.replace("\\\n", " ").splitlines():
-        if line.startswith("COPY . ."):
-            break
-        if line.startswith("COPY "):
-            *sources, destination = shlex.split(line)[1:]
+    for line in _dependency_layer_lines(docker_text):
+        verb, stripped = _layer_instruction(line)
+        if verb is None:
+            continue
+        if verb == "COPY":
+            assert stripped.startswith("COPY "), \
+                f"dependency layer must use uppercase COPY: {stripped}"
+            *sources, destination = shlex.split(stripped)[1:]
             target = dest / destination
             target.mkdir(parents=True, exist_ok=True)
             for source in sources:
                 shutil.copyfile(root / source, target / Path(source).name)
-        elif line.startswith("RUN "):
-            for command in line[4:].split("&&"):
+        elif verb == "RUN":
+            assert stripped.startswith("RUN "), \
+                f"dependency layer must use uppercase RUN: {stripped}"
+            for command in stripped[4:].split("&&"):
                 words = shlex.split(command)
                 if words[:2] == ["mkdir", "-p"]:
                     for path in words[2:]:
@@ -77,6 +128,9 @@ def reconstruct(docker_text, root, dest):
                 else:
                     raise AssertionError(
                         f"unsupported dependency-layer command: {words[0]}")
+        else:
+            raise AssertionError(
+                f"unsupported dependency-layer instruction: {stripped}")
     return fetch_seen
 
 
