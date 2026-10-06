@@ -47,7 +47,7 @@ at restore rather than silently becoming SQL NULL. Legacy JSON `null` cannot
 distinguish JSON null from SQL NULL; the legacy contract maps it to SQL NULL.
 
 `pre-reservation-v4.ndjson` is a synthetic text-encoded compatibility archive
-with the exact 83-table inventory from the Rust writer before reservation
+with the exact 85-table inventory from the Rust writer before reservation
 persistence, plus one voice room row. Empty entries have no columns. It is not a production dump or an
 execution of that historical binary: it pins the previous format/inventory
 independently of the current `DUMP_TABLES`. Unit inspection and a migrated-schema
