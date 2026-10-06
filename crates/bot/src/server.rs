@@ -73,20 +73,27 @@ fn router_with_guard(
                         // A 503 from /readyz is routine (parked, connecting or
                         // draining, including the keepalive probes), not an
                         // error. Anything else keeps the default ERROR level.
+                        // (`tracing::event!` needs a constant level, so one
+                        // fixed-level event per branch.)
                         use tower_http::classify::ServerErrorsFailureClass as Class;
-                        let level = match &classification {
+                        match &classification {
                             Class::StatusCode(code) if *code == StatusCode::SERVICE_UNAVAILABLE => {
-                                tracing::Level::DEBUG
+                                tracing::debug!(
+                                    parent: span,
+                                    classification = %classification,
+                                    latency_ms = latency.as_millis(),
+                                    "response failed"
+                                );
                             }
-                            _ => tracing::Level::ERROR,
-                        };
-                        tracing::event!(
-                            parent: span,
-                            level,
-                            classification = %classification,
-                            latency_ms = latency.as_millis(),
-                            "response failed"
-                        );
+                            _ => {
+                                tracing::error!(
+                                    parent: span,
+                                    classification = %classification,
+                                    latency_ms = latency.as_millis(),
+                                    "response failed"
+                                );
+                            }
+                        }
                     },
                 ),
         )

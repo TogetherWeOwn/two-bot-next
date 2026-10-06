@@ -40,8 +40,8 @@ impl BootActivation {
             {
                 tracing::warn!(
                     capability = capability.as_str(),
-                    guild_id = ?self.guild_id,
-                    application_id = ?self.application_id,
+                    guild_id = self.guild_id.map(|id| id.to_string()),
+                    application_id = self.application_id.map(|id| id.to_string()),
                     reason = %reason,
                     "live activation refused"
                 );

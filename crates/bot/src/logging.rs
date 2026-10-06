@@ -100,12 +100,12 @@ fn filter(rust_log: Option<&str>, log_level: Option<&str>) -> EnvFilter {
     let level = log_level
         .and_then(|value| value.parse::<LevelFilter>().ok())
         .unwrap_or(LevelFilter::INFO);
-    // Scope the default to our crates (`EnvFilter` matches target prefixes, so
+    // Scope verbosity to our crates (`EnvFilter` matches target prefixes, so
     // one directive covers two_bot, two_bot_core, two_bot_discord and the rest).
-    // Anything else keeps the implicit ERROR-only default, as before this
-    // change: dependency chatter (tower-http request lines, sqlx, twilight)
-    // stays out unless RUST_LOG opts in. RUST_LOG still overrides everything.
-    EnvFilter::new(format!("two_bot={level}"))
+    // Anything else logs at ERROR only: dependency chatter (tower-http request
+    // lines, sqlx, twilight) stays out unless RUST_LOG opts in. RUST_LOG still
+    // overrides everything.
+    EnvFilter::new(format!("error,two_bot={level}"))
 }
 
 fn subscriber<W>(
@@ -547,20 +547,103 @@ mod tests {
                         .is_some_and(|target| target.starts_with("tower_http::trace"))
                 })
                 .collect();
-            assert!(!http.is_empty(), "no request/failure logs at {level}");
-            assert!(http.iter().any(|line| line["level"] == "error"));
-            if level == "debug" {
-                assert!(http
-                    .iter()
-                    .any(|line| line["message"] == "started processing request"));
-                assert!(http.iter().any(|line| line["status"] == 200));
-            }
-            for line in http {
-                assert_eq!(line["run_id"], run_id, "{level}: {line}");
-                assert_eq!(line["spans"][0]["name"], "run");
-            }
+            // The default filter scopes verbosity to our crates (`error` floor
+            // elsewhere), so no tower line flows here at any level — in
+            // particular the routine /readyz 503 never logs at ERROR.
+            assert!(
+                http.is_empty(),
+                "tower lines must stay filtered at {level}: {http:?}"
+            );
             assert!(!capture.text().contains("synthetic-http-secret"));
             assert!(!capture.text().contains("access_token"));
+        }
+    }
+
+    /// When `RUST_LOG` admits tower-http, the routine /readyz 503 still must
+    /// not log at ERROR: the trace layer downgrades it to DEBUG.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readyz_503_downgraded_when_tower_admitted() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tracing::{instrument::WithSubscriber, Instrument};
+
+        let capture = Capture::default();
+        let dispatch = tracing::Dispatch::new(subscriber(
+            LogFormat::Json,
+            filter(Some("error,tower_http=debug"), None),
+            capture.clone(),
+        ));
+        let run = tracing::dispatcher::with_default(&dispatch, run_span);
+        let run_id = tracing::dispatcher::with_default(&dispatch, || {
+            let _guard = run.enter();
+            tracing::error!(msg = "test_run_marker");
+            capture.lines()[0]["run_id"].as_str().unwrap().to_owned()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = crate::server::SharedState::new(
+            Arc::new(tokio::sync::RwLock::new(
+                crate::gateway::GatewayState::Unconfigured,
+            )),
+            None,
+        );
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(
+            crate::server::serve_with_shutdown(
+                listener,
+                state,
+                crate::jobs::statuses(&[], true),
+                shutdown,
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .instrument(run)
+            .with_subscriber(dispatch),
+        );
+        let requests = async {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            assert!(String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 503"));
+        };
+        let requests_result =
+            tokio::time::timeout(std::time::Duration::from_secs(3), requests).await;
+        stop.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        requests_result.unwrap();
+        let http: Vec<_> = capture
+            .lines()
+            .iter()
+            .filter(|line| {
+                line["target"]
+                    .as_str()
+                    .is_some_and(|target| target.starts_with("tower_http::trace"))
+            })
+            .collect();
+        assert!(!http.is_empty(), "no tower failure line for the 503");
+        assert!(
+            http.iter().all(|line| line["level"] != "error"),
+            "no failure may log at ERROR: {http:?}"
+        );
+        assert!(
+            http.iter()
+                .any(|line| line["level"] == "debug" && line["message"] == "response failed"),
+            "expected the downgraded 503 failure line: {http:?}"
+        );
+        for line in http {
+            assert_eq!(line["run_id"], run_id, "{line}");
+            assert_eq!(line["spans"][0]["name"], "run");
         }
     }
 
