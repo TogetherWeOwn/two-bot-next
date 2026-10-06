@@ -569,7 +569,7 @@ mod tests {
         let capture = Capture::default();
         let dispatch = tracing::Dispatch::new(subscriber(
             LogFormat::Json,
-            filter(Some("error,tower_http=debug"), None),
+            filter(Some("error,two_bot::server=debug"), None),
             capture.clone(),
         ));
         let run = tracing::dispatcher::with_default(&dispatch, run_span);
@@ -622,16 +622,15 @@ mod tests {
             .unwrap()
             .unwrap();
         requests_result.unwrap();
-        let http: Vec<_> = capture
-            .lines()
+        let lines = capture.lines();
+        let http: Vec<_> = lines
             .iter()
             .filter(|line| {
-                line["target"]
-                    .as_str()
-                    .is_some_and(|target| target.starts_with("tower_http::trace"))
+                line["target"].as_str() == Some("two_bot::server")
+                    && line["message"].as_str() == Some("response failed")
             })
             .collect();
-        assert!(!http.is_empty(), "no tower failure line for the 503");
+        assert!(!http.is_empty(), "no failure line for the 503");
         assert!(
             http.iter().all(|line| line["level"] != "error"),
             "no failure may log at ERROR: {http:?}"
