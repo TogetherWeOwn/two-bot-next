@@ -312,6 +312,10 @@
     "crates/cutover/migrations/0420_send_admission_lease_backfill.sql": {
       "sha256": "357e82186a067ef3774734cf53425a5dcf6cda039a4679c3439de3b0e84eeb72",
       "justification": "Fence the production 0419 apply: stamp legacy-held send-admission rows (lease stamp 0) with the apply-time clock so the next admit does not reclaim a live sender; update-only, re-runnable."
+    },
+    "crates/cutover/migrations/0421_voice_first_number_bound.sql": {
+      "sha256": "0dfe81e30d3a5ec067b26a99598468d30fcc0443ce35775e940cb307bf197439",
+      "justification": "Bound voice first_room_number to 1..=4294967295 (u32 export codec): clamp existing rows, then CHECK beside 0224."
     }
   }
 }

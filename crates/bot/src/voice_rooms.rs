@@ -5477,7 +5477,7 @@ pub fn decide_position(creator: Option<CreatorChannel>, request: &PositionReques
         creator.first_room_number = first_number;
     }
     if creator.validate().is_err() {
-        return refuse("The first room number must be 1 or higher.");
+        return refuse("The first room number must be between 1 and 4294967295.");
     }
     PositionPlan::Update(creator)
 }
@@ -5581,6 +5581,105 @@ pub fn decide_inherit_permissions(
         return refuse("Those permission settings are not valid. Check the source channel.");
     }
     InheritPermissionsPlan::Update(creator)
+}
+
+/// Refusal when an `/inheritpermissions` channel source fails the live-cache
+/// checks, or `None` when it may be stored. `source` is the cached source
+/// channel (`None` = not in this guild, including a wrong or cross-guild id).
+/// `actor_permissions` is the actor's effective permissions on it (`None` =
+/// incomplete snapshot, fail closed). The kind set mirrors the V11 import
+/// validation (voice, stage, text, category); the View check stops a
+/// confused-deputy copy where the bot's Manage Roles power would copy
+/// overwrites the admin could not see.
+#[must_use]
+pub fn inherit_source_refusal(
+    source: Option<&Channel>,
+    actor_permissions: Option<Permissions>,
+) -> Option<String> {
+    let Some(source) = source else {
+        return Some(
+            "That source channel was not found in this server. Pick a channel from the list and try again."
+                .to_owned(),
+        );
+    };
+    if !matches!(
+        source.kind,
+        ChannelType::GuildVoice
+            | ChannelType::GuildStageVoice
+            | ChannelType::GuildText
+            | ChannelType::GuildCategory
+    ) {
+        return Some(
+            "Pick a voice, stage, text or category channel to copy overrides from.".to_owned(),
+        );
+    }
+    let Some(permissions) = actor_permissions else {
+        return Some("Could not check the source channel yet. Try again in a moment.".to_owned());
+    };
+    if !permissions.contains(Permissions::VIEW_CHANNEL) {
+        return Some(
+            "You need View Channel on the source channel to copy its overrides.".to_owned(),
+        );
+    }
+    None
+}
+
+/// The live-cache half of `/inheritpermissions` validation: the source id must
+/// resolve in this guild's snapshot, be a copyable kind, and be visible to the
+/// actor. Returns the refusal text, or `None` when the source may be stored.
+/// Missing data (no actor, not ready, incomplete roles) fails closed with
+/// "try again" rather than storing an unvalidated source.
+fn inherit_source_live_refusal<S, H>(
+    runtime: &VoiceRuntime<S, H>,
+    interaction: &Interaction,
+    guild_id: Snowflake,
+    source_id: Snowflake,
+) -> Option<String>
+where
+    S: RoomPersistence + Send + 'static,
+    H: RoomWrites + Send + 'static,
+{
+    let not_ready = || "Could not check the source channel yet. Try again in a moment.".to_owned();
+    let Some(actor) = runtime.live_actor(guild_id) else {
+        return Some(not_ready());
+    };
+    let live = actor.live.inner.read().expect("live voice lock");
+    if !live.ready {
+        return Some(not_ready());
+    }
+    let source = live.channels.get(&source_id);
+    if let Some(source) = source {
+        if source.guild_id.map(Id::get) != Some(guild_id) {
+            return Some(
+                "That source channel was not found in this server. Pick a channel from the list and try again."
+                    .to_owned(),
+            );
+        }
+    }
+    let Some(member) = interaction.member.as_ref() else {
+        return Some(not_ready());
+    };
+    let Some(user) = member.user.as_ref() else {
+        return Some(not_ready());
+    };
+    let member_id = user.id.get();
+    let Some(bot) = live.bot.as_ref() else {
+        return Some(not_ready());
+    };
+    // Missing effective permissions fail closed: without them the View check
+    // cannot run, so refuse rather than storing an unvalidated source.
+    let actor_permissions = match source {
+        None => None,
+        Some(source) => effective_permissions(
+            guild_id,
+            bot.guild_owner_id,
+            member_id,
+            &member.roles,
+            &bot.roles,
+            source.permission_overwrites.as_deref().unwrap_or_default(),
+        ),
+    };
+    inherit_source_refusal(source, actor_permissions)
 }
 
 /// `/defaultlimit` input after parsing. `None` clears to inherit the
@@ -7529,6 +7628,20 @@ where
                 ))
                 .await;
                 return true;
+            }
+            // A channel source must resolve in this guild, be a copyable
+            // kind, and be visible to the actor: otherwise every later room
+            // creation fails with AccessDenied, or the bot copies overwrites
+            // the admin could not see. Fail closed before touching the store.
+            if request.source.as_deref() == Some("channel") {
+                if let Some(source_id) = request.source_channel.filter(|id| *id != 0) {
+                    if let Some(refusal) =
+                        inherit_source_live_refusal(runtime, interaction, guild_id, source_id)
+                    {
+                        reply(ephemeral_response(&refusal)).await;
+                        return true;
+                    }
+                }
             }
             let (store, _) = runtime.make_pair();
             let text = match store.creator_for(guild_id, channel_id).await {
