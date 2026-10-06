@@ -340,9 +340,14 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
         }
         assert!(!events[0].contains_key("actor_permissions"));
         assert_eq!(events[1]["actor_permissions"], "0");
+        // The slash helper builds member permissions via
+        // Permissions::from_bits_truncate, so unknown high bits never reach
+        // the audit path; pin the truncated decimal, not the raw !bits.
         assert_eq!(
             events[2]["actor_permissions"],
-            (!row.required_permissions).to_string()
+            Permissions::from_bits_truncate(!row.required_permissions)
+                .bits()
+                .to_string()
         );
     }
 }
