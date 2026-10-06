@@ -410,6 +410,18 @@ class RefusalTests(unittest.TestCase):
         self.assertEqual(instance.evidence["drill"]["intended_image"], BACKOUT_IMAGE)
         self.assertEqual(instance.evidence["drill"]["running_image"], BACKOUT_IMAGE)
 
+    def test_backout_rollout_replaced_before_convergence_refused(self):
+        # A `replaced` row superseded in flight proves nothing: incomplete
+        # steps and 0 updated instances stay refused without any change.
+        world = World()
+        for row in world.rollouts:
+            if row["id"] == "r-backout":
+                row["status"] = "replaced"
+                row["steps"] = [{"status": "in_progress"}]
+                row["progress"] = {"total_steps": 1, "current_step": 1,
+                                   "total_instances": 1, "updated_instances": 0}
+        self.assert_refused_without_change(world, pin(), "backout_rollout_not_completed")
+
     def test_backout_rollout_image_mismatch_refused(self):
         world = World()
         for row in world.rollouts:
