@@ -1438,7 +1438,8 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
                 "channel",
                 "Notice channel; leave empty to use the automatic fallback",
                 CommandOptionType::Channel,
-            )]),
+            )
+            .channel_types(vec![0])]),
             CommandOption::new(
                 "mention",
                 "Set or clear the role mentioned on errors",
