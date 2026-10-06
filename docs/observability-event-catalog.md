@@ -29,7 +29,7 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `gateway leveling dispatch failed` | `crates/bot/src/gateway.rs:609` | Leveling funnel drain failed inside the checkpoint deadline |
 | `onboarding interaction interrupted; member must reselect` | `crates/bot/src/gateway.rs:791` | Durable onboarding job recovered without callback credentials; kept as interruption receipt |
 | `invite counter read unavailable; retaining snapshot` | `crates/bot/src/gateway.rs:899` | REST invite read failed; persisted baseline kept instead of an empty listing |
-| `interaction acknowledgement blocked; checkpoint unchanged` | `crates/bot/src/gateway.rs:286` | Ordered RSVP acknowledgement hit send-admission Blocked; cursor holds instead of passing a never-acknowledged command |
+| `interaction acknowledgement blocked; advancing past lost callback` | `crates/bot/src/gateway.rs:287` | Ordered RSVP acknowledgement hit send-admission Blocked; checkpoint advances past the lost callback without replaying uncertain effects |
 | `interaction response failed; not replaying command` | `crates/bot/src/gateway.rs:290`, `:294`, `:300` | Ordered RSVP preparation or completion failed without admission blockage; command advances without replaying uncertain effects |
 | `READY identity differs from boot token; ordered identity not armed` | `crates/bot/src/gateway.rs:682` | READY application id differs from the boot/REST pin; ordered identity stays disarmed and its fence keeps refusing |
 | `gateway prerequisites missing; gateway parked, /readyz reports down` | `crates/bot/src/main.rs:564` | Token, database URL or guild ID missing; shard never starts |

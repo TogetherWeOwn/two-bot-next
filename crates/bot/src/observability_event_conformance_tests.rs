@@ -30,7 +30,7 @@ const GATEWAY_RS_EVENTS: [&str; 15] = [
     "voice database unavailable; voice rooms disabled",
     "voice rooms enabled; gateway sink attached",
     "voice HTTP setup failed; voice rooms disabled",
-    "interaction acknowledgement blocked; checkpoint unchanged",
+    "interaction acknowledgement blocked; advancing past lost callback",
     "interaction response failed; not replaying command",
     "READY identity differs from boot token; ordered identity not armed",
 ];
