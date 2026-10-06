@@ -386,15 +386,41 @@ class RefusalTests(unittest.TestCase):
         self.assert_refused_without_change(world, pin(), "backout_rollout_absent")
 
     def test_backout_rollout_not_completed_refused(self):
-        # Live run 5: pin present with a matching image but status `replaced`
-        # after 5 newer rollouts. Strict policy keeps it unproven.
-        for status in ("replaced", "reverted", "progressing", "pending"):
+        # `reverted`, `progressing` and `pending` stay unproven even when the
+        # image matches. `replaced` is proven (see the accepted case below).
+        for status in ("reverted", "progressing", "pending"):
             with self.subTest(status=status):
                 world = World()
                 for row in world.rollouts:
                     if row["id"] == "r-backout":
                         row["status"] = status
                 self.assert_refused_without_change(world, pin(), "backout_rollout_not_completed")
+
+    def test_backout_rollout_replaced_with_matching_image_accepted(self):
+        # `replaced` with a matching image plus served-worker history proves
+        # prior convergence: the platform marks the predecessor `replaced`
+        # whenever a newer head completes, so the pin still dispatches.
+        world = World()
+        for row in world.rollouts:
+            if row["id"] == "r-backout":
+                row["status"] = "replaced"
+        instance, failures, _ = run_drill(world)
+        self.assertEqual(failures, [])
+        self.assertEqual(world.deploys, [BACKOUT_IMAGE, PRE_IMAGE])
+        self.assertEqual(instance.evidence["drill"]["intended_image"], BACKOUT_IMAGE)
+        self.assertEqual(instance.evidence["drill"]["running_image"], BACKOUT_IMAGE)
+
+    def test_backout_rollout_replaced_before_convergence_refused(self):
+        # A `replaced` row superseded in flight proves nothing: incomplete
+        # steps and 0 updated instances stay refused without any change.
+        world = World()
+        for row in world.rollouts:
+            if row["id"] == "r-backout":
+                row["status"] = "replaced"
+                row["steps"] = [{"status": "in_progress"}]
+                row["progress"] = {"total_steps": 1, "current_step": 1,
+                                   "total_instances": 1, "updated_instances": 0}
+        self.assert_refused_without_change(world, pin(), "backout_rollout_not_completed")
 
     def test_backout_rollout_image_mismatch_refused(self):
         world = World()

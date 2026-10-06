@@ -86,6 +86,7 @@ fn runtime(pool: sqlx::PgPool, mock: &MockRest, enabled: bool) -> InteractionRun
         pool,
         ActionExecutor::with_proxy("lfg-test-token".into(), Some(mock.origin())).expect("executor"),
         BOT,
+        two_bot_core::ClassifierConfig::default(),
     )
 }
 

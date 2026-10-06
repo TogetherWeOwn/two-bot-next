@@ -698,6 +698,24 @@ fn interaction_create_event_carries_routable_data() {
 }
 
 #[test]
+fn logging_channel_picker_restriction_survives_twilight_publication() {
+    let logging = two_bot_core::voice_rooms::voice_commands()
+        .into_iter()
+        .find(|command| command.name == "logging")
+        .unwrap();
+    let commands = publish_commands(&[logging]);
+    let wire = serde_json::to_value(&commands[0]).unwrap();
+    let sub = wire["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|option| option["name"] == "channel")
+        .unwrap();
+    assert_eq!(sub["options"][0]["type"], 7);
+    assert_eq!(sub["options"][0]["channel_types"], serde_json::json!([0]));
+}
+
+#[test]
 fn twilight_publish_shape_matches_the_registry_wire_shape() {
     // One definition converts losslessly: name/options casing, permission
     // bits as a decimal string, guild-only throughout.

@@ -202,6 +202,18 @@ where
         for (key, value) in correlation {
             fields.entry(key).or_insert(value);
         }
+        // Correlation IDs must stay decimal strings (docs/logging.md):
+        // snowflakes exceed 2^53, so JSON numbers would silently round for
+        // JS/jq consumers. Normalize numbers from either the event or its
+        // spans; every current call site already emits strings, so this is
+        // a fail-closed guard, not a live code path.
+        for key in ["interaction_id", "guild_id", "run_id"] {
+            if fields.get(key).is_some_and(Value::is_number) {
+                if let Some(value) = fields.remove(key) {
+                    fields.insert(key.into(), value.to_string().into());
+                }
+            }
+        }
         if !spans.is_empty() {
             fields.insert("spans".into(), spans.into());
         } else {
@@ -361,6 +373,30 @@ mod tests {
         assert_eq!(lines[0]["spans"][0]["name"], "run");
         assert_eq!(lines[0]["spans"][1]["guild_id"], "456");
         assert_eq!(lines[1]["guild_id"], "explicit");
+    }
+
+    #[test]
+    fn numeric_correlation_fields_normalize_to_decimal_strings() {
+        // Snowflakes exceed 2^53: a raw u64 field would serialize as a JSON
+        // number and silently round for JS/jq consumers (docs/logging.md).
+        let capture = Capture::default();
+        tracing::subscriber::with_default(
+            subscriber(LogFormat::Json, filter(None, None), capture.clone()),
+            || {
+                let run = tracing::info_span!("run", run_id = "run-9").entered();
+                tracing::info!(
+                    guild_id = 1545644954272137297u64,
+                    interaction_id = 1469137636663758888u64,
+                    msg = "job_started"
+                );
+                drop(run);
+            },
+        );
+        let lines = capture.lines();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["guild_id"], "1545644954272137297");
+        assert_eq!(lines[0]["interaction_id"], "1469137636663758888");
+        assert_eq!(lines[0]["run_id"], "run-9");
     }
 
     #[test]

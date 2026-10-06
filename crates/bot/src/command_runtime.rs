@@ -56,7 +56,9 @@ use sqlx::{Pool, Postgres};
 use tracing::warn;
 use twilight_gateway::Event;
 use twilight_model::{
-    application::interaction::{application_command::CommandOptionValue, Interaction},
+    application::interaction::{
+        application_command::CommandOptionValue, Interaction, InteractionData,
+    },
     channel::message::{Message, MessageFlags},
     gateway::GatewayReaction,
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
@@ -275,6 +277,7 @@ impl CommandRuntime {
             pool.clone(),
             executor.clone(),
             0,
+            two_bot_core::ClassifierConfig::from_env(),
         );
         let channel = ChannelModerationRuntime::new(
             ChannelModerationStore::from_pool(pool.clone()),
@@ -301,6 +304,12 @@ impl CommandRuntime {
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
             voice_kick_vote: Mutex::new(None),
         })
+    }
+
+    /// Test-only access to the shared interaction surface for identity assertions.
+    #[cfg(test)]
+    pub(crate) fn test_interactions(&self) -> &two_bot_discord::interactions::InteractionRuntime {
+        &self.interactions
     }
 
     pub(crate) fn published_commands(&self) -> Option<Arc<[two_bot_core::CommandDefinition]>> {
@@ -561,13 +570,55 @@ impl CommandRuntime {
         runtime
     }
 
+    /// Dispatch alongside ordered RSVP execution. That path owns RSVP replies
+    /// (including refusals) and publishes the full registry before polling.
+    /// Keep the standalone dispatch fallback for gateway callers without it.
+    pub(crate) fn dispatch_remaining(self: &Arc<Self>, event: &Event) {
+        match event {
+            Event::Ready(ready) => {
+                // The ordered surface owns registry publication; identity still
+                // initializes here so LFG keeps READY's ids without a REST read.
+                // A READY-supplied id never overwrites the boot pin on faith.
+                let ready_application = ready.application.id.get();
+                let pinned = self.application_id.load(Ordering::Relaxed);
+                if pinned == 0 || pinned == ready_application {
+                    self.set_identity(ready.user.id.get(), ready_application);
+                } else {
+                    warn!(
+                        application_id = ready_application,
+                        "READY identity differs from boot token; identity not armed"
+                    );
+                }
+                self.dispatch_ticket_connection(event);
+                return;
+            }
+            Event::Resumed => {
+                self.dispatch_ticket_connection(event);
+                return;
+            }
+            Event::InteractionCreate(interaction) => {
+                if let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_ref() {
+                    if matches!(
+                        data.name.as_str(),
+                        "rsvp" | "rsvp-attendance" | "attendance"
+                    ) {
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.dispatch(event);
+    }
+
     pub(crate) fn dispatch_guard(self: &Arc<Self>) -> CommandDispatchGuard {
         CommandDispatchGuard(Arc::clone(self))
     }
 
     /// The one process executor (admission lane and pacing included); other
-    /// runtimes (onboarding, automod) render through a clone, never a private
-    /// client.
+    /// runtimes (onboarding, automod) and the ordered interaction surface
+    /// render through a clone, never a private client. One token key, one
+    /// pacing lane, one governed admission for both surfaces.
     pub fn executor(&self) -> ActionExecutor {
         self.executor.clone()
     }
@@ -813,23 +864,35 @@ impl CommandRuntime {
                 })
             }
             Event::Resumed => {
-                if let Some(tickets) = &self.tickets {
-                    let runtime = Arc::clone(self);
-                    // Saved sessions emit RESUMED without READY. Resolve the
-                    // authenticated USER through the shared executor before
-                    // waking maintenance; application ids are not author ids.
-                    // Keep the lookup in the ticket shutdown scope, independent
-                    // of registry publication and its success/dedup gate.
-                    tickets.spawn(async move {
-                        runtime.ready_tickets_after_resume().await;
-                    });
-                }
+                // Saved sessions emit RESUMED without READY: wake ticket
+                // maintenance through the shared ticket scope before the
+                // registry sync, exactly as the ordered surface does.
+                self.dispatch_ticket_connection(event);
                 let runtime = Arc::clone(self);
                 self.spawn(LANE_REGISTRY, async move {
                     runtime.publish_registry(None).await;
                 })
             }
             _ => false,
+        }
+    }
+
+    /// Ticket identity is independent of which runtime owns registry publication.
+    fn dispatch_ticket_connection(self: &Arc<Self>, event: &Event) {
+        let Some(tickets) = &self.tickets else {
+            return;
+        };
+        match event {
+            Event::Ready(ready) => tickets.on_ready(ready.user.id.get()),
+            Event::Resumed => {
+                let runtime = Arc::clone(self);
+                // Application ids are not author ids. Keep this lookup within
+                // the ticket shutdown scope, independent of registry sync.
+                tickets.spawn(async move {
+                    runtime.ready_tickets_after_resume().await;
+                });
+            }
+            _ => {}
         }
     }
 
@@ -1224,7 +1287,7 @@ impl CommandRuntime {
         }
         if self
             .executor
-            .answer_interaction(
+            .answer_interaction_with_blocked_retry(
                 interaction.id.get(),
                 &interaction.token,
                 &InteractionResponse {
@@ -1250,7 +1313,11 @@ impl CommandRuntime {
         };
         if self
             .executor
-            .edit_interaction_response(interaction.application_id.get(), &interaction.token, &reply)
+            .edit_interaction_response_with_blocked_retry(
+                interaction.application_id.get(),
+                &interaction.token,
+                &reply,
+            )
             .await
             .is_err()
         {
@@ -1677,7 +1744,7 @@ impl CommandRuntime {
     async fn defer(&self, interaction: &Interaction, command: &str) -> bool {
         match self
             .executor
-            .answer_interaction(
+            .answer_interaction_with_blocked_retry(
                 interaction.id.get(),
                 &interaction.token,
                 &InteractionResponse {
@@ -1701,7 +1768,11 @@ impl CommandRuntime {
     async fn answer(&self, interaction: &Interaction, response: InteractionResponse) {
         if let Err(err) = self
             .executor
-            .answer_interaction(interaction.id.get(), &interaction.token, &response)
+            .answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &response,
+            )
             .await
         {
             warn!(interaction_id = %interaction.id.get(), error = %err, "sticky reply failed");
@@ -1712,7 +1783,7 @@ impl CommandRuntime {
     async fn finish(&self, interaction: &Interaction, content: impl AsRef<str>) {
         if let Err(err) = self
             .executor
-            .edit_interaction_response(
+            .edit_interaction_response_with_blocked_retry(
                 interaction.application_id.get(),
                 &interaction.token,
                 content.as_ref(),
