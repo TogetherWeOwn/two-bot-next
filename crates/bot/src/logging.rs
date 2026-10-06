@@ -554,6 +554,15 @@ mod tests {
                 http.is_empty(),
                 "tower lines must stay filtered at {level}: {http:?}"
             );
+            // Every line that survives the filter still carries the run it
+            // served (the marker, plus the downgraded 503 failure at DEBUG).
+            assert!(!lines.is_empty(), "no lines captured at {level}");
+            for line in &lines {
+                assert_eq!(line["run_id"], run_id, "{level}: {line}");
+                if line.get("spans").is_some() {
+                    assert_eq!(line["spans"][0]["name"], "run", "{level}: {line}");
+                }
+            }
             assert!(!capture.text().contains("synthetic-http-secret"));
             assert!(!capture.text().contains("access_token"));
         }
