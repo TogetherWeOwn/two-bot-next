@@ -6,10 +6,14 @@
 //!
 //! Layers:
 //! - router (`InteractionRouter::route_slash`): resolved Discord permission
-//!   bits against the parity §1 table. Denied copy is
-//!   `RouterRefusal::ModerationPermission(action).message()`.
+//!   bits against the parity §1 table. Denied copy is the actionable
+//!   `RouterRefusal::ModerationPermission(action).message()` — what Discord
+//!   shows.
 //! - policy (`assert_moderation_allowed`): same bits plus target/hierarchy
-//!   checks. Denied copy is the `PolicyError` display text.
+//!   checks. Its `PolicyError` display is an internal diagnostic: the
+//!   internal-action executor maps it to a closed `Refusal` code before any
+//!   reply, so the legacy `moderation.<action>` id never reaches Discord.
+//!   The router stays the single user-facing denial surface.
 //!
 //! Synthetic fixtures only: literal permission bits, synthetic snowflake ids,
 //! no Discord, no network, no database, no guild dependency.
@@ -21,7 +25,9 @@ use two_bot_core::moderation::{
     assert_moderation_allowed, ModerationAction, ModerationActor, ModerationPolicy,
     ModerationRequest, ModerationTarget, PolicyError,
 };
-use two_bot_core::{HandlerId, InteractionRouter, RouterGates, SlashContext, SlashOutcome};
+use two_bot_core::{
+    HandlerId, InteractionRouter, RouterGates, RouterRefusal, SlashContext, SlashOutcome,
+};
 
 const GUILD: u64 = 2222;
 const OWEN_ID: &str = "123456789012345678";
@@ -128,7 +134,14 @@ fn policy_request(
     }
 }
 
-fn denied_copy(action: ModerationAction) -> String {
+/// What Discord shows: the actionable router refusal for `action`.
+fn router_denied_copy(action: ModerationAction) -> String {
+    RouterRefusal::ModerationPermission(action).message()
+}
+
+/// Internal policy diagnostic for `action` (never user-facing: the executor
+/// maps it to a closed `Refusal` code before any reply).
+fn policy_denied_copy(action: ModerationAction) -> String {
     format!("Missing required permission for {}", action.action_name())
 }
 
@@ -172,7 +185,7 @@ fn role_matrix_matches_permission_gates() {
 }
 
 #[test]
-fn router_allows_or_refuses_per_role_with_legacy_copy() {
+fn router_allows_or_refuses_per_role_with_actionable_copy() {
     let router = router();
     let roles = roles();
     for action in member_actions() {
@@ -205,22 +218,28 @@ fn router_allows_or_refuses_per_role_with_legacy_copy() {
                 };
                 assert_eq!(
                     refusal.message(),
-                    denied_copy(action),
+                    router_denied_copy(action),
                     "{} denied copy for {}",
                     role.name,
                     action.command_name(),
                 );
                 // Pin the literal copy so a silent reword breaks loudly.
                 let literal = match action {
-                    ModerationAction::Ban => "Missing required permission for moderation.ban",
+                    ModerationAction::Ban => {
+                        "You need the Ban Members permission to use /ban. Ask a server moderator or admin to grant it."
+                    }
                     ModerationAction::TempBan => {
-                        "Missing required permission for moderation.tempban"
+                        "You need the Ban Members permission to use /tempban. Ask a server moderator or admin to grant it."
                     }
-                    ModerationAction::Kick => "Missing required permission for moderation.kick",
+                    ModerationAction::Kick => {
+                        "You need the Kick Members permission to use /kick. Ask a server moderator or admin to grant it."
+                    }
                     ModerationAction::Timeout => {
-                        "Missing required permission for moderation.timeout"
+                        "You need the Moderate Members permission to use /timeout. Ask a server moderator or admin to grant it."
                     }
-                    ModerationAction::Warn => "Missing required permission for moderation.warn",
+                    ModerationAction::Warn => {
+                        "You need the Moderate Members permission to use /warn. Ask a server moderator or admin to grant it."
+                    }
                     _ => unreachable!("member verbs only"),
                 };
                 assert_eq!(refusal.message(), literal);
@@ -230,7 +249,7 @@ fn router_allows_or_refuses_per_role_with_legacy_copy() {
 }
 
 #[test]
-fn policy_allows_or_refuses_per_role_with_legacy_copy() {
+fn policy_allows_or_refuses_per_role_with_internal_copy() {
     let policy = policy();
     let roles = roles();
     for action in member_actions() {
@@ -255,7 +274,7 @@ fn policy_allows_or_refuses_per_role_with_legacy_copy() {
                 let copy = verdict.expect_err("denied").to_string();
                 assert_eq!(
                     copy,
-                    denied_copy(action),
+                    policy_denied_copy(action),
                     "{} policy copy for {}",
                     role.name,
                     action.command_name(),
