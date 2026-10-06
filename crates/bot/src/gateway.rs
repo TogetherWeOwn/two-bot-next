@@ -269,12 +269,13 @@ type RsvpAcknowledgement = tokio::task::JoinHandle<
     Result<two_bot_discord::rsvp::PreparedRsvp, two_bot_discord::DiscordError>,
 >;
 
-/// Completes one acknowledged command; returns whether the checkpoint may
-/// advance past it. Only an admission-Blocked preparation exhaustion returns
-/// false: the callback never reached Discord, so the cursor must hold instead
-/// of silently passing a never-acknowledged command. Every other preparation
-/// failure, task failure and completion failure keeps the existing warn-and-
-/// advance behavior.
+/// Completes one acknowledged command; always returns true so the checkpoint
+/// advances past it. Every acknowledgement failure — including an admission-
+/// Blocked preparation exhaustion — warns and advances: holding the cursor
+/// cannot recover the command (Discord's initial-callback window closes
+/// before any restart could replay it), while failing the worker turns one
+/// lost callback into a process-wide outage and restart loop. Do not replay
+/// uncertain effects or log interaction tokens here.
 async fn complete_acknowledgement(
     runtime: &two_bot_discord::interactions::InteractionRuntime,
     acknowledgement: RsvpAcknowledgement,
@@ -283,8 +284,8 @@ async fn complete_acknowledgement(
         Ok(Ok(prepared)) => prepared,
         Ok(Err(error)) => {
             if error.is_admission_blocked() {
-                warn!("interaction acknowledgement blocked; checkpoint unchanged");
-                return false;
+                warn!("interaction acknowledgement blocked; advancing past lost callback");
+                return true;
             }
             // Do not replay uncertain effects or log interaction tokens.
             warn!("interaction response failed; not replaying command");

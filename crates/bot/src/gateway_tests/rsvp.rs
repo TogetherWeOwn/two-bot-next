@@ -817,9 +817,14 @@ async fn exhausted_lane_hold_fences_checkpoint_past_unacked_command() {
     let db = TestDb::new().await;
     let seen = Arc::new(AtomicBool::new(false));
     // Past B's 2.5 s retry budget but inside the 5 s wire timeout, so A's read
-    // still completes while only B's acknowledgement is lost.
+    // still completes while only B's acknowledgement is lost. The loss is
+    // warn-and-advance, never fatal: holding the cursor could not recover the
+    // command, and failing the worker would turn one lost callback into a
+    // process-wide outage.
     let rest = lane_holding_rest(Arc::clone(&seen), Duration::from_millis(3500)).await;
-    let (runner, mut ws) = connect_governed(&db, &rest, "mock-token-exhausted", None).await;
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let (runner, mut ws) =
+        connect_governed(&db, &rest, "mock-token-exhausted", Some(receiver)).await;
     ws.send(Message::text(interaction(2, "going").to_string()))
         .await
         .unwrap();
@@ -828,22 +833,12 @@ async fn exhausted_lane_hold_fences_checkpoint_past_unacked_command() {
     ws.send(Message::text(interaction(3, "interested").to_string()))
         .await
         .unwrap();
-    let error = tokio::time::timeout(Duration::from_secs(20), runner)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("interaction acknowledgement failed; checkpoint unchanged"),
-        "{error}"
-    );
-    // The drain waited out A's held read before fencing: B's loss surfaces only
-    // after the lane hold elapses.
-    assert!(delivered.elapsed() >= Duration::from_secs(3));
-    // A committed; the cursor holds there instead of passing never-acked B.
-    assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 2);
+    // The runner keeps going and the checkpoint advances past B: B's loss
+    // waited out the retry budget instead of failing fast.
+    wait_sequence(&db.store, 3).await;
+    assert!(delivered.elapsed() >= Duration::from_secs(2));
+    // A committed and B advanced past with no callback and no store effect.
+    assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 3);
     let status: String = sqlx::query_scalar("SELECT status FROM event_rsvps")
         .fetch_one(&db.pool)
         .await
@@ -865,6 +860,14 @@ async fn exhausted_lane_hold_fences_checkpoint_past_unacked_command() {
         "{}",
         requests.len()
     );
+    shutdown.send_replace(true);
+    // Bound the shutdown drain: a wedged runner must fail loudly with a
+    // message instead of burning the CI budget with zero output.
+    tokio::time::timeout(Duration::from_secs(30), runner)
+        .await
+        .expect("governed runner shutdown deadline")
+        .unwrap()
+        .unwrap();
     drop(ws);
     rest.shutdown().await;
     db.close().await;
