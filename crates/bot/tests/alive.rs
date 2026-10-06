@@ -4,6 +4,11 @@
 #[path = "common/database_guard.rs"]
 mod database_guard;
 
+#[allow(dead_code)]
+#[path = "../../discord/tests/common/mod.rs"]
+mod common;
+use common::RestRequest;
+
 use std::{net::SocketAddr, panic::AssertUnwindSafe, process::Stdio, sync::Arc, time::Duration};
 
 use futures_util::{FutureExt as _, SinkExt as _, StreamExt as _};
@@ -125,6 +130,8 @@ impl Bot {
             .env("TWO_DATABASE_TLS", "local-only")
             .env("DISCORD_GATEWAY_URL", gateway)
             .env("DISCORD_API_BASE", api)
+            .env("TWO_ANNOUNCEMENTS", "1")
+            .env("TWO_COMMUNITY_SCORECARD", "1")
             .env("RUST_LOG", "two_bot=info")
             .env("LOG_FORMAT", "json")
             .env("NO_COLOR", "1")
@@ -198,7 +205,7 @@ struct MockDiscord {
     api: String,
     auth: mpsc::Receiver<Value>,
     release: mpsc::Sender<()>,
-    rest_requests: Arc<Mutex<Vec<String>>>,
+    rest_requests: Arc<Mutex<Vec<RestRequest>>>,
     task: JoinHandle<()>,
     rest_task: JoinHandle<()>,
 }
@@ -208,9 +215,12 @@ impl MockDiscord {
         let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ws_addr = ws_listener.local_addr().unwrap();
         let url = format!("ws://{ws_addr}");
-        // Dedicated REST socket: onboarding identity and website jobs share
-        // DISCORD_API_BASE, never the gateway's two boot accept slots. No
-        // `/api/v10` suffix — the executor appends the version to this origin.
+        // Registry publication is HTTP before gateway connect on BOTH boots.
+        // Onboarding identity and website jobs share DISCORD_API_BASE, so use
+        // a route-aware REST socket separate from the gateway: job reads must
+        // neither consume scripted registry replies nor be mistaken for
+        // websocket upgrades. No `/api/v10` suffix — the executor appends
+        // the version to this origin itself.
         let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = format!("http://{}", rest_listener.local_addr().unwrap());
         let (auth_tx, auth) = mpsc::channel(2);
@@ -271,10 +281,9 @@ impl MockDiscord {
                 }
             }
         });
-        // Dedicated REST double: answers the website jobs' paced reads with
-        // valid payloads and records arrivals so the test can prove a job
-        // tick happened during the first boot before restart/resume.
-        let rest_requests: Arc<Mutex<Vec<String>>> = Arc::default();
+        // Dedicated REST double: records registry bodies and website-job
+        // reads so both full publication and a first-boot tick are observable.
+        let rest_requests: Arc<Mutex<Vec<RestRequest>>> = Arc::default();
         let rest_task = tokio::spawn(serve_rest(rest_listener, rest_requests.clone()));
         Self {
             url,
@@ -295,12 +304,11 @@ impl MockDiscord {
     }
 }
 
-/// Dedicated REST double on its own socket: answers the binary's paced
-/// website-job reads and records every arrival. The gateway listener must
-/// never see a plain-HTTP connection — one queued job tick consumed its
-/// second accept slot and broke resume (exact-head CI: `Upgrade(
-/// MissingHeader("Upgrade"))` at accept, then `authentication packet`).
-async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<String>>>) {
+/// Dedicated REST double on its own socket: answers registry publication and
+/// paced website-job reads by route, recording full request bodies. The gateway
+/// listener must never see plain HTTP — a queued job tick previously consumed
+/// its second accept slot and broke resume with `MissingHeader("Upgrade")`.
+async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<RestRequest>>>) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
             break;
@@ -324,43 +332,73 @@ async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<String>>>) {
                     return;
                 }
             }
-            let request_line = String::from_utf8_lossy(&head)
-                .lines()
-                .next()
-                .unwrap_or("")
-                .to_owned();
-            let path = request_line
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or("")
-                .to_owned();
-            recorded.lock().await.push(path.clone());
-            // Serve the custom-command identity probes, onboarding's boot
-            // identity probe and website event reads on one REST socket; the
-            // fixture grounds no raid windows and unknown routes fail closed.
-            let (status, body): (&str, &[u8]) =
-                if request_line.starts_with("GET ") && path == "/api/v10/users/@me" {
-                    ("200 OK", br#"{"id":"999","bot":true}"#)
-                } else if path == "/api/v10/applications/@me" {
-                    ("200 OK", b"{\"id\":\"1111\"}")
-                } else if path == "/api/v10/guilds/2222" {
-                    ("200 OK", b"{\"id\":\"2222\",\"name\":\"Alive fixture\"}")
-                } else if path == "/api/v10/applications/1111/guilds/2222/commands"
-                    || path.contains("scheduled-events")
-                {
-                    ("200 OK", b"[]")
-                } else {
-                    (
-                        "404 Not Found",
-                        b"{\"message\":\"alive mock: unknown route\"}",
-                    )
+            let head_end = head.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let request_head = String::from_utf8_lossy(&head[..head_end]);
+            let mut lines = request_head.lines();
+            let mut request_line = lines.next().unwrap_or("").split_whitespace();
+            let method = request_line.next().unwrap_or("").to_owned();
+            let path = request_line.next().unwrap_or("").to_owned();
+            let headers: Vec<(String, String)> = lines
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.trim().to_lowercase(), value.trim().to_owned()))
+                .collect();
+            let content_len = headers
+                .iter()
+                .find(|(name, _)| name == "content-length")
+                .and_then(|(_, value)| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            if content_len > 1024 * 1024 {
+                return;
+            }
+            let mut request_body = head[head_end..].to_vec();
+            while request_body.len() < content_len {
+                let Ok(n) = stream.read(&mut chunk).await else {
+                    return;
                 };
+                if n == 0 {
+                    return;
+                }
+                request_body.extend_from_slice(&chunk[..n]);
+            }
+            request_body.truncate(content_len);
+            // Copy before the record takes ownership so the registry PUT can
+            // echo the submitted command list as its JSON receipt.
+            let registry_echo = request_body.clone();
+            recorded.lock().await.push(RestRequest {
+                method: method.clone(),
+                path: path.clone(),
+                headers,
+                body: request_body,
+                received_at: tokio::time::Instant::now(),
+            });
+            // Registry and job requests can interleave, so never script replies
+            // by arrival order. The fixture grounds no raid windows; only the
+            // events mirror reads. Unknown routes fail closed on this socket.
+            // Also serves onboarding's boot identity probe on this REST socket.
+            let (status, body): (&str, Vec<u8>) = match (method.as_str(), path.as_str()) {
+                ("GET", "/api/v10/applications/@me") => ("200 OK", b"{\"id\":\"1111\"}".to_vec()),
+                ("GET", "/api/v10/users/@me") => {
+                    ("200 OK", b"{\"id\":\"999\",\"bot\":true}".to_vec())
+                }
+                ("GET", "/api/v10/guilds/2222") => (
+                    "200 OK",
+                    b"{\"id\":\"2222\",\"name\":\"Alive fixture\"}".to_vec(),
+                ),
+                ("PUT", "/api/v10/applications/1111/guilds/2222/commands") => {
+                    ("200 OK", registry_echo)
+                }
+                ("GET", path) if path.contains("scheduled-events") => ("200 OK", b"[]".to_vec()),
+                _ => (
+                    "404 Not Found",
+                    b"{\"message\":\"alive mock: unknown route\"}".to_vec(),
+                ),
+            };
             let response = format!(
                 "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 body.len(),
             );
             let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.write_all(body).await;
+            let _ = stream.write_all(&body).await;
         });
     }
 }
@@ -422,6 +460,8 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
     let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = reserved.local_addr().unwrap();
     drop(reserved);
+    // Registry-sync requests consumed by the per-boot assertion below.
+    let mut consumed = 0usize;
     for boot in 0..2 {
         // Restart with an unreachable bootstrap URL: RESUME must select the
         // unchanged persisted endpoint rather than quietly IDENTIFY again.
@@ -439,6 +479,75 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         assert!(before.contains("\"gateway\",\"starting\""));
         discord.release.send(()).await.unwrap(); // Health precedes HELLO.
         let auth = discord.authentication().await;
+        let requests: Vec<_> = discord
+            .rest_requests
+            .lock()
+            .await
+            .iter()
+            .filter(|request| {
+                request.path == "/api/v10/applications/@me"
+                    || request.path == "/api/v10/applications/1111/guilds/2222/commands"
+            })
+            .cloned()
+            .collect();
+        // Boot performs three registry-sync requests before gateway connect,
+        // all awaited before Identify so the boot-0 slice is exact: the
+        // custom-command bootstrap identity, the ordered-interaction boot-sync
+        // identity, then the boot-sync publication. The mock withholds READY
+        // until the release below, so no READY/RESUMED publish can appear in
+        // boot 0's slice. Boot 1's slice may additionally carry boot 0's
+        // READY-time republication at its head; only its trailing three are
+        // asserted.
+        let fresh = &requests[consumed..];
+        let sync = if boot == 0 {
+            assert_eq!(
+                fresh.len(),
+                3,
+                "registry sync on each boot: two identities plus one publication"
+            );
+            fresh
+        } else {
+            assert!(
+                fresh.len() >= 3,
+                "registry sync on each boot: two identities plus one publication"
+            );
+            &fresh[fresh.len() - 3..]
+        };
+        let bootstrap_identity = &sync[0];
+        assert_eq!(bootstrap_identity.method, "GET");
+        assert_eq!(bootstrap_identity.path, "/api/v10/applications/@me");
+        let identity = &sync[1];
+        assert_eq!(identity.method, "GET");
+        assert_eq!(identity.path, "/api/v10/applications/@me");
+        let publish = &sync[2];
+        assert_eq!(publish.method, "PUT");
+        assert_eq!(
+            publish.path,
+            "/api/v10/applications/1111/guilds/2222/commands"
+        );
+        let commands: Vec<Value> = serde_json::from_slice(&publish.body).unwrap();
+        let names: Vec<_> = commands
+            .iter()
+            .map(|command| command["name"].as_str().unwrap())
+            .collect();
+        // The harness boots with a synthetic token no clearance recognizes,
+        // so activation narrows every clearable surface while scorecard
+        // stays: the single boot PUT carries exactly core plus scorecard
+        // plus the always-on help discovery command, each once. Uncleared
+        // surfaces stay unpublished (and refused at dispatch) rather than
+        // advertised.
+        assert_eq!(
+            names,
+            ["rank", "leaderboard", "help", "attendance"],
+            "publish the narrowed shared registry exactly once, nothing withheld or extra"
+        );
+        if boot == 1 {
+            assert_eq!(
+                publish.body, requests[2].body,
+                "same registry on RESUMED boot"
+            );
+        }
+        consumed += fresh.len();
         // The DML-only binary has now finished checkpoint loading against the
         // harness-migrated schema.
         assert_eq!(
@@ -479,7 +588,7 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
                         .lock()
                         .await
                         .iter()
-                        .any(|path| path.contains("scheduled-events"))
+                        .any(|request| request.path.contains("scheduled-events"))
                     {
                         break;
                     }

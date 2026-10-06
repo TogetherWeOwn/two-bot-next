@@ -42,6 +42,8 @@ pub mod onboarding_messages;
 pub mod onboarding_permissions;
 pub mod pipeline;
 pub mod ratelimit_guard;
+#[cfg(feature = "db")]
+pub mod rsvp;
 #[cfg(any(test, feature = "test-support"))]
 pub mod staging_slash_smoke;
 #[cfg(test)]

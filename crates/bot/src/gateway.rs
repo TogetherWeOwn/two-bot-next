@@ -265,9 +265,135 @@ async fn transport_disconnected(state: &RwLock<GatewayState>, generation: &Atomi
     }
 }
 
+type RsvpAcknowledgement = tokio::task::JoinHandle<
+    Result<two_bot_discord::rsvp::PreparedRsvp, two_bot_discord::DiscordError>,
+>;
+
+/// Completes one acknowledged command; always returns true so the checkpoint
+/// advances past it. Every acknowledgement failure — including an admission-
+/// Blocked preparation exhaustion — warns and advances: holding the cursor
+/// cannot recover the command (Discord's initial-callback window closes
+/// before any restart could replay it), while failing the worker turns one
+/// lost callback into a process-wide outage and restart loop. Do not replay
+/// uncertain effects or log interaction tokens here.
+async fn complete_acknowledgement(
+    runtime: &two_bot_discord::interactions::InteractionRuntime,
+    acknowledgement: RsvpAcknowledgement,
+) -> bool {
+    let prepared = match acknowledgement.await {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(error)) => {
+            if error.is_admission_blocked() {
+                warn!("interaction acknowledgement blocked; advancing past lost callback");
+                return true;
+            }
+            // Do not replay uncertain effects or log interaction tokens.
+            warn!("interaction response failed; not replaying command");
+            return true;
+        }
+        Err(_) => {
+            warn!("interaction response failed; not replaying command");
+            return true;
+        }
+    };
+    if runtime.complete(prepared).await.is_err() {
+        // Do not replay uncertain effects or log interaction tokens.
+        warn!("interaction response failed; not replaying command");
+    }
+    true
+}
+
+struct AcceptedRsvp {
+    acknowledgement: RsvpAcknowledgement,
+    completed: tokio::sync::oneshot::Sender<bool>,
+}
+
+/// Reception acknowledges immediately; completion stays serial and supervised
+/// even if the funnel writer fails. The dispatch backlog bounds admission.
+///
+/// The returned acknowledgement scope tracks every spawned prepare task so
+/// the bounded completion policy can cancel/join all owned drain/ack work on
+/// timeout or shard cancellation. Aborting never replays uncertain effects.
+fn start_rsvp_drain(
+    runtime: Arc<two_bot_discord::interactions::InteractionRuntime>,
+) -> (
+    tokio::sync::mpsc::UnboundedSender<AcceptedRsvp>,
+    tokio::task::JoinHandle<()>,
+    Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+) {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<AcceptedRsvp>();
+    let task = tokio::spawn(async move {
+        while let Some(accepted) = receiver.recv().await {
+            let acknowledged = complete_acknowledgement(&runtime, accepted.acknowledgement).await;
+            let _ = accepted.completed.send(acknowledged);
+        }
+    });
+    (sender, task, Arc::new(std::sync::Mutex::new(Vec::new())))
+}
+
+/// Cancellation fallback for the RSVP drain: aborts the owned drain and
+/// acknowledgement tasks when the shard future is cancelled. Normal shutdown
+/// joins through the bounded timeout path; this [`Drop`] only fires on
+/// cancellation (or before the join), where awaiting is impossible. Abort
+/// never replays uncertain effects or releases ambiguous admission.
+struct RsvpCancelGuard {
+    drain: Option<tokio::task::AbortHandle>,
+    acks: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+}
+
+impl Drop for RsvpCancelGuard {
+    fn drop(&mut self) {
+        if let Some(drain) = self.drain.as_ref() {
+            drain.abort();
+        }
+        abort_rsvp_acks(&self.acks);
+    }
+}
+
+fn abort_rsvp_acks(acks: &Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>) {
+    if let Ok(owned) = acks.lock() {
+        for handle in owned.iter() {
+            handle.abort();
+        }
+    }
+}
+
+/// Bounded completion policy with supervised ownership: the timeout owns the
+/// drain task across the wait (expiry never detaches it), admission is
+/// already stopped by the dropped sender, and expiry aborts the drain plus
+/// every tracked acknowledgement before joining the drain. Aborting never
+/// replays uncertain effects or retries committed work; it only stops new
+/// effects/replies after the deadline. A healthy drain still completes and
+/// returns its own outcome.
+async fn join_rsvp_drain(
+    mut task: tokio::task::JoinHandle<()>,
+    acks: &Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+    max: std::time::Duration,
+) -> Result<(), sqlx::Error> {
+    match tokio::time::timeout(max, &mut task).await {
+        Ok(result) => {
+            // The drain returned, so every accepted acknowledgement already
+            // completed through it. Abort the scope anyway: a prepare whose
+            // queue send failed never entered the drain, and must not
+            // outlive the runner's return either.
+            abort_rsvp_acks(acks);
+            result.map_err(|_| sqlx::Error::InvalidArgument("interaction drain failed".into()))
+        }
+        Err(_) => {
+            task.abort();
+            abort_rsvp_acks(acks);
+            let _ = (&mut task).await;
+            Err(sqlx::Error::InvalidArgument(
+                "interaction drain deadline exceeded".into(),
+            ))
+        }
+    }
+}
+
 struct ReceivedDispatch {
     event: Event,
     observed_at: String,
+    completion: Option<tokio::sync::oneshot::Receiver<bool>>,
 }
 #[cfg(test)]
 impl ReceivedDispatch {
@@ -275,6 +401,7 @@ impl ReceivedDispatch {
         Self {
             event,
             observed_at: two_bot_core::now_iso(),
+            completion: None,
         }
     }
 }
@@ -293,7 +420,7 @@ enum ReceivedWork {
         /// Cold voice RESUME: reception waits for this commit before IDENTIFY.
         committed: Option<tokio::sync::oneshot::Sender<()>>,
     },
-    Failed,
+    Failed(sqlx::Error),
 }
 
 /// Covers stream termination, receive/checkpoint failures and task
@@ -338,6 +465,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
     pipeline: Arc<GatewayPipeline<I>>,
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
+    interactions: Option<Arc<two_bot_discord::interactions::InteractionRuntime>>,
     onboarding: Option<Arc<crate::onboarding::OnboardingRuntime>>,
     runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
     automod: Option<Arc<crate::automod_gateway::ProductionAutomod>>,
@@ -348,8 +476,64 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let _voice_connection = VoiceConnectionGuard(voice.clone());
     let generation = Arc::new(AtomicU64::new(0));
     let saved = checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, store.load()).await?;
+    // ONE complete serialized registry owner at boot. The detached command
+    // runtime's publisher merges persisted enabled custom rows with the
+    // constrained builtin surface; the ordered `publish_current` path would
+    // PUT a builtins-only replacement (`publish_set(&[])`) that drops custom
+    // slash rows until a later management republish. Resolve the token
+    // identity once through the shared executor, arm the ordered fence from
+    // the same lookup, then publish the merged set. READY/RESUMED dispatch
+    // stays publication-free, so this boot sync is the single writer.
+    // Without the command runtime, keep the ordered builtins-only sync.
+    match (interactions.as_ref(), runtime.as_ref()) {
+        (Some(ordered), Some(commands)) => {
+            let application_id =
+                commands
+                    .executor()
+                    .current_application_id()
+                    .await
+                    .map_err(|_| {
+                        sqlx::Error::InvalidArgument("interaction registry boot sync failed".into())
+                    })?;
+            ordered.set_application_id(application_id);
+            commands
+                .publish_registry_checked(Some(application_id))
+                .await
+                .map_err(|_| {
+                    sqlx::Error::InvalidArgument("interaction registry boot sync failed".into())
+                })?;
+        }
+        (Some(ordered), None) => {
+            ordered.publish_current().await.map_err(|_| {
+                sqlx::Error::InvalidArgument("interaction registry boot sync failed".into())
+            })?;
+        }
+        _ => {}
+    }
+    let (rsvp_sender, rsvp_drain, rsvp_acks) = match interactions.as_ref() {
+        Some(runtime) => {
+            let (sender, task, acks) = start_rsvp_drain(Arc::clone(runtime));
+            (Some(sender), Some(task), acks)
+        }
+        None => (None, None, Arc::new(std::sync::Mutex::new(Vec::new()))),
+    };
+    // Caller-cancellation fallback: dropping the shard future aborts the
+    // owned drain and acknowledgement tasks instead of detaching them.
+    let _rsvp_cancel = RsvpCancelGuard {
+        drain: rsvp_drain.as_ref().map(|task| task.abort_handle()),
+        acks: Arc::clone(&rsvp_acks),
+    };
+    let receive_rsvp = rsvp_sender.clone();
+    let receive_acks = Arc::clone(&rsvp_acks);
     // Tickets run beside reception and are cancelled/joined before return.
     let tickets = runtime.as_ref().and_then(|runtime| runtime.start_tickets());
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Fatal worker invalidation only: a cooperative shutdown must still drain
+    // queued accepted work through the writer instead of discarding it.
+    let worker_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let error = Arc::new(std::sync::Mutex::new(None));
+    let worker_error = Arc::clone(&error);
+    let (failed, failure) = tokio::sync::watch::channel(false);
     let receive_generation = Arc::clone(&generation);
     let automod_enabled = automod.is_some();
     // The worker dispatches text automations itself once automod has decided.
@@ -371,6 +555,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
             let state = Arc::clone(&receive_state);
             let generation = Arc::clone(&receive_generation);
             let runtime = runtime.clone();
+            let interactions = interactions.clone();
+            let rsvp_sender = receive_rsvp.clone();
+            let ack_tracker = Arc::clone(&receive_acks);
             let onboarding = receive_onboarding.clone();
             let in_flight_acks = Arc::clone(&in_flight_acks);
             let pipeline = Arc::clone(&receive_pipeline);
@@ -461,7 +648,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             Err(_) => return Err(sqlx::Error::InvalidArgument("gateway dispatch parse failed".into())),
                         };
                         received = Some(checkpoint.clone());
-                        let dispatch = parsed.map(|parsed| Box::new(ReceivedDispatch { event: Event::from(parsed), observed_at }));
+                        let mut dispatch = parsed.map(|parsed| Box::new(ReceivedDispatch { event: Event::from(parsed), observed_at, completion: None }));
                         // Detached command ingress must not wait behind the
                         // serial funnel writer's REST/SQL latency. Main's
                         // command claims remain independent of this checkpoint.
@@ -469,7 +656,53 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         // disposition: rejected creates never reach automations.
                         if let (Some(runtime), Some(dispatch)) = (runtime.as_ref(), dispatch.as_ref()) {
                             if !(automod_enabled && matches!(dispatch.event, Event::MessageCreate(_))) {
-                                runtime.dispatch(&dispatch.event);
+                                if interactions.is_some() {
+                                    runtime.dispatch_remaining(&dispatch.event);
+                                } else {
+                                    runtime.dispatch(&dispatch.event);
+                                }
+                            }
+                        }
+                        // The ordered runtime is a separate instance from the
+                        // command runtime's own copy: READY identity must reach
+                        // it directly, or its application fence stays disarmed
+                        // and bot-user checks stay lazy.
+                        if let (Some(interactions), Some(dispatch)) =
+                            (interactions.as_ref(), dispatch.as_ref())
+                        {
+                            if let Event::Ready(ready) = &dispatch.event {
+                                // A READY-supplied id never overwrites the
+                                // boot/REST pin on faith; a mismatch stays
+                                // disarmed and the fence keeps refusing.
+                                if !interactions.try_arm_ready_identity(
+                                    ready.user.id.get(),
+                                    ready.application.id.get(),
+                                ) {
+                                    tracing::warn!(
+                                        application_id = ready.application.id.get(),
+                                        "READY identity differs from boot token; ordered identity not armed"
+                                    );
+                                }
+                            }
+                        }
+                        if let (Some(runtime), Some(sender), Some(dispatch)) = (interactions.as_ref(), rsvp_sender.as_ref(), dispatch.as_mut()) {
+                            if let Event::InteractionCreate(interaction) = &dispatch.event {
+                                let interaction = interaction.0.clone();
+                                let runtime = Arc::clone(runtime);
+                                let acknowledgement = tokio::spawn(async move { runtime.prepare(interaction).await });
+                                // Track owned acknowledgement work so the bounded
+                                // completion policy can cancel it on timeout or
+                                // shard cancellation instead of detaching it.
+                                if let Ok(mut owned) = ack_tracker.lock() {
+                                    owned.retain(|handle| !handle.is_finished());
+                                    owned.push(acknowledgement.abort_handle());
+                                }
+                                let (completed, completion) = tokio::sync::oneshot::channel();
+                                sender.send(AcceptedRsvp { acknowledgement, completed })
+                                    .map_err(|_| {
+                                        sqlx::Error::InvalidArgument("interaction drain stopped".into())
+                                    })?;
+                                dispatch.completion = Some(completion);
                             }
                         }
                         // The only onboarding effect at reception is a bounded
@@ -515,8 +748,8 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         Some((work, (shard, received, deadline, observer, bootstrap)))
                     }
                     Ok(None) => None,
-                    Err(_) => Some((
-                        ReceivedWork::Failed,
+                    Err(error) => Some((
+                        ReceivedWork::Failed(error),
                         (shard, received, deadline, observer, bootstrap),
                     )),
                 }
@@ -533,6 +766,10 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let writer_live = Arc::clone(&live_interactions);
     let writer_signal = Arc::clone(&queue_signal);
     let writer_onboarding = onboarding.clone();
+    // Set once reception and the blocking writer have drained: no further
+    // checkpoint commit can arrive, so the queue worker may exit once idle.
+    let writer_drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drain_signal = Arc::clone(&queue_signal);
     let queue_worker = onboarding.clone().map(|runtime| {
         onboarding_queue(
             runtime,
@@ -541,108 +778,125 @@ pub async fn run_shard<I: InviteSource + 'static>(
             Arc::clone(&generation),
             Arc::clone(&live_interactions),
             Arc::clone(&queue_signal),
+            Arc::clone(&writer_drained),
         )
     });
     let dispatch = crate::dispatch::dispatch_bounded(
         // Ending reception is cooperative: dispatch_bounded keeps supervising
         // and draining its blocking writer instead of being aborted/dropped.
-        events.take_until(shutdown),
+        events.take_until(async move {
+            tokio::select! {
+                _ = shutdown => {},
+                _ = crate::server::shutdown_requested(failure) => {},
+            }
+        }),
         crate::dispatch::DISPATCH_BACKLOG,
-        move |work| match work {
-            ReceivedWork::Clear(deadline) => handle
-                .block_on(checkpoint_io(
-                    &worker_state,
-                    &generation,
-                    deadline,
-                    store.clear(),
-                ))
-                .unwrap_or_else(|_| panic!("gateway clear failed")),
-            ReceivedWork::Failed => panic!("gateway receive failed; checkpoint unchanged"),
-            ReceivedWork::Dispatch {
-                dispatch,
-                edit,
-                checkpoint,
-                deadline,
-                generation: observed_generation,
-                acknowledgement,
-                committed,
-            } => {
-                let timer = crate::gateway_metrics::DispatchTimer::start();
-                let mut connected = false;
-                let mut onboarding_job = None;
-                // Automod decides first, in gateway order, once per delivery.
-                let disposition = automod.as_ref().and_then(|automod| {
-                    let (delivery, at) = match (edit, dispatch.as_deref()) {
-                        (Some(edit), _) => *edit,
-                        (None, Some(dispatch)) => (
-                            two_bot_discord::automod::event_to_automod(
+        move |work| {
+            // Already-running work may finish; queued funnel effects are not
+            // admitted after a fatal worker error. A cooperative shutdown still
+            // drains queued accepted work. Accepted RSVP has its own drain.
+            if worker_failed.load(Ordering::Acquire) {
+                return;
+            }
+            let operation =
+                match work {
+                    ReceivedWork::Clear(deadline) => handle.block_on(checkpoint_io(
+                        &worker_state,
+                        &generation,
+                        deadline,
+                        store.clear(),
+                    )),
+                    ReceivedWork::Failed(error) => Err(error),
+                    ReceivedWork::Dispatch {
+                        dispatch,
+                        edit,
+                        checkpoint,
+                        deadline,
+                        generation: observed_generation,
+                        acknowledgement,
+                        committed,
+                    } => {
+                        let timer = crate::gateway_metrics::DispatchTimer::start();
+                        let mut connected = false;
+                        let mut onboarding_job = None;
+                        // Automod decides first, in gateway order, once per delivery.
+                        let disposition = automod.as_ref().and_then(|automod| {
+                            let (delivery, at) = match (edit, dispatch.as_deref()) {
+                                (Some(edit), _) => *edit,
+                                (None, Some(dispatch)) => (
+                                    two_bot_discord::automod::event_to_automod(
+                                        &dispatch.event,
+                                        crate::automod_gateway::receipt_ms(&dispatch.observed_at),
+                                    )?,
+                                    dispatch.observed_at.clone(),
+                                ),
+                                (None, None) => return None,
+                            };
+                            Some(
+                                handle.block_on(crate::automod_gateway::process(
+                                    automod, delivery, &at,
+                                )),
+                            )
+                        });
+                        let mut acknowledgement_held = false;
+                        // Staff audit rows: translated pre-update (member deltas and
+                        // voice boundaries need the rows the funnel is about to
+                        // mutate), stored before the checkpoint commits. The store
+                        // write is idempotent, so a crash between the two replays
+                        // safely; a failed write never stalls this worker.
+                        let mut audit_events = Vec::new();
+                        if let Some(dispatch) = dispatch {
+                            // A cold voice RESUME is followed by IDENTIFY; READY connects.
+                            connected = matches!(dispatch.event, Event::Ready(_) | Event::Resumed)
+                                && committed.is_none();
+                            // Capture member state before the cache pipeline mutates it.
+                            onboarding_job = writer_onboarding
+                                .as_ref()
+                                .and_then(|runtime| runtime.capture(&dispatch.event, &pipeline));
+                            audit_events = crate::audit_gateway::translate(
                                 &dispatch.event,
-                                crate::automod_gateway::receipt_ms(&dispatch.observed_at),
-                            )?,
-                            dispatch.observed_at.clone(),
-                        ),
-                        (None, None) => return None,
-                    };
-                    Some(handle.block_on(crate::automod_gateway::process(automod, delivery, &at)))
-                });
-                // Staff audit rows: translated pre-update (member deltas and
-                // voice boundaries need the rows the funnel is about to
-                // mutate), stored before the checkpoint commits. The store
-                // write is idempotent, so a crash between the two replays
-                // safely; a failed write never stalls this worker.
-                let mut audit_events = Vec::new();
-                if let Some(dispatch) = dispatch {
-                    // A cold voice RESUME is followed by IDENTIFY; READY connects.
-                    connected = matches!(dispatch.event, Event::Ready(_) | Event::Resumed)
-                        && committed.is_none();
-                    // Capture member state before the cache pipeline mutates it.
-                    onboarding_job = writer_onboarding
-                        .as_ref()
-                        .and_then(|runtime| runtime.capture(&dispatch.event, &pipeline));
-                    audit_events = crate::audit_gateway::translate(
-                        &dispatch.event,
-                        pipeline.cache(),
-                        &dispatch.observed_at,
-                        checkpoint.sequence,
-                    );
-                    // Exactly one funnel call per dispatch, then drain deferred
-                    // XP awards through the leveling runtime under the
-                    // checkpoint deadline before the cursor commits. Without a
-                    // leveling runtime the drain is a no-op.
-                    let requests = match disposition {
-                        Some(disposition) => pipeline.collect_at_with_message_disposition(
-                            &dispatch.event,
-                            &dispatch.observed_at,
-                            disposition,
-                        ),
-                        None => pipeline.collect_at(
-                            &dispatch.event,
-                            &dispatch.observed_at,
-                            two_bot_discord::MessageEligibility::default(),
-                        ),
-                    };
-                    // Voice after the cache update, so snapshots are complete.
-                    // Handling never blocks (actor inbox). A transport loss seen
-                    // at reception after this dispatch must still win over any
-                    // snapshot it just published.
-                    if let Some(voice) = worker_voice.as_ref() {
-                        voice.handle(&dispatch.event, pipeline.cache());
-                        if generation.load(Ordering::Acquire) != observed_generation {
-                            voice.disconnect();
-                        }
-                    }
-                    if automod_enabled
-                        && matches!(dispatch.event, Event::MessageCreate(_))
-                        && crate::automod_gateway::runs_text_automations(disposition)
-                    {
-                        if let Some(runtime) = command_runtime.as_ref() {
-                            // Detached spawn from the blocking worker needs the runtime.
-                            let _guard = handle.enter();
-                            runtime.dispatch(&dispatch.event);
-                        }
-                    }
-                    if !requests.is_empty() {
-                        handle
+                                pipeline.cache(),
+                                &dispatch.observed_at,
+                                checkpoint.sequence,
+                            );
+                            // Exactly one funnel call per dispatch, then drain deferred
+                            // XP awards through the leveling runtime under the
+                            // checkpoint deadline before the cursor commits. Without a
+                            // leveling runtime the drain is a no-op.
+                            let requests = match disposition {
+                                Some(disposition) => pipeline.collect_at_with_message_disposition(
+                                    &dispatch.event,
+                                    &dispatch.observed_at,
+                                    disposition,
+                                ),
+                                None => pipeline.collect_at(
+                                    &dispatch.event,
+                                    &dispatch.observed_at,
+                                    two_bot_discord::MessageEligibility::default(),
+                                ),
+                            };
+                            // Voice after the cache update, so snapshots are complete.
+                            // Handling never blocks (actor inbox). A transport loss seen
+                            // at reception after this dispatch must still win over any
+                            // snapshot it just published.
+                            if let Some(voice) = worker_voice.as_ref() {
+                                voice.handle(&dispatch.event, pipeline.cache());
+                                if generation.load(Ordering::Acquire) != observed_generation {
+                                    voice.disconnect();
+                                }
+                            }
+                            if automod_enabled
+                                && matches!(dispatch.event, Event::MessageCreate(_))
+                                && crate::automod_gateway::runs_text_automations(disposition)
+                            {
+                                if let Some(runtime) = command_runtime.as_ref() {
+                                    // Detached spawn from the blocking worker needs the runtime.
+                                    let _guard = handle.enter();
+                                    runtime.dispatch(&dispatch.event);
+                                }
+                            }
+                            if !requests.is_empty() {
+                                handle
                             .block_on(checkpoint_io(&worker_state, &generation, deadline, async {
                                 pipeline.drain(requests).await.map(drop).map_err(|error| {
                                     // Runtime Display is sanitized; never
@@ -659,104 +913,192 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             .unwrap_or_else(|_| {
                                 panic!("gateway leveling dispatch failed; checkpoint unchanged")
                             });
+                            }
+                            // A Blocked receipt-callback exhaustion leaves the command
+                            // never-acknowledged: hold the cursor instead of
+                            // silently passing it. The error path below releases
+                            // a cold-resume wait and records the fence.
+                            acknowledgement_held = if let Some(completion) = dispatch.completion {
+                                !handle.block_on(completion).unwrap_or_else(|_| {
+                                    panic!("interaction drain failed; checkpoint unchanged")
+                                })
+                            } else {
+                                false
+                            };
+                        }
+                        if !audit_events.is_empty() {
+                            let pending = std::mem::take(&mut audit_events);
+                            handle.block_on(crate::audit_gateway::record_all(&pending));
+                        }
+                        let durable_job = onboarding_job
+                            .as_ref()
+                            .map(|job| {
+                                job.durable_payload().map(|payload| GatewayJob {
+                                    payload,
+                                    occurred_at_ms: checkpoint.updated_at_ms,
+                                })
+                            })
+                            .transpose()
+                            .unwrap_or_else(|_| panic!("invalid onboarding job"));
+                        let checkpoint_result = if acknowledgement_held {
+                            Err(sqlx::Error::InvalidArgument(
+                                "interaction acknowledgement failed; checkpoint unchanged".into(),
+                            ))
+                        } else {
+                            handle.block_on(checkpoint_io(
+                                &worker_state,
+                                &generation,
+                                deadline,
+                                store.commit_dispatch_with_job(
+                                    &checkpoint,
+                                    pipeline.handlers().store().take_batch(),
+                                    durable_job,
+                                ),
+                            ))
+                        };
+                        // A failed checkpoint is recorded on `operation` (the
+                        // worker stops and accepted RSVP drains) instead of
+                        // panicking away accepted commands.
+                        match checkpoint_result {
+                            Ok((_, job_id)) => {
+                                timer.committed();
+                                if let Some(id) = job_id {
+                                    if let Some(OnboardingJob::Interaction(interaction)) =
+                                        onboarding_job
+                                    {
+                                        let ticket = acknowledgement.unwrap_or_else(|| {
+                                            panic!("onboarding interaction missing ingress ticket")
+                                        });
+                                        writer_live
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .insert(
+                                                id,
+                                                LiveInteraction {
+                                                    interaction,
+                                                    ticket,
+                                                    generation: observed_generation,
+                                                },
+                                            );
+                                    }
+                                    writer_signal.notify_one();
+                                }
+                                if connected {
+                                    let mut state = handle.block_on(worker_state.write());
+                                    if *state != GatewayState::Draining
+                                        && generation.load(Ordering::Acquire) == observed_generation
+                                    {
+                                        *state = GatewayState::Connected;
+                                        info!(
+                                            sequence = checkpoint.sequence,
+                                            "gateway ready; checkpoint committed"
+                                        );
+                                    }
+                                }
+                                if let Some(committed) = committed {
+                                    let _ = committed.send(());
+                                }
+                                Ok(())
+                            }
+                            Err(error) => {
+                                if let Some(committed) = committed {
+                                    let _ = committed.send(());
+                                }
+                                Err(error)
+                            }
+                        }
                     }
-                }
-                if !audit_events.is_empty() {
-                    let pending = std::mem::take(&mut audit_events);
-                    handle.block_on(crate::audit_gateway::record_all(&pending));
-                }
-                let durable_job = onboarding_job
-                    .as_ref()
-                    .map(|job| {
-                        job.durable_payload().map(|payload| GatewayJob {
-                            payload,
-                            occurred_at_ms: checkpoint.updated_at_ms,
-                        })
-                    })
-                    .transpose()
-                    .unwrap_or_else(|_| panic!("invalid onboarding job"));
-                let (_, job_id) = handle
-                    .block_on(checkpoint_io(
-                        &worker_state,
-                        &generation,
-                        deadline,
-                        store.commit_dispatch_with_job(
-                            &checkpoint,
-                            pipeline.handlers().store().take_batch(),
-                            durable_job,
-                        ),
-                    ))
-                    .unwrap_or_else(|_| panic!("gateway checkpoint failed"));
-                timer.committed();
-                if let Some(id) = job_id {
-                    if let Some(OnboardingJob::Interaction(interaction)) = onboarding_job {
-                        let ticket = acknowledgement.unwrap_or_else(|| {
-                            panic!("onboarding interaction missing ingress ticket")
-                        });
-                        writer_live
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(
-                                id,
-                                LiveInteraction {
-                                    interaction,
-                                    ticket,
-                                    generation: observed_generation,
-                                },
-                            );
-                    }
-                    writer_signal.notify_one();
-                }
-                if connected {
-                    let mut state = handle.block_on(worker_state.write());
-                    if *state != GatewayState::Draining
-                        && generation.load(Ordering::Acquire) == observed_generation
-                    {
-                        *state = GatewayState::Connected;
-                        info!(
-                            sequence = checkpoint.sequence,
-                            "gateway ready; checkpoint committed"
-                        );
-                    }
-                }
-                if let Some(committed) = committed {
-                    let _ = committed.send(());
-                }
+                };
+            if let Err(error) = operation {
+                // Retain the original error without panicking away accepted
+                // commands or allowing a later checkpoint to leap past failure.
+                *worker_error.lock().expect("gateway error lock") = Some(error);
+                worker_failed.store(true, Ordering::Release);
+                failed.send_replace(true);
             }
         },
         move || async move {
+            stopped.store(true, Ordering::Release);
             *stop_state.write().await = GatewayState::Draining;
         },
         crate::dispatch::DISPATCH_IO_MAX,
         crate::dispatch::DISPATCH_DRAIN_MAX,
     );
     let result: Result<(), sqlx::Error> = match queue_worker {
-        // The durable queue worker only returns on a fatal error; fail the
-        // runner (Draining) and drop reception/writer with it.
-        Some(queue_worker) => tokio::select! {
-            result = dispatch => {
-                result.map_err(|reason| sqlx::Error::InvalidArgument(reason.into()))
+        // The durable queue worker returns on a fatal error, or once the
+        // writer drain below observes it quiescent. Fail the runner
+        // (Draining) and drop reception/writer with it on a fatal return.
+        Some(queue_worker) => {
+            futures_util::pin_mut!(queue_worker);
+            tokio::select! {
+                result = dispatch => {
+                    let result = result.map_err(|reason| sqlx::Error::InvalidArgument(reason.into()));
+                    if result.is_ok() && error.lock().expect("gateway error lock").is_none() {
+                        // Cooperative end with a healthy writer: the last
+                        // commit may have raced the drain return before the
+                        // queue worker claimed it, stranding the job until
+                        // the next boot. Drive the queue to quiescence,
+                        // bounded, while still polling it for fatal errors.
+                        // Anything still pending then keeps the bounded
+                        // restart-recovery path, as a dropped worker would.
+                        writer_drained.store(true, Ordering::Release);
+                        drain_signal.notify_one();
+                        match tokio::time::timeout(
+                            crate::dispatch::DISPATCH_DRAIN_MAX,
+                            &mut queue_worker,
+                        )
+                        .await
+                        {
+                            Ok(Err(worker_error)) => {
+                                *state.write().await = GatewayState::Draining;
+                                Err(worker_error)
+                            }
+                            _ => result,
+                        }
+                    } else {
+                        result
+                    }
+                }
+                result = &mut queue_worker => {
+                    *state.write().await = GatewayState::Draining;
+                    result
+                }
             }
-            result = queue_worker => {
-                *state.write().await = GatewayState::Draining;
-                result
-            }
-        },
+        }
         None => dispatch
             .await
             .map_err(|reason| sqlx::Error::InvalidArgument(reason.into())),
     };
     // Reception does not restart in this runner. Keep Draining sticky through
     // both successful shutdown and fatal exit, including any remaining writer.
+    drop(rsvp_sender);
+    let drained = match rsvp_drain {
+        Some(task) => join_rsvp_drain(task, &rsvp_acks, crate::dispatch::DISPATCH_DRAIN_MAX).await,
+        None => Ok(()),
+    };
     if let Some(tickets) = tickets {
         tickets.shutdown().await;
     }
-    result
+    drained?;
+    // The dispatch supervisor is the authority on admission: when it fails
+    // closed (backlog full, I/O or drain deadlines), its reason stands even
+    // if the stuck worker later records its own checkpoint timeout. The
+    // supervisor breaks first; the worker timeout is the consequence of the
+    // same stuck checkpoint under drain, not a second cause. A cooperative
+    // supervisor return still surfaces the worker's retained error, so
+    // checkpoint-failure reporting after accepted-work drain is unchanged.
+    result?;
+    if let Some(error) = error.lock().expect("gateway error lock").take() {
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Durable onboarding job worker: claims committed jobs, runs them through the
 /// shared executor with bounded concurrency and records completion. Returns
-/// only on a fatal error (the runner then fails closed).
+/// on a fatal error (the runner then fails closed), or once the writer drain
+/// flag is set and the durable queue is empty with no effect in flight
+/// (cooperative shutdown drain).
 async fn onboarding_queue(
     runtime: Arc<crate::onboarding::OnboardingRuntime>,
     store: GatewaySessionStore,
@@ -764,6 +1106,7 @@ async fn onboarding_queue(
     generation: Arc<AtomicU64>,
     live_interactions: LiveInteractions,
     signal: Arc<tokio::sync::Notify>,
+    writer_drained: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), sqlx::Error> {
     let deadline = CHECKPOINT_IO_MAX;
     let mut feature_jobs = tokio::task::JoinSet::new();
@@ -778,6 +1121,13 @@ async fn onboarding_queue(
     )
     .await?;
     loop {
+        // Once the writer has drained, no new job can be committed: force a
+        // final claim probe (a commit may have raced the drain return) and
+        // exit once no claimed effect is in flight either.
+        let draining = writer_drained.load(Ordering::Acquire);
+        if draining {
+            queue_dirty = true;
+        }
         // Claim only available worker slots; reception keeps polling Twilight.
         if queue_dirty && feature_jobs.len() < ONBOARDING_WORKER_LIMIT {
             if let Some(saved) =
@@ -840,6 +1190,9 @@ async fn onboarding_queue(
                 }
             } else {
                 queue_dirty = false;
+                if draining && feature_jobs.is_empty() {
+                    return Ok(());
+                }
             }
         }
         tokio::select! {
@@ -1448,5 +1801,104 @@ mod tests {
         ] {
             assert!(!output.contains(secret));
         }
+    }
+
+    /// Wedged acknowledgement stand-in: records its effect only after the
+    /// test lock is released, like store work waiting past the drain
+    /// deadline. Returns the effect flag, its release, and the task.
+    fn wedged_acknowledgement() -> (
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let effect = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let waiter = tokio::spawn({
+            let effect = std::sync::Arc::clone(&effect);
+            let release = std::sync::Arc::clone(&release);
+            async move {
+                release.notified().await;
+                effect.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
+        (effect, release, waiter)
+    }
+
+    /// Draining supervision owns the drain across the bounded wait: expiry
+    /// aborts (never detaches) and joins, so releasing the test lock after
+    /// the policy returns starts no new effect or reply.
+    #[tokio::test]
+    async fn rsvp_drain_timeout_cancels_owned_work_before_join() {
+        let (effect, release, waiter) = wedged_acknowledgement();
+        let scope: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(vec![waiter.abort_handle()]));
+        // The drain itself never finishes, like a drain wedged behind the
+        // acknowledgement above after admission has stopped.
+        let drain = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        let outcome = join_rsvp_drain(drain, &scope, std::time::Duration::from_millis(50)).await;
+        assert!(
+            outcome
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("interaction drain deadline exceeded"),
+            "{outcome:?}"
+        );
+        // Release the lock only after the policy has returned, exactly like
+        // the detached-task scenario. The aborted waiter must record
+        // nothing and be cancelled, not left running.
+        release.notify_waiters();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(
+            !effect.load(std::sync::atomic::Ordering::Acquire),
+            "released lock must not start new effects after drain timeout"
+        );
+    }
+
+    /// The healthy accepted-work drain still completes with its own outcome:
+    /// aborting the (already finished) scope is a no-op, never a failure.
+    #[tokio::test]
+    async fn rsvp_drain_healthy_completion_preserved() {
+        let scope: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let quick = tokio::spawn(async {});
+        scope
+            .lock()
+            .expect("ack scope lock")
+            .push(quick.abort_handle());
+        assert!(quick.await.is_ok());
+        let drain = tokio::spawn(async {});
+        assert!(
+            join_rsvp_drain(drain, &scope, std::time::Duration::from_secs(5))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// Shard-future cancellation drops the guard, which aborts the owned
+    /// drain and acknowledgement tasks instead of detaching them.
+    #[tokio::test]
+    async fn rsvp_cancel_guard_aborts_owned_work_on_drop() {
+        let (effect, release, waiter) = wedged_acknowledgement();
+        let scope: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(vec![waiter.abort_handle()]));
+        let drain = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        {
+            let _guard = RsvpCancelGuard {
+                drain: Some(drain.abort_handle()),
+                acks: std::sync::Arc::clone(&scope),
+            };
+        }
+        release.notify_waiters();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(drain.await.unwrap_err().is_cancelled());
+        assert!(
+            !effect.load(std::sync::atomic::Ordering::Acquire),
+            "released lock must not start new effects after cancellation"
+        );
     }
 }

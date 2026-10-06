@@ -191,7 +191,8 @@ pub fn response_for_slash(outcome: &SlashOutcome) -> Option<InteractionResponse>
 }
 
 /// Shared execution runtime: route once, acknowledge promptly, then run the
-/// registered feature through the shared REST executor. Unsupported features
+/// registered feature (RSVP/attendance totals and host check-in, LFG, and the
+/// other wired slices) through the shared REST executor. Unsupported features
 /// remain owned by their integration slices, not by a second dispatcher.
 #[cfg(feature = "db")]
 #[derive(Debug)]
@@ -200,7 +201,9 @@ pub struct InteractionRuntime {
     /// example the custom-command execution seam): registrations are complete
     /// once `with_router` returns, so every `Arc` clone reads the same set.
     pub router: std::sync::Arc<InteractionRouter>,
-    executor: crate::ActionExecutor,
+    pub pool: sqlx::Pool<sqlx::Postgres>,
+    pub executor: crate::ActionExecutor,
+    pub classifier: two_bot_core::ClassifierConfig,
     lfg: crate::lfg_interactions::LfgInteractions,
     bot_user_id: std::sync::atomic::AtomicU64,
     application_id: std::sync::atomic::AtomicU64,
@@ -208,13 +211,123 @@ pub struct InteractionRuntime {
 
 #[cfg(feature = "db")]
 impl InteractionRuntime {
+    /// Returns false for interactions owned by another feature or guild: LFG
+    /// outcomes run through the shared LFG executor path, RSVP/attendance
+    /// interactions run through the RSVP path, anything else stays silent.
+    pub async fn handle(&self, interaction: &Interaction) -> Result<bool, crate::DiscordError> {
+        let application_id = self
+            .application_id
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if application_id != 0 && interaction.application_id.get() != application_id {
+            return Ok(false);
+        }
+        let routed = route_interaction(&self.router, interaction, None);
+        if matches!(
+            &routed,
+            RoutedInteraction::Slash {
+                outcome: SlashOutcome::Handled {
+                    handler: two_bot_core::HandlerId::Lfg | two_bot_core::HandlerId::LfgClose,
+                },
+                ..
+            } | RoutedInteraction::Component {
+                outcome: two_bot_core::ComponentOutcome::Handled {
+                    handler: two_bot_core::ComponentHandler::LfgSignup,
+                },
+                ..
+            }
+        ) {
+            return self.handle_routed(interaction, routed).await;
+        }
+        // A refusal for a non-RSVP command (LFG permission or feature gates)
+        // must still be answered. The RSVP path ignores those names, so it
+        // would drop the denial silently; RSVP refusals stay on the RSVP
+        // path, which answers the identical refusal.
+        let refusal_for_other = match &routed {
+            RoutedInteraction::Slash {
+                name,
+                outcome: SlashOutcome::Refuse { .. },
+            } => !crate::rsvp::is_rsvp_command(name),
+            _ => false,
+        };
+        if refusal_for_other {
+            return self.handle_routed(interaction, routed).await;
+        }
+        crate::rsvp::handle_rsvp_interaction(
+            &self.router,
+            &self.pool,
+            &self.executor,
+            &self.classifier,
+            interaction,
+        )
+        .await
+    }
+
+    pub async fn prepare(
+        &self,
+        interaction: Interaction,
+    ) -> Result<crate::rsvp::PreparedRsvp, crate::DiscordError> {
+        // Same application-identity refusal as `handle`/`handle_routed`, before
+        // any callback or store work: the callback route carries no app check.
+        let application_id = self
+            .application_id
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if application_id != 0 && interaction.application_id.get() != application_id {
+            return Ok(crate::rsvp::PreparedRsvp::ignored());
+        }
+        crate::rsvp::prepare_rsvp_interaction(&self.router, &self.executor, interaction).await
+    }
+
+    pub async fn complete(
+        &self,
+        prepared: crate::rsvp::PreparedRsvp,
+    ) -> Result<bool, crate::DiscordError> {
+        crate::rsvp::complete_rsvp_interaction(
+            prepared,
+            &self.pool,
+            &self.executor,
+            &self.classifier,
+        )
+        .await
+    }
+
+    /// Boot sync also covers persisted-session RESUMED, which has no application
+    /// payload. Resolve the identity with the shared executor before connecting,
+    /// and arm this runtime's application fence from the same lookup.
+    pub async fn publish_current(&self) -> Result<(), crate::DiscordError> {
+        let application_id = self.executor.current_application_id().await?;
+        self.set_application_id(application_id);
+        self.publish(application_id).await
+    }
+
+    /// One full registry sync, never an RSVP-only partial replacement.
+    pub async fn publish(&self, application_id: u64) -> Result<(), crate::DiscordError> {
+        let guild_id =
+            self.router.gates().configured_guild.ok_or_else(|| {
+                crate::DiscordError::Rejected("missing configured guild".to_owned())
+            })?;
+        let definitions = self
+            .router
+            .publish_set(&[])
+            .map_err(|_| crate::DiscordError::Rejected("invalid command registry".to_owned()))?;
+        self.executor
+            .publish_guild_commands(application_id, guild_id, &publish_commands(&definitions))
+            .await
+    }
+
     pub fn new(
         gates: two_bot_core::RouterGates,
         pool: sqlx::PgPool,
         executor: crate::ActionExecutor,
         bot_user_id: u64,
+        classifier: two_bot_core::ClassifierConfig,
     ) -> Self {
-        Self::with_router(InteractionRouter::new(gates), pool, executor, bot_user_id)
+        Self::with_router(
+            InteractionRouter::new(gates),
+            pool,
+            executor,
+            bot_user_id,
+            classifier,
+        )
     }
 
     /// Compose LFG with the bot's existing feature registrations in ONE router.
@@ -223,6 +336,7 @@ impl InteractionRuntime {
         pool: sqlx::PgPool,
         executor: crate::ActionExecutor,
         bot_user_id: u64,
+        classifier: two_bot_core::ClassifierConfig,
     ) -> Self {
         #[derive(Debug)]
         struct LfgRegistration(two_bot_core::HandlerId);
@@ -235,7 +349,9 @@ impl InteractionRuntime {
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgClose)));
         Self {
             router: std::sync::Arc::new(router),
+            pool: pool.clone(),
             executor,
+            classifier,
             lfg: crate::lfg_interactions::LfgInteractions::new(pool),
             bot_user_id: std::sync::atomic::AtomicU64::new(bot_user_id),
             application_id: std::sync::atomic::AtomicU64::new(0),
@@ -268,16 +384,38 @@ impl InteractionRuntime {
             .store(id, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Returns false for interactions owned by another feature or guild.
-    pub async fn handle(&self, interaction: &Interaction) -> Result<bool, crate::DiscordError> {
-        let application_id = self
-            .application_id
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if application_id != 0 && interaction.application_id.get() != application_id {
-            return Ok(false);
+    /// Current application pin (0 = unpinned). READY callers check this before
+    /// arming identity so a mismatched payload cannot replace the boot pin.
+    pub fn application_pin(&self) -> u64 {
+        self.application_id
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Arm READY identity only when the boot pin confirms the payload (or no
+    /// pin exists). Returns false and changes nothing on mismatch.
+    pub fn try_arm_ready_identity(&self, bot_user_id: u64, application_id: u64) -> bool {
+        let pinned = self.application_pin();
+        if pinned != 0 && pinned != application_id {
+            return false;
         }
-        let routed = route_interaction(&self.router, interaction, None);
-        self.handle_routed(interaction, routed).await
+        self.set_bot_user_id(bot_user_id);
+        self.set_application_id(application_id);
+        true
+    }
+
+    pub fn test_bot_user_id(&self) -> u64 {
+        self.bot_user_id.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn test_application_id(&self) -> u64 {
+        self.application_id
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test-only lazy bot-user resolution: proves a READY-stored identity is
+    /// retained without HTTP even when the identity lookup would fail.
+    pub async fn test_resolved_bot_user_id(&self) -> u64 {
+        self.bot_user_id().await
     }
 
     /// Execute an outcome from this runtime's shared router without routing twice.
@@ -302,7 +440,7 @@ impl InteractionRuntime {
                 ..
             } => {
                 self.executor
-                    .answer_interaction(
+                    .answer_interaction_with_blocked_retry(
                         interaction.id.get(),
                         &interaction.token,
                         &refusal_response(refusal),
@@ -392,7 +530,11 @@ impl InteractionRuntime {
         // Acknowledge before locks, SQL or paced REST can exceed Discord's 3 s window.
         // https://docs.discord.com/developers/interactions/receiving-and-responding#interaction-response
         self.executor
-            .answer_interaction(interaction.id.get(), &interaction.token, &deferred)
+            .answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &deferred,
+            )
             .await?;
         let result = match request {
             Ok(request) => {
