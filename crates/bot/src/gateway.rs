@@ -586,13 +586,17 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             Err(error) if matches!(error.kind(), twilight_gateway::error::ReceiveMessageErrorType::Reconnect) => {
                                 transport_disconnected(&state, &generation).await;
                                 voice_disconnected(voice.as_ref());
-                                warn!("gateway reconnect failed; Twilight will retry");
+                                warn!(
+                                    msg = "gateway_reconnect_failed",
+                                    "gateway reconnect failed; Twilight will retry"
+                                );
                                 continue;
                             }
                             Err(_) => return Err(sqlx::Error::InvalidArgument("gateway receive failed".into())),
                         };
                         observer.observe(&message, &shard);
                         let Message::Text(text) = message else {
+                            crate::logging::shard_closed(&message);
                             transport_disconnected(&state, &generation).await;
                             voice_disconnected(voice.as_ref());
                             let rejected = matches!(message, Message::Close(Some(ref frame)) if matches!(frame.code, 4007 | 4009));
@@ -756,7 +760,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             }
         },
     );
-    info!(shard = ?ShardId::ONE, "gateway shard loop started");
+    info!(msg = "gateway_started", shard = ?ShardId::ONE, "gateway shard loop started");
     let handle = tokio::runtime::Handle::current();
     let worker_state = Arc::clone(&state);
     let worker_voice = voice;
