@@ -407,6 +407,50 @@ fn lfg_select(values: Vec<String>) -> Interaction {
     interaction
 }
 
+/// The same interaction as `member` with `permissions`, with its own id/token.
+fn from_member(mut interaction: Interaction, member: u64, permissions: Permissions) -> Interaction {
+    interaction.id = Id::new(member);
+    interaction.token = format!("token-{member}");
+    let resolved = interaction.member.as_mut().expect("guild member");
+    resolved.permissions = Some(permissions);
+    resolved.user = Some(user(member, false));
+    interaction
+}
+
+fn interaction_event(interaction: Interaction) -> Event {
+    Event::InteractionCreate(Box::new(InteractionCreate(interaction)))
+}
+
+/// A router-refused command: the first thing it does is one REST callback, so
+/// a delayed mock reply holds its worker slot without any database.
+fn open_command(member: u64) -> Event {
+    interaction_event(from_member(
+        slash("sticky-remove", Some(CHANNEL), Vec::new()),
+        member,
+        Permissions::empty(),
+    ))
+}
+
+/// `/timeout` from a member who holds `MODERATE_MEMBERS`; moderation is gated
+/// off in `gates`, so the router answers with one refusal callback.
+fn moderator_command(member: u64) -> Event {
+    interaction_event(from_member(
+        slash("timeout", Some(CHANNEL), Vec::new()),
+        member,
+        Permissions::MODERATE_MEMBERS,
+    ))
+}
+
+fn held_callbacks(count: usize) -> Vec<RestResponse> {
+    (0..count)
+        .map(|_| RestResponse {
+            status: 200,
+            body: None,
+            delay: Duration::from_secs(30),
+        })
+        .collect()
+}
+
 fn option(name: &str, value: CommandOptionValue) -> CommandDataOption {
     CommandDataOption {
         name: name.to_owned(),
@@ -662,7 +706,7 @@ async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
                 .collect();
             assert_eq!(
                 names,
-                vec!["rank", "leaderboard"],
+                vec!["rank", "leaderboard", "help"],
                 "unrelated core commands remain; uncleared surfaces are replaced"
             );
         }
@@ -775,7 +819,7 @@ async fn activation_boot_from_env_fixture() {
     let defs = runtime.router().publish_set(&[]).unwrap();
     let names: Vec<_> = defs.iter().map(|def| def.name.as_str()).collect();
     if expected == "narrowed" {
-        assert_eq!(names, ["rank", "leaderboard"]);
+        assert_eq!(names, ["rank", "leaderboard", "help"]);
         assert!(!runtime.router().gates().moderation);
         assert!(!runtime.router().gates().automations);
         assert!(!runtime.router().gates().announcements);
@@ -877,6 +921,67 @@ async fn refused_interaction_is_answered_ephemerally_via_executor() {
 }
 
 #[tokio::test]
+async fn unconfirmed_help_does_not_invent_a_live_registry() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    assert!(runtime.published_commands().is_none());
+    runtime
+        .on_interaction(&slash("help", Some(CHANNEL), Vec::new()))
+        .await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1);
+    let reply: serde_json::Value = serde_json::from_slice(&callbacks[0].body).unwrap();
+    assert_eq!(reply["type"], 4);
+    assert_eq!(reply["data"]["flags"], 64);
+    assert_eq!(
+        reply["data"]["content"],
+        "The command list is still refreshing. Try /help again shortly."
+    );
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "no publication or store work from help"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn help_answers_immediately_from_the_live_publish_set() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    // All feature gates on: the reply must equal the rendered live set.
+    let router_gates = RouterGates {
+        scorecard: true,
+        moderation: true,
+        ..gates(true, true)
+    };
+    let runtime = runtime_without_db(router_gates, true, origin);
+    assert!(runtime.published_commands().is_none());
+    runtime.publish_registry_checked(Some(1111)).await.unwrap();
+    assert!(runtime.published_commands().is_some());
+    runtime
+        .on_interaction(&slash("help", Some(CHANNEL), Vec::new()))
+        .await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1, "one immediate callback, no defer");
+    let reply: serde_json::Value =
+        serde_json::from_slice(&callbacks[0].body).expect("callback json");
+    assert_eq!(reply["type"], 4, "immediate response, not a defer");
+    assert_eq!(reply["data"]["flags"], 64, "ephemeral");
+    let content = reply["data"]["content"].as_str().expect("content");
+    let defs = router_with_commands(router_gates)
+        .publish_set(&[])
+        .expect("live set");
+    assert_eq!(content, two_bot_core::help_text(&defs));
+    assert!(content.contains("/help"), "lists itself");
+    assert!(content.contains("/ban"), "lists gated commands");
+    assert!(
+        content.contains("needs Ban Members"),
+        "marks the gate: {content}"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn published_unwired_commands_reply_without_defer_or_store_work() {
     for router_gates in [
         gates(false, false),
@@ -916,11 +1021,13 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "schedule-list"
                         | "rank"
                         | "leaderboard"
+                        | "help"
                 )
             })
             .collect();
         assert!(!unwired.contains(&"rank"));
         assert!(!unwired.contains(&"leaderboard"));
+        assert!(!unwired.contains(&"help"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }
@@ -1292,29 +1399,15 @@ async fn dispatch_spawns_interaction_work_off_the_shard_loop() {
 
 #[tokio::test]
 async fn bounded_dispatch_keeps_publication_independent_and_cancels_on_gateway_exit() {
-    let (mock, origin) = MockRest::start_script(
-        (0..17)
-            .map(|_| RestResponse {
-                status: 200,
-                body: None,
-                delay: Duration::from_secs(30),
-            })
-            .collect(),
-    )
-    .await;
+    let (mock, origin) = MockRest::start_script(held_callbacks(17)).await;
     let runtime = runtime_without_db(gates(false, false), false, origin);
     let guard = runtime.dispatch_guard();
-    let event = Event::InteractionCreate(Box::new(InteractionCreate(slash(
-        "sticky-remove",
-        Some(CHANNEL),
-        Vec::new(),
-    ))));
-    for _ in 0..16 {
-        assert!(runtime.dispatch(&event));
+    for member in 1..=16 {
+        assert!(runtime.dispatch(&open_command(member)));
     }
-    for _ in 0..100 {
+    for member in 17..117 {
         assert!(
-            !runtime.dispatch(&event),
+            !runtime.dispatch(&open_command(member)),
             "no spawned waiters on saturation"
         );
     }
@@ -1326,16 +1419,193 @@ async fn bounded_dispatch_keeps_publication_independent_and_cancels_on_gateway_e
         !runtime.dispatch(&ready()),
         "overlapping registry sync coalesces"
     );
-    wait_for(|| mock.requests().len() == 17, "all admitted work started").await;
-    assert_eq!(mock.posts_to("/callback").await.len(), 16);
+    wait_for(
+        || {
+            let requests = mock.requests();
+            (1..=16).all(|member| {
+                requests
+                    .iter()
+                    .any(|r| r.path.contains(&format!("/token-{member}/")))
+            }) && requests.iter().any(|r| r.method == "PUT")
+        },
+        "all admitted work started",
+    )
+    .await;
+    wait_for(
+        || {
+            mock.requests()
+                .iter()
+                .any(|r| r.path.contains("/token-17/"))
+        },
+        "a busy reply for the first refused member",
+    )
+    .await;
     drop(guard);
     wait_for(
         || Arc::strong_count(&runtime) == 1,
         "all scoped work cancelled",
     )
     .await;
-    assert!(!runtime.dispatch(&event), "closed scope refuses new work");
-    assert_eq!(mock.requests().len(), 17, "rejected work never sent HTTP");
+    let sent = mock.requests().len();
+    assert!(
+        !runtime.dispatch(&open_command(500)),
+        "closed scope refuses new work"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(mock.requests().len(), sent, "closed scope sent no HTTP");
+    mock.shutdown().await;
+}
+
+fn callback_json(request: &RestRequest) -> serde_json::Value {
+    serde_json::from_slice(&request.body).expect("callback body")
+}
+
+#[tokio::test]
+async fn saturated_interaction_lane_still_answers_a_moderator_command() {
+    // Sixteen members fill the shared interaction lane; each worker is held on
+    // its first callback.
+    let (mock, origin) = MockRest::start_script(held_callbacks(16)).await;
+    let runtime = runtime_without_db(gates(false, false), false, origin);
+    let _guard = runtime.dispatch_guard();
+    for member in 1..=16 {
+        assert!(runtime.dispatch(&open_command(member)));
+    }
+    assert!(
+        !runtime.dispatch(&open_command(17)),
+        "the shared lane is full for open commands"
+    );
+
+    assert!(
+        runtime.dispatch(&moderator_command(900)),
+        "the reserved lane admits a permitted moderator"
+    );
+    wait_for(
+        || {
+            mock.requests()
+                .iter()
+                .any(|r| r.path.contains("/token-900/"))
+        },
+        "moderator callback",
+    )
+    .await;
+    let moderator = mock
+        .requests()
+        .into_iter()
+        .find(|r| r.path.contains("/token-900/"))
+        .expect("moderator callback");
+    let reply = callback_json(&moderator);
+    assert_eq!(reply["type"], 4);
+    assert_eq!(
+        reply["data"]["content"],
+        RouterRefusal::ModerationDisabled.message(),
+        "the router, not admission, answered the command"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn refused_open_command_gets_one_ephemeral_busy_reply() {
+    let (mock, origin) = MockRest::start_script(held_callbacks(16)).await;
+    let runtime = runtime_without_db(gates(false, false), false, origin);
+    let _guard = runtime.dispatch_guard();
+    for member in 1..=16 {
+        assert!(runtime.dispatch(&open_command(member)));
+    }
+    assert!(!runtime.dispatch(&open_command(17)));
+    wait_for(
+        || {
+            mock.requests()
+                .iter()
+                .any(|r| r.path.contains("/token-17/"))
+        },
+        "busy callback",
+    )
+    .await;
+    let busy: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.path.contains("/token-17/"))
+        .collect();
+    assert_eq!(busy.len(), 1, "one callback, no retry loop");
+    let reply = callback_json(&busy[0]);
+    assert_eq!(reply["type"], 4);
+    assert_eq!(reply["data"]["flags"], 64, "ephemeral");
+    assert_eq!(
+        reply["data"]["content"],
+        crate::interaction_admission::BUSY_REPLY
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn one_member_cannot_hold_more_than_their_share_of_the_lane() {
+    let cap = crate::interaction_admission::PER_USER_IN_FLIGHT;
+    let (mock, origin) = MockRest::start_script(held_callbacks(cap + 1)).await;
+    let runtime = runtime_without_db(gates(false, false), false, origin);
+    let _guard = runtime.dispatch_guard();
+    for _ in 0..cap {
+        assert!(runtime.dispatch(&open_command(42)));
+    }
+    assert!(
+        !runtime.dispatch(&open_command(42)),
+        "the member is at their cap while the lane has room"
+    );
+    assert!(
+        runtime.dispatch(&open_command(43)),
+        "another member is unaffected"
+    );
+    wait_for(
+        || {
+            mock.requests()
+                .iter()
+                .filter(|r| r.path.contains("/token-42/"))
+                .count()
+                == cap + 1
+        },
+        "capped member's work plus one busy reply",
+    )
+    .await;
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn reserved_lane_is_not_reachable_without_the_permission() {
+    let (mock, origin) = MockRest::start_script(held_callbacks(16)).await;
+    let runtime = runtime_without_db(gates(false, false), false, origin);
+    let _guard = runtime.dispatch_guard();
+    for member in 1..=16 {
+        assert!(runtime.dispatch(&open_command(member)));
+    }
+    // Same command, same lane pressure, but the invoker lacks MODERATE_MEMBERS.
+    let impostor = interaction_event(from_member(
+        slash("timeout", Some(CHANNEL), Vec::new()),
+        901,
+        Permissions::SEND_MESSAGES,
+    ));
+    assert!(
+        !runtime.dispatch(&impostor),
+        "naming a moderation command is not enough"
+    );
+    wait_for(
+        || {
+            mock.requests()
+                .iter()
+                .any(|r| r.path.contains("/token-901/"))
+        },
+        "busy callback",
+    )
+    .await;
+    let reply = callback_json(
+        &mock
+            .requests()
+            .into_iter()
+            .find(|r| r.path.contains("/token-901/"))
+            .expect("callback"),
+    );
+    assert_eq!(
+        reply["data"]["content"],
+        crate::interaction_admission::BUSY_REPLY
+    );
     mock.shutdown().await;
 }
 
@@ -3868,59 +4138,137 @@ async fn sticky_and_feed_slices_share_one_runtime() {
     db.close().await;
 }
 
-fn kick_slash() -> Interaction {
+fn kick_as(permissions: Permissions, guild: u64) -> Interaction {
     let mut interaction = slash(
         "kick",
         Some(CHANNEL),
         vec![option("member", CommandOptionValue::User(Id::new(303)))],
     );
-    interaction.member.as_mut().unwrap().permissions = Some(Permissions::all());
+    interaction.member.as_mut().unwrap().permissions = Some(permissions);
+    interaction.guild_id = Some(Id::new(guild));
     interaction
 }
 
-fn moderation_gates() -> RouterGates {
+fn kick_gates(moderation: bool) -> RouterGates {
     RouterGates {
         configured_guild: Some(GUILD),
-        moderation: true,
+        moderation,
         ..gates(false, false)
     }
 }
 
-#[tokio::test]
-async fn claimed_kick_stays_silent_for_the_voice_sink() {
-    let (mock, origin) = MockRest::start(Vec::new()).await;
-    let runtime = runtime_without_db(moderation_gates(), false, origin);
-    // Claimed (target in a tracked room): the voice sink answers the vote,
-    // so the router sends no callback at all.
-    runtime.set_voice_kick_claim(Arc::new(|_, _| Box::pin(async move { Some(500u64) })));
-    runtime.on_interaction(&kick_slash()).await;
-    assert!(
-        mock.posts_to("/callback").await.is_empty(),
-        "claimed kick sends no router callback"
-    );
-    assert!(mock.requests().is_empty(), "no other REST effects");
-    mock.shutdown().await;
+/// Wire a voice delegate that counts its calls and answers `claims`. The
+/// stub never sends a callback itself, so a `true` answer must leave the
+/// router silent and a `false` answer must leave exactly one router reply.
+fn wire_kick_vote(runtime: &CommandRuntime, claims: bool) -> Arc<AtomicU64> {
+    let calls = Arc::new(AtomicU64::new(0));
+    let observed = Arc::clone(&calls);
+    runtime.set_voice_kick_vote(Arc::new(move |_| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move { claims })
+    }));
+    calls
 }
 
-#[tokio::test]
-async fn unclaimed_kick_keeps_the_moderation_path() {
-    let (mock, origin) = MockRest::start(Vec::new()).await;
-    let runtime = runtime_without_db(moderation_gates(), false, origin.clone());
-    // No claim wired: pre-existing behavior, one unavailable callback.
-    runtime.on_interaction(&kick_slash()).await;
-    // Claim wired but target outside any tracked room: same path.
-    runtime.set_voice_kick_claim(Arc::new(|_, _| Box::pin(async move { None })));
-    runtime.on_interaction(&kick_slash()).await;
+async fn sole_ephemeral_reply(mock: &MockRest, case: &str) -> String {
     let callbacks = mock.posts_to("/callback").await;
-    assert_eq!(callbacks.len(), 2, "both unclaimed kicks answer");
-    for callback in callbacks {
-        let reply: serde_json::Value = serde_json::from_slice(&callback.body).unwrap();
-        assert_eq!(reply["type"], 4, "immediate response, not a defer");
-        assert_eq!(reply["data"]["flags"], 64);
-        assert_eq!(
-            reply["data"]["content"],
-            "This command is not available in this build yet."
-        );
+    assert_eq!(callbacks.len(), 1, "{case} answers exactly once");
+    let reply: serde_json::Value = serde_json::from_slice(&callbacks[0].body).unwrap();
+    assert_eq!(reply["type"], 4, "{case}: immediate reply, not a defer");
+    assert_eq!(reply["data"]["flags"], 64, "{case}: ephemeral reply");
+    assert_eq!(mock.requests().len(), 1, "{case}: no other REST effects");
+    reply["data"]["content"].as_str().unwrap().to_owned()
+}
+
+// The router is the only answerer of `/kick`. A passing moderation gate or the
+// guild fence decides the interaction before the voice delegate is consulted,
+// so sitting in a voice room never shields a member from a moderator and a
+// foreign guild never reaches the vote path.
+#[tokio::test]
+async fn kick_moderation_outcomes_never_consult_the_voice_delegate() {
+    let cases = [
+        (
+            "moderator",
+            Permissions::all(),
+            true,
+            GUILD,
+            "This command is not available in this build yet.".to_owned(),
+        ),
+        (
+            "foreign guild",
+            Permissions::all(),
+            true,
+            9999,
+            RouterRefusal::GuildRestricted.message(),
+        ),
+    ];
+    for (case, permissions, moderation, guild, expected) in cases {
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        let runtime = runtime_without_db(kick_gates(moderation), false, origin);
+        // A delegate that would claim every interaction must still not run.
+        let calls = wire_kick_vote(&runtime, true);
+        runtime.on_interaction(&kick_as(permissions, guild)).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "{case} skips voice");
+        assert_eq!(sole_ephemeral_reply(&mock, case).await, expected, "{case}");
+        mock.shutdown().await;
     }
-    mock.shutdown().await;
+}
+
+// Moderation off, or the invoker lacking Kick Members, still serves the V4
+// vote for room occupants: the delegate is asked once and, when it answers
+// the interaction, the router stays silent.
+#[tokio::test]
+async fn refused_kick_hands_the_interaction_to_the_voice_delegate() {
+    let cases = [
+        ("missing permission", Permissions::empty(), true),
+        ("moderation disabled", Permissions::all(), false),
+    ];
+    for (case, permissions, moderation) in cases {
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        let runtime = runtime_without_db(kick_gates(moderation), false, origin);
+        let calls = wire_kick_vote(&runtime, true);
+        runtime.on_interaction(&kick_as(permissions, GUILD)).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "{case} asks voice once");
+        assert!(
+            mock.posts_to("/callback").await.is_empty(),
+            "{case}: voice owns the callback, the router sends none"
+        );
+        assert!(mock.requests().is_empty(), "{case}: no other REST effects");
+        mock.shutdown().await;
+    }
+}
+
+// Voice declines (the invoker is not in the target's room, the target left
+// between reads, or voice is off): the router refusal is the single reply.
+// The same holds with no delegate wired at all.
+#[tokio::test]
+async fn declined_kick_gets_the_router_refusal_exactly_once() {
+    let cases = [
+        (
+            "missing permission",
+            Permissions::empty(),
+            true,
+            RouterRefusal::ModerationPermission(two_bot_core::ModerationAction::Kick).message(),
+        ),
+        (
+            "moderation disabled",
+            Permissions::all(),
+            false,
+            RouterRefusal::ModerationDisabled.message(),
+        ),
+    ];
+    for (case, permissions, moderation, expected) in cases {
+        for wired in [true, false] {
+            let case = format!("{case} (delegate wired: {wired})");
+            let (mock, origin) = MockRest::start(Vec::new()).await;
+            let runtime = runtime_without_db(kick_gates(moderation), false, origin);
+            let calls = wired.then(|| wire_kick_vote(&runtime, false));
+            runtime.on_interaction(&kick_as(permissions, GUILD)).await;
+            if let Some(calls) = calls {
+                assert_eq!(calls.load(Ordering::Relaxed), 1, "{case} asks voice once");
+            }
+            assert_eq!(sole_ephemeral_reply(&mock, &case).await, expected, "{case}");
+            mock.shutdown().await;
+        }
+    }
 }

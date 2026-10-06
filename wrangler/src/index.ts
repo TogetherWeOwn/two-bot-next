@@ -84,12 +84,16 @@ export interface Env extends ForwardedFlagEnv {
   TWO_AUTOMOD?: string;
   // Explicit: not a TWO_* flag, so outside the container-env allowlist.
   DISCORD_APPLICATION_ID?: string;
+  /** Infrastructure ID protected from temporary-room deletion. */
+  DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID?: string;
   BOT_PORT?: string;
   KEEPALIVE_SECONDS?: string;
   /** Consecutive failed probes; default covers ~10 minutes of keepalive ticks. */
   UNREADY_ALERT_FAILURES?: string;
   /** Optional Worker secret; never forwarded to the container or logged. */
   OPS_ALERT_WEBHOOK_URL?: string;
+  /** Worker-only forwarding switch. Only "on" posts; all other values are log-only. */
+  OPS_ALERT_FORWARDING?: string;
   /** Optional Worker secret: bearer token for GET /ops/metrics. Unset → route 404s. */
   METRICS_SCRAPE_TOKEN?: string;
   /** Optional Hyperdrive binding to shared Postgres; absent → snapshot, clicks dropped. */
@@ -106,6 +110,18 @@ export interface Env extends ForwardedFlagEnv {
   TWO_INTERNAL_CHANNEL_KEYS?: string;
   /** Signing keys: a secret, forwarded by its own explicit line and never logged. */
   TWO_INTERNAL_KEYS?: string;
+}
+
+/** Both alert senders share this exact Discord-only destination boundary. */
+function opsAlertWebhookUrl(binding: string): URL {
+  // Validate the literal spelling before URL parsing can normalize whitespace,
+  // userinfo, backslashes or dot segments. Only the default HTTPS port is allowed.
+  // https://docs.discord.com/developers/resources/webhook#execute-webhook
+  if (binding !== binding.trim() ||
+      !/^https:\/\/discord\.com(?::443)?\/api\/webhooks\/[0-9]+\/[A-Za-z0-9_-]+$/.test(binding)) {
+    throw new Error("invalid webhook binding");
+  }
+  return new URL(binding);
 }
 
 // Per-isolate crawler cap (60 burst, 1/sec refill — matches legacy
@@ -268,6 +284,8 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
   }
   const applicationId = env[APPLICATION_ID_KEY];
   if (applicationId !== undefined) vars[APPLICATION_ID_KEY] = applicationId;
+  const lobbyId = env.DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID;
+  if (lobbyId !== undefined) vars["DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID"] = lobbyId;
   vars["LISTEN_ADDR"] = `0.0.0.0:${port}`;
   // Private internal-actions receiver (TOG-12980). Dark unless the Operator
   // sets TWO_INTERNAL_ACTIONS to exactly "1"; any other value forwards nothing,
@@ -632,11 +650,11 @@ export class TwoBotContainer extends Container<Env> {
   }
 
   private async postWebhookText(content: string): Promise<void> {
+    if (this.env.OPS_ALERT_FORWARDING !== "on") return;
     const binding = this.env.OPS_ALERT_WEBHOOK_URL;
     if (!binding) return;
     try {
-      const url = new URL(binding);
-      if (url.protocol !== "https:" || url.username || url.password) throw new Error("invalid webhook binding");
+      const url = opsAlertWebhookUrl(binding);
       const response = await fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -652,13 +670,11 @@ export class TwoBotContainer extends Container<Env> {
   }
 
   private async postReadinessWebhook(event: ReadinessEvent): Promise<void> {
+    if (this.env.OPS_ALERT_FORWARDING !== "on") return;
     const binding = this.env.OPS_ALERT_WEBHOOK_URL;
     if (!binding) return;
     try {
-      const url = new URL(binding);
-      if (url.protocol !== "https:" || url.username || url.password) {
-        throw new Error("invalid webhook binding");
-      }
+      const url = opsAlertWebhookUrl(binding);
       const response = await fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },

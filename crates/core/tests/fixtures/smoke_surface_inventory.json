@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 27,
+  "count": 28,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -39,8 +39,20 @@
       "deferral_reason": null
     },
     {
+      "name": "help",
+      "description": "Show this server's live commands, grouped by who can use them.",
+      "family": "core",
+      "gate": "always",
+      "default_member_permissions": null,
+      "dm_permission": false,
+      "options": [],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only discovery command with no legacy counterpart; answers from the live publish set with no store or network effect, so it is pinned offline by the router and help-renderer tests rather than the live smoke five."
+    },
+    {
       "name": "attendance",
-      "description": "Record a verified human attendee for a Discord event occurrence.",
+      "description": "Check in a verified human attendee for a scheduled event (scorecard)",
       "family": "scorecard",
       "gate": "scorecard",
       "default_member_permissions": "8589934592",
@@ -48,7 +60,7 @@
       "options": [
         {
           "name": "event-occurrence",
-          "description": "Scheduled event id or stable occurrence id.",
+          "description": "Event id (number in the event URL) or occurrence id, e.g. 12345 or weekly-standup-2026-10-03",
           "type": "string",
           "required": true,
           "min_value": null,
@@ -292,7 +304,7 @@
       "options": [
         {
           "name": "event-id",
-          "description": "Discord scheduled event id",
+          "description": "Discord scheduled event id (number in the event URL), e.g. 12345",
           "type": "string",
           "required": true,
           "min_value": null,
@@ -321,7 +333,7 @@
     },
     {
       "name": "rsvp-attendance",
-      "description": "Show Owen RSVP totals for a scheduled event",
+      "description": "Show RSVP totals for a scheduled event",
       "family": "announcements",
       "gate": "announcements",
       "default_member_permissions": null,
@@ -329,7 +341,7 @@
       "options": [
         {
           "name": "event-id",
-          "description": "Discord scheduled event id",
+          "description": "Discord scheduled event id (number in the event URL), e.g. 12345",
           "type": "string",
           "required": true,
           "min_value": null,
@@ -362,7 +374,7 @@
         },
         {
           "name": "starts-at",
-          "description": "ISO-8601 start time",
+          "description": "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
           "type": "string",
           "required": true,
           "min_value": null,
@@ -372,7 +384,7 @@
         },
         {
           "name": "roles",
-          "description": "tank:Tank:2,healer:Healer:2,dps:DPS:6",
+          "description": "Role slots as role:Label:count, comma-separated, e.g. tank:Tank:2,dps:DPS:6",
           "type": "string",
           "required": true,
           "min_value": null,
@@ -395,7 +407,7 @@
       "options": [
         {
           "name": "id",
-          "description": "LFG id",
+          "description": "LFG id from the posted signup",
           "type": "string",
           "required": true,
           "min_value": null,

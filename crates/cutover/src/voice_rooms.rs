@@ -8,13 +8,15 @@
 
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
 use two_bot_core::voice_access::{validate_access_controls, AccessControls};
 use two_bot_core::voice_logging::{parse_detail_level, LoggingSettings};
+use two_bot_core::voice_private::PrivacyRecord;
 use two_bot_core::voice_rooms::{
     CreatorChannel, PermissionSource, RoomPosition, TextCompanion, VoiceRoom,
 };
+use two_bot_core::voice_vote_kick_audit::KickAuditRow;
 use two_bot_core::{format_iso_millis, parse_iso_millis, Snowflake};
 
 use super::voice_config_store::PgVoiceConfigStore;
@@ -390,6 +392,240 @@ impl PgRoomStore {
         .iter()
         .map(|row| Ok((decode_id(row, "channel_id")?, row.try_get("custom_name")?)))
         .collect()
+    }
+
+    /// Append V4 vote-kick audit rows in one transaction. Idempotent per
+    /// (guild, vote, event): a replayed row is dropped, never overwritten, so
+    /// a flush retried after an unknown outcome cannot duplicate or rewrite
+    /// history. A timestamp that does not parse falls back to the database
+    /// clock rather than wedging the batch.
+    pub async fn add_kick_audit(&self, rows: &[KickAuditRow]) -> Result<(), sqlx::Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for row in rows {
+            let occurred_at = parse_iso_millis(&row.occurred_at)
+                .and_then(|millis| {
+                    OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000).ok()
+                })
+                .unwrap_or_else(OffsetDateTime::now_utc);
+            let count = |value: usize| i32::try_from(value).unwrap_or(i32::MAX);
+            let progress = row
+                .progress
+                .map(|p| (count(p.yes), count(p.required), count(p.total)));
+            sqlx::query(
+                "INSERT INTO voice_vote_kick_audit
+                 (guild_id, vote_id, event, room_id, initiator_id, target_id, outcome,
+                  yes_votes, votes_required, voters_total, occurred_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                 ON CONFLICT (guild_id, vote_id, event) DO NOTHING",
+            )
+            .bind(row.guild_id.to_string())
+            .bind(row.vote_id.to_string())
+            .bind(row.event.as_str())
+            .bind(row.room_id.to_string())
+            .bind(row.initiator_id.to_string())
+            .bind(row.target_id.to_string())
+            .bind(row.outcome)
+            .bind(progress.map(|p| p.0))
+            .bind(progress.map(|p| p.1))
+            .bind(progress.map(|p| p.2))
+            .bind(occurred_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await
+    }
+
+    /// V3 privacy records for the guild's rooms that differ from the default
+    /// (private, holding a Join channel, or carrying blocks), keyed by room
+    /// channel. A room absent from the map is public with no Join channel and
+    /// an empty block list.
+    pub async fn privacy_in_guild(
+        &self,
+        guild_id: Snowflake,
+    ) -> Result<BTreeMap<Snowflake, PrivacyRecord>, sqlx::Error> {
+        let mut records: BTreeMap<Snowflake, PrivacyRecord> = BTreeMap::new();
+        for row in sqlx::query(
+            "SELECT channel_id, private, join_channel_id FROM voice_rooms
+             WHERE guild_id = $1 AND (private OR join_channel_id IS NOT NULL)",
+        )
+        .bind(guild_id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        {
+            let join_channel_id = row
+                .try_get::<Option<String>, _>("join_channel_id")?
+                .map(|id| {
+                    id.parse::<u64>()
+                        .map_err(|error| sqlx::Error::Decode(Box::new(error)))
+                })
+                .transpose()?;
+            records.insert(
+                decode_id(&row, "channel_id")?,
+                PrivacyRecord {
+                    private: row.try_get("private")?,
+                    join_channel_id,
+                    blocked: BTreeSet::new(),
+                },
+            );
+        }
+        for row in sqlx::query(
+            "SELECT room_channel_id, blocked_member_id FROM voice_room_blocks
+             WHERE guild_id = $1",
+        )
+        .bind(guild_id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        {
+            let blocked = row
+                .try_get::<String, _>("blocked_member_id")?
+                .parse::<u64>()
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+            records
+                .entry(decode_id(&row, "room_channel_id")?)
+                .or_default()
+                .blocked
+                .insert(blocked);
+        }
+        Ok(records)
+    }
+
+    /// Persist one room's privacy record in a single transaction: the flag and
+    /// Join channel on the room row, and the block list replaced to match.
+    /// Returns false (writing nothing) when no row tracks the room, so a
+    /// record can never outlive the room.
+    pub async fn save_privacy(
+        &self,
+        guild_id: Snowflake,
+        channel_id: Snowflake,
+        record: &PrivacyRecord,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE voice_rooms
+             SET private = $3, join_channel_id = $4, privacy_touched_at = now()
+             WHERE guild_id = $1 AND channel_id = $2",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(record.private)
+        .bind(record.join_channel_id.map(|id| id.to_string()))
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            != 0;
+        if !updated {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let blocked: Vec<String> = record.blocked.iter().map(ToString::to_string).collect();
+        sqlx::query(
+            "DELETE FROM voice_room_blocks
+             WHERE guild_id = $1 AND room_channel_id = $2
+               AND NOT (blocked_member_id = ANY($3))",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(&blocked)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO voice_room_blocks (guild_id, room_channel_id, blocked_member_id)
+             SELECT $1, $2, unnest($3::text[])
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(&blocked)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// V3 approved Connect grants for the guild's rooms, keyed by room channel.
+    /// One row is one member the worker approved and Discord may still hold a
+    /// Connect allow for: it is written before the grant PUT and retired only
+    /// after the revocation PUT lands (or the grant is definitively refused).
+    /// A room absent from the map holds no approved grants.
+    pub async fn join_grants_in_guild(
+        &self,
+        guild_id: Snowflake,
+    ) -> Result<BTreeMap<Snowflake, BTreeSet<Snowflake>>, sqlx::Error> {
+        let mut grants: BTreeMap<Snowflake, BTreeSet<Snowflake>> = BTreeMap::new();
+        for row in sqlx::query(
+            "SELECT room_channel_id, member_id FROM voice_join_grants
+             WHERE guild_id = $1",
+        )
+        .bind(guild_id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        {
+            grants
+                .entry(decode_id(&row, "room_channel_id")?)
+                .or_default()
+                .insert(decode_id(&row, "member_id")?);
+        }
+        Ok(grants)
+    }
+
+    /// Record an approval's intent before granting Connect. Idempotent: a
+    /// retried intent is a no-op. Returns false (writing nothing) when no row
+    /// tracks the room, so a grant can never outlive its room.
+    pub async fn save_join_grant(
+        &self,
+        guild_id: Snowflake,
+        channel_id: Snowflake,
+        member_id: Snowflake,
+    ) -> Result<bool, sqlx::Error> {
+        if member_id == 0 {
+            return Err(invalid_argument("join grant member must be nonzero"));
+        }
+        let exists: bool = sqlx::query_scalar(
+            "SELECT count(*) > 0 FROM voice_rooms
+             WHERE guild_id = $1 AND channel_id = $2",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        if !exists {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO voice_join_grants (guild_id, room_channel_id, member_id)
+             VALUES ($1, $2, $3)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(member_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
+    }
+
+    /// Retire a grant after its revocation landed (or its grant was refused).
+    /// Idempotent: retiring an absent row is success, so a retried revoke
+    /// whose outcome was unknown cannot leave a duplicate or fail.
+    pub async fn remove_join_grant(
+        &self,
+        guild_id: Snowflake,
+        channel_id: Snowflake,
+        member_id: Snowflake,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "DELETE FROM voice_join_grants
+             WHERE guild_id = $1 AND room_channel_id = $2 AND member_id = $3",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(member_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn room_for(

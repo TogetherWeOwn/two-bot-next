@@ -2,10 +2,18 @@ use super::*;
 use serde_json::json;
 use std::sync::Mutex;
 
+#[path = "voice_delete_guard_tests.rs"]
+mod delete_guards;
+#[path = "voice_join_requests_tests.rs"]
+mod join;
 #[path = "voice_kick_tests.rs"]
 mod kick;
+#[path = "voice_rooms_limit_tests.rs"]
+mod limit_command;
 #[path = "voice_name_tests.rs"]
 mod name;
+#[path = "voice_private_runtime_tests.rs"]
+mod private;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
 
@@ -108,6 +116,8 @@ struct Store {
     trace: Trace,
     creators: Mutex<Vec<CreatorChannel>>,
     rooms: Mutex<HashMap<u64, VoiceRoom>>,
+    rooms_errors: Mutex<VecDeque<StoreError>>,
+    after_rooms: Option<Hook>,
     owner_intents: Mutex<HashMap<u64, OwnerGrantIntent>>,
     owner_pending: Mutex<HashSet<u64>>,
     owner_revision: AtomicU64,
@@ -123,6 +133,12 @@ struct Store {
     save_logging_error: Option<StoreError>,
     forget_errors: Mutex<VecDeque<StoreError>>,
     companion_errors: Mutex<VecDeque<StoreError>>,
+    privacy: Mutex<BTreeMap<u64, PrivacyRecord>>,
+    save_privacy_errors: Mutex<VecDeque<StoreError>>,
+    /// Durable approved Connect grants, keyed by room then member.
+    join_grants: Mutex<BTreeMap<u64, BTreeSet<u64>>>,
+    save_join_grant_errors: Mutex<VecDeque<StoreError>>,
+    remove_join_grant_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
     after_persist: Option<Hook>,
     config: Arc<Mutex<VoiceConfiguration>>,
@@ -131,6 +147,9 @@ struct Store {
     creators_error: Option<StoreError>,
     custom_names: Mutex<HashMap<u64, String>>,
     save_custom_name_errors: Mutex<VecDeque<StoreError>>,
+    /// V4 audit rows appended so far, in append order.
+    kick_audit: Mutex<Vec<KickAuditRow>>,
+    kick_audit_errors: Mutex<VecDeque<StoreError>>,
 }
 
 impl Store {
@@ -139,6 +158,8 @@ impl Store {
             trace,
             creators: Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)]),
             rooms: Mutex::new(HashMap::new()),
+            rooms_errors: Mutex::new(VecDeque::new()),
+            after_rooms: None,
             owner_intents: Mutex::new(HashMap::new()),
             owner_pending: Mutex::new(HashSet::new()),
             owner_revision: AtomicU64::new(0),
@@ -154,6 +175,11 @@ impl Store {
             save_logging_error: None,
             forget_errors: Mutex::new(VecDeque::new()),
             companion_errors: Mutex::new(VecDeque::new()),
+            privacy: Mutex::new(BTreeMap::new()),
+            save_privacy_errors: Mutex::new(VecDeque::new()),
+            join_grants: Mutex::new(BTreeMap::new()),
+            save_join_grant_errors: Mutex::new(VecDeque::new()),
+            remove_join_grant_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
             after_persist: None,
             config: Arc::new(Mutex::new(empty_config())),
@@ -162,6 +188,8 @@ impl Store {
             creators_error: None,
             custom_names: Mutex::new(HashMap::new()),
             save_custom_name_errors: Mutex::new(VecDeque::new()),
+            kick_audit: Mutex::new(Vec::new()),
+            kick_audit_errors: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -208,7 +236,14 @@ impl RoomPersistence for Store {
         Ok(())
     }
     async fn rooms(&self, _: u64) -> Result<Vec<VoiceRoom>, StoreError> {
-        Ok(self.rooms.lock().unwrap().values().cloned().collect())
+        if let Some(error) = self.rooms_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        let rooms = self.rooms.lock().unwrap().values().cloned().collect();
+        if let Some(hook) = &self.after_rooms {
+            hook();
+        }
+        Ok(rooms)
     }
     async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), StoreError> {
         if let Some(error) = *self.add_creator_error.lock().unwrap() {
@@ -352,6 +387,8 @@ impl RoomPersistence for Store {
             return Err(error);
         }
         self.rooms.lock().unwrap().remove(&channel);
+        self.privacy.lock().unwrap().remove(&channel);
+        self.join_grants.lock().unwrap().remove(&channel);
         self.owner_intents.lock().unwrap().remove(&channel);
         self.owner_pending.lock().unwrap().remove(&channel);
         Ok(())
@@ -413,6 +450,81 @@ impl RoomPersistence for Store {
             .push(format!("remove_companion:{room}"));
         Ok(self.companions.lock().unwrap().remove(&(guild, room)))
     }
+    async fn record_kick_audit(&self, rows: &[KickAuditRow]) -> Result<(), StoreError> {
+        if let Some(error) = self.kick_audit_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        // Same idempotency as the table's (guild, vote, event) key.
+        let mut stored = self.kick_audit.lock().unwrap();
+        for row in rows {
+            if !stored
+                .iter()
+                .any(|s| (s.guild_id, s.vote_id, s.event) == (row.guild_id, row.vote_id, row.event))
+            {
+                stored.push(row.clone());
+            }
+        }
+        Ok(())
+    }
+    async fn privacy(&self, _: u64) -> Result<BTreeMap<u64, PrivacyRecord>, StoreError> {
+        Ok(self.privacy.lock().unwrap().clone())
+    }
+    async fn save_privacy(
+        &self,
+        _: u64,
+        room: u64,
+        record: &PrivacyRecord,
+    ) -> Result<bool, StoreError> {
+        self.trace.lock().unwrap().push(format!(
+            "save_privacy:{room}:{}:{:?}:{}",
+            record.private,
+            record.join_channel_id,
+            record.blocked.len()
+        ));
+        if let Some(error) = self.save_privacy_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        if !self.rooms.lock().unwrap().contains_key(&room) {
+            return Ok(false);
+        }
+        self.privacy.lock().unwrap().insert(room, record.clone());
+        Ok(true)
+    }
+    async fn join_grants(&self, _: u64) -> Result<BTreeMap<u64, BTreeSet<u64>>, StoreError> {
+        Ok(self.join_grants.lock().unwrap().clone())
+    }
+    async fn save_join_grant(&self, _: u64, room: u64, member: u64) -> Result<bool, StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("save_join_grant:{room}:{member}"));
+        if let Some(error) = self.save_join_grant_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        if !self.rooms.lock().unwrap().contains_key(&room) {
+            return Ok(false);
+        }
+        self.join_grants
+            .lock()
+            .unwrap()
+            .entry(room)
+            .or_default()
+            .insert(member);
+        Ok(true)
+    }
+    async fn remove_join_grant(&self, _: u64, room: u64, member: u64) -> Result<(), StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("remove_join_grant:{room}:{member}"));
+        if let Some(error) = self.remove_join_grant_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        if let Some(members) = self.join_grants.lock().unwrap().get_mut(&room) {
+            members.remove(&member);
+        }
+        Ok(())
+    }
 }
 
 /// Scripted `/import` download queue shared with the harness.
@@ -424,17 +536,47 @@ struct OverwriteGate {
     release: tokio::sync::Notify,
 }
 
+/// Hold one `/limit` PATCH mid-flight: the fake signals `sent` when the
+/// write starts and finishes only after `release`.
+#[derive(Default)]
+struct LimitGate {
+    sent: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+/// One join-request message the fake Discord accepted.
+#[derive(Clone)]
+struct SentPrompt {
+    channel: u64,
+    content: String,
+    mention: Option<u64>,
+    components: Vec<Component>,
+    message: MessageRef,
+}
+
 struct Http {
     trace: Trace,
     next_id: Mutex<u64>,
     create_errors: Mutex<VecDeque<RoomHttpError>>,
     move_errors: Mutex<VecDeque<RoomHttpError>>,
     delete_errors: Mutex<VecDeque<RoomHttpError>>,
+    delete_channel_errors: Mutex<HashMap<u64, VecDeque<RoomHttpError>>>,
     rename_errors: Mutex<VecDeque<RoomHttpError>>,
+    limit_errors: Mutex<VecDeque<RoomHttpError>>,
     companion_errors: Mutex<VecDeque<RoomHttpError>>,
     view_errors: Mutex<VecDeque<RoomHttpError>>,
+    /// Scripted failures for the V4 enforcement's Connect deny.
+    kick_errors: Mutex<VecDeque<RoomHttpError>>,
+    overwrite_errors: Mutex<VecDeque<RoomHttpError>>,
+    join_errors: Mutex<VecDeque<RoomHttpError>>,
+    written_overwrites: Mutex<Vec<(u64, PermissionOverwrite)>>,
     notices: Mutex<Vec<(NoticeTarget, String, Option<u64>)>>,
     refused_notices: Mutex<Vec<NoticeTarget>>,
+    /// V3 join-request prompts posted in a room's chat, and the scripted
+    /// errors (one per attempt) the next sends fail with.
+    prompts: Mutex<Vec<SentPrompt>>,
+    prompt_errors: Mutex<VecDeque<RoomHttpError>>,
+    next_message: Mutex<u64>,
     created_attributes: Mutex<Vec<RoomChannelAttributes>>,
     created_names: Mutex<Vec<String>>,
     companion_plans: Mutex<Vec<TextChannelPlan>>,
@@ -442,7 +584,9 @@ struct Http {
     after_create: Option<Hook>,
     before_move: Option<Hook>,
     before_delete: Option<Hook>,
+    before_limit: Option<Hook>,
     overwrites_gate: Option<Arc<OverwriteGate>>,
+    limit_gate: Option<Arc<LimitGate>>,
     downloaded_urls: Mutex<Vec<String>>,
     download_results: DownloadResults,
 }
@@ -455,11 +599,20 @@ impl Http {
             create_errors: Mutex::new(VecDeque::new()),
             move_errors: Mutex::new(VecDeque::new()),
             delete_errors: Mutex::new(VecDeque::new()),
+            delete_channel_errors: Mutex::new(HashMap::new()),
             rename_errors: Mutex::new(VecDeque::new()),
+            limit_errors: Mutex::new(VecDeque::new()),
             companion_errors: Mutex::new(VecDeque::new()),
             view_errors: Mutex::new(VecDeque::new()),
+            kick_errors: Mutex::new(VecDeque::new()),
+            overwrite_errors: Mutex::new(VecDeque::new()),
+            join_errors: Mutex::new(VecDeque::new()),
+            written_overwrites: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             refused_notices: Mutex::new(Vec::new()),
+            prompts: Mutex::new(Vec::new()),
+            prompt_errors: Mutex::new(VecDeque::new()),
+            next_message: Mutex::new(9_000),
             created_attributes: Mutex::new(Vec::new()),
             created_names: Mutex::new(Vec::new()),
             companion_plans: Mutex::new(Vec::new()),
@@ -467,7 +620,9 @@ impl Http {
             after_create: None,
             before_move: None,
             before_delete: None,
+            before_limit: None,
             overwrites_gate: None,
+            limit_gate: None,
             downloaded_urls: Mutex::new(Vec::new()),
             download_results: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -580,6 +735,9 @@ impl RoomWrites for Http {
         if !guard() {
             return Err(RoomHttpError::Cancelled);
         }
+        if let Some(error) = self.kick_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
         self.trace
             .lock()
             .unwrap()
@@ -594,6 +752,15 @@ impl RoomWrites for Http {
             return Err(RoomHttpError::Cancelled);
         }
         self.trace.lock().unwrap().push(format!("delete:{channel}"));
+        if let Some(error) = self
+            .delete_channel_errors
+            .lock()
+            .unwrap()
+            .get_mut(&channel)
+            .and_then(VecDeque::pop_front)
+        {
+            return Err(error);
+        }
         match self.delete_errors.lock().unwrap().pop_front() {
             Some(error) => Err(error),
             None => Ok(()),
@@ -605,6 +772,31 @@ impl RoomWrites for Http {
             .unwrap()
             .push(format!("rename:{channel}:{name}"));
         match self.rename_errors.lock().unwrap().pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    async fn set_user_limit(
+        &self,
+        channel: u64,
+        user_limit: u32,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if let Some(hook) = &self.before_limit {
+            hook();
+        }
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("limit:{channel}:{user_limit}"));
+        if let Some(gate) = &self.limit_gate {
+            gate.sent.notify_one();
+            gate.release.notified().await;
+        }
+        match self.limit_errors.lock().unwrap().pop_front() {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -683,6 +875,120 @@ impl RoomWrites for Http {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+    async fn put_overwrite(
+        &self,
+        channel: u64,
+        overwrite: PermissionOverwrite,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace.lock().unwrap().push(format!(
+            "overwrite:{channel}:{}:{:?}",
+            overwrite.id.get(),
+            overwrite.kind
+        ));
+        if let Some(error) = self.overwrite_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        self.written_overwrites
+            .lock()
+            .unwrap()
+            .push((channel, overwrite));
+        Ok(())
+    }
+    async fn create_join_channel(
+        &self,
+        _: u64,
+        name: &str,
+        parent_id: Option<u64>,
+        position: Option<u64>,
+        guard: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("create_join:{name}:{parent_id:?}:{position:?}"));
+        if let Some(error) = self.join_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        let id = {
+            let mut id = self.next_id.lock().unwrap();
+            let next = *id;
+            *id += 1;
+            next
+        };
+        let mut created = channel(id, 2, parent_id);
+        created.name = Some(name.to_owned());
+        Ok(created)
+    }
+    async fn delete_overwrite(
+        &self,
+        channel: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("delete_overwrite:{channel}:{member}"));
+        match self.overwrite_errors.lock().unwrap().pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    async fn send_component_message(
+        &self,
+        channel: u64,
+        content: &str,
+        mention_user: Option<u64>,
+        components: &[Component],
+    ) -> Result<MessageRef, RoomHttpError> {
+        self.trace.lock().unwrap().push(format!("prompt:{channel}"));
+        if let Some(error) = self.prompt_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        let message_id = {
+            let mut id = self.next_message.lock().unwrap();
+            let next = *id;
+            *id += 1;
+            next
+        };
+        let message = MessageRef {
+            channel_id: channel,
+            message_id,
+        };
+        self.prompts.lock().unwrap().push(SentPrompt {
+            channel,
+            content: content.to_owned(),
+            mention: mention_user,
+            components: components.to_vec(),
+            message,
+        });
+        Ok(message)
+    }
+    async fn edit_component_message(
+        &self,
+        message: MessageRef,
+        content: &str,
+        components: &[Component],
+    ) -> Result<(), RoomHttpError> {
+        self.trace.lock().unwrap().push(format!(
+            "edit_prompt:{}:{}:{}:{}",
+            message.channel_id,
+            message.message_id,
+            content,
+            components.len()
+        ));
+        Ok(())
     }
     async fn send_notice(
         &self,
@@ -821,6 +1127,214 @@ async fn persistence_failure_compensates_the_exact_new_channel_and_never_moves()
         ["create", "persist:500", "delete:500", "forget:500"]
     );
     assert_eq!(worker.failures().len(), 1);
+}
+
+/// Worker-level pin for the legacy "only creator channels create rooms" rule
+/// (the core `decide_room_join` test does not exercise `GuildRoomWorker`).
+/// Mutation: drop the `creators.contains_key` gate from `accept_join`.
+#[tokio::test]
+async fn joining_a_channel_that_is_not_a_creator_never_creates_a_room() {
+    const LOBBY: u64 = 777;
+    let (live, store, http, trace) = fixture();
+    live.publish(snapshot(&[LOBBY], vec![]));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // The gateway still hands out a ticket for any voice channel; the worker
+    // is what refuses it.
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(LOBBY), Some(false))
+        .expect("ticket for a joined channel");
+    assert_eq!(ticket.creator_id, LOBBY);
+    assert!(!worker.accept_join(ticket, "lobby room", 7, NOW.to_owned()));
+    assert!(!worker.dispatch_one(0).await);
+    assert!(worker.creations.is_empty());
+    assert!(worker.tracked().is_empty());
+    assert!(worker.failures().is_empty());
+    assert!(trace.lock().unwrap().is_empty());
+    // The configured creator still works for the same member afterwards.
+    worker.live.voice_update(MEMBER, None, Some(false));
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 1).await;
+    assert_eq!(*trace.lock().unwrap(), ["create", "persist:500"]);
+}
+
+/// A guild with no creator row configured creates nothing, even when a member
+/// sits in a voice channel. Mutation: as above.
+#[tokio::test]
+async fn a_guild_without_creator_channels_never_creates_a_room() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap().clear();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .expect("ticket for a joined channel");
+    assert!(!worker.accept_join(ticket, "new room", 7, NOW.to_owned()));
+    assert!(!worker.dispatch_one(0).await);
+    assert!(worker.tracked().is_empty());
+    assert!(worker.failures().is_empty());
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+/// The overwrite/permission preflight (`prepare`) must refuse before the
+/// channel POST, at worker level. Mutation: run `prepare()` after `create`
+/// (the trace then contains `create` for the refused plan).
+#[tokio::test]
+async fn refused_creation_plan_records_a_failure_before_any_channel_is_created() {
+    // Bot lacks Manage Channels on the creator channel.
+    let (live, store, http, trace) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .inner
+        .write()
+        .unwrap()
+        .bot
+        .as_mut()
+        .unwrap()
+        .roles = vec![role(permissions() & !Permissions::MANAGE_CHANNELS)];
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        worker.failures().back(),
+        Some(&LifecycleFailure::MissingPermission {
+            write: RefusedWrite::Create,
+            channel_id: CREATOR,
+            findings: vec![PermissionFinding {
+                permission: VoicePermission::ManageChannels,
+                scope: VoicePermissionScope::Guild,
+                category_id: None,
+                channel_id: None,
+            }],
+        })
+    );
+    assert!(worker.creations.is_empty());
+    assert!(worker.tracked().is_empty());
+    assert!(!worker.dispatch_one(1).await);
+    assert!(trace.lock().unwrap().is_empty());
+
+    // A private-by-default creator without Manage Roles: `plan_room` refuses
+    // instead of silently making a public room.
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].private_default = true;
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .inner
+        .write()
+        .unwrap()
+        .bot
+        .as_mut()
+        .unwrap()
+        .roles = vec![role(permissions() & !Permissions::MANAGE_ROLES)];
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(matches!(
+        worker.failures().back(),
+        Some(LifecycleFailure::MissingPermission {
+            write: RefusedWrite::Create,
+            channel_id: CREATOR,
+            ..
+        })
+    ));
+    assert!(worker.creations.is_empty());
+    assert!(worker.tracked().is_empty());
+    assert!(!worker.dispatch_one(1).await);
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.http.created_attributes.lock().unwrap().is_empty());
+}
+
+/// A failed compensation delete must keep the room (and its provenance)
+/// tracked so a later sweep can remove it, never strand an untracked orphan.
+/// Mutation: drop the room from `rooms` after the refused compensation delete.
+#[tokio::test]
+async fn failed_rollback_keeps_the_room_tracked_until_a_later_sweep_removes_it() {
+    let (live, mut store, http, trace) = fixture();
+    store.persist_error = Some(StoreError::Unavailable);
+    http.delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "delete:500"]
+    );
+    // Retained with its creation provenance and flagged for compensation.
+    let kept = worker.tracked().get(&500).expect("room stays tracked");
+    assert_eq!(kept.owner_id, MEMBER);
+    assert_eq!(kept.original_creator_id, MEMBER);
+    assert_eq!(kept.creator_channel_id, CREATOR);
+    assert!(worker.compensation.contains(&500));
+    assert!(worker.deletes.contains(&500));
+    // The refused delete is not retried against unchanged permissions.
+    for time in [3000, 6000, 10000] {
+        worker.reconcile();
+        assert!(!worker.dispatch_one(time).await);
+    }
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "delete:500"]
+    );
+    assert!(worker.tracked().contains_key(&500));
+    // A permission refresh lets the next sweep retry the delete and forget it.
+    worker.live.publish(snapshot(&[500], vec![]));
+    worker.reconcile();
+    dispatch(&mut worker, 10000).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            "create",
+            "persist:500",
+            "delete:500",
+            "delete:500",
+            "forget:500"
+        ]
+    );
+    assert!(worker.tracked().is_empty());
+    assert!(!worker.compensation.contains(&500));
+    assert!(!worker.deletes.contains(&500));
+}
+
+/// Pending acceptance for the durable half of "retain provenance after a
+/// failed rollback": the exact channel must outlive the worker that created
+/// it. Today the failed persist writes nothing, so the only record is the
+/// creating worker's in-memory `rooms`/`compensation`, and a worker rebuilt
+/// from persisted state cannot rediscover the channel. Run it with
+/// `--ignored` to see the gap; enable it, unedited, once a durable witness
+/// exists. The parity row for the legacy rollback commit stays `carded` until
+/// then.
+#[tokio::test]
+#[ignore = "pending: no durable witness survives a failed persist plus a refused rollback"]
+async fn a_restarted_worker_rediscovers_a_channel_whose_rollback_failed() {
+    let (live, mut store, http, _) = fixture();
+    store.persist_error = Some(StoreError::Unavailable);
+    http.delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert!(worker.tracked().contains_key(&500), "same-worker retention");
+
+    // Restart: a fresh worker, store connection and live snapshot built only
+    // from what the first worker's store persisted. Nothing in memory crosses.
+    let (live, fresh_store, http, _) = fixture();
+    live.publish(snapshot(&[500], vec![]));
+    *fresh_store.rooms.lock().unwrap() = worker.store.rooms.lock().unwrap().clone();
+    drop(worker);
+    let restarted = GuildRoomWorker::load(live, fresh_store, http)
+        .await
+        .unwrap();
+    assert!(
+        restarted.tracked().contains_key(&500) || restarted.compensation.contains(&500),
+        "the channel whose rollback failed must be rediscoverable after a restart"
+    );
 }
 
 #[tokio::test]
@@ -962,7 +1476,7 @@ async fn stale_create_guard_stays_silent_even_when_permissions_also_change() {
     assert!(!worker.send_notices(0).await);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reconnect_only_prunes_tracked_empty_channels_and_counts_unknown_members_as_human() {
     let (live, store, http, trace) = fixture();
     for id in [500, 501, 502, 503] {
@@ -989,6 +1503,7 @@ async fn reconnect_only_prunes_tracked_empty_channels_and_counts_unknown_members
         ],
     ));
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     for time in 0..2 {
         dispatch(&mut worker, time).await;
@@ -1632,7 +2147,7 @@ async fn ownership_commands_while_halted_refuse_paused() {
     assert!(text.contains("paused"), "{text}");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn not_ready_and_disconnected_snapshots_never_allow_destructive_reconciliation() {
     let (_, store, http, trace) = fixture();
     store.rooms.lock().unwrap().insert(500, room(500));
@@ -1641,6 +2156,7 @@ async fn not_ready_and_disconnected_snapshots_never_allow_destructive_reconcilia
     worker.reconcile();
     assert!(!worker.dispatch_one(0).await);
     worker.live.publish(snapshot(&[500], vec![]));
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     worker.live.disconnect();
     assert!(!worker.dispatch_one(1).await);
@@ -1657,7 +2173,7 @@ async fn not_ready_and_disconnected_snapshots_never_allow_destructive_reconcilia
     assert_eq!(worker.tracked().len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn occupants_arriving_during_delete_backoff_cancel_the_write() {
     let (live, store, mut http, trace) = fixture();
     store.rooms.lock().unwrap().insert(500, room(500));
@@ -1667,13 +2183,14 @@ async fn occupants_arriving_during_delete_backoff_cancel_the_write() {
         shared.voice_update(MEMBER, Some(500), Some(false));
     }));
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     dispatch(&mut worker, 0).await;
     assert!(trace.lock().unwrap().is_empty());
     assert_eq!(worker.tracked().len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn delete_403_suspends_without_a_retry_storm_and_refresh_resumes() {
     let (live, store, http, trace) = fixture();
     store.rooms.lock().unwrap().insert(500, room(500));
@@ -1683,6 +2200,7 @@ async fn delete_403_suspends_without_a_retry_storm_and_refresh_resumes() {
         .unwrap()
         .push_back(RoomHttpError::AccessDenied);
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     dispatch(&mut worker, 0).await;
     for time in [3000, 6000, 10000] {
@@ -1691,12 +2209,213 @@ async fn delete_403_suspends_without_a_retry_storm_and_refresh_resumes() {
     }
     assert_eq!(*trace.lock().unwrap(), ["delete:500"]);
     worker.live.publish(snapshot(&[500], vec![]));
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     dispatch(&mut worker, 10000).await;
     assert_eq!(
         *trace.lock().unwrap(),
         ["delete:500", "delete:500", "forget:500"]
     );
+}
+
+/// Prime one eligible delete before reconciling both rooms, so each sweep
+/// visitation order is deterministic despite the tracked-room HashMap.
+async fn two_empty_rooms(
+    first: u64,
+    failures: VecDeque<RoomHttpError>,
+) -> (GuildRoomWorker<Store, Http>, Trace) {
+    let (live, store, http, trace) = fixture();
+    for id in [500, 501] {
+        store.rooms.lock().unwrap().insert(id, room(id));
+        live.upsert_channel(channel(id, 2, Some(CATEGORY)));
+    }
+    http.delete_channel_errors
+        .lock()
+        .unwrap()
+        .insert(500, failures);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // These scenarios predate the ordinary empty-room grace and assert the
+    // delete is queued at once: shorten the grace to zero via the
+    // fixture-only seam so reconcile behaves as on main. Production keeps
+    // the 60 s default.
+    worker.live.set_empty_grace(Duration::ZERO);
+    worker.queue_delete(first, false);
+    worker.reconcile();
+    assert_eq!(worker.queue.pending_counts(GUILD), (2, 0));
+    (worker, trace)
+}
+
+#[tokio::test]
+async fn transient_delete_isolated_in_either_sweep_order_and_retried_after_backoff() {
+    for first in [500, 501] {
+        let (mut worker, trace) =
+            two_empty_rooms(first, VecDeque::from([RoomHttpError::UnknownOutcome])).await;
+        dispatch(&mut worker, 0).await;
+        dispatch(&mut worker, 1).await;
+        let expected = if first == 500 {
+            vec!["delete:500", "delete:501", "forget:501"]
+        } else {
+            vec!["delete:501", "forget:501", "delete:500"]
+        };
+        assert_eq!(*trace.lock().unwrap(), expected, "first room {first}");
+        assert_eq!(worker.tracked().get(&500), Some(&room(500)));
+        assert!(!worker.tracked().contains_key(&501));
+        assert_eq!(
+            worker.store.rooms.lock().unwrap().get(&500),
+            Some(&room(500))
+        );
+        assert!(!worker.store.rooms.lock().unwrap().contains_key(&501));
+        assert!(worker
+            .live
+            .inner
+            .read()
+            .unwrap()
+            .channels
+            .contains_key(&500));
+        worker.reconcile();
+        assert_eq!(worker.queue.pending_counts(GUILD), (1, 0));
+        for time in [2, 100, 1_999] {
+            assert!(
+                !worker.dispatch_one(time).await,
+                "retry must wait for its backoff"
+            );
+        }
+        assert_eq!(*trace.lock().unwrap(), expected);
+        dispatch(&mut worker, 3_000).await;
+        assert!(worker.tracked().is_empty());
+        assert!(worker.store.rooms.lock().unwrap().is_empty());
+        assert!(worker.queue.failed().is_empty());
+        assert_eq!(
+            &trace.lock().unwrap()[expected.len()..],
+            ["delete:500", "forget:500"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn transient_delete_dead_letter_retains_provenance_without_requeue_storms() {
+    let (mut worker, trace) = two_empty_rooms(
+        500,
+        VecDeque::from(vec![
+            RoomHttpError::UnknownOutcome;
+            QUEUE_MAX_ATTEMPTS as usize
+        ]),
+    )
+    .await;
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    let mut previous = 0;
+    for attempt in 1..QUEUE_MAX_ATTEMPTS {
+        worker.reconcile();
+        let before_due = previous + two_bot_core::voice_rooms::fail_backoff_ms(attempt) - 1;
+        assert!(!worker.dispatch_one(before_due).await);
+        let due = u64::from(attempt) * 61_000;
+        dispatch(&mut worker, due).await;
+        previous = due;
+    }
+    let failed = worker.queue.failed();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(
+        failed[0].action.action,
+        RoomAction::DeleteRoom { channel_id: 500 }
+    );
+    assert_eq!(failed[0].action.attempts, QUEUE_MAX_ATTEMPTS);
+    assert_eq!(worker.tracked().get(&500), Some(&room(500)));
+    assert_eq!(
+        worker.store.rooms.lock().unwrap().get(&500),
+        Some(&room(500))
+    );
+    assert!(worker
+        .live
+        .inner
+        .read()
+        .unwrap()
+        .channels
+        .contains_key(&500));
+    for time in [previous + 1, previous + 60_000, previous + 600_000] {
+        worker.reconcile();
+        assert!(!worker.dispatch_one(time).await);
+    }
+    assert_eq!(
+        trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| *call == "delete:500")
+            .count(),
+        QUEUE_MAX_ATTEMPTS as usize
+    );
+    assert!(!trace.lock().unwrap().contains(&"forget:500".to_owned()));
+    // A new eligible room still progresses after the earlier failure is terminal.
+    worker.store.rooms.lock().unwrap().insert(502, room(502));
+    worker.rooms.insert(502, room(502));
+    worker.live.upsert_channel(channel(502, 2, Some(CATEGORY)));
+    worker.reconcile();
+    dispatch(&mut worker, previous + 600_001).await;
+    assert!(!worker.tracked().contains_key(&502));
+    assert!(trace.lock().unwrap().contains(&"forget:502".to_owned()));
+    assert_eq!(worker.queue.failed(), failed);
+}
+
+#[tokio::test]
+async fn refused_delete_isolated_in_either_sweep_order_without_retry_storms() {
+    for first in [500, 501] {
+        let (mut worker, trace) =
+            two_empty_rooms(first, VecDeque::from([RoomHttpError::AccessDenied])).await;
+        dispatch(&mut worker, 0).await;
+        dispatch(&mut worker, 1).await;
+        assert_eq!(worker.tracked().get(&500), Some(&room(500)));
+        assert!(!worker.tracked().contains_key(&501));
+        assert!(worker.queue.is_suspended(GUILD, 500));
+        for time in [3_000, 60_000, 600_000] {
+            worker.reconcile();
+            assert!(!worker.dispatch_one(time).await);
+        }
+        let calls = trace.lock().unwrap();
+        assert_eq!(calls.iter().filter(|call| *call == "delete:500").count(), 1);
+        assert!(calls.contains(&"forget:501".to_owned()));
+        assert!(!calls.contains(&"forget:500".to_owned()));
+    }
+}
+
+#[tokio::test]
+async fn transient_delete_retry_rechecks_occupancy_permissions_and_readiness() {
+    for changed in ["occupancy", "permissions", "readiness"] {
+        let (mut worker, trace) =
+            two_empty_rooms(500, VecDeque::from([RoomHttpError::UnknownOutcome])).await;
+        dispatch(&mut worker, 0).await;
+        dispatch(&mut worker, 1).await;
+        match changed {
+            "occupancy" => {
+                worker.live.voice_update(MEMBER, Some(500), Some(false));
+            }
+            "permissions" => {
+                worker
+                    .live
+                    .inner
+                    .write()
+                    .unwrap()
+                    .bot
+                    .as_mut()
+                    .unwrap()
+                    .roles = vec![role(Permissions::VIEW_CHANNEL)];
+            }
+            "readiness" => worker.live.disconnect(),
+            _ => unreachable!(),
+        }
+        // No reconcile is needed to invalidate the previously queued write.
+        // Dispatch and its last-moment guard must recheck current live facts.
+        worker.dispatch_one(3_000).await;
+        assert_eq!(
+            *trace.lock().unwrap(),
+            ["delete:500", "delete:501", "forget:501"]
+        );
+        assert_eq!(worker.tracked().get(&500), Some(&room(500)));
+        assert_eq!(
+            worker.store.rooms.lock().unwrap().get(&500),
+            Some(&room(500))
+        );
+    }
 }
 
 #[tokio::test]
@@ -1739,7 +2458,7 @@ async fn unknown_create_is_never_retried_or_inferred_from_untracked_channels() {
     assert!(worker.tracked().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn uncertain_move_waits_for_occupancy_evidence_and_last_human_leave_deletes() {
     let (live, store, http, trace) = fixture();
     http.move_errors
@@ -1756,6 +2475,7 @@ async fn uncertain_move_waits_for_occupancy_evidence_and_last_human_leave_delete
     worker.reconcile();
     assert!(!worker.dispatch_one(3).await);
     worker.live.voice_update(MEMBER, None, Some(false));
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     dispatch(&mut worker, 4).await;
     assert_eq!(
@@ -1770,7 +2490,7 @@ async fn uncertain_move_waits_for_occupancy_evidence_and_last_human_leave_delete
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn database_forget_failure_retries_only_sql_after_successful_delete() {
     let (live, store, http, trace) = fixture();
     store.rooms.lock().unwrap().insert(500, room(500));
@@ -1781,6 +2501,7 @@ async fn database_forget_failure_retries_only_sql_after_successful_delete() {
         .push_back(StoreError::Unavailable);
     live.upsert_channel(channel(500, 2, Some(CATEGORY)));
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     dispatch(&mut worker, 0).await;
     assert_eq!(worker.tracked().len(), 1);
@@ -1816,7 +2537,7 @@ async fn credential_refusal_stops_all_further_writes() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn rename_backoff_never_delays_deleting_another_room_and_keeps_latest_name() {
     let (live, store, http, trace) = fixture();
     for id in [500, 501] {
@@ -1837,6 +2558,7 @@ async fn rename_backoff_never_delays_deleting_another_room_and_keeps_latest_name
     dispatch(&mut worker, 0).await;
     worker.propose_name(500, "latest", 1);
     worker.live.voice_update(MEMBER + 1, None, None);
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     dispatch(&mut worker, 2).await;
     // Coalescing replaces the retry's stale name once its budget is due.
@@ -2251,7 +2973,11 @@ fn voice_command_set_is_gated_on_two_voice() {
             "defaultlimit",
             "alwaysprivate",
             "kick",
-            "name"
+            "name",
+            "private",
+            "public",
+            "limit",
+            "unlimit"
         ]
     );
     let off = VoiceGates::from_map(&Default::default());
@@ -5126,16 +5852,17 @@ async fn join_grants_view_and_leave_revokes_without_deny() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn companion_deleted_with_its_room_and_delete_is_idempotent() {
     let (live, store, http, trace) = companion_fixture();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     let mut now = 0;
     join_with_companion(&mut worker, MEMBER, &mut now).await;
     let text_id = worker.companions[&500].text_channel_id;
-    // Everyone leaves: reconcile queues the room delete, which deletes the
-    // companion first.
+    // Everyone leaves: after the grace, reconcile queues the room delete and
+    // its companion cleanup.
     worker.live.voice_update(MEMBER, None, Some(false));
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
     dispatch(&mut worker, now).await;
     let calls = trace.lock().unwrap().clone();
@@ -7433,50 +8160,80 @@ fn voice_member_in(member_id: u64, channel_id: u64) -> VoiceMember {
     }
 }
 
-#[tokio::test]
-async fn sink_claimed_kick_answers_public_ballot_without_defer() {
-    const VOTER: u64 = 301;
-    const TARGET: u64 = 303;
-    const KICK_ROOM: u64 = 500;
-    let trace = Trace::default();
+const KICK_VOTER: u64 = 301;
+const KICK_TARGET: u64 = 303;
+const KICK_ROOM: u64 = 500;
+const OTHER_ROOM: u64 = 501;
+
+/// A runtime tracking `KICK_ROOM` and `OTHER_ROOM` with the given occupants.
+fn kick_room_runtime(
+    trace: &Trace,
+    enabled: bool,
+    members: Vec<VoiceMember>,
+) -> VoiceRuntime<Store, Http> {
     let runtime = VoiceRuntime::new(
         {
             let trace = trace.clone();
             move || {
                 let store = Store::new(trace.clone());
-                store
-                    .rooms
-                    .lock()
-                    .unwrap()
-                    .insert(KICK_ROOM, room(KICK_ROOM));
+                for channel in [KICK_ROOM, OTHER_ROOM] {
+                    store.rooms.lock().unwrap().insert(channel, room(channel));
+                }
                 (store, Http::new(trace.clone()))
             }
         },
         Duration::from_millis(10),
-        true,
+        enabled,
     );
-    assert!(runtime.publish_snapshot(
-        GUILD,
-        snapshot(
-            &[KICK_ROOM],
-            vec![
-                voice_member_in(VOTER, KICK_ROOM),
-                voice_member_in(TARGET, KICK_ROOM),
-            ],
-        )
-    ));
+    // A disabled runtime spawns no actor, so nothing is published.
+    assert_eq!(
+        runtime.publish_snapshot(GUILD, snapshot(&[KICK_ROOM, OTHER_ROOM], members)),
+        enabled
+    );
+    runtime
+}
+
+#[tokio::test]
+async fn kick_vote_in_a_shared_room_answers_the_public_ballot_without_defer() {
+    let trace = Trace::default();
+    let runtime = kick_room_runtime(
+        &trace,
+        true,
+        vec![
+            voice_member_in(KICK_VOTER, KICK_ROOM),
+            voice_member_in(KICK_TARGET, KICK_ROOM),
+        ],
+    );
     let replies = Replies::new(trace.clone());
-    VoiceResponder::respond_with(
+    let answered = VoiceResponder::start_kick_vote(
         &runtime,
         &replies,
-        &kick_sink_interaction(TARGET, VOTER),
-        None,
-        None,
+        &kick_sink_interaction(KICK_TARGET, KICK_VOTER),
     )
     .await;
+    assert!(
+        answered,
+        "voice owns the callback, so the router stays silent"
+    );
     // No defer: the ballot goes out as the initial public callback, so every
     // occupant can see the buttons and reach quorum.
-    assert_eq!(*trace.lock().unwrap(), ["respond"]);
+    // Reconcile may still prune the empty OTHER_ROOM, so look only for
+    // interaction callbacks rather than an exact trace.
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.as_str() == "defer" || call.as_str() == "complete"),
+        "no defer, got {calls:?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.as_str() == "respond")
+            .count(),
+        1,
+        "one public ballot, got {calls:?}"
+    );
     let completed = replies.completed.lock().unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(
@@ -7491,22 +8248,90 @@ async fn sink_claimed_kick_answers_public_ballot_without_defer() {
     assert_eq!(data.components.as_ref().map_or(0, Vec::len), 1);
 }
 
+// Every decline sends no callback at all: the router answers instead, so a
+// callback here would be a second answer to the same interaction.
 #[tokio::test]
-async fn sink_unclaimed_kick_stays_fully_silent_for_the_router() {
+async fn kick_vote_declines_without_a_callback_unless_the_invoker_shares_the_room() {
+    let occupied = vec![
+        voice_member_in(KICK_VOTER, KICK_ROOM),
+        voice_member_in(KICK_TARGET, KICK_ROOM),
+    ];
+    let cases = [
+        // (case, enabled, occupants)
+        ("no tracked room at all", true, Vec::new()),
+        (
+            "target outside any room",
+            true,
+            vec![voice_member_in(KICK_VOTER, KICK_ROOM)],
+        ),
+        (
+            "invoker outside any room",
+            true,
+            vec![voice_member_in(KICK_TARGET, KICK_ROOM)],
+        ),
+        (
+            "invoker in a different tracked room",
+            true,
+            vec![
+                voice_member_in(KICK_VOTER, OTHER_ROOM),
+                voice_member_in(KICK_TARGET, KICK_ROOM),
+            ],
+        ),
+        ("voice disabled", false, occupied),
+    ];
+    for (case, enabled, members) in cases {
+        let trace = Trace::default();
+        let runtime = kick_room_runtime(&trace, enabled, members);
+        let replies = Replies::new(trace.clone());
+        let answered = VoiceResponder::start_kick_vote(
+            &runtime,
+            &replies,
+            &kick_sink_interaction(KICK_TARGET, KICK_VOTER),
+        )
+        .await;
+        assert!(!answered, "{case}: the router must answer");
+        // Reconcile may still prune an empty tracked room, so look only for
+        // interaction callbacks rather than an empty trace.
+        let calls = trace.lock().unwrap().clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("respond") || call.starts_with("defer")),
+            "{case}: no callback, got {calls:?}"
+        );
+        assert!(replies.completed.lock().unwrap().is_empty(), "{case}");
+    }
+}
+
+// The sink never answers `/kick` on its own account, even for a room
+// occupant: the router decides first (moderation gate, then `kick_vote`).
+#[tokio::test]
+async fn sink_never_answers_kick_without_the_router() {
     let trace = Trace::default();
-    let runtime = test_runtime(trace.clone());
+    let runtime = kick_room_runtime(
+        &trace,
+        true,
+        vec![
+            voice_member_in(KICK_VOTER, KICK_ROOM),
+            voice_member_in(KICK_TARGET, KICK_ROOM),
+        ],
+    );
     let replies = Replies::new(trace.clone());
-    // No actor, no rooms: a moderation-shaped target must produce no ack at
-    // all here, otherwise the defer races (and loses to) the router answer.
     VoiceResponder::respond_with(
         &runtime,
         &replies,
-        &kick_sink_interaction(303, 301),
+        &kick_sink_interaction(KICK_TARGET, KICK_VOTER),
         None,
         None,
     )
     .await;
-    assert!(trace.lock().unwrap().is_empty());
+    let calls = trace.lock().unwrap().clone();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.starts_with("respond") || call.starts_with("defer")),
+        "no callback, got {calls:?}"
+    );
     assert!(replies.completed.lock().unwrap().is_empty());
 }
 
@@ -7637,6 +8462,7 @@ fn dead_letter_families_cover_every_queue_action_shape() {
             RoomAction::KickMember {
                 channel_id: 500,
                 member_id: MEMBER,
+                vote_id: 7_000,
             },
             "kick",
         ),
@@ -7653,6 +8479,13 @@ fn dead_letter_families_cover_every_queue_action_shape() {
                 custom_name: Some("den".to_owned()),
             },
             "rename",
+        ),
+        (
+            RoomAction::SetUserLimit {
+                channel_id: 500,
+                user_limit: 4,
+            },
+            "limit",
         ),
     ];
     for (action, family) in &cases {
@@ -7696,7 +8529,7 @@ async fn terminal_queue_failure_dead_letters_exactly_once_per_family() {
     assert_eq!(worker.queue.failed()[0].action.attempts, QUEUE_MAX_ATTEMPTS);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reconcile_pass_reports_its_plan_sizes() {
     let (live, store, http, _) = fixture();
     store.rooms.lock().unwrap().insert(500, room(500));
@@ -7704,6 +8537,7 @@ async fn reconcile_pass_reports_its_plan_sizes() {
     live.upsert_channel(channel(500, 2, Some(CATEGORY)));
     live.upsert_channel(channel(501, 2, Some(CATEGORY)));
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
     let resumed_before = global_series("two_bot_voice_reconcile_actions_total{action=\"resumed\"}");
     let enqueued_before =
         global_series("two_bot_voice_reconcile_actions_total{action=\"delete_enqueued\"}");

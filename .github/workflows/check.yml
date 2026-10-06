@@ -5,6 +5,17 @@ name: check
 
 on:
   pull_request:
+    # Pinned minimal PR surface: with no `types`, GitHub fires only on
+    # opened/synchronize/reopened (label, assignment, review-request and
+    # close events never run this workflow), so the explicit list below is
+    # identical to the bare trigger. It is written out so the offline trigger
+    # test can lock it: check.yml never reads the PR title or body, so
+    # `edited` would only re-run (and, via cancel-in-progress, restart) the
+    # full matrix on an unchanged SHA, and `ready_for_review` would re-run
+    # the same SHA with no draft gating. Every new head SHA arrives via
+    # opened or synchronize, so the gate always reports. Title re-lint on
+    # `edited` lives in supply-chain.yml, where it belongs.
+    types: [opened, synchronize, reopened]
   push:
     branches: [main]
   # Weekly full run (CI standard rule 6, TOG-14881): the supply-chain
@@ -244,6 +255,11 @@ jobs:
       - name: Docker dependency-layer manifests (offline)
         if: needs.job-inputs.outputs.rust != 'false'
         run: python3 scripts/check-docker-manifests.py
+
+      # Fail-closed fixtures for the validator above: stdlib only, no cargo,
+      # so this runs unguarded next to the offline layer-shape check.
+      - name: Docker manifest validator fixtures (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_docker_manifests.py' -v
 
       # Lint lane: its own entry (compile-only artifacts), saved on pushes to main only.
       - name: Restore cargo cache
@@ -1512,6 +1528,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollout.py -v
       - name: Verify staging rollback drill (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollback_drill.py -v
+      - name: Verify staging container backout/restore drill (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill.py -v
       - name: Verify staging ownership-takeover retry (offline fixtures)
         run: node --test scripts/test-ownership-control.mjs
       - name: Verify staging redirect smoke (offline fixtures)
@@ -1519,6 +1537,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_redirect_smoke.py -v
       - name: Verify staging automation read smoke (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_automation_read_smoke.py -v
+      - name: Verify staging voice smoke (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_smoke.py -v
       - name: Verify staging health-contract probe (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_health_contract_probe.py -v
       - name: Verify voice denied-copy fixtures (offline fixtures)

@@ -18,13 +18,15 @@ use std::{sync::Arc, time::Duration};
 
 use sqlx::PgPool;
 use two_bot_core::{
-    audit_scheduled, claim_due, clamp_retry_delay_ms, complete_run, format_iso_ms, lease_until_ms,
-    post_failure_retryable, retry_scheduled, FeatureGates, OccurrenceOutcome, ScheduledAuditInput,
-    ScheduledMessageRow, ScheduledStoreError, SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
+    activation::LiveCapability, audit_scheduled, claim_due, clamp_retry_delay_ms, complete_run,
+    format_iso_ms, lease_until_ms, post_failure_retryable, retry_scheduled, FeatureGates,
+    OccurrenceOutcome, ScheduledAuditInput, ScheduledMessageRow, ScheduledStoreError,
+    SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
 };
 use two_bot_discord::executor::{ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordError};
 
 use crate::{
+    activation::BootActivation,
     jobs::{self, ErrorClass, Job, JobAction},
     website_jobs::Context,
 };
@@ -40,9 +42,11 @@ mod tests;
 
 /// The supervised ticker for the configured guild, or `None` while
 /// `TWO_AUTOMATIONS` is off (legacy only started the scheduler when automations
-/// were enabled, and a disabled scheduler fired zero jobs). A disabled or
-/// misconfigured gate builds no job, so no row is claimed, posted or audited.
-pub(crate) fn register(context: Arc<Context>) -> Option<Job> {
+/// were enabled, and a disabled scheduler fired zero jobs) or the boot
+/// identity does not permit automations (the live-identity fence, TOG-15758).
+/// A disabled, refused or misconfigured gate builds no job, so no row is
+/// claimed, posted or audited.
+pub(crate) fn register(context: Arc<Context>, activation: &BootActivation) -> Option<Job> {
     let gates = match FeatureGates::from_env() {
         Ok(gates) => gates,
         Err(_) => {
@@ -53,8 +57,9 @@ pub(crate) fn register(context: Arc<Context>) -> Option<Job> {
             return None;
         }
     };
-    register_gated(
+    register_fenced(
         gates,
+        activation,
         Arc::new(move || {
             let context = context.clone();
             Box::pin(async move {
@@ -62,6 +67,24 @@ pub(crate) fn register(context: Arc<Context>) -> Option<Job> {
             })
         }),
     )
+}
+
+/// Identity can only narrow the env gate: the ticker posts under the token's
+/// identity, exactly like the `/schedule` verbs the router refuses there.
+pub(crate) fn register_fenced(
+    gates: FeatureGates,
+    activation: &BootActivation,
+    action: JobAction,
+) -> Option<Job> {
+    let fenced = activation.constrain_features(gates);
+    if gates.automations && !fenced.automations {
+        tracing::warn!(
+            job = NAMES[0],
+            capability = LiveCapability::Automations.as_str(),
+            "scheduled messages parked: live activation refused"
+        );
+    }
+    register_gated(fenced, action)
 }
 
 fn register_gated(gates: FeatureGates, action: JobAction) -> Option<Job> {

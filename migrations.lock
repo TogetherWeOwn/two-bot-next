@@ -48,7 +48,7 @@
     "crates/cutover/migrations/0124_channel_shared_timestamps.sql": {
       "sha256": "5cd8d34365dd82e49cb7a801d2047371ee26b6857bd600e9bf61e47b5eb4072b",
       "justification": "Align shared channel/member ledger timestamps without changing applied SQL for TOG-10174."
-      },
+    },
     "crates/cutover/migrations/0130_custom_commands.sql": {
       "sha256": "805f43fcdad3c5d401ef9e975e49d59dd4fe01b18eed2de742d1952b76c20e96",
       "justification": "Register custom-command persistence and shared automation audit for TOG-10080; existing branch SQL unchanged."
@@ -261,6 +261,14 @@
       "sha256": "9f205bf43ab1fd5069baf32b1db8d53a5e0a7cf2ac98c5199af093ded7c667f0",
       "justification": "Guild-fenced website event-key to Discord scheduled-event ID map for the signed event.read verifier (TOG-15757); unmapped keys refuse before any Discord call."
     },
+    "crates/cutover/migrations/0416_voice_room_privacy.sql": {
+      "sha256": "339abf52f877b7ee310ef73f5abfa204918219503a8a6f01c4b9c29c20db4637",
+      "justification": "Voice V3 owner privacy persistence: private flag, Join channel id and the per-room block list; additive column and table only."
+    },
+    "crates/cutover/migrations/0417_voice_vote_kick_audit.sql": {
+      "sha256": "ce40e510fe70b0435c519bb4dd578a8d832395c732f5800c12ec716a1c9a7500",
+      "justification": "Voice V4 vote-kick audit trail: append-only voice_vote_kick_audit rows for vote start, refusal, result and room-scoped enforcement; kept apart from moderation_audit so a voice disconnect is never read as a member kick."
+    },
     "crates/store/migrations/0400_initial.sql": {
       "sha256": "49c7136827484e0625cad889208a03e48026acb854282de3a0a9c5aa4d951b00",
       "justification": "Add unpublished S6 funnel foundation for TOG-9811 under an unused workspace number; preserve proposed SQL bytes."
@@ -292,6 +300,18 @@
     "crates/store/migrations/0407_invite_campaigns.sql": {
       "sha256": "18f81ad0a9f98008cb975ef469f1d52f5c10100b31b14bf63693bb2a4f731abc",
       "justification": "TOG-12415: S6 target DDL for the go.two.gg redirect store; legacy 0006 shape with timestamptz."
+    },
+    "crates/cutover/migrations/0418_voice_join_grants.sql": {
+      "sha256": "e0f7419d2526a36b822892b5206619f24684f3edfa0231ac43262c1116fcfb03",
+      "justification": "Voice V3 approved Connect grants: durable voice_join_grants witness per approved room member, written before the Discord grant and retired only after revocation, so a restart cannot strand a Connect allow past /public."
+    },
+    "crates/cutover/migrations/0419_send_admission_lease.sql": {
+      "sha256": "40ff7070f9519d6519a4b6da01ceb8f7d6d742b20d132140be8ef14ad8fdbf29",
+      "justification": "Discord send-admission in-flight lease: stamp each take so a dead holder's lane is reclaimable after the lease instead of wedging boot forever; additive column only."
+    },
+    "crates/cutover/migrations/0420_send_admission_lease_backfill.sql": {
+      "sha256": "357e82186a067ef3774734cf53425a5dcf6cda039a4679c3439de3b0e84eeb72",
+      "justification": "Fence the production 0419 apply: stamp legacy-held send-admission rows (lease stamp 0) with the apply-time clock so the next admit does not reclaim a live sender; update-only, re-runnable."
     }
   }
 }

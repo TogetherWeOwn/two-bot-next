@@ -10,7 +10,7 @@
 //! (gated on `TWO_VOICE=1` by the binary).
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
     sync::{
@@ -82,6 +82,7 @@ use two_bot_core::{
         RoomMember, RoomOwnership,
     },
     voice_permissions::OWNER_ALLOW_BITS,
+    voice_private::{MemberId, PrivacyRecord, PrivateRoom},
     voice_rooms::{
         category_full_message, is_usable_channel_name, voice_commands, ActionQueue, CreatorChannel,
         NewRoomSpec, PermissionSource, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction,
@@ -96,15 +97,19 @@ use two_bot_core::{
     voice_utilities::{invite_render, ping_render},
     voice_vote_kick::{
         VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError, VoteKickRef,
-        VoteKickStatus, VoteKickUpdate, VoteRoomFacts,
+        VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts,
+    },
+    voice_vote_kick_audit::{
+        refusal_outcome, result_outcome, EnforcementOutcome, KickAuditEvent, KickAuditRow,
+        OUTCOME_EVIDENCE_UNAVAILABLE, OUTCOME_NOT_A_ROOM, OUTCOME_STARTED,
     },
     AutomodPolicy, CommandDefinition, OverwriteTarget, PermissionFinding,
     PermissionOverwrite as HealthOverwrite, Snowflake, VoicePermission, VoicePermissionScope,
 };
 use two_bot_cutover::voice_rooms::{OwnerGrantIntent, PgRoomStore};
 use two_bot_discord::voice_rooms::{
-    can_enforce_kick, can_manage_room, effective_permissions, RoomChannelAttributes, RoomHttp,
-    RoomHttpError,
+    can_enforce_kick, can_manage_room, effective_permissions, MessageRef, RoomChannelAttributes,
+    RoomHttp, RoomHttpError,
 };
 
 #[path = "voice_name_panel.rs"]
@@ -261,6 +266,51 @@ pub trait RoomPersistence: Send + Sync {
         guild: Snowflake,
         room: Snowflake,
     ) -> impl Future<Output = Result<Option<TextCompanion>, StoreError>> + Send;
+    /// Append V4 vote-kick audit rows in one transaction. Idempotent per
+    /// (guild, vote, event): a replayed row is dropped, never overwritten, so
+    /// the worker may retry a flush whose outcome it did not see.
+    fn record_kick_audit(
+        &self,
+        rows: &[KickAuditRow],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// V3 privacy records for the guild's rooms that are not public with an
+    /// empty block list; every other room reads as the default.
+    fn privacy(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<BTreeMap<Snowflake, PrivacyRecord>, StoreError>> + Send;
+    /// Replace one room's privacy record. `Ok(false)` when the room has no
+    /// database row, so a record never outlives its room.
+    fn save_privacy(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        record: &PrivacyRecord,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+    /// V3 approved Connect grants for the guild's rooms, keyed by room
+    /// channel. One entry is one member the worker approved and Discord may
+    /// still hold a Connect allow for; a room absent from the map holds none.
+    fn join_grants(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<BTreeMap<Snowflake, BTreeSet<Snowflake>>, StoreError>> + Send;
+    /// Record an approval's intent before granting Connect. Idempotent; a
+    /// retried intent is a no-op. `Ok(false)` when the room has no database
+    /// row, so a grant never outlives its room.
+    fn save_join_grant(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+    /// Retire a grant after its revocation landed (or its grant was refused).
+    /// Idempotent: retiring an absent grant is success.
+    fn remove_join_grant(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
 impl RoomPersistence for PgRoomStore {
@@ -409,6 +459,57 @@ impl RoomPersistence for PgRoomStore {
             .await
             .map_err(store_error)
     }
+
+    async fn record_kick_audit(&self, rows: &[KickAuditRow]) -> Result<(), StoreError> {
+        self.add_kick_audit(rows).await.map_err(store_error)
+    }
+
+    async fn privacy(
+        &self,
+        guild: Snowflake,
+    ) -> Result<BTreeMap<Snowflake, PrivacyRecord>, StoreError> {
+        self.privacy_in_guild(guild).await.map_err(store_error)
+    }
+
+    async fn save_privacy(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        record: &PrivacyRecord,
+    ) -> Result<bool, StoreError> {
+        PgRoomStore::save_privacy(self, guild, room, record)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn join_grants(
+        &self,
+        guild: Snowflake,
+    ) -> Result<BTreeMap<Snowflake, BTreeSet<Snowflake>>, StoreError> {
+        self.join_grants_in_guild(guild).await.map_err(store_error)
+    }
+
+    async fn save_join_grant(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        member: Snowflake,
+    ) -> Result<bool, StoreError> {
+        self.save_join_grant(guild, room, member)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn remove_join_grant(
+        &self,
+        guild: Snowflake,
+        room: Snowflake,
+        member: Snowflake,
+    ) -> Result<(), StoreError> {
+        self.remove_join_grant(guild, room, member)
+            .await
+            .map_err(store_error)
+    }
 }
 
 fn store_error(error: sqlx::Error) -> StoreError {
@@ -456,6 +557,17 @@ fn voice_dead_action(action: &RoomAction) -> &'static str {
         // The override write belongs to the rename family: same feature,
         // and the bounded `action` label set stays as documented.
         RoomAction::RenameRoom { .. } | RoomAction::SetCustomName { .. } => "rename",
+        // V3 privacy writes share the unknown-shape family so the bounded
+        // metric label set stays unchanged.
+        RoomAction::SetEveryoneConnect { .. }
+        | RoomAction::CreateJoinChannel { .. }
+        | RoomAction::DeleteJoinChannel { .. }
+        | RoomAction::SavePrivacy { .. }
+        | RoomAction::AskJoinOwner { .. }
+        | RoomAction::ApproveJoin { .. }
+        | RoomAction::RevokeJoinAccess { .. }
+        | RoomAction::RetireJoinPrompt { .. } => "other",
+        RoomAction::SetUserLimit { .. } => "limit",
     }
 }
 
@@ -542,6 +654,14 @@ pub trait RoomWrites: Send + Sync {
         channel: Snowflake,
         name: &str,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// V3 `/limit` and `/unlimit`: set the room channel's user limit (`0` is
+    /// unlimited, at most 99). Idempotent; a 429 returns to the queue.
+    fn set_user_limit(
+        &self,
+        channel: Snowflake,
+        user_limit: u32,
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
     /// Download a Discord-hosted `/import` file, capped at `max_bytes`
     /// (the caller checks the attachment size before asking).
     fn download_attachment(
@@ -575,6 +695,67 @@ pub trait RoomWrites: Send + Sync {
         member_id: Snowflake,
         guard: WriteGuard,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// V3 `/private` and `/public`: replace one role or member overwrite on a
+    /// room channel (a PUT, so the caller passes every bit it wants kept). The
+    /// default refuses, so a writer without overwrite access fails closed.
+    fn put_overwrite(
+        &self,
+        channel: Snowflake,
+        overwrite: PermissionOverwrite,
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send {
+        let _ = (channel, overwrite, guard);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
+    /// V3: create the Join voice channel in the room's category, next to the
+    /// room, with no overwrites of its own (it syncs to the category). The
+    /// default refuses.
+    fn create_join_channel(
+        &self,
+        guild: Snowflake,
+        name: &str,
+        parent_id: Option<Snowflake>,
+        position: Option<u64>,
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<Channel, RoomHttpError>> + Send {
+        let _ = (guild, name, parent_id, position, guard);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
+    /// V3 join request: delete one member's overwrite on a room channel.
+    /// Deleting an absent overwrite is success. The default refuses.
+    fn delete_overwrite(
+        &self,
+        channel: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send {
+        let _ = (channel, member, guard);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
+    /// V3 join request: post a message with buttons to a room's chat. Only
+    /// `mention_user` can be pinged. The default refuses, so a writer that
+    /// cannot post fails closed.
+    fn send_component_message(
+        &self,
+        channel: Snowflake,
+        content: &str,
+        mention_user: Option<Snowflake>,
+        components: &[Component],
+    ) -> impl Future<Output = Result<MessageRef, RoomHttpError>> + Send {
+        let _ = (channel, content, mention_user, components);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
+    /// V3 join request: replace the text and buttons of a message this bot
+    /// posted (no buttons when `components` is empty). The default refuses.
+    fn edit_component_message(
+        &self,
+        message: MessageRef,
+        content: &str,
+        components: &[Component],
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send {
+        let _ = (message, content, components);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
     /// V10 error notice. `mention_role` is pinged on channel targets only.
     /// The default refuses, so a writer that cannot post notices fails closed
     /// (the worker counts the attempt and moves on) instead of dropping them
@@ -650,6 +831,16 @@ impl RoomWrites for RoomHttp {
         self.rename_room(channel, name).await
     }
 
+    async fn set_user_limit(
+        &self,
+        channel: Snowflake,
+        user_limit: u32,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.set_room_user_limit(channel, user_limit, move || guard())
+            .await
+    }
+
     async fn download_attachment(
         &self,
         url: &str,
@@ -685,6 +876,58 @@ impl RoomWrites for RoomHttp {
     ) -> Result<(), RoomHttpError> {
         self.revoke_companion_view(text_channel_id, member_id, move || guard())
             .await
+    }
+
+    async fn put_overwrite(
+        &self,
+        channel: Snowflake,
+        overwrite: PermissionOverwrite,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.put_channel_overwrite(channel, &overwrite, move || guard())
+            .await
+    }
+
+    async fn create_join_channel(
+        &self,
+        guild: Snowflake,
+        name: &str,
+        parent_id: Option<Snowflake>,
+        position: Option<u64>,
+        guard: WriteGuard,
+    ) -> Result<Channel, RoomHttpError> {
+        self.create_join_voice_channel(guild, name, parent_id, position, move || guard())
+            .await
+    }
+
+    async fn delete_overwrite(
+        &self,
+        channel: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.delete_member_overwrite(channel, member, move || guard())
+            .await
+    }
+
+    async fn send_component_message(
+        &self,
+        channel: Snowflake,
+        content: &str,
+        mention_user: Option<Snowflake>,
+        components: &[Component],
+    ) -> Result<MessageRef, RoomHttpError> {
+        self.post_component_message(channel, content, mention_user, components)
+            .await
+    }
+
+    async fn edit_component_message(
+        &self,
+        message: MessageRef,
+        content: &str,
+        components: &[Component],
+    ) -> Result<(), RoomHttpError> {
+        RoomHttp::edit_component_message(self, message, content, components).await
     }
 
     async fn send_notice(
@@ -768,9 +1011,72 @@ struct LiveState {
     channel_revisions: HashMap<Snowflake, u64>,
     members: HashMap<Snowflake, MemberState>,
     bot: Option<BotAccess>,
+    protected_channels: HashSet<Snowflake>,
+    /// Continuous human-empty evidence in this authoritative gateway session.
+    /// Reconnects restart the grace; human joins cancel it even between ticks.
+    empty_since: HashMap<Snowflake, tokio::time::Instant>,
+    /// Fixture-only override of [`EMPTY_ROOM_GRACE`]; production never sets it.
+    empty_grace: Option<Duration>,
+}
+
+/// Ordinary empty rooms get a full reconnect grace. Failed-create compensation
+/// has exact in-hand provenance and bypasses only this deadline, not occupancy.
+const EMPTY_ROOM_GRACE: Duration = Duration::from_secs(60);
+
+/// Boot-only infrastructure protection. Stored settings remain unwired; these
+/// already-forwarded process keys must never be inferred from room rows.
+fn configured_protected_channels(
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<HashSet<Snowflake>, &'static str> {
+    let mut protected = HashSet::new();
+    for (key, multiple) in [
+        ("DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID", false),
+        ("TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID", false),
+        ("TWO_TEMP_VOICE_CATEGORY_ID", false),
+        ("TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS", true),
+    ] {
+        let Some(raw) = env(key).filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        for value in raw.split(',') {
+            let value = value.trim();
+            let id = value
+                .parse::<Snowflake>()
+                .map_err(|_| "invalid protected channel id")?;
+            if id == 0 || value != id.to_string() || (!multiple && raw.contains(',')) {
+                return Err("invalid protected channel id");
+            }
+            protected.insert(id);
+        }
+    }
+    Ok(protected)
 }
 
 impl LiveState {
+    fn delete_protected(&self, channel: Snowflake) -> bool {
+        self.protected_channels.contains(&channel)
+            || self
+                .channels
+                .get(&channel)
+                .is_some_and(|channel| channel.kind == ChannelType::GuildCategory)
+    }
+
+    fn refresh_empty_since(&mut self, channel: Snowflake) {
+        if self.channels.contains_key(&channel) && self.humans(channel) == 0 {
+            self.empty_since
+                .entry(channel)
+                .or_insert_with(tokio::time::Instant::now);
+        } else {
+            self.empty_since.remove(&channel);
+        }
+    }
+
+    fn empty_grace_elapsed(&self, channel: Snowflake) -> bool {
+        self.empty_since
+            .get(&channel)
+            .is_some_and(|since| since.elapsed() >= self.empty_grace.unwrap_or(EMPTY_ROOM_GRACE))
+    }
+
     fn ticket_valid(&self, ticket: JoinTicket) -> bool {
         self.ready
             && self.generation == ticket.generation
@@ -897,6 +1203,22 @@ impl LiveGuild {
         }
     }
 
+    /// Add configured infrastructure IDs, independently of room provenance.
+    /// Keep this in shared state so a write awaiting a rate limit sees updates.
+    pub fn protect_channels(&self, channels: impl IntoIterator<Item = Snowflake>) {
+        self.inner
+            .write()
+            .expect("live voice lock")
+            .protected_channels
+            .extend(channels);
+    }
+
+    /// Shorten the empty-room grace for offline fixtures that exercise
+    /// unrelated lifecycle races. Production keeps the 60 s default.
+    pub fn set_empty_grace(&self, grace: Duration) {
+        self.inner.write().expect("live voice lock").empty_grace = Some(grace);
+    }
+
     pub fn publish(&self, snapshot: GuildSnapshot) -> bool {
         if snapshot
             .channels
@@ -935,6 +1257,11 @@ impl LiveGuild {
             })
             .collect();
         live.bot = Some(snapshot.bot);
+        live.empty_since.clear();
+        let channels: Vec<_> = live.channels.keys().copied().collect();
+        for channel in channels {
+            live.refresh_empty_since(channel);
+        }
         live.ready = true;
         true
     }
@@ -943,6 +1270,7 @@ impl LiveGuild {
         let mut live = self.inner.write().expect("live voice lock");
         live.ready = false;
         live.generation += 1;
+        live.empty_since.clear();
     }
 
     /// V10 health check: the bot's missing Manage Channels, Move Members,
@@ -1044,9 +1372,16 @@ impl LiveGuild {
         now_ms: u64,
     ) -> Option<JoinTicket> {
         let mut live = self.inner.write().expect("live voice lock");
+        let previous_channel = live
+            .members
+            .get(&member)
+            .and_then(|previous| previous.channel_id);
         if let Some(previous) = live.members.get_mut(&member) {
             if previous.channel_id == channel {
                 previous.bot = bot.or(previous.bot);
+                if let Some(channel) = channel {
+                    live.refresh_empty_since(channel);
+                }
                 return None;
             }
         }
@@ -1062,6 +1397,12 @@ impl LiveGuild {
                 joined_at_ms: now_ms,
             },
         );
+        if let Some(previous) = previous_channel {
+            live.refresh_empty_since(previous);
+        }
+        if let Some(channel) = channel {
+            live.refresh_empty_since(channel);
+        }
         channel.filter(|_| live.ready).map(|creator_id| JoinTicket {
             member_id: member,
             creator_id,
@@ -1073,10 +1414,12 @@ impl LiveGuild {
     pub fn upsert_channel(&self, channel: Channel) {
         if channel.guild_id.map(Id::get) == Some(self.guild_id) {
             let mut live = self.inner.write().expect("live voice lock");
+            let id = channel.id.get();
             live.next_channel_revision += 1;
             let revision = live.next_channel_revision;
-            live.channel_revisions.insert(channel.id.get(), revision);
-            live.channels.insert(channel.id.get(), channel);
+            live.channel_revisions.insert(id, revision);
+            live.channels.insert(id, channel);
+            live.refresh_empty_since(id);
         }
     }
 
@@ -1084,6 +1427,7 @@ impl LiveGuild {
         let mut live = self.inner.write().expect("live voice lock");
         live.channel_revisions.remove(&channel);
         live.channels.remove(&channel);
+        live.empty_since.remove(&channel);
     }
 
     /// REST completion must never roll back gateway evidence or resurrect a
@@ -1316,6 +1660,8 @@ pub struct GuildRoomWorker<S, H> {
     ownership_queued: HashSet<Snowflake>,
     renames: RenameCoalescer,
     desired_names: HashMap<Snowflake, String>,
+    /// Callers waiting on a queued `/limit` write, by queue action id.
+    limit_acks: HashMap<u64, oneshot::Sender<limit::LimitAck>>,
     /// V3 `/name` overrides by room: the owner's text as typed, template
     /// tokens intact. A room without an entry uses its template name.
     custom_names: HashMap<Snowflake, String>,
@@ -1326,6 +1672,19 @@ pub struct GuildRoomWorker<S, H> {
     deletes: HashSet<Snowflake>,
     compensation: HashSet<Snowflake>,
     denied: HashMap<Snowflake, (u64, Option<Permissions>)>,
+    /// V3 privacy state by room (private flag, Join channel, block list),
+    /// loaded from the store and changed only after the matching Discord
+    /// write lands. See [`private_runtime`].
+    privacy: HashMap<Snowflake, PrivateRoom>,
+    /// Rooms whose in-memory privacy state is not yet durable.
+    privacy_dirty: HashSet<Snowflake>,
+    /// Join channel ids this worker created or loaded from its own store:
+    /// the only ones a `DeleteJoinChannel` may delete.
+    join_deletable: HashSet<Snowflake>,
+    /// V3 join-request bookkeeping that is runtime-only by design: this
+    /// worker's request-id epoch, Join-channel entries already handled and
+    /// the posted prompts. See [`join_requests`].
+    join: join_requests::JoinRequests,
     failures: VecDeque<LifecycleFailure>,
     notices: Vec<NoticeState>,
     halted: bool,
@@ -1335,6 +1694,16 @@ pub struct GuildRoomWorker<S, H> {
     /// from the payload.
     vote_refs: HashMap<Snowflake, VoteKickRef>,
     active_votes: Vec<VoteKickRef>,
+    /// Who started each vote this session, by vote ID. The vote core binds the
+    /// target but not the initiator, and every audit row names both.
+    vote_initiators: HashMap<Snowflake, Snowflake>,
+    /// V4 audit rows not yet appended, oldest first. Appended off the actor's
+    /// synchronous vote path by [`GuildRoomWorker::flush_kick_audit`]; a failed
+    /// flush keeps them (the append is idempotent) up to
+    /// `KICK_AUDIT_BUFFER_MAX`.
+    kick_audit: VecDeque<KickAuditRow>,
+    /// Earliest actor time the next flush may run after a failed one.
+    kick_audit_retry_ms: u64,
     /// Automod policy the create-path name filter runs under. The default
     /// policy still blocks invite and external links; the runtime installs the
     /// configured word list through [`GuildRoomWorker::with_name_policy`].
@@ -1350,6 +1719,37 @@ pub enum KickRefusal {
     /// The channel is not a tracked temporary room.
     NotARoom,
     Vote(VoteKickError),
+}
+
+/// Audit code for a refused `/kick` start.
+fn kick_refusal_outcome(refusal: KickRefusal) -> &'static str {
+    match refusal {
+        KickRefusal::Unavailable => OUTCOME_EVIDENCE_UNAVAILABLE,
+        KickRefusal::NotARoom => OUTCOME_NOT_A_ROOM,
+        KickRefusal::Vote(error) => refusal_outcome(error),
+    }
+}
+
+/// One V4 audit row, stamped with the worker's wall clock. Snowflakes and
+/// fixed codes only: never an interaction token, a name or free text.
+fn kick_audit_row(
+    event: KickAuditEvent,
+    vote: VoteKickRef,
+    initiator_id: Snowflake,
+    outcome: &'static str,
+    progress: Option<VoteProgress>,
+) -> KickAuditRow {
+    KickAuditRow {
+        guild_id: vote.guild_id,
+        room_id: vote.room_id,
+        vote_id: vote.id,
+        initiator_id,
+        target_id: vote.target_id,
+        event,
+        outcome,
+        progress,
+        occurred_at: now_iso(),
+    }
 }
 
 /// Monotonic actor time handed to the vote core.
@@ -1368,6 +1768,17 @@ const NOTICE_REPEAT_INTERVAL_MS: u64 = 15 * 60 * 1000;
 /// Longest notice body; Discord's message limit is 2000 characters.
 const NOTICE_MAX_CHARS: usize = 1500;
 
+/// Audit rows held while the store is unreachable. Past this the oldest row is
+/// dropped and a persistence failure is recorded, so a long outage cannot grow
+/// the worker without bound.
+const KICK_AUDIT_BUFFER_MAX: usize = 256;
+
+/// Rows appended per flush (one transaction).
+const KICK_AUDIT_BATCH: usize = 32;
+
+/// Pause after a failed flush before the next attempt.
+const KICK_AUDIT_RETRY_MS: u64 = 5_000;
+
 const OWNER_REPAIR_COOLDOWN_MS: u64 = 60_000;
 
 /// Repeat bookkeeping for one tracked failure. `last_attempt_ms` is the
@@ -1381,12 +1792,13 @@ struct NoticeState {
 
 impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     pub async fn load(live: LiveGuild, store: S, http: H) -> Result<Self, StoreError> {
-        let creators = store
+        let creators: HashMap<_, _> = store
             .creators(live.guild_id)
             .await?
             .into_iter()
             .map(|c| (c.channel_id, c))
             .collect();
+        live.protect_channels(creators.keys().copied());
         let access = store.access_controls(live.guild_id).await?;
         let rooms = store
             .rooms(live.guild_id)
@@ -1406,12 +1818,45 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .into_iter()
             .map(|channel| (channel, 0))
             .collect();
+        let (mut privacy, join_deletable) =
+            Self::load_privacy(&rooms, store.privacy(live.guild_id).await?);
+        let join_grants = store.join_grants(live.guild_id).await?;
+        // Hydrate approved Connect grants: a private room remembers its
+        // approvals so a later `/public` revokes them; a grant whose room is
+        // public or gone still needs its revocation, which the queue lost on
+        // restart, so it is re-queued here. The witness is retired only by a
+        // successful revoke (or a refused grant), never by this hydration.
+        let mut pending_revokes = Vec::new();
+        for (room, members) in &join_grants {
+            match privacy.get_mut(room) {
+                Some(state) if state.private => {
+                    // A grant witness can outlive a later Block (approve,
+                    // failed revoke, re-private, Block): hydrating it blindly
+                    // would put a blocked member into `granted`, which
+                    // `validate()` refuses and wedges the room. Blocked
+                    // members keep only their revocation.
+                    for member in members {
+                        if state.blocked.contains(&MemberId(*member)) {
+                            pending_revokes.push((*room, *member));
+                        } else {
+                            state.granted.insert(MemberId(*member));
+                        }
+                    }
+                }
+                _ => {
+                    for member in members {
+                        pending_revokes.push((*room, *member));
+                    }
+                }
+            }
+        }
         let custom_names = store
             .custom_names(live.guild_id)
             .await?
             .into_iter()
             .collect();
-        Ok(Self {
+        let guild_id = live.guild_id;
+        let worker = Self {
             live,
             store,
             http,
@@ -1427,6 +1872,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             ownership_queued: HashSet::new(),
             renames: RenameCoalescer::new(),
             desired_names: HashMap::new(),
+            limit_acks: HashMap::new(),
             custom_names,
             creations: HashMap::new(),
             accepted: HashMap::new(),
@@ -1435,14 +1881,31 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             deletes: HashSet::new(),
             compensation: HashSet::new(),
             denied: HashMap::new(),
+            privacy,
+            privacy_dirty: HashSet::new(),
+            join_deletable,
+            join: join_requests::JoinRequests::new(),
             failures: VecDeque::new(),
             notices: Vec::new(),
             halted: false,
             votes: VoteKickCore::new(),
             vote_refs: HashMap::new(),
             active_votes: Vec::new(),
+            vote_initiators: HashMap::new(),
+            kick_audit: VecDeque::new(),
+            kick_audit_retry_ms: 0,
             name_policy: Arc::new(AutomodPolicy::default()),
-        })
+        };
+        for (room, member) in pending_revokes {
+            worker.queue.enqueue(
+                guild_id,
+                RoomAction::RevokeJoinAccess {
+                    room_channel_id: room,
+                    member_id: member,
+                },
+            );
+        }
+        Ok(worker)
     }
 
     /// Run the create-path name filter under `policy` from here on.
@@ -1637,6 +2100,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let mut suspended: u64 = 0;
         let mut resumed: u64 = 0;
         for channel in self.rooms.keys().copied() {
+            if live.delete_protected(channel) {
+                continue;
+            }
             if !live.channels.contains_key(&channel) {
                 self.queue.resume(self.live.guild_id, channel);
                 resumed = resumed.saturating_add(1);
@@ -1670,7 +2136,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     .uncertain_moves
                     .get(&channel)
                     .is_some_and(|ticket| live.ticket_valid(*ticket));
-            if live.humans(channel) == 0 && !move_pending {
+            if live.humans(channel) == 0
+                && !move_pending
+                && (self.compensation.contains(&channel) || live.empty_grace_elapsed(channel))
+            {
                 empty.push(channel);
             } else if live.humans(channel) > 0 && !move_pending {
                 occupied.push(channel);
@@ -1717,6 +2186,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.companion_seen.insert(channel, current);
         }
         drop(live);
+        self.reconcile_privacy();
+        self.scan_join_entries();
         let delete_enqueued = empty.len() as u64;
         for channel in empty {
             self.queue_delete(channel, false);
@@ -1938,6 +2409,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     }
 
     fn queue_owner_handoff(&mut self, channel_id: Snowflake, previous_owner_id: Snowflake) {
+        // Requests raised to the previous owner can no longer be answered.
+        self.join_owner_changed(channel_id);
         self.ownership_repairs.entry(channel_id).or_insert(0);
         if self.ownership_queued.insert(channel_id) {
             let room = &self.rooms[&channel_id];
@@ -2163,12 +2636,28 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         ))
     }
 
-    /// Fold a vote update into worker state: forget finished votes and queue the
-    /// room-scoped enforcement exactly once (the core emits the decision only on
-    /// the first transition to passed).
+    /// Fold a vote update into worker state: forget finished votes, audit the
+    /// result once, and queue the room-scoped enforcement exactly once (the
+    /// core emits the decision only on the first transition to passed).
     fn settle_vote(&mut self, update: VoteKickUpdate) -> VoteKickUpdate {
         if update.status != VoteKickStatus::Active {
+            // A finished vote answers later ballots with its terminal status;
+            // only the pass that still held it active records the result.
+            let was_active = self
+                .active_votes
+                .iter()
+                .any(|vote| vote.id == update.vote.id);
             self.active_votes.retain(|vote| vote.id != update.vote.id);
+            if let (true, Some(outcome)) = (was_active, result_outcome(update.status)) {
+                let initiator_id = self.vote_initiator(update.vote.id);
+                self.push_kick_audit(kick_audit_row(
+                    KickAuditEvent::VoteResult,
+                    update.vote,
+                    initiator_id,
+                    outcome,
+                    Some(update.progress),
+                ));
+            }
         }
         if let Some(kick) = update.kick {
             self.queue.enqueue(
@@ -2176,15 +2665,126 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 RoomAction::KickMember {
                     channel_id: kick.room_id,
                     member_id: kick.target_id,
+                    vote_id: update.vote.id,
                 },
             );
         }
         update
     }
 
+    /// Who started a vote this session. Every vote the core knows began in
+    /// [`Self::kick_start`], so the fallback is unreachable.
+    fn vote_initiator(&self, vote_id: Snowflake) -> Snowflake {
+        self.vote_initiators.get(&vote_id).copied().unwrap_or(0)
+    }
+
+    /// Queue one audit row for the next flush. A full buffer drops its oldest
+    /// row and records the loss on `/setup` instead of growing.
+    fn push_kick_audit(&mut self, row: KickAuditRow) {
+        if self.kick_audit.len() >= KICK_AUDIT_BUFFER_MAX {
+            self.kick_audit.pop_front();
+            self.record(LifecycleFailure::Persistence {
+                channel_id: None,
+                error: StoreError::Unavailable,
+            });
+        }
+        self.kick_audit.push_back(row);
+    }
+
+    /// Audit the terminal outcome of a passed vote's room-scoped enforcement.
+    fn audit_enforcement(
+        &mut self,
+        vote_id: Snowflake,
+        channel_id: Snowflake,
+        member_id: Snowflake,
+        outcome: EnforcementOutcome,
+    ) {
+        let vote = VoteKickRef {
+            id: vote_id,
+            guild_id: self.live.guild_id,
+            room_id: channel_id,
+            target_id: member_id,
+        };
+        let initiator_id = self.vote_initiator(vote_id);
+        self.push_kick_audit(kick_audit_row(
+            KickAuditEvent::Enforcement,
+            vote,
+            initiator_id,
+            outcome.as_str(),
+            None,
+        ));
+    }
+
+    /// Append buffered audit rows, one batch per call. Driven by the actor's
+    /// timer, off the synchronous vote path. A failure keeps the rows and
+    /// waits `KICK_AUDIT_RETRY_MS`; it never halts the worker, because a
+    /// refused credential on this table (a grant not yet applied) must not
+    /// stop room management. Returns whether a batch was appended.
+    pub async fn flush_kick_audit(&mut self, now_ms: u64) -> bool {
+        if self.kick_audit.is_empty() || now_ms < self.kick_audit_retry_ms {
+            return false;
+        }
+        let batch: Vec<KickAuditRow> = self
+            .kick_audit
+            .iter()
+            .take(KICK_AUDIT_BATCH)
+            .cloned()
+            .collect();
+        match self.store.record_kick_audit(&batch).await {
+            Ok(()) => {
+                self.kick_audit.drain(..batch.len());
+                true
+            }
+            Err(error) => {
+                self.kick_audit_retry_ms = now_ms.saturating_add(KICK_AUDIT_RETRY_MS);
+                self.record(LifecycleFailure::Persistence {
+                    channel_id: None,
+                    error,
+                });
+                false
+            }
+        }
+    }
+
     /// Start a vote in `room_id`. `vote_id` must be the unique initiating
-    /// interaction ID. Starting casts no ballot.
+    /// interaction ID. Starting casts no ballot. Every start that reaches the
+    /// worker leaves one audit row: `vote_started`, or `vote_refused` with the
+    /// refusal code.
     pub fn kick_start(
+        &mut self,
+        vote_id: Snowflake,
+        room_id: Snowflake,
+        initiator_id: Snowflake,
+        target_id: Snowflake,
+        now_ms: u64,
+    ) -> Result<VoteKickUpdate, KickRefusal> {
+        let started = self.begin_vote(vote_id, room_id, initiator_id, target_id, now_ms);
+        let row = match &started {
+            Ok(update) => kick_audit_row(
+                KickAuditEvent::VoteStarted,
+                update.vote,
+                initiator_id,
+                OUTCOME_STARTED,
+                Some(update.progress),
+            ),
+            Err(refusal) => kick_audit_row(
+                KickAuditEvent::VoteRefused,
+                VoteKickRef {
+                    id: vote_id,
+                    guild_id: self.live.guild_id,
+                    room_id,
+                    target_id,
+                },
+                initiator_id,
+                kick_refusal_outcome(*refusal),
+                None,
+            ),
+        };
+        self.push_kick_audit(row);
+        started
+    }
+
+    fn begin_vote(
         &mut self,
         vote_id: Snowflake,
         room_id: Snowflake,
@@ -2205,6 +2805,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .start(vote_id, facts, initiator_id, target_id, &ActorClock(now_ms))
             .map_err(KickRefusal::Vote)?;
         self.vote_refs.insert(vote_id, update.vote);
+        self.vote_initiators.insert(vote_id, initiator_id);
         self.active_votes.push(update.vote);
         Ok(self.settle_vote(update))
     }
@@ -2753,10 +3354,52 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 }
                 let live = self.live.clone();
                 let compensate = self.compensation.contains(&channel_id);
+                if !compensate {
+                    // Ordinary deletes need current durable provenance, not a
+                    // stale loaded row or a caller's queued channel ID. A lost
+                    // row leaks the live channel rather than guessing ownership.
+                    match self.store.rooms(self.live.guild_id).await {
+                        Ok(rooms) => {
+                            if !rooms.iter().any(|room| {
+                                room.guild_id == self.live.guild_id && room.channel_id == channel_id
+                            }) {
+                                self.queue.mark_succeeded(&action);
+                                self.queue.drop_for_channel(self.live.guild_id, channel_id);
+                                self.rooms.remove(&channel_id);
+                                self.deletes.remove(&channel_id);
+                                self.renames.forget(channel_id);
+                                self.moves.remove(&channel_id);
+                                self.uncertain_moves.remove(&channel_id);
+                                self.desired_names.remove(&channel_id);
+                                self.observe_voice_state();
+                                return true;
+                            }
+                        }
+                        Err(error) => {
+                            self.record(LifecycleFailure::Persistence {
+                                channel_id: Some(channel_id),
+                                error,
+                            });
+                            if error == StoreError::CredentialRefused {
+                                self.halted = true;
+                                self.queue.mark_succeeded(&action);
+                            } else {
+                                self.mark_failed_observed(
+                                    action,
+                                    "voice-room provenance unavailable".to_owned(),
+                                    elapsed_ms(now_ms, started),
+                                );
+                            }
+                            return true;
+                        }
+                    }
+                }
                 let guard: WriteGuard = Arc::new(move || {
                     let state = live.inner.read().expect("live voice lock");
                     state.ready
+                        && !state.delete_protected(channel_id)
                         && state.humans(channel_id) == 0
+                        && (compensate || state.empty_grace_elapsed(channel_id))
                         && state
                             .permissions(live.guild_id, channel_id)
                             .is_some_and(|p| {
@@ -2776,7 +3419,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     .expect("live voice lock")
                     .channels
                     .contains_key(&channel_id);
-                let result = if !present {
+                let protected = self
+                    .live
+                    .inner
+                    .read()
+                    .expect("live voice lock")
+                    .delete_protected(channel_id);
+                let result = if protected || (present && !guard()) {
+                    Err(RoomHttpError::Cancelled)
+                } else if !present {
                     Ok(())
                 } else {
                     self.http.delete(channel_id, guard).await
@@ -2801,10 +3452,27 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             );
                             return true;
                         }
+                        // V3: the Join channel goes with its room, ahead of the
+                        // row: a failed delete retries instead of leaking it.
+                        if !self.delete_join_for(channel_id).await {
+                            self.mark_failed_observed(
+                                action,
+                                "Join channel delete unavailable".to_owned(),
+                                elapsed_ms(now_ms, started),
+                            );
+                            return true;
+                        }
                         match self.store.forget(self.live.guild_id, channel_id).await {
                             Ok(()) => {
                                 self.queue.mark_succeeded(&action);
-                                self.queue.drop_for_channel(self.live.guild_id, channel_id);
+                                // A limit queued behind this delete never
+                                // dispatches: settle its acknowledgement as
+                                // obsolete now instead of leaving the sender
+                                // orphaned until the next limit command.
+                                let dropped =
+                                    self.queue.drain_for_channel(self.live.guild_id, channel_id);
+                                self.settle_dropped_limits(dropped);
+                                self.forget_privacy(channel_id);
                                 self.rooms.remove(&channel_id);
                                 self.companions.remove(&channel_id);
                                 self.companion_channels.remove(&channel_id);
@@ -3126,6 +3794,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             RoomAction::KickMember {
                 channel_id,
                 member_id,
+                vote_id,
             } => {
                 let permissions = self
                     .live
@@ -3133,12 +3802,20 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     .read()
                     .expect("live voice lock")
                     .permissions(self.live.guild_id, channel_id);
+                // What a clean `Ok` below means; each skip or partial write
+                // overrides it so the audit row says what Discord was asked.
+                let mut applied = EnforcementOutcome::ConnectDeniedAndDisconnected;
                 let result = if self.rooms.get(&channel_id).is_none_or(|room| {
                     member_id == room.owner_id || member_id == room.original_creator_id
                 }) {
                     // Either the room is gone and its overwrites went with it, or
                     // ownership changed after the vote passed and the target is now
                     // the owner or original creator: write nothing.
+                    applied = if self.rooms.contains_key(&channel_id) {
+                        EnforcementOutcome::SkippedTargetProtected
+                    } else {
+                        EnforcementOutcome::SkippedRoomGone
+                    };
                     Ok(())
                 } else if !can_enforce_kick(permissions) {
                     Err(RoomHttpError::AccessDenied)
@@ -3162,7 +3839,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         {
                             // The target left or moved on since the deny landed:
                             // nothing to disconnect.
-                            Err(RoomHttpError::Cancelled) => Ok(()),
+                            Err(RoomHttpError::Cancelled) => {
+                                applied = EnforcementOutcome::ConnectDeniedTargetAbsent;
+                                Ok(())
+                            }
                             other => other,
                         },
                         Err(error) => Err(error),
@@ -3171,6 +3851,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 match result {
                     Ok(()) => {
                         self.queue.mark_succeeded(&action);
+                        self.audit_enforcement(vote_id, channel_id, member_id, applied);
                     }
                     Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
                         self.queue.mark_rate_limited(
@@ -3181,15 +3862,40 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         );
                     }
                     Err(RoomHttpError::UnknownOutcome) => {
-                        // Both writes are idempotent, so a retry is safe.
-                        self.mark_failed_observed(
+                        // Both writes are idempotent, so a retry is safe. Only
+                        // the attempt that exhausts the budget is terminal.
+                        let exhausted = action.attempts.saturating_add(1) >= QUEUE_MAX_ATTEMPTS;
+                        let released = self.mark_failed_observed(
                             action,
                             "Discord kick outcome unknown".to_owned(),
                             elapsed_ms(now_ms, started),
                         );
+                        if exhausted && released {
+                            self.audit_enforcement(
+                                vote_id,
+                                channel_id,
+                                member_id,
+                                EnforcementOutcome::GaveUp,
+                            );
+                        }
                     }
-                    Err(error) => self.complete_error(action, channel_id, error),
+                    Err(error) => {
+                        let outcome = match error {
+                            RoomHttpError::AccessDenied => EnforcementOutcome::PermissionMissing,
+                            RoomHttpError::Cancelled => EnforcementOutcome::SkippedRoomGone,
+                            _ => EnforcementOutcome::DiscordError,
+                        };
+                        self.complete_error(action, channel_id, error);
+                        self.audit_enforcement(vote_id, channel_id, member_id, outcome);
+                    }
                 }
+            }
+            RoomAction::SetUserLimit {
+                channel_id,
+                user_limit,
+            } => {
+                self.dispatch_set_user_limit(action, channel_id, user_limit, now_ms, started)
+                    .await;
             }
             RoomAction::SetCustomName {
                 channel_id,
@@ -3197,6 +3903,18 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             } => {
                 self.dispatch_custom_name(action, channel_id, custom_name, now_ms, started)
                     .await;
+            }
+            RoomAction::SetEveryoneConnect { .. }
+            | RoomAction::CreateJoinChannel { .. }
+            | RoomAction::DeleteJoinChannel { .. }
+            | RoomAction::SavePrivacy { .. } => {
+                self.dispatch_privacy(action, now_ms, started).await;
+            }
+            RoomAction::AskJoinOwner { .. }
+            | RoomAction::ApproveJoin { .. }
+            | RoomAction::RevokeJoinAccess { .. }
+            | RoomAction::RetireJoinPrompt { .. } => {
+                self.dispatch_join(action, now_ms, started).await;
             }
             RoomAction::RenameRoom { channel_id, name } => {
                 let valid = {
@@ -3370,6 +4088,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             let guard: WriteGuard = Arc::new(move || {
                 let state = live.inner.read().expect("live voice lock");
                 state.ready
+                    && !state.delete_protected(text_channel_id)
                     && state
                         .permissions(guild_id, text_channel_id)
                         .is_some_and(|permissions| {
@@ -3377,6 +4096,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 .contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_CHANNELS)
                         })
             });
+            if !guard() {
+                return false;
+            }
             if let Err(error) = self.http.delete(text_channel_id, guard).await {
                 self.record(LifecycleFailure::Discord {
                     channel_id: text_channel_id,
@@ -3601,18 +4323,20 @@ pub trait VoiceEventSink: Send + Sync {
     /// A cold RESUME has replayed durably but cannot populate a fresh cache.
     /// The supervisor must IDENTIFY after committing RESUMED, not before replay.
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool;
-    /// Resolve the tracked room a member is currently in, if any. The shared
-    /// router asks this for `/kick`: a tracked-room target means the voice
-    /// sink owns the interaction (vote-kick) and the router must stay silent;
-    /// anything else keeps the existing moderation path. Boxed (not `impl
-    /// Future`) so the trait stays object-safe behind `Arc<dyn _>`.
-    fn kick_claim_room(
+    /// Start a room vote-kick for a `/kick` the shared router has already
+    /// refused for moderation (moderation off, or the invoker lacks Kick
+    /// Members). The router is the only answerer of `/kick`; this is its
+    /// delegate for room occupants. `true` means this sink answered the
+    /// interaction itself (sent or failed, never retried), so the router must
+    /// not; `false` means no callback was attempted and the router answers.
+    /// Boxed (not `impl Future`) so the trait stays object-safe behind
+    /// `Arc<dyn _>`.
+    fn kick_vote(
         &self,
-        guild: Snowflake,
-        member: Snowflake,
-    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
-        let _ = (guild, member);
-        Box::pin(async { None })
+        interaction: Interaction,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        let _ = interaction;
+        Box::pin(async { false })
     }
 }
 
@@ -3649,6 +4373,25 @@ enum ActorCommand {
         command: OwnershipCommand,
         reply: oneshot::Sender<String>,
     },
+    /// V3 `/limit` and `/unlimit`: the worker resolves the caller's room,
+    /// decides, queues the Discord write and replies with the text (or a
+    /// pending acknowledgement for the queued write).
+    Limit {
+        actor_id: Snowflake,
+        is_admin: bool,
+        command: LimitCommand,
+        reply: oneshot::Sender<limit::LimitReply>,
+    },
+    /// V3 owner command (`/private`, `/public`): the worker resolves the
+    /// caller's current room, gates on owner-or-admin, queues the @everyone
+    /// Connect write and replies with the user-facing text.
+    Privacy {
+        actor_id: Snowflake,
+        is_admin: bool,
+        actor_display: String,
+        command: PrivacyCommand,
+        reply: oneshot::Sender<String>,
+    },
     /// V4: start a vote-kick; the reply carries the vote state or the refusal.
     KickStart {
         vote_id: Snowflake,
@@ -3676,6 +4419,12 @@ enum ActorCommand {
     Name {
         command: NameCommand,
         reply: oneshot::Sender<NameReply>,
+    },
+    /// V3 Approve / Deny / Block button: the worker decides against the
+    /// room's current owner and the request's current state.
+    JoinDecision {
+        decision: JoinDecisionCommand,
+        reply: oneshot::Sender<JoinReply>,
     },
 }
 
@@ -3716,6 +4465,8 @@ pub struct VoiceRuntime<S, H> {
     make: Arc<dyn Fn() -> (S, H) + Send + Sync>,
     tick: Duration,
     enabled: bool,
+    protected_channels: HashSet<Snowflake>,
+    empty_grace: Option<Duration>,
     seeds: AtomicU64,
     actors: Mutex<HashMap<Snowflake, GuildActor>>,
     /// Serializes `/access` read-modify-write cycles so two admins cannot
@@ -3746,12 +4497,27 @@ where
             make: Arc::new(make),
             tick,
             enabled,
+            protected_channels: HashSet::new(),
+            empty_grace: None,
             seeds: AtomicU64::new(initial_seed()),
             actors: Mutex::new(HashMap::new()),
             access_lock: tokio::sync::Mutex::new(()),
             pending_imports: Mutex::new(HashMap::new()),
             name_policy: Arc::new(AutomodPolicy::default()),
         }
+    }
+
+    /// Install boot configuration before spawning any actors.
+    pub fn with_protected_channels(mut self, channels: HashSet<Snowflake>) -> Self {
+        self.protected_channels = channels;
+        self
+    }
+
+    /// Offline-fixture seam: shorten the empty-room grace for tests that
+    /// exercise unrelated lifecycle races. Production keeps the 60 s default.
+    pub fn with_empty_grace(mut self, grace: Duration) -> Self {
+        self.empty_grace = Some(grace);
+        self
     }
 
     /// Filter room names under the guild's configured automod policy. Without
@@ -3813,6 +4579,12 @@ where
             live: LiveGuild::new(guild),
             tx,
         };
+        actor
+            .live
+            .protect_channels(self.protected_channels.iter().copied());
+        if let Some(grace) = self.empty_grace {
+            actor.live.set_empty_grace(grace);
+        }
         let live = actor.live.clone();
         let make = Arc::clone(&self.make);
         let tick = self.tick;
@@ -3907,6 +4679,33 @@ where
             .send(ActorCommand::Ownership {
                 actor_id,
                 is_admin,
+                command,
+                reply,
+            })
+            .ok()?;
+        inbox.await.ok()
+    }
+
+    /// Run one V3 owner command (`/private`, `/public`) on the live worker
+    /// and return the ephemeral reply text. `actor_display` names the Join
+    /// channel when the caller owns the room. `None` when the guild has no
+    /// live actor.
+    pub async fn run_privacy(
+        &self,
+        guild: Snowflake,
+        actor_id: Snowflake,
+        is_admin: bool,
+        actor_display: String,
+        command: PrivacyCommand,
+    ) -> Option<String> {
+        let actor = self.live_actor(guild)?;
+        let (reply, inbox) = oneshot::channel();
+        actor
+            .tx
+            .send(ActorCommand::Privacy {
+                actor_id,
+                is_admin,
+                actor_display,
                 command,
                 reply,
             })
@@ -4023,6 +4822,7 @@ where
     fn creator_added(&self, creator: &CreatorChannel, channel: Channel) {
         if let Some(actor) = self.live_actor(creator.guild_id) {
             actor.live.upsert_channel(channel);
+            actor.live.protect_channels([creator.channel_id]);
             let _ = actor.tx.send(ActorCommand::CreatorAdded(creator.clone()));
         }
     }
@@ -4088,6 +4888,7 @@ where
     /// settings snapshot taken when it was created.
     fn creator_updated(&self, creator: &CreatorChannel) {
         if let Some(actor) = self.live_actor(creator.guild_id) {
+            actor.live.protect_channels([creator.channel_id]);
             let _ = actor.tx.send(ActorCommand::CreatorAdded(creator.clone()));
         }
     }
@@ -4207,14 +5008,6 @@ where
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
         self.enabled && cache.current_user().is_none()
     }
-
-    fn kick_claim_room(
-        &self,
-        guild: Snowflake,
-        member: Snowflake,
-    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
-        Box::pin(self.kick_room_of(guild, member))
-    }
 }
 
 async fn run_actor<S: RoomPersistence, H: RoomWrites>(
@@ -4250,9 +5043,13 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
                 // behind a 64-write burst either.
                 worker.dispatch_one(now_ms).await;
                 worker.send_notices(now_ms).await;
+                worker.flush_kick_audit(now_ms).await;
             }
         }
     }
+    // Inbox closed: append what is left (one failed batch ends it) so a clean
+    // shutdown keeps the trail.
+    while worker.flush_kick_audit(u64::MAX).await {}
 }
 
 fn apply_command<S: RoomPersistence, H: RoomWrites>(
@@ -4272,6 +5069,7 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             worker.reconcile();
         }
         ActorCommand::CreatorAdded(creator) => {
+            worker.live.protect_channels([creator.channel_id]);
             worker.creators.insert(creator.channel_id, creator);
             worker.reconcile();
         }
@@ -4299,6 +5097,23 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         } => {
             let _ = reply.send(worker.apply_ownership(actor_id, is_admin, command));
         }
+        ActorCommand::Limit {
+            actor_id,
+            is_admin,
+            command,
+            reply,
+        } => {
+            let _ = reply.send(worker.apply_limit(actor_id, is_admin, command));
+        }
+        ActorCommand::Privacy {
+            actor_id,
+            is_admin,
+            actor_display,
+            command,
+            reply,
+        } => {
+            let _ = reply.send(worker.apply_privacy(actor_id, is_admin, &actor_display, command));
+        }
         ActorCommand::KickStart {
             vote_id,
             room_id,
@@ -4323,6 +5138,9 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         ActorCommand::Name { command, reply } => {
             let _ = reply.send(worker.apply_name(command, now_ms));
         }
+        ActorCommand::JoinDecision { decision, reply } => {
+            let _ = reply.send(worker.apply_join_decision(decision));
+        }
     }
 }
 
@@ -4332,6 +5150,10 @@ pub fn build_production_runtime(
     pool: sqlx::PgPool,
     name_policy: AutomodPolicy,
 ) -> Result<VoiceResponder<PgRoomStore, RoomHttp, RoomHttp>, RoomHttpError> {
+    // Malformed protection IDs refuse the whole runtime. The gateway reports it
+    // through its cataloged `voice HTTP setup failed` event.
+    let protected = configured_protected_channels(|key| std::env::var(key).ok())
+        .map_err(|_| RoomHttpError::InvalidRequest)?;
     let replies = RoomHttp::new(token.to_owned())?;
     let http = replies.clone();
     let store = PgRoomStore::new(pool);
@@ -4342,6 +5164,7 @@ pub fn build_production_runtime(
                 Duration::from_millis(250),
                 true,
             )
+            .with_protected_channels(protected)
             .with_name_policy(name_policy),
         ),
         Arc::new(replies),
@@ -5370,6 +6193,11 @@ pub enum VoiceCommand {
     Transfer {
         target_id: Snowflake,
     },
+    /// V3 owner (or admin) denies Connect to @everyone and opens the Join
+    /// channel.
+    Private,
+    /// V3 owner (or admin) restores access and deletes the Join channel.
+    Public,
     Access(AccessAction),
     Logging(LoggingAction),
     Export,
@@ -5388,6 +6216,11 @@ pub enum VoiceCommand {
         vote_id: Snowflake,
         ballot: VoteBallot,
     },
+    /// V3 `/limit [count]`: set the room's user limit, or lock it at the
+    /// current headcount when no count is given.
+    Limit(LimitArg),
+    /// V3 `/unlimit`: remove the room's user limit.
+    Unlimit,
     /// V3 `/name`: the owner's panel to set a custom name or restore the
     /// template name.
     Name,
@@ -5591,6 +6424,8 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
             })
         }
         "reclaim" => Some(VoiceCommand::Reclaim),
+        "private" => Some(VoiceCommand::Private),
+        "public" => Some(VoiceCommand::Public),
         "transfer" => {
             // The `member` option is required at registration, so Discord
             // always sends it; zero means a malformed payload and refuses
@@ -5632,6 +6467,10 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
             target,
             reason: parse_kick_reason(&command.options),
         }),
+        "limit" => Some(VoiceCommand::Limit(limit::parse_limit_arg(
+            &command.options,
+        ))),
+        "unlimit" => Some(VoiceCommand::Unlimit),
         "name" => Some(VoiceCommand::Name),
         _ => None,
     }
@@ -5659,6 +6498,20 @@ fn parse_kick_reason(options: &[CommandDataOption]) -> Option<String> {
             }
             _ => None,
         })
+}
+
+/// The invoker's server display name: nickname, then global name, then user
+/// name. Empty when the interaction carries no user.
+fn interaction_display_name(interaction: &Interaction) -> String {
+    let member = interaction.member.as_ref();
+    let user = member
+        .and_then(|member| member.user.as_ref())
+        .or(interaction.user.as_ref());
+    member
+        .and_then(|member| member.nick.clone())
+        .or_else(|| user.and_then(|user| user.global_name.clone()))
+        .or_else(|| user.map(|user| user.name.clone()))
+        .unwrap_or_default()
 }
 
 fn parse_logging_action(options: &[CommandDataOption]) -> LoggingAction {
@@ -5768,6 +6621,8 @@ impl VoiceCommand {
             Self::AlwaysPrivate { .. } => "alwaysprivate",
             Self::Access(_) => "access",
             Self::Reclaim => "reclaim",
+            Self::Private => "private",
+            Self::Public => "public",
             Self::Transfer { .. } => "transfer",
             Self::Logging(_) => "logging",
             Self::Export => "export",
@@ -5775,6 +6630,8 @@ impl VoiceCommand {
             // Ballots share the `kick` restriction surface: one role gate
             // covers starting votes and casting them.
             Self::Kick { .. } | Self::Ballot { .. } => "kick",
+            Self::Limit(_) => "limit",
+            Self::Unlimit => "unlimit",
             Self::Name => "name",
         }
     }
@@ -6375,6 +7232,9 @@ where
         return handle_name_interaction(runtime, interaction, guild_id, names, action, true, reply)
             .await;
     }
+    if let Some(click) = join_component_action(interaction) {
+        return handle_join_interaction(runtime, interaction, guild_id, click, reply).await;
+    }
     let Some(command) = parse_voice_command(interaction) else {
         return false;
     };
@@ -6818,6 +7678,56 @@ where
                 reply,
             )
             .await
+        }
+        VoiceCommand::Limit(arg) => {
+            limit::handle_limit(
+                runtime,
+                interaction,
+                guild_id,
+                member.is_admin,
+                LimitCommand::Limit(arg),
+                reply,
+            )
+            .await
+        }
+        VoiceCommand::Unlimit => {
+            limit::handle_limit(
+                runtime,
+                interaction,
+                guild_id,
+                member.is_admin,
+                LimitCommand::Unlimit,
+                reply,
+            )
+            .await
+        }
+        VoiceCommand::Private | VoiceCommand::Public => {
+            let (command, name) = if matches!(command, VoiceCommand::Private) {
+                (PrivacyCommand::Private, "private")
+            } else {
+                (PrivacyCommand::Public, "public")
+            };
+            let Some(actor_id) = invoker_member_id(interaction) else {
+                reply(ephemeral_response(&format!(
+                    "I couldn't tell who invoked /{name} — try again."
+                )))
+                .await;
+                return true;
+            };
+            let text = runtime
+                .run_privacy(
+                    guild_id,
+                    actor_id,
+                    member.is_admin,
+                    interaction_display_name(interaction),
+                    command,
+                )
+                .await
+                .unwrap_or_else(|| {
+                    "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+                });
+            reply(ephemeral_response(&text)).await;
+            true
         }
         VoiceCommand::Export => {
             let Some(inventory) = inventory else {
@@ -7312,54 +8222,26 @@ where
         inventory: Option<GuildInventory>,
         names: NameDirectory,
     ) {
-        // Vote-kick owns its transport. A non-room `/kick` belongs to the
-        // moderation path, so return before any acknowledgement and let the
-        // router answer: deferring here would race it and hang on "thinking".
-        if let Some(VoiceCommand::Kick { target, .. }) = parse_voice_command(interaction) {
-            let Some(guild) = interaction_guild(interaction) else {
-                return;
-            };
-            if runtime.kick_room_of(guild, target).await.is_none() {
-                return;
-            }
-            let answered: Arc<Mutex<Option<InteractionResponse>>> = Arc::new(Mutex::new(None));
-            let writer = Arc::clone(&answered);
-            handle_voice_interaction_with(
-                runtime,
-                interaction,
-                invite_code,
-                inventory.as_ref(),
-                move |response| async move {
-                    *writer.lock().unwrap() = Some(response);
-                },
-            )
-            .await;
-            let response = answered.lock().unwrap().take();
-            if let Some(response) = response {
-                if let Err(error) = replies.respond(interaction, response).await {
-                    warn!(interaction_id = interaction.id.get(), %error,
-                        "voice vote response failed; not retried");
-                }
-            }
+        // `/kick` is answered by the shared router alone (moderation first,
+        // then `kick_vote` for the occupants it refused). Acknowledging here
+        // would race it and could answer twice.
+        if matches!(
+            parse_voice_command(interaction),
+            Some(VoiceCommand::Kick { .. })
+        ) {
             return;
         }
-        if let Some(VoiceCommand::Ballot { .. }) = parse_voice_command(interaction) {
-            // Ballots update the public message in place (type 7). The
-            // defer + PATCH path would edit each voter's own ephemeral
-            // followup instead, so answer with the initial callback.
-            let answered: Arc<Mutex<Option<InteractionResponse>>> = Arc::new(Mutex::new(None));
-            let writer = Arc::clone(&answered);
-            handle_voice_interaction_with(
-                runtime,
-                interaction,
-                invite_code,
-                inventory.as_ref(),
-                move |response| async move {
-                    *writer.lock().unwrap() = Some(response);
-                },
-            )
-            .await;
-            let response = answered.lock().unwrap().take();
+        if matches!(
+            parse_voice_command(interaction),
+            Some(VoiceCommand::Ballot { .. })
+        ) || join_component_action(interaction).is_some()
+        {
+            // Ballots and join-request decisions update the public message in
+            // place (type 7). The defer + PATCH path would edit each
+            // presser's own ephemeral followup instead, so answer with the
+            // initial callback.
+            let response =
+                Self::capture_response(runtime, interaction, invite_code, inventory.as_ref()).await;
             if let Some(response) = response {
                 if let Err(error) = replies.respond(interaction, response).await {
                     warn!(interaction_id = interaction.id.get(), %error,
@@ -7416,6 +8298,69 @@ where
         )
         .await;
     }
+
+    /// Start the V4 room vote for a `/kick` the router refused for moderation.
+    /// The vote exists only for an invoker who shares a tracked room with the
+    /// target; anyone else gets the router's refusal, which also keeps a
+    /// stranger from learning that the target sits in a room. Returns `true`
+    /// once this sink owns the callback (a failed send is logged, never
+    /// retried) and `false` when no callback was attempted.
+    async fn start_kick_vote(
+        runtime: &VoiceRuntime<S, H>,
+        replies: &R,
+        interaction: &Interaction,
+    ) -> bool {
+        if !runtime.enabled {
+            return false;
+        }
+        let Some(VoiceCommand::Kick { target, .. }) = parse_voice_command(interaction) else {
+            return false;
+        };
+        let (Some(guild), Some(initiator)) = (
+            interaction_guild(interaction),
+            interaction.author_id().map(|id| id.get()),
+        ) else {
+            return false;
+        };
+        let Some(room) = runtime.kick_room_of(guild, target).await else {
+            return false;
+        };
+        if runtime.kick_room_of(guild, initiator).await != Some(room) {
+            return false;
+        }
+        let Some(response) = Self::capture_response(runtime, interaction, None, None).await else {
+            return false;
+        };
+        if let Err(error) = replies.respond(interaction, response).await {
+            warn!(interaction_id = interaction.id.get(), %error,
+                "voice vote response failed; not retried");
+        }
+        true
+    }
+
+    /// Run the voice handler and keep its single response instead of sending
+    /// it, for commands that answer through the initial callback.
+    async fn capture_response(
+        runtime: &VoiceRuntime<S, H>,
+        interaction: &Interaction,
+        invite_code: Option<&str>,
+        inventory: Option<&GuildInventory>,
+    ) -> Option<InteractionResponse> {
+        let answered: Arc<Mutex<Option<InteractionResponse>>> = Arc::new(Mutex::new(None));
+        let writer = Arc::clone(&answered);
+        handle_voice_interaction_with(
+            runtime,
+            interaction,
+            invite_code,
+            inventory,
+            move |response| async move {
+                *writer.lock().unwrap() = Some(response);
+            },
+        )
+        .await;
+        let mut slot = answered.lock().unwrap();
+        slot.take()
+    }
 }
 
 impl<S, H, R> VoiceEventSink for VoiceResponder<S, H, R>
@@ -7430,9 +8375,15 @@ where
             return;
         }
         if let Event::InteractionCreate(created) = event {
-            if parse_voice_command(&created.0).is_none()
+            let command = parse_voice_command(&created.0);
+            // The shared router answers `/kick`; see `kick_vote`.
+            if matches!(command, Some(VoiceCommand::Kick { .. })) {
+                return;
+            }
+            if command.is_none()
                 && voice_import_action(&created.0).is_none()
                 && name_component_action(&created.0).is_none()
+                && join_component_action(&created.0).is_none()
             {
                 return;
             }
@@ -7465,15 +8416,26 @@ where
         self.runtime.needs_bootstrap(cache)
     }
 
-    fn kick_claim_room(
+    fn kick_vote(
         &self,
-        guild: Snowflake,
-        member: Snowflake,
-    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
+        interaction: Interaction,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
         let runtime = Arc::clone(&self.runtime);
-        Box::pin(async move { runtime.kick_room_of(guild, member).await })
+        let replies = Arc::clone(&self.replies);
+        Box::pin(async move { Self::start_kick_vote(&runtime, &replies, &interaction).await })
     }
 }
+
+#[path = "voice_rooms_limit.rs"]
+mod limit;
+pub use limit::{LimitArg, LimitCommand};
+mod private_runtime;
+pub use private_runtime::PrivacyCommand;
+
+mod join_requests;
+use join_requests::{
+    handle_join_interaction, join_component_action, JoinDecisionCommand, JoinReply,
+};
 
 #[cfg(test)]
 #[path = "voice_rooms_tests.rs"]

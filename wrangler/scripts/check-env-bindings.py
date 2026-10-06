@@ -37,6 +37,14 @@ RECEIVER_CONFIG_PREFIX = "TWO_INTERNAL_"
 # publication stays an Operator-approved Worker binding, never a committed var.
 BOOT_PUBLISH_VAR = "TWO_COMMANDS_PUBLISH_ON_BOOT"
 BOOT_PUBLISH_ENVS = {"staging"}
+# The temporary-voice gate attaches the voice sink to the gateway and (once the
+# registry wiring lands) publishes the voice commands. It reads migrated voice
+# tables, so it is bound per environment only after that environment's ledger
+# carries them: staging first. A top-level var would be required in every
+# environment, so it is denied there too; production binding stays an
+# Operator-approved Worker binding, never a committed var.
+VOICE_GATE_VAR = "TWO_VOICE"
+VOICE_GATE_ENVS = {"staging"}
 
 
 def check(path: Path) -> list[str]:
@@ -71,6 +79,13 @@ def check(path: Path) -> list[str]:
             )
         if variables.get(BOOT_PUBLISH_VAR, "1") != "1":
             errors.append(f'{prefix}: {BOOT_PUBLISH_VAR} must be exactly "1" or absent')
+        if VOICE_GATE_VAR in variables and env_name not in VOICE_GATE_ENVS:
+            errors.append(
+                f"{prefix}: {VOICE_GATE_VAR} is staging-only "
+                "(top-level vars are required in every env; production voice is Operator-approved)"
+            )
+        if variables.get(VOICE_GATE_VAR, "1") != "1":
+            errors.append(f'{prefix}: {VOICE_GATE_VAR} must be exactly "1" or absent')
         for key in sorted(k for k in variables if k.startswith(RECEIVER_CONFIG_PREFIX)):
             errors.append(f"{prefix}: {key} is an Operator-set Worker secret, never a wrangler.toml var")
         threshold = variables.get("UNREADY_ALERT_FAILURES")
