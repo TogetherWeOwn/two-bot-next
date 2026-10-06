@@ -30,6 +30,11 @@ use crate::funnel::Snowflake;
 pub const MAX_CHANNEL_NAME_LEN: u32 = 100;
 /// Largest voice user limit (`/limit`, 0 = unlimited, max 99).
 pub const MAX_USER_LIMIT: i64 = 99;
+/// Largest first room number (`/position first-number`): the V11 export codec
+/// stores it as `u32`, so anything above `u32::MAX` breaks `/export` and
+/// `/import` with "Could not read the voice configuration" and can overflow
+/// room numbering later. Mirrored by the `voice_creators` SQL CHECK.
+pub const MAX_FIRST_ROOM_NUMBER: i64 = u32::MAX as i64;
 /// Discord category ceiling (spec V1: hitting it errors and suggests a
 /// second creator channel in another category).
 pub const MAX_CHANNELS_PER_CATEGORY: usize = 50;
@@ -125,7 +130,7 @@ impl CreatorChannel {
                 return Err(CreatorSettingsError::LimitOutOfRange(limit));
             }
         }
-        if self.first_room_number < 1 {
+        if !(1..=MAX_FIRST_ROOM_NUMBER).contains(&self.first_room_number) {
             return Err(CreatorSettingsError::NumberStartOutOfRange(
                 self.first_room_number,
             ));
@@ -180,7 +185,7 @@ pub fn is_usable_channel_name(name: &str) -> bool {
 pub enum CreatorSettingsError {
     #[error("default limit must be 0–99, got {0}")]
     LimitOutOfRange(i64),
-    #[error("first room number must be >= 1, got {0}")]
+    #[error("first room number must be 1–4294967295, got {0}")]
     NumberStartOutOfRange(i64),
     #[error("permission source is a channel but no channel was given")]
     MissingPermissionChannel,
@@ -1493,7 +1498,7 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
                 "First room number (numbering starts here)",
                 CommandOptionType::Integer,
             )
-            .min_value(1),
+            .int_range(1, MAX_FIRST_ROOM_NUMBER),
         ]),
         CommandDefinition::new(
             "group",
@@ -2099,6 +2104,19 @@ mod tests {
             bad.validate(),
             Err(CreatorSettingsError::NumberStartOutOfRange(0))
         );
+        // The V11 export codec stores the start as u32: anything above
+        // u32::MAX breaks `/export` and `/import`.
+        let mut capped = creator();
+        capped.first_room_number = MAX_FIRST_ROOM_NUMBER;
+        assert!(capped.validate().is_ok());
+        for bad_number in [MAX_FIRST_ROOM_NUMBER + 1, i64::MAX] {
+            let mut bad = creator();
+            bad.first_room_number = bad_number;
+            assert_eq!(
+                bad.validate(),
+                Err(CreatorSettingsError::NumberStartOutOfRange(bad_number))
+            );
+        }
         let mut bad = creator();
         bad.permission_source = PermissionSource::Channel(CREATOR);
         bad.permission_channel_id = None;
@@ -2710,6 +2728,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["channel", "position", "first-number"]
         );
+        // `/position first-number` bounds match the V11 export codec (u32):
+        // a larger value would break `/export` and `/import`.
+        assert_eq!(position.options[2].min_value, Some(1));
+        assert_eq!(position.options[2].max_value, Some(MAX_FIRST_ROOM_NUMBER));
         // `/inheritpermissions` requires its source; the channel rides along
         // only for the channel source.
         let inherit = defs

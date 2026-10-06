@@ -4779,7 +4779,7 @@ fn decide_position_refuses_empty_and_bad_numbers() {
         ),
         PositionPlan::Refuse { .. }
     ));
-    for bad in [0, -3] {
+    for bad in [0, -3, 4_294_967_296, i64::MAX] {
         assert!(
             matches!(
                 decide_position(
@@ -4794,6 +4794,18 @@ fn decide_position_refuses_empty_and_bad_numbers() {
             "first number {bad} must refuse"
         );
     }
+    // The export codec bound itself still stores.
+    let capped = match decide_position(
+        base(),
+        &PositionRequest {
+            position: None,
+            first_number: Some(4_294_967_295),
+        },
+    ) {
+        PositionPlan::Update(creator) => creator,
+        PositionPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    };
+    assert_eq!(capped.first_room_number, 4_294_967_295);
 }
 
 #[test]
@@ -4900,6 +4912,33 @@ fn decide_inherit_permissions_refuses_bad_input() {
             "{bad:?}"
         );
     }
+}
+
+#[test]
+fn inherit_source_refusal_needs_guild_kind_and_view() {
+    // Unknown id (not in this guild) refuses.
+    assert!(inherit_source_refusal(None, Some(permissions())).is_some());
+    // Copyable kinds (voice 2, stage 13, text 0, category 4) with View pass.
+    for kind in [0u8, 2u8, 4u8, 13u8] {
+        let source = channel(400, kind, None);
+        assert!(
+            inherit_source_refusal(Some(&source), Some(permissions())).is_none(),
+            "kind {kind} must pass"
+        );
+    }
+    // Anything else (DM 1, announcement 5, thread 10) refuses.
+    for kind in [1u8, 3u8, 5u8, 10u8, 15u8] {
+        let source = channel(400, kind, None);
+        assert!(
+            inherit_source_refusal(Some(&source), Some(permissions())).is_some(),
+            "kind {kind} must refuse"
+        );
+    }
+    // Incomplete snapshots fail closed; a viewer without View refuses.
+    let voice = channel(400, 2, None);
+    assert!(inherit_source_refusal(Some(&voice), None).is_some());
+    assert!(inherit_source_refusal(Some(&voice), Some(Permissions::empty())).is_some());
+    assert!(inherit_source_refusal(Some(&voice), Some(Permissions::VIEW_CHANNEL)).is_none());
 }
 
 #[test]
