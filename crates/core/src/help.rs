@@ -181,6 +181,8 @@ mod tests {
             automations: true,
             announcements: true,
             moderation: true,
+            voice: true,
+            voice_assistant: true,
             tickets: true,
             self_roles: true,
             onboarding_picker: true,
@@ -209,7 +211,10 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        assert!(text.contains("**Server commands** (28 live)"));
+        // 28 legacy builtins plus the 16 gated voice commands and
+        // `/templateassistant` (voice `kick` loses first-wins to moderation
+        // `/kick`): matches the regenerated `docs/commands.md` total.
+        assert!(text.contains("**Server commands** (45 live)"));
         assert!(text.len() < 2000, "fits Discord's content ceiling");
     }
 
@@ -242,6 +247,8 @@ mod tests {
             automations: false,
             announcements: false,
             moderation: false,
+            voice: false,
+            voice_assistant: false,
             ..all_on()
         });
         let defs = off.publish_set(&[]).expect("core-only set");
@@ -264,7 +271,13 @@ mod tests {
             }])
             .expect("set with custom");
         let text = help_text(&defs);
-        assert!(text.contains("**Custom**\n/faq\n"));
+        // The gated voice set has no help group yet, so it shares the Custom
+        // section ahead of the DB row; the row still renders under Custom.
+        let custom = text
+            .split("**Custom**\n")
+            .nth(1)
+            .expect("custom section renders");
+        assert!(custom.contains("/faq"), "custom row renders under Custom");
     }
 
     #[test]
