@@ -547,109 +547,121 @@ pub async fn run_shard<I: InviteSource + 'static>(
             Arc::clone(&queue_signal),
         )
     });
-    let dispatch = crate::dispatch::dispatch_bounded(
-        // Ending reception is cooperative: dispatch_bounded keeps supervising
-        // and draining its blocking writer instead of being aborted/dropped.
-        events.take_until(shutdown),
-        crate::dispatch::DISPATCH_BACKLOG,
-        move |work| match work {
-            ReceivedWork::Clear(deadline) => handle
-                .block_on(checkpoint_io(
-                    &worker_state,
-                    &generation,
-                    deadline,
-                    store.clear(),
-                ))
-                .unwrap_or_else(|_| panic!("gateway clear failed")),
-            ReceivedWork::Failed => panic!("gateway receive failed; checkpoint unchanged"),
-            ReceivedWork::Dispatch {
-                dispatch,
-                edit,
-                checkpoint,
-                deadline,
-                generation: observed_generation,
-                acknowledgement,
-                committed,
-            } => {
-                let timer = crate::gateway_metrics::DispatchTimer::start();
-                let mut connected: Option<&str> = None;
-                let mut onboarding_job = None;
-                // Automod decides first, in gateway order, once per delivery.
-                let disposition = automod.as_ref().and_then(|automod| {
-                    let (delivery, at) = match (edit, dispatch.as_deref()) {
-                        (Some(edit), _) => *edit,
-                        (None, Some(dispatch)) => (
-                            two_bot_discord::automod::event_to_automod(
+    // The blocking dispatch worker inherits no span context: capture the
+    // serving task's gateway span (child of the run span) and re-enter it per
+    // dispatch so lifecycle events keep guild_id/run_id correlation
+    // (docs/logging.md). Without this, ready/gateway_resumed ship bare.
+    let dispatch_span = tracing::Span::current();
+    let dispatch =
+        crate::dispatch::dispatch_bounded(
+            // Ending reception is cooperative: dispatch_bounded keeps supervising
+            // and draining its blocking writer instead of being aborted/dropped.
+            events.take_until(shutdown),
+            crate::dispatch::DISPATCH_BACKLOG,
+            move |work| {
+                let _dispatch_guard = dispatch_span.enter();
+                match work {
+                    ReceivedWork::Clear(deadline) => handle
+                        .block_on(checkpoint_io(
+                            &worker_state,
+                            &generation,
+                            deadline,
+                            store.clear(),
+                        ))
+                        .unwrap_or_else(|_| panic!("gateway clear failed")),
+                    ReceivedWork::Failed => panic!("gateway receive failed; checkpoint unchanged"),
+                    ReceivedWork::Dispatch {
+                        dispatch,
+                        edit,
+                        checkpoint,
+                        deadline,
+                        generation: observed_generation,
+                        acknowledgement,
+                        committed,
+                    } => {
+                        let timer = crate::gateway_metrics::DispatchTimer::start();
+                        let mut connected: Option<&str> = None;
+                        let mut onboarding_job = None;
+                        // Automod decides first, in gateway order, once per delivery.
+                        let disposition = automod.as_ref().and_then(|automod| {
+                            let (delivery, at) = match (edit, dispatch.as_deref()) {
+                                (Some(edit), _) => *edit,
+                                (None, Some(dispatch)) => (
+                                    two_bot_discord::automod::event_to_automod(
+                                        &dispatch.event,
+                                        crate::automod_gateway::receipt_ms(&dispatch.observed_at),
+                                    )?,
+                                    dispatch.observed_at.clone(),
+                                ),
+                                (None, None) => return None,
+                            };
+                            Some(
+                                handle.block_on(crate::automod_gateway::process(
+                                    automod, delivery, &at,
+                                )),
+                            )
+                        });
+                        // Staff audit rows: translated pre-update (member deltas and
+                        // voice boundaries need the rows the funnel is about to
+                        // mutate), stored before the checkpoint commits. The store
+                        // write is idempotent, so a crash between the two replays
+                        // safely; a failed write never stalls this worker.
+                        let mut audit_events = Vec::new();
+                        if let Some(dispatch) = dispatch {
+                            // A cold voice RESUME is followed by IDENTIFY; READY connects.
+                            connected = match &dispatch.event {
+                                Event::Ready(_) if committed.is_none() => Some("ready"),
+                                Event::Resumed if committed.is_none() => Some("gateway_resumed"),
+                                _ => None,
+                            };
+                            // Capture member state before the cache pipeline mutates it.
+                            onboarding_job = writer_onboarding
+                                .as_ref()
+                                .and_then(|runtime| runtime.capture(&dispatch.event, &pipeline));
+                            audit_events = crate::audit_gateway::translate(
                                 &dispatch.event,
-                                crate::automod_gateway::receipt_ms(&dispatch.observed_at),
-                            )?,
-                            dispatch.observed_at.clone(),
-                        ),
-                        (None, None) => return None,
-                    };
-                    Some(handle.block_on(crate::automod_gateway::process(automod, delivery, &at)))
-                });
-                // Staff audit rows: translated pre-update (member deltas and
-                // voice boundaries need the rows the funnel is about to
-                // mutate), stored before the checkpoint commits. The store
-                // write is idempotent, so a crash between the two replays
-                // safely; a failed write never stalls this worker.
-                let mut audit_events = Vec::new();
-                if let Some(dispatch) = dispatch {
-                    // A cold voice RESUME is followed by IDENTIFY; READY connects.
-                    connected = match &dispatch.event {
-                        Event::Ready(_) if committed.is_none() => Some("ready"),
-                        Event::Resumed if committed.is_none() => Some("gateway_resumed"),
-                        _ => None,
-                    };
-                    // Capture member state before the cache pipeline mutates it.
-                    onboarding_job = writer_onboarding
-                        .as_ref()
-                        .and_then(|runtime| runtime.capture(&dispatch.event, &pipeline));
-                    audit_events = crate::audit_gateway::translate(
-                        &dispatch.event,
-                        pipeline.cache(),
-                        &dispatch.observed_at,
-                        checkpoint.sequence,
-                    );
-                    // Exactly one funnel call per dispatch, then drain deferred
-                    // XP awards through the leveling runtime under the
-                    // checkpoint deadline before the cursor commits. Without a
-                    // leveling runtime the drain is a no-op.
-                    let requests = match disposition {
-                        Some(disposition) => pipeline.collect_at_with_message_disposition(
-                            &dispatch.event,
-                            &dispatch.observed_at,
-                            disposition,
-                        ),
-                        None => pipeline.collect_at(
-                            &dispatch.event,
-                            &dispatch.observed_at,
-                            two_bot_discord::MessageEligibility::default(),
-                        ),
-                    };
-                    // Voice after the cache update, so snapshots are complete.
-                    // Handling never blocks (actor inbox). A transport loss seen
-                    // at reception after this dispatch must still win over any
-                    // snapshot it just published.
-                    if let Some(voice) = worker_voice.as_ref() {
-                        voice.handle(&dispatch.event, pipeline.cache());
-                        if generation.load(Ordering::Acquire) != observed_generation {
-                            voice.disconnect();
-                        }
-                    }
-                    if automod_enabled
-                        && matches!(dispatch.event, Event::MessageCreate(_))
-                        && crate::automod_gateway::runs_text_automations(disposition)
-                    {
-                        if let Some(runtime) = command_runtime.as_ref() {
-                            // Detached spawn from the blocking worker needs the runtime.
-                            let _guard = handle.enter();
-                            runtime.dispatch(&dispatch.event);
-                        }
-                    }
-                    if !requests.is_empty() {
-                        handle
+                                pipeline.cache(),
+                                &dispatch.observed_at,
+                                checkpoint.sequence,
+                            );
+                            // Exactly one funnel call per dispatch, then drain deferred
+                            // XP awards through the leveling runtime under the
+                            // checkpoint deadline before the cursor commits. Without a
+                            // leveling runtime the drain is a no-op.
+                            let requests = match disposition {
+                                Some(disposition) => pipeline.collect_at_with_message_disposition(
+                                    &dispatch.event,
+                                    &dispatch.observed_at,
+                                    disposition,
+                                ),
+                                None => pipeline.collect_at(
+                                    &dispatch.event,
+                                    &dispatch.observed_at,
+                                    two_bot_discord::MessageEligibility::default(),
+                                ),
+                            };
+                            // Voice after the cache update, so snapshots are complete.
+                            // Handling never blocks (actor inbox). A transport loss seen
+                            // at reception after this dispatch must still win over any
+                            // snapshot it just published.
+                            if let Some(voice) = worker_voice.as_ref() {
+                                voice.handle(&dispatch.event, pipeline.cache());
+                                if generation.load(Ordering::Acquire) != observed_generation {
+                                    voice.disconnect();
+                                }
+                            }
+                            if automod_enabled
+                                && matches!(dispatch.event, Event::MessageCreate(_))
+                                && crate::automod_gateway::runs_text_automations(disposition)
+                            {
+                                if let Some(runtime) = command_runtime.as_ref() {
+                                    // Detached spawn from the blocking worker needs the runtime.
+                                    let _guard = handle.enter();
+                                    runtime.dispatch(&dispatch.event);
+                                }
+                            }
+                            if !requests.is_empty() {
+                                handle
                             .block_on(checkpoint_io(&worker_state, &generation, deadline, async {
                                 pipeline.drain(requests).await.map(drop).map_err(|error| {
                                     // Runtime Display is sanitized; never
@@ -666,79 +678,80 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             .unwrap_or_else(|_| {
                                 panic!("gateway leveling dispatch failed; checkpoint unchanged")
                             });
+                            }
+                        }
+                        if !audit_events.is_empty() {
+                            let pending = std::mem::take(&mut audit_events);
+                            handle.block_on(crate::audit_gateway::record_all(&pending));
+                        }
+                        let durable_job = onboarding_job
+                            .as_ref()
+                            .map(|job| {
+                                job.durable_payload().map(|payload| GatewayJob {
+                                    payload,
+                                    occurred_at_ms: checkpoint.updated_at_ms,
+                                })
+                            })
+                            .transpose()
+                            .unwrap_or_else(|_| panic!("invalid onboarding job"));
+                        let (_, job_id) = handle
+                            .block_on(checkpoint_io(
+                                &worker_state,
+                                &generation,
+                                deadline,
+                                store.commit_dispatch_with_job(
+                                    &checkpoint,
+                                    pipeline.handlers().store().take_batch(),
+                                    durable_job,
+                                ),
+                            ))
+                            .unwrap_or_else(|_| panic!("gateway checkpoint failed"));
+                        timer.committed();
+                        if let Some(id) = job_id {
+                            if let Some(OnboardingJob::Interaction(interaction)) = onboarding_job {
+                                let ticket = acknowledgement.unwrap_or_else(|| {
+                                    panic!("onboarding interaction missing ingress ticket")
+                                });
+                                writer_live
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .insert(
+                                        id,
+                                        LiveInteraction {
+                                            interaction,
+                                            ticket,
+                                            generation: observed_generation,
+                                        },
+                                    );
+                            }
+                            writer_signal.notify_one();
+                        }
+                        if let Some(msg) = connected {
+                            let mut state = handle.block_on(worker_state.write());
+                            if *state != GatewayState::Draining
+                                && generation.load(Ordering::Acquire) == observed_generation
+                            {
+                                *state = GatewayState::Connected;
+                                info!(
+                                    msg,
+                                    sequence = checkpoint.sequence,
+                                    shard = ?ShardId::ONE,
+                                    "gateway ready; checkpoint committed"
+                                );
+                            }
+                        }
+                        if let Some(committed) = committed {
+                            let _ = committed.send(());
+                        }
                     }
                 }
-                if !audit_events.is_empty() {
-                    let pending = std::mem::take(&mut audit_events);
-                    handle.block_on(crate::audit_gateway::record_all(&pending));
-                }
-                let durable_job = onboarding_job
-                    .as_ref()
-                    .map(|job| {
-                        job.durable_payload().map(|payload| GatewayJob {
-                            payload,
-                            occurred_at_ms: checkpoint.updated_at_ms,
-                        })
-                    })
-                    .transpose()
-                    .unwrap_or_else(|_| panic!("invalid onboarding job"));
-                let (_, job_id) = handle
-                    .block_on(checkpoint_io(
-                        &worker_state,
-                        &generation,
-                        deadline,
-                        store.commit_dispatch_with_job(
-                            &checkpoint,
-                            pipeline.handlers().store().take_batch(),
-                            durable_job,
-                        ),
-                    ))
-                    .unwrap_or_else(|_| panic!("gateway checkpoint failed"));
-                timer.committed();
-                if let Some(id) = job_id {
-                    if let Some(OnboardingJob::Interaction(interaction)) = onboarding_job {
-                        let ticket = acknowledgement.unwrap_or_else(|| {
-                            panic!("onboarding interaction missing ingress ticket")
-                        });
-                        writer_live
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(
-                                id,
-                                LiveInteraction {
-                                    interaction,
-                                    ticket,
-                                    generation: observed_generation,
-                                },
-                            );
-                    }
-                    writer_signal.notify_one();
-                }
-                if let Some(msg) = connected {
-                    let mut state = handle.block_on(worker_state.write());
-                    if *state != GatewayState::Draining
-                        && generation.load(Ordering::Acquire) == observed_generation
-                    {
-                        *state = GatewayState::Connected;
-                        info!(
-                            msg,
-                            sequence = checkpoint.sequence,
-                            shard = ?ShardId::ONE,
-                            "gateway ready; checkpoint committed"
-                        );
-                    }
-                }
-                if let Some(committed) = committed {
-                    let _ = committed.send(());
-                }
-            }
-        },
-        move || async move {
-            *stop_state.write().await = GatewayState::Draining;
-        },
-        crate::dispatch::DISPATCH_IO_MAX,
-        crate::dispatch::DISPATCH_DRAIN_MAX,
-    );
+            },
+            move || async move {
+                *stop_state.write().await = GatewayState::Draining;
+            },
+            crate::dispatch::DISPATCH_IO_MAX,
+            crate::dispatch::DISPATCH_DRAIN_MAX,
+        );
     let result: Result<(), sqlx::Error> = match queue_worker {
         // The durable queue worker only returns on a fatal error; fail the
         // runner (Draining) and drop reception/writer with it.

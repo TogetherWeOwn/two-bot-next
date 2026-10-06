@@ -439,6 +439,42 @@ fn ready_commits(logs: &str) -> usize {
     msg_count(logs, &["ready", "gateway_resumed"])
 }
 
+/// Every durable READY/RESUMED commit must carry gateway correlation
+/// (`docs/logging.md`): the decimal-string guild id plus the boot run id. The
+/// emit site runs on the dispatch `spawn_blocking` worker, which inherits no
+/// span context, so the serving task's gateway span is re-entered per
+/// dispatch; these assertions prove it through the real binary.
+fn assert_ready_correlation(logs: &str) {
+    let mut seen = 0;
+    for line in logs.lines() {
+        let event: Value = match serde_json::from_str(line) {
+            Ok(event) => event,
+            Err(_) => continue,
+        };
+        let is_ready = event
+            .get("msg")
+            .and_then(Value::as_str)
+            .is_some_and(|msg| msg == "ready" || msg == "gateway_resumed");
+        if !is_ready {
+            continue;
+        }
+        seen += 1;
+        assert_eq!(
+            event.get("guild_id").and_then(Value::as_str),
+            Some(GUILD),
+            "ready log must carry the decimal-string guild id"
+        );
+        assert!(
+            event
+                .get("run_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty()),
+            "ready log must carry the boot run id"
+        );
+    }
+    assert!(seen > 0, "expected at least one ready commit in logs");
+}
+
 async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, logs: &Logs) {
     let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = reserved.local_addr().unwrap();
@@ -511,6 +547,7 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         }
         sleep(Duration::from_millis(100)).await;
         bot.assert_alive();
+        assert_ready_correlation(&logs.lock().await);
         bot.terminate().await;
         let rebound = TcpListener::bind(addr)
             .await
@@ -519,6 +556,7 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
     }
     let logs = logs.lock().await;
     assert_eq!(ready_commits(&logs), 2, "ready log on each boot");
+    assert_ready_correlation(&logs);
     assert_eq!(
         msg_count(&logs, &["shutdown_started"]),
         2,
