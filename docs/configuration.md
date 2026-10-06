@@ -77,7 +77,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 121.
+Catalog entries: 122.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
@@ -157,10 +157,11 @@ Catalog entries: 121.
 | `TWO_INTERNAL_ALLOW_EVENT_READ` | env_only | Not specified in Next | environment only | Capability gate for event reads. |
 | `TWO_INTERNAL_ALLOW_MODERATION` | env_only | Not specified in Next | environment only | Capability gate for internal moderation actions. |
 | `TWO_INTERNAL_ALLOW_SETTINGS` | env_only | Not specified in Next | environment only | Capability gate for internal settings actions. |
-| `TWO_INTERNAL_BIND` | env_only | Not specified in Next | environment only | Canonical combined private IP:port for receiver configuration; no default or Container bootstrap wiring. |
+| `TWO_INTERNAL_BIND` | env_only | Not specified in Next | environment only | Canonical combined IP:port for receiver configuration; a wildcard bind requires the Worker-set container marker (TOG-16851). |
 | `TWO_INTERNAL_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy split internal-action listener interface; receiver configuration uses TWO_INTERNAL_BIND instead. |
 | `TWO_INTERNAL_CALLERS` | env_only | Not specified in Next | environment only | Signing-key-to-stable-caller mappings for receiver configuration; environment-only identity boundary, not loaded by Container bootstrap. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | env_only | Not specified in Next | environment only | Logical channel-key allowlist for internal actions. |
+| `TWO_INTERNAL_CONTAINER` | env_only | Not specified in Next | environment only | Worker-set marker admitting a wildcard receiver bind; the container network is presumed private but unverified (TOG-16851). |
 | `TWO_INTERNAL_PORT` | env_only | Not specified in Next | environment only | Legacy split internal-action listener port; receiver configuration uses TWO_INTERNAL_BIND instead. |
 | `TWO_INTERNAL_ROLE_KEYS` | env_only | Not specified in Next | environment only | Logical role-key allowlist for internal actions. |
 | `TWO_JOIN_RISK_THRESHOLD` | hot | Not specified in Next | stored unwired | Join-risk threshold for protection decisions. |

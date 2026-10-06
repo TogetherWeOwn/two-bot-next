@@ -22,11 +22,23 @@ export const ACTIONS_PATH = "/internal/actions";
 /** Fixed receiver port, distinct from BOT_PORT (8080). */
 export const RECEIVER_PORT = 8091;
 /**
- * The Worker, not the Operator, picks the bind: a loopback literal passes the
- * receiver's `assert_private_bind` (crates/core/src/internal_actions.rs) and
- * can never become a wildcard or public address through Worker configuration.
+ * The Worker, not the Operator, picks the bind. TOG-16851: the Containers port
+ * check and `containerFetch` cannot reach a loopback-only socket inside the
+ * Container, so the receiver listens on all interfaces. The bot accepts that
+ * wildcard only with the Worker-set `TWO_INTERNAL_CONTAINER` marker
+ * (crates/core/src/internal_action_config.rs); the container network is
+ * private and the receiver keeps its HMAC/caller checks. An Operator-supplied
+ * bind value is still ignored.
  */
-export const RECEIVER_BIND = `127.0.0.1:${RECEIVER_PORT}`;
+export const RECEIVER_BIND = `0.0.0.0:${RECEIVER_PORT}`;
+/**
+ * Worker-set marker proving the process runs inside the private Cloudflare
+ * Container network, where the wildcard `RECEIVER_BIND` is reachable only via
+ * `containerFetch` and the startup port check. Never an Operator value or a
+ * `wrangler.toml` var (see scripts/check-env-bindings.py).
+ */
+export const CONTAINER_MARKER = "TWO_INTERNAL_CONTAINER";
+export const CONTAINER_MARKER_VALUE = "1";
 
 /** Mirrors the receiver (crates/bot/src/internal_action_http.rs:41-42, MAX_BODY_BYTES). */
 export const MAX_BODY_BYTES = 2 * 1024 * 1024;
