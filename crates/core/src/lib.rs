@@ -14,6 +14,7 @@ pub mod audit_mirror;
 pub mod audit_service;
 #[cfg(feature = "db")]
 pub mod audit_store;
+pub mod automation_transfer;
 pub mod automod;
 pub mod automod_runtime;
 #[cfg(feature = "db")]
@@ -60,6 +61,7 @@ pub mod gateway_funnel;
 pub mod gateway_session;
 pub mod handlers;
 pub mod health;
+pub mod help;
 pub mod inactivity;
 #[cfg(feature = "db")]
 pub mod inactivity_store;
@@ -78,6 +80,7 @@ pub mod lfg;
 #[cfg(feature = "db")]
 pub mod lfg_store;
 pub mod mac;
+pub mod mee6;
 pub mod member_leave_gap;
 pub mod member_moderation;
 #[cfg(feature = "db")]
@@ -137,6 +140,7 @@ pub mod voice_private;
 pub mod voice_reconcile;
 pub mod voice_rename_coalescer;
 pub mod voice_room_controls;
+pub mod voice_room_name;
 pub mod voice_rooms;
 pub mod voice_style;
 pub mod voice_template;
@@ -144,6 +148,7 @@ pub mod voice_template_lint;
 pub mod voice_text_channel;
 pub mod voice_utilities;
 pub mod voice_vote_kick;
+pub mod voice_vote_kick_audit;
 #[cfg(feature = "db")]
 pub mod website_store;
 
@@ -153,6 +158,11 @@ pub use action_outcomes::{
     KickOutcome, KickResult, KickStatus, ModerationExecution, BACKOFF_BASE_MS, MAX_HTTP_TRIES,
     MAX_RETRY_AFTER_MS, RETRY_AFTER_PADDING_MS,
 };
+pub use automation_transfer::{
+    diff_import, export_document, max_import_entries, parse_import_document, ExportDocument,
+    ExportedCommand, ImportDiff, ImportOutcome, ImportParseError, ImportRejection, ParsedImport,
+    PendingSchedule, EXPORT_VERSION,
+};
 pub use automod::{
     match_automod, normalize_content, sanction_for, validate_automod_rules, AutomodConfig,
     AutomodExportError, AutomodExportRule, AutomodFilter, AutomodGateError, AutomodMessage,
@@ -160,11 +170,11 @@ pub use automod::{
     DEFAULT_SANCTIONS,
 };
 pub use channel_moderation::{
-    moderation_result_text, plan_lockdown, plan_unlock, require_channel_reason,
-    validate_purge_count, validate_slowmode_seconds, BoundsError, ChannelModerationVerb,
-    ChannelOutcome, EveryoneOverwrite, LockdownPlan, LockdownRecord, LockdownSeed, MaskError,
-    UnlockError, UnlockPlan, MAX_PURGE_COUNT, MAX_SLOWMODE_SECONDS, MIN_PURGE_COUNT,
-    SEND_MESSAGES_BIT,
+    message_created_ms, moderation_result_text, plan_lockdown, plan_purge, plan_unlock,
+    require_channel_reason, validate_purge_count, validate_slowmode_seconds, BoundsError,
+    ChannelModerationVerb, ChannelOutcome, EveryoneOverwrite, LockdownPlan, LockdownRecord,
+    LockdownSeed, MaskError, PurgePlan, UnlockError, UnlockPlan, LOCKDOWN_BITS, MAX_PURGE_COUNT,
+    MAX_SLOWMODE_SECONDS, MIN_PURGE_COUNT, SEND_MESSAGES_BIT,
 };
 #[cfg(feature = "db")]
 pub use channel_moderation_store::{
@@ -203,10 +213,11 @@ pub use custom_commands::{
     accepted_text_trigger, adjudicate_delete, adjudicate_put, adjudicate_run,
     builtin_command_names, check_capacity, deregister_set, error_code, format_command_list,
     is_builtin_trigger, max_custom_commands, placeholders_in, registry_with_custom,
-    render_template, require_automations_enabled, trigger_word, validate_put_input,
-    validate_template, AuditRecord, CommandError, DeleteDecision, PutCommandInput, PutDecision,
-    RunOutcome, StoredCommand, TemplateContext, TemplateError, MAX_COMMAND_NAME_CHARS,
-    MAX_DESCRIPTION_CHARS, MAX_RENDERED_CHARS, MAX_TEMPLATE_CHARS, TEMPLATE_PLACEHOLDERS,
+    render_template, require_automations_enabled, reserved_command_names, trigger_word,
+    validate_put_input, validate_template, AuditRecord, CommandError, DeleteDecision,
+    PutCommandInput, PutDecision, RunOutcome, StoredCommand, TemplateContext, TemplateError,
+    MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_RENDERED_CHARS, MAX_TEMPLATE_CHARS,
+    TEMPLATE_PLACEHOLDERS,
 };
 pub use events::{CoreEvent, VoiceSessionDelta};
 pub use evidence::{
@@ -234,6 +245,7 @@ pub use health::{
     classify_voice_error, ComponentStatus, HealthReport, VoiceComponent, VoiceDiagnostic,
     VoiceFailureKind, VoiceHealthReport, VoicePermission, VoicePermissionScope, VoiceReadiness,
 };
+pub use help::help_text;
 pub use inactivity::{
     flag_inactive, inactivity_cutoff_ms, member_inactive_event_key, parse_inactivity_days,
     select_inactive, should_flag, FlaggedMember, InactivityCandidate, InactivityOutcome,
@@ -277,6 +289,10 @@ pub use lfg::{
     LfgSelectAction, LfgSelectOption, LfgSignup, LfgStatus, RoleSpecError, SignupOutcome,
     StartsAtError, TitleError, LFG_LEAVE_VALUE, LFG_SELECT_PREFIX, MAX_LFG_ROLES,
     MAX_OPTION_LABEL_CHARS, MAX_ROLE_SLOTS, MAX_TITLE_CHARS,
+};
+pub use mee6::{
+    clean_mee6_name, parse_mee6_entry, translate_export, translate_mee6_template, Mee6CommandInput,
+    TranslatedCommand, TranslatedExport,
 };
 pub use member_leave_gap::{
     classify_leave_gaps, leave_gap_feeds_from_rows, ClassifyResult, FillBound, GapJoin, GapKind,

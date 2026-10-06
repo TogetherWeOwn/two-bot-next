@@ -716,12 +716,10 @@ impl OnboardingRuntime {
             .iter()
             .filter(|destination| destination.degraded)
             .count();
-        let reply = if plan.channel_ids.is_empty() {
-            "Your games are saved, but I couldn't find a room you can open. Please try again later."
-                .to_owned()
-        } else {
-            game_picker_reply(&plan, config.guild_id)
-        };
+        // One reply builder for every outcome: with no reachable room it says
+        // the roles were saved and names each pick that has no channel, as the
+        // legacy picker does (docs/onboarding-port.md, runtime contract 5).
+        let reply = game_picker_reply(&plan, config.guild_id);
         record_game_selection_in_transaction(&mut lock, &guild, &member, &selected, &plan, at)
             .await
             .map_err(|_| RuntimeError::Store)?;

@@ -36,7 +36,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
 | `two_bot_voice_operations_total{op,outcome}` | Finished room create/move/delete outcomes; `op` is `create`, `move` or `delete`, `outcome` is `success`, `category_full`, `discord`, `persistence` or `cancelled`; retries and 429 backoffs are not outcomes |
 | `two_bot_voice_reconcile_actions_total{action}` | Reconcile plan sizes; `action` is `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued` |
-| `two_bot_voice_dead_letters_total{action}` | Queue writes that exhausted `QUEUE_MAX_ATTEMPTS` (10); `action` is `create`, `move`, `delete`, `companion`, `ownership`, `kick`, `rename` or `other` |
+| `two_bot_voice_dead_letters_total{action}` | Queue writes that exhausted `QUEUE_MAX_ATTEMPTS` (10); `action` is `create`, `move`, `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other` |
 | `two_bot_voice_tracked_rooms` | Rooms tracked in memory; compare with live Discord channels for ghosts |
 | `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
@@ -127,10 +127,12 @@ as dynamic labels.
   `two_bot_job_last_success_timestamp_seconds{job}` and
   `two_bot_job_consecutive_failures{job}` — `job` is one of
   `invite_snapshot`, `session_checkpoint`, `counter`, `rank`,
-  `scheduled_events`, `presence_probe`, `community_scorecard`, `inactivity`,
-  `audit_retry`, `scheduled_messages`, `other`; `outcome` is `success` or `failure`.
+  `scheduled_events`, `settings`, `presence_probe`, `community_scorecard`,
+  `inactivity`, `audit_retry`, `scheduled_messages`, `other`; `outcome` is
+  `success` or `failure`.
   `session_checkpoint` records successful durable gateway commits; zero means
   never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
+  `settings` is the DB-only 15 s `guild_settings` version poll.
 - `two_bot_voice_operations_total{op,outcome}` — `op` is `create`, `move`
   or `delete`; `outcome` is `success`, `category_full`, `discord`,
   `persistence` or `cancelled`. `Rejected` status/code values never become
@@ -138,7 +140,7 @@ as dynamic labels.
 - `two_bot_voice_reconcile_actions_total{action}` — `action` is
   `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued`.
 - `two_bot_voice_dead_letters_total{action}` — `action` is `create`, `move`,
-  `delete`, `companion`, `ownership`, `kick`, `rename` or `other`.
+  `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other`.
 - `two_bot_db_errors_total{op}` — `op` is `admission` or `other`. Recorded
   by `Metrics::db_error`; currently only send-admission SQL
   (admit/extend/complete storage failures) reports, so `other` stays zero
@@ -230,9 +232,12 @@ controller's bounded cache pool was missing at implementation time.
 
 Chosen path: the Container Durable Object (the only caller that can reach the
 container-internal listener) pulls `/metrics` via `containerFetch` on every
-keepalive tick, evaluates the checked-in rules and posts transitions to the
-optional `OPS_ALERT_WEBHOOK_URL` Discord-compatible webhook. No Prometheus
-server, no new infrastructure.
+keepalive tick, evaluates the checked-in rules and records structured transitions
+in logs and DO storage. Forwarding to the optional `OPS_ALERT_WEBHOOK_URL` Discord
+webhook requires exactly `OPS_ALERT_FORWARDING = "on"`; the default is `"off"`.
+Both readiness and metrics share the [Discord-only destination validator and
+non-destructive disable switch](container-readiness.md#threshold-and-notifications).
+No Prometheus server, no new infrastructure.
 
 - Authenticated pull: `GET /ops/metrics` on the Worker with
   `Authorization: Bearer <METRICS_SCRAPE_TOKEN>`. The token is an optional

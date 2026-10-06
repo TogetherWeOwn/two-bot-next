@@ -2,14 +2,19 @@
 //!
 //! Applies this crate's embedded migrations through the same SQLx migrator the
 //! gateway used before it went DML-only, with ledger `public._sqlx_migrations`.
-//! Unlike `sqlx migrate run` plus a separate `psql` session, every pooled
-//! connection runs `SET ROLE two_bot_migrator` in `after_connect`, so each
-//! connection that executes DDL is proven to hold the migrator group.
+//! Every pooled connection runs `SET ROLE` in `after_connect` and verifies
+//! `current_user`: plan connections assume the read-only [`READ_ONLY_ROLE`]
+//! group (physically incapable of DDL), while apply connections assume the
+//! [`MIGRATOR_ROLE`] group, so each connection that executes DDL is proven to
+//! hold the migrator group.
 //!
 //! Fail-closed: every refusal happens before any DDL. The runner never resets,
 //! reverts, restores, creates roles, grants privileges or reads other
-//! credentials. The database URL arrives only through the fixed environment
-//! binding [`URL_ENV`] and is never printed.
+//! credentials. The database URL arrives only through the mode's fixed
+//! environment binding ([`PLAN_URL_ENV`] for plan, [`URL_ENV`] for apply) and
+//! is never printed. Plan refuses when the RO binding is absent, even when a
+//! migrator URL is set elsewhere, and refuses before reading the ledger when
+//! its login also holds [`MIGRATOR_ROLE`] (the plan credential is RO only).
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -24,9 +29,16 @@ use sqlx::{
     Executor, PgPool, Row,
 };
 
-/// Fixed binding name; the value is a secret and is never echoed.
+/// Fixed binding names; each value is a secret and is never echoed.
+/// Plan reads only the RO binding; apply reads only the migrator binding.
 pub const URL_ENV: &str = "TWO_BOT_STAGING_MIGRATOR_DATABASE_URL";
+pub const PLAN_URL_ENV: &str = "TWO_BOT_STAGING_PLAN_DATABASE_URL";
 pub const MIGRATOR_ROLE: &str = "two_bot_migrator";
+/// Read-only migration-plan identity: SELECT on bot tables, the admission
+/// lane and the ledger; no DML, DDL, sequence, function or web-view access
+/// (rendered by `sql/database_roles.sql`, verified by
+/// `crates/core/tests/database_roles.rs`).
+pub const READ_ONLY_ROLE: &str = "two_bot_migrator_ro";
 /// SQLx library version this runner is pinned to (asserted against Cargo.lock).
 pub const SQLX_VERSION: &str = "0.9.0";
 pub const RUNNER_VERSION: u32 = 1;
@@ -64,6 +76,14 @@ pub struct Request {
     /// required for apply; both are ignored for plan.
     pub plan_manifest_sha256: Option<String>,
     pub plan_run_id: Option<String>,
+    /// Provenance anchor (TOG-15157): path to the producing plan run's
+    /// downloaded `staging-migrate-manifest.json` (the workflow fetches it
+    /// from `plan_run_id` before the runner starts). Apply hashes nothing
+    /// itself here; it parses the artifact and requires its embedded
+    /// `plan_manifest_sha256` to equal the recomputed manifest hash, so the
+    /// bound hash is proven to come from the named run. Required for apply;
+    /// ignored for plan.
+    pub plan_manifest_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +180,65 @@ pub fn check_plan_binding(
     Ok(computed)
 }
 
+/// Provenance of the bound hash, checked after manifest computation but
+/// before any DDL (TOG-15157 gap 2).
+///
+/// Exactness (`check_plan_binding`) proves the hash matches this run's own
+/// source SHA, pending list and migration table, but that recomputation
+/// alone cannot prove the hash came from the named producing run: its
+/// inputs are public. So apply additionally parses the producing run's
+/// downloaded manifest (fetched by the workflow from `plan_run_id` before
+/// the runner starts) and requires its embedded `plan_manifest_sha256` to
+/// equal the just-computed hash. A wrong run id, an expired or missing
+/// artifact, an unreadable or unparseable file, or a field mismatch all
+/// refuse: verification that is impossible is verification that failed.
+/// For plan the check is a no-op (plan produces the manifest; it binds
+/// nothing).
+pub fn check_plan_provenance(req: &Request, computed_hash: &str) -> Result<(), RunError> {
+    if !req.apply {
+        return Ok(());
+    }
+    let run_id = req.plan_run_id.as_deref().unwrap_or_default().trim();
+    let path = req.plan_manifest_path.as_deref().unwrap_or_default().trim();
+    if path.is_empty() {
+        return refuse(
+            "apply requires plan_manifest_path: the producing plan_run_id run's \
+             downloaded staging-migrate-manifest.json",
+        );
+    }
+    let bytes = std::fs::read(path).map_err(|_| {
+        RunError::Refused(format!(
+            "cannot read the manifest the workflow fetched from producing plan_run_id {run_id} \
+             at {path}; plan_run_id verification is impossible, refusing"
+        ))
+    })?;
+    let artifact: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        RunError::Refused(format!(
+            "the manifest fetched from producing plan_run_id {run_id} at {path} is not valid \
+             JSON; plan_manifest_sha256 provenance is unprovable, refusing"
+        ))
+    })?;
+    let produced = artifact
+        .get("plan_manifest_sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if produced.is_empty() {
+        return refuse(format!(
+            "the manifest fetched from producing plan_run_id {run_id} carries no \
+             plan_manifest_sha256; the bound hash is unproven, refusing"
+        ));
+    }
+    if produced != computed_hash.trim().to_ascii_lowercase() {
+        return refuse(format!(
+            "the manifest fetched from producing plan_run_id {run_id} does not match \
+             plan_manifest_sha256; apply is not bound to that plan run, refusing"
+        ));
+    }
+    Ok(())
+}
+
 /// Pure prerequisite checks; nothing here touches the network.
 ///
 /// Pinned-identity model: the workflow pins the exact non-secret staging
@@ -225,6 +304,21 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
         }
         _ => {}
     }
+    // Provenance anchor: apply must also name the producing run's downloaded
+    // manifest so `run_on_pool` can prove the bound hash came from that run.
+    // Shape only here; the read and comparison happen after the manifest is
+    // computed but before any DDL.
+    if req.apply
+        && req
+            .plan_manifest_path
+            .as_deref()
+            .is_none_or(|p| p.trim().is_empty())
+    {
+        return refuse(
+            "apply requires plan_manifest_path: the producing plan_run_id run's \
+             downloaded staging-migrate-manifest.json",
+        );
+    }
     // NOTE: no `staging`-substring requirement here. The pinned host plus the
     // binding-match check in `verify_target` is the staging identity; the
     // database name alone cannot prove it.
@@ -235,27 +329,56 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
         return refuse("reviewed ACL plan reference is missing or not a bare reference");
     }
     if req.url.as_deref().is_none_or(str::is_empty) {
-        return refuse(format!("migrator binding {URL_ENV} is not provided"));
+        return refuse(format!(
+            "{} binding {} is not provided",
+            if req.apply { "migrator" } else { "plan" },
+            binding_env(req),
+        ));
     }
     Ok(())
 }
 
+/// The fixed environment binding for this mode: plan reads only the
+/// read-only binding, apply reads only the migrator binding. The CLI sets
+/// `Request.url` from exactly this binding, so a mode can never borrow the
+/// other mode's credential; `validate_request` refuses an absent binding
+/// before any connection is attempted.
+fn binding_env(req: &Request) -> &'static str {
+    if req.apply {
+        URL_ENV
+    } else {
+        PLAN_URL_ENV
+    }
+}
+
+/// The database group this mode assumes per connection: plan is physically
+/// read-only, apply holds the migrator group that owns DDL.
+fn expected_role(req: &Request) -> &'static str {
+    if req.apply {
+        MIGRATOR_ROLE
+    } else {
+        READ_ONLY_ROLE
+    }
+}
+
 fn verify_target(req: &Request) -> Result<sqlx::postgres::PgConnectOptions, RunError> {
+    let binding = binding_env(req);
     let url = req.url.as_deref().unwrap_or_default();
     if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
-        return refuse("migrator binding is not a Postgres URL");
+        return refuse(format!("{binding} value is not a Postgres URL"));
     }
     two_bot_core::database_url::validate(url).map_err(|m| RunError::Refused(m.to_owned()))?;
-    let options = two_bot_core::database_url::connect_options(url).map_err(|_| {
-        RunError::Refused("migrator binding is not a valid database URL".to_owned())
-    })?;
+    let options = two_bot_core::database_url::connect_options(url)
+        .map_err(|_| RunError::Refused(format!("{binding} value is not a valid database URL")))?;
     let host = options.get_host().to_ascii_lowercase();
     let database = options.get_database().unwrap_or_default();
     if host.contains("-pooler") {
         return refuse("pooler endpoints are refused; use the direct endpoint");
     }
     if host != req.expected_host.to_ascii_lowercase() || database != req.expected_database {
-        return refuse("migrator binding target does not match the verified staging identity");
+        return refuse(format!(
+            "{binding} target does not match the verified staging identity"
+        ));
     }
     Ok(options)
 }
@@ -311,6 +434,30 @@ fn reconcile_against(ledger: &[LedgerRow], known: &[(i64, String)]) -> Result<Ve
         .collect())
 }
 
+/// Plan must run as a login that holds only [`READ_ONLY_ROLE`]. `session_user`
+/// is unaffected by the per-connection `SET ROLE`, so this tests the login
+/// itself: a login that could also `SET ROLE` to [`MIGRATOR_ROLE`] (directly,
+/// by inheritance, or as a superuser) is not a read-only credential and is
+/// refused. Fails closed: a failed check refuses too. Names the role, never the
+/// login or the URL.
+async fn refuse_migrator_member_plan_login(conn: &mut PgConnection) -> Result<(), RunError> {
+    let holds_migrator: bool =
+        sqlx::query_scalar("SELECT pg_has_role(session_user, $1::name, 'MEMBER')")
+            .bind(MIGRATOR_ROLE)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|_| {
+                RunError::Failed("plan login role check failed".to_owned(), Value::Null)
+            })?;
+    if holds_migrator {
+        return refuse(format!(
+            "plan login holds the {MIGRATOR_ROLE} group; the plan binding must be a login \
+             that holds only {READ_ONLY_ROLE}"
+        ));
+    }
+    Ok(())
+}
+
 async fn read_ledger(conn: &mut PgConnection) -> Result<Vec<LedgerRow>, sqlx::Error> {
     let exists: bool =
         sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations') IS NOT NULL")
@@ -364,6 +511,7 @@ fn source_manifest(migrator: &Migrator) -> Value {
 
 async fn connect(
     options: sqlx::postgres::PgConnectOptions,
+    role: &'static str,
     verified: Arc<AtomicUsize>,
 ) -> Result<PgPool, RunError> {
     PgPoolOptions::new()
@@ -372,13 +520,18 @@ async fn connect(
             let verified = Arc::clone(&verified);
             Box::pin(async move {
                 // Per-connection: a separate psql SET ROLE cannot activate this.
-                conn.execute("SET ROLE two_bot_migrator").await?;
+                // `role` is one of the two fixed group constants, never input.
+                sqlx::query(sqlx::AssertSqlSafe(format!("SET ROLE {role}")))
+                    .execute(&mut *conn)
+                    .await?;
                 conn.execute("SET search_path = public").await?;
                 let current: String = sqlx::query_scalar("SELECT current_user::text")
                     .fetch_one(&mut *conn)
                     .await?;
-                if current != MIGRATOR_ROLE {
-                    return Err(sqlx::Error::Protocol("migrator role not active".to_owned()));
+                if current != role {
+                    return Err(sqlx::Error::Protocol(format!(
+                        "expected role {role} is not active"
+                    )));
                 }
                 verified.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -387,19 +540,20 @@ async fn connect(
         .connect_with(options)
         .await
         .map_err(|_| {
-            RunError::Refused(
-                "could not connect and SET ROLE two_bot_migrator (missing binding or membership)"
-                    .to_owned(),
-            )
+            RunError::Refused(format!(
+                "could not connect and SET ROLE {role} (missing binding or membership)"
+            ))
         })
 }
 
-/// Run the plan (read-only) or apply. Returns the sanitized manifest.
+/// Run the plan (read-only, RO binding and role) or apply (migrator binding
+/// and role). Returns the sanitized manifest.
 pub async fn run(req: &Request) -> Result<Value, RunError> {
     validate_request(req)?;
     let options = verify_target(req)?;
     let verified = Arc::new(AtomicUsize::new(0));
-    let pool = connect(options, Arc::clone(&verified)).await?;
+    let role = expected_role(req);
+    let pool = connect(options, role, Arc::clone(&verified)).await?;
     let result = run_on_pool(req, &pool, &verified).await;
     pool.close().await;
     result
@@ -415,6 +569,11 @@ async fn run_on_pool(
         .acquire()
         .await
         .map_err(|_| failed("pool acquire failed"))?;
+    // "RO only" is enforced, not just documented: a plan login that also holds
+    // the migrator group is refused before the ledger is read.
+    if !req.apply {
+        refuse_migrator_member_plan_login(&mut conn).await?;
+    }
     let before = read_ledger(&mut conn)
         .await
         .map_err(|_| failed("ledger read failed"))?;
@@ -430,6 +589,9 @@ async fn run_on_pool(
         return refuse("expected_pending does not match the computed pending list");
     }
     let computed_hash = check_plan_binding(req, &pending, &MIGRATOR)?;
+    // Provenance follows exactness: the bound hash must additionally be the
+    // hash the named producing plan run uploaded. Both refuse before any DDL.
+    check_plan_provenance(req, &computed_hash)?;
 
     let mut applied = 0usize;
     let mut after = before.clone();
@@ -478,7 +640,7 @@ async fn run_on_pool(
         "target": {"host": req.expected_host, "database": req.expected_database},
         "recovery_evidence_ref": req.recovery_evidence_ref,
         "acl_plan_ref": req.acl_plan_ref,
-        "role": MIGRATOR_ROLE,
+        "role": expected_role(req),
         "role_verified_connections": verified.load(Ordering::SeqCst),
         "source_migrations": source_manifest(&MIGRATOR),
         "ledger_before": ledger_json(&before),
@@ -487,6 +649,10 @@ async fn run_on_pool(
         "expected_pending": expected,
         "plan_manifest_sha256": computed_hash,
         "plan_run_id": req.plan_run_id.clone().unwrap_or_default(),
+        // True only for apply, and only because `check_plan_provenance`
+        // passed above: reaching this manifest means the bound hash was
+        // proven to come from the named producing plan run.
+        "plan_provenance_verified": req.apply,
         "applied_count": applied,
     }))
 }
@@ -505,6 +671,42 @@ mod tests {
                 checksum_hex: hex::encode(&m.checksum),
             })
             .collect()
+    }
+
+    #[test]
+    fn claim_transport_projection_fixture_matches_rust() {
+        use sqlx::{
+            migrate::{Migration, MigrationType},
+            SqlSafeStr,
+        };
+        // Synthetic SQL, no database. The shared consumer vector contains an
+        // i64 above JS's safe-integer bound and a UTF-8 description.
+        let migrator = Migrator::with_migrations(vec![
+            Migration::new(
+                1,
+                "first fixture".into(),
+                MigrationType::Simple,
+                "SELECT 1;".into_sql_str(),
+                false,
+            ),
+            Migration::new(
+                9_007_199_254_740_993,
+                "fixture résumé".into(),
+                MigrationType::Simple,
+                "SELECT 2;".into_sql_str(),
+                false,
+            ),
+        ]);
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/staging-migrate-plan.json"))
+                .unwrap();
+        let pending = [1, 9_007_199_254_740_993];
+        assert_eq!(fixture["source_migrations"], source_manifest(&migrator));
+        assert_eq!(fixture["pending_before"], json!(pending));
+        assert_eq!(
+            fixture["plan_manifest_sha256"],
+            manifest_hash(&"a".repeat(40), &pending, &migrator)
+        );
     }
 
     #[test]
@@ -677,6 +879,10 @@ mod tests {
             ),
             plan_manifest_sha256: Some(hash),
             plan_run_id: Some("123456789".to_owned()),
+            // Shape-valid only: `validate_request` checks presence, while
+            // `check_plan_provenance` reads the file. Provenance tests below
+            // point this at real temp manifests.
+            plan_manifest_path: Some("producing-plan/staging-migrate-manifest.json".to_owned()),
         }
     }
 
@@ -742,6 +948,8 @@ mod tests {
             },
             |r: &mut Request| r.plan_run_id = Some(String::new()),
             |r: &mut Request| r.plan_run_id = Some("plan-42".to_owned()),
+            |r: &mut Request| r.plan_manifest_path = None,
+            |r: &mut Request| r.plan_manifest_path = Some("   ".to_owned()),
         ] {
             let mut req = good.clone();
             mutate(&mut req);
@@ -753,9 +961,130 @@ mod tests {
             expected_pending: None,
             plan_manifest_sha256: None,
             plan_run_id: None,
+            plan_manifest_path: None,
             ..good
         };
         assert!(validate_request(&plan).is_ok());
+    }
+
+    /// Write `contents` to a unique temp file and return its path. Unit tests
+    /// run in parallel in one process, so the atomic counter keeps names
+    /// disjoint; the caller removes the file.
+    fn temp_manifest(contents: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "staging-provenance-test-{}-{id}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).expect("temp manifest must be writable");
+        path
+    }
+
+    /// A producing-run manifest artifact carrying `hash` in its embedded
+    /// `plan_manifest_sha256` field, as the plan job's `tee` would upload it.
+    fn producing_manifest(hash: &str) -> String {
+        json!({
+            "runner_version": RUNNER_VERSION,
+            "mode": "plan",
+            "source_sha": "a".repeat(40),
+            "plan_manifest_sha256": hash,
+            "plan_run_id": "",
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn plan_provenance_accepts_the_producing_run_manifest() {
+        let sha = "a".repeat(40);
+        let pending = pending_versions();
+        let hash = manifest_hash(&sha, &pending, &MIGRATOR);
+        let path = temp_manifest(&producing_manifest(&hash));
+        let req = Request {
+            plan_manifest_path: Some(path.to_string_lossy().into_owned()),
+            ..bound_apply(&pending, &sha)
+        };
+        assert!(validate_request(&req).is_ok());
+        assert_eq!(check_plan_binding(&req, &pending, &MIGRATOR).unwrap(), hash);
+        assert!(check_plan_provenance(&req, &hash).is_ok());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn plan_provenance_refuses_another_run_manifest() {
+        let sha = "a".repeat(40);
+        let pending = pending_versions();
+        let hash = manifest_hash(&sha, &pending, &MIGRATOR);
+        // Same shape, different producing run: its manifest carries another
+        // hash, so binding apply to this run id must refuse.
+        let other = manifest_hash(&"b".repeat(40), &pending, &MIGRATOR);
+        assert_ne!(other, hash);
+        let path = temp_manifest(&producing_manifest(&other));
+        let req = Request {
+            plan_manifest_path: Some(path.to_string_lossy().into_owned()),
+            ..bound_apply(&pending, &sha)
+        };
+        assert!(validate_request(&req).is_ok());
+        let err = check_plan_provenance(&req, &hash).unwrap_err();
+        assert!(matches!(err, RunError::Refused(_)));
+        let message = err.to_string();
+        assert!(message.contains("plan_run_id"), "{message}");
+        assert!(message.contains("plan_manifest_sha256"), "{message}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn plan_provenance_refuses_when_verification_is_impossible() {
+        let sha = "a".repeat(40);
+        let pending = pending_versions();
+        let hash = manifest_hash(&sha, &pending, &MIGRATOR);
+        let good = bound_apply(&pending, &sha);
+        // A wrong run id (or an expired artifact) leaves no manifest file:
+        // the download step fails and, if the runner is ever reached without
+        // one, the missing file refuses rather than proceeding unverified.
+        let missing = Request {
+            plan_manifest_path: Some(
+                std::env::temp_dir()
+                    .join("staging-provenance-test-no-such-file.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..good.clone()
+        };
+        assert!(validate_request(&missing).is_ok());
+        assert!(matches!(
+            check_plan_provenance(&missing, &hash),
+            Err(RunError::Refused(_))
+        ));
+        // Corrupt or field-less artifacts are equally unprovable.
+        for contents in [
+            "{not json".to_owned(),
+            json!({"mode": "plan"}).to_string(),
+            json!({"mode": "plan", "plan_manifest_sha256": 42}).to_string(),
+            json!({"mode": "plan", "plan_manifest_sha256": ""}).to_string(),
+        ] {
+            let path = temp_manifest(&contents);
+            let req = Request {
+                plan_manifest_path: Some(path.to_string_lossy().into_owned()),
+                ..good.clone()
+            };
+            assert!(matches!(
+                check_plan_provenance(&req, &hash),
+                Err(RunError::Refused(_))
+            ));
+            std::fs::remove_file(&path).ok();
+        }
+        // Plan binds nothing, so it never reads the (absent) artifact.
+        let plan = Request {
+            apply: false,
+            expected_pending: None,
+            plan_manifest_sha256: None,
+            plan_run_id: None,
+            plan_manifest_path: None,
+            ..good
+        };
+        assert!(check_plan_provenance(&plan, &hash).is_ok());
     }
 
     #[test]
@@ -771,6 +1100,7 @@ mod tests {
             expected_pending: None,
             plan_manifest_sha256: None,
             plan_run_id: None,
+            plan_manifest_path: None,
         };
         assert!(validate_request(&ok).is_ok());
         // The verified shared-Neon staging identity needs no `staging` in the
@@ -857,9 +1187,95 @@ mod tests {
             expected_pending: Some(String::new()),
             plan_manifest_sha256: Some("ab".repeat(32)),
             plan_run_id: Some("123456789".to_owned()),
+            plan_manifest_path: Some("producing-plan/staging-migrate-manifest.json".to_owned()),
             ..ok.clone()
         })
         .is_ok());
+        // Apply refuses without the producing run's downloaded manifest: a
+        // bound hash with no provenance anchor cannot be verified.
+        assert!(matches!(
+            validate_request(&Request {
+                apply: true,
+                expected_pending: Some(String::new()),
+                plan_manifest_sha256: Some("ab".repeat(32)),
+                plan_run_id: Some("123456789".to_owned()),
+                plan_manifest_path: None,
+                ..ok.clone()
+            }),
+            Err(RunError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn modes_select_role_and_binding() {
+        let sha = "a".repeat(40);
+        let plan = Request {
+            url: Some("postgres://u@agent-testdb:5432/two_staging".to_owned()),
+            source_sha: sha.clone(),
+            expected_host: "agent-testdb".to_owned(),
+            expected_database: "two_staging".to_owned(),
+            recovery_evidence_ref: "TOG-1#doc".to_owned(),
+            acl_plan_ref: "TOG-2#doc".to_owned(),
+            apply: false,
+            expected_pending: None,
+            plan_manifest_sha256: None,
+            plan_run_id: None,
+            plan_manifest_path: None,
+        };
+        assert_eq!(binding_env(&plan), PLAN_URL_ENV);
+        assert_eq!(expected_role(&plan), READ_ONLY_ROLE);
+        assert!(validate_request(&plan).is_ok());
+        assert_ne!(PLAN_URL_ENV, URL_ENV);
+        let pending = pending_versions();
+        let apply = bound_apply(&pending, &sha);
+        assert_eq!(binding_env(&apply), URL_ENV);
+        assert_eq!(expected_role(&apply), MIGRATOR_ROLE);
+    }
+
+    #[test]
+    fn plan_refuses_a_missing_ro_binding_by_name() {
+        let ok = Request {
+            url: Some("postgres://u@agent-testdb:5432/two_staging".to_owned()),
+            source_sha: "a".repeat(40),
+            expected_host: "agent-testdb".to_owned(),
+            expected_database: "two_staging".to_owned(),
+            recovery_evidence_ref: "TOG-1#doc".to_owned(),
+            acl_plan_ref: "TOG-2#doc".to_owned(),
+            apply: false,
+            expected_pending: None,
+            plan_manifest_sha256: None,
+            plan_run_id: None,
+            plan_manifest_path: None,
+        };
+        // Plan refuses on the absent RO binding by name: the migrator URL is a
+        // different binding and can never satisfy the plan path.
+        for missing in [
+            Request {
+                url: None,
+                ..ok.clone()
+            },
+            Request {
+                url: Some(String::new()),
+                ..ok.clone()
+            },
+        ] {
+            let err = validate_request(&missing).unwrap_err().to_string();
+            assert!(
+                err.contains(PLAN_URL_ENV),
+                "plan refusal must name the RO binding, got: {err}"
+            );
+        }
+        // Apply still names its own binding, unchanged.
+        let pending = pending_versions();
+        let missing_apply = Request {
+            url: None,
+            ..bound_apply(&pending, &"a".repeat(40))
+        };
+        let err = validate_request(&missing_apply).unwrap_err().to_string();
+        assert!(
+            err.contains(URL_ENV),
+            "apply refusal must name the migrator binding, got: {err}"
+        );
     }
 
     #[test]
@@ -875,6 +1291,7 @@ mod tests {
             expected_pending: None,
             plan_manifest_sha256: None,
             plan_run_id: None,
+            plan_manifest_path: None,
         };
         assert!(validate_request(&base).is_ok());
         assert!(verify_target(&base).is_ok());

@@ -53,6 +53,9 @@ storage = "sqlite"
 # REDIRECT_FALLBACK_CODE is the invite code for `/` and DB outages.
 REDIRECT_FALLBACK_CODE = ""
 REDIRECT_MAPPINGS_JSON = "[]"
+# Worker-only paging switch: installing a webhook secret alone never sends.
+# Vars are non-inheritable, so every environment explicitly defaults to off.
+OPS_ALERT_FORWARDING = "off"
 # Container HTTP port (must match the Rust LISTEN_ADDR port).
 BOT_PORT = "8080"
 # Keepalive tick: the DO schedule() below re-arms itself this often; each
@@ -97,6 +100,9 @@ storage = "sqlite"
 # S1 lands the shared DB (vars are not inherited, so this must be repeated).
 REDIRECT_FALLBACK_CODE = ""
 REDIRECT_MAPPINGS_JSON = "[]"
+# Worker-only paging switch: installing a webhook secret alone never sends.
+# Vars are non-inheritable, so every environment explicitly defaults to off.
+OPS_ALERT_FORWARDING = "off"
 # Container HTTP port (must match the Rust LISTEN_ADDR port).
 BOT_PORT = "8080"
 # Keepalive tick: renews the activity timeout so the gateway WebSocket
@@ -116,6 +122,24 @@ INTERNAL_ACTIONS_INGRESS = "1"
 # configured. Rollback is unset + re-publish (PUT is a full replacement).
 TWO_AUTOMATIONS = "1"
 TWO_ANNOUNCEMENTS = "1"
+# Staging-only boot publication (docs/command-publish.md): at startup the
+# container fetches the staging guild's command registry, compares hashes and
+# sends one full replacement only when they differ. It uses the container's own
+# send-admission database, so no operator database credential is needed. The
+# application ID is the staging bot's public ID. The live-guild fence stays on
+# (TWO_COMMANDS_ALLOW_LIVE_GUILD is never set), so a live GUILD_ID refuses.
+# Never top-level and never production. Rollback: delete both lines, redeploy.
+TWO_COMMANDS_PUBLISH_ON_BOOT = "1"
+DISCORD_APPLICATION_ID = "1469137636663758888"
+# Staging-only temporary voice gate (docs/voice-cutover-rehearsal.md): attaches
+# the voice sink to the gateway so the staging guild exercises room lifecycle
+# events. It reads the voice tables (migrations 0224-0229, 0412-0414, 0416-0418), so
+# the staging ledger must already carry them (post-apply plan shows no pending). Reconcile only touches rows the
+# bot tracks; the guild's permanent voice channels stay untouched. Forwarded
+# into the container via FORWARDED_FLAGS (wrangler/src/container-env.ts).
+# Never top-level and never production: scripts/check-env-bindings.py fails
+# either. Rollback: delete the line, redeploy.
+TWO_VOICE = "1"
 
 [env.production.version_metadata]
 binding = "CF_VERSION_METADATA"
@@ -149,6 +173,9 @@ storage = "sqlite"
 # B3 (TOG-9696) redirect snapshot placeholder (see staging block above).
 REDIRECT_FALLBACK_CODE = ""
 REDIRECT_MAPPINGS_JSON = "[]"
+# Worker-only paging switch: installing a webhook secret alone never sends.
+# Vars are non-inheritable, so every environment explicitly defaults to off.
+OPS_ALERT_FORWARDING = "off"
 BOT_PORT = "8080"
 KEEPALIVE_SECONDS = "60"
 TWO_GUILD_NAME = "TogetherWeOwn"

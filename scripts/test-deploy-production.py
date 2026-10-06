@@ -89,12 +89,48 @@ URL_CHECK = inline_script("Require a production Worker URL distinct from staging
 GATE = inline_script("Gate on /health + truthful /readyz")
 
 
+CI_RUN_ID = 101
+CI_SUITE_ID = 201
+CHECK_IDS = {"ci-ok": 301, "worker check": 302, "check": 303}
+
+
+def workflow_run(run_id=CI_RUN_ID, number=1, attempt=1, suite_id=CI_SUITE_ID,
+                 status="completed", conclusion="success"):
+    return {
+        "id": run_id, "run_number": number, "run_attempt": attempt,
+        "check_suite_id": suite_id, "head_sha": SHA, "status": status, "conclusion": conclusion,
+    }
+
+
+def check_run(name, status="completed", conclusion="success", app_id=15368,
+              check_id=None, suite_id=CI_SUITE_ID):
+    check_id = CHECK_IDS[name] if check_id is None else check_id
+    return {
+        "id": check_id, "url": f"https://api.github.com/repos/{REPO}/check-runs/{check_id}",
+        "name": name, "head_sha": SHA, "status": status, "conclusion": conclusion,
+        "app": {"id": app_id}, "check_suite": {"id": suite_id},
+    }
+
+
+def workflow_job(name, run_id=CI_RUN_ID, attempt=1, check_id=None):
+    return {
+        "name": name, "run_id": run_id, "run_attempt": attempt, "head_sha": SHA,
+        "check_run_url": check_run(name, check_id=check_id)["url"],
+        "status": "completed", "conclusion": "success",
+    }
+
+
 def green():
     return {
         "compare": {"status": "ahead"},
-        "check": {"check_runs": [{"name": "check", "conclusion": "success"}]},
-        "worker check": {"check_runs": [{"name": "worker check", "conclusion": "success"}]},
+        "ci-runs": {"total_count": 1, "workflow_runs": [workflow_run()]},
+        "ci-run": workflow_run(),
+        "ci-jobs": {"total_count": 2, "jobs": [workflow_job(name) for name in ("ci-ok", "worker check")]},
+        "ci-ok": {"check_runs": [check_run("ci-ok")]},
+        "check": {"check_runs": [check_run("check")]},
+        "worker check": {"check_runs": [check_run("worker check")]},
         "staging": {"total_count": 1, "workflow_runs": [{"conclusion": "success"}]},
+        "staging-all": {"total_count": 1, "workflow_runs": [staging_run()]},
         "environment": {
             "name": "production",
             "protection_rules": [
@@ -106,6 +142,10 @@ def green():
         },
         "branches": {"total_count": 1, "branch_policies": [{"name": "main", "type": "branch"}]},
     }
+
+
+def staging_run(run_id=501, number=5, status="completed", conclusion="success", sha=SHA):
+    return {"id": run_id, "run_number": number, "head_sha": sha, "status": status, "conclusion": conclusion}
 
 
 def failed_call():
@@ -207,6 +247,15 @@ class StaticGuardTests(unittest.TestCase):
         self.assertEqual(conditions["      - name: Deploy to production"], ["if: env.MODE == 'deploy'"])
         self.assertEqual(conditions["      - name: Roll back production"], ["if: env.MODE == 'rollback'"])
 
+    def test_pre_freeze_candidate_requires_the_full_latest_ci_verdict(self):
+        row = next(line for line in (ROOT / "docs/cutover-sequence.md").read_text().splitlines()
+                   if line.startswith("| 0.1 |"))
+        for gate in ("latest `check.yml` run/current attempt", "full `ci-ok` verdict",
+                     "Rust/DB lanes", "`worker check`", "`pr-lint`", "`gitleaks`",
+                     "on that exact head", "lint-only `check` is insufficient"):
+            self.assertIn(gate, row)
+        self.assertNotIn("`check` (`fmt`, `clippy -D warnings`, tests", row)
+
     def test_run_scripts_never_interpolate_expressions(self):
         blocks = run_blocks()
         self.assertGreaterEqual(len(blocks), 6)
@@ -215,7 +264,7 @@ class StaticGuardTests(unittest.TestCase):
 
 
 class GuardBehaviourTests(unittest.TestCase):
-    def guard(self, sha=SHA, rollback="", ref="refs/heads/main", **responses):
+    def guard(self, sha=SHA, rollback="", ref="refs/heads/main", auto="", **responses):
         api = {**green(), **responses}
         calls = []
 
@@ -230,6 +279,22 @@ class GuardBehaviourTests(unittest.TestCase):
                 self.assertEqual(query["app_id"], "15368")
                 self.assertEqual(query["filter"], "latest")
                 key = query["check_name"]
+            elif path == f"repos/{REPO}/actions/workflows/check.yml/runs":
+                self.assertEqual(query["head_sha"], sha.strip().lower())
+                self.assertNotIn("status", query)
+                self.assertNotIn("branch", query)
+                key = "ci-runs"
+            elif re.fullmatch(rf"repos/{REPO}/actions/runs/[0-9]+", path):
+                key = "ci-run"
+            elif re.fullmatch(rf"repos/{REPO}/actions/runs/[0-9]+/attempts/[0-9]+/jobs", path):
+                key = "ci-jobs"
+            elif path == f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs" and "status" not in query:
+                # Automated approval: every run on the SHA, never a success-only filter.
+                self.assertEqual(
+                    {k: query[k] for k in ("head_sha", "branch")},
+                    {"head_sha": sha.strip().lower(), "branch": "main"},
+                )
+                key = "staging-all"
             elif path == f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs":
                 self.assertEqual(
                     {k: query[k] for k in ("head_sha", "branch", "status")},
@@ -243,14 +308,25 @@ class GuardBehaviourTests(unittest.TestCase):
             else:
                 self.fail(f"unexpected API call {path}")
             result = api[key]
+            if callable(result):
+                result = result(path, query)
             if isinstance(result, Exception):
                 raise result
+            if path.endswith("/check-runs") and isinstance(result, dict):
+                # Match the GitHub API's name/App filters, but never filter by
+                # status: a pending latest run must not disappear behind green.
+                self.assertNotIn("status", query)
+                result = {"check_runs": [
+                    run for run in result.get("check_runs", [])
+                    if run.get("name") == key and str(run.get("app", {}).get("id")) == query["app_id"]
+                ]}
             return result if isinstance(result, str) else json.dumps(result)
 
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
             output, summary = Path(tmp) / "output", Path(tmp) / "summary"
             env = {
                 "GITHUB_REPOSITORY": REPO, "GITHUB_REF": ref, "SHA": sha, "ROLLBACK": rollback,
+                "AUTO_APPROVE": auto,
                 "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary),
             }
             stdout, code = io.StringIO(), 0
@@ -278,9 +354,11 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": ""})
         self.assertIn(SHA, summary)
+        self.assertIn("full `ci-ok` verdict", summary)
+        self.assertIn("green ci-ok", "\n".join(TOP["on"]))
         self.assertEqual(
             [query.get("check_name") for path, query in calls if path.endswith("/check-runs")],
-            ["check", "worker check"],
+            ["ci-ok", "worker check"],
         )
 
     def test_main_head_itself_passes_and_sha_is_normalised(self):
@@ -319,11 +397,188 @@ class GuardBehaviourTests(unittest.TestCase):
                 self.assertRefused(self.guard(compare={"status": status}), "not an ancestor of origin/main")
 
     def test_missing_or_red_checks_are_refused(self):
-        for name in ("check", "worker check"):
-            for runs in ([], [{"conclusion": "failure"}], [{"conclusion": None}],
-                         [{"conclusion": "success"}, {"conclusion": "cancelled"}], [{"conclusion": "skipped"}]):
+        for name in ("ci-ok", "worker check"):
+            for runs in ([], [check_run(name, conclusion="failure")],
+                         [check_run(name, status="queued", conclusion=None)],
+                         [check_run(name), check_run(name, conclusion="cancelled")],
+                         [check_run(name, conclusion="skipped")]):
                 with self.subTest(name=name, runs=runs):
-                    self.assertRefused(self.guard(**{name: {"check_runs": runs}}), f"`{name}` has no successful run")
+                    self.assertRefused(
+                        self.guard(**{name: {"check_runs": runs}}), f"`{name}` has no successful completed run"
+                    )
+
+    def test_incomplete_full_ci_verdict_is_refused_even_with_green_lint_worker_and_staging(self):
+        # Lint and worker success cannot vouch for the moved Rust/DB lanes.
+        bad_runs = [[]]
+        bad_runs += [[check_run("ci-ok", conclusion=conclusion)] for conclusion in (
+            "failure", "cancelled", "skipped", "neutral", "timed_out", "action_required", "stale", None,
+        )]
+        bad_runs += [[check_run("ci-ok", status=status, conclusion=conclusion)]
+                     for status in ("queued", "in_progress", None)
+                     for conclusion in (None, "success")]
+        for rollback in ("", VERSION):
+            for runs in bad_runs:
+                with self.subTest(rollback=bool(rollback), runs=runs):
+                    self.assertRefused(
+                        self.guard(rollback=rollback, **{"ci-ok": {"check_runs": runs}}),
+                        "`ci-ok` has no successful completed run",
+                    )
+
+    def test_latest_pending_or_red_verdict_cannot_be_hidden_by_an_older_green_run(self):
+        for latest in (check_run("ci-ok", status="in_progress", conclusion=None),
+                       check_run("ci-ok", conclusion="failure")):
+            with self.subTest(latest=latest):
+                # The API may return latest runs from more than one check suite.
+                self.assertRefused(
+                    self.guard(**{"ci-ok": {"check_runs": [check_run("ci-ok"), latest]}}),
+                    "`ci-ok` has no successful completed run",
+                )
+
+    def test_old_green_cannot_hide_a_new_run_without_an_aggregate(self):
+        for rollback in ("", VERSION):
+            for status, conclusion in (("queued", None), ("in_progress", None),
+                                       ("in_progress", "failure"), ("completed", "failure"),
+                                       ("completed", "cancelled"), ("completed", "skipped")):
+                with self.subTest(rollback=bool(rollback), status=status, conclusion=conclusion):
+                    newer = workflow_run(run_id=102, number=2, status=status, conclusion=conclusion)
+                    # The name-filtered aggregate, worker and staging remain green.
+                    self.assertRefused(self.guard(rollback=rollback, **{
+                        "ci-runs": {"total_count": 2, "workflow_runs": [workflow_run(), newer]},
+                        "ci-run": newer,
+                        "ci-jobs": {"total_count": 1, "jobs": [workflow_job("worker check", run_id=102)]},
+                    }), "check.yml latest run/attempt has no successful completed verdict")
+
+    def test_old_green_cannot_hide_a_new_attempt_without_an_aggregate(self):
+        for rollback in ("", VERSION):
+            for status, conclusion in (("queued", None), ("in_progress", None),
+                                       ("completed", "failure"), ("completed", "cancelled")):
+                with self.subTest(rollback=bool(rollback), status=status):
+                    # The list response can lag; refresh the current attempt by run ID.
+                    self.assertRefused(self.guard(rollback=rollback, **{
+                        "ci-run": workflow_run(attempt=2, status=status, conclusion=conclusion),
+                    }), "check.yml latest run/attempt has no successful completed verdict")
+
+    def test_latest_green_run_and_attempt_pass_in_both_modes(self):
+        latest = workflow_run(run_id=102, number=2, attempt=2, suite_id=202)
+        for rollback in ("", VERSION):
+            with self.subTest(rollback=bool(rollback)):
+                result = self.guard(rollback=rollback, **{
+                    # Deliberately newest-first: do not rely on response ordering.
+                    "ci-runs": {"total_count": 2, "workflow_runs": [latest, workflow_run()]},
+                    "ci-run": latest,
+                    "ci-jobs": {"total_count": 2, "jobs": [
+                        workflow_job(name, run_id=102, attempt=2, check_id=CHECK_IDS[name] + 100)
+                        for name in ("ci-ok", "worker check")
+                    ]},
+                    **{name: {"check_runs": [check_run(name), check_run(
+                        name, check_id=CHECK_IDS[name] + 100, suite_id=202,
+                    )]} for name in ("ci-ok", "worker check")},
+                })
+                self.assertEqual(result[0], 0)
+                self.assertEqual(result[1]["mode"], "rollback" if rollback else "deploy")
+                self.assertIn("run `102`, attempt `2` (latest, completed/success)", result[2])
+                self.assertIn((f"repos/{REPO}/actions/runs/102/attempts/2/jobs",
+                               {"per_page": "100", "page": "1"}), result[3])
+
+    def test_old_check_evidence_cannot_stand_in_for_the_latest_attempt(self):
+        for rollback in ("", VERSION):
+            for name in ("ci-ok", "worker check"):
+                for key, bad in (("run_id", 100), ("run_attempt", 1), ("head_sha", "f" * 40),
+                                 ("status", "in_progress"), ("conclusion", "failure"),
+                                 ("check_run_url", None)):
+                    with self.subTest(rollback=bool(rollback), name=name, key=key):
+                        jobs = [workflow_job(n, attempt=2) for n in ("ci-ok", "worker check")]
+                        next(job for job in jobs if job["name"] == name)[key] = bad
+                        self.assertRefused(self.guard(rollback=rollback, **{
+                            "ci-run": workflow_run(attempt=2),
+                            "ci-jobs": {"total_count": 2, "jobs": jobs},
+                        }), f"`{name}` has no successful completed job")
+                for key, bad in (("url", "https://api.github.com/repos/other/repo/check-runs/1"),
+                                 ("head_sha", "f" * 40), ("check_suite", {"id": 999})):
+                    with self.subTest(rollback=bool(rollback), name=name, key=key):
+                        check = {**check_run(name), key: bad}
+                        self.assertRefused(self.guard(rollback=rollback, **{
+                            name: {"check_runs": [check]},
+                        }), f"`{name}` has no successful completed run")
+
+    def test_missing_or_duplicate_required_attempt_jobs_are_refused(self):
+        for name in ("ci-ok", "worker check"):
+            other = "worker check" if name == "ci-ok" else "ci-ok"
+            for selected in ([], [workflow_job(name), workflow_job(name)]):
+                with self.subTest(name=name, count=len(selected)):
+                    jobs = [workflow_job(other), *selected]
+                    self.assertRefused(self.guard(**{
+                        "ci-jobs": {"total_count": len(jobs), "jobs": jobs},
+                    }), f"`{name}` has no successful completed job")
+
+    def test_completed_run_without_current_aggregate_evidence_is_refused(self):
+        for name in ("ci-ok", "worker check"):
+            with self.subTest(name=name):
+                # Run status alone is not evidence: only the old check URL exists.
+                jobs = [workflow_job(n, check_id=CHECK_IDS[n] + (100 if n == name else 0))
+                        for n in ("ci-ok", "worker check")]
+                self.assertRefused(self.guard(**{
+                    "ci-jobs": {"total_count": 2, "jobs": jobs},
+                }), f"`{name}` has no successful completed run")
+
+    def test_run_metadata_and_incomplete_enumeration_fail_closed(self):
+        for runs in ({"total_count": 0, "workflow_runs": []},
+                     {"total_count": 2, "workflow_runs": []},
+                     {"total_count": 1001, "workflow_runs": [workflow_run()]},
+                     {"workflow_runs": [workflow_run()]},
+                     {"total_count": 1, "workflow_runs": [{**workflow_run(), "head_sha": "f" * 40}]},
+                     {"total_count": 1, "workflow_runs": [{**workflow_run(), "run_number": None}]}):
+            with self.subTest(runs=runs):
+                self.assertRefused(self.guard(**{"ci-runs": runs}), "check.yml")
+        for key, bad in (("id", 102), ("head_sha", "f" * 40), ("run_number", 2),
+                         ("run_attempt", None), ("check_suite_id", None)):
+            with self.subTest(key=key):
+                self.assertRefused(self.guard(**{
+                    "ci-run": {**workflow_run(), key: bad},
+                }), "could not verify the latest check.yml attempt")
+        self.assertRefused(self.guard(**{
+            "ci-jobs": {"total_count": 2, "jobs": []},
+        }), "could not enumerate")
+
+    def test_pagination_does_not_hide_a_newer_run_or_required_job(self):
+        newer = workflow_run(run_id=102, number=2, status="queued", conclusion=None)
+        self.assertRefused(self.guard(**{
+            "ci-runs": lambda path, query: {"total_count": 2, "workflow_runs": [
+                workflow_run() if query["page"] == "1" else newer,
+            ]}, "ci-run": newer,
+        }), "check.yml latest run/attempt has no successful completed verdict")
+        result = self.guard(**{
+            "ci-jobs": lambda path, query: {"total_count": 2, "jobs": [
+                workflow_job("ci-ok" if query["page"] == "1" else "worker check"),
+            ]},
+        })
+        self.assertEqual(result[0], 0)
+
+    def test_new_run_or_attempt_during_guard_read_is_refused(self):
+        for rerun in (False, True):
+            with self.subTest(rerun=rerun):
+                reads = iter([workflow_run(), workflow_run(
+                    run_id=CI_RUN_ID if rerun else 102, number=1 if rerun else 2,
+                    attempt=2 if rerun else 1,
+                )])
+                if rerun:
+                    responses = {"ci-run": lambda path, query: next(reads)}
+                else:
+                    lists = iter([green()["ci-runs"], {"total_count": 1, "workflow_runs": [workflow_run(
+                        run_id=102, number=2,
+                    )]}])
+                    responses = {"ci-run": lambda path, query: next(reads),
+                                 "ci-runs": lambda path, query: next(lists)}
+                self.assertRefused(self.guard(**responses), "latest run/attempt changed during validation")
+
+    def test_another_apps_green_verdict_cannot_authorize_production(self):
+        untrusted = check_run("ci-ok", app_id=12345)
+        for trusted in ([], [check_run("ci-ok", conclusion="failure")]):
+            with self.subTest(trusted=trusted):
+                self.assertRefused(
+                    self.guard(**{"ci-ok": {"check_runs": [untrusted, *trusted]}}),
+                    "`ci-ok` has no successful completed run",
+                )
 
     def test_sha_without_a_successful_staging_deploy_is_refused(self):
         self.assertRefused(self.guard(staging={"total_count": 0, "workflow_runs": []}), "deploy-staging has no successful run")
@@ -350,8 +605,51 @@ class GuardBehaviourTests(unittest.TestCase):
                 result = self.guard(branches={"branch_policies": branches})
                 self.assertRefused(result, "from main only")
 
+    def test_auto_approve_passes_without_reviewers_when_latest_staging_deploy_is_green(self):
+        environment = {**green()["environment"], "protection_rules": [{"type": "branch_policy"}]}
+        code, outputs, summary, calls, _ = self.guard(auto="true", environment=environment)
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": ""})
+        self.assertIn("Approval: automated", summary)
+        self.assertIn("deploy-staging run `501`", summary)
+        self.assertTrue(any(path.endswith("deploy-staging.yml/runs") and "status" not in q for path, q in calls))
+
+    def test_auto_approve_refuses_unless_the_latest_staging_deploy_succeeded(self):
+        environment = {**green()["environment"], "protection_rules": []}
+        for runs, reason in (
+            ([], "no verifiable latest run"),
+            ([staging_run(conclusion="failure")], "not a completed success"),
+            ([staging_run(), staging_run(run_id=502, number=6, conclusion="failure")], "not a completed success"),
+            ([staging_run(), staging_run(run_id=502, number=6, status="in_progress", conclusion=None)],
+             "not a completed success"),
+            ([staging_run(sha="f" * 40)], "no verifiable latest run"),
+        ):
+            with self.subTest(runs=runs):
+                result = self.guard(auto="true", environment=environment,
+                                    **{"staging-all": {"total_count": len(runs), "workflow_runs": runs}})
+                self.assertRefused(result, reason)
+
+    def test_auto_approve_keeps_every_other_guard(self):
+        environment = {**green()["environment"], "protection_rules": []}
+        self.assertRefused(self.guard(auto="true", environment=environment,
+                                      staging={"total_count": 0, "workflow_runs": []}),
+                           "deploy-staging has no successful run")
+        self.assertRefused(self.guard(auto="true", environment=environment, compare={"status": "behind"}),
+                           "not an ancestor of origin/main")
+        self.assertRefused(self.guard(auto="true", ref="refs/heads/feature"), "dispatch this workflow from main only")
+        policy = {**environment, "deployment_branch_policy": None}
+        self.assertRefused(self.guard(auto="true", environment=policy), "restrict deployments to main")
+        self.assertRefused(self.guard(auto="true", branches={"branch_policies": [{"name": "*", "type": "branch"}]}),
+                           "from main only")
+
+    def test_reviewers_stay_required_unless_auto_approve_is_exactly_true(self):
+        environment = {**green()["environment"], "protection_rules": []}
+        for flag in ("", "false", "TRUE", "1", " true"):
+            with self.subTest(flag=flag):
+                self.assertRefused(self.guard(auto=flag, environment=environment), "no required reviewers")
+
     def test_api_failures_fail_closed(self):
-        for key in ("compare", "check", "worker check", "staging", "branches"):
+        for key in ("compare", "ci-runs", "ci-run", "ci-jobs", "ci-ok", "worker check", "staging", "branches"):
             for broken in (failed_call(), "not json"):
                 with self.subTest(key=key, broken=broken):
                     self.assertRefused(self.guard(**{key: broken}), "failing closed")

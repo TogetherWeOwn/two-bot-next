@@ -2,7 +2,7 @@
 //!
 //! Executes `moderation.ban`, `moderation.tempban`, `moderation.kick`,
 //! `moderation.timeout` and `moderation.warn` through the shared
-//! [`MemberModerationService`](two_bot_core::member_moderation::MemberModerationService),
+//! [`MemberModerationService`],
 //! so the durable ledger rows are identical whether the action was triggered
 //! by a slash command or by the website. The receiver must authorize the
 //! internal request (HMAC, allowlist, nonce/replay rules), parse its body with
@@ -172,7 +172,8 @@ where
     /// `actor` and `target` must be resolved in the configured guild by the
     /// runtime (legacy resolver), NEVER built from caller-supplied
     /// roles/permissions. `bot_highest_role_position` is the runtime's read of
-    /// the bot's own standing in the guild. `now_ms` is the caller's clock
+    /// the bot's own standing in the guild; unknown positions must refuse
+    /// before calling this method. `now_ms` is the caller's clock
     /// reading in unix millis; it is injected so tests assert exact expiries.
     #[allow(clippy::too_many_arguments)]
     pub async fn execute(
@@ -180,7 +181,7 @@ where
         request: &InternalMemberRequest,
         actor: &ModerationActor,
         target: &ModerationTarget,
-        bot_highest_role_position: Option<i64>,
+        bot_highest_role_position: i64,
         request_id: &str,
         idempotency_key: &str,
         now_ms: i64,

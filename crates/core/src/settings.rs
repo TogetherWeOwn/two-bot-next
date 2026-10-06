@@ -6,9 +6,9 @@
 //! from legacy two-bot as framework-free data plus pure functions. Storage
 //! stays behind the caller: the sqlx store lives in `two-bot-cutover`
 //! (`crates/cutover/src/settings.rs`, migrations `0330`–`0331`), which calls
-//! into this module; the 15 s ticker wires into the bot runtime in a follow-up
-//! once the S4 router/REST slices land — this module builds no dispatcher and
-//! no HTTP client.
+//! into this module; the bot binary's 15 s supervisor poll publishes through
+//! [`live_channel`] (TOG-10898) — this module builds no dispatcher and no
+//! HTTP client.
 //!
 //! Classes (parity §7): `hot` keys reload from `guild_settings` without a
 //! restart, `cold` keys are storable but need a restart before consumers pick
@@ -36,9 +36,10 @@
 //! website-verb handlers (TOG-9880), and temp-voice runtime (owned by the
 //! parent — the `TEMP_VOICE_*` catalogue rows below are classification only).
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use serde_json::Value;
+use tokio::sync::watch;
 
 /// How often the version poll runs (legacy `pollSeconds ?? 15`, TOG-3093
 /// ADR §2.1). The poll reads a transactional revision and row count; sequence
@@ -120,6 +121,7 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_INTERNAL_BIND_HOST", SettingClass::EnvOnly),
     ("TWO_INTERNAL_CALLERS", SettingClass::EnvOnly),
     ("TWO_INTERNAL_CHANNEL_KEYS", SettingClass::EnvOnly),
+    ("TWO_INTERNAL_CONTAINER", SettingClass::EnvOnly),
     ("TWO_INTERNAL_PORT", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ROLE_KEYS", SettingClass::EnvOnly),
     // --- capability gates outside the namespace (TOG-3183 finding) ---
@@ -584,6 +586,106 @@ impl RefreshReport {
     }
 }
 
+/// The read side of the shared hot-settings handle (TOG-10898). One
+/// `tokio::sync::watch` channel carries an immutable `Arc<SettingsCache>`;
+/// readers clone the current snapshot under watch's short read lock and never
+/// observe a half-rebuilt cache. Rebuilding happens outside that lock, so reads
+/// do not wait for database work or cache construction.
+///
+/// Before the first publish, readers see the empty revision-0 cache: every
+/// lookup falls through to the environment exactly as if the table were
+/// empty, which is also the behaviour while the poll job is parked.
+#[derive(Debug, Clone)]
+pub struct LiveSettings {
+    rx: watch::Receiver<Arc<SettingsCache>>,
+}
+
+/// The write side, owned by the single supervisor poll task. Mutable refresh
+/// state stays on the writer; readers only ever see a fully published
+/// snapshot.
+#[derive(Debug)]
+pub struct LiveSettingsWriter {
+    tx: watch::Sender<Arc<SettingsCache>>,
+    cache: SettingsCache,
+}
+
+/// Build the writer/reader pair: the poll job keeps the writer, feature
+/// runtimes clone the reader.
+#[must_use]
+pub fn live_channel() -> (LiveSettingsWriter, LiveSettings) {
+    let (tx, rx) = watch::channel(Arc::new(SettingsCache::default()));
+    (
+        LiveSettingsWriter {
+            tx,
+            cache: SettingsCache::default(),
+        },
+        LiveSettings { rx },
+    )
+}
+
+impl LiveSettingsWriter {
+    /// True when the polled marks moved (revision or row count); the caller
+    /// then loads a consistent snapshot and hands it to [`Self::publish`].
+    #[must_use]
+    pub fn needs_refresh(&self, revision: i64, rows: i64) -> bool {
+        self.cache.needs_refresh(revision, rows)
+    }
+
+    /// Rebuild the working cache from one consistent snapshot and publish only
+    /// hot-wired entries when the marks moved. Keep the full working cache for
+    /// change detection and restart-required logs; cold, env-only and unwired
+    /// entries never reach live readers. The caller must refuse malformed
+    /// snapshots before this runs: publish is all-or-nothing.
+    pub fn publish(&mut self, snapshot: &SettingsSnapshot) -> RefreshReport {
+        let report = self.cache.refresh(snapshot);
+        if report.changed {
+            let mut live = self.cache.clone();
+            live.entries.retain(|(_, key), _| {
+                classify_key(key) == Some(SettingClass::Hot) && HOT_WIRED.contains(&key.as_str())
+            });
+            self.tx.send_replace(Arc::new(live));
+        }
+        report
+    }
+
+    /// Revision of the writer's working cache (`0` before the first publish).
+    #[must_use]
+    pub fn revision(&self) -> i64 {
+        self.cache.revision()
+    }
+}
+
+impl LiveSettings {
+    /// The latest published snapshot (empty, revision 0, before the first
+    /// successful poll — reads fall through to the environment).
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<SettingsCache> {
+        Arc::clone(&self.rx.borrow())
+    }
+
+    /// Transactional revision of the published snapshot (`0` before the first
+    /// publish).
+    #[must_use]
+    pub fn revision(&self) -> i64 {
+        self.rx.borrow().revision()
+    }
+
+    /// One hot-wired value for a guild, or `None` to fall through to the
+    /// environment. Cold, env-only, unknown and hot-but-unwired keys are absent
+    /// from the published snapshot.
+    #[must_use]
+    pub fn get(&self, guild_id: &str, key: &str) -> Option<Value> {
+        self.rx.borrow().get(guild_id, key).cloned()
+    }
+
+    /// One guild's env-shaped view — the input a store-first config consumer
+    /// (legacy `storeFirst`) layers under the process environment.
+    #[must_use]
+    pub fn env_snapshot(&self, guild_id: Option<&str>) -> HashMap<String, String> {
+        self.rx.borrow().env_snapshot(guild_id)
+    }
+}
+
 /// A validated settings write, ready for the store to execute (legacy
 /// `SettingsStore.set` up to — but not including — the SQL).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -796,6 +898,7 @@ mod tests {
         "TWO_INTERNAL_BIND_HOST",
         "TWO_INTERNAL_CALLERS",
         "TWO_INTERNAL_CHANNEL_KEYS",
+        "TWO_INTERNAL_CONTAINER",
         "TWO_INTERNAL_PORT",
         "TWO_INTERNAL_ROLE_KEYS",
         "TWO_MODERATION",
@@ -828,7 +931,7 @@ mod tests {
             assert_eq!(classify_key(key), Some(SettingClass::EnvOnly), "{key}");
         }
         let expected_total = EXPECTED_HOT.len() + EXPECTED_COLD.len() + EXPECTED_ENV_ONLY.len();
-        assert_eq!(expected_total, 121, "tripwire lists must stay complete");
+        assert_eq!(expected_total, 122, "tripwire lists must stay complete");
         assert_eq!(
             SETTING_CLASSES.len(),
             expected_total,
@@ -1135,5 +1238,98 @@ mod tests {
         let delete = validate_write("g1", "TWO_ONBOARDING_DRY_RUN", None, "admin")
             .expect("delete validates");
         assert_eq!(delete.action, WriteAction::Delete);
+    }
+
+    #[test]
+    fn live_channel_publishes_only_when_the_poll_moved() {
+        let (mut writer, live) = live_channel();
+        // Parked or pre-first-poll readers see the empty revision-0 cache:
+        // every lookup falls through to the environment.
+        assert_eq!(live.revision(), 0);
+        assert_eq!(live.get("g1", "TWO_RAID_JOIN_THRESHOLD"), None);
+        assert!(live.env_snapshot(Some("g1")).is_empty());
+
+        let loaded = snapshot(1, vec![row("g1", "TWO_RAID_JOIN_THRESHOLD", json!(3), 1)]);
+        assert!(writer.needs_refresh(1, 1));
+        let report = writer.publish(&loaded);
+        assert!(report.changed);
+        assert_eq!(live.revision(), 1);
+        assert_eq!(live.get("g1", "TWO_RAID_JOIN_THRESHOLD"), Some(json!(3)));
+        assert_eq!(writer.revision(), 1);
+
+        // Republishing identical marks is a no-op: readers keep the same Arc.
+        let published = live.snapshot();
+        assert!(!writer.needs_refresh(1, 1));
+        let report = writer.publish(&snapshot(
+            1,
+            vec![row("g1", "TWO_RAID_JOIN_THRESHOLD", json!(3), 1)],
+        ));
+        assert!(!report.changed);
+        assert!(Arc::ptr_eq(&published, &live.snapshot()));
+    }
+
+    #[test]
+    fn live_channel_never_publishes_restart_required_or_ignored_keys() {
+        let (mut writer, live) = live_channel();
+        let blocked = [
+            "TWO_FEED_POLL_SECONDS",
+            "TWO_AUTOMOD_BAD_WORDS", // Hot, but not yet in HOT_WIRED.
+            "DISCORD_TOKEN",
+            "TWO_MADE_UP_KEY",
+        ];
+        for revision in 1..=2 {
+            let mut rows = vec![row(
+                "g1",
+                "TWO_RAID_JOIN_THRESHOLD",
+                json!(revision),
+                revision,
+            )];
+            rows.extend(
+                blocked
+                    .iter()
+                    .map(|key| row("g1", key, json!(revision), revision)),
+            );
+            let report = writer.publish(&snapshot(revision, rows));
+            assert!(report.changed);
+            assert_eq!(report.cold.len(), 2);
+            assert_eq!(report.ignored.len(), 2);
+            assert_eq!(
+                live.get("g1", "TWO_RAID_JOIN_THRESHOLD"),
+                Some(json!(revision))
+            );
+            for key in blocked {
+                assert_eq!(live.get("g1", key), None, "{key}");
+                assert_eq!(live.snapshot().get("g1", key), None, "{key}");
+                assert!(!live.env_snapshot(Some("g1")).contains_key(key), "{key}");
+            }
+            // Poll marks still cover all stored rows, not just live entries.
+            assert!(!writer.needs_refresh(revision, 5));
+        }
+        let report = writer.publish(&snapshot(
+            3,
+            vec![row("g1", "TWO_RAID_JOIN_THRESHOLD", json!(2), 2)],
+        ));
+        assert_eq!(report.cold.len(), 2); // Deletion also requires restart.
+        assert_eq!(live.snapshot().size(), 1);
+        assert!(live
+            .env_snapshot(Some("g1"))
+            .keys()
+            .all(|key| key == "TWO_RAID_JOIN_THRESHOLD"));
+    }
+
+    #[test]
+    fn live_channel_delete_hands_the_key_back_to_the_environment() {
+        let (mut writer, live) = live_channel();
+        writer.publish(&snapshot(
+            1,
+            vec![row("g1", "TWO_RAID_JOIN_THRESHOLD", json!(3), 1)],
+        ));
+        assert_eq!(live.get("g1", "TWO_RAID_JOIN_THRESHOLD"), Some(json!(3)));
+
+        let report = writer.publish(&snapshot(2, vec![]));
+        assert!(report.changed);
+        assert_eq!(live.revision(), 2);
+        assert_eq!(live.get("g1", "TWO_RAID_JOIN_THRESHOLD"), None);
+        assert!(live.env_snapshot(Some("g1")).is_empty());
     }
 }

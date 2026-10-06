@@ -10,6 +10,26 @@ The `two-bot` binary registers these named jobs in `bot::website_jobs`, using
 | `counter` | 60 seconds | 45 seconds |
 | `rank` | 10 minutes | 120 seconds |
 | `scheduled_events` | 10 minutes | 120 seconds |
+| `settings` | 15 seconds | 10 seconds |
+
+`settings` is the `guild_settings` hot-reload poll (TOG-10898), registered by
+`bot::settings_jobs` before the REST executor is built: it needs only
+`DATABASE_URL`, so a bad `DISCORD_API_BASE` cannot park it. Each tick reads
+the transactional revision plus row count; only a moved mark pays for the
+consistent snapshot load, which is validated (no empty `guild_id`/`key`, no
+duplicate pairs — refused whole with `settings_snapshot_rejected` and the
+previous snapshot kept) and published through a `watch`-carried
+`Arc<SettingsCache>` (`two_bot_core::settings::live_channel`). Feature
+runtimes read `settings_jobs::live()` — `None` while the poll is parked; a
+reader before the first publish sees the empty revision-0 cache and falls
+through to the environment either way. Applied swaps log `settings_applied
+{version, keys}` (key names only), `setting_changed` per hot key,
+`settings_restart_required` per stored-but-cold key, and
+`setting_ignored_not_applied` per env-only/unknown row. The published cache
+contains only `HOT_WIRED` keys: cold and hot-but-unwired keys remain in the
+writer's stored-state cache for diff/logging, never in `get()`, `snapshot()` or
+`env_snapshot()` exposed to live consumers. `settings_applied.keys` lists only
+hot-applied keys; restart-required keys have their own log event.
 
 Each job gets one random startup offset in `[0, min(cadence, 5 seconds)]`.
 The first attempt runs at that offset and subsequent deadlines keep the same
@@ -45,7 +65,7 @@ come from the guild object's `roles` array. Domain/store semantics are unchanged
   valid empty event array clears it.
 
 `/readyz` retains its existing `components` array and adds an informational
-`jobs` object keyed by the three names. Each entry carries `parked`, `running`,
+`jobs` object keyed by the four names above plus the three community-job names below. Each entry carries `parked`, `running`,
 `last_start`, `last_success` (Unix milliseconds), `last_error_class`, and
 `consecutive_failures`. Successful attempts clear the error/streak. Error
 classes are fixed identifiers, not SQL errors, REST bodies or panic payloads.
@@ -62,8 +82,8 @@ joins the gateway. Cancellation remains sticky even before the HTTP future's
 first poll, and a job awaiting the status lock cannot schedule a post-stop attempt.
 
 Cadences cannot be overridden in a deployed binary. Test builds alone accept
-positive `TWO_TEST_COUNTER_INTERVAL_MS`, `TWO_TEST_RANK_INTERVAL_MS`, and
-`TWO_TEST_EVENTS_INTERVAL_MS` values. Paused-time regressions cover phase,
+positive `TWO_TEST_COUNTER_INTERVAL_MS`, `TWO_TEST_RANK_INTERVAL_MS`,
+`TWO_TEST_EVENTS_INTERVAL_MS`, and `TWO_TEST_SETTINGS_INTERVAL_MS` values. Paused-time regressions cover phase,
 jitter bounds, overrun skips, timeouts, panic isolation and shutdown. The REST
 adapter integration test uses the existing mock double and shared strict
 `two-bot-testsupport` fixture, applying migrations in a unique disposable database
@@ -75,6 +95,8 @@ permission to fall back to direct Cargo:
 ```sh
 TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090 \
   python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot website_jobs::
+TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10898 \
+  python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot settings_jobs::
 python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot jobs::
 python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot server::
 python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot lifecycle_tests::
@@ -91,6 +113,14 @@ This slice ports the three S5 community jobs as framework-free domain logic in
 module registers them on the job supervisor inside `bot::website_jobs::serve`
 (TOG-10897), so the shipped binary drives them on their legacy cadences under
 the env gates below.
+
+The live-identity capability fence (`activation.rs`) does not narrow these three
+jobs, by decision rather than omission: none of them writes to Discord. The
+presence probe only reads the guild and roster, and the scorecard and inactivity
+sweep touch Postgres alone, so there is no `LiveCapability` to bind them to. The
+scheduled-message ticker and the feed poller do post, and are fenced. The test
+`community_jobs_have_no_discord_write_path` fails if a community job gains a
+write verb; bind that job to a capability in `BootActivation` before it ships.
 
 ## Modules
 
@@ -155,11 +185,11 @@ the env gates below.
   `bot::website_jobs::serve`) resolves the env gates once at boot. A gated-off
   or misconfigured job logs `job_disabled` (warn on `invalid_config`), produces
   no supervised job, and is marked parked in the `/readyz` status map alongside
-  the website jobs. The supervisor's status map therefore always lists all ten
-  job names (the six website/community jobs plus the audit-retry job, the
-  scheduled-messages job, the self-role recovery job and the gated `feeds` job,
-  each parked when its service is unregistered), even when announcements are
-  off.
+  the website jobs and settings poll. The supervisor's status map therefore
+  always lists all eleven job names (the six website/community jobs plus the
+  audit-retry job, the scheduled-messages job, the self-role recovery job, the
+  gated `feeds` job and the DB-only settings poll, each parked when its service
+  is unregistered), even when announcements are off.
 
 ## Verification
 

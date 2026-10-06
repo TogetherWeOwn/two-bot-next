@@ -114,7 +114,7 @@ const RECEIVER_CONFIG =
   "private-receiver config (TOG-12980); reaches the Container only through an explicit containerEnvVars " +
   "line while TWO_INTERNAL_ACTIONS is exactly 1, never this flag allowlist (CISO TOG-12979 C8)";
 const RECEIVER_BIND =
-  "private-receiver bind; the Worker sets one fixed loopback literal (internal-actions.ts), never an Operator value";
+  "private-receiver bind; the Worker sets one fixed wildcard literal plus the container marker (internal-actions.ts), never an Operator value";
 const LEGACY = "legacy input with no Next reader; settings.rs keeps it only to refuse storage";
 const REDIRECT = "go.two.gg redirect is served by the Worker (REDIRECT_*), not the Container";
 
@@ -123,6 +123,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_DATABASE_URL: "cutover/operator CLI secret; the Container reads DATABASE_URL",
   TWO_STAGING_DATABASE_URL: SECRET,
   TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: SECRET,
+  TWO_BOT_STAGING_PLAN_DATABASE_URL: SECRET,
   TWO_RESTORE_URL: SECRET,
   TWO_MODERATION_AUDIT_SECRET: SECRET,
   TWO_ONBOARDING_ROTA_PSEUDONYM_KEY: SECRET,
@@ -164,6 +165,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_INTERNAL_ALLOW_MODERATION: CAPABILITY,
   TWO_INTERNAL_ALLOW_SETTINGS: CAPABILITY,
   TWO_INTERNAL_CHANNEL_KEYS: RECEIVER_CONFIG,
+  TWO_INTERNAL_CONTAINER: RECEIVER_CONFIG,
   TWO_INTERNAL_KEYS: SECRET,
   TWO_INTERNAL_ROLE_KEYS: CAPABILITY,
   TWO_ONBOARDING_ROTA_MEASUREMENT: LEGACY,
@@ -180,10 +182,12 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_BOT_TEST_BACKUP_BIN: TEST,
   TWO_LEVELING_TEST_CI: TEST,
   TWO_CUSTOM_COMMAND_TEST_CI: TEST,
+  TWO_AUTOMATION_TRANSFER_TEST_CI: TEST,
   TWO_LFG_TESTDB_CI: TEST,
   TWO_TEST_COUNTER_INTERVAL_MS: TEST,
   TWO_TEST_EVENTS_INTERVAL_MS: TEST,
   TWO_TEST_RANK_INTERVAL_MS: TEST,
+  TWO_TEST_SETTINGS_INTERVAL_MS: TEST,
   TWO_FEED_XML_RESOURCE_PROBE: TEST,
   TWO_INTERNAL_ALLOW_ANYTHING: TEST,
   TWO_INTERNAL_FUTURE_GATE: TEST,
@@ -192,6 +196,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_NEW_GATE: TEST,
   TWO_NEVER_EXISTED: TEST,
   TWO_SOMETHING_NEW: TEST,
+  TWO_MADE_UP_KEY: TEST,
   TWO_TOTALLY_MADE_UP: TEST,
   TWO_TYPO_KEYS: TEST,
   TWO_UNKNOWN: TEST,

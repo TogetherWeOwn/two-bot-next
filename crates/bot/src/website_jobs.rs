@@ -1,4 +1,5 @@
-//! Runtime adapters for the three existing website-contract domains.
+//! Runtime adapters for the three existing website-contract domains, plus the
+//! `guild_settings` hot-reload poll registered alongside them (TOG-10898).
 
 use std::{sync::Arc, time::Duration};
 
@@ -14,14 +15,24 @@ use two_bot_core::{
 use two_bot_discord::executor::ActionExecutor;
 
 use crate::{
+    activation::BootActivation,
     audit_runtime, community_jobs, feed_jobs,
     jobs::{self, ErrorClass, Job},
+    member_runtime::{self, MemberRuntime},
     scheduled_jobs,
     self_role_handlers::{SelfRoleService, RECOVERY_JOB_NAME},
     server,
 };
 
-pub const NAMES: [&str; 3] = ["counter", "rank", "scheduled_events"];
+/// Every supervised job name, in `/readyz` order. The settings poll needs
+/// only the database, so it is registered separately from the REST-backed
+/// jobs below.
+pub const NAMES: [&str; 4] = [
+    "counter",
+    "rank",
+    "scheduled_events",
+    crate::settings_jobs::NAME,
+];
 
 #[cfg(test)]
 #[path = "website_jobs_tests.rs"]
@@ -117,6 +128,9 @@ fn admission_pool(url: &str) -> Result<PgPool, String> {
         .connect_lazy_with(options))
 }
 
+/// Boot-composed single call: the eight parameters are the full supervised
+/// surface (config, listener, gateway, shutdown plus one slot per consumer).
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     config: &Config,
     listener: tokio::net::TcpListener,
@@ -125,10 +139,17 @@ pub async fn serve(
     self_roles: Option<Arc<SelfRoleService>>,
     automod: crate::automod_gateway::Slot,
     receiver: Option<crate::internal_action_http::BoundReceiver>,
+    member: Option<Arc<MemberRuntime>>,
 ) -> std::io::Result<()> {
     let mut registered = Vec::new();
     let mut parked = Vec::new();
+    // The same token-derived identity the router and gateway fence use, so a
+    // job that posts under the bot identity cannot outrun a refused capability.
+    let activation = BootActivation::from_config(config);
     if let Ok((token, url, guild)) = crate::gateway_prerequisites(config) {
+        // The settings poll is DB-only: register it before REST construction
+        // so a bad DISCORD_API_BASE cannot park hot reload.
+        registered.push(crate::settings_jobs::job(url));
         // Lazy connection preserves parked/startup behavior; every wire attempt
         // still fails closed on this same runtime database authority.
         let rest = admission_pool(url).and_then(|pool| {
@@ -181,11 +202,22 @@ pub async fn serve(
                         }),
                     });
                 }
-                registered.push(scheduled_jobs::register(context.clone()));
+                let scheduled = scheduled_jobs::register(context.clone(), &activation);
+                let scheduled_parked = scheduled.is_none();
+                registered.extend(scheduled);
+                // The unban sweep shares the boot-composed member consumer:
+                // one guild store across commands and sweep, never a second
+                // same-guild consumer with its own local queues.
+                if let Some(member) = member {
+                    registered.push(member_runtime::sweep_job(member, context.rest.clone()));
+                }
                 let registration = community_jobs::register(context.clone());
                 registered.extend(registration.jobs);
                 parked = registration.parked;
-                if let Some(job) = feed_jobs::register(context.clone()) {
+                if scheduled_parked {
+                    parked.push(scheduled_jobs::NAMES[0]);
+                }
+                if let Some(job) = feed_jobs::register(context.clone(), &activation) {
                     registered.push(job);
                 } else {
                     parked.push(feed_jobs::NAME);
@@ -204,6 +236,7 @@ pub async fn serve(
     } else {
         tracing::info!("website jobs parked: gateway prerequisites missing");
     }
+
     if let Some(service) = self_roles {
         registered.push(service.recovery_job());
     }
@@ -226,11 +259,14 @@ pub async fn serve(
 }
 
 async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::SharedStatus {
+    // NAMES already carries the DB-only settings poll alongside the
+    // REST-backed domains, so the status map lists all eleven jobs.
     let mut names: Vec<&'static str> = NAMES
         .into_iter()
         .chain(community_jobs::NAMES)
         .chain(audit_runtime::NAMES)
         .chain(scheduled_jobs::NAMES)
+        .chain(member_runtime::NAMES)
         .chain([RECOVERY_JOB_NAME])
         .chain([feed_jobs::NAME])
         .collect();

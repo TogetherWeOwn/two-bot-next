@@ -13,6 +13,15 @@ Job map (each a pure function of the changed paths):
 - ``worker``: the ``worker check`` job (npm typecheck/tests plus the offline
   script verifications it runs).
 - ``parity``: the ``parity-docs`` job (baseline ancestry + link guard).
+- ``supply``: the ``supply-chain`` SBOM/vulnerability scan. Runs when Rust
+  code, dependency manifests, the runtime image inputs, ``.github/**`` or
+  the selectors themselves change -- plus every push to main and the weekly
+  schedule (fail-closed non-PR default). Docs-only and worker-UI-only PRs
+  skip it (CI standard TOG-14877, adopted TOG-14881).
+- ``docs``: informational only, no job gates on it. True when any changed
+  path is documentation (``docs/`` or a ``*.md`` outside ``.github/``), so
+  the ``docs-only PR skips heavy jobs`` verification has an explicit signal
+  alongside ``rust=false``, ``supply=false`` and container ``build=false``.
 
 Coupling notes (verified 2026-10-02, enforced by test_job_inputs.py):
 - Rust tests read a pinned doc set by content (parity/cutover/commands/
@@ -49,7 +58,9 @@ ROOT = Path(__file__).resolve().parents[1]
 RUST = "rust"
 WORKER = "worker"
 PARITY = "parity"
-ALL_JOBS = frozenset({RUST, WORKER, PARITY})
+SUPPLY = "supply"
+DOCS = "docs"
+ALL_JOBS = frozenset({RUST, WORKER, PARITY, SUPPLY})
 NO_JOBS = frozenset()
 
 # Exact files that revalidate everything (gate wiring, manifests).
@@ -60,6 +71,16 @@ ALL_EXACT = frozenset({
     "rust-toolchain.toml",
     "deny.toml",
     "migrations.lock",
+})
+
+# The change-detection filter itself (CI standard rule 4, TOG-14881): an edit
+# to either selector or its regression suite revalidates everything rather
+# than risk a silently stale gate.
+SELECTOR_EXACT = frozenset({
+    "scripts/job-inputs.py",
+    "scripts/container-inputs.py",
+    "scripts/test_job_inputs.py",
+    "scripts/test_container_inputs.py",
 })
 
 # Rust sources and their fixtures: the worker drift test
@@ -100,7 +121,9 @@ WORKER_PREFIX = "wrangler/"
 # reader-coverage test): parity/cutover by the preconditions binary,
 # commands/configuration by the reference_docs test, voice-rooms by the
 # fixture validator, staging-e2e-command-matrix by the matrix coverage test,
-# soak/parity by the checklist and baseline guards.
+# soak/parity by the checklist and baseline guards, smoke-run-record and
+# smoke-expected-responses by the smoke surface inventory link test (and
+# smoke-surface-inventory for the same family of smoke content reads).
 # parity.md and the baseline also gate parity-docs. Existence-only docs
 # (staging-soak/backup/preflight: the preconditions binary checks is_file,
 # never content) and runbook/container-readiness (worker tests only) fall
@@ -116,6 +139,9 @@ RUST_DOCS = frozenset({
     "docs/soak-checklist.json",
     "docs/soak-checklist.md",
     "docs/staging-e2e-command-matrix.md",
+    "docs/smoke-expected-responses.md",
+    "docs/smoke-run-record.md",
+    "docs/smoke-surface-inventory.md",
 })
 PARITY_DOCS = frozenset({
     "docs/parity.md",
@@ -127,7 +153,9 @@ WORKER_DOCS = frozenset({
 })
 DOCS_PREFIX = "docs/"
 
-# Exact workflow files whose offline verifications run in the worker job.
+# Exact workflow files whose offline verifications run in the worker job
+# (kept as documentation of that coupling; classification of any
+# ``.github/workflows/`` edit is ALL_JOBS per CI standard rule 4, TOG-14881).
 WORKER_WORKFLOWS = frozenset({
     ".github/workflows/supply-chain.yml",
     ".github/workflows/release.yml",
@@ -151,16 +179,19 @@ SKIP_EXACT = frozenset({
     ".github/dependabot.yml",
 })
 
-# The release-please config is read by the worker job's release-lifecycle
-# verification step.
+# The worker job's release-lifecycle verification reads the release-please
+# config and the copyable testsupport dependency example in CONTRIBUTING.md.
 WORKER_EXACT = frozenset({
     "release-please-config.json",
     ".release-please-manifest.json",
+    "CONTRIBUTING.md",
     "wrangler/wrangler.toml",
 })
 
-# Image-only inputs: the container selector owns them, and the check job's
-# offline manifest step still runs ungated, so no test job needs them.
+# Image-only inputs: the container selector owns the image build, and the
+# check job's offline manifest step still runs ungated -- but the SBOM /
+# vulnerability scan inventories exactly these files, so they select
+# ``supply`` (CI standard rule 6, TOG-14881). They select no test job.
 IMAGE_ONLY_EXACT = frozenset({
     "Dockerfile",
     "Dockerfile.distroless",
@@ -181,11 +212,29 @@ def normalize(path):
     return path.lstrip("/")
 
 
+def is_docs(path):
+    """True for documentation paths (informational ``docs`` output only)."""
+    path = normalize(path)
+    if path.startswith(DOCS_PREFIX):
+        return True
+    return Path(path).suffix.lower() == ".md" and not path.startswith(".github/")
+
+
 def classify(path):
-    """Jobs affected by one repo-relative path (fail-closed: unknown runs all)."""
+    """Jobs affected by one repo-relative path (fail-closed: unknown runs all).
+
+    The ``supply`` area rides along with ``rust`` (Rust code changes alter
+    the shipped binary the scan inventories) and is additionally selected by
+    the image-only inputs; ``docs`` is computed in :func:`selection`, never
+    here, so every set below stays within ``ALL_JOBS``.
+    """
     path = normalize(path)
     if path in ALL_EXACT:
         return ALL_JOBS
+    if path in SELECTOR_EXACT:
+        return ALL_JOBS
+    if path in IMAGE_ONLY_EXACT:
+        return frozenset({SUPPLY})
     if path.startswith(RUST_WORKER_PREFIXES):
         jobs = {RUST, WORKER}
         if path == "crates/core/tests/fixtures/legacy_registry.json":
@@ -225,14 +274,16 @@ def classify(path):
         # test), but runbook.test.ts asserts on the docs/ listing itself.
         return frozenset({WORKER})
     if path.startswith(WORKFLOWS_PREFIX):
-        return frozenset({WORKER})
-    if path in SKIP_EXACT or path in IMAGE_ONLY_EXACT:
+        # CI standard rule 4 (TOG-14881): `.github/**` edits revalidate
+        # everything -- they change what every other gate means.
+        return ALL_JOBS
+    if path in SKIP_EXACT:
         return NO_JOBS
     if path in WORKER_EXACT:
         return frozenset({WORKER})
     if path.startswith(FAIL_CLOSED_PREFIXES):
         return ALL_JOBS
-    # Markdown outside docs//.github/ is never compiled or asserted on.
+    # Other markdown outside docs//.github/ has no content reader.
     if Path(path).suffix.lower() == ".md" and not path.startswith(".github/"):
         return NO_JOBS
     # Fail-closed: unrecognized paths (e.g. a brand-new top-level directory)
@@ -246,13 +297,19 @@ def selection(changed, deleted=()):
     ``deleted`` paths force every job: existence gates (the preconditions
     REQUIRED_DOCS list, the worker docs/-listing assertion) cannot tell a
     modification from a deletion, so any deletion revalidates everything.
+
+    ``supply`` additionally follows ``rust``: Rust code changes alter the
+    shipped binary the SBOM/vulnerability scan inventories (CI standard
+    rule 6). ``docs`` is informational only and never gates a job.
     """
-    jobs = {job: False for job in (RUST, WORKER, PARITY)}
+    jobs = {job: False for job in (RUST, WORKER, PARITY, SUPPLY, DOCS)}
     if any(path.strip() for path in deleted):
         return {job: True for job in jobs}
     for path in changed:
         for job in classify(path):
             jobs[job] = True
+    jobs[SUPPLY] = jobs[SUPPLY] or jobs[RUST]
+    jobs[DOCS] = any(is_docs(path) for path in changed)
     return jobs
 
 
@@ -281,7 +338,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-ref", required=True)
     parser.add_argument("--head-ref", required=True)
-    parser.add_argument("--job", choices=(RUST, WORKER, PARITY), default=None,
+    parser.add_argument("--job", choices=(RUST, WORKER, PARITY, SUPPLY, DOCS),
+                        default=None,
                         help="print only this job's selection (default: all)")
     args = parser.parse_args(argv)
     try:
@@ -298,7 +356,7 @@ def main(argv=None):
     if args.job is not None:
         print("true" if jobs[args.job] else "false")
     else:
-        for job in (RUST, WORKER, PARITY):
+        for job in (RUST, WORKER, PARITY, SUPPLY, DOCS):
             print(f"{job}={'true' if jobs[job] else 'false'}")
     return 0
 

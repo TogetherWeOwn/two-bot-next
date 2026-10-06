@@ -63,6 +63,7 @@ pub const JOBS: &[&str] = &[
     "counter",
     "rank",
     "scheduled_events",
+    "settings",
     "presence_probe",
     "community_scorecard",
     "inactivity",
@@ -98,6 +99,7 @@ pub const VOICE_DEAD_ACTIONS: &[&str] = &[
     "ownership",
     "kick",
     "rename",
+    "limit",
     "other",
 ];
 /// Storage-failure operations: `admission` is send-admission SQL
@@ -177,7 +179,7 @@ struct Values {
     handler: Histogram,
     voice_ops: [[u64; 5]; 3],
     voice_reconcile: [u64; 4],
-    voice_dead: [u64; 8],
+    voice_dead: [u64; 9],
     voice_tracked: u64,
     voice_compensation: u64,
     voice_orphans: u64,
@@ -747,7 +749,7 @@ mod tests {
         assert!(text.contains("two_bot_voice_tracked_rooms 7\n"));
         assert!(text.contains("two_bot_voice_compensation_pending 2\n"));
         assert!(text.contains("two_bot_voice_orphans_total 1\n"));
-        // Fixed cardinality: 3x5 ops + 4 reconcile + 8 dead-letters.
+        // Fixed cardinality: 3x5 ops + 4 reconcile + 9 dead-letters.
         let mut series = std::collections::HashSet::new();
         for line in text.lines().filter(|line| !line.starts_with('#')) {
             let (key, value) = line.rsplit_once(' ').unwrap();

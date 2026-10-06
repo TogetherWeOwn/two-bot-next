@@ -35,6 +35,7 @@ pub mod internal_member_moderation;
 pub mod leveling_runtime;
 #[cfg(feature = "db")]
 pub mod lfg_interactions;
+pub mod member_moderation;
 mod message_safety;
 pub mod onboarding_config;
 pub mod onboarding_messages;
@@ -43,6 +44,8 @@ pub mod pipeline;
 pub mod ratelimit_guard;
 #[cfg(feature = "db")]
 pub mod rsvp;
+#[cfg(any(test, feature = "test-support"))]
+pub mod staging_slash_smoke;
 #[cfg(test)]
 mod test_clock;
 pub mod voice_rooms;
@@ -59,7 +62,7 @@ pub use executor::{
 };
 pub use intents::{cache_resource_types, gateway_intents, needs_message_content};
 pub use interactions::{
-    command_to_twilight, deferred_response, dispatch_interaction, publish_commands,
+    command_to_twilight, deferred_response, dispatch_interaction, help_response, publish_commands,
     refusal_response, response_for_slash, route_interaction, text_response, DispatchOptions,
     InteractionReplyTransport, RoutedInteraction,
 };

@@ -127,6 +127,7 @@ async fn diff_and_publish_default_to_get_only_without_opening_a_database() {
             "compiled hash:",
             "+ 1/rank",
             "+ 1/leaderboard",
+            "+ 1/help",
             "Dry run: no commands written.",
         ] {
             assert!(
@@ -265,7 +266,8 @@ async fn command_help_needs_no_credentials_and_sends_no_rest() {
             "two-bot commands publish [--apply]",
             "--allow-live-guild",
             "DISCORD_TOKEN",
-            "No database is opened.",
+            "TWO_DATABASE_URL",
+            "no gateway is started",
         ] {
             assert!(
                 help.contains(expected),

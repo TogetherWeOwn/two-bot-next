@@ -589,6 +589,36 @@ mod tests {
     }
 
     #[test]
+    fn repeat_alert_staff_message_names_sustained_burst() {
+        // Zero cooldown: every threshold-meeting burst after the first is a
+        // repeat. A cap of one id forces the truncation branch too.
+        let mut watch = RaidWatch::new(0.0, 1).unwrap();
+        let tuning = RaidTuning::new(60.0, 2.0).unwrap();
+        assert!(watch.observe("g", "a", 0, tuning).is_none());
+        let first = watch.observe("g", "b", 500, tuning).unwrap();
+        assert!(!first.repeat);
+        let sustained = watch.observe("g", "c", 900, tuning).unwrap();
+        assert!(sustained.repeat);
+        assert!(sustained.truncated);
+        // The sustained burst renders the repeat head staff actually see.
+        let text = sustained.staff_message();
+        assert!(
+            text.content
+                .starts_with("**Join burst still going** - 3 more joins within a second."),
+            "unexpected head: {}",
+            text.content
+        );
+        assert!(text.content.contains("...and 2 more"));
+        assert!(text.content.contains("kicked, banned and messaged nobody"));
+        assert_eq!(text.mentions, MentionPolicy::None);
+        // The first alert keeps the non-repeat head for contrast.
+        assert!(first
+            .staff_message()
+            .content
+            .starts_with("**Join burst** - 2 accounts joined"));
+    }
+
+    #[test]
     fn tuning_is_read_per_call_and_fractional_values_survive() {
         let mut watch = RaidWatch::new(0.0, 50).unwrap();
         let old = RaidTuning::new(60.0, 5.0).unwrap();

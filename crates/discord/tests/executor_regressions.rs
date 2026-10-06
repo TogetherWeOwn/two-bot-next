@@ -10,7 +10,7 @@
 #[allow(dead_code)]
 mod common;
 
-use common::{MockRest, ScriptedResponse};
+use common::{aged_message_id, fresh_message_id, MockRest, ScriptedResponse};
 use two_bot_core::{ActionOutcome, ModerationAction, ModerationExecution};
 use two_bot_discord::{ActionExecutor, ChannelCall, DiscordError};
 
@@ -105,11 +105,7 @@ async fn timeout_outcome_sends_a_valid_timestamp() {
             },
         )
         .await;
-    assert!(
-        result.is_ok(),
-        "normal 600 s timeout produced {result:?}; {} wire requests",
-        mock.requests().len()
-    );
+    assert!(result.is_ok(), "normal 600 s timeout was refused");
     let reqs = mock.requests();
     assert_eq!(reqs.len(), 1, "exactly one wire call");
     assert_eq!(reqs[0].method, "PATCH");
@@ -255,11 +251,7 @@ async fn unreadable_channel_does_not_mutate_permissions() {
             },
         )
         .await;
-    assert!(
-        result.is_err(),
-        "unreadable channel produced {result:?}; {} wire requests",
-        mock.requests().len()
-    );
+    assert!(result.is_err(), "unreadable channel was accepted");
     assert_eq!(
         mock.requests().len(),
         1,
@@ -290,11 +282,7 @@ async fn non_numeric_overwrite_masks_refuse_without_mutation() {
             },
         )
         .await;
-    assert!(
-        result.is_err(),
-        "non-string masks produced {result:?}; {} wire requests",
-        mock.requests().len()
-    );
+    assert!(result.is_err(), "non-string masks were accepted");
     assert_eq!(mock.requests().len(), 1, "no mutation follows");
     mock.shutdown().await;
 }
@@ -360,11 +348,7 @@ async fn malformed_overwrite_rows_refuse_without_mutation() {
                 },
             )
             .await;
-        assert!(
-            result.is_err(),
-            "{name} produced {result:?}; {} wire requests",
-            mock.requests().len()
-        );
+        assert!(result.is_err(), "{name} was accepted");
         assert_eq!(
             mock.requests().len(),
             1,
@@ -575,7 +559,11 @@ async fn purge_outcome_uses_actual_affected_count() {
     let mock = MockRest::start(
         vec![ScriptedResponse::json(
             200,
-            serde_json::json!([{"id": "11"}, {"id": "12"}, {"id": "13"}]),
+            serde_json::json!([
+                {"id": fresh_message_id(1)},
+                {"id": fresh_message_id(2)},
+                {"id": fresh_message_id(3)}
+            ]),
         )],
         ScriptedResponse::status(204),
     )
@@ -650,6 +638,257 @@ async fn purge_accepts_a_valid_empty_history_without_deletion() {
     );
     assert_eq!(mock.requests().len(), 1);
     assert_eq!(mock.requests()[0].method, "GET");
+    mock.shutdown().await;
+}
+
+fn history<S: AsRef<str>>(ids: &[S]) -> ScriptedResponse {
+    let rows = ids
+        .iter()
+        .map(|id| serde_json::json!({"id": id.as_ref()}))
+        .collect();
+    ScriptedResponse::json(200, serde_json::Value::Array(rows))
+}
+
+fn wire_calls(mock: &MockRest) -> Vec<(String, String)> {
+    mock.requests()
+        .into_iter()
+        .map(|request| (request.method, request.path))
+        .collect()
+}
+
+fn bulk_body(mock: &MockRest, index: usize) -> Vec<String> {
+    let body: serde_json::Value =
+        serde_json::from_slice(&mock.requests()[index].body).expect("bulk body is JSON");
+    body["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .map(|id| id.as_str().expect("string id").to_owned())
+        .collect()
+}
+
+// Discord rejects a bulk delete holding any message older than 14 days with a
+// 400, which used to fail the whole purge of a quiet channel.
+#[tokio::test]
+async fn purge_deletes_messages_older_than_fourteen_days_singly() {
+    let (new_a, new_b) = (fresh_message_id(1), fresh_message_id(2));
+    let (old_a, old_b) = (aged_message_id(3), aged_message_id(4));
+    let mock = MockRest::start(
+        vec![history(&[&new_a, &old_a, &new_b, &old_b])],
+        ScriptedResponse::status(204),
+    )
+    .await;
+    let affected = executor_for(&mock).purge(CHANNEL, 4, REASON).await.unwrap();
+    assert_eq!(affected, 4);
+    let calls = wire_calls(&mock);
+    assert_eq!(calls.len(), 4, "list, one bulk call, one delete per old id");
+    assert_eq!(calls[0].0, "GET");
+    assert_eq!(calls[1].0, "POST");
+    assert!(calls[1].1.ends_with("/messages/bulk-delete"));
+    assert_eq!(bulk_body(&mock, 1), [new_a, new_b]);
+    assert_eq!(calls[2].0, "DELETE");
+    assert!(calls[2].1.ends_with(&format!("/messages/{old_a}")));
+    assert_eq!(calls[3].0, "DELETE");
+    assert!(calls[3].1.ends_with(&format!("/messages/{old_b}")));
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn purge_of_only_old_messages_never_sends_a_bulk_delete() {
+    let (old_a, old_b) = (aged_message_id(1), aged_message_id(2));
+    let mock = MockRest::start(
+        vec![history(&[&old_a, &old_b])],
+        ScriptedResponse::status(204),
+    )
+    .await;
+    assert_eq!(
+        executor_for(&mock).purge(CHANNEL, 2, REASON).await.unwrap(),
+        2
+    );
+    let calls = wire_calls(&mock);
+    assert_eq!(calls.len(), 3);
+    assert!(calls[1..].iter().all(|(method, _)| method == "DELETE"));
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn purge_deletes_a_lone_recent_message_next_to_old_ones_singly() {
+    let (new_a, old_a) = (fresh_message_id(1), aged_message_id(2));
+    let mock = MockRest::start(
+        vec![history(&[&new_a, &old_a])],
+        ScriptedResponse::status(204),
+    )
+    .await;
+    assert_eq!(
+        executor_for(&mock).purge(CHANNEL, 2, REASON).await.unwrap(),
+        2
+    );
+    let calls = wire_calls(&mock);
+    assert_eq!(calls.len(), 3, "bulk delete needs at least two messages");
+    assert!(calls[1..].iter().all(|(method, _)| method == "DELETE"));
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn purge_skips_pinned_messages_and_the_bots_own_panels() {
+    let (kept_pin, kept_panel) = (fresh_message_id(1), fresh_message_id(2));
+    let (gone_a, gone_b) = (fresh_message_id(3), fresh_message_id(4));
+    let other_bot = fresh_message_id(5);
+    let rows = serde_json::json!([
+        {"id": kept_pin, "pinned": true, "author": {"id": "10", "bot": false}},
+        {"id": kept_panel, "pinned": false, "author": {"id": "777", "bot": true}},
+        {"id": gone_a, "pinned": false, "author": {"id": "10", "bot": false}},
+        {"id": other_bot, "pinned": false, "author": {"id": "888", "bot": true}},
+        {"id": gone_b, "author": {"id": "11"}},
+    ]);
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, rows),
+            ScriptedResponse::json(200, serde_json::json!({"id": "777", "bot": true})),
+        ],
+        ScriptedResponse::status(204),
+    )
+    .await;
+    let affected = executor_for(&mock).purge(CHANNEL, 5, REASON).await.unwrap();
+    assert_eq!(affected, 3, "another bot's spam is still purged");
+    let calls = wire_calls(&mock);
+    assert_eq!(calls.len(), 3, "list, bot identity, one bulk delete");
+    assert!(calls[1].1.ends_with("/users/@me"));
+    assert!(calls[2].1.ends_with("/messages/bulk-delete"));
+    assert_eq!(bulk_body(&mock, 2), [gone_a, other_bot, gone_b]);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn purge_reads_the_bot_identity_only_when_a_bot_authored_a_message() {
+    let (a, b) = (fresh_message_id(1), fresh_message_id(2));
+    let rows = serde_json::json!([
+        {"id": a, "pinned": false, "author": {"id": "10", "bot": false}},
+        {"id": b, "pinned": false, "author": {"id": "11"}},
+    ]);
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, rows)],
+        ScriptedResponse::status(204),
+    )
+    .await;
+    assert_eq!(
+        executor_for(&mock).purge(CHANNEL, 2, REASON).await.unwrap(),
+        2
+    );
+    assert_eq!(mock.requests().len(), 2);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn purge_of_only_protected_messages_deletes_nothing() {
+    let id = fresh_message_id(1);
+    let rows = serde_json::json!([{"id": id, "pinned": true}]);
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, rows)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    assert_eq!(
+        executor_for(&mock).purge(CHANNEL, 1, REASON).await.unwrap(),
+        0
+    );
+    assert_eq!(mock.requests().len(), 1, "only the read-only list was sent");
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn purge_fails_closed_when_the_bot_identity_is_unreadable() {
+    let id = fresh_message_id(1);
+    let rows = serde_json::json!([{"id": id, "author": {"id": "777", "bot": true}}]);
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, rows),
+            ScriptedResponse::status(503),
+        ],
+        ScriptedResponse::status(204),
+    )
+    .await;
+    let result = executor_for(&mock).purge(CHANNEL, 1, REASON).await;
+    assert!(matches!(result, Err(DiscordError::Unavailable(_))));
+    assert_eq!(mock.requests().len(), 2, "no delete after a failed read");
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn purge_skips_a_message_deleted_after_the_listing() {
+    let (old_a, old_b) = (aged_message_id(1), aged_message_id(2));
+    let mock = MockRest::start(
+        vec![
+            history(&[&old_a, &old_b]),
+            ScriptedResponse::status(404),
+            ScriptedResponse::status(204),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    assert_eq!(
+        executor_for(&mock).purge(CHANNEL, 2, REASON).await.unwrap(),
+        1
+    );
+    assert_eq!(mock.requests().len(), 3);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn purge_reports_the_deleted_count_when_a_later_delete_is_refused() {
+    let ids = [aged_message_id(1), aged_message_id(2), aged_message_id(3)];
+    for refusal in [
+        ScriptedResponse::status(403),
+        ScriptedResponse::rate_limited(0.0, "0"),
+    ] {
+        let mock = MockRest::start(
+            vec![
+                history(&[&ids[0], &ids[1], &ids[2]]),
+                ScriptedResponse::status(204),
+                refusal,
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        // The refused delete proves only itself had no effect; message one is
+        // gone, so the purge must not claim that nothing was mutated.
+        assert_eq!(
+            executor_for(&mock).purge(CHANNEL, 3, REASON).await.unwrap(),
+            1
+        );
+        assert_eq!(mock.requests().len(), 3, "stops at the refusal");
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn purge_keeps_an_uncertain_failure_after_progress_uncertain() {
+    let ids = [aged_message_id(1), aged_message_id(2)];
+    let mock = MockRest::start(
+        vec![
+            history(&[&ids[0], &ids[1]]),
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(503),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let result = executor_for(&mock).purge(CHANNEL, 2, REASON).await;
+    assert!(matches!(result, Err(DiscordError::Unavailable(_))));
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn purge_first_refusal_reports_the_error_with_nothing_deleted() {
+    let ids = [aged_message_id(1), aged_message_id(2)];
+    let mock = MockRest::start(
+        vec![history(&[&ids[0], &ids[1]]), ScriptedResponse::status(403)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let result = executor_for(&mock).purge(CHANNEL, 2, REASON).await;
+    assert!(matches!(result, Err(DiscordError::Rejected(_))));
+    assert_eq!(mock.requests().len(), 2);
     mock.shutdown().await;
 }
 

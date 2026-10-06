@@ -381,7 +381,7 @@ async fn assert_stalled_delete_is_bounded(partial_body: bool) {
     assert_eq!(records[0].attempts, MAX_HTTP_TRIES);
     let requests = recorded.lock().unwrap();
     assert_eq!(requests.len(), 6 * MAX_HTTP_TRIES as usize);
-    for attempt in requests.chunks_exact(6) {
+    for attempt in requests.as_chunks::<6>().0 {
         assert_eq!(attempt[4], format!("GET /api/v10/guilds/{G}/members/{A}"));
         assert_eq!(
             attempt[5],

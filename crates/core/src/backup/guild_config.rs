@@ -201,11 +201,9 @@ fn base64_decode_standard(seg: &str) -> Result<Vec<u8>, ()> {
         vals.push(v);
     }
     let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in vals.chunks_exact(4) {
-        let n = (u32::from(chunk[0]) << 18)
-            | (u32::from(chunk[1]) << 12)
-            | (u32::from(chunk[2]) << 6)
-            | u32::from(chunk[3]);
+    for &[c0, c1, c2, c3] in vals.as_chunks::<4>().0 {
+        let n =
+            (u32::from(c0) << 18) | (u32::from(c1) << 12) | (u32::from(c2) << 6) | u32::from(c3);
         out.push((n >> 16) as u8);
         out.push((n >> 8) as u8);
         out.push(n as u8);

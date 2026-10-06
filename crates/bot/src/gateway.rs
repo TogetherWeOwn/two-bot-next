@@ -29,7 +29,7 @@ use two_bot_core::gateway_session::{
     boot_action_with, dispatch_action, invalidates_session, BootAction, DispatchAction,
     GatewaySession,
 };
-use two_bot_core::{ComponentStatus, Config, InviteState, Snowflake};
+use two_bot_core::{AutomodPolicy, ComponentStatus, Config, InviteState, Snowflake};
 use two_bot_cutover::gateway_session::{GatewayJob, GatewaySessionStore};
 use two_bot_cutover::{connect, DB_POOL_MAX_DEFAULT};
 use two_bot_discord::{
@@ -838,6 +838,12 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             )
                         });
                         let mut acknowledgement_held = false;
+                        // Staff audit rows: translated pre-update (member deltas and
+                        // voice boundaries need the rows the funnel is about to
+                        // mutate), stored before the checkpoint commits. The store
+                        // write is idempotent, so a crash between the two replays
+                        // safely; a failed write never stalls this worker.
+                        let mut audit_events = Vec::new();
                         if let Some(dispatch) = dispatch {
                             // A cold voice RESUME is followed by IDENTIFY; READY connects.
                             connected = matches!(dispatch.event, Event::Ready(_) | Event::Resumed)
@@ -846,6 +852,12 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             onboarding_job = writer_onboarding
                                 .as_ref()
                                 .and_then(|runtime| runtime.capture(&dispatch.event, &pipeline));
+                            audit_events = crate::audit_gateway::translate(
+                                &dispatch.event,
+                                pipeline.cache(),
+                                &dispatch.observed_at,
+                                checkpoint.sequence,
+                            );
                             // Exactly one funnel call per dispatch, then drain deferred
                             // XP awards through the leveling runtime under the
                             // checkpoint deadline before the cursor commits. Without a
@@ -912,6 +924,10 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             } else {
                                 false
                             };
+                        }
+                        if !audit_events.is_empty() {
+                            let pending = std::mem::take(&mut audit_events);
+                            handle.block_on(crate::audit_gateway::record_all(&pending));
                         }
                         let durable_job = onboarding_job
                             .as_ref()
@@ -1373,7 +1389,10 @@ pub async fn build_voice_runtime(
             return None;
         }
     };
-    match build_production_runtime(token, db.pool().clone()) {
+    // Name restrictions are independent of chat counts, sanctions and gates:
+    // a malformed unrelated setting must not discard the configured word list.
+    let name_policy = AutomodPolicy::name_policy_from_map(&std::env::vars().collect());
+    match build_production_runtime(token, db.pool().clone(), name_policy) {
         Ok(runtime) => {
             info!("voice rooms enabled; gateway sink attached");
             Some(Arc::new(runtime))

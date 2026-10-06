@@ -158,12 +158,19 @@ class SupplyChainTests(unittest.TestCase):
                 if not action.startswith("./"):
                     self.assertRegex(action, r"@[0-9a-f]{40}$", f"Unpinned action in {path}: {action}")
 
+    def test_all_workflow_container_and_service_images_are_digest_pinned(self):
+        # Dependabot's docker ecosystem scans Dockerfiles only, so a floating
+        # tag in a workflow container/service would never be bumped or noticed.
+        for path in (ROOT / ".github/workflows").glob("*.yml"):
+            for image in re.findall(r"^[ \t]+image:[ \t]+(\S+)", path.read_text(), re.MULTILINE):
+                self.assertRegex(image, r"@sha256:[0-9a-f]{64}$", f"Unpinned image in {path}: {image}")
+
     def test_base_images_are_digest_pinned_and_dependabot_tracks_docker(self):
         images = re.findall(r"^FROM (\S+)", (ROOT / "Dockerfile").read_text(), re.MULTILINE)
         self.assertEqual(len(images), 2)
         for image in images:
             self.assertRegex(image, r"@sha256:[0-9a-f]{64}$")
-        self.assertTrue(images[0].startswith("rust:1.94-trixie@"))
+        self.assertTrue(images[0].startswith("rust:1.98-trixie@"))
         self.assertTrue(images[1].startswith("gcr.io/distroless/cc-debian13:nonroot@"))
         self.assertIn("package-ecosystem: docker", (ROOT / ".github/dependabot.yml").read_text())
 
@@ -298,21 +305,34 @@ class SupplyChainTests(unittest.TestCase):
 
     def test_required_check_rejects_every_non_success_scan_result(self):
         workflow = (ROOT / ".github/workflows/check.yml").read_text()
-        job = workflow.split("\n  check:\n", 1)[1]
-        # Merged with main's dependency-aware selector (#282): the
-        # self-role/parity gates are selector-aware, but the supply-chain
-        # gate stays unconditional — no job-inputs exception may hide a
-        # failed, skipped or cancelled scan.
-        self.assertIn("needs: [self-role-store, supply-chain, parity-docs, job-inputs]", job)
+        job = workflow.split("\n  ci-ok:\n", 1)[1]
+        # CI standard rule 6: the supply-chain gate is selector-aware like the
+        # self-role/parity gates -- the required `ci-ok` aggregator rejects a
+        # failed, skipped or cancelled scan when `supply` was selected, and
+        # only tolerates the skip the selector itself produced (a `skipped`
+        # result with `supply == 'false'`). No other exception may hide a
+        # scan result. (The lint lane `check` no longer waits on the scan, so
+        # the aggregators own this gate.)
+        self.assertIn("supply-chain", job.split("steps:", 1)[0])
         self.assertIn("if: ${{ always() }}", job)
-        guard = re.search(r"- name: require supply-chain gate to pass\n\s+if: ([^\n]*)\n\s+run: exit 1", job)
-        self.assertIsNotNone(guard)
-        self.assertEqual(guard[1], "needs.supply-chain.result != 'success'")
-        for scan in ["success", "failure", "skipped", "cancelled"]:
-            with self.subTest(scan=scan):
-                condition = guard[1].replace("needs.supply-chain.result", f"'{scan}'")
-                result = subprocess.run(["bash", "-c", f"if [[ {condition} ]]; then exit 1; fi"])
-                self.assertEqual(result.returncode, 0 if scan == "success" else 1)
+        self.assertIn("SUPPLY_CHAIN_RESULT: ${{ needs.supply-chain.result }}", job)
+        self.assertIn("SUPPLY_SELECTED: ${{ needs.job-inputs.outputs.supply }}", job)
+        script = job.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
+        script = "\n".join(line[10:] for line in script.splitlines())
+        for scan, selected, fail in [
+                ("success", "true", False), ("failure", "true", True),
+                ("skipped", "true", True), ("cancelled", "true", True),
+                ("success", "false", False), ("failure", "false", True),
+                ("skipped", "false", False), ("cancelled", "false", True)]:
+            with self.subTest(scan=scan, selected=selected):
+                env = {"PATH": os.environ["PATH"], "JOB_INPUTS_RESULT": "success",
+                       "SUPPLY_CHAIN_RESULT": scan, "SUPPLY_SELECTED": selected,
+                       # Every other gate is green and selected, or skipped and deselected.
+                       "CHECK_RESULT": "success"}
+                for var in re.findall(r"^\s+(\w+_RESULT): \$\{\{", job, re.M):
+                    env.setdefault(var, "success")
+                result = subprocess.run(["python3", "-c", script], env=env, capture_output=True)
+                self.assertEqual(result.returncode, 1 if fail else 0, result.stdout.decode())
 
     def test_shared_gate_and_dry_run_publication_guards(self):
         supply = (ROOT / ".github/workflows/sbom.yml").read_text()

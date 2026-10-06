@@ -1,0 +1,62 @@
+[package]
+name = "two-bot-next-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Separate workspace: libFuzzer and nightly flags never enter the normal build.
+[workspace]
+members = ["."]
+resolver = "2"
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+serde_json = { version = "1", features = ["preserve_order"] }
+two-bot-core = { version = "0.3.0", path = "../crates/core", default-features = false } # x-release-please-version
+two-bot-cutover = { version = "0.3.0", path = "../crates/cutover" } # x-release-please-version
+
+[[bin]]
+name = "internal_action"
+path = "fuzz_targets/internal_action.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "automod"
+path = "fuzz_targets/automod.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "prefix_trigger"
+path = "fuzz_targets/prefix_trigger.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mee6_export"
+path = "fuzz_targets/mee6_export.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "guild_config_snapshot"
+path = "fuzz_targets/guild_config_snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "voice_config"
+path = "fuzz_targets/voice_config.rs"
+test = false
+doc = false
+bench = false

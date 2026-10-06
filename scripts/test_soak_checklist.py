@@ -363,6 +363,13 @@ class DeltaChecklistTests(unittest.TestCase):
     def line(self, needle):
         return next(line for line in self.parity.splitlines() if needle in line)
 
+    def carded_line(self):
+        """Any ledger row still `carded`; rows leave that status as they port."""
+        return next(
+            line for line in self.parity.splitlines()
+            if line.startswith("| [") and " | carded | " in line
+        )
+
     def entry(self, data, entry_id):
         return next(e for e in data["entries"] if e["id"] == entry_id)
 
@@ -413,7 +420,7 @@ class DeltaChecklistTests(unittest.TestCase):
                     validate(changed, self.checklist)
 
     def test_ledger_status_changes_are_stale(self):
-        line = self.line("| [bffccf3]")
+        line = self.carded_line()
         dropped = line.replace("| carded | ", "| dropped | drop: superseded; ", 1)
         with self.assertRaisesRegex(ValueError, "missing=\\[\\]; stale="):
             validate(self.parity.replace(line, dropped, 1), self.checklist)
@@ -452,20 +459,38 @@ class DeltaChecklistTests(unittest.TestCase):
             validate(self.parity.replace(line, line + "\n" + row, 1), self.checklist)
 
     def test_owner_cards_must_match_disposition(self):
+        # A synthetic gap row, so this test does not depend on a real ledger
+        # row staying open: real rows flip to ported as their cards close.
+        line = self.line("| [bffccf3]")
+        row = ("| [abc1234](https://example.invalid) | `src/x/` | fix(x): new | gap | "
+               "[TOG-11145](/TOG/issues/TOG-11145) — open |")
+        parity = self.parity.replace(line, line + "\n" + row, 1)
         data = copy.deepcopy(self.checklist)
-        self.entry(data, "s13-1d64196")["owner"] = ["TOG-11146"]
-        with self.assertRaisesRegex(ValueError, "s13-1d64196: stale owner"):
-            validate(self.parity, data)
-        self.entry(data, "s13-1d64196")["owner"] = ["TOG-11145"]
-        line = self.line("| [1d64196]")
-        moved = self.parity.replace(line, line.replace("TOG-11145", "TOG-99999"), 1)
-        with self.assertRaisesRegex(ValueError, "s13-1d64196: stale owner"):
+        data["entries"].append({
+            "id": "s13-abc1234",
+            "parity": {"section": 13, "row": [
+                "[abc1234](https://example.invalid)", "`src/x/`", "fix(x): new", "gap"]},
+            "owner": ["TOG-11145"],
+            "status": "waived",
+            "action": "Run the fixture.",
+            "expected": "It passes.",
+            "evidence": "Attach the result.",
+            "reason": "Proposed waiver.",
+            "approver": "pending",
+        })
+        validate(parity, data)
+        self.entry(data, "s13-abc1234")["owner"] = ["TOG-11146"]
+        with self.assertRaisesRegex(ValueError, "s13-abc1234: stale owner"):
+            validate(parity, data)
+        self.entry(data, "s13-abc1234")["owner"] = ["TOG-11145"]
+        moved = parity.replace(row, row.replace("TOG-11145", "TOG-99999"), 1)
+        with self.assertRaisesRegex(ValueError, "s13-abc1234: stale owner"):
             validate(moved, data)
         for owner in (None, [], ["owner"], "TOG-11145"):
             with self.subTest(owner=owner):
-                self.entry(data, "s13-1d64196")["owner"] = owner
+                self.entry(data, "s13-abc1234")["owner"] = owner
                 with self.assertRaisesRegex(ValueError, "requires owner cards"):
-                    validate(self.parity, data)
+                    validate(parity, data)
         # A ported row with no cited card still names its owning slice.
         data = copy.deepcopy(self.checklist)
         self.entry(data, "s13-3dc9720").pop("owner")
@@ -478,7 +503,7 @@ class DeltaChecklistTests(unittest.TestCase):
             delta_rows(self.parity.replace(header, "| Legacy commit | Area | Change | State | Disposition |", 1))
         with self.assertRaisesRegex(ValueError, "must end in Disposition"):
             delta_rows(self.parity.replace(header, "| Legacy commit | Area | Change | Status | Outcome |", 1))
-        line = self.line("| [bffccf3]")
+        line = self.carded_line()
         with self.assertRaisesRegex(ValueError, "unknown ledger status 'pending'"):
             delta_rows(self.parity.replace(line, line.replace("| carded |", "| pending |", 1), 1))
         with self.assertRaisesRegex(ValueError, "malformed table row"):
@@ -509,7 +534,9 @@ class DeltaChecklistTests(unittest.TestCase):
         automated = [e for e in self.checklist["entries"] if e["parity"]["section"] == 13 and e["status"] == "automated"]
         self.assertEqual({e["parity"]["row"][3] for e in automated}, {"ported"})
         for entry in automated:
-            self.assertTrue(entry["verification"].startswith("python3 scripts/cargo_cache.py run -- test -p two-bot-core "))
+            for command in entry["verification"].split(" && "):
+                with self.subTest(entry=entry["id"], command=command):
+                    self.assertTrue(command.startswith("python3 scripts/cargo_cache.py run -- test -p two-bot"))
 
     def test_render_lists_delta_sections_and_owners(self):
         output = render(self.checklist)

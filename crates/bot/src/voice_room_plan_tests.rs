@@ -243,7 +243,7 @@ fn a_missing_chosen_source_channel_fails_closed() {
     let mut world = World::new(full());
     world.settings.permission_source = PermissionSource::Channel(701);
     world.settings.permission_channel_id = Some(701);
-    assert_eq!(world.plan(), Err(RoomHttpError::AccessDenied));
+    assert_eq!(world.plan(), Err(RoomHttpError::NotFound));
 }
 
 #[test]

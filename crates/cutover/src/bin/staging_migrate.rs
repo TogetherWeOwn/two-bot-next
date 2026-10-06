@@ -4,20 +4,26 @@
 //! staging-migrate --plan|--apply --source-sha <40hex> --staging-host <host>
 //!   --staging-database <db> --recovery-evidence-ref <ref> --acl-plan-ref <ref>
 //!   [--expected-pending <ascending,comma-separated versions>]
-//!   [--plan-manifest-sha256 <64hex> --plan-run-id <run id>]
+//!   [--plan-manifest-sha256 <64hex> --plan-run-id <run id>
+//!    --plan-manifest-path <producing run's downloaded manifest>]
 //! ```
 //!
-//! The database URL comes only from TWO_BOT_STAGING_MIGRATOR_DATABASE_URL.
-//! --apply refuses before any DDL unless --expected-pending equals the computed
-//! pending list exactly and --plan-manifest-sha256 equals the SHA-256 of the
-//! plan job's uploaded manifest for the same source SHA; --plan prints that
-//! manifest (including its own hash) and ignores the plan-binding flags.
+//! The database URL comes only from the mode's fixed binding:
+//! TWO_BOT_STAGING_PLAN_DATABASE_URL for --plan (a login holding only
+//! two_bot_migrator_ro, physically read-only; --plan refuses a login that also
+//! holds two_bot_migrator), TWO_BOT_STAGING_MIGRATOR_DATABASE_URL for --apply. --apply refuses before any DDL unless --expected-pending equals
+//! the computed pending list exactly, --plan-manifest-sha256 equals the SHA-256
+//! of the plan job's uploaded manifest for the same source SHA, and the downloaded
+//! manifest at --plan-manifest-path (fetched by the workflow from the
+//! --plan-run-id run) carries that same hash, proving the bound hash came
+//! from the named producing run; --plan prints that manifest (including its
+//! own hash) and ignores the plan-binding flags.
 //! Exit: 0 ok, 2 refused before any DDL, 1 failed (evidence on stdout).
 
 // Operator CLI reports intentionally use stdout; runtime/library modules do not.
 #![allow(clippy::print_stdout)]
 
-use two_bot_cutover::staging_migrate::{run, Request, RunError, URL_ENV};
+use two_bot_cutover::staging_migrate::{run, Request, RunError, PLAN_URL_ENV, URL_ENV};
 
 fn main() {
     std::process::exit(real_main());
@@ -39,7 +45,8 @@ fn real_main() -> i32 {
             | "--acl-plan-ref"
             | "--expected-pending"
             | "--plan-manifest-sha256"
-            | "--plan-run-id" => match it.next() {
+            | "--plan-run-id"
+            | "--plan-manifest-path" => match it.next() {
                 Some(v) => {
                     values.insert(arg.clone(), v.clone());
                 }
@@ -52,8 +59,11 @@ fn real_main() -> i32 {
         return refused("choose exactly --plan or --apply");
     };
     let get = |k: &str| values.get(k).cloned().unwrap_or_default();
+    // Each mode reads only its own binding: a plan run can never borrow the
+    // migrator credential, and an absent RO binding refuses before connecting.
+    let binding = if apply { URL_ENV } else { PLAN_URL_ENV };
     let req = Request {
-        url: std::env::var(URL_ENV).ok(),
+        url: std::env::var(binding).ok(),
         source_sha: get("--source-sha"),
         expected_host: get("--staging-host"),
         expected_database: get("--staging-database"),
@@ -63,6 +73,7 @@ fn real_main() -> i32 {
         expected_pending: values.get("--expected-pending").cloned(),
         plan_manifest_sha256: values.get("--plan-manifest-sha256").cloned(),
         plan_run_id: values.get("--plan-run-id").cloned(),
+        plan_manifest_path: values.get("--plan-manifest-path").cloned(),
     };
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
