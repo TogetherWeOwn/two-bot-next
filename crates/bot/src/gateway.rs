@@ -964,7 +964,7 @@ impl InviteSource for HttpInvites {
                 .flatten();
                 if result.is_none() {
                     warn!(
-                        guild_id,
+                        guild_id = guild_id.to_string(),
                         "invite counter read unavailable; retaining snapshot"
                     );
                 }

@@ -424,7 +424,7 @@ impl InteractionRuntime {
             }
             Err(_) => {
                 tracing::warn!(
-                    interaction_id = interaction.id.get(),
+                    interaction_id = interaction.id.get().to_string(),
                     "LFG operation failed; details withheld"
                 );
                 "LFG operation failed; check the saved state before retrying.".into()

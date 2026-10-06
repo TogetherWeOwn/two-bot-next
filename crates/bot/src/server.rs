@@ -63,7 +63,33 @@ fn router_with_guard(
         .layer(axum::Extension(guard))
         // Internal metrics live on the same listener (Worker never proxies it).
         .merge(crate::metrics_http::router())
-        .layer(TraceLayer::new_for_http().make_span_with(RedactedHttpMakeSpan))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(RedactedHttpMakeSpan)
+                .on_failure(
+                    |classification: tower_http::classify::ServerErrorsFailureClass,
+                     latency: std::time::Duration,
+                     span: &tracing::Span| {
+                        // A 503 from /readyz is routine (parked, connecting or
+                        // draining, including the keepalive probes), not an
+                        // error. Anything else keeps the default ERROR level.
+                        use tower_http::classify::ServerErrorsFailureClass as Class;
+                        let level = match &classification {
+                            Class::StatusCode(code) if *code == StatusCode::SERVICE_UNAVAILABLE => {
+                                tracing::Level::DEBUG
+                            }
+                            _ => tracing::Level::ERROR,
+                        };
+                        tracing::event!(
+                            parent: span,
+                            level,
+                            classification = %classification,
+                            latency_ms = latency.as_millis(),
+                            "response failed"
+                        );
+                    },
+                ),
+        )
 }
 
 /// Span factory for the public listener: method plus a redacted path only.

@@ -100,7 +100,12 @@ fn filter(rust_log: Option<&str>, log_level: Option<&str>) -> EnvFilter {
     let level = log_level
         .and_then(|value| value.parse::<LevelFilter>().ok())
         .unwrap_or(LevelFilter::INFO);
-    EnvFilter::new(level.to_string())
+    // Scope the default to our crates (`EnvFilter` matches target prefixes, so
+    // one directive covers two_bot, two_bot_core, two_bot_discord and the rest).
+    // Anything else keeps the implicit ERROR-only default, as before this
+    // change: dependency chatter (tower-http request lines, sqlx, twilight)
+    // stays out unless RUST_LOG opts in. RUST_LOG still overrides everything.
+    EnvFilter::new(format!("two_bot={level}"))
 }
 
 fn subscriber<W>(

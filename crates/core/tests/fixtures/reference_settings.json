@@ -18,7 +18,7 @@
   "DISCORD_TICKET_STAFF_ROLE_ID": "Staff role used by ticket authorization.",
   "DISCORD_TOKEN": "Container Discord authentication token; never stored in guild settings.",
   "DISCORD_VOICE_LOG_CHANNEL_ID": "Destination for voice-session logs.",
-  "LOG_LEVEL": "Legacy logging filter with no Next reader; Container tracing reads RUST_LOG.",
+  "LOG_LEVEL": "Container two_bot tracing level when RUST_LOG is unset (info default); RUST_LOG overrides.",
   "TEMP_VOICE_ENABLED": "Legacy temporary-voice enable flag; classification does not imply runtime wiring.",
   "TWO_ANNOUNCEMENTS": "Enable announcement command publication and routing.",
   "TWO_ANTI_NUKE": "Enable anti-nuke protection.",

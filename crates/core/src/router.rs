@@ -355,9 +355,9 @@ impl InteractionRouter {
         tracing::warn!(
             target: "two_bot_core::command_permissions",
             command = row.command,
-            guild_id = ?guild_id,
+            guild_id = guild_id.map(|id| id.to_string()),
             required_permissions = row.required_permissions,
-            actor_permissions = ?actor_permissions,
+            actor_permissions = actor_permissions.map(|id| id.to_string()),
             "command_permission_denied"
         );
         false
@@ -1338,5 +1338,76 @@ mod tests {
         );
         assert!(!gates.automations && gates.announcements && !gates.moderation);
         assert!(gates.scorecard && !gates.tickets && gates.onboarding_picker);
+    }
+
+    /// `command_permission_denied` must log Discord IDs as decimal strings
+    /// (`docs/logging.md`), never `Some(…)` or JSON numbers.
+    #[test]
+    fn permission_denied_logs_decimal_string_ids() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+        struct Guard<'a>(std::sync::MutexGuard<'a, Vec<u8>>);
+
+        impl std::io::Write for Guard<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for SharedBuf {
+            type Writer = Guard<'a>;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                Guard(self.0.lock().unwrap_or_else(|e| e.into_inner()))
+            }
+        }
+
+        let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(buf.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!InteractionRouter::permission_allowed(
+                "purge",
+                Some(GUILD),
+                Some(0)
+            ));
+        });
+        let text = String::from_utf8(buf.0.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .expect("log output is utf-8");
+        let denied = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| {
+                event
+                    .get("fields")
+                    .and_then(|fields| fields.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("command_permission_denied")
+            })
+            .expect("permission denial is logged");
+        let fields = denied.get("fields").expect("json fields envelope");
+        assert_eq!(
+            fields.get("guild_id").and_then(serde_json::Value::as_str),
+            Some("2222"),
+            "guild id must be a decimal string, not Some(…)"
+        );
+        assert_eq!(
+            fields
+                .get("actor_permissions")
+                .and_then(serde_json::Value::as_str),
+            Some("0"),
+            "actor permissions must be a decimal string"
+        );
     }
 }

@@ -117,8 +117,9 @@ No Cloudflare API reaches container stdout either, so voice-event emission has
 no CI read path; follow [staging voice-event verification](staging-voice-event-verification.md)
 for the dashboard procedure.
 
-Rust uses formatted `tracing` logs, configured by `RUST_LOG`, fallback
-`two_bot=info`; it does not consume legacy `LOG_LEVEL`. This wrapper currently
+Rust uses JSON `tracing` logs, configured by `RUST_LOG`, fallback
+`two_bot={LOG_LEVEL:-info}` (dependency crates stay ERROR-only unless
+`RUST_LOG` opts in); `/readyz` 503s log at DEBUG, not ERROR. This wrapper currently
 forwards **only** `DISCORD_TOKEN`, `DATABASE_URL`, `GUILD_ID` and its computed
 `LISTEN_ADDR`, not `RUST_LOG` or arbitrary `TWO_*` flags. Adding a Worker var
 alone will not configure the container. Do not dump env or HTTP headers to

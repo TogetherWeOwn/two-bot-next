@@ -13,8 +13,10 @@ Docker explicitly sets `LOG_FORMAT=json`; native runs also default to JSON.
   `warn,two_bot=debug,two_bot_discord=info`. Malformed/empty directives fall back
   to `LOG_LEVEL` without plain-text stderr diagnostics.
 - `LOG_LEVEL`: `trace`, `debug`, `info`, `warn`, `error`, `off` (case-insensitive).
-  Missing/invalid levels default to `info`. Levels apply to all targets unless
-  overridden by `RUST_LOG`.
+  Missing/invalid levels default to `info`. The level applies to the `two_bot`
+  target prefix (all workspace crates); anything else keeps the implicit
+  ERROR-only default unless `RUST_LOG` overrides. `/readyz` 503s log at
+  DEBUG, not ERROR.
 - `--help`, backup/export CLI stdout, and the silent `--healthcheck` probe are
   separate protocols, not JSON logging. Panics/OS diagnostics are not tracing
   events and are not covered by this format contract.
