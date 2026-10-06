@@ -47,6 +47,8 @@ import { connectPostgres } from "./redirect-db.ts";
 import { forwardedFlagVars, type ForwardedFlagEnv } from "./container-env.ts";
 import {
   ACTIONS_PATH,
+  CONTAINER_MARKER,
+  CONTAINER_MARKER_VALUE,
   RECEIVER_BIND,
   RECEIVER_PORT,
   REQUEST_TIMEOUT_MS,
@@ -287,14 +289,16 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
   const lobbyId = env.DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID;
   if (lobbyId !== undefined) vars["DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID"] = lobbyId;
   vars["LISTEN_ADDR"] = `0.0.0.0:${port}`;
-  // Private internal-actions receiver (TOG-12980). Dark unless the Operator
-  // sets TWO_INTERNAL_ACTIONS to exactly "1"; any other value forwards nothing,
-  // so a typo cannot crash-loop the gateway (the receiver boots all-or-nothing).
-  // The bind is the Worker's loopback constant, never an Operator-set value.
+  // Private internal-actions receiver (TOG-12980, bind TOG-16851). Dark unless
+  // the Operator sets TWO_INTERNAL_ACTIONS to exactly "1"; any other value
+  // forwards nothing, so a typo cannot crash-loop the gateway (the receiver
+  // boots all-or-nothing). The bind and the container marker are the Worker's
+  // constants, never Operator-set values.
   if (receiverEnabled(env)) {
     if (port === RECEIVER_PORT) throw new Error("BOT_PORT must differ from the internal-actions receiver port");
     vars["TWO_INTERNAL_ACTIONS"] = "1";
     vars["TWO_INTERNAL_BIND"] = RECEIVER_BIND;
+    vars[CONTAINER_MARKER] = CONTAINER_MARKER_VALUE;
     if (env.TWO_INTERNAL_CALLERS) vars["TWO_INTERNAL_CALLERS"] = env.TWO_INTERNAL_CALLERS;
     if (env.TWO_INTERNAL_CHANNEL_KEYS) vars["TWO_INTERNAL_CHANNEL_KEYS"] = env.TWO_INTERNAL_CHANNEL_KEYS;
     if (env.TWO_INTERNAL_KEYS) vars["TWO_INTERNAL_KEYS"] = env.TWO_INTERNAL_KEYS;

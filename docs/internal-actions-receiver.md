@@ -45,16 +45,20 @@ lines, and only while `TWO_INTERNAL_ACTIONS` is exactly `1`:
 | Name | Source |
 | --- | --- |
 | `TWO_INTERNAL_ACTIONS` | Worker secret, forwarded as `1` |
-| `TWO_INTERNAL_BIND` | Worker constant `127.0.0.1:8091`. An Operator-supplied value is ignored, so the bind can never become a wildcard or public address. |
+| `TWO_INTERNAL_BIND` | Worker constant `0.0.0.0:8091` (TOG-16851: the Containers port check and `containerFetch` cannot reach a loopback-only socket). An Operator-supplied value is ignored, so the bind can never become a public address. |
 | `TWO_INTERNAL_CALLERS` | Worker secret, e.g. `web-staging:website-staging` |
+| `TWO_INTERNAL_CONTAINER` | Worker constant `1`: proves the process runs inside the private container network, where the wildcard bind is reachable only via `containerFetch` and the startup port check. The bot refuses a wildcard bind without exactly this marker. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | Worker secret, e.g. `smoke-throwaway:<channel snowflake in the TWO Staging guild>` |
 | `TWO_INTERNAL_KEYS` | Worker secret `web-staging:<64 hex>`; never a var, never logged |
 
 Fixed receiver port: **8091** (health stays on `BOT_PORT` 8080, and the two may
 not be equal while the receiver is enabled). While enabled, 8091 joins the
 container's startup port checks, so a sidecar that cannot reach the receiver
-fails the start instead of reporting a half-working bot. The loopback literal
-satisfies `assert_private_bind`; no Rust change was needed.
+fails the start instead of reporting a half-working bot. TOG-16851: a
+loopback-only socket is unreachable from the Containers port check and
+`containerFetch`, so the Worker binds the wildcard and the bot accepts it only
+with the `TWO_INTERNAL_CONTAINER` marker; other binds still pass
+`assert_private_bind`.
 
 ### Enable order and rollback
 
@@ -70,10 +74,12 @@ that is not yet deployed), deploy that one version, then run the takeover once.
 4. Operator stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
 5. Rollback: stage deletion of `TWO_INTERNAL_ACTIONS` (`wrangler versions secret delete`), deploy and transfer ownership; or use the existing Worker-version rollback. The route is absent again and the next container start carries no receiver setting.
 
-The first enable is also the proof that the platform sidecar reaches a second
-port bound to loopback. If the startup port check for 8091 fails, roll back and
-hand the question to the CTO: the fallback is Rust-side private-IP discovery
-through `assert_private_bind`, never a wildcard bind or a shell wrapper.
+TOG-16851 proved a loopback-only receiver never becomes healthy: the Containers
+port check and `containerFetch` cannot reach it, so the container waited on 8091
+forever. The fix binds the wildcard behind the Worker-set container marker (the
+container network is private; HMAC/caller checks are unchanged). If the startup
+port check for 8091 fails after this change, roll back and hand the question to
+the CTO.
 
 ## Authentication across a durable nonce commit
 
@@ -113,7 +119,8 @@ An enabled receiver requires all of these settings, without defaults:
 
 | Setting | Meaning |
 | --- | --- |
-| `TWO_INTERNAL_BIND` | Literal private IP plus explicit nonzero port. IPv6 uses brackets. No hostname, URL, wildcard, public address or ephemeral port. |
+| `TWO_INTERNAL_BIND` | Literal IP plus explicit nonzero port. IPv6 uses brackets. No hostname, URL, public address or ephemeral port. A specific private IP always passes; the wildcard (`0.0.0.0`, `::`) passes only with `TWO_INTERNAL_CONTAINER` exactly `1`. |
+| `TWO_INTERNAL_CONTAINER` | Required only with a wildcard bind: exactly `1`, Worker-set. Ignored for a specific private bind. |
 | `TWO_INTERNAL_KEYS` | Existing comma-separated `key-id:secret` signing specification; each secret is at least 32 bytes. At most 64 keys, with unique IDs and distinct secrets. |
 | `TWO_INTERNAL_CALLERS` | Comma-separated `key-id:caller` mappings. Exactly one entry for each signing key, no unknown entries. The caller is a stable logical identity, not a key-rotation version. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | Explicit nonempty comma-separated channel-key/Discord-ID map. Names are unique; IDs are canonical, nonzero, u64-representable snowflakes. |
@@ -182,7 +189,8 @@ Messages are fixed/redacted and all envelopes use `Cache-Control: no-store`.
 
 The configuration unit tests use only the existing public signing vectors. They
 exercise dark defaults, strict enable values, missing/non-Unicode settings,
-private literal binds, distinct-key rotation with caller continuity,
+private literal binds, wildcard binds only with the container marker,
+distinct-key rotation with caller continuity,
 duplicate/ambiguous mappings, same-secret aliases for the same or different
 callers, canonical channels and redaction.
 They do not read runtime credentials, open sockets, access databases or send to

@@ -401,23 +401,27 @@ approved version transition.
   IPv6 loopback/ULA/link-local and mapped private IPv4; it refuses wildcard,
   public, hostname, malformed and host:port inputs with **no override**
   (`crates/core/src/internal_actions.rs:1430`). Bind the validated literal, not
-  the original string or a subsequently resolved hostname. No private listener
-  or network ACL was verified. The current Worker intentionally forwards
-  `LISTEN_ADDR=0.0.0.0:<port>` **for probes only** (`wrangler/src/index.ts:105`);
-  a public Worker proxy would still cross a public boundary even with a guarded
-  private Container listener.
-- **Staging-only ingress (TOG-12980, CISO conditions on TOG-12979):** the staging
-  Worker proxies exactly `POST /internal/actions` to a loopback receiver listener
-  (`127.0.0.1:8091`, set by the Worker, never an Operator value). It is dark
-  unless the staging-only var `INTERNAL_ACTIONS_INGRESS` and the Operator secret
-  `TWO_INTERNAL_ACTIONS` are both `1`; `scripts/check-env-bindings.py` denies the
-  var in production. The Worker bounds method, path, query, content type,
-  2 MiB body, timeouts, header allowlist, per-IP and in-flight caps before the
-  Container is touched, forwards bytes unchanged inside the ownership fence, and
-  never relays Container error text or starts the Container. Authentication is
-  still the receiver's v1 HMAC and durable nonce burn. Caps are per isolate
-  (the residual in F7 above). Whether the sidecar reaches a loopback second
-  port is proven by the first staging enable; see
+  the original string or a subsequently resolved hostname. The receiver config
+  admits the wildcard only with the Worker-set `TWO_INTERNAL_CONTAINER` marker
+  (TOG-16851: the Containers port check cannot reach loopback; the container
+  network is private). No private listener or network ACL was verified. The
+  current Worker intentionally forwards `LISTEN_ADDR=0.0.0.0:<port>` **for
+  probes only** (`wrangler/src/index.ts:105`); a public Worker proxy would still
+  cross a public boundary even with a guarded private Container listener.
+- **Staging-only ingress (TOG-12980, CISO conditions on TOG-12979; bind TOG-16851):**
+  the staging Worker proxies exactly `POST /internal/actions` to a wildcard
+  receiver listener (`0.0.0.0:8091` plus the Worker-set `TWO_INTERNAL_CONTAINER`
+  marker, never Operator values). TOG-16851 proved a loopback-only socket is
+  unreachable from the Containers port check and `containerFetch`; the container
+  network is private and the bot refuses the wildcard without exactly that
+  marker. It is dark unless the staging-only var `INTERNAL_ACTIONS_INGRESS` and
+  the Operator secret `TWO_INTERNAL_ACTIONS` are both `1`;
+  `scripts/check-env-bindings.py` denies the var in production. The Worker bounds
+  method, path, query, content type, 2 MiB body, timeouts, header allowlist,
+  per-IP and in-flight caps before the Container is touched, forwards bytes
+  unchanged inside the ownership fence, and never relays Container error text or
+  starts the Container. Authentication is still the receiver's v1 HMAC and
+  durable nonce burn. Caps are per isolate (the residual in F7 above). See
   [the receiver doc](internal-actions-receiver.md#staging-ingress-default-dark).
 
 ## Rejection logging and secret minimization

@@ -147,7 +147,7 @@ class AlertBindingTests(unittest.TestCase):
 
     def test_receiver_config_is_never_a_toml_var(self):
         for section in ["vars", "env.staging.vars", "env.production.vars"]:
-            for key in ["TWO_INTERNAL_KEYS", "TWO_INTERNAL_ACTIONS", "TWO_INTERNAL_BIND"]:
+            for key in ["TWO_INTERNAL_KEYS", "TWO_INTERNAL_ACTIONS", "TWO_INTERNAL_BIND", "TWO_INTERNAL_CONTAINER"]:
                 with self.subTest(section=section, key=key):
                     config = BASE.replace(f"[{section}]", f'[{section}]\n{key} = "synthetic-secret"', 1)
                     errors = self.check_config(config)
