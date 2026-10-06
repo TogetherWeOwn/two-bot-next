@@ -39,6 +39,9 @@ mod gateway_failure;
 mod gateway_metrics;
 #[cfg(test)]
 mod gateway_tests;
+mod interaction_admission;
+#[cfg(test)]
+mod interaction_composition_tests;
 mod internal_action_http;
 mod jobs;
 mod join_risk_runtime;
@@ -400,6 +403,18 @@ async fn main() {
                         member,
                         &activation,
                     );
+                    // Ordered RSVP surface over the runtime's governed executor.
+                    // `None` whenever the command runtime is parked; the gateway
+                    // and funnel still boot.
+                    let interactions = runtime.as_ref().and_then(|runtime| {
+                        build_interaction_runtime(
+                            &pool,
+                            guild_id,
+                            &gates,
+                            runtime.executor(),
+                            &activation,
+                        )
+                    });
                     if let Some(runtime) = &runtime {
                         let config = gateway_commands::GatewayCommandConfig::from_map(
                             guild_id,
@@ -537,15 +552,15 @@ async fn main() {
                         }
                         None => None,
                     };
-                    // V4 `kick` collision: when the voice sink owns a kick
-                    // target (tracked room), the router yields so the vote
-                    // is answered exactly once. Both runtimes exist only
-                    // inside this task, so the claim wires here.
+                    // V4 `kick` collision: the router answers every `/kick`
+                    // and delegates the room vote to the voice sink when
+                    // moderation refuses an occupant. Both runtimes exist
+                    // only inside this task, so the delegate wires here.
                     if let (Some(runtime), Some(voice)) = (runtime.as_ref(), voice.as_ref()) {
                         let voice = Arc::clone(voice);
-                        runtime.set_voice_kick_claim(Arc::new(move |guild, member| {
+                        runtime.set_voice_kick_vote(Arc::new(move |interaction| {
                             let voice = Arc::clone(&voice);
-                            Box::pin(async move { voice.kick_claim_room(guild, member).await })
+                            Box::pin(async move { voice.kick_vote(interaction).await })
                         }));
                     }
 
@@ -564,6 +579,7 @@ async fn main() {
                         pipeline,
                         Arc::clone(&state),
                         store,
+                        interactions,
                         onboarding,
                         runtime,
                         automod,
@@ -632,6 +648,70 @@ async fn main() {
         );
         std::process::exit(1);
     }
+}
+
+/// Ordered RSVP surface over the command runtime's governed REST executor:
+/// one shared executor (one token key, one pacing lane) serves both the
+/// detached command dispatch and the ordered interaction completion. Returns
+/// `None` — gateway and funnel still boot — when command-gate parsing fails,
+/// so bad env parks only this surface. Mirrors
+/// [`command_runtime::CommandRuntime::from_env`]: no permissive defaults,
+/// no loopback broadening, no live probe.
+fn build_interaction_runtime(
+    pool: &sqlx::Pool<sqlx::Postgres>,
+    guild_id: u64,
+    onboarding: &two_bot_core::OnboardingGates,
+    executor: two_bot_discord::ActionExecutor,
+    activation: &activation::BootActivation,
+) -> Option<Arc<two_bot_discord::interactions::InteractionRuntime>> {
+    let features = match two_bot_core::FeatureGates::from_env() {
+        Ok(features) => features,
+        Err(err) => {
+            tracing::warn!(error = %err, "feature gates invalid; ordered interaction surface parked");
+            return None;
+        }
+    };
+    // Mirror `CommandRuntime::from_env`: a denied capability never reaches its
+    // feature-specific validation, so stale moderation env cannot re-enable a
+    // refused surface on this path.
+    let moderation = if activation.permitted(two_bot_core::activation::LiveCapability::Moderation) {
+        match two_bot_core::ModerationGates::from_env() {
+            Ok(moderation) => moderation,
+            Err(err) => {
+                tracing::warn!(error = %err, "moderation gates invalid; ordered interaction surface parked");
+                return None;
+            }
+        }
+    } else {
+        two_bot_core::ModerationGates {
+            enabled: false,
+            owen_user_id: String::new(),
+            protected_role_ids: Default::default(),
+        }
+    };
+    let gates = two_bot_core::RouterGates::from_slices(
+        Some(guild_id),
+        &features,
+        &moderation,
+        two_bot_core::SurfaceFlags {
+            session_picker: onboarding.mode == two_bot_core::OnboardingMode::Session,
+            tickets: ticket_runtime::TicketConfig::from_env(guild_id).is_some(),
+            scorecard: std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|v| v == "1"),
+            ..Default::default()
+        },
+    );
+    // Apply the exact boot activation narrowing so the ordered router carries
+    // the same capability policy as the shared command runtime. Never widen.
+    let router = two_bot_core::InteractionRouter::new(activation.constrain_router(gates));
+    Some(Arc::new(
+        two_bot_discord::interactions::InteractionRuntime::with_router(
+            router,
+            pool.clone(),
+            executor,
+            0,
+            two_bot_core::ClassifierConfig::from_env(),
+        ),
+    ))
 }
 
 /// This receiver slice is staging-only, not authority to enable production.

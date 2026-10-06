@@ -245,7 +245,11 @@ impl LevelingRuntime {
             _ => unreachable!(),
         };
         self.executor
-            .answer_interaction(interaction.id.get(), &interaction.token, &response)
+            .answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &response,
+            )
             .await?;
         Ok(true)
     }

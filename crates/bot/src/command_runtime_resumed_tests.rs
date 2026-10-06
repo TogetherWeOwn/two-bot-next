@@ -87,6 +87,22 @@ async fn resumed_without_ready_initializes_bot_user_and_wakes_tickets_independen
 }
 
 #[tokio::test]
+async fn ordered_rsvp_dispatch_preserves_ticket_resume_without_duplicate_registry() {
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(200, json!({"id":"400","bot":true})),
+    )
+    .await;
+    let (runtime, tickets) = runtime(&mock);
+    runtime.dispatch_remaining(&Event::Resumed);
+    wait_for(|| tickets.readiness_for_test() == (400, 1)).await;
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(mock.requests()[0].path, "/api/v10/users/@me");
+    assert!(!*runtime.registry_synced.lock().await);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn failed_resumed_identity_neither_initializes_nor_changes_ticket_readiness() {
     for response in [
         ScriptedResponse::status(403),

@@ -2,7 +2,10 @@
 //! Database mutations commit before the ONE full registry is republished.
 //! No gateway listener here: the runtime injects this service into its dispatch.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, PoisonError, RwLock},
+    time::Duration,
+};
 
 use sqlx::PgPool;
 use tokio::sync::Mutex;
@@ -66,6 +69,8 @@ impl InteractionHandler for Registration {
     }
 }
 
+type PublishedCommands = Option<Arc<[two_bot_core::CommandDefinition]>>;
+
 #[derive(Clone)]
 pub struct CustomCommandRuntime {
     pool: PgPool,
@@ -75,6 +80,9 @@ pub struct CustomCommandRuntime {
     // All clones serialize mutation + read + publish, not just the HTTP PUT.
     // Otherwise an older full-set snapshot can overwrite a newer addition.
     registry: Arc<Mutex<()>>,
+    /// Exact merged set from the last confirmed full-registry PUT. Clones share
+    /// this snapshot; committed DB changes alone must not advance discovery.
+    published_commands: Arc<RwLock<PublishedCommands>>,
 }
 
 impl CustomCommandRuntime {
@@ -95,7 +103,17 @@ impl CustomCommandRuntime {
             executor,
             application_id,
             registry: Arc::new(Mutex::new(())),
+            published_commands: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Clone the last confirmed publication without a DB read or a lock held
+    /// across the reply's I/O. `None` means publication is not yet confirmed.
+    pub fn published_commands(&self) -> Option<Arc<[two_bot_core::CommandDefinition]>> {
+        self.published_commands
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Used on READY and after successful add/remove. Never publish just the
@@ -126,7 +144,13 @@ impl CustomCommandRuntime {
         self.executor
             .publish_guild_commands(self.application_id, guild, &publish_commands(&defs))
             .await
-            .map_err(|_| CustomCommandError::Publication)
+            .map_err(|_| CustomCommandError::Publication)?;
+        let snapshot: Arc<[two_bot_core::CommandDefinition]> = defs.into();
+        *self
+            .published_commands
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(snapshot);
+        Ok(())
     }
 
     /// Returns false for another feature's interaction. Guild/application fences
@@ -137,6 +161,10 @@ impl CustomCommandRuntime {
         interaction: &Interaction,
         guild_name: Option<&str>,
     ) -> Result<bool, CustomCommandError> {
+        // Receipt-relative acknowledgement budget: the bounded pre-wire retry
+        // below must cover this lookup plus admission/transport, leaving margin
+        // below Discord's three-second initial deadline.
+        let received = tokio::time::Instant::now();
         if interaction.application_id.get() != self.application_id
             || interaction.guild_id.map(|id| id.get()) != self.router.gates().configured_guild
             || interaction.guild_id.is_none()
@@ -177,20 +205,26 @@ impl CustomCommandRuntime {
         };
         match outcome {
             SlashOutcome::Refuse { refusal } => {
-                self.executor
-                    .answer_interaction(
+                // Bounded retry for provably pre-wire Blocked contention only;
+                // the receipt-relative deadline covers the pre-defer lookup
+                // above. Uncertain sends are never retried.
+                tokio::time::timeout_at(
+                    received + Duration::from_millis(crate::executor::RECEIPT_ADMISSION_BUDGET_MS),
+                    self.executor.answer_interaction_with_blocked_retry(
                         interaction.id.get(),
                         &interaction.token,
                         &refusal_response(refusal),
-                    )
-                    .await
-                    .map_err(|_| CustomCommandError::Delivery)?;
+                    ),
+                )
+                .await
+                .map_err(|_| CustomCommandError::Delivery)?
+                .map_err(|_| CustomCommandError::Delivery)?;
                 Ok(true)
             }
             SlashOutcome::Handled {
                 handler: HandlerId::AutomationAdmin,
             } if management => {
-                self.defer(interaction, true).await?;
+                self.defer(interaction, true, received).await?;
                 let reply = self.manage(interaction, data, &guild).await;
                 self.complete(
                     interaction,
@@ -205,7 +239,7 @@ impl CustomCommandRuntime {
             SlashOutcome::Handled {
                 handler: HandlerId::AutomationCustom,
             } => {
-                self.defer(interaction, false).await?;
+                self.defer(interaction, false, received).await?;
                 let row = row.ok_or(CustomCommandError::Context)?;
                 let actor = interaction.author().ok_or(CustomCommandError::Context)?;
                 let context =
@@ -361,6 +395,7 @@ impl CustomCommandRuntime {
         &self,
         interaction: &Interaction,
         ephemeral: bool,
+        received: tokio::time::Instant,
     ) -> Result<(), CustomCommandError> {
         let response = InteractionResponse {
             kind: InteractionResponseType::DeferredChannelMessageWithSource,
@@ -370,10 +405,20 @@ impl CustomCommandRuntime {
                 ..Default::default()
             }),
         };
-        self.executor
-            .answer_interaction(interaction.id.get(), &interaction.token, &response)
-            .await
-            .map_err(|_| CustomCommandError::Delivery)
+        // Same receipt-relative bounded pre-wire retry as the refusal path:
+        // a Blocked attempt never reached the wire, so retrying it cannot
+        // double-acknowledge. Uncertain sends are never retried.
+        tokio::time::timeout_at(
+            received + Duration::from_millis(crate::executor::RECEIPT_ADMISSION_BUDGET_MS),
+            self.executor.answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &response,
+            ),
+        )
+        .await
+        .map_err(|_| CustomCommandError::Delivery)?
+        .map_err(|_| CustomCommandError::Delivery)
     }
 
     async fn complete(
@@ -381,8 +426,16 @@ impl CustomCommandRuntime {
         interaction: &Interaction,
         content: &str,
     ) -> Result<(), CustomCommandError> {
+        // Bounded retry for provably pre-wire Blocked contention only. The
+        // deferred completion carries no three-second deadline, but a Blocked
+        // attempt never reached the wire, so retrying it cannot repeat an
+        // accepted edit. Uncertain sends are never retried.
         self.executor
-            .edit_interaction_response(self.application_id, &interaction.token, content)
+            .edit_interaction_response_with_blocked_retry(
+                self.application_id,
+                &interaction.token,
+                content,
+            )
             .await
             .map_err(|_| CustomCommandError::Delivery)
     }

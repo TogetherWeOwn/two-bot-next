@@ -207,6 +207,10 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // V3 block list (0416): one row per blocked member, stamped on insert; an
     // unblock deletes the row, so only additions are measurable.
     TableSpec { table: "voice_room_blocks", measure: TableMeasure::Columns(&["created_at"]) },
+    // V3 approved Connect grants (0418): one row per approved member, stamped
+    // on intent; a revocation or refused grant deletes the row, so only
+    // approvals are measurable.
+    TableSpec { table: "voice_join_grants", measure: TableMeasure::Columns(&["created_at"]) },
     // Insert-once creation snapshot plus V2 ownership handoffs, whose
     // timestamp lives in `owner_touched_at` (migration 0412), V3 `/name`
     // custom-name changes, stamped in `name_touched_at` (migration 0414), and V3
@@ -216,7 +220,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Columns(&["created_at", "owner_touched_at", "name_touched_at", "privacy_touched_at"]),
     },
     // Capture both accepted creates and post-baseline bindings/rollbacks of
-    // reservations created before the baseline (migration 0417).
+    // reservations created before the baseline (migration 0422).
     TableSpec { table: "voice_create_reservations", measure: TableMeasure::Columns(&["created_at", "settled_at"]) },
     TableSpec { table: "voice_owner_grants", measure: TableMeasure::Columns(&["touched_at"]) },
     // Same insert-once shape as voice_rooms (PgRoomStore::add_companion never
@@ -276,6 +280,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
             "mutable per-guild settings row with no timestamp column; no member IDs",
         ),
     },
+    // Append-only vote-kick audit rows (migration 0417); `occurred_at` is the
+    // event time, written once per row.
+    TableSpec { table: "voice_vote_kick_audit", measure: TableMeasure::Columns(&["occurred_at"]) },
     TableSpec {
         table: "web_contract_meta",
         measure: TableMeasure::Unmeasurable("singleton contract row with no timestamp column"),

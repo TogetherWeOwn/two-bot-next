@@ -182,20 +182,24 @@ Guard and token state (logs + `/readyz`, no metric series):
   a governed path, not a rollback. Contract: [REST guard](rest-guard.md).
 
 Admission lane state (durable gate in `public.discord_send_admission`: one row
-per credential fingerprint, no TTL, no drop-release). Read-only, test copy or
-backup artifact only — never staging/production:
+per credential fingerprint, 60 s self-heal lease on `in_flight`, no
+drop-release). Read-only, test copy or backup artifact only — never
+staging/production:
 
 ```sql
-SELECT generation, in_flight, indefinite, hold_until_ms
+SELECT generation, in_flight, in_flight_since_ms, indefinite, hold_until_ms
   FROM public.discord_send_admission;
 ```
 
-`in_flight = true` with no completing exchange is a wedged lane: it needs
-explicitly authorized reconciliation (fence all credential users, prove the old
-send cannot continue, record evidence for the exact generation) — never an
-automatic expiry, startup reset, or force-send. An `indefinite` hold or a
-`hold_until_ms` far in the future refuses every new send until the durable
-hold allows it. Contract: [send admission](discord-send-admission.md).
+`in_flight = true` with a fresh `in_flight_since_ms` and no completing
+exchange is a live send: leave it alone. A stamp older than the 60 s lease is
+reclaimed automatically by the next `admit` (watch for the `reclaimed a stale
+in-flight lane` warning). Only an `indefinite` hold needs explicitly
+authorized reconciliation (fence all credential users, prove the old send
+cannot continue, record evidence for the exact generation) — never a startup
+reset or force-send. A `hold_until_ms` far in the future refuses every new
+send until the durable hold allows it. Contract:
+[send admission](discord-send-admission.md).
 
 | Level | Condition | Action |
 |---|---|---|

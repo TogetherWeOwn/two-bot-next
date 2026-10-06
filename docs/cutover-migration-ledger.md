@@ -106,11 +106,15 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0414_voice_rooms_custom_name | up | voice_rooms | re-runnable | Drop columns `custom_name` and `name_touched_at`; rooms fall back to their template name. |
 | 0415_internal_event_keys | up | internal_event_keys | backout-script | Unguarded `CREATE TABLE` fails on re-apply; backout drops the table (event.read loses its key map until upsert re-registers keys). |
 | 0416_voice_room_privacy | up | voice_rooms, voice_room_blocks | backout-script | Unguarded `ADD COLUMN`/`ADD CONSTRAINT` fail on re-apply; backout drops the join-channel constraint, the three privacy columns and the block table (private rooms become public in the store while their Discord overwrite stays; export the block list first). |
-| 0417_voice_create_reservations | up | voice_create_reservations | re-runnable | Drop the table; room creates lose their rolling burst and cooldown history (in-flight creates stop holding cap slots). |
+| 0417_voice_vote_kick_audit | up | voice_vote_kick_audit | re-runnable | Drop the table; the vote-kick audit history it holds is not reconstructible. |
+| 0418_voice_join_grants | up | voice_join_grants | re-runnable | Drop the table; approved Connect grants lose their revocation witness (rooms keep their Discord overwrites until `/public` re-derives them). |
+| 0419_send_admission_lease | up | discord_send_admission | re-runnable | Drop column `in_flight_since_ms`; lanes revert to hold-forever (a stuck lane needs the manual release again). |
+| 0420_send_admission_lease_backfill | up | discord_send_admission | re-runnable | Data-only stamp of legacy-held rows; nothing to undo (re-apply only moves rows still at the legacy default). |
+| 0422_voice_create_reservations | up | voice_create_reservations | re-runnable | Drop the table; room creates lose their rolling burst and cooldown history (in-flight creates stop holding cap slots). |
 
 ## Notes
 
-- Voice rows (0224-0229, 0412-0414, 0416, 0417) are listed here for completeness; their runtime
+- Voice rows (0224-0229, 0412, 0414, 0416-0418, 0422) are listed here for completeness; their runtime
   rollback disposition belongs to the voice rollback card, not this ledger.
 - Unguarded DDL (`CREATE TABLE` / `ADD COLUMN` without `IF NOT EXISTS`) is
   classed `backout-script` even when the change is additive, because a

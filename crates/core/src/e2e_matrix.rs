@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 27 built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 28 built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -32,7 +32,7 @@ use crate::commands::{
 /// must set on staging for the command to be published at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum E2eGate {
-    /// Always published (`rank`, `leaderboard`).
+    /// Always published (`rank`, `leaderboard`, `help`).
     Always,
     /// `TWO_COMMUNITY_SCORECARD=1`.
     Scorecard,
@@ -120,7 +120,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 27-row contract in legacy publish order (core, scorecard, automation,
+/// The 28-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -144,6 +144,16 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "Everyone",
             "Leaderboard",
             "Public mention-suppressed top-ten reply.",
+            &[],
+        ),
+        row(
+            "help",
+            31,
+            E2eGate::Always,
+            0,
+            "Everyone",
+            "Help",
+            "Immediate ephemeral reply (no defer, no store read) listing the live published commands grouped by audience with permission hints.",
             &[],
         ),
         row(

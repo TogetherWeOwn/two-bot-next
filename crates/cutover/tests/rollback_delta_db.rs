@@ -97,7 +97,7 @@ impl TestDb {
             include_str!("../migrations/0412_voice_rooms_ownership_touched.sql"),
             include_str!("../migrations/0414_voice_rooms_custom_name.sql"),
             include_str!("../migrations/0416_voice_room_privacy.sql"),
-            include_str!("../migrations/0417_voice_create_reservations.sql"),
+            include_str!("../migrations/0422_voice_create_reservations.sql"),
         ] {
             sqlx::raw_sql(migration).execute(&pool).await?;
         }

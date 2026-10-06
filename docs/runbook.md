@@ -159,8 +159,10 @@ that monitoring is armed.
 ### Metrics alerts
 
 The Container DO pulls the container-internal `/metrics` on every keepalive tick,
-evaluates the rules in `wrangler/src/alert-rules.ts`, and posts one message per
-transition (fire, resolve) to `OPS_ALERT_WEBHOOK_URL`. See
+evaluates the rules in `wrangler/src/alert-rules.ts`, and logs/persists each
+transition (fire, resolve). It posts to `OPS_ALERT_WEBHOOK_URL` only when
+`OPS_ALERT_FORWARDING` is exactly `"on"` (default `"off"`); turning forwarding off
+retains the credential and monitoring. See
 [metrics](metrics.md#off-container-scrape-and-alert-rules). Fetch the live data
 with `curl -H "Authorization: Bearer $METRICS_SCRAPE_TOKEN" "$WORKER_URL/ops/metrics"`.
 
@@ -561,6 +563,50 @@ the 60 s budget, probe counts, the container image digest and instance counts.
 Gateway-session count is not observable from probes; read the Worker logs for it.
 If the run stops on a 401/403 it skips the restore: recover with a
 `deploy-staging` dispatch with `release_fence=true` after the binding is fixed.
+
+**Container-image backout/restore drill.** The manual `staging-container-drill`
+workflow (dispatch from `main` only) backouts staging to a previously reviewed
+Rust source/image pair and restores the baseline through the FULL container
+rollout path. It is the answer to the Worker-only drill's gap (same image on
+both legs, no session witness): every leg fences the singleton, runs a full
+`wrangler deploy` of the pinned pre-built image, takes over with an
+epoch-checked handoff, and verifies a converged `full_auto` rollout plus the
+exact Worker version, source revision, build id and running image digest
+before timing first ready. Old source is never checked out and no Dockerfile
+is rebuilt: the deploy config is generated from the reviewed `wrangler.toml`
+on `main` with only the container image overridden to the digest-pinned
+registry reference.
+
+Dispatch contract (all pins immutable; `latest` and mutable tags are refused):
+`backout_source_sha` (40-hex), `backout_build_id`, `backout_image`
+(`registry...@sha256:...`), `backout_worker_version` (UUID),
+`backout_rollout_id` (prior completed staging rollout that served the image),
+`backout_review_ref` (format `PR-<n>:ci-ok-<shortsha>`, strict tokens only),
+`backout_staging_run_id` (prior successful staging deployment run),
+`compatibility_note` (format `schema-<id>+DO-<state>+flags-<state>`, strict
+tokens only), and optional `session_attestation` (counts and windows only;
+see below). Before dispatch, recheck the pair with read-only calls: the
+source commit is on `main` with green required checks and an independent
+review; the staging run's evidence shows the same digest serving; the schema,
+Durable Object state, bindings and enabled flags are unchanged since that
+pair (no DB or storage rewind and no migrations happen in the drill, by
+construction). The script cross-checks live what it can (prior rollout
+completed with the image, Worker version served traffic, same namespace
+binding, baseline healthy with a proven revision) and refuses same-image,
+never-served and incompatible pairs before any change.
+
+Session witness: one healthy instance or `/readyz` is not acceptance. The
+script records a temporally complete probe timeline per leg and requires a
+covering operator log-count attestation of exactly one distinct gateway
+session across each handoff window (`fenced` to `first_ready` in the
+evidence). Obtain the counts from the staging Worker logs over those UTC
+windows and record only the counts, never session identifiers, tokens,
+bodies or member content. Without that attestation the witness is
+NOT_PROVEN and the drill fails acceptance while still restoring the
+baseline; mark missing coverage NOT_PROVEN, never PASS. Same-image evidence
+is rejected as container-drill acceptance. On a 401/403 the restore is
+skipped with no credential fallback: recover with a `deploy-staging`
+dispatch with `release_fence=true` after the binding is fixed.
 
 Cloudflare references:
 [Worker rollbacks and resource limits](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/),

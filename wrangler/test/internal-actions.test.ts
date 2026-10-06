@@ -14,6 +14,8 @@ import worker, { TwoBotContainer, type Env } from "../src/index.ts";
 import { OWNER_KEY, DEPLOYMENT_HEADER } from "../src/ownership.ts";
 import {
   ACTIONS_PATH,
+  CONTAINER_MARKER,
+  CONTAINER_MARKER_VALUE,
   MAX_BODY_BYTES,
   MAX_IN_FLIGHT,
   RECEIVER_BIND,
@@ -581,13 +583,16 @@ test("receiver env reaches the Container only while TWO_INTERNAL_ACTIONS is exac
     {
       TWO_INTERNAL_ACTIONS: "1",
       TWO_INTERNAL_BIND: RECEIVER_BIND,
+      [CONTAINER_MARKER]: CONTAINER_MARKER_VALUE,
       TWO_INTERNAL_CALLERS: RECEIVER_SECRETS.TWO_INTERNAL_CALLERS,
       TWO_INTERNAL_CHANNEL_KEYS: RECEIVER_SECRETS.TWO_INTERNAL_CHANNEL_KEYS,
       TWO_INTERNAL_KEYS: KEYS,
     },
-    "the bind is the Worker's loopback constant; other TWO_INTERNAL_* names never pass",
+    "the bind and container marker are the Worker's constants; other TWO_INTERNAL_* names never pass",
   );
-  assert.equal(RECEIVER_BIND, "127.0.0.1:8091");
+  assert.equal(RECEIVER_BIND, "0.0.0.0:8091");
+  assert.equal(CONTAINER_MARKER, "TWO_INTERNAL_CONTAINER");
+  assert.equal(CONTAINER_MARKER_VALUE, "1");
   assert.equal(env["LISTEN_ADDR"], "0.0.0.0:8080", "the public health bind is unchanged");
   assert.ok(on.logs.every((line) => !line.includes(KEYS)), "the signing key is never logged");
 });
@@ -632,4 +637,17 @@ test("a receiver that never listens fails startup instead of reporting ready", a
     h.bot.startAndWaitForPorts(8080, { portReadyTimeoutMS: 400, waitInterval: 100 }),
     /connection refused|port 8091|Failed to verify port/i,
   );
+});
+
+// TOG-16851: with the receiver on and listening on the Worker's wildcard bind,
+// the startup port check for both ports succeeds and the container is healthy.
+test("health and receiver ports listening together pass startup while enabled", async (t) => {
+  const h = await harness(t, ENABLED_ENV);
+  await h.bot.startAndWaitForPorts(8080, { portReadyTimeoutMS: 2000, waitInterval: 50 });
+  assert.equal(h.runtime.running, true);
+  assert.equal(h.starts.length, 1);
+  const env = h.starts[0]?.env ?? {};
+  assert.equal(env["TWO_INTERNAL_BIND"], RECEIVER_BIND);
+  assert.equal(env[CONTAINER_MARKER], CONTAINER_MARKER_VALUE);
+  assert.deepEqual(h.bot.requiredPorts, [8080, RECEIVER_PORT]);
 });

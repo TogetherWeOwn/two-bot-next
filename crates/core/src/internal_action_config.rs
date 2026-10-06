@@ -55,8 +55,25 @@ impl InternalActionConfig {
         let listen_addr: SocketAddr = bind
             .parse()
             .map_err(|_| invalid("TWO_INTERNAL_BIND", "expected a literal IP:port"))?;
-        assert_private_bind(&listen_addr.ip().to_string())
-            .map_err(|_| invalid("TWO_INTERNAL_BIND", "expected a specific private IP"))?;
+        if listen_addr.ip().is_unspecified() {
+            // TOG-16851: the Containers port check and containerFetch cannot
+            // reach a loopback-only socket, so the Worker binds the wildcard
+            // inside the private container network. A wildcard bind is accepted
+            // only with the Worker-set container marker; everywhere else the
+            // bind must stay a specific private IP.
+            match lookup("TWO_INTERNAL_CONTAINER") {
+                Ok(marker) if marker == "1" => {}
+                _ => {
+                    return Err(invalid(
+                        "TWO_INTERNAL_BIND",
+                        "expected a specific private IP",
+                    ));
+                }
+            }
+        } else {
+            assert_private_bind(&listen_addr.ip().to_string())
+                .map_err(|_| invalid("TWO_INTERNAL_BIND", "expected a specific private IP"))?;
+        }
         if listen_addr.port() == 0 {
             return Err(invalid("TWO_INTERNAL_BIND", "expected a nonzero port"));
         }
@@ -317,6 +334,37 @@ mod tests {
                 addr
             );
         }
+    }
+
+    #[test]
+    fn wildcard_bind_requires_the_container_marker() {
+        // TOG-16851: the Worker binds 0.0.0.0 inside the private container
+        // network because the port check cannot reach loopback. The marker is
+        // Worker-set; without exactly "1" the wildcard stays refused.
+        for addr in ["0.0.0.0:8091", "[::]:8091"] {
+            let mut vars = vars();
+            vars.insert("TWO_INTERNAL_BIND", addr.to_owned());
+            assert!(load(&vars).is_err(), "{addr} without the marker");
+            for marker in ["", "0", "true", " 1", "cloudflare"] {
+                let mut marked = vars.clone();
+                marked.insert("TWO_INTERNAL_CONTAINER", marker.to_owned());
+                assert!(load(&marked).is_err(), "{addr} with {marker:?}");
+            }
+            let mut marked = vars.clone();
+            marked.insert("TWO_INTERNAL_CONTAINER", "1".to_owned());
+            assert_eq!(
+                load(&marked).unwrap().unwrap().listen_addr().to_string(),
+                addr,
+                "{addr} with the marker"
+            );
+        }
+        // The marker changes nothing for a specific private bind.
+        let mut vars = vars();
+        vars.insert("TWO_INTERNAL_CONTAINER", "1".to_owned());
+        assert_eq!(
+            load(&vars).unwrap().unwrap().listen_addr().to_string(),
+            "127.0.0.1:8091"
+        );
     }
 
     #[test]

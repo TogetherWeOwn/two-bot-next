@@ -96,6 +96,9 @@ pub struct CommandOption {
     pub max_length: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub choices: Vec<CommandChoice>,
+    /// Allowed Discord channel type integers for a channel picker.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub channel_types: Vec<u8>,
     /// Nested options of a sub-command; empty for every other option.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub options: Vec<CommandOption>,
@@ -114,6 +117,7 @@ impl CommandOption {
             max_value: None,
             max_length: None,
             choices: Vec::new(),
+            channel_types: Vec::new(),
             options: Vec::new(),
         }
     }
@@ -150,6 +154,14 @@ impl CommandOption {
     #[must_use]
     pub fn max_length(mut self, max: u32) -> Self {
         self.max_length = Some(max);
+        self
+    }
+
+    /// Restrict a channel picker; the runtime must still validate the target.
+    /// <https://docs.discord.com/developers/interactions/application-commands#application-command-object-application-command-option-structure>
+    #[must_use]
+    pub fn channel_types(mut self, channel_types: Vec<u8>) -> Self {
+        self.channel_types = channel_types;
         self
     }
 
@@ -238,7 +250,9 @@ pub const PERM_MANAGE_CHANNELS: u64 = 16;
 pub const PERM_MANAGE_GUILD: u64 = 32;
 pub const PERM_MANAGE_EVENTS: u64 = 8589934592;
 
-/// Always-published core commands (two-bot `CORE_COMMAND_DATA` = leveling).
+/// Always-published core commands (two-bot `CORE_COMMAND_DATA` = leveling,
+/// plus the Next-only `/help` discovery surface — legacy has no help command,
+/// see the `help` row in the registry golden exceptions).
 #[must_use]
 pub fn core_commands() -> Vec<CommandDefinition> {
     vec![
@@ -246,8 +260,12 @@ pub fn core_commands() -> Vec<CommandDefinition> {
             CommandOption::new("member", "Show another member.", CommandOptionType::User),
         ]),
         CommandDefinition::new("leaderboard", "Show the server XP leaderboard."),
+        CommandDefinition::new("help", HELP_DESCRIPTION),
     ]
 }
+
+/// Discovery reply entry point, shared by the registry golden fixture.
+pub const HELP_DESCRIPTION: &str = "Show this server's live commands, grouped by who can use them.";
 
 /// Merge the authoritative guild command set.
 ///
@@ -309,6 +327,32 @@ pub enum RegistryError {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn logging_channel_picker_serializes_only_guild_text() {
+        let definition = crate::voice_rooms::voice_commands()
+            .into_iter()
+            .find(|command| command.name == "logging")
+            .unwrap();
+        let wire = serde_json::to_value(&definition).unwrap();
+        let sub = wire["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|option| option["name"] == "channel")
+            .unwrap();
+        assert_eq!(sub["options"][0]["type"], 7);
+        assert_eq!(sub["options"][0]["channel_types"], serde_json::json!([0]));
+        let decoded: CommandDefinition = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded, definition);
+        let unrestricted = CommandOption::new("channel", "Any channel", CommandOptionType::Channel);
+        let old_wire = serde_json::to_value(&unrestricted).unwrap();
+        assert!(old_wire.get("channel_types").is_none());
+        assert_eq!(
+            serde_json::from_value::<CommandOption>(old_wire).unwrap(),
+            unrestricted
+        );
+    }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
@@ -409,8 +453,10 @@ mod tests {
                 }
             }
             let actual = merge_commands(&[builtins, duplicates], &custom);
-            if builtin_count + 2 > 100 {
-                prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 2)));
+            // 3 core (rank, leaderboard, help) plus the generated builtins;
+            // the duplicated slice adds no new names.
+            if builtin_count + 3 > 100 {
+                prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 3)));
             } else if expected.len() > 100 {
                 prop_assert_eq!(actual, Err(RegistryError::TotalLimit(expected.len())));
             } else {
@@ -428,16 +474,21 @@ mod tests {
     #[test]
     fn core_commands_match_legacy_names() {
         let core = core_commands();
-        assert_eq!(core.len(), 2);
+        assert_eq!(core.len(), 3);
         assert_eq!(core[0].name, "rank");
         assert_eq!(core[1].name, "leaderboard");
+        assert_eq!(core[2].name, "help");
         // Guild-only, DM off (legacy `setDMPermission(false)`).
         assert!(core.iter().all(|c| !c.dm_permission));
-        // `rank` has one optional `member` user option; `leaderboard` none.
+        // `rank` has one optional `member` user option; `leaderboard` and the
+        // Next-only `help` take none; `help` is open to everyone.
         assert_eq!(core[0].options.len(), 1);
         assert_eq!(core[0].options[0].kind, 6);
         assert!(core[0].options[0].required.is_none());
         assert!(core[1].options.is_empty());
+        assert!(core[2].options.is_empty());
+        assert_eq!(core[2].description, HELP_DESCRIPTION);
+        assert!(core[2].default_member_permissions.is_none());
     }
 
     #[test]
@@ -453,7 +504,7 @@ mod tests {
         }];
         let merged = merge_commands(&[extra], &custom).expect("merges");
         let names: Vec<_> = merged.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "rsvp", "faq"]);
+        assert_eq!(names, ["rank", "leaderboard", "help", "rsvp", "faq"]);
     }
 
     #[test]
@@ -466,8 +517,8 @@ mod tests {
         )];
         let rsvp_totals = vec![CommandDefinition::new("attendance", "Show RSVP totals")];
         let merged = merge_commands(&[scorecard, rsvp_totals], &[]).expect("merges");
-        assert_eq!(merged.len(), 3); // rank, leaderboard, attendance×1
-        assert_eq!(merged[2].description, "Record a verified attendee");
+        assert_eq!(merged.len(), 4); // rank, leaderboard, help, attendance×1
+        assert_eq!(merged[3].description, "Record a verified attendee");
     }
 
     #[test]
@@ -496,12 +547,13 @@ mod tests {
         ];
         let merged = merge_commands(&[], &custom).expect("merges");
         let names: Vec<_> = merged.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "faq"]);
+        assert_eq!(names, ["rank", "leaderboard", "help", "faq"]);
     }
 
     #[test]
     fn builtin_limit_enforced() {
-        let extra: Vec<CommandDefinition> = (0..99)
+        // 3 core + 98 fillers = 101: one past the ceiling.
+        let extra: Vec<CommandDefinition> = (0..98)
             .map(|i| CommandDefinition::new(&format!("cmd-{i}"), "filler"))
             .collect();
         let err = merge_commands(&[extra], &[]).expect_err("must exceed 100");

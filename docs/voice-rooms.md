@@ -27,8 +27,19 @@ library code with no Discord dependency and can start immediately.
   That member is the room's **owner** and **original creator**.
 - New rooms copy bitrate, RTC region, video quality, NSFW flag and default user
   limit from their creator channel.
-- A room is deleted as soon as its last human member leaves (bots don't count). If
-  someone deletes a room by hand, the bot quietly forgets it.
+- Ordinary rooms are eligible for deletion after 60 continuous human-empty
+  seconds (bots don't count; unknown bot identity counts as human). A human join
+  cancels the deadline; a later leave starts a full grace, even between ticks.
+  Reconnect snapshots start a fresh grace rather than counting disconnected time.
+  If someone deletes a room by hand, the bot quietly forgets it.
+- Configured Lobby, generator/creator and category IDs are never deleted, even
+  when a room or companion provenance row claims them. Creator IDs loaded from
+  the store and live category channels are protected too. Boot process inputs
+  `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`, `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`,
+  `TWO_TEMP_VOICE_CATEGORY_ID` and comma-separated `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS`
+  supply additional protection; malformed IDs disable the voice runtime. Stored
+  settings remain unwired. `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` is not consumed:
+  this safety grace is fixed at 60 seconds.
 - If the member can't be moved in (missing Move Members, or they left first), the
   bot deletes the room immediately.
 - If the bot loses access to a room (View Channel, Connect, Manage Channels or Move
@@ -40,7 +51,7 @@ library code with no Discord dependency and can start immediately.
   settings". Anyone can view it; actions need admin.
 - **Accept when:**
   - Each join produces exactly one room, the member ends up in it, and the room is
-    deleted within seconds of emptying.
+    deleted within a timer tick of the 60-second empty grace expiring.
   - Two members joining at the same moment get two rooms.
   - After a restart, the bot reconciles tracked rooms against the channels that
     actually exist and cleans up the empty ones.
@@ -104,7 +115,13 @@ library code with no Discord dependency and can start immediately.
 
 ## V4: Vote-kick
 
-- `/kick member [reason]`: any occupant can start a vote.
+- `/kick member [reason]`: any occupant can start a vote. The shared router
+  answers every `/kick`. A moderator who passes the guild fence, the moderation
+  gate and the Kick Members check always gets the moderation kick, so sitting in
+  a room never shields a member from a moderator. Only a `/kick` the router
+  refuses (moderation off, or the invoker lacks Kick Members) reaches the vote,
+  and only when the invoker shares the target's room; everyone else gets the
+  router's refusal.
 - It passes with a strict majority of the occupants other than the target.
   Progress shows as required/total. Votes are cast with buttons; not voting
   counts as No. The vote expires after 2 minutes.
@@ -266,6 +283,14 @@ library code with no Discord dependency and can start immediately.
 ## V10: Logging, health, errors, utilities
 
 - `/logging`: log channel, detail level, who gets mentioned on errors, or off.
+  Setting a channel requires a cached guild text channel where the invoking
+  member can view and send messages. Setting a mention requires a cached,
+  mentionable, unmanaged role other than @everyone, strictly below the member's
+  highest role (the guild owner is exempt from hierarchy only). Mention Everyone
+  does not bypass these checks. Missing cache evidence refuses the change;
+  clearing either setting still works. Delivery suppresses stored roles that
+  are deleted, managed or no longer mentionable, and skips configured channels
+  that are no longer cached guild text channels.
 - Error notices go to the first place that works: the guild system channel
   (mentioning whoever last set up the bot), a DM to that person or the guild
   owner, then the creator channel's chat.

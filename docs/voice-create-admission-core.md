@@ -65,7 +65,7 @@ positive cooldown, as legacy's millisecond comparison does.
 
 The pure core is now called by the runtime with persisted history:
 
-- **Table.** `crates/cutover/migrations/0417_voice_create_reservations.sql`
+- **Table.** `crates/cutover/migrations/0422_voice_create_reservations.sql`
   stores one row per accepted create (`guild_id`, `user_id`, `created_at`, plus
   `channel_id` and `settled_at`). Rows are never deleted when a room is deleted,
   a create is rolled back or the bot restarts, so the burst window and the

@@ -400,7 +400,7 @@ VALUES ('100000000000000001', '100000000000000033', '100000000000000030',
         '2026-08-01T10:00:00.123456Z'),
        ('100000000000000001', '100000000000000034', '100000000000000035',
         '100000000000000003', '100000000000000002', '7', '2026-08-02T10:00:00Z');
--- Accepted create reservations (0417): one bound to the room above, one
+-- Accepted create reservations (0422): one bound to the room above, one
 -- rolled back (no channel), both settled; plus one still in flight.
 INSERT INTO voice_create_reservations (guild_id, user_id, created_at, channel_id, settled_at)
 VALUES ('100000000000000001', '100000000000000002', '2026-08-01T09:59:58Z',
@@ -418,6 +418,11 @@ WHERE guild_id = '100000000000000001' AND channel_id = '100000000000000034';
 INSERT INTO voice_room_blocks (guild_id, room_channel_id, blocked_member_id, created_at)
 VALUES ('100000000000000001', '100000000000000034', '100000000000000004',
         '2026-08-03T10:05:00Z');
+-- V3 approved Connect grants (0418): one member approved on the private room;
+-- `/public` revokes exactly this witness while other overwrites are preserved.
+INSERT INTO voice_join_grants (guild_id, room_channel_id, member_id, created_at)
+VALUES ('100000000000000001', '100000000000000034', '100000000000000005',
+        '2026-08-03T10:06:00Z');
 -- Pending and completed owner-grant provenance must survive backup/restore.
 INSERT INTO voice_owner_grants (guild_id, channel_id, member_id, revision, pending, touched_at)
 VALUES ('100000000000000001', '100000000000000033', '100000000000000002', 'pending-room-revision', TRUE, '2026-08-01T10:00:00Z'),
@@ -472,3 +477,19 @@ INSERT INTO voice_command_roles (guild_id, command)
 VALUES ('100000000000000001', 'kick'), ('100000000000000001', 'limit');
 INSERT INTO voice_command_role_members (guild_id, command, role_id)
 VALUES ('100000000000000001', 'kick', '100000000000000043');
+-- Vote-kick audit trail (0417): a started and a finished vote with progress,
+-- plus a refusal and an enforcement row that carry none.
+INSERT INTO voice_vote_kick_audit (guild_id, vote_id, event, room_id, initiator_id,
+  target_id, outcome, yes_votes, votes_required, voters_total, occurred_at)
+VALUES ('100000000000000001', '100000000000000050', 'vote_started', '100000000000000033',
+        '100000000000000003', '100000000000000004', 'started', 0, 3, 4,
+        '2026-08-03T10:00:00.123456Z'),
+       ('100000000000000001', '100000000000000050', 'vote_result', '100000000000000033',
+        '100000000000000003', '100000000000000004', 'passed', 3, 3, 4,
+        '2026-08-03T10:00:30Z'),
+       ('100000000000000001', '100000000000000050', 'enforcement', '100000000000000033',
+        '100000000000000003', '100000000000000004', 'connect_denied_and_disconnected',
+        NULL, NULL, NULL, '2026-08-03T10:00:31Z'),
+       ('100000000000000001', '100000000000000051', 'vote_refused', '100000000000000033',
+        '100000000000000003', '100000000000000002', 'protected_target',
+        NULL, NULL, NULL, '2026-08-03T10:05:00Z');
