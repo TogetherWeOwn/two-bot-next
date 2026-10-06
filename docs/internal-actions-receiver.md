@@ -47,7 +47,7 @@ lines, and only while `TWO_INTERNAL_ACTIONS` is exactly `1`:
 | `TWO_INTERNAL_ACTIONS` | Worker secret, forwarded as `1` |
 | `TWO_INTERNAL_BIND` | Worker constant `0.0.0.0:8091` (TOG-16851: the Containers port check and `containerFetch` cannot reach a loopback-only socket). An Operator-supplied value is ignored, so the bind can never become a public address. |
 | `TWO_INTERNAL_CALLERS` | Worker secret, e.g. `web-staging:website-staging` |
-| `TWO_INTERNAL_CONTAINER` | Worker constant `1`: proves the process runs inside the private container network, where the wildcard bind is reachable only via `containerFetch` and the startup port check. The bot refuses a wildcard bind without exactly this marker. |
+| `TWO_INTERNAL_CONTAINER` | Worker constant `1`: the Worker sets it to mark the process as running inside the private container network, where the wildcard bind is reachable only via `containerFetch` and the startup port check. The marker is a deployment claim, not a proof: the bot trusts it only because the Worker (not the Operator) sets it. A wildcard bind without exactly this marker is refused. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | Worker secret, e.g. `smoke-throwaway:<channel snowflake in the TWO Staging guild>` |
 | `TWO_INTERNAL_KEYS` | Worker secret `web-staging:<64 hex>`; never a var, never logged |
 
