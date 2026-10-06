@@ -79,7 +79,7 @@
   "TWO_INTERNAL_BIND_HOST": "Legacy split internal-action listener interface; receiver configuration uses TWO_INTERNAL_BIND instead.",
   "TWO_INTERNAL_CALLERS": "Signing-key-to-stable-caller mappings for receiver configuration; environment-only identity boundary, not loaded by Container bootstrap.",
   "TWO_INTERNAL_CHANNEL_KEYS": "Logical channel-key allowlist for internal actions.",
-  "TWO_INTERNAL_CONTAINER": "Worker-set marker admitting a wildcard receiver bind inside the private container network (TOG-16851).",
+  "TWO_INTERNAL_CONTAINER": "Worker-set marker admitting a wildcard receiver bind; the container network is presumed private but unverified (TOG-16851).",
   "TWO_INTERNAL_PORT": "Legacy split internal-action listener port; receiver configuration uses TWO_INTERNAL_BIND instead.",
   "TWO_INTERNAL_ROLE_KEYS": "Logical role-key allowlist for internal actions.",
   "TWO_JOIN_RISK_THRESHOLD": "Join-risk threshold for protection decisions.",

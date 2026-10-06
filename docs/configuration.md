@@ -161,7 +161,7 @@ Catalog entries: 122.
 | `TWO_INTERNAL_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy split internal-action listener interface; receiver configuration uses TWO_INTERNAL_BIND instead. |
 | `TWO_INTERNAL_CALLERS` | env_only | Not specified in Next | environment only | Signing-key-to-stable-caller mappings for receiver configuration; environment-only identity boundary, not loaded by Container bootstrap. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | env_only | Not specified in Next | environment only | Logical channel-key allowlist for internal actions. |
-| `TWO_INTERNAL_CONTAINER` | env_only | Not specified in Next | environment only | Worker-set marker admitting a wildcard receiver bind inside the private container network (TOG-16851). |
+| `TWO_INTERNAL_CONTAINER` | env_only | Not specified in Next | environment only | Worker-set marker admitting a wildcard receiver bind; the container network is presumed private but unverified (TOG-16851). |
 | `TWO_INTERNAL_PORT` | env_only | Not specified in Next | environment only | Legacy split internal-action listener port; receiver configuration uses TWO_INTERNAL_BIND instead. |
 | `TWO_INTERNAL_ROLE_KEYS` | env_only | Not specified in Next | environment only | Logical role-key allowlist for internal actions. |
 | `TWO_JOIN_RISK_THRESHOLD` | hot | Not specified in Next | stored unwired | Join-risk threshold for protection decisions. |
