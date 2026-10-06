@@ -762,6 +762,51 @@ async fn malformed_resource_fields_and_live_shapes_refuse_before_any_write() {
 }
 
 #[tokio::test]
+async fn malformed_emoji_name_refuses_before_any_write() {
+    for invalid in [
+        json!(""),
+        json!(" "),
+        json!(7),
+        json!(false),
+        json!({}),
+        json!([]),
+    ] {
+        for target_only in [false, true] {
+            let mut malformed = Value::Object(snapshot());
+            malformed["emojis"] =
+                json!([{"id": "e1", "name": invalid, "managed": false, "roles": []}]);
+            let malformed = malformed.as_object().unwrap().clone();
+            let (source, live) = if target_only {
+                (snapshot(), malformed)
+            } else {
+                (malformed, snapshot())
+            };
+            let prefix = if target_only { "Target." } else { "Snapshot." };
+            let defect = format!("{prefix}emojis[0].name");
+            assert_refused_without_writes(source, live, &defect).await;
+        }
+    }
+    // An absent name refuses on either side.
+    for target_only in [false, true] {
+        let mut malformed = Value::Object(snapshot());
+        malformed["emojis"] = json!([{"id": "e1", "managed": false, "roles": []}]);
+        let malformed = malformed.as_object().unwrap().clone();
+        let (source, live) = if target_only {
+            (snapshot(), malformed)
+        } else {
+            (malformed, snapshot())
+        };
+        let prefix = if target_only { "Target." } else { "Snapshot." };
+        let defect = format!("{prefix}emojis[0].name");
+        assert_refused_without_writes(source, live, &defect).await;
+    }
+    // A null name (unavailable managed emoji) still validates.
+    let mut named = snapshot();
+    named["emojis"] = json!([{"id": "e1", "name": null, "managed": true, "roles": []}]);
+    plan_restore(&named, &named).unwrap();
+}
+
+#[tokio::test]
 async fn legacy_and_sealed_masks_and_additive_fields_still_restore() {
     use two_bot_core::backup::guild_config::seal_snapshot;
 

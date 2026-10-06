@@ -251,6 +251,20 @@ fn validate_input_shape(input: &Map<String, Value>, label: &str) -> Result<(), R
             if collection != "emojis" && !nonempty_string(row.get("name")) {
                 return Err(shape_error(&format!("{path}.name"), "a nonempty string"));
             }
+            // Unvalidated emoji names reach the planner: "" plans a create
+            // that Discord rejects after earlier writes land, while a
+            // non-string name is silently skipped. Null stays valid for
+            // unavailable managed emojis.
+            if collection == "emojis"
+                && row
+                    .get("name")
+                    .is_none_or(|name| !name.is_null() && !nonempty_string(Some(name)))
+            {
+                return Err(shape_error(
+                    &format!("{path}.name"),
+                    "null or a nonempty string",
+                ));
+            }
             for field in ["managed", "hoist", "mentionable"] {
                 if let Some(value) = row.get(field) {
                     if !value.is_boolean() {
