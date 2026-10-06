@@ -166,6 +166,11 @@ def rollouts(client, app_id):
     rows = sequence(client.api(f"/containers/applications/{identifier(app_id)}/rollouts?limit={LIMIT}"))
     # The pinned API exposes a `last` input but no verified next-cursor contract.
     # A saturated page is not evidence of a complete before/after snapshot.
+    # Live note: the endpoint returns at most 50 rows despite limit=100
+    # (retention ~31h seen 10-04 19:43Z to 10-06 03:09Z), so this guard never
+    # fires on live traffic. Callers treat an absent id as unproven and
+    # re-derive pins from a live read (distance-1 rule) instead of relying
+    # on this page being complete.
     require(len(rows) < LIMIT, "rollout_snapshot_truncated")
     ids = [identifier(mapping(row).get("id")) for row in rows]
     require(len(ids) == len(set(ids)), "duplicate_rollout_identity")
