@@ -20,7 +20,13 @@ Fail-closed rules, each pinned by scripts/test_staging_container_drill.py:
   of a named prior rollout that completed on staging, and the named Worker
   version must have served staging traffic with the same durable-object
   namespace as the baseline. Same-image, never-served and
-  binding-incompatible pairs are refused before any change.
+  binding-incompatible pairs are refused before any change. The named-rollout
+  proof is three separate refusals: `backout_rollout_absent` (pin missing
+  from the live rollouts page, including pins aged out of it),
+  `backout_rollout_not_completed` (`status=<allowlisted>`; `replaced` and
+  `reverted` stay unproven even when the image matches, so pins expire on
+  any newer rollout and the target stays the newest completed rollout with
+  a differing image), and `backout_rollout_image_mismatch`.
 - The restore leg returns to the live-captured healthy baseline (serving
   Worker version, serving image, `/readyz` revision/build); the final
   running image must equal the baseline image or the drill fails.
@@ -429,10 +435,23 @@ class Drill:
         require(pin["worker_version"] in history, "backout_worker_never_served")
         rows = {rollout.identifier(rollout.mapping(row).get("id")): rollout.mapping(row)
                 for row in rollout.rollouts(self.client, app["id"])}
-        require(pin["rollout_id"] in rows, "backout_rollout_unproven")
+        # The live rollouts page holds at most ~50 rows despite limit=100
+        # (retention ~31h seen 10-04 to 10-06), so a pin older than that reads
+        # as absent here. Pins therefore expire on ANY newer rollout and are
+        # always re-derived from a live read of this endpoint (distance-1:
+        # newest completed rollout with a differing image).
+        require(pin["rollout_id"] in rows, "backout_rollout_absent")
         proven = rows[pin["rollout_id"]]
-        require(mapping_status(proven) == "completed", "backout_rollout_unproven")
-        require(rollout_image(proven) == pin["image"], "backout_rollout_unproven")
+        # Strict: `replaced` with a matching image stays unproven. A replaced
+        # rollout was superseded (run 5: pin present, image matched, status
+        # `replaced` after 5 newer rollouts), so its convergence proof no
+        # longer belongs to it. The detail names the allowlisted status.
+        proven_status = mapping_status(proven)
+        require(proven_status == "completed", "backout_rollout_not_completed",
+                "status=" + (proven_status if proven_status in
+                              ("pending", "progressing", "completed",
+                               "replaced", "reverted") else "unknown"))
+        require(rollout_image(proven) == pin["image"], "backout_rollout_image_mismatch")
         namespace = rollout.identifier(
             rollout.mapping(app.get("durable_objects")).get("namespace_id"))
         require(rollout.worker_namespace(self.client, pin["worker_version"]) == namespace,

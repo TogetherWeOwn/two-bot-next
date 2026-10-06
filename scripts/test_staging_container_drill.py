@@ -380,22 +380,28 @@ class RefusalTests(unittest.TestCase):
         self.assert_refused_without_change(World(), pin(worker_version=NEVER),
                                            "backout_worker_never_served")
 
-    def test_backout_rollout_must_be_completed_with_the_image(self):
+    def test_backout_rollout_absent_refused(self):
         world = World()
         world.rollouts = [row for row in world.rollouts if row["id"] != "r-backout"]
-        self.assert_refused_without_change(world, pin(), "backout_rollout_unproven")
+        self.assert_refused_without_change(world, pin(), "backout_rollout_absent")
 
-        world = World()
-        for row in world.rollouts:
-            if row["id"] == "r-backout":
-                row["status"] = "reverted"
-        self.assert_refused_without_change(world, pin(), "backout_rollout_unproven")
+    def test_backout_rollout_not_completed_refused(self):
+        # Live run 5: pin present with a matching image but status `replaced`
+        # after 5 newer rollouts. Strict policy keeps it unproven.
+        for status in ("replaced", "reverted", "progressing", "pending"):
+            with self.subTest(status=status):
+                world = World()
+                for row in world.rollouts:
+                    if row["id"] == "r-backout":
+                        row["status"] = status
+                self.assert_refused_without_change(world, pin(), "backout_rollout_not_completed")
 
+    def test_backout_rollout_image_mismatch_refused(self):
         world = World()
         for row in world.rollouts:
             if row["id"] == "r-backout":
                 row["target_configuration"] = {"image": OTHER_IMAGE}
-        self.assert_refused_without_change(world, pin(), "backout_rollout_unproven")
+        self.assert_refused_without_change(world, pin(), "backout_rollout_image_mismatch")
 
     def test_incompatible_worker_binding_refused(self):
         world = World()
