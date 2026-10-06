@@ -49,6 +49,7 @@ mod join_risk_runtime_tests;
 mod lifecycle_tests;
 #[cfg(test)]
 mod log_volume_guard_tests;
+mod logging;
 mod member_cli;
 mod member_runtime;
 mod metrics_http;
@@ -85,7 +86,7 @@ mod website_jobs;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, Instrument};
 use two_bot_core::{ComponentStatus, Config, VoiceGates};
 
 use futures_util::FutureExt as _;
@@ -130,13 +131,11 @@ async fn main() {
         print_backup_help_and_exit().await;
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "two_bot=info".into()),
-        )
-        .init();
+    logging::init();
+    run(&cli_args).instrument(logging::run_span()).await;
+}
 
+async fn run(cli_args: &[String]) {
     let receiver_config = two_bot_core::internal_action_config::InternalActionConfig::from_env()
         .unwrap_or_else(|_| {
             tracing::error!(
@@ -153,7 +152,7 @@ async fn main() {
             );
             std::process::exit(1);
         }
-        tracing::warn!(error = %err, "config invalid; continuing with safe defaults");
+        tracing::warn!(msg = "config_invalid", error = %err, "config invalid; continuing with safe defaults");
         Config {
             discord_token: None,
             database_url: None,
@@ -257,7 +256,7 @@ async fn main() {
         let vars: std::collections::HashMap<String, String> = std::env::vars().collect();
         let gates = two_bot_core::disable_preflight::DisableGates::from_map(&vars);
         if !gates.moderation || !gates.automations {
-            let overridden = two_bot_core::disable_preflight::override_active(&vars, &cli_args);
+            let overridden = two_bot_core::disable_preflight::override_active(&vars, cli_args);
             match two_bot_core::disable_preflight::boot_check(&pool, &gates, overridden).await {
                 Ok(two_bot_core::disable_preflight::BootVerdict::Proceed) => {}
                 Ok(two_bot_core::disable_preflight::BootVerdict::Refused(owed)) => {
@@ -349,7 +348,8 @@ async fn main() {
         let self_roles = self_roles.clone();
         let member = member.clone();
         let linger_stop = stopping.clone();
-        Some(tokio::spawn(async move {
+        let gateway_span = logging::gateway_span(guild_id);
+        let task = async move {
             // A panic is caught only to name it on /readyz; the task still ends
             // in `Err`, which the supervisor treats exactly like a JoinError.
             let outcome: Result<Result<(), gateway_failure::StepFailure>, _> =
@@ -557,6 +557,7 @@ async fn main() {
                         gateway_url.as_deref(),
                     );
                     info!(
+                        msg = "gateway_connecting",
                         resume = saved.is_some(),
                         "durable gateway initialized; shard connecting"
                     );
@@ -600,10 +601,12 @@ async fn main() {
                     Err(failed.error)
                 }
             }
-        }))
+        };
+        Some(tokio::spawn(task.instrument(gateway_span)))
     } else {
         *gateway.write().await = GatewayState::Unconfigured;
         info!(
+            msg = "gateway_parked",
             missing = gateway_prerequisites(&config).unwrap_err(),
             status = ?ComponentStatus::Down,
             "gateway prerequisites missing; gateway parked, /readyz reports down"
@@ -627,6 +630,7 @@ async fn main() {
     };
     if result.is_err() {
         tracing::error!(
+            msg = "shutdown_failed",
             startup_phase = "service_supervisor",
             error_class = "container_service_failed",
             "container service failed"
@@ -658,6 +662,7 @@ async fn publish_gateway_failure(
     linger: std::time::Duration,
 ) {
     tracing::error!(
+        msg = "gateway_failed",
         startup_phase = gateway_failure::FailurePhase::DurableGateway.as_str(),
         error_class = class.as_str(),
         "durable gateway failed; checkpoint unchanged, readiness unavailable"
