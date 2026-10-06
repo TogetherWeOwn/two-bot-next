@@ -1424,9 +1424,12 @@ impl LiveGuild {
     /// Stored roles can become managed/unmentionable or be deleted after a save.
     /// Never use the bot's Mention Everyone permission to override mentionability.
     fn safe_notice_role(&self, id: Snowflake) -> bool {
+        // No readiness gate: delivery filters last-known cache evidence, which
+        // survives a gateway reconnect, so a due notice still reaches the
+        // configured channel with its mention instead of leaking to the
+        // system channel. Absent evidence fails the lookups below on its own.
         let live = self.inner.read().expect("live voice lock");
-        live.ready
-            && id != self.guild_id
+        id != self.guild_id
             && live.bot.as_ref().is_some_and(|bot| {
                 bot.roles
                     .iter()
@@ -1435,12 +1438,13 @@ impl LiveGuild {
     }
 
     fn text_notice_channel(&self, id: Snowflake) -> bool {
+        // No readiness gate here either: see `safe_notice_role`. An uncached
+        // channel fails the lookup below on its own.
         let live = self.inner.read().expect("live voice lock");
-        live.ready
-            && live.channels.get(&id).is_some_and(|channel| {
-                channel.guild_id.map(Id::get) == Some(self.guild_id)
-                    && channel.kind == ChannelType::GuildText
-            })
+        live.channels.get(&id).is_some_and(|channel| {
+            channel.guild_id.map(Id::get) == Some(self.guild_id)
+                && channel.kind == ChannelType::GuildText
+        })
     }
 
     /// System channel and owner for V10 notice routing; `None` until the bot

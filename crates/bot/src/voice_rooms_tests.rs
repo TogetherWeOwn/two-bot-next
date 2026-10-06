@@ -8278,6 +8278,26 @@ async fn configured_channel_wins_over_the_fallback_chain() {
 }
 
 #[tokio::test]
+async fn configured_channel_still_wins_while_reconnecting() {
+    // `disconnect` clears readiness but keeps the cached channels and roles.
+    // Delivery filters last-known evidence, so a due notice still reaches the
+    // configured channel with its mention instead of leaking to the system
+    // channel and consuming a repeat.
+    let settings = LoggingSettings {
+        channel_id: Some(650),
+        mention_role_id: Some(NOTICE_ROLE),
+        ..LoggingSettings::default()
+    };
+    let mut worker = failed_worker(settings, Some(SYSTEM_CHANNEL)).await;
+    worker.live.disconnect();
+    assert!(worker.send_notices(0).await);
+    let notices = sent(&worker);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].0, NoticeTarget::Channel(650));
+    assert_eq!(notices[0].2, Some(NOTICE_ROLE));
+}
+
+#[tokio::test]
 async fn notices_fall_back_from_system_channel_to_owner_dm_to_creator_chat() {
     let mut worker = failed_worker(LoggingSettings::default(), Some(SYSTEM_CHANNEL)).await;
     worker
