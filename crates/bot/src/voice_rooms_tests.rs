@@ -4271,10 +4271,15 @@ async fn logging_mention_refuses_unsafe_roles_without_saving() {
         )
         .await;
         let response = response.expect("refusal");
-        assert!(
-            response_text(&response).contains("Nothing was changed"),
-            "{case}"
-        );
+        let text = response_text(&response);
+        if case == "missing-held" {
+            // The actor's own role is missing from cache, so the guild admin
+            // gate denies before target validation runs. Either layer refuses
+            // without saving.
+            assert_eq!(text, "You need Manage Channels to use /logging.", "{case}");
+        } else {
+            assert!(text.contains("Nothing was changed"), "{case}: {text}");
+        }
         assert_eq!(
             response.data.as_ref().unwrap().flags,
             Some(MessageFlags::EPHEMERAL)
@@ -4373,16 +4378,21 @@ async fn logging_channel_refuses_non_text_unknown_and_hidden_targets() {
             ),
         )
         .await;
-        assert!(
-            response_text(&response.unwrap()).contains("Nothing was changed"),
-            "{case}"
-        );
+        let text = response_text(&response.unwrap());
+        if case == "missing-held" {
+            // The actor's own role is missing from cache, so the guild admin
+            // gate denies before target validation runs. Either layer refuses
+            // without saving.
+            assert_eq!(text, "You need Manage Channels to use /logging.", "{case}");
+        } else {
+            assert!(text.contains("Nothing was changed"), "{case}: {text}");
+        }
         assert_eq!(*shared.lock().unwrap(), initial, "{case}");
     }
 }
 
 #[tokio::test]
-async fn logging_targets_fail_closed_without_live_evidence_but_clearing_still_works() {
+async fn logging_targets_fail_closed_without_target_evidence_but_clearing_still_works() {
     let initial = LoggingSettings {
         channel_id: Some(5),
         mention_role_id: Some(9),
@@ -4390,6 +4400,12 @@ async fn logging_targets_fail_closed_without_live_evidence_but_clearing_still_wo
     };
     let shared = Arc::new(Mutex::new(initial));
     let runtime = logging_runtime(shared.clone(), None, None);
+    // The actor stays admin through the live cache, but neither target has
+    // cache evidence, so validation refuses while clearing still saves.
+    let mut snapshot = logging_snapshot();
+    snapshot.channels.clear();
+    snapshot.bot.roles.retain(|role| role.id.get() != 9);
+    assert!(runtime.publish_snapshot(GUILD, snapshot));
     for sub in [
         sub_option("channel", vec![channel_option("channel", 5)]),
         sub_option("mention", vec![role_option("role", 9)]),
@@ -4442,11 +4458,13 @@ async fn logging_command_reports_store_failures_and_changes_nothing() {
     };
     let shared = Arc::new(Mutex::new(LoggingSettings::default()));
     let unsavable = logging_runtime(shared.clone(), None, Some(StoreError::Unavailable));
+    assert!(unsavable.publish_snapshot(GUILD, logging_snapshot()));
     let (_, response) = handle_capture(&unsavable, &level()).await;
     assert!(response_text(&response.expect("reply")).contains("Nothing was changed"));
     assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
 
     let unreadable = logging_runtime(shared.clone(), Some(StoreError::Unavailable), None);
+    assert!(unreadable.publish_snapshot(GUILD, logging_snapshot()));
     let (_, response) = handle_capture(&unreadable, &level()).await;
     assert!(response_text(&response.expect("reply")).contains("Nothing was changed"));
     assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
