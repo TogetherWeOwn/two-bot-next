@@ -81,8 +81,8 @@ tests.
 
 `crates/bot/src/voice_rooms/private_runtime.rs` runs this core inside the
 guild worker. It covers the two owner commands, the persisted privacy state and
-the Join channel; the join-request buttons, grants and pending requests are a
-later slice.
+the Join channel. The join-request flow is in
+[Runtime wiring: join requests](#runtime-wiring-join-requests).
 
 - **Gate.** The caller must be in the room and be its owner or hold Manage
   Channels (`require_room_owner`). Both commands are idempotent and reply
@@ -122,8 +122,64 @@ later slice.
   one that is not is forgotten and the forgetting persisted. The room stays
   private; `/private` plans a new Join channel. Nothing is forgotten without an
   authoritative snapshot that still shows the room.
-- **Not yet.** Renaming the Join channel when ownership or the owner's name
-  changes (`set_owner`), and persisting grants and pending requests.
+- **Grants are durable.** Approved members' Connect allows are witnessed in
+  `voice_join_grants` (one row per room member, written before the grant PUT
+  and retired only after the revoke lands or the grant is refused), so a
+  restart cannot strand a Connect allow past `/public`. Worker load hydrates
+  private rooms' grants and re-queues revocations for grants whose room is
+  public or gone. Revocation clears only the Connect bit and keeps every other
+  allow/deny bit, including vote-kick denies.
+
+## Runtime wiring: join requests
+
+`crates/bot/src/voice_rooms/join_requests.rs` runs `enter_join_channel` and
+`decide` inside the same worker.
+
+- **Entry.** Each reconcile looks at who sits in a private room's Join channel.
+  A member counts as having *entered* when the gateway recorded a new
+  transition for them, so one stay raises one request: an owner's Deny does not
+  raise the same member again every tick. Leaving and coming back asks again
+  under a fresh id. Bots are skipped; the core already ignores the owner,
+  occupants, approved members and blocked members (silently).
+- **Prompt.** One `RoomAction::AskJoinOwner` posts a message in the room's own
+  chat with three buttons,
+  `two:voice:join-approve|deny|block:<room>:<request>`. Only the owner is pinged;
+  the requester is named by id. There is no DM fallback: a press on a DM carries
+  no guild, so it could not be routed or role-gated. A request answered or
+  withdrawn before the queue reaches the prompt posts nothing. When the bot
+  cannot post in the room's chat the request is dropped (the failure shows in
+  `/setup`) instead of sitting pending behind buttons nobody got.
+- **Answer.** A press runs the guild's `/private` role gate, then the worker
+  checks the room's *current* owner (admins do not count) and the request's
+  current state. A stale, answered or withdrawn button, and one minted before a
+  restart, is answered with an ephemeral refusal and changes nothing; the
+  worker never stays silent on a press it owns. Ids outside the three join
+  verbs stay with their own handlers. The answer replaces the prompt in place
+  (no buttons, no pings).
+  - *Approve* queues one write: a Connect allow for that member on the room
+    only (never Manage Roles, other bits kept), then a move from the Join
+    channel, but only if the member is still there. It refuses when the member
+    carries a Connect deny from a passed vote-kick: an owner cannot undo a vote.
+    A refused grant is not claimed, so the member can ask again.
+  - *Deny* writes nothing.
+  - *Block* persists through the privacy record (`voice_room_blocks`), so it
+    survives a restart and `/public`.
+- **Withdrawal.** An ownership change withdraws requests raised to the previous
+  owner, retires their buttons and asks the new owner about everyone still
+  waiting. `/public` takes approved members' Connect allow back and retires
+  open prompts. A room delete forgets the state; its prompts go with the
+  channel.
+- **Request ids.** Pending requests, grants and prompts are runtime-only. Each
+  button appends the worker's fresh 128-bit CSPRNG epoch to the numeric core
+  request id. The worker refuses a different or missing epoch before deciding,
+  so a reset counter or a repeated/backward wall clock cannot revive an old
+  button. Epochs are collision-resistant, not clock-based; ids remain within
+  Discord's 100-character limit even with maximum-width numeric fields.
+- **Grants are durable.** The approval intent is recorded in
+  `voice_join_grants` before the Connect PUT; a refused grant retires its row
+  so the member can ask again, while an unknown grant or revoke outcome keeps
+  its row so a retry or a restart can still revoke. Only a successful revoke
+  (or a refused grant) retires the witness.
 
 ## Residual parent work
 

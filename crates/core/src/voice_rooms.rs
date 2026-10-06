@@ -30,6 +30,11 @@ use crate::funnel::Snowflake;
 pub const MAX_CHANNEL_NAME_LEN: u32 = 100;
 /// Largest voice user limit (`/limit`, 0 = unlimited, max 99).
 pub const MAX_USER_LIMIT: i64 = 99;
+/// Largest first room number (`/position first-number`): the V11 export codec
+/// stores it as `u32`, so anything above `u32::MAX` breaks `/export` and
+/// `/import` with "Could not read the voice configuration" and can overflow
+/// room numbering later. Mirrored by the `voice_creators` SQL CHECK.
+pub const MAX_FIRST_ROOM_NUMBER: i64 = u32::MAX as i64;
 /// Discord category ceiling (spec V1: hitting it errors and suggests a
 /// second creator channel in another category).
 pub const MAX_CHANNELS_PER_CATEGORY: usize = 50;
@@ -125,7 +130,7 @@ impl CreatorChannel {
                 return Err(CreatorSettingsError::LimitOutOfRange(limit));
             }
         }
-        if self.first_room_number < 1 {
+        if !(1..=MAX_FIRST_ROOM_NUMBER).contains(&self.first_room_number) {
             return Err(CreatorSettingsError::NumberStartOutOfRange(
                 self.first_room_number,
             ));
@@ -180,7 +185,7 @@ pub fn is_usable_channel_name(name: &str) -> bool {
 pub enum CreatorSettingsError {
     #[error("default limit must be 0–99, got {0}")]
     LimitOutOfRange(i64),
-    #[error("first room number must be >= 1, got {0}")]
+    #[error("first room number must be 1–4294967295, got {0}")]
     NumberStartOutOfRange(i64),
     #[error("permission source is a channel but no channel was given")]
     MissingPermissionChannel,
@@ -753,6 +758,14 @@ pub enum RoomAction {
         channel_id: Snowflake,
         name: String,
     },
+    /// V3 `/limit` and `/unlimit`: set the room channel's user limit
+    /// (`0` is unlimited, at most [`MAX_USER_LIMIT`]). The worker has already
+    /// decided the value with the pure room-controls core; the write is
+    /// idempotent, so a retried action is safe.
+    SetUserLimit {
+        channel_id: Snowflake,
+        user_limit: u32,
+    },
     /// V3 `/name`: persist the worker's custom-name override for a tracked
     /// room (`None` after a restore). No Discord write: the rename itself
     /// rides [`RoomAction::RenameRoom`] on the deferred lane. A stale action
@@ -796,6 +809,35 @@ pub enum RoomAction {
     SavePrivacy {
         channel_id: Snowflake,
     },
+    /// V3 join request: show the room owner the Approve / Deny / Block buttons
+    /// for one pending request. The dispatch re-checks that the request is
+    /// still pending, so a request answered or withdrawn while this waited
+    /// posts nothing.
+    AskJoinOwner {
+        room_channel_id: Snowflake,
+        member_id: Snowflake,
+        request_id: u64,
+    },
+    /// V3 Approve: allow Connect for this member on the room only, then move
+    /// them in from the Join channel if they are still there. Both writes are
+    /// idempotent, so a retried action is safe.
+    ApproveJoin {
+        room_channel_id: Snowflake,
+        member_id: Snowflake,
+    },
+    /// V3 `/public`: remove the Connect allow an approval wrote for this
+    /// member.
+    RevokeJoinAccess {
+        room_channel_id: Snowflake,
+        member_id: Snowflake,
+    },
+    /// V3: take the buttons off a join-request message in the room's chat
+    /// whose request can no longer be answered. Scoped to its room: once the
+    /// room is deleted the message goes with it, so a pending edit is dropped.
+    RetireJoinPrompt {
+        room_channel_id: Snowflake,
+        message_id: Snowflake,
+    },
 }
 
 /// Queue lane.
@@ -813,6 +855,18 @@ impl RoomAction {
         }
     }
 
+    /// Ordering scope, separate from suspend/drop: a companion creation
+    /// must not overtake a backed-off delete of its room, even though its
+    /// unknown creation outcome must not be cancelled by suspend/drop.
+    fn ordering_channel_id(&self) -> Option<Snowflake> {
+        match self {
+            Self::CreateCompanion {
+                room_channel_id, ..
+            } => Some(*room_channel_id),
+            _ => self.channel_id(),
+        }
+    }
+
     /// The room channel this action touches, if any (suspend/drop scope).
     /// Companion view edits scope to their room: once the room is gone its
     /// companion is deleted, so pending grants/revokes for it are dropped
@@ -827,6 +881,7 @@ impl RoomAction {
             | Self::DeleteRoom { channel_id }
             | Self::UpdateOwnership { channel_id, .. }
             | Self::RenameRoom { channel_id, .. }
+            | Self::SetUserLimit { channel_id, .. }
             | Self::SetEveryoneConnect { channel_id, .. }
             | Self::SavePrivacy { channel_id }
             | Self::CreateJoinChannel {
@@ -834,6 +889,22 @@ impl RoomAction {
                 ..
             }
             | Self::SetCustomName { channel_id, .. }
+            | Self::AskJoinOwner {
+                room_channel_id: channel_id,
+                ..
+            }
+            | Self::ApproveJoin {
+                room_channel_id: channel_id,
+                ..
+            }
+            | Self::RevokeJoinAccess {
+                room_channel_id: channel_id,
+                ..
+            }
+            | Self::RetireJoinPrompt {
+                room_channel_id: channel_id,
+                ..
+            }
             | Self::GrantCompanionView {
                 room_channel_id: channel_id,
                 ..
@@ -924,7 +995,9 @@ impl QueueInner {
 /// notes": per-guild ordered queues, honour retry-after on 429).
 ///
 /// Two FIFO lanes per guild: urgent (create/move/delete) drains before
-/// deferred (rename). Order is preserved within each lane.
+/// deferred (rename). A backed-off delete may be bypassed only by actions
+/// for other known room channels, never its own follow-ups or an unscoped
+/// create. Other backoffs retain lane order; urgent 429s still hold the guild.
 #[derive(Debug, Default)]
 pub struct ActionQueue {
     inner: Mutex<QueueInner>,
@@ -987,6 +1060,9 @@ impl ActionQueue {
         // so rename backlogs never delay room lifecycle writes. Suspension
         // is snapshotted first so the scan closure holds no `inner` borrow.
         let suspended: Vec<(Snowflake, Snowflake)> = inner.suspended.iter().copied().collect();
+        // Carry waiting room scopes into the deferred lane too: a rename
+        // must not overtake that room's delayed lifecycle action.
+        let mut waiting_channels = HashSet::new();
         for urgent in [true, false] {
             let queue = if urgent {
                 inner.urgent.get_mut(&guild_id)
@@ -996,19 +1072,40 @@ impl ActionQueue {
             let Some(queue) = queue else {
                 continue;
             };
-            let idx = queue.iter().position(|q| {
-                q.action
+            let mut idx = None;
+            for (i, queued) in queue.iter().enumerate() {
+                if queued
+                    .action
                     .channel_id()
-                    .is_none_or(|ch| !suspended.contains(&(guild_id, ch)))
-            });
-            if let Some(i) = idx {
-                if queue[i].not_before_ms <= now_ms {
-                    let mut action = queue.remove(i)?;
-                    inner.next_dispatch_id += 1;
-                    action.dispatch_id = inner.next_dispatch_id;
-                    inner.in_flight.insert(guild_id, action.dispatch_id);
-                    return Some(action);
+                    .is_some_and(|ch| suspended.contains(&(guild_id, ch)))
+                {
+                    continue;
                 }
+                let channel = queued.action.ordering_channel_id();
+                if channel.is_some_and(|ch| waiting_channels.contains(&ch)) {
+                    continue;
+                }
+                if channel.is_none() && !waiting_channels.is_empty() {
+                    break;
+                }
+                if queued.not_before_ms > now_ms {
+                    if let Some(ch) = channel {
+                        waiting_channels.insert(ch);
+                    }
+                    if matches!(queued.action, RoomAction::DeleteRoom { .. }) {
+                        continue;
+                    }
+                    break;
+                }
+                idx = Some(i);
+                break;
+            }
+            if let Some(i) = idx {
+                let mut action = queue.remove(i)?;
+                inner.next_dispatch_id += 1;
+                action.dispatch_id = inner.next_dispatch_id;
+                inner.in_flight.insert(guild_id, action.dispatch_id);
+                return Some(action);
             }
         }
         None
@@ -1106,21 +1203,37 @@ impl ActionQueue {
     }
 
     /// Drop every pending action touching the channel (room deleted by hand
-    /// or forgotten by reconcile). Returns the dropped count.
-    pub fn drop_for_channel(&self, guild_id: Snowflake, channel_id: Snowflake) -> usize {
+    /// or forgotten by reconcile). Returns the dropped actions' ids so
+    /// callers can settle their waiters instead of leaving them orphaned.
+    pub fn drain_for_channel(&self, guild_id: Snowflake, channel_id: Snowflake) -> Vec<u64> {
         let mut inner = self.inner.lock().expect("queue lock");
-        let mut dropped = 0;
-        if let Some(queue) = inner.urgent.get_mut(&guild_id) {
-            let before = queue.len();
-            queue.retain(|q| q.action.channel_id() != Some(channel_id));
-            dropped += before - queue.len();
-        }
-        if let Some(queue) = inner.deferred.get_mut(&guild_id) {
-            let before = queue.len();
-            queue.retain(|q| q.action.channel_id() != Some(channel_id));
-            dropped += before - queue.len();
+        let mut dropped = Vec::new();
+        for lane in [true, false] {
+            let queue = if lane {
+                inner.urgent.get_mut(&guild_id)
+            } else {
+                inner.deferred.get_mut(&guild_id)
+            };
+            let Some(queue) = queue else {
+                continue;
+            };
+            let mut kept = VecDeque::with_capacity(queue.len());
+            for queued in queue.drain(..) {
+                if queued.action.channel_id() == Some(channel_id) {
+                    dropped.push(queued.id);
+                } else {
+                    kept.push_back(queued);
+                }
+            }
+            *queue = kept;
         }
         dropped
+    }
+
+    /// Drop every pending action touching the channel (room deleted by hand
+    /// or forgotten by reconcile). Returns the dropped count.
+    pub fn drop_for_channel(&self, guild_id: Snowflake, channel_id: Snowflake) -> usize {
+        self.drain_for_channel(guild_id, channel_id).len()
     }
 
     /// Pending (urgent, deferred) counts for the guild. Diagnostics/tests.
@@ -1385,7 +1498,7 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
                 "First room number (numbering starts here)",
                 CommandOptionType::Integer,
             )
-            .min_value(1),
+            .int_range(1, MAX_FIRST_ROOM_NUMBER),
         ]),
         CommandDefinition::new(
             "group",
@@ -1507,6 +1620,17 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
             "public",
             "Let anyone join your voice room again and remove its Join channel",
         ),
+        CommandDefinition::new(
+            "limit",
+            "Set your room's user limit (no number locks it at the current headcount)",
+        )
+        .options(vec![CommandOption::new(
+            "count",
+            "Limit 0-99 (0 is unlimited; leave empty to lock at who is here now)",
+            CommandOptionType::Integer,
+        )
+        .int_range(0, MAX_USER_LIMIT)]),
+        CommandDefinition::new("unlimit", "Remove your room's user limit"),
     ]
 }
 
@@ -1888,19 +2012,50 @@ mod tests {
     }
 
     #[test]
+    fn deletes_keep_independent_retry_deadlines() {
+        let q = ActionQueue::new();
+        let first = q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 500 });
+        let second = q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 501 });
+        let healthy = q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 502 });
+        let action = q.pop_due(GUILD, 0).unwrap();
+        assert!(q.mark_failed(action, "transient".to_owned(), 0));
+        let action = q.pop_due(GUILD, 1).expect("second room is independent");
+        assert_eq!(action.id, second);
+        assert!(q.mark_failed(action, "transient".to_owned(), 1));
+        let action = q.pop_due(GUILD, 1).expect("healthy room is independent");
+        assert_eq!(action.id, healthy);
+        assert!(q.mark_succeeded(&action));
+        assert_eq!(q.pop_due(GUILD, 1_999), None);
+        let action = q.pop_due(GUILD, 2_000).unwrap();
+        assert_eq!(action.id, first);
+        assert!(q.mark_failed(action, "still down".to_owned(), 2_000));
+        assert_eq!(q.pop_due(GUILD, 2_000), None);
+        let action = q.pop_due(GUILD, 2_001).expect("second room's own deadline");
+        assert_eq!(action.id, second);
+        assert_eq!(action.attempts, 1);
+        assert!(q.mark_succeeded(&action));
+        assert_eq!(q.pop_due(GUILD, 5_999), None);
+        let action = q.pop_due(GUILD, 6_000).expect("first room's second retry");
+        assert_eq!(action.id, first);
+        assert_eq!(action.attempts, 2);
+    }
+
+    #[test]
     fn queue_dead_letters_after_max_attempts() {
         let q = ActionQueue::new();
         q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 500 });
         let mut action = q.pop_due(GUILD, 0).expect("due");
-        for _ in 0..QUEUE_MAX_ATTEMPTS {
+        for attempts in 1..=QUEUE_MAX_ATTEMPTS {
             let now = action.not_before_ms;
-            q.mark_failed(action.clone(), "boom".to_owned(), now);
-            if let Some(next) = q.pop_due(GUILD, u64::MAX) {
-                action = next;
-            } else {
-                break;
+            assert!(q.mark_failed(action.clone(), "boom".to_owned(), now));
+            if attempts < QUEUE_MAX_ATTEMPTS {
+                let due = now + fail_backoff_ms(attempts);
+                assert_eq!(q.pop_due(GUILD, due - 1), None);
+                action = q.pop_due(GUILD, due).expect("retry exactly when due");
+                assert_eq!(action.attempts, attempts);
             }
         }
+        assert_eq!(q.pop_due(GUILD, u64::MAX), None);
         let failed = q.failed();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].reason, "boom");
@@ -1949,6 +2104,19 @@ mod tests {
             bad.validate(),
             Err(CreatorSettingsError::NumberStartOutOfRange(0))
         );
+        // The V11 export codec stores the start as u32: anything above
+        // u32::MAX breaks `/export` and `/import`.
+        let mut capped = creator();
+        capped.first_room_number = MAX_FIRST_ROOM_NUMBER;
+        assert!(capped.validate().is_ok());
+        for bad_number in [MAX_FIRST_ROOM_NUMBER + 1, i64::MAX] {
+            let mut bad = creator();
+            bad.first_room_number = bad_number;
+            assert_eq!(
+                bad.validate(),
+                Err(CreatorSettingsError::NumberStartOutOfRange(bad_number))
+            );
+        }
         let mut bad = creator();
         bad.permission_source = PermissionSource::Channel(CREATOR);
         bad.permission_channel_id = None;
@@ -1992,15 +2160,160 @@ mod tests {
     }
 
     #[test]
-    fn backoff_preserves_lifecycle_order() {
+    fn delete_backoff_preserves_channel_order_without_blocking_other_rooms() {
         let q = ActionQueue::new();
         let first = q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 500 });
-        q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 501 });
+        let same_channel = q.enqueue(
+            GUILD,
+            RoomAction::MoveMember {
+                member_id: MEMBER,
+                channel_id: 500,
+            },
+        );
+        let other = q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 501 });
         let action = q.pop_due(GUILD, 0).expect("first action");
         assert_eq!(action.id, first);
-        q.mark_failed(action, "transient".to_owned(), 0);
+        assert!(q.mark_failed(action.clone(), "transient".to_owned(), 0));
+        let independent = q.pop_due(GUILD, 1).expect("other room is due");
+        assert_eq!(independent.id, other);
+        assert_eq!(q.pop_due(GUILD, 2_000), None, "one guild write at a time");
+        assert!(
+            !q.mark_succeeded(&action),
+            "stale callback cannot release it"
+        );
+        assert!(q.mark_succeeded(&independent));
+        assert_eq!(q.pop_due(GUILD, 1_999), None);
+        let retry = q.pop_due(GUILD, 2_000).expect("retry first");
+        assert_eq!(retry.id, first);
+        assert_eq!(retry.attempts, 1);
+        assert_ne!(retry.dispatch_id, action.dispatch_id);
+        assert!(q.mark_succeeded(&retry));
+        assert_eq!(
+            q.pop_due(GUILD, 2_000).expect("same-channel follow-up").id,
+            same_channel
+        );
+    }
+
+    #[test]
+    fn user_limit_actions_are_urgent_and_scoped_to_their_room() {
+        let q = ActionQueue::new();
+        q.enqueue(
+            GUILD,
+            RoomAction::RenameRoom {
+                channel_id: 500,
+                name: "slow".to_owned(),
+            },
+        );
+        let limit = RoomAction::SetUserLimit {
+            channel_id: 500,
+            user_limit: 4,
+        };
+        q.enqueue(GUILD, limit.clone());
+        assert_eq!(limit.channel_id(), Some(500));
+        // The urgent lane drains before the pending rename.
+        assert_eq!(q.pending_counts(GUILD), (1, 1));
+        assert_eq!(q.pop_due(GUILD, 0).map(|a| a.action), Some(limit));
+        // A suspended room holds its limit write; forgetting the room drops it.
+        let again = RoomAction::SetUserLimit {
+            channel_id: 501,
+            user_limit: 0,
+        };
+        q.enqueue(GUILD + 1, again);
+        q.suspend(GUILD + 1, 501);
+        assert_eq!(q.pop_due(GUILD + 1, 0), None);
+        assert_eq!(q.drop_for_channel(GUILD + 1, 501), 1);
+    }
+
+    #[test]
+    fn delete_backoff_holds_companion_creation_and_same_channel_renames() {
+        use crate::voice_text_channel::TextChannelSettings;
+
+        let q = ActionQueue::new();
+        let delete = q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 500 });
+        let companion = q.enqueue(
+            GUILD,
+            RoomAction::CreateCompanion {
+                room_channel_id: 500,
+                plan: TextChannelPlan {
+                    room_id: 500,
+                    guild_id: GUILD,
+                    name: "voice-chat".to_owned(),
+                    category_id: 400,
+                    overwrites: vec![],
+                    settings: TextChannelSettings::default(),
+                },
+            },
+        );
+        let rename = q.enqueue(
+            GUILD,
+            RoomAction::RenameRoom {
+                channel_id: 500,
+                name: "waiting".to_owned(),
+            },
+        );
+        let other = q.enqueue(
+            GUILD,
+            RoomAction::RenameRoom {
+                channel_id: 501,
+                name: "independent".to_owned(),
+            },
+        );
+        let action = q.pop_due(GUILD, 0).unwrap();
+        assert!(q.mark_failed(action, "transient".to_owned(), 0));
+        let independent = q.pop_due(GUILD, 1).expect("other channel's rename");
+        assert_eq!(independent.id, other);
+        assert!(q.mark_succeeded(&independent));
+        assert_eq!(q.pop_due(GUILD, 1_999), None);
+        let retry = q.pop_due(GUILD, 2_000).unwrap();
+        assert_eq!(retry.id, delete);
+        assert!(q.mark_succeeded(&retry));
+        let next = q.pop_due(GUILD, 2_000).unwrap();
+        assert_eq!(next.id, companion);
+        assert!(q.mark_succeeded(&next));
+        assert_eq!(q.pop_due(GUILD, 2_000).unwrap().id, rename);
+    }
+
+    #[test]
+    fn unscoped_creations_remain_a_barrier_during_delete_backoff() {
+        let q = ActionQueue::new();
+        let first = q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 500 });
+        let create = q.enqueue(
+            GUILD,
+            RoomAction::CreateRoom {
+                creator_channel_id: CREATOR,
+                owner_id: MEMBER,
+                name: "new".to_owned(),
+                seed: 7,
+            },
+        );
+        let other = q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 501 });
+        let action = q.pop_due(GUILD, 0).unwrap();
+        assert!(q.mark_failed(action, "transient".to_owned(), 0));
         assert_eq!(q.pop_due(GUILD, 1), None);
-        assert_eq!(q.pop_due(GUILD, 2_000).expect("retry first").id, first);
+        let retry = q.pop_due(GUILD, 2_000).unwrap();
+        assert_eq!(retry.id, first);
+        assert!(q.mark_succeeded(&retry));
+        let next = q.pop_due(GUILD, 2_000).unwrap();
+        assert_eq!(next.id, create);
+        assert!(q.mark_succeeded(&next));
+        assert_eq!(q.pop_due(GUILD, 2_000).unwrap().id, other);
+    }
+
+    #[test]
+    fn non_delete_backoff_keeps_urgent_fifo_order() {
+        let q = ActionQueue::new();
+        let first = q.enqueue(
+            GUILD,
+            RoomAction::MoveMember {
+                member_id: MEMBER,
+                channel_id: 500,
+            },
+        );
+        q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 501 });
+        let action = q.pop_due(GUILD, 0).unwrap();
+        assert!(q.mark_failed(action, "transient".to_owned(), 0));
+        assert_eq!(q.pop_due(GUILD, 1), None);
+        assert_eq!(q.pop_due(GUILD, 2_000).unwrap().id, first);
     }
 
     #[test]
@@ -2239,6 +2552,38 @@ mod tests {
     }
 
     #[test]
+    fn join_request_actions_all_scope_to_their_room() {
+        let actions = [
+            RoomAction::AskJoinOwner {
+                room_channel_id: 500,
+                member_id: 401,
+                request_id: 7,
+            },
+            RoomAction::ApproveJoin {
+                room_channel_id: 500,
+                member_id: 401,
+            },
+            RoomAction::RevokeJoinAccess {
+                room_channel_id: 500,
+                member_id: 401,
+            },
+            // The prompt lives in the room's chat and goes with the room.
+            RoomAction::RetireJoinPrompt {
+                room_channel_id: 500,
+                message_id: 9_001,
+            },
+        ];
+        let q = ActionQueue::new();
+        for action in actions {
+            assert_eq!(action.channel_id(), Some(500));
+            q.enqueue(GUILD, action);
+        }
+        q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 501 });
+        assert_eq!(q.drop_for_channel(GUILD, 500), 4);
+        assert_eq!(q.pending_counts(GUILD), (1, 0));
+    }
+
+    #[test]
     fn voice_command_shapes_and_gates() {
         let defs = voice_commands();
         assert_eq!(
@@ -2263,7 +2608,9 @@ mod tests {
                 "kick",
                 "name",
                 "private",
-                "public"
+                "public",
+                "limit",
+                "unlimit"
             ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
@@ -2381,6 +2728,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["channel", "position", "first-number"]
         );
+        // `/position first-number` bounds match the V11 export codec (u32):
+        // a larger value would break `/export` and `/import`.
+        assert_eq!(position.options[2].min_value, Some(1));
+        assert_eq!(position.options[2].max_value, Some(MAX_FIRST_ROOM_NUMBER));
         // `/inheritpermissions` requires its source; the channel rides along
         // only for the channel source.
         let inherit = defs
@@ -2413,6 +2764,19 @@ mod tests {
         );
         assert_eq!(kick.options[0].required, Some(true));
         assert_eq!(kick.options[1].required, None);
+        // `/limit` and `/unlimit` are owner commands the worker gates: open in
+        // the definition, with one optional 0-99 count and no options.
+        let limit = defs.iter().find(|def| def.name == "limit").unwrap();
+        assert_eq!(limit.default_member_permissions, None);
+        assert_eq!(limit.options.len(), 1);
+        assert_eq!(limit.options[0].name, "count");
+        assert_eq!(limit.options[0].kind, CommandOptionType::Integer.as_u8());
+        assert_eq!(limit.options[0].required, None);
+        assert_eq!(limit.options[0].min_value, Some(0));
+        assert_eq!(limit.options[0].max_value, Some(MAX_USER_LIMIT));
+        let unlimit = defs.iter().find(|def| def.name == "unlimit").unwrap();
+        assert_eq!(unlimit.default_member_permissions, None);
+        assert!(unlimit.options.is_empty());
         // `/name` is open to every member with no options: the panel and modal
         // carry the name, and the worker refuses everyone but the owner or an
         // admin.

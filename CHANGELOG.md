@@ -303,6 +303,7 @@
 
 ### Fixed
 
+- Keep moderation commands answerable while the shared interaction lane is busy. Cap each member at three admitted interactions, reserve an eight-worker lane for permission-gated slash commands from members who hold the permission, and answer anything not admitted with one ephemeral "busy, try again" callback instead of dropping it silently. Bound the LFG queue to the running request plus eight waiters so sign-up selects cannot fill the lane.
 * **activation:** enforce token identity and live capability clearance ([#124](https://github.com/TogetherWeOwn/two-bot-next/issues/124)) ([9f0835e](https://github.com/TogetherWeOwn/two-bot-next/commit/9f0835e970a3cb04e8865fbaf8ba19d55e7f6215))
 * **audit:** capture sweep logs through a global subscriber ([#284](https://github.com/TogetherWeOwn/two-bot-next/issues/284)) ([1be7367](https://github.com/TogetherWeOwn/two-bot-next/commit/1be7367c035966b04c8e7d759bedddfa7055e720))
 * **automod:** match legacy repeat lookback depth ([#313](https://github.com/TogetherWeOwn/two-bot-next/issues/313)) ([1397c72](https://github.com/TogetherWeOwn/two-bot-next/commit/1397c720b4af44c6a717390427470ddcc1b6e2cd))

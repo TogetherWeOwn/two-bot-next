@@ -30,7 +30,10 @@ are outside this implementation's scope.
   untouched by member erasure. A room's private flag and Join channel ID
   (`voice_rooms`) hold no member IDs. Its block list (`voice_room_blocks`) does:
   erasure removes the erased member's rows from every room's list, and a room
-  erased with its owner takes its whole list with it (the rows cascade). Guild room-command controls
+  erased with its owner takes its whole list with it (the rows cascade). Its approved-grant
+  witness (`voice_join_grants`) does the same: erasure removes the erased member's rows from
+  every room's grant list, and a room erased with its owner takes its grants with it
+  (the rows cascade). Guild room-command controls
   (`voice_access_controls`: creation switch, required role ID, per-command role
   IDs) and room logging settings (`voice_logging_settings`: detail level, notice
   channel ID, mention role ID) hold channel and role IDs only and no member IDs.

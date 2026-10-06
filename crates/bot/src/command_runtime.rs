@@ -87,6 +87,7 @@ use two_bot_discord::{
 };
 
 use crate::activation::BootActivation;
+use crate::interaction_admission::{accepts_busy_reply, is_privileged, UserSlots, BUSY_REPLY};
 
 /// Audit-log reason for retiring the previous sticky (legacy audits carry a
 /// free-text reason; kept short — `audit_reason` caps at 512 chars).
@@ -139,12 +140,20 @@ pub type VoiceKickVote =
 
 /// Separate admission budgets prevent message bursts or registry pacing from
 /// consuming interaction acknowledgement capacity. No queued/spawned waiters.
-const DISPATCH_LIMITS: [usize; 3] = [16, 16, 1];
+/// `PRIVILEGED` is reserved for permission-gated slash commands from members who
+/// hold the permission; open interactions never enter it, so a burst of them
+/// cannot starve moderation. `BUSY` carries the one-call "busy" replies.
+const DISPATCH_LIMITS: [usize; 5] = [16, 16, 1, 8, 8];
+const LANE_MESSAGES: usize = 0;
+const LANE_INTERACTIONS: usize = 1;
+const LANE_REGISTRY: usize = 2;
+const LANE_PRIVILEGED: usize = 3;
+const LANE_BUSY: usize = 4;
 
 #[derive(Default)]
 struct DispatchTasks {
     stopped: bool,
-    lanes: [Vec<tokio::task::AbortHandle>; 3],
+    lanes: [Vec<tokio::task::AbortHandle>; DISPATCH_LIMITS.len()],
 }
 
 /// Cancels admitted work on gateway exit, including supervisor cancellation.
@@ -161,6 +170,12 @@ impl Drop for CommandDispatchGuard {
             }
         }
     }
+}
+
+/// Callback target for a busy reply; token-bearing, so deliberately not Debug.
+struct BusyTarget {
+    interaction_id: u64,
+    token: String,
 }
 
 /// The shared command runtime: one router + one REST executor + the sqlx
@@ -182,6 +197,8 @@ pub struct CommandRuntime {
     gateway_commands: tokio::sync::OnceCell<crate::gateway_commands::GatewayCommands>,
     channel: ChannelModerationRuntime,
     tasks: Mutex<DispatchTasks>,
+    /// Interactions admitted per member; see [`crate::interaction_admission`].
+    user_slots: UserSlots,
     /// Shared self-role surface; production boot stays parked pending acceptance.
     self_roles: Option<Arc<SelfRoleService>>,
     leveling: LevelingRuntime,
@@ -273,6 +290,7 @@ impl CommandRuntime {
             gateway_commands: tokio::sync::OnceCell::new(),
             channel,
             tasks: Mutex::new(DispatchTasks::default()),
+            user_slots: UserSlots::default(),
             self_roles,
             leveling,
             guild_id,
@@ -559,19 +577,99 @@ impl CommandRuntime {
         lane: usize,
         work: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> bool {
+        self.spawn_first(&[lane], work)
+    }
+
+    /// Admit `work` into the first of `lanes` that has room.
+    fn spawn_first(
+        &self,
+        lanes: &[usize],
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
         let mut tasks = self.tasks.lock().expect("command task scope");
         if tasks.stopped {
             return false;
         }
-        let handles = &mut tasks.lanes[lane];
-        handles.retain(|handle| !handle.is_finished());
-        if handles.len() >= DISPATCH_LIMITS[lane] {
-            warn!(lane, "command dispatch saturated; event not admitted");
-            return false;
+        for &lane in lanes {
+            let handles = &mut tasks.lanes[lane];
+            handles.retain(|handle| !handle.is_finished());
+            if handles.len() < DISPATCH_LIMITS[lane] {
+                let task = tokio::spawn(work);
+                handles.push(task.abort_handle());
+                return true;
+            }
         }
-        let task = tokio::spawn(work);
-        handles.push(task.abort_handle());
-        true
+        warn!(?lanes, "command dispatch saturated; event not admitted");
+        false
+    }
+
+    /// Admit one non-ticket interaction. A member at their cap, or a full lane,
+    /// gets an ephemeral busy reply rather than silence. Privileged commands try
+    /// the reserved lane first and may spill into the shared one.
+    fn admit_interaction(self: &Arc<Self>, interaction: Interaction) -> bool {
+        let busy = self.busy_target(&interaction);
+        let slot = match interaction.author_id() {
+            Some(user) => match self.user_slots.acquire(user.get()) {
+                Some(slot) => Some(slot),
+                None => {
+                    self.reply_busy(busy);
+                    return false;
+                }
+            },
+            None => None,
+        };
+        let lanes: &[usize] = if is_privileged(&interaction) {
+            &[LANE_PRIVILEGED, LANE_INTERACTIONS]
+        } else {
+            &[LANE_INTERACTIONS]
+        };
+        let runtime = Arc::clone(self);
+        let admitted = self.spawn_first(lanes, async move {
+            let _slot = slot;
+            let handled = match runtime.gateway_commands.get() {
+                Some(custom) => custom.handle_interaction(&interaction).await,
+                None => false,
+            };
+            if !handled {
+                runtime.on_interaction(&interaction).await;
+            }
+        });
+        if !admitted {
+            self.reply_busy(busy);
+        }
+        admitted
+    }
+
+    /// Where to send the busy reply, for interactions that accept one.
+    fn busy_target(&self, interaction: &Interaction) -> Option<BusyTarget> {
+        let known = self.application_id.load(Ordering::Relaxed);
+        if !accepts_busy_reply(interaction)
+            || (known != 0 && interaction.application_id.get() != known)
+        {
+            return None;
+        }
+        Some(BusyTarget {
+            interaction_id: interaction.id.get(),
+            token: interaction.token.clone(),
+        })
+    }
+
+    /// Tell the invoker to retry: one callback on a small dedicated lane. When
+    /// that lane is saturated too, the event is dropped with only a log line.
+    fn reply_busy(self: &Arc<Self>, target: Option<BusyTarget>) {
+        let Some(target) = target else {
+            return;
+        };
+        let runtime = Arc::clone(self);
+        self.spawn(LANE_BUSY, async move {
+            if let Err(error) = runtime
+                .executor
+                .answer_interaction(target.interaction_id, &target.token, &ephemeral(BUSY_REPLY))
+                .await
+            {
+                warn!(interaction_id = target.interaction_id, %error, "busy reply failed");
+            }
+        });
     }
 
     /// Shares this runtime's pool, executor/pacing and onboarding gates with
@@ -658,7 +756,7 @@ impl CommandRuntime {
                 }
                 let runtime = Arc::clone(self);
                 let message = message.0.clone();
-                self.spawn(0, async move {
+                self.spawn(LANE_MESSAGES, async move {
                     if let Some(custom) = runtime.gateway_commands.get() {
                         custom.handle_message(&message).await;
                     }
@@ -679,15 +777,7 @@ impl CommandRuntime {
                     });
                     true
                 } else {
-                    self.spawn(1, async move {
-                        let handled = match runtime.gateway_commands.get() {
-                            Some(custom) => custom.handle_interaction(&interaction).await,
-                            None => false,
-                        };
-                        if !handled {
-                            runtime.on_interaction(&interaction).await;
-                        }
-                    })
+                    self.admit_interaction(interaction)
                 }
             }
             Event::ReactionAdd(reaction) => {
@@ -718,7 +808,7 @@ impl CommandRuntime {
                 }
                 let runtime = Arc::clone(self);
                 let application_id = ready.application.id.get();
-                self.spawn(2, async move {
+                self.spawn(LANE_REGISTRY, async move {
                     runtime.publish_registry(Some(application_id)).await;
                 })
             }
@@ -735,7 +825,7 @@ impl CommandRuntime {
                     });
                 }
                 let runtime = Arc::clone(self);
-                self.spawn(2, async move {
+                self.spawn(LANE_REGISTRY, async move {
                     runtime.publish_registry(None).await;
                 })
             }

@@ -113,6 +113,25 @@ impl RoomPersistence for Arc<Store> {
     ) -> Result<bool, StoreError> {
         self.as_ref().save_privacy(guild, room, record).await
     }
+    async fn join_grants(&self, guild: u64) -> Result<BTreeMap<u64, BTreeSet<u64>>, StoreError> {
+        self.as_ref().join_grants(guild).await
+    }
+    async fn save_join_grant(
+        &self,
+        guild: u64,
+        room: u64,
+        member: u64,
+    ) -> Result<bool, StoreError> {
+        self.as_ref().save_join_grant(guild, room, member).await
+    }
+    async fn remove_join_grant(
+        &self,
+        guild: u64,
+        room: u64,
+        member: u64,
+    ) -> Result<(), StoreError> {
+        self.as_ref().remove_join_grant(guild, room, member).await
+    }
 }
 
 #[derive(Clone, Default)]
@@ -188,6 +207,14 @@ impl RoomWrites for GatedHttp {
     async fn rename(&self, channel: u64, name: &str) -> Result<(), RoomHttpError> {
         self.http.rename(channel, name).await
     }
+    async fn set_user_limit(
+        &self,
+        channel: u64,
+        user_limit: u32,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.http.set_user_limit(channel, user_limit, guard).await
+    }
     async fn download_attachment(
         &self,
         url: &str,
@@ -229,11 +256,14 @@ impl RoomWrites for GatedHttp {
 type Runtime = VoiceRuntime<Arc<Store>, GatedHttp>;
 
 fn runtime(store: Arc<Store>, http: GatedHttp) -> Runtime {
+    // These races predate the empty-room grace and run in real time, so they
+    // shorten it; the grace itself is pinned by the paused-time guard tests.
     VoiceRuntime::new(
         move || (store.clone(), http.clone()),
         Duration::from_millis(10),
         true,
     )
+    .with_empty_grace(Duration::ZERO)
 }
 
 fn ready_event() -> Event {

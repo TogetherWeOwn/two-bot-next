@@ -114,7 +114,7 @@ const RECEIVER_CONFIG =
   "private-receiver config (TOG-12980); reaches the Container only through an explicit containerEnvVars " +
   "line while TWO_INTERNAL_ACTIONS is exactly 1, never this flag allowlist (CISO TOG-12979 C8)";
 const RECEIVER_BIND =
-  "private-receiver bind; the Worker sets one fixed loopback literal (internal-actions.ts), never an Operator value";
+  "private-receiver bind; the Worker sets one fixed wildcard literal plus the container marker (internal-actions.ts), never an Operator value";
 const LEGACY = "legacy input with no Next reader; settings.rs keeps it only to refuse storage";
 const REDIRECT = "go.two.gg redirect is served by the Worker (REDIRECT_*), not the Container";
 
@@ -165,6 +165,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_INTERNAL_ALLOW_MODERATION: CAPABILITY,
   TWO_INTERNAL_ALLOW_SETTINGS: CAPABILITY,
   TWO_INTERNAL_CHANNEL_KEYS: RECEIVER_CONFIG,
+  TWO_INTERNAL_CONTAINER: RECEIVER_CONFIG,
   TWO_INTERNAL_KEYS: SECRET,
   TWO_INTERNAL_ROLE_KEYS: CAPABILITY,
   TWO_ONBOARDING_ROTA_MEASUREMENT: LEGACY,

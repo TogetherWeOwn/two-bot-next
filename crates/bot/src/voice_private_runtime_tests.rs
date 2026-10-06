@@ -23,10 +23,12 @@ fn parts() -> (LiveGuild, Store, Http, Trace) {
 
 async fn worker() -> (Worker, Trace) {
     let (live, store, http, trace) = parts();
-    (
-        GuildRoomWorker::load(live, store, http).await.unwrap(),
-        trace,
-    )
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // These scenarios predate the empty-room grace and assert immediate
+    // deletion, so they shorten it; the grace itself is pinned by the
+    // paused-time guard tests.
+    worker.live.set_empty_grace(Duration::ZERO);
+    (worker, trace)
 }
 
 /// Run every queued write to completion; each tick jumps past any backoff, so
@@ -246,7 +248,7 @@ async fn public_restores_connect_deletes_the_join_channel_and_keeps_blocks() {
     let (mut worker, trace) = worker().await;
     private_cmd(&mut worker, OWNER);
     drain(&mut worker).await;
-    // A block (written by the join-request slice) must outlive the toggle.
+    // A block (written by a Block press) must outlive the toggle.
     worker
         .privacy
         .get_mut(&ROOM)

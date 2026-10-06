@@ -180,7 +180,7 @@ gates for that integration. Current-public-surface findings are marked explicitl
 | Denial of service | Public probes wake/pin singleton Container or consume pool/crypto/memory | DO path allowlist, six-second readiness probe, pool/timeouts. Public `/health` and `/readyz` return 405 for non-GET/HEAD, then spend a per-caller **60 burst, 1/second** `healthBuckets` budget (429 with `Retry-After`) before the Container is touched, and forward a sanitized probe (`wrangler/src/index.ts:84-88`, `:410-444`; TOG-12245, #259). Redirects spend a separate `clickBuckets` map (`:65-67`, `:496`). Both are `TokenBuckets` with idle expiry no shorter than full refill, a 10,000-key fail-closed cap and a 64-entry sweep budget (`wrangler/src/redirect.ts:126-254`). Reserved-internal `/metrics*` 404s land before the bucket and DB lookup (`wrangler/src/index.ts:459`, `wrangler/src/redirect.ts:344-346`); readiness webhook failures stay generic and never log the secret URL (`wrangler/src/index.ts:382`) | Probe and redirect buckets are per isolate, not a global edge limit: a recycled or different isolate starts every caller full. The cap bounds memory but refuses every new caller while 10,000 keys are live; a new key at the cap first reaps idle entries, so a map of one-time callers drains on new-key traffic alone (fixed, TOG-12387). Probes have no application auth. Action body cap runs after HMAC and nonce burn; authenticated nonce flood precedes key bucket. Gateway fan-out is detached per event, so a hostile event burst spawns bounded runtime work (ticket lane 10 s, cumulative 120 s) rather than stalling heartbeats — bound it anyway. F1/F7. |
 | Denial of service | Spend the same clock interval twice in an action bucket | This change keeps a last-seen clock high-water mark | New regression covers both bucket specs; restart/multi-instance buckets are still local. Future receiver needs bounded ingress/concurrency. F7. |
 | Elevation of privilege | Compromised signer invokes all enabled verbs or changes its own gates | Environment-only approval flags; settings catalog denies `TWO_INTERNAL_*`, `TWO_MODERATION`, secrets and unknown keys; overwrite requires a second flag. Phase-1 defaults remain exactly `role.assign`, `announcement.post`, `event.upsert` (`crates/core/src/internal_actions.rs:778`); settings CAS rejects stale writes instead of silently reverting (`VersionConflict`) | Keys have no per-caller capabilities. Mapped roles/configured channels and allowed hot/cold settings still carry privilege; validate policy before enabling. P1 F2. |
-| Elevation of privilege | Treat public wildcard health bind as an approved actions bind | `assert_private_bind` rejects wildcard/public/hostname addresses with no override (`crates/core/src/internal_actions.rs:1430`) | Current health listener is deliberately `0.0.0.0`; never reuse it for an unguarded receiver or weaken the bind guard to fit the Worker. Internal `/metrics` shares that listener but is never proxied; treat it as non-public by routing, not by the bind. P1 F1. |
+| Elevation of privilege | Treat public wildcard health bind as an approved actions bind | `assert_private_bind` rejects wildcard/public/hostname addresses with no override inside that function (`crates/core/src/internal_actions.rs:1430`); the single marker-gated wildcard exception in the receiver config is documented below and is pending CTO/CISO decision (review TOG-16872) | Current health listener is deliberately `0.0.0.0`; never reuse it for an unguarded receiver or widen the marker-gated exception beyond the staging receiver. Internal `/metrics` shares that listener but is never proxied; treat it as non-public by routing, not by the bind. P1 F1. |
 
 ## Action-by-action blast radius
 
@@ -399,25 +399,38 @@ approved version transition.
   scope per #155); those bound ticket work, not action ingress.
 - `assert_private_bind` accepts specific loopback/RFC1918/CGNAT/link-local IPv4,
   IPv6 loopback/ULA/link-local and mapped private IPv4; it refuses wildcard,
-  public, hostname, malformed and host:port inputs with **no override**
-  (`crates/core/src/internal_actions.rs:1430`). Bind the validated literal, not
-  the original string or a subsequently resolved hostname. No private listener
-  or network ACL was verified. The current Worker intentionally forwards
-  `LISTEN_ADDR=0.0.0.0:<port>` **for probes only** (`wrangler/src/index.ts:105`);
-  a public Worker proxy would still cross a public boundary even with a guarded
-  private Container listener.
-- **Staging-only ingress (TOG-12980, CISO conditions on TOG-12979):** the staging
-  Worker proxies exactly `POST /internal/actions` to a loopback receiver listener
-  (`127.0.0.1:8091`, set by the Worker, never an Operator value). It is dark
-  unless the staging-only var `INTERNAL_ACTIONS_INGRESS` and the Operator secret
-  `TWO_INTERNAL_ACTIONS` are both `1`; `scripts/check-env-bindings.py` denies the
-  var in production. The Worker bounds method, path, query, content type,
-  2 MiB body, timeouts, header allowlist, per-IP and in-flight caps before the
-  Container is touched, forwards bytes unchanged inside the ownership fence, and
-  never relays Container error text or starts the Container. Authentication is
-  still the receiver's v1 HMAC and durable nonce burn. Caps are per isolate
-  (the residual in F7 above). Whether the sidecar reaches a loopback second
-  port is proven by the first staging enable; see
+  public, hostname, malformed and host:port inputs with **no override inside
+  that function** (`crates/core/src/internal_actions.rs:1430`). Bind the
+  validated literal, not the original string or a subsequently resolved
+  hostname. The one exception to "never a wildcard bind" lives outside that
+  function, in `InternalActionConfig::from_lookup`: it admits the wildcard
+  only with the Worker-set `TWO_INTERNAL_CONTAINER` marker exactly `1`
+  (TOG-16851: the Containers port check cannot reach loopback; the container
+  network is presumed private but no private listener or network ACL was
+  verified; the exception is pending CTO/CISO decision, review TOG-16872).
+  The marker is a
+  Worker-set deployment claim, not a verified proof, so it must never come
+  from Operator input or `wrangler.toml` (rejected by
+  `scripts/check-env-bindings.py`). No private listener or network ACL was
+  verified. The
+  current Worker intentionally forwards `LISTEN_ADDR=0.0.0.0:<port>` **for
+  probes only** (`wrangler/src/index.ts:105`); a public Worker proxy would still
+  cross a public boundary even with a guarded private Container listener.
+- **Staging-only ingress (TOG-12980, CISO conditions on TOG-12979; bind TOG-16851):**
+  the staging Worker proxies exactly `POST /internal/actions` to a wildcard
+  receiver listener (`0.0.0.0:8091` plus the Worker-set `TWO_INTERNAL_CONTAINER`
+  marker, never Operator values). TOG-16851 proved a loopback-only socket is
+  unreachable from the Containers port check and `containerFetch`; the container
+  network is presumed private but unverified, and the bot refuses the wildcard
+  without exactly that marker. It is dark unless the staging-only var
+  `INTERNAL_ACTIONS_INGRESS` and
+  the Operator secret `TWO_INTERNAL_ACTIONS` are both `1`;
+  `scripts/check-env-bindings.py` denies the var in production. The Worker bounds
+  method, path, query, content type, 2 MiB body, timeouts, header allowlist,
+  per-IP and in-flight caps before the Container is touched, forwards bytes
+  unchanged inside the ownership fence, and never relays Container error text or
+  starts the Container. Authentication is still the receiver's v1 HMAC and
+  durable nonce burn. Caps are per isolate (the residual in F7 above). See
   [the receiver doc](internal-actions-receiver.md#staging-ingress-default-dark).
 
 ## Rejection logging and secret minimization

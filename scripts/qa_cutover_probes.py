@@ -58,10 +58,9 @@ import urllib.request
 
 BODY_CAP = 64 << 10
 DEFAULT_TIMEOUT_SECONDS = 10
-# urllib's default `Python-urllib/x.y` agent is refused with Cloudflare error
-# 1010 on the staging workers.dev host (every route answers 403), so the probe
-# names itself, as scripts/staging_probe.py does.
-USER_AGENT = "two-bot-next-cutover-probes/1 (read-only)"
+# Cloudflare rejects the default "Python-urllib/x.y" agent at the edge with 403
+# (error 1010), so an explicit agent is required for the probe to reach the Worker.
+USER_AGENT = "two-bot-next-staging-rollout/1.0"
 KNOWN_STATUSES = ("ready", "starting", "down")
 REQUIRED_COMPONENTS = ("process", "gateway")
 
@@ -122,9 +121,9 @@ def fetch(url, timeout):
     """One GET without redirects; returns (status, body bytes)."""
     opener = urllib.request.build_opener(_NoRedirect)
     try:
-        request = urllib.request.Request(
-            url, method="GET", headers={"User-Agent": USER_AGENT})
-        with opener.open(request, timeout=timeout) as response:
+        with opener.open(urllib.request.Request(url, headers={"User-Agent": USER_AGENT},
+                                               method="GET"),
+                         timeout=timeout) as response:
             return response.status, response.read(BODY_CAP + 1)
     except urllib.error.HTTPError as e:
         return e.code, e.read(BODY_CAP + 1)

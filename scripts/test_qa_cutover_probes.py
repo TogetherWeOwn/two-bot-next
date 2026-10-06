@@ -245,5 +245,29 @@ class EvidenceTest(unittest.TestCase):
         handle.assert_not_called()
 
 
+class UserAgentTests(unittest.TestCase):
+    def test_fetch_sends_an_explicit_user_agent(self):
+        seen = []
+
+        class Response(io.BytesIO):
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class Opener:
+            def open(self, request, timeout=None):
+                seen.append(request.get_header("User-agent"))
+                return Response(b"{}")
+
+        with mock.patch.object(probe.urllib.request, "build_opener", return_value=Opener()):
+            probe.fetch("https://two-bot-next-staging.example-sub.workers.dev/readyz", 10)
+        self.assertEqual(seen, [probe.USER_AGENT])
+        self.assertFalse(seen[0].startswith("Python-urllib"))
+
+
 if __name__ == "__main__":
     unittest.main()

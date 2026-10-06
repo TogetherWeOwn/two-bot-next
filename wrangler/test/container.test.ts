@@ -36,7 +36,7 @@ const WORKER_ENV = {
   KEEPALIVE_SECONDS: "60",
   REDIRECT_FALLBACK_CODE: "not-a-container-var",
   REDIRECT_MAPPINGS_JSON: "[]",
-  OPS_ALERT_WEBHOOK_URL: "https://ops.invalid/synthetic-secret",
+  OPS_ALERT_WEBHOOK_URL: "https://discord.com/api/webhooks/123456789012345678/synthetic-token-not-a-secret",
   UNREADY_ALERT_FAILURES: "10",
 };
 const EXPECTED_ENV = {
@@ -66,6 +66,7 @@ const PUBLICATION_WORKER_ENV = {
   ...PUBLICATION_ENV,
   DISCORD_API_BASE: "https://not-forwarded.invalid",
   UNRELATED_SETTING: "not-a-container-var",
+  OPS_ALERT_FORWARDING: "on",
 };
 
 type StartConfig = {
@@ -905,7 +906,37 @@ async function alertHarness(t: TestContext, env: Partial<Env> = {}, values?: Map
   };
 }
 
-const ALERT_ENV = { UNREADY_ALERT_FAILURES: "3", OPS_ALERT_WEBHOOK_URL: WORKER_ENV.OPS_ALERT_WEBHOOK_URL };
+const ALERT_ENV = {
+  UNREADY_ALERT_FAILURES: "3",
+  OPS_ALERT_WEBHOOK_URL: WORKER_ENV.OPS_ALERT_WEBHOOK_URL,
+  OPS_ALERT_FORWARDING: "on",
+};
+
+type AlertSender = "readiness" | "metrics";
+async function senderHarness(t: TestContext, sender: AlertSender, env: Partial<Env>, values?: Map<string, unknown>) {
+  const h = await alertHarness(t, { UNREADY_ALERT_FAILURES: "1", ...env }, values);
+  let failing = true;
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path === "/metrics") {
+      return new Response(sender === "metrics"
+        ? `two_bot_job_consecutive_failures{job="rank"} ${failing ? 3 : 0}\n` : "");
+    }
+    return new Response(null, { status: sender === "readiness" && failing ? 503 : 200 });
+  });
+  return { ...h, recover: () => { failing = false; } };
+}
+
+function assertAlertRecorded(h: Awaited<ReturnType<typeof senderHarness>>, sender: AlertSender) {
+  if (sender === "readiness") {
+    assert.equal(h.values.get("two-bot:readiness")?.alerted, true);
+    assert.equal(h.events()[0].event, "container_unready_alert");
+  } else {
+    assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, ["job_consecutive_failures:rank"]);
+    assert.equal(h.events()[0].event, "metrics_alert");
+    assert.match(h.events()[0].content, /ALERT job_consecutive_failures:rank/);
+  }
+}
 
 async function fireSdkAlarm(t: TestContext, bot: TwoBotContainer, advance = 60_000) {
   const firing = bot.alarm();
@@ -1220,15 +1251,120 @@ for (const failure of [429, 500, "throw"] as const) {
   });
 }
 
-for (const binding of ["http://ops.invalid/secret", "not a URL", "https://user:secret@ops.invalid/"]) {
-  test("invalid webhook binding is sanitized and not fetched: " + binding, async (t) => {
-    const h = await alertHarness(t, { UNREADY_ALERT_FAILURES: "1", OPS_ALERT_WEBHOOK_URL: binding });
+const WEBHOOK_PATH = new URL(ALERT_ENV.OPS_ALERT_WEBHOOK_URL).pathname;
+const INVALID_WEBHOOKS = {
+  "non-Discord host": `https://ops.invalid${WEBHOOK_PATH}`,
+  "subdomain": `https://canary.discord.com${WEBHOOK_PATH}`,
+  "lookalike host": `https://discord.com.invalid${WEBHOOK_PATH}`,
+  "non-default port": `https://discord.com:8443${WEBHOOK_PATH}`,
+  "non-webhook path": "https://discord.com/api/channels/123/messages",
+  "query": `${ALERT_ENV.OPS_ALERT_WEBHOOK_URL}?wait=true`,
+  "empty query": `${ALERT_ENV.OPS_ALERT_WEBHOOK_URL}?`,
+  "fragment": `${ALERT_ENV.OPS_ALERT_WEBHOOK_URL}#fragment`,
+  "empty fragment": `${ALERT_ENV.OPS_ALERT_WEBHOOK_URL}#`,
+  "userinfo": `https://user:synthetic@discord.com${WEBHOOK_PATH}`,
+  "empty userinfo": `https://@discord.com${WEBHOOK_PATH}`,
+  "HTTP": `http://discord.com${WEBHOOK_PATH}`,
+  "HTTPS loopback": `https://127.0.0.1${WEBHOOK_PATH}`,
+  "invalid URL": "not a URL",
+  "missing id": "https://discord.com/api/webhooks//synthetic-token",
+  "non-numeric id": "https://discord.com/api/webhooks/not-an-id/synthetic-token",
+  "missing token": "https://discord.com/api/webhooks/123/",
+  "extra path segment": `${ALERT_ENV.OPS_ALERT_WEBHOOK_URL}/messages/123`,
+  "encoded token separator": `${ALERT_ENV.OPS_ALERT_WEBHOOK_URL}%2Fextra`,
+  "encoded path": `https://discord.com/%61pi${WEBHOOK_PATH.slice(4)}`,
+  "dot-segment alias": `https://discord.com/ignored/..${WEBHOOK_PATH}`,
+  "backslash alias": `https://discord.com\\${WEBHOOK_PATH.slice(1)}`,
+  "leading whitespace": ` ${ALERT_ENV.OPS_ALERT_WEBHOOK_URL}`,
+  "trailing newline": `${ALERT_ENV.OPS_ALERT_WEBHOOK_URL}\n`,
+};
+
+for (const sender of ["readiness", "metrics"] as const) {
+  for (const [name, binding] of Object.entries(INVALID_WEBHOOKS)) {
+    test(`${sender} rejects webhook ${name} without fetching or logging the binding`, async (t) => {
+      const h = await senderHarness(t, sender, { OPS_ALERT_FORWARDING: "on", OPS_ALERT_WEBHOOK_URL: binding });
+      await h.tick();
+      await h.tick();
+      assert.equal(h.posts.length, 0);
+      assertAlertRecorded(h, sender);
+      assert.equal(h.events()[1].event, sender === "readiness"
+        ? "container_unready_webhook_failed" : "metrics_alert_webhook_failed");
+      assert.equal(h.events()[1].status, null);
+      assert.ok(h.logs.every((line) => !line.includes(binding)));
+      assert.equal(h.schedules.mock.callCount(), 2);
+    });
+  }
+
+  for (const port of ["", ":443"]) {
+    test(`${sender} sends only the canonical Discord webhook on default port ${port || "implicit"}`, async (t) => {
+      const h = await senderHarness(t, sender, {
+        OPS_ALERT_FORWARDING: "on", OPS_ALERT_WEBHOOK_URL: `https://discord.com${port}${WEBHOOK_PATH}`,
+      });
+      const timeout = t.mock.method(AbortSignal, "timeout");
+      await h.tick();
+      await h.tick();
+      assert.equal(h.posts.length, 1, "at most one attempt per persisted transition");
+      assertAlertRecorded(h, sender);
+      const post = h.posts[0]!;
+      assert.equal(post.url, ALERT_ENV.OPS_ALERT_WEBHOOK_URL);
+      assert.equal(post.init.method, "POST");
+      assert.equal(post.init.redirect, "error");
+      assert.ok(post.init.signal instanceof AbortSignal);
+      const bound = timeout.mock.calls.find((call) => call.result === post.init.signal);
+      assert.deepEqual(bound?.arguments, [6000]);
+      assert.deepEqual(JSON.parse(String(post.init.body)).allowed_mentions, { parse: [], replied_user: false });
+    });
+  }
+
+  for (const flag of [undefined, "off", "", "ON", "true", "1", " on", "on "]) {
+    test(`${sender} forwarding ${JSON.stringify(flag)} keeps monitoring durable and log-only`, async (t) => {
+      const h = await senderHarness(t, sender, { OPS_ALERT_FORWARDING: flag, OPS_ALERT_WEBHOOK_URL: ALERT_ENV.OPS_ALERT_WEBHOOK_URL });
+      await h.tick();
+      await h.tick();
+      assert.equal(h.posts.length, 0, "installing the secret alone must never page");
+      assertAlertRecorded(h, sender);
+      h.recover();
+      await h.tick();
+      await h.tick();
+      assert.equal(h.posts.length, 0);
+      assert.deepEqual(h.events().map((event) => event.event), sender === "readiness"
+        ? ["container_unready_alert", "container_unready_recovery"] : ["metrics_alert", "metrics_alert"]);
+      assert.equal(h.values.get("two-bot:readiness")?.alerted, false);
+      assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, []);
+      if (sender === "metrics") assert.match(h.events()[1].content, /RESOLVED job_consecutive_failures:rank/);
+      assert.equal(h.schedules.mock.callCount(), 4);
+      assert.ok(h.logs.every((line) => !line.includes(ALERT_ENV.OPS_ALERT_WEBHOOK_URL)));
+    });
+  }
+
+  test(`${sender} can disable forwarding without deleting the secret or replaying transitions`, async (t) => {
+    const enabled = { OPS_ALERT_FORWARDING: "on", OPS_ALERT_WEBHOOK_URL: ALERT_ENV.OPS_ALERT_WEBHOOK_URL };
+    const first = await senderHarness(t, sender, enabled);
+    await first.tick();
+    assert.equal(first.posts.length, 1);
+    const disabled = await senderHarness(t, sender, { ...enabled, OPS_ALERT_FORWARDING: "off" }, first.values);
+    await disabled.tick();
+    disabled.recover();
+    await disabled.tick();
+    assert.equal(disabled.posts.length, 0);
+    assert.equal(disabled.values.get("two-bot:readiness")?.alerted, false);
+    assert.deepEqual(disabled.values.get("two-bot:metrics-alerts")?.firing, []);
+    assert.equal(disabled.events().length, 1, "the muted recovery is still logged");
+    const resumed = await senderHarness(t, sender, enabled, disabled.values);
+    resumed.recover();
+    await resumed.tick();
+    assert.equal(resumed.posts.length, 0, "enabling must not replay a muted recovery");
+  });
+
+  test(`${sender} fetch error details never escape to logs`, async (t) => {
+    const h = await senderHarness(t, sender, { OPS_ALERT_FORWARDING: "on", OPS_ALERT_WEBHOOK_URL: ALERT_ENV.OPS_ALERT_WEBHOOK_URL });
+    const detail = `synthetic-fetch-error ${ALERT_ENV.OPS_ALERT_WEBHOOK_URL}`;
+    const webhook = t.mock.method(globalThis, "fetch", async () => { throw new Error(detail); });
     await h.tick();
     await h.tick();
-    assert.equal(h.posts.length, 0);
-    assert.equal(h.events()[1].event, "container_unready_webhook_failed");
-    assert.ok(h.logs.every((line) => !line.includes(binding)));
-    assert.equal(h.schedules.mock.callCount(), 2);
+    assert.equal(webhook.mock.callCount(), 1);
+    assert.equal(h.events()[1].status, null);
+    assert.ok(h.logs.every((line) => !line.includes("synthetic-fetch-error") && !line.includes(ALERT_ENV.OPS_ALERT_WEBHOOK_URL)));
   });
 }
 
@@ -1252,7 +1388,7 @@ test("storage failure still rearms keepalive but does not send an unpersisted al
 });
 
 test("keepalive pulls /metrics, alerts once on a failing job and resolves", async (t) => {
-  const h = await alertHarness(t, { UNREADY_ALERT_FAILURES: "1000", OPS_ALERT_WEBHOOK_URL: WORKER_ENV.OPS_ALERT_WEBHOOK_URL });
+  const h = await alertHarness(t, { ...ALERT_ENV, UNREADY_ALERT_FAILURES: "1000" });
   let failures = 3;
   t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
     const path = new URL(typeof input === "string" ? input : input.url).pathname;
