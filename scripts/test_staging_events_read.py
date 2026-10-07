@@ -8,6 +8,7 @@ connection. The login URL and member id below are synthetic.
 
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
+import hashlib
 import io
 import json
 import os
@@ -30,12 +31,41 @@ URL = (f"postgresql://two_bot_events_ro:{PASSWORD}@ep-staging-example.us-east-2.
        "?sslmode=require&channel_binding=require")
 IDENTITY = "two_bot_events_ro,two_bot\n"
 FAKE_PSQL = """#!/usr/bin/env python3
-import json, os, pathlib, sys
+import hashlib, json, os, pathlib, sys
 here = pathlib.Path(__file__).parent
 behavior = json.loads((here / "behavior.json").read_text())
 stdin = sys.stdin.read()
+# The login password must never reach a file in clear: log a marker plus a
+# hash the test compares, so a leaked log still proves nothing.
+logged = dict(os.environ)
+secret = logged.pop("PGPASSWORD", None)
+if secret is not None:
+    logged["PGPASSWORD_SHA256"] = hashlib.sha256(secret.encode()).hexdigest()
+    logged["PGPASSWORD"] = "REDACTED"
 with open(here / "calls.jsonl", "a") as log:
-    log.write(json.dumps({"argv": sys.argv[1:], "stdin": stdin, "environ": dict(os.environ)}) + "\\n")
+    log.write(json.dumps({"argv": sys.argv[1:], "stdin": stdin, "environ": logged}) + "\\n")
+# Failure text is built here from the live process values, never stored in
+# behavior.json: that file is clear text and must not hold a credential.
+kind = behavior.get("fail_kind")
+if kind:
+    values = {"member": "", "password": os.environ.get("PGPASSWORD", ""),
+              "guild": "1545644954272137297"}
+    for token in sys.argv[1:]:
+        if token.startswith("member="):
+            values["member"] = token[len("member="):]
+        elif token.startswith("guild="):
+            values["guild"] = token[len("guild="):]
+    templates = {
+        "permission": ("ERROR:  permission denied for table events\\n"
+                       "LINE 5: AND member_id = '{member}'\\n"
+                       "DETAIL: password {password} for guild {guild}\\n"),
+        "auth": "psql: error: password authentication failed for user x {password}",
+        "refused": "psql: error: connection to server at {member} failed: Connection refused",
+        "timeout": "canceling statement due to statement timeout {member}",
+        "strange": "strange failure {member}",
+    }
+    sys.stderr.write(templates[kind].format(**values))
+    sys.exit(behavior.get("exit", 2))
 if behavior.get("fail"):
     sys.stderr.write(behavior["fail"])
     sys.exit(behavior.get("exit", 2))
@@ -51,13 +81,13 @@ def rows_csv(count, event_type="message_created"):
 class Fixture:
     """A temp dir holding the fake psql and its behavior, plus a runner for main()."""
 
-    def __init__(self, test, rows="", identity=IDENTITY, fail=None, exit_code=2):
+    def __init__(self, test, rows="", identity=IDENTITY, fail=None, fail_kind=None, exit_code=2):
         self.dir = Path(tempfile.mkdtemp(prefix="events-read-test-"))
         test.addCleanup(self.cleanup)
         self.psql = self.dir / "psql"
         self.psql.write_text(FAKE_PSQL)
         self.psql.chmod(self.psql.stat().st_mode | stat.S_IXUSR)
-        self.set(rows=rows, identity=identity, fail=fail, exit=exit_code)
+        self.set(rows=rows, identity=identity, fail=fail, fail_kind=fail_kind, exit=exit_code)
         self.output = self.dir / "out.json"
         self.summary = self.dir / "summary.md"
 
@@ -263,7 +293,9 @@ class ReadTests(unittest.TestCase):
             self.assertNotIn("postgres", joined)
             self.assertNotIn(PASSWORD, call["stdin"])
             environ = call["environ"]
-            self.assertEqual(environ["PGPASSWORD"], PASSWORD)
+            self.assertEqual(environ["PGPASSWORD"], "REDACTED")
+            self.assertEqual(environ["PGPASSWORD_SHA256"],
+                             hashlib.sha256(PASSWORD.encode()).hexdigest())
             self.assertEqual(environ["PGUSER"], "two_bot_events_ro")
             self.assertEqual(environ["PGDATABASE"], "two_bot")
             self.assertNotIn("GH_TOKEN", environ)
@@ -322,17 +354,15 @@ class ReadTests(unittest.TestCase):
                 self.assertIn("refusing", err)
 
     def test_psql_stderr_is_never_echoed(self):
-        leaky = (f'ERROR:  permission denied for table events\nLINE 5: AND member_id = \'{MEMBER}\'\n'
-                 f'DETAIL: password {PASSWORD} for guild 1545644954272137297\n')
-        for stderr, phrase in ((leaky, "permission denied for the read-only role"),
-                               (f"psql: error: password authentication failed for user x {PASSWORD}",
-                                "authentication failed"),
-                               (f"psql: error: connection to server at {MEMBER} failed: Connection refused",
-                                "could not connect"),
-                               (f"canceling statement due to statement timeout {MEMBER}", "statement timeout"),
-                               (f"strange failure {MEMBER}", "psql failed")):
+        # The fake builds each stderr from its live process values, so the
+        # synthetic credential never sits in behavior.json in clear text.
+        for kind, phrase in (("permission", "permission denied for the read-only role"),
+                             ("auth", "authentication failed"),
+                             ("refused", "could not connect"),
+                             ("timeout", "statement timeout"),
+                             ("strange", "psql failed")):
             with self.subTest(phrase=phrase):
-                fixture = Fixture(self, fail=stderr, exit_code=2)
+                fixture = Fixture(self, fail_kind=kind, exit_code=2)
                 code, out, err = fixture.run()
                 self.assertEqual(code, 1)
                 self.assertIn(phrase, err)
