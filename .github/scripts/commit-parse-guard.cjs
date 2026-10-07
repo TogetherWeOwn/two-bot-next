@@ -148,8 +148,11 @@ function main(argv, env = process.env) {
       console.log('The squash commit for this PR parses for release-please.');
       return 0;
     }
+    const override = body.includes('BEGIN_COMMIT_OVERRIDE')
+      ? ' The body contains the commit-override marker, so release-please parses only the text after it as this commit; drop the marker from prose.'
+      : '';
     report(failures, 'squash commit',
-      'Positions count the title as line 1 and a blank line as line 2, so PR body line N is position N+2.');
+      `Positions count the title as line 1 and a blank line as line 2, so PR body line N is position N+2.${override}`);
     return 1;
   }
   if (mode === 'range') {

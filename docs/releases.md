@@ -179,7 +179,9 @@ code, test names and function signatures are the usual source.
   line 1, a blank line is line 2, so PR body line N is position N+2). The body
   is checked again on every edit, so fixing the text turns the check green.
   Release PRs are exempt: their merge commit is the release itself. A
-  `BEGIN_COMMIT_OVERRIDE` section is honored exactly as release-please honors it.
+  `BEGIN_COMMIT_OVERRIDE` section is honored exactly as release-please honors
+  it, so never write that marker in prose: release-please would parse the text
+  after it as the commit message.
 - **The release workflow** parses every commit since the last `vX.Y.Z` tag
   before it regenerates the release PR (`schedule` and `workflow_dispatch`;
   never on a push). A failure stops the run, so `dispatch-checks` never starts.

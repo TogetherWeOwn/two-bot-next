@@ -62,6 +62,10 @@ assert.deepEqual(checkPullRequest({title: TITLE, number: '7', body: rescue, head
 const poisoned = `${NORMAL_BODY}\nBEGIN_COMMIT_OVERRIDE\nfix(gateway): ok\n\n${HOSTILE_BARE}END_COMMIT_OVERRIDE\n`;
 assert.equal(checkPullRequest({title: TITLE, number: '7', body: poisoned, headRef: 'fix/x'}).length, 1);
 
+// Prose that merely mentions the marker is treated as an override, as native does.
+const mention = `${NORMAL_BODY}\nThe marker BEGIN_COMMIT_OVERRIDE is parsed as a commit message.\n`;
+assert.equal(checkPullRequest({title: TITLE, number: '7', body: mention, headRef: 'fix/x'}).length, 1);
+
 // 5. The release PR is release-please's own and is exempt.
 assert.deepEqual(checkPullRequest({
   title: 'chore(main): release 0.4.0', number: '9', body: HOSTILE_BODY,
@@ -141,6 +145,8 @@ try {
   assert.equal(rejected.status, 1);
   assert.match(rejected.stdout, /::error title=Unparseable squash commit::/);
   assert.match(rejected.stderr, /will drop this change from the release notes/);
+  assert.doesNotMatch(rejected.stderr, /commit-override marker/);
+  assert.match(cli(`${NORMAL_BODY}\nBEGIN_COMMIT_OVERRIDE in prose\n`).stderr, /commit-override marker/, 'The advice names the marker');
 } finally {
   fs.rmSync(bodyFile, {force: true});
 }
