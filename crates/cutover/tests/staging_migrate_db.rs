@@ -621,7 +621,11 @@ async fn real_sqlx_runner_cases() -> TestResult {
     // The plan-only readout ran under the read-only role: it reports the ledger
     // owner, counts and verifier findings, and never an error.
     let audit = &m["audit"];
-    assert!(audit["error"].is_null(), "readout failed: {}", audit["error"]);
+    assert!(
+        audit["error"].is_null(),
+        "readout failed: {}",
+        audit["error"]
+    );
     assert!(audit["ledger_owner"].as_str().is_some());
     assert_eq!(audit["ledger_counts"]["successful_rows"], 29);
     assert_eq!(audit["ledger_counts"]["failed_rows"], 0);
