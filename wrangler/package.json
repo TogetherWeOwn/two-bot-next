@@ -25,5 +25,8 @@
     "miniflare": "5.20260926.1-alpha",
     "typescript": "7.0.2",
     "wrangler": "4.147.0"
+  },
+  "overrides": {
+    "sharp": "0.35.5"
   }
 }
