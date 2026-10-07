@@ -463,11 +463,12 @@ async fn nested_inviter_session_keys_and_owned_children_are_included() {
 async fn operator_released_request_survives_operator_and_actor_erasure_as_replay_fence() {
     const CHANNEL: &str = "999999999999999991";
     const KEY: &str = "wedged-original-key";
+    const ORIGINAL_HASH: &str = "sensitive-original-actor-hash";
     const TIME: &str = "2026-10-04T00:00:00.000Z";
     let Some(db) = database().await else { return };
     let store = ChannelModerationStore::from_pool(db.pool().clone());
     let ChannelClaim::Claimed { ticket } = store
-        .claim(GUILD, KEY, "moderation.lockdown", "hash", TIME)
+        .claim(GUILD, KEY, "moderation.lockdown", ORIGINAL_HASH, TIME)
         .await
         .unwrap()
     else {
@@ -527,8 +528,8 @@ async fn operator_released_request_survives_operator_and_actor_erasure_as_replay
                 .await
                 .unwrap();
         assert_eq!(audits, 0, "{audit_actor} personal audit data must be gone");
-        let fence: (String, Option<String>) = sqlx::query_as(
-            "SELECT state, outcome FROM moderation_idempotency
+        let fence: (String, Option<String>, String) = sqlx::query_as(
+            "SELECT state, outcome, request_hash FROM moderation_idempotency
               WHERE guild_id = $1 AND idempotency_key = $2",
         )
         .bind(GUILD)
@@ -538,10 +539,14 @@ async fn operator_released_request_survives_operator_and_actor_erasure_as_replay
         .unwrap_or_else(|_| panic!("{audit_actor} erasure deleted the replay fence"));
         assert_eq!(
             fence,
-            ("done".to_owned(), Some("operator_released".to_owned()))
+            (
+                "done".to_owned(),
+                Some("operator_released".to_owned()),
+                "operator_released".to_owned(),
+            )
         );
         let ChannelClaim::Replayed { outcome, .. } = store
-            .claim(GUILD, KEY, "moderation.lockdown", "hash", TIME)
+            .claim(GUILD, KEY, "moderation.lockdown", ORIGINAL_HASH, TIME)
             .await
             .unwrap()
         else {

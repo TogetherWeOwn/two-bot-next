@@ -12,7 +12,7 @@ use crate::{ChannelModerationStore, Secret};
 /// One consistent read of the lane and its request ledger. Ownership tokens stay
 /// private/redacted; the printable fingerprint binds a later CLI confirmation to
 /// this inspection without publishing either ownership capability.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ChannelLaneInspection {
     guild_id: String,
     channel_id: String,
@@ -21,6 +21,15 @@ pub struct ChannelLaneInspection {
     claim_token: Secret<String>,
     claim: Value,
     generation: String,
+}
+
+impl std::fmt::Debug for ChannelLaneInspection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChannelLaneInspection")
+            .field("report", &self.report())
+            .finish()
+    }
 }
 
 impl ChannelLaneInspection {
@@ -34,9 +43,13 @@ impl ChannelLaneInspection {
         self.claim["state"] == "in_flight" && self.lane_token == self.claim_token
     }
 
-    /// Operator-visible rows, with only the ownership capabilities redacted.
+    /// Operator-visible rows, with ownership tokens and the actor-derived request
+    /// hash redacted from both stdout and the durable release audit.
     #[must_use]
     pub fn report(&self) -> Value {
+        let mut claim = self.claim.clone();
+        claim["claim_token"] = json!("[REDACTED]");
+        claim["request_hash"] = json!("[REDACTED]");
         json!({
             "expected_generation": self.generation,
             "moderation_channel_executions": {
@@ -45,7 +58,7 @@ impl ChannelLaneInspection {
                 "idempotency_key": self.claim_key,
                 "claim_token": "[REDACTED]",
             },
-            "moderation_idempotency": self.claim,
+            "moderation_idempotency": claim,
         })
     }
 }
@@ -146,8 +159,8 @@ impl ChannelModerationStore {
         });
         let retired = sqlx::query(
             "UPDATE moderation_idempotency
-                SET state = 'done', outcome = 'operator_released', result_json = $1,
-                    completed_at = NOW()
+                SET state = 'done', outcome = 'operator_released', request_hash = 'operator_released',
+                    result_json = $1, completed_at = NOW()
               WHERE guild_id = $2 AND idempotency_key = $3 AND claim_token = $4
                 AND state = 'in_flight' AND action = $5 AND request_hash = $6
               RETURNING current_user::text AS database_role, session_user::text AS database_login",

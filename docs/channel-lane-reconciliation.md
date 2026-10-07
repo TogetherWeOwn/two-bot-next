@@ -28,10 +28,10 @@ existing approval gates; integration tests use only disposable test services.
    these with the intended action and the stored lockdown recovery seed. A purge
    may already have deleted messages; never repeat it just because its result was
    lost. Resolve disagreement and newer/manual lockdowns before unlocking.
-4. Run inspection below. Read both matching rows, original action/hash/state,
-   timestamps and the generation fingerprint. Ownership `claim_token` values are
-   redacted, including in the audit; the fingerprint is not an execution ticket.
-   Missing/mismatched rows, `done` claims or inconsistent lane/claim tokens must
+4. Run inspection below. Read both matching rows, action/state and timestamps,
+   plus the generation fingerprint. The actor-derived `request_hash` and ownership
+   `claim_token` values are redacted, including in the audit; the fingerprint is
+   not an execution ticket. Missing/mismatched rows, `done` claims or inconsistent lane/claim tokens must
    not be repaired with this command. Leave those fenced and investigate.
 5. Only after the old write has settled and the channel is reconciled, confirm
    using **the fingerprint from that inspection**, your Discord user ID and a
@@ -40,11 +40,12 @@ existing approval gates; integration tests use only disposable test services.
 6. Verify the released audit receipt. The CLI preserves `moderation_lockdowns`
    byte-for-byte and retires the old request to `done/operator_released`, so old
    redelivery replays a no-mutation result. Member erasure (operator or original
-   actor) deletes the personal audit rows but never this `operator_released`
-   ledger row: it is the replay fence, holding only the key, action, request
-   hash, a generic result and timestamps. Resume workers only when safe. A new
-   `/unlock` uses the surviving seed and a new request key; do not unlock a newer
-   lockdown based on an old incident. Re-observe Discord after any authorized
+   actor) erases their member-linked audit rows but never this `operator_released`
+   ledger row: it is the replay fence, holding only the key, action, fixed
+   `operator_released` request-hash marker, generic result and timestamps. The
+   actor-derived hash is redacted from inspection and audit snapshots. Resume
+   workers only when safe. A new `/unlock` uses the surviving seed and a new
+   request key; do not unlock a newer lockdown based on an old incident. Re-observe Discord after any authorized
    follow-up. Releasing a lane does not itself restore masks or reset slowmode.
 
 ## Inspect, then explicitly confirm

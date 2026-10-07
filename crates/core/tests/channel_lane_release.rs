@@ -8,6 +8,7 @@ const GUILD: &str = "111111111111111111";
 const CHANNEL: &str = "222222222222222222";
 const OPERATOR: &str = "333333333333333333";
 const TIME: &str = "2026-10-04T00:00:00.000Z";
+const ORIGINAL_HASH: &str = "actor-derived-test-hash";
 
 async fn database() -> TestDatabase {
     let url = std::env::var("TWO_TEST_DATABASE_URL").expect("test bootstrap required");
@@ -32,7 +33,14 @@ async fn claim(store: &ChannelModerationStore, key: &str) -> ChannelClaimTicket 
 async fn release_audits_previous_state_preserves_seed_and_prevents_old_key_replay() {
     let db = database().await;
     let store = ChannelModerationStore::from_pool(db.pool().clone());
-    let ticket = claim(&store, "wedged").await;
+    let ChannelClaim::Claimed { ticket } = store
+        .claim(GUILD, "wedged", "moderation.lockdown", ORIGINAL_HASH, TIME)
+        .await
+        .unwrap()
+    else {
+        panic!("expected a new claim");
+    };
+    assert!(store.claim_channel(&ticket, CHANNEL).await.unwrap());
     let seed = store
         .record_lockdown(
             CHANNEL,
@@ -55,6 +63,10 @@ async fn release_audits_previous_state_preserves_seed_and_prevents_old_key_repla
     let report = before.report();
     assert_eq!(report["moderation_idempotency"]["state"], "in_flight");
     assert_eq!(
+        report["moderation_idempotency"]["request_hash"],
+        "[REDACTED]"
+    );
+    assert_eq!(
         report["moderation_channel_executions"]["claim_token"],
         "[REDACTED]"
     );
@@ -69,13 +81,23 @@ async fn release_audits_previous_state_preserves_seed_and_prevents_old_key_repla
     .await
     .unwrap();
     assert!(!report.to_string().contains(&raw_token));
-    assert!(!format!("{before:?}").contains(&raw_token));
+    let debug_inspection = format!("{before:?}");
+    assert!(!debug_inspection.contains(&raw_token));
+    assert!(!debug_inspection.contains(ORIGINAL_HASH));
     let audit_id = store
         .force_release_channel_lane(&before, OPERATOR, "REST settled; channel reconciled")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(store.get_lockdown(CHANNEL).await.unwrap(), Some(seed));
+    let released_hash: String = sqlx::query_scalar(
+        "SELECT request_hash FROM moderation_idempotency WHERE guild_id = $1 AND idempotency_key = 'wedged'",
+    )
+    .bind(GUILD)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(released_hash, "operator_released");
     assert!(store
         .inspect_channel_lane(GUILD, CHANNEL, "wedged")
         .await
@@ -85,11 +107,18 @@ async fn release_audits_previous_state_preserves_seed_and_prevents_old_key_repla
         .complete(&ticket, "locked_down", "{}", TIME)
         .await
         .unwrap());
+    assert!(matches!(
+        store
+            .claim(GUILD, "wedged", "moderation.unlock", ORIGINAL_HASH, TIME)
+            .await
+            .unwrap(),
+        ChannelClaim::Mismatch
+    ));
     let ChannelClaim::Replayed {
         outcome,
         result_json,
     } = store
-        .claim(GUILD, "wedged", "moderation.lockdown", "hash", TIME)
+        .claim(GUILD, "wedged", "moderation.lockdown", ORIGINAL_HASH, TIME)
         .await
         .unwrap()
     else {
@@ -106,6 +135,10 @@ async fn release_audits_previous_state_preserves_seed_and_prevents_old_key_repla
     assert_eq!(audit.2, "moderation.channel_lane_release");
     let metadata: Value = serde_json::from_str(&audit.3).unwrap();
     assert_eq!(metadata["previous"], report);
+    assert_eq!(
+        metadata["previous"]["moderation_idempotency"]["request_hash"],
+        "[REDACTED]"
+    );
     assert_eq!(metadata["database_login"], "agent_test");
     assert_eq!(metadata["database_role"], "agent_test");
     assert_eq!(metadata["recovery_seed"], "untouched");

@@ -67,7 +67,11 @@ PostgreSQL login and effective role. No public/slash/website release route exist
 | `moderation_audit` | None | INSERT (strict, same transaction) | `two_bot_runtime` DML |
 | `moderation_lockdowns` | Reconciliation reads outside the CLI | **No access/write by this command** | Existing recovery policy unchanged |
 
-The ledger is retained as a terminal replay tombstone, not deleted, and the member-erasure plan skips it (`done` / `operator_released`), so the personal audit rows can be erased without re-arming the old key. A read-only
+The ledger is retained as a terminal replay tombstone, not deleted, and the
+member-erasure plan skips it (`done` / `operator_released`), so the personal audit
+rows can be erased without re-arming the old key. Release replaces the
+actor-derived request hash with the fixed `operator_released` marker; the original
+value is redacted from the inspection and audit snapshot. A read-only
 login cannot confirm release; `two_web_reader` cannot inspect or release these
 base tables. No new privilege is required. Follow the
 [channel reconciliation checklist](channel-lane-reconciliation.md) before any

@@ -266,6 +266,16 @@
       "table": "member_erasure_audit",
       "column": "actor",
       "reason": "Minimal operator accountability for erasures: actor and time only, never the erased subject, guild, request or content. Actor records are retained independently of member activity."
+    },
+    {
+      "table": "moderation_idempotency",
+      "column": "idempotency_key",
+      "reason": "An operator-released request must retain its request key as a replay fence so delayed delivery cannot repeat the uncertain Discord mutation."
+    },
+    {
+      "table": "moderation_idempotency",
+      "column": "request_hash",
+      "reason": "An operator-released request retains only the fixed non-identity operator_released marker; its actor-derived request hash is overwritten and redacted from inspection/audit snapshots."
     }
   ]
 }

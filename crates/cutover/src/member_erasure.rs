@@ -7,9 +7,10 @@
 //! an operator reconciled and released (`done` / `operator_released`). Its
 //! Discord effect was never proven, so that row is the replay fence that stops a
 //! delayed delivery of the same key from claiming afresh and repeating the
-//! mutation. It keeps only the key, action, request hash, generic result and
-//! timestamps; the actor, target, reason and operator attribution live in
-//! `moderation_audit`, which erasure still deletes.
+//! mutation. It keeps only the key, action, a fixed non-identity request-hash
+//! marker, generic result and timestamps; the actor-derived hash is redacted from
+//! inspection/audit snapshots, and member-linked `moderation_audit` rows remain
+//! covered by the erasure manifest.
 
 use serde::Deserialize;
 use sqlx::{PgConnection, PgPool};

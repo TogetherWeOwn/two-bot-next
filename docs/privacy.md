@@ -67,9 +67,11 @@ are outside this implementation's scope.
   operator reconciled and released (`moderation_idempotency`, `done` /
   `operator_released`). Its Discord effect was never proven, so the row is the
   replay fence that keeps a delayed delivery of the old key from repeating the
-  mutation. It holds only the website or interaction key, action, request hash, a
-  fixed generic result and timestamps. The actor, operator, channel, reason and
-  previous-state audit (`moderation_audit`) are erased as usual.
+  mutation. It holds only the website or interaction key, action, a fixed
+  non-identity `operator_released` request-hash marker, generic result and
+  timestamps. Release overwrites the actor-derived request hash and redacts it
+  from inspection and audit snapshots. Member-linked moderation audit rows remain
+  covered by the erasure manifest.
 - Internal action/replay ledgers store actor/target/resource IDs and outcomes,
   with hashed keys/nonces/event identities. Settings and immutable settings audit
   store operator attribution and JSON policy configuration.
@@ -101,6 +103,7 @@ The manifest explicitly retains these control-plane records:
 | `guild_settings_audit.actor`, `old_value`, `new_value` | Immutable configuration history; the database refuses DELETE, UPDATE and TRUNCATE, even a zero-row DELETE. No trigger disabling or audit bypass is permitted. IDs in prior/current policy remain here. |
 | `audit_kill_switch.engaged_by` | Global incident-control attribution, with no guild scope. Member erasure never disengages or rewrites the halt. |
 | `member_erasure_audit.actor` | Minimal operator accountability, retained independently of member activity. It is not the erased subject field. |
+| `moderation_idempotency` rows with `done` / `operator_released` | Indefinite replay fence for an uncertain Discord mutation. It retains the request key, action, fixed `operator_released` marker, generic result and timestamps; the actor-derived request hash is overwritten, and the inspection/audit snapshot redacts it. |
 
 These exceptions currently have **no enforced expiry**. This CLI is not a claim
 that all personal data is gone. A request involving retained policy/audit data

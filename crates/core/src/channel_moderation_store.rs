@@ -287,14 +287,24 @@ impl ChannelModerationStore {
             // attempt releasing its claim. Still running; the caller retries.
             return Ok(ChannelClaim::InFlight);
         };
+        let state: String = row.get("state");
+        let outcome: Option<String> = row.get("outcome");
         let stored_action: String = row.get("action");
-        let stored_hash: String = row.get("request_hash");
-        if stored_action != action || stored_hash != request_hash {
+        if stored_action != action {
             return Ok(ChannelClaim::Mismatch);
         }
-        let state: String = row.get("state");
+        if state == "done" && outcome.as_deref() == Some("operator_released") {
+            let result_json: Option<String> = row.get("result_json");
+            return Ok(ChannelClaim::Replayed {
+                outcome: "operator_released".to_owned(),
+                result_json: result_json.unwrap_or_else(|| "{}".to_owned()),
+            });
+        }
+        let stored_hash: String = row.get("request_hash");
+        if stored_hash != request_hash {
+            return Ok(ChannelClaim::Mismatch);
+        }
         if state == "done" {
-            let outcome: Option<String> = row.get("outcome");
             let result_json: Option<String> = row.get("result_json");
             return Ok(ChannelClaim::Replayed {
                 outcome: outcome.unwrap_or_else(|| "unknown".to_owned()),
