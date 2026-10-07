@@ -19,7 +19,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 44.
+Built-in commands: 50.
 
 ## `/access`
 
@@ -57,14 +57,14 @@ Start new rooms from one creator as private
 
 ## `/attendance`
 
-Record a verified human attendee for a Discord event occurrence.
+Check in a verified human attendee for a scheduled event (scorecard)
 
 - Default permissions: ManageEvents (`8589934592`)
 - Available in DMs: false
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-occurrence` | string | true | — | — | 128 | — | Scheduled event id or stable occurrence id. |
+| `event-occurrence` | string | true | — | — | 128 | — | Event id (number in the event URL) or occurrence id, e.g. 12345 or weekly-standup-2026-10-03 |
 | `member` | user | true | — | — | — | — | Human member who attended. |
 
 ## `/ban`
@@ -189,6 +189,15 @@ Toggle shared numbering per category for one creator channel
 | `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
 | `enabled` | boolean | false | — | — | — | — | Share numbering across the category (default on) |
 
+## `/help`
+
+Show this server's live commands, grouped by who can use them.
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
+
 ## `/import`
 
 Preview a voice configuration file before applying it
@@ -253,8 +262,8 @@ Post a raid/LFG signup with role slots
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `title` | string | true | — | — | — | — | Event or group title |
-| `starts-at` | string | true | — | — | — | — | ISO-8601 start time |
-| `roles` | string | true | — | — | — | — | tank:Tank:2,healer:Healer:2,dps:DPS:6 |
+| `starts-at` | string | true | — | — | — | — | ISO-8601 start time, e.g. 2026-10-04T18:00:00Z |
+| `roles` | string | true | — | — | — | — | Role slots as role:Label:count, comma-separated, e.g. tank:Tank:2,dps:DPS:6 |
 
 ## `/lfg-close`
 
@@ -265,7 +274,18 @@ Close a raid/LFG signup
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `id` | string | true | — | — | — | — | LFG id |
+| `id` | string | true | — | — | — | — | LFG id from the posted signup |
+
+## `/limit`
+
+Set your room's user limit (no number locks it at the current headcount)
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `count` | integer | false | 0 | 99 | — | — | Limit 0-99 (0 is unlimited; leave empty to lock at who is here now) |
 
 ## `/lockdown`
 
@@ -295,6 +315,15 @@ Set where room health notices go and how much they say
 | `mention` | subcommand | false | — | — | — | — | Set or clear the role mentioned on errors |
 | `mention role` | role | false | — | — | — | — | Role to mention; leave empty to clear it |
 
+## `/name`
+
+Set a custom name for your temporary voice room, or restore the template name
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
+
 ## `/ping`
 
 Show the bot's response latency
@@ -315,7 +344,25 @@ Set where new rooms appear and the first room number
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
 | `position` | string | false | — | — | — | Above = `"above"`; Below = `"below"` | New rooms go above or below the creator channel |
-| `first-number` | integer | false | 1 | — | — | — | First room number (numbering starts here) |
+| `first-number` | integer | false | 1 | 4294967295 | — | — | First room number (numbering starts here) |
+
+## `/private`
+
+Deny new members from joining your voice room and open a Join channel
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
+
+## `/public`
+
+Let anyone join your voice room again and remove its Join channel
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
 
 ## `/purge`
 
@@ -358,19 +405,19 @@ RSVP to a Discord scheduled event
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-id` | string | true | — | — | — | — | Discord scheduled event id |
+| `event-id` | string | true | — | — | — | — | Discord scheduled event id (number in the event URL), e.g. 12345 |
 | `status` | string | true | — | — | — | Going = `"going"`; Interested = `"interested"`; Declined = `"declined"` | Your response |
 
 ## `/rsvp-attendance`
 
-Show Owen RSVP totals for a scheduled event
+Show RSVP totals for a scheduled event
 
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-id` | string | true | — | — | — | — | Discord scheduled event id |
+| `event-id` | string | true | — | — | — | — | Discord scheduled event id (number in the event URL), e.g. 12345 |
 
 ## `/schedule`
 
@@ -457,7 +504,7 @@ Temporarily ban a member
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `target` | user | true | — | — | — | — | Member to moderate |
-| `duration_seconds` | integer | true | 60 | — | — | — | Duration in seconds |
+| `duration_seconds` | integer | true | 60 | 31536000 | — | — | Duration in seconds |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
 
 ## `/templateassistant`
@@ -495,7 +542,7 @@ Timeout a member
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `target` | user | true | — | — | — | — | Member to moderate |
-| `duration_seconds` | integer | true | 60 | — | — | — | Duration in seconds |
+| `duration_seconds` | integer | true | 60 | 2419200 | — | — | Duration in seconds |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
 
 ## `/transfer`
@@ -508,6 +555,15 @@ Hand your temporary voice room to a member in it
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `member` | user | true | — | — | — | — | Member in the room to make the new owner |
+
+## `/unlimit`
+
+Remove your room's user limit
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
 
 ## `/unlock`
 

@@ -271,6 +271,14 @@ pub enum RoomHttpError {
     UnknownOutcome,
 }
 
+/// A message the bot posted: the channel it landed in and its id, so the same
+/// message can be edited later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MessageRef {
+    pub channel_id: Snowflake,
+    pub message_id: Snowflake,
+}
+
 #[derive(Clone)]
 pub struct RoomHttp {
     // Twilight builds and validates requests, but its ResponseFuture retries
@@ -736,22 +744,100 @@ impl RoomHttp {
         member_id: Snowflake,
         still_managing: impl Fn() -> bool + Send + 'static,
     ) -> Result<(), RoomHttpError> {
-        if text_channel_id == 0 || member_id == 0 {
+        self.delete_member_overwrite(text_channel_id, member_id, still_managing)
+            .await
+    }
+
+    /// Delete one member's overwrite on a channel. Deleting an absent
+    /// overwrite (or a channel already gone) is success: the end state — no
+    /// overwrite — already holds.
+    pub async fn delete_member_overwrite(
+        &self,
+        channel_id: Snowflake,
+        member_id: Snowflake,
+        still_valid: impl Fn() -> bool + Send + 'static,
+    ) -> Result<(), RoomHttpError> {
+        if channel_id == 0 || member_id == 0 {
             return Err(RoomHttpError::InvalidRequest);
         }
         let request = self
             .http
-            .delete_channel_permission(Id::new(text_channel_id))
+            .delete_channel_permission(Id::new(channel_id))
             .member(Id::new(member_id))
             .try_into_request()
             .map_err(classify_http_error)?;
-        match self.send(request, still_managing).await {
+        match self.send(request, still_valid).await {
             Ok(_) => Ok(()),
-            // Deleting an absent overwrite (or a channel already gone) is
-            // success: the end state — no overwrite — already holds.
             Err(RoomHttpError::NotFound) => Ok(()),
             Err(other) => Err(other),
         }
+    }
+
+    /// V3 `/private` and `/public`: replace one role or member overwrite on a
+    /// room channel. The write is a PUT that replaces the target's whole
+    /// overwrite, so the caller passes the bits it wants kept. Manage Roles is
+    /// never written as an allow, whatever the caller passes (the create-time
+    /// exclusion holds for every overwrite this adapter emits), and CONNECT or
+    /// any other bit may not sit in both lists.
+    pub async fn put_channel_overwrite(
+        &self,
+        channel_id: Snowflake,
+        overwrite: &PermissionOverwrite,
+        still_valid: impl Fn() -> bool + Send + 'static,
+    ) -> Result<(), RoomHttpError> {
+        if channel_id == 0 || overwrite.id.get() == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let kind = match overwrite.kind {
+            PermissionOverwriteType::Role => HttpPermissionOverwriteType::Role,
+            PermissionOverwriteType::Member => HttpPermissionOverwriteType::Member,
+            _ => return Err(RoomHttpError::InvalidRequest),
+        };
+        let deny = overwrite.deny;
+        let allow = (overwrite.allow & !Permissions::MANAGE_ROLES) & !deny;
+        let wire = HttpPermissionOverwrite {
+            allow: Some(allow),
+            deny: Some(deny),
+            id: overwrite.id,
+            kind,
+        };
+        let request = self
+            .http
+            .update_channel_permission(Id::new(channel_id), &wire)
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        self.send(request, still_valid).await?;
+        Ok(())
+    }
+
+    /// V3: create the Join voice channel next to a private room. No
+    /// overwrites ride the POST, so it syncs to the category and the bot's own
+    /// access comes from the category rather than a new grant. Single attempt:
+    /// an unknown outcome must not produce another POST.
+    pub async fn create_join_voice_channel(
+        &self,
+        guild_id: Snowflake,
+        name: &str,
+        parent_id: Option<Snowflake>,
+        position: Option<u64>,
+        still_valid: impl Fn() -> bool + Send + 'static,
+    ) -> Result<Channel, RoomHttpError> {
+        if guild_id == 0 || parent_id == Some(0) {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let mut request = self
+            .http
+            .create_guild_channel(Id::new(guild_id), name)
+            .kind(ChannelType::GuildVoice);
+        if let Some(position) = position {
+            request = request.position(position);
+        }
+        if let Some(parent_id) = parent_id {
+            request = request.parent_id(Id::new(parent_id));
+        }
+        let request = request.try_into_request().map_err(classify_http_error)?;
+        let body = self.send(request, still_valid).await?;
+        serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)
     }
 
     /// Post an operator notice to a channel. Only the given role (if any) can
@@ -805,6 +891,83 @@ impl RoomHttp {
         self.post_notice(channel.id.get(), content, None).await
     }
 
+    /// V3 join request: post a message with buttons to a channel and return
+    /// where it landed. Only `mention_user` (if any) can be pinged:
+    /// `allowed_mentions` is otherwise empty, so any other mention in
+    /// `content` renders without a ping. Single attempt, so an unknown
+    /// outcome never posts a second prompt on its own.
+    pub async fn post_component_message(
+        &self,
+        channel_id: Snowflake,
+        content: &str,
+        mention_user: Option<Snowflake>,
+        components: &[Component],
+    ) -> Result<MessageRef, RoomHttpError> {
+        if channel_id == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let mut mentions = AllowedMentions::default();
+        if let Some(user) = mention_user.filter(|user| *user != 0) {
+            mentions.users.push(Id::new(user));
+        }
+        let request = self
+            .http
+            .create_message(Id::new(channel_id))
+            .content(content)
+            .components(components)
+            .allowed_mentions(Some(&mentions))
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        let body = self.send(request, || true).await?;
+        parse_posted_message(channel_id, &body)
+    }
+
+    /// Replace the text and buttons of a message the bot posted. An empty
+    /// `components` list removes the buttons. No mentions are allowed. A
+    /// message (or its channel) that is already gone is `NotFound`.
+    pub async fn edit_component_message(
+        &self,
+        message: MessageRef,
+        content: &str,
+        components: &[Component],
+    ) -> Result<(), RoomHttpError> {
+        if message.channel_id == 0 || message.message_id == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let mentions = AllowedMentions::default();
+        let request = self
+            .http
+            .update_message(Id::new(message.channel_id), Id::new(message.message_id))
+            .content(Some(content))
+            .components(Some(components))
+            .allowed_mentions(Some(&mentions))
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        self.send(request, || true).await?;
+        Ok(())
+    }
+
+    /// Atomic room-scoped overwrite replacement for an owner handoff.
+    /// Source: <https://docs.discord.com/developers/resources/channel#modify-channel>
+    pub async fn update_room_overwrites(
+        &self,
+        channel_id: Snowflake,
+        overwrites: &[PermissionOverwrite],
+        still_valid: impl Fn() -> bool + Send + 'static,
+    ) -> Result<Channel, RoomHttpError> {
+        if channel_id == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let request = self
+            .http
+            .update_channel(Id::new(channel_id))
+            .permission_overwrites(overwrites)
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        let body = self.send(request, still_valid).await?;
+        serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)
+    }
+
     pub async fn rename_room(
         &self,
         channel_id: Snowflake,
@@ -825,6 +988,49 @@ impl RoomHttp {
             .await
             .map_err(|_| RoomHttpError::RenameDeferred)??;
         Ok(())
+    }
+
+    /// V3 `/limit` and `/unlimit`: set one room channel's user limit (`0` is
+    /// unlimited). Discord accepts `0..=99`; anything larger is refused before
+    /// the request is built. The write is idempotent, so a retry after an
+    /// unknown outcome is safe.
+    pub async fn set_room_user_limit(
+        &self,
+        channel_id: Snowflake,
+        user_limit: u32,
+        still_valid: impl Fn() -> bool + Send + 'static,
+    ) -> Result<(), RoomHttpError> {
+        let Ok(user_limit) = u16::try_from(user_limit) else {
+            return Err(RoomHttpError::InvalidRequest);
+        };
+        if channel_id == 0 || user_limit > 99 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let request = self
+            .http
+            .update_channel(Id::new(channel_id))
+            .user_limit(user_limit)
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        self.send(request, still_valid).await?;
+        Ok(())
+    }
+}
+
+/// The id of a message Discord just created. A 2xx whose body does not name a
+/// message is an unknown outcome, never an id of zero.
+fn parse_posted_message(channel_id: Snowflake, body: &[u8]) -> Result<MessageRef, RoomHttpError> {
+    #[derive(Deserialize)]
+    struct Posted {
+        id: String,
+    }
+    let posted: Posted = serde_json::from_slice(body).map_err(|_| RoomHttpError::UnknownOutcome)?;
+    match posted.id.parse::<Snowflake>() {
+        Ok(message_id) if message_id != 0 => Ok(MessageRef {
+            channel_id,
+            message_id,
+        }),
+        _ => Err(RoomHttpError::UnknownOutcome),
     }
 }
 

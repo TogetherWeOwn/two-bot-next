@@ -25,7 +25,7 @@ rollout approval separately.
 The desired set is the compiled builtins enabled by the same publishing gates:
 `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`, `TWO_MODERATION=1` (including its existing
 `TWO_OWEN_USER_ID`/protected-role validation), and `TWO_COMMUNITY_SCORECARD=1`.
-`TWO_VOICE=1` adds the temporary-voice set after moderation (16 new names; the
+`TWO_VOICE=1` adds the temporary-voice set after moderation (21 new names; the
 voice `kick` loses first-wins to moderation `/kick`), and `/templateassistant`
 joins it only when `TWO_ASSISTANT_ENDPOINT` is also configured. The running bot
 publishes the voice set only while its voice sink actually built; this CLI reads

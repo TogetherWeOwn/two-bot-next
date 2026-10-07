@@ -39,6 +39,9 @@ mod gateway_failure;
 mod gateway_metrics;
 #[cfg(test)]
 mod gateway_tests;
+mod interaction_admission;
+#[cfg(test)]
+mod interaction_composition_tests;
 mod internal_action_http;
 mod jobs;
 mod join_risk_runtime;
@@ -48,6 +51,9 @@ mod join_risk_runtime_tests;
 mod lifecycle_tests;
 #[cfg(test)]
 mod log_volume_guard_tests;
+mod logging;
+mod member_cli;
+mod member_runtime;
 mod metrics_http;
 mod moderation_cli;
 #[cfg(test)]
@@ -82,7 +88,7 @@ mod website_jobs;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, Instrument};
 use two_bot_core::{ComponentStatus, Config, VoiceGates};
 
 use futures_util::FutureExt as _;
@@ -127,13 +133,11 @@ async fn main() {
         print_backup_help_and_exit().await;
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "two_bot=info".into()),
-        )
-        .init();
+    logging::init();
+    run(&cli_args).instrument(logging::run_span()).await;
+}
 
+async fn run(cli_args: &[String]) {
     let receiver_config = two_bot_core::internal_action_config::InternalActionConfig::from_env()
         .unwrap_or_else(|_| {
             tracing::error!(
@@ -150,7 +154,7 @@ async fn main() {
             );
             std::process::exit(1);
         }
-        tracing::warn!(error = %err, "config invalid; continuing with safe defaults");
+        tracing::warn!(msg = "config_invalid", error = %err, "config invalid; continuing with safe defaults");
         Config {
             discord_token: None,
             database_url: None,
@@ -254,7 +258,7 @@ async fn main() {
         let vars: std::collections::HashMap<String, String> = std::env::vars().collect();
         let gates = two_bot_core::disable_preflight::DisableGates::from_map(&vars);
         if !gates.moderation || !gates.automations {
-            let overridden = two_bot_core::disable_preflight::override_active(&vars, &cli_args);
+            let overridden = two_bot_core::disable_preflight::override_active(&vars, cli_args);
             match two_bot_core::disable_preflight::boot_check(&pool, &gates, overridden).await {
                 Ok(two_bot_core::disable_preflight::BootVerdict::Proceed) => {}
                 Ok(two_bot_core::disable_preflight::BootVerdict::Refused(owed)) => {
@@ -320,6 +324,15 @@ async fn main() {
         }
         _ => None,
     };
+    // ONE member-moderation consumer: gateway command dispatch and the
+    // supervised unban sweep share this Arc. Disabled, invalidly configured
+    // or non-staging guilds leave the verbs and the job unregistered.
+    let member = match (gateway_prerequisites(&config), store.as_ref()) {
+        (Ok((_, _, guild_id)), Some(db)) => {
+            member_runtime::MemberRuntime::from_env(db.pool().clone(), guild_id)
+        }
+        _ => None,
+    };
     // V1 voice rooms: per-guild lifecycle actors fed by the gateway sink.
     // Inert unless TWO_VOICE=1 with token + database present; any failure
     // degrades to voice-off with a warn, never a boot failure.
@@ -335,8 +348,10 @@ async fn main() {
         let state = Arc::clone(&gateway);
         let slot = Arc::clone(&automod_slot);
         let self_roles = self_roles.clone();
+        let member = member.clone();
         let linger_stop = stopping.clone();
-        Some(tokio::spawn(async move {
+        let gateway_span = logging::gateway_span(guild_id);
+        let task = async move {
             // A panic is caught only to name it on /readyz; the task still ends
             // in `Err`, which the supervisor treats exactly like a JoinError.
             let outcome: Result<Result<(), gateway_failure::StepFailure>, _> =
@@ -385,9 +400,22 @@ async fn main() {
                         guild_id,
                         self_roles,
                         gates,
+                        member,
                         &activation,
                         voice.is_some(),
                     );
+                    // Ordered RSVP surface over the runtime's governed executor.
+                    // `None` whenever the command runtime is parked; the gateway
+                    // and funnel still boot.
+                    let interactions = runtime.as_ref().and_then(|runtime| {
+                        build_interaction_runtime(
+                            &pool,
+                            guild_id,
+                            &gates,
+                            runtime.executor(),
+                            &activation,
+                        )
+                    });
                     if let Some(runtime) = &runtime {
                         let config = gateway_commands::GatewayCommandConfig::from_map(
                             guild_id,
@@ -525,15 +553,15 @@ async fn main() {
                         }
                         None => None,
                     };
-                    // V4 `kick` collision: when the voice sink owns a kick
-                    // target (tracked room), the router yields so the vote
-                    // is answered exactly once. Both runtimes exist only
-                    // inside this task, so the claim wires here.
+                    // V4 `kick` collision: the router answers every `/kick`
+                    // and delegates the room vote to the voice sink when
+                    // moderation refuses an occupant. Both runtimes exist
+                    // only inside this task, so the delegate wires here.
                     if let (Some(runtime), Some(voice)) = (runtime.as_ref(), voice.as_ref()) {
                         let voice = Arc::clone(voice);
-                        runtime.set_voice_kick_claim(Arc::new(move |guild, member| {
+                        runtime.set_voice_kick_vote(Arc::new(move |interaction| {
                             let voice = Arc::clone(&voice);
-                            Box::pin(async move { voice.kick_claim_room(guild, member).await })
+                            Box::pin(async move { voice.kick_vote(interaction).await })
                         }));
                     }
 
@@ -544,6 +572,7 @@ async fn main() {
                         gateway_url.as_deref(),
                     );
                     info!(
+                        msg = "gateway_connecting",
                         resume = saved.is_some(),
                         "durable gateway initialized; shard connecting"
                     );
@@ -552,6 +581,7 @@ async fn main() {
                         pipeline,
                         Arc::clone(&state),
                         store,
+                        interactions,
                         onboarding,
                         runtime,
                         automod,
@@ -587,10 +617,12 @@ async fn main() {
                     Err(failed.error)
                 }
             }
-        }))
+        };
+        Some(tokio::spawn(task.instrument(gateway_span)))
     } else {
         *gateway.write().await = GatewayState::Unconfigured;
         info!(
+            msg = "gateway_parked",
             missing = gateway_prerequisites(&config).unwrap_err(),
             status = ?ComponentStatus::Down,
             "gateway prerequisites missing; gateway parked, /readyz reports down"
@@ -606,6 +638,7 @@ async fn main() {
         self_roles,
         automod_slot,
         receiver,
+        member,
     );
     let result = match gateway_task {
         Some(task) => supervise_gateway(task, http, gateway, shutdown).await,
@@ -613,12 +646,77 @@ async fn main() {
     };
     if result.is_err() {
         tracing::error!(
+            msg = "shutdown_failed",
             startup_phase = "service_supervisor",
             error_class = "container_service_failed",
             "container service failed"
         );
         std::process::exit(1);
     }
+}
+
+/// Ordered RSVP surface over the command runtime's governed REST executor:
+/// one shared executor (one token key, one pacing lane) serves both the
+/// detached command dispatch and the ordered interaction completion. Returns
+/// `None` — gateway and funnel still boot — when command-gate parsing fails,
+/// so bad env parks only this surface. Mirrors
+/// [`command_runtime::CommandRuntime::from_env`]: no permissive defaults,
+/// no loopback broadening, no live probe.
+fn build_interaction_runtime(
+    pool: &sqlx::Pool<sqlx::Postgres>,
+    guild_id: u64,
+    onboarding: &two_bot_core::OnboardingGates,
+    executor: two_bot_discord::ActionExecutor,
+    activation: &activation::BootActivation,
+) -> Option<Arc<two_bot_discord::interactions::InteractionRuntime>> {
+    let features = match two_bot_core::FeatureGates::from_env() {
+        Ok(features) => features,
+        Err(err) => {
+            tracing::warn!(error = %err, "feature gates invalid; ordered interaction surface parked");
+            return None;
+        }
+    };
+    // Mirror `CommandRuntime::from_env`: a denied capability never reaches its
+    // feature-specific validation, so stale moderation env cannot re-enable a
+    // refused surface on this path.
+    let moderation = if activation.permitted(two_bot_core::activation::LiveCapability::Moderation) {
+        match two_bot_core::ModerationGates::from_env() {
+            Ok(moderation) => moderation,
+            Err(err) => {
+                tracing::warn!(error = %err, "moderation gates invalid; ordered interaction surface parked");
+                return None;
+            }
+        }
+    } else {
+        two_bot_core::ModerationGates {
+            enabled: false,
+            owen_user_id: String::new(),
+            protected_role_ids: Default::default(),
+        }
+    };
+    let gates = two_bot_core::RouterGates::from_slices(
+        Some(guild_id),
+        &features,
+        &moderation,
+        two_bot_core::SurfaceFlags {
+            session_picker: onboarding.mode == two_bot_core::OnboardingMode::Session,
+            tickets: ticket_runtime::TicketConfig::from_env(guild_id).is_some(),
+            scorecard: std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|v| v == "1"),
+            ..Default::default()
+        },
+    );
+    // Apply the exact boot activation narrowing so the ordered router carries
+    // the same capability policy as the shared command runtime. Never widen.
+    let router = two_bot_core::InteractionRouter::new(activation.constrain_router(gates));
+    Some(Arc::new(
+        two_bot_discord::interactions::InteractionRuntime::with_router(
+            router,
+            pool.clone(),
+            executor,
+            0,
+            two_bot_core::ClassifierConfig::from_env(),
+        ),
+    ))
 }
 
 /// This receiver slice is staging-only, not authority to enable production.
@@ -644,6 +742,7 @@ async fn publish_gateway_failure(
     linger: std::time::Duration,
 ) {
     tracing::error!(
+        msg = "gateway_failed",
         startup_phase = gateway_failure::FailurePhase::DurableGateway.as_str(),
         error_class = class.as_str(),
         "durable gateway failed; checkpoint unchanged, readiness unavailable"

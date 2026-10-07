@@ -60,173 +60,27 @@ impl PgVoiceConfigStore {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *tx)
             .await?;
-        let creators = sqlx::query(
-            "SELECT * FROM voice_creators WHERE guild_id = $1
-             ORDER BY length(channel_id), channel_id",
-        )
-        .bind(&guild)
-        .fetch_all(&mut *tx)
-        .await?
-        .iter()
-        .map(decode_creator)
-        .collect::<Result<Vec<_>, _>>()?;
-        let templates = sqlx::query(
-            "SELECT channel_id, name_template, status_template FROM voice_channel_templates
-             WHERE guild_id = $1 ORDER BY length(channel_id), channel_id",
-        )
-        .bind(&guild)
-        .fetch_all(&mut *tx)
-        .await?
-        .iter()
-        .map(|row| {
-            Ok(ChannelTemplates {
-                channel_id: row.try_get("channel_id")?,
-                name_template: row.try_get("name_template")?,
-                status_template: row.try_get("status_template")?,
-            })
-        })
-        .collect::<Result<Vec<_>, sqlx::Error>>()?;
-        let aliases = sqlx::query(
-            r#"SELECT game, alias FROM voice_game_aliases
-               WHERE guild_id = $1 ORDER BY game COLLATE "C""#,
-        )
-        .bind(&guild)
-        .fetch_all(&mut *tx)
-        .await?
-        .iter()
-        .map(|row| {
-            Ok(GameAlias {
-                game: row.try_get("game")?,
-                alias: row.try_get("alias")?,
-            })
-        })
-        .collect::<Result<Vec<_>, sqlx::Error>>()?;
-        let mut lists: Vec<RandomList> = Vec::new();
-        for row in sqlx::query(
-            r#"SELECT list_name, choice FROM voice_random_list_choices
-               WHERE guild_id = $1 ORDER BY list_name COLLATE "C", position"#,
-        )
-        .bind(&guild)
-        .fetch_all(&mut *tx)
-        .await?
-        {
-            let name: String = row.try_get("list_name")?;
-            let choice: String = row.try_get("choice")?;
-            match lists.last_mut() {
-                Some(list) if list.name == name => list.choices.push(choice),
-                _ => lists.push(RandomList {
-                    name,
-                    choices: vec![choice],
-                }),
-            }
-        }
-        let logging =
-            match sqlx::query("SELECT channel_id, detail FROM voice_logging WHERE guild_id = $1")
-                .bind(&guild)
-                .fetch_optional(&mut *tx)
-                .await?
-            {
-                None => None,
-                Some(row) => Some(LoggingConfiguration {
-                    channel_id: row.try_get("channel_id")?,
-                    detail: match row.try_get::<&str, _>("detail")? {
-                        "errors" => LogDetail::Errors,
-                        "lifecycle" => LogDetail::Lifecycle,
-                        "verbose" => LogDetail::Verbose,
-                        _ => return Err(invalid_argument("unknown logging detail")),
-                    },
-                    mention_member_ids: sqlx::query_scalar(
-                        "SELECT member_id FROM voice_logging_mention_members
-                     WHERE guild_id = $1 ORDER BY length(member_id), member_id",
-                    )
-                    .bind(&guild)
-                    .fetch_all(&mut *tx)
-                    .await?,
-                    mention_role_ids: sqlx::query_scalar(
-                        "SELECT role_id FROM voice_logging_mention_roles
-                     WHERE guild_id = $1 ORDER BY length(role_id), role_id",
-                    )
-                    .bind(&guild)
-                    .fetch_all(&mut *tx)
-                    .await?,
-                }),
-            };
-        let mut command_roles: Vec<CommandRoles> = Vec::new();
-        // A command with no roles is a row in `voice_command_roles` alone.
-        for row in sqlx::query(
-            r#"SELECT c.command, m.role_id
-               FROM voice_command_roles c
-               LEFT JOIN voice_command_role_members m
-                 ON m.guild_id = c.guild_id AND m.command = c.command
-               WHERE c.guild_id = $1
-               ORDER BY c.command COLLATE "C", length(m.role_id), m.role_id"#,
-        )
-        .bind(&guild)
-        .fetch_all(&mut *tx)
-        .await?
-        {
-            let command: String = row.try_get("command")?;
-            let role: Option<String> = row.try_get("role_id")?;
-            match command_roles.last_mut() {
-                Some(entry) if entry.command == command => entry.role_ids.extend(role),
-                _ => command_roles.push(CommandRoles {
-                    command,
-                    role_ids: role.into_iter().collect(),
-                }),
-            }
-        }
-        let settings = match sqlx::query("SELECT * FROM voice_guild_settings WHERE guild_id = $1")
-            .bind(&guild)
-            .fetch_optional(&mut *tx)
-            .await?
-        {
-            Some(row) => GuildSettings {
-                creation_enabled: row.try_get("creation_enabled")?,
-                unique_names: row.try_get("unique_names")?,
-                no_game_label: row.try_get("no_game_label")?,
-                force_single_game: row.try_get("force_single_game")?,
-                count_members_without_activity: row.try_get("count_members_without_activity")?,
-                time_zone: row.try_get("time_zone")?,
-                text_channel_name: row.try_get("text_channel_name")?,
-                text_viewer_role_id: row.try_get("text_viewer_role_id")?,
-                command_role_id: row.try_get("command_role_id")?,
-                command_roles,
-            },
-            None => GuildSettings {
-                creation_enabled: true,
-                unique_names: false,
-                no_game_label: DEFAULT_NO_GAME_LABEL.to_owned(),
-                force_single_game: false,
-                count_members_without_activity: false,
-                time_zone: DEFAULT_TIME_ZONE.to_owned(),
-                text_channel_name: DEFAULT_TEXT_CHANNEL_NAME.to_owned(),
-                text_viewer_role_id: None,
-                command_role_id: None,
-                command_roles,
-            },
-        };
+        let config = read_configuration(&mut tx, &guild).await?;
         tx.rollback().await?;
-        Ok(VoiceConfiguration {
-            version: VOICE_CONFIG_VERSION,
-            guild_id: guild,
-            creators,
-            templates,
-            aliases,
-            lists,
-            logging,
-            settings,
-        })
+        Ok(config)
     }
 
-    /// Replace every configuration section for `guild_id` in one transaction.
-    /// Sections absent from `config` are removed. The caller must have run
-    /// `validate_configuration` against a trusted inventory; this refuses a
-    /// wrong version or guild, non-canonical snowflakes (the SQL format CHECK
-    /// does not bound the u64 range) and anything the SQL CHECKs reject.
+    /// Replace every configuration section for `guild_id` in one transaction,
+    /// but only when the stored configuration still equals `expected` (the
+    /// snapshot the preview was rendered from). The compare runs inside the
+    /// same transaction under the per-guild advisory lock, so a concurrent
+    /// `/import` or settings write between the Confirm re-read and the write
+    /// is a `RowNotFound` (mapped to `StoreError::Conflict` by the bot
+    /// adapter) instead of a silent overwrite. Sections absent from `config`
+    /// are removed. The caller must have run `validate_configuration` against
+    /// a trusted inventory; this refuses a wrong version or guild,
+    /// non-canonical snowflakes (the SQL format CHECK does not bound the u64
+    /// range) and anything the SQL CHECKs reject.
     pub async fn apply(
         &self,
         guild_id: u64,
         config: &VoiceConfiguration,
+        expected: &VoiceConfiguration,
     ) -> Result<(), sqlx::Error> {
         let guild = guild_id.to_string();
         if config.version != VOICE_CONFIG_VERSION {
@@ -237,6 +91,11 @@ impl PgVoiceConfigStore {
                 "configuration belongs to a different guild",
             ));
         }
+        if expected.guild_id != guild {
+            return Err(invalid_argument(
+                "expected configuration belongs to a different guild",
+            ));
+        }
         let mut tx = self.pool.begin().await?;
         // One writer per guild: concurrent applies would otherwise interleave
         // their DELETE/INSERT pairs and trip primary keys.
@@ -244,6 +103,13 @@ impl PgVoiceConfigStore {
             .bind(format!("voice_config:{guild}"))
             .execute(&mut *tx)
             .await?;
+        // Compare-and-swap inside the lock: the preview hash already bound
+        // (`current`, `candidate`), but the re-read happened without the
+        // lock. A mismatch here means the guild changed in between.
+        let current = read_configuration(&mut tx, &guild).await?;
+        if current != *expected {
+            return Err(sqlx::Error::RowNotFound);
+        }
         write_creators(&mut tx, &guild, config).await?;
         write_templates(&mut tx, &guild, config).await?;
         write_aliases(&mut tx, &guild, config).await?;
@@ -254,6 +120,171 @@ impl PgVoiceConfigStore {
         write_settings(&mut tx, &guild, config).await?;
         tx.commit().await
     }
+}
+
+/// Every configuration section for `guild`, read from the caller's
+/// transaction. [`PgVoiceConfigStore::snapshot`] wraps this in a read-only
+/// `REPEATABLE READ` transaction; [`PgVoiceConfigStore::apply`] calls it after
+/// taking the per-guild advisory lock to compare-and-swap.
+async fn read_configuration(
+    tx: &mut Transaction<'_, Postgres>,
+    guild: &str,
+) -> Result<VoiceConfiguration, sqlx::Error> {
+    let creators = sqlx::query(
+        "SELECT * FROM voice_creators WHERE guild_id = $1
+             ORDER BY length(channel_id), channel_id",
+    )
+    .bind(guild)
+    .fetch_all(&mut **tx)
+    .await?
+    .iter()
+    .map(decode_creator)
+    .collect::<Result<Vec<_>, _>>()?;
+    let templates = sqlx::query(
+        "SELECT channel_id, name_template, status_template FROM voice_channel_templates
+             WHERE guild_id = $1 ORDER BY length(channel_id), channel_id",
+    )
+    .bind(guild)
+    .fetch_all(&mut **tx)
+    .await?
+    .iter()
+    .map(|row| {
+        Ok(ChannelTemplates {
+            channel_id: row.try_get("channel_id")?,
+            name_template: row.try_get("name_template")?,
+            status_template: row.try_get("status_template")?,
+        })
+    })
+    .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    let aliases = sqlx::query(
+        r#"SELECT game, alias FROM voice_game_aliases
+               WHERE guild_id = $1 ORDER BY game COLLATE "C""#,
+    )
+    .bind(guild)
+    .fetch_all(&mut **tx)
+    .await?
+    .iter()
+    .map(|row| {
+        Ok(GameAlias {
+            game: row.try_get("game")?,
+            alias: row.try_get("alias")?,
+        })
+    })
+    .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    let mut lists: Vec<RandomList> = Vec::new();
+    for row in sqlx::query(
+        r#"SELECT list_name, choice FROM voice_random_list_choices
+               WHERE guild_id = $1 ORDER BY list_name COLLATE "C", position"#,
+    )
+    .bind(guild)
+    .fetch_all(&mut **tx)
+    .await?
+    {
+        let name: String = row.try_get("list_name")?;
+        let choice: String = row.try_get("choice")?;
+        match lists.last_mut() {
+            Some(list) if list.name == name => list.choices.push(choice),
+            _ => lists.push(RandomList {
+                name,
+                choices: vec![choice],
+            }),
+        }
+    }
+    let logging =
+        match sqlx::query("SELECT channel_id, detail FROM voice_logging WHERE guild_id = $1")
+            .bind(guild)
+            .fetch_optional(&mut **tx)
+            .await?
+        {
+            None => None,
+            Some(row) => Some(LoggingConfiguration {
+                channel_id: row.try_get("channel_id")?,
+                detail: match row.try_get::<&str, _>("detail")? {
+                    "errors" => LogDetail::Errors,
+                    "lifecycle" => LogDetail::Lifecycle,
+                    "verbose" => LogDetail::Verbose,
+                    _ => return Err(invalid_argument("unknown logging detail")),
+                },
+                mention_member_ids: sqlx::query_scalar(
+                    "SELECT member_id FROM voice_logging_mention_members
+                     WHERE guild_id = $1 ORDER BY length(member_id), member_id",
+                )
+                .bind(guild)
+                .fetch_all(&mut **tx)
+                .await?,
+                mention_role_ids: sqlx::query_scalar(
+                    "SELECT role_id FROM voice_logging_mention_roles
+                     WHERE guild_id = $1 ORDER BY length(role_id), role_id",
+                )
+                .bind(guild)
+                .fetch_all(&mut **tx)
+                .await?,
+            }),
+        };
+    let mut command_roles: Vec<CommandRoles> = Vec::new();
+    // A command with no roles is a row in `voice_command_roles` alone.
+    for row in sqlx::query(
+        r#"SELECT c.command, m.role_id
+               FROM voice_command_roles c
+               LEFT JOIN voice_command_role_members m
+                 ON m.guild_id = c.guild_id AND m.command = c.command
+               WHERE c.guild_id = $1
+               ORDER BY c.command COLLATE "C", length(m.role_id), m.role_id"#,
+    )
+    .bind(guild)
+    .fetch_all(&mut **tx)
+    .await?
+    {
+        let command: String = row.try_get("command")?;
+        let role: Option<String> = row.try_get("role_id")?;
+        match command_roles.last_mut() {
+            Some(entry) if entry.command == command => entry.role_ids.extend(role),
+            _ => command_roles.push(CommandRoles {
+                command,
+                role_ids: role.into_iter().collect(),
+            }),
+        }
+    }
+    let settings = match sqlx::query("SELECT * FROM voice_guild_settings WHERE guild_id = $1")
+        .bind(guild)
+        .fetch_optional(&mut **tx)
+        .await?
+    {
+        Some(row) => GuildSettings {
+            creation_enabled: row.try_get("creation_enabled")?,
+            unique_names: row.try_get("unique_names")?,
+            no_game_label: row.try_get("no_game_label")?,
+            force_single_game: row.try_get("force_single_game")?,
+            count_members_without_activity: row.try_get("count_members_without_activity")?,
+            time_zone: row.try_get("time_zone")?,
+            text_channel_name: row.try_get("text_channel_name")?,
+            text_viewer_role_id: row.try_get("text_viewer_role_id")?,
+            command_role_id: row.try_get("command_role_id")?,
+            command_roles,
+        },
+        None => GuildSettings {
+            creation_enabled: true,
+            unique_names: false,
+            no_game_label: DEFAULT_NO_GAME_LABEL.to_owned(),
+            force_single_game: false,
+            count_members_without_activity: false,
+            time_zone: DEFAULT_TIME_ZONE.to_owned(),
+            text_channel_name: DEFAULT_TEXT_CHANNEL_NAME.to_owned(),
+            text_viewer_role_id: None,
+            command_role_id: None,
+            command_roles,
+        },
+    };
+    Ok(VoiceConfiguration {
+        version: VOICE_CONFIG_VERSION,
+        guild_id: guild.to_owned(),
+        creators,
+        templates,
+        aliases,
+        lists,
+        logging,
+        settings,
+    })
 }
 
 async fn write_creators(

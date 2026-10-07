@@ -1352,6 +1352,44 @@ pub fn validate_announcement<'a>(
     Ok(channel_id)
 }
 
+/// Website event-key shape (legacy `requireString` plus a bound): the key is
+/// only ever compared, never interpreted, and the bound matters because it is
+/// a primary-key column. Same charset as [`valid_idempotency_key`].
+#[must_use]
+pub fn valid_event_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    (1..=200).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+}
+
+/// `event.read` field validation: the caller names an event *key*, never a
+/// snowflake — there is no field for a raw Discord id. The key map is the
+/// whole address space.
+pub fn validate_event_key(body: &Map<String, Value>) -> Result<&str, ActionError> {
+    let key = require_field_str(body, "event_key")?;
+    if !valid_event_key(key) {
+        return Err(ActionError::new(
+            ErrorCode::Malformed,
+            "\"event_key\" must be 1-200 characters of [A-Za-z0-9._:-]",
+            "bad_event_key",
+        ));
+    }
+    Ok(key)
+}
+
+/// Refusal for a well-formed key with no mapping in this guild (legacy
+/// `event_key_unknown`): `action_not_allowed`, before any Discord call.
+#[must_use]
+pub fn unmapped_event_key(key: &str) -> ActionError {
+    ActionError::new(
+        ErrorCode::ActionNotAllowed,
+        format!(r#""{key}" is not mapped to an event in this guild"#),
+        "event_key_unknown",
+    )
+}
+
 /// `settings.set` value-size check: cheap ceiling on what one setting may
 /// weigh. The value itself is never echoed back — the website already knows
 /// what it sent, and the result is what gets stored against the idempotency
@@ -2702,13 +2740,14 @@ mod tests {
     #[test]
     fn catalog_counts_match_legacy_census() {
         // Shared legacy census: hot 41 / cold 28 / env_only 48, plus the
-        // receiver's combined bind and caller mapping (both env-only),
-        // plus the two template-assistant endpoint keys (both env-only).
-        // Count actual entries, not just representatives of each class.
+        // receiver's combined bind, caller mapping and container marker
+        // (all env-only), plus the two template-assistant endpoint keys
+        // (both env-only). Count actual entries, not just representatives
+        // of each class.
         for (class, expected) in [
             (SettingClass::Hot, 41),
             (SettingClass::Cold, 28),
-            (SettingClass::EnvOnly, 52),
+            (SettingClass::EnvOnly, 53),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),
@@ -3023,6 +3062,33 @@ mod tests {
                 .code,
             ErrorCode::Malformed
         );
+    }
+
+    #[test]
+    fn event_key_names_a_key_never_a_snowflake() {
+        let body = map(json!({"event_key": "launch:2026"}));
+        assert_eq!(validate_event_key(&body).expect("valid"), "launch:2026");
+        assert!(valid_event_key("a"));
+        assert!(!valid_event_key(""));
+        assert!(!valid_event_key(&"k".repeat(201)));
+        assert!(!valid_event_key("has space"));
+        for raw in [
+            json!({}),
+            json!({"event_key": ""}),
+            json!({"event_key": "has space"}),
+            json!({"event_key": "k".repeat(201)}),
+            json!({"event_id": "100000000000000002"}),
+        ] {
+            assert_eq!(
+                validate_event_key(&map(raw)).expect_err("bad key").code,
+                ErrorCode::Malformed
+            );
+        }
+        // An unmapped key is a typed refusal, never a Discord call: the key map
+        // is the whole address space.
+        let refused = unmapped_event_key("ghost:key");
+        assert_eq!(refused.code, ErrorCode::ActionNotAllowed);
+        assert_eq!(refused.log_reason, "event_key_unknown");
     }
 
     #[test]

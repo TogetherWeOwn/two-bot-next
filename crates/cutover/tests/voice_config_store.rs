@@ -235,7 +235,9 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     assert!(rooms.add_companion(&companion).await?);
 
     // apply -> snapshot is the identity on a fully populated guild.
-    store.apply(GUILD, &config).await?;
+    // Compare-and-swap: `expected` is the snapshot the write was planned
+    // from, compared inside the locked transaction.
+    store.apply(GUILD, &config, &fresh).await?;
     let stored = store.snapshot(GUILD).await?;
     assert_eq!(stored, config);
 
@@ -244,7 +246,7 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     let exported = export_configuration(&stored, &inventory)?;
     let imported = import_configuration(&exported, &inventory)?;
     assert_eq!(imported, stored);
-    store.apply(GUILD, &imported).await?;
+    store.apply(GUILD, &imported, &stored).await?;
     let again = store.snapshot(GUILD).await?;
     assert_eq!(again, stored);
     assert_eq!(export_configuration(&again, &inventory)?, exported);
@@ -252,12 +254,14 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     // Another guild is independent of this one.
     let mut neighbour = config.clone();
     neighbour.guild_id = "42".to_owned();
-    store.apply(42, &neighbour).await?;
+    let neighbour_expected = store.snapshot(42).await?;
+    store.apply(42, &neighbour, &neighbour_expected).await?;
     assert_eq!(store.snapshot(42).await?, neighbour);
 
     // apply replaces changed rows and removes sections the document lacks.
     let smaller = alternate(&config);
-    store.apply(GUILD, &smaller).await?;
+    let smaller_expected = store.snapshot(GUILD).await?;
+    store.apply(GUILD, &smaller, &smaller_expected).await?;
     assert_eq!(store.snapshot(GUILD).await?, smaller);
     assert_eq!(
         store.snapshot(42).await?,
@@ -286,7 +290,8 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     // settings). The templates/aliases/lists rows fail after the creators
     // section is already written, so they prove a late-section failure still
     // rolls back the whole apply.
-    store.apply(GUILD, &config).await?;
+    let restore_expected = store.snapshot(GUILD).await?;
+    store.apply(GUILD, &config, &restore_expected).await?;
     let before = store.snapshot(GUILD).await?;
     assert_eq!(before, config);
     let rows_before = config_rows(pool, GUILD_ID).await?;
@@ -341,7 +346,7 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
         ("version", &wrong_version),
     ] {
         assert!(
-            store.apply(GUILD, document).await.is_err(),
+            store.apply(GUILD, document, &before).await.is_err(),
             "{label} must be rejected"
         );
         assert_eq!(
@@ -365,7 +370,15 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     let snapshot = store.snapshot(77).await?;
     assert_eq!(snapshot.creators.len(), 1);
     assert_eq!(snapshot.creators[0].default_limit, 0);
-    store.apply(77, &snapshot).await?;
+    store.apply(77, &snapshot, &snapshot).await?;
+    // A stale expected snapshot is a compare-and-swap conflict and leaves
+    // the stored configuration intact: move current forward, then retry the
+    // old write with the old expected.
+    let mut concurrent = snapshot.clone();
+    concurrent.settings.time_zone = "America/New_York".to_owned();
+    store.apply(77, &concurrent, &snapshot).await?;
+    assert!(store.apply(77, &snapshot, &snapshot).await.is_err());
+    assert_eq!(store.snapshot(77).await?, concurrent);
     assert_eq!(rooms.creator_for(77, 7).await?, Some(creator));
     Ok(())
 }
@@ -469,7 +482,7 @@ async fn verify_inherit_edges(pool: &PgPool, schema: &str) -> TestResult {
     assert_eq!(snapshot.creators[2].default_limit, 4);
 
     // A plain round trip keeps the NULL: inherit never becomes unlimited.
-    store.apply(78, &snapshot).await?;
+    store.apply(78, &snapshot, &snapshot).await?;
     assert_eq!(raw_default_limit(pool, "78", "7").await?, Some(None));
     assert_eq!(raw_default_limit(pool, "78", "8").await?, Some(Some(0)));
     assert_eq!(raw_default_limit(pool, "78", "9").await?, Some(Some(4)));
@@ -488,7 +501,7 @@ async fn verify_inherit_edges(pool: &PgPool, schema: &str) -> TestResult {
     first.first_number = 9;
     first.group_by_category = true;
     first.permission_source = PermissionSource::Category {};
-    store.apply(78, &edited).await?;
+    store.apply(78, &edited, &snapshot).await?;
     assert_eq!(
         raw_default_limit(pool, "78", "7").await?,
         Some(None),
@@ -504,16 +517,17 @@ async fn verify_inherit_edges(pool: &PgPool, schema: &str) -> TestResult {
     // An explicit limit over an inherit row clears the inherit ...
     let mut recapped = stored.clone();
     recapped.creators[0].default_limit = 4;
-    store.apply(78, &recapped).await?;
+    store.apply(78, &recapped, &stored).await?;
     assert_eq!(raw_default_limit(pool, "78", "7").await?, Some(Some(4)));
     // ... and an explicit 0 over a cap stores unlimited, never NULL.
     let mut cleared = store.snapshot(78).await?;
+    let cleared_expected = cleared.clone();
     cleared.creators[0].default_limit = 0;
-    store.apply(78, &cleared).await?;
+    store.apply(78, &cleared, &cleared_expected).await?;
     assert_eq!(raw_default_limit(pool, "78", "7").await?, Some(Some(0)));
     // The second snapshot/apply cycle is stable once the row is explicit.
     let stable = store.snapshot(78).await?;
-    store.apply(78, &stable).await?;
+    store.apply(78, &stable, &stable).await?;
     assert_eq!(raw_default_limit(pool, "78", "7").await?, Some(Some(0)));
     assert_eq!(store.snapshot(78).await?, stable);
 
@@ -521,6 +535,7 @@ async fn verify_inherit_edges(pool: &PgPool, schema: &str) -> TestResult {
     // a guild that never had the creator stores 0, not NULL, and the 99
     // boundary round-trips alongside per-creator privacy/position/numbering.
     let mut fresh = store.snapshot(79).await?;
+    let fresh_expected = fresh.clone();
     assert!(fresh.creators.is_empty());
     fresh.creators.push(CreatorConfiguration {
         channel_id: "81".to_owned(),
@@ -546,7 +561,7 @@ async fn verify_inherit_edges(pool: &PgPool, schema: &str) -> TestResult {
         group_by_category: true,
         permission_source: PermissionSource::Category {},
     });
-    store.apply(79, &fresh).await?;
+    store.apply(79, &fresh, &fresh_expected).await?;
     assert_eq!(raw_default_limit(pool, "79", "81").await?, Some(Some(0)));
     assert_eq!(raw_default_limit(pool, "79", "82").await?, Some(Some(99)));
     assert_eq!(store.snapshot(79).await?, fresh);
@@ -573,7 +588,8 @@ async fn verify_inherit_edges(pool: &PgPool, schema: &str) -> TestResult {
     let exported = export_configuration(&fresh, &inventory)?;
     let imported = import_configuration(&exported, &inventory)?;
     assert_eq!(imported, fresh);
-    store.apply(79, &imported).await?;
+    let imported_expected = store.snapshot(79).await?;
+    store.apply(79, &imported, &imported_expected).await?;
     assert_eq!(store.snapshot(79).await?, fresh);
     Ok(())
 }

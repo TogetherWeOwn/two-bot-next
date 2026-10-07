@@ -117,6 +117,8 @@ impl TestSchema {
 struct DiscordState {
     roles: HashSet<String>,
     dark_primary: bool,
+    /// Deny the member the game hub forum, the fallback of every pick.
+    dark_hub: bool,
     unavailable_channel: Option<String>,
     reject_next_post: bool,
     reject_roles: bool,
@@ -155,7 +157,9 @@ async fn discord(state: Arc<Mutex<DiscordState>>) -> MockRest {
                 if state.unavailable_channel.as_deref() == Some(id) {
                     return ScriptedResponse::status(503);
                 }
-                let overwrites = if state.dark_primary && GAME_PICKS.iter().any(|pick| pick.primary_channel_id == Some(id)) {
+                let overwrites = if (state.dark_primary && GAME_PICKS.iter().any(|pick| pick.primary_channel_id == Some(id)))
+                    || (state.dark_hub && id == GAME_HUB_CHANNEL_ID)
+                {
                     json!([{"id":"44","type":1,"allow":"0","deny":"1024"}])
                 } else if id == GAME_PICKS[0].primary_channel_id.unwrap() {
                     json!([
@@ -829,6 +833,203 @@ async fn onboarding_runtime_hot_settings_and_live_channel_fences() {
             posts(&mock).len(),
             3,
             "configured guild check survives direct job calls"
+        );
+    })
+    .catch_unwind()
+    .await;
+    db.close().await;
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn onboarding_runtime_session_picks_route_in_catalog_order() {
+    let db = TestSchema::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let mock = discord(Arc::new(Mutex::new(DiscordState::default()))).await;
+        let runtime = runtime(&db.pool, &mock, &vars("session", false));
+        // Submission order and repeats must not reorder the plan: the catalog
+        // lists find-players (channel 10) before join-voice (channel 11).
+        runtime
+            .handle(
+                component(
+                    SESSION_SELECT_ID,
+                    &["join-voice", "find-players", "join-voice"],
+                ),
+                NOW,
+            )
+            .await
+            .unwrap();
+        let reply: Value = serde_json::from_slice(&replies(&mock)[0].body).unwrap();
+        assert_eq!(reply["content"], "On it - head to <#10> and <#11>.");
+        let metadata: String =
+            sqlx::query_scalar("SELECT metadata FROM events WHERE event_type = $1")
+                .bind(EVENT_CHANNEL_ROUTED)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let routed: Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(routed["picks"], json!(["find-players", "join-voice"]));
+        assert_eq!(routed["channels"], json!(["10", "11"]));
+        assert_eq!(routed["unavailable"], json!([]));
+    })
+    .catch_unwind()
+    .await;
+    db.close().await;
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn onboarding_runtime_goodbye_hot_setting_reaches_live_handler() {
+    let db = TestSchema::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let mock = discord(Arc::new(Mutex::new(DiscordState::default()))).await;
+        // Built once, before any stored write: the deployment list names 13.
+        let live = runtime(&db.pool, &mock, &vars("session", false));
+        let goodbye = || OnboardingJob::Goodbye {
+            guild_id: 22,
+            username: "dave".into(),
+            bot: false,
+            joined_at_ms: Some(NOW - 86_400_000),
+        };
+        live.handle(goodbye(), NOW).await.unwrap();
+        assert_eq!(
+            posts(&mock)[0].path,
+            "/api/v10/channels/13/messages",
+            "deployment value before any stored write"
+        );
+        let store = SettingsStore::new(&db.pool);
+        store
+            .set(
+                "22",
+                "DISCORD_GOODBYE_CHANNEL_IDS",
+                Some(json!(["12"])),
+                "test",
+            )
+            .await
+            .unwrap();
+        live.handle(goodbye(), NOW + 1).await.unwrap();
+        assert_eq!(
+            posts(&mock)[1].path,
+            "/api/v10/channels/12/messages",
+            "a stored goodbye channel reaches the already-built runtime without a restart"
+        );
+        store
+            .set("22", "DISCORD_GOODBYE_CHANNEL_IDS", None, "test")
+            .await
+            .unwrap();
+        live.handle(goodbye(), NOW + 2).await.unwrap();
+        assert_eq!(
+            posts(&mock)[2].path,
+            "/api/v10/channels/13/messages",
+            "delete restores the deployment fallback"
+        );
+        assert_eq!(posts(&mock).len(), 3);
+    })
+    .catch_unwind()
+    .await;
+    db.close().await;
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn onboarding_runtime_game_picker_withholds_invisible_destinations_and_dedupes_keys() {
+    let db = TestSchema::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let shooters = pick_by_key("shooters").unwrap();
+        let primary = shooters.primary_channel_id.unwrap();
+        // Neither the dedicated rooms nor the hub fallback is open to the member.
+        let state = Arc::new(Mutex::new(DiscordState {
+            dark_primary: true,
+            dark_hub: true,
+            ..Default::default()
+        }));
+        let mock = discord(Arc::clone(&state)).await;
+        let live = runtime(&db.pool, &mock, &vars("legacy", false));
+        live.handle(
+            component(GAME_SELECT_ID, &["shooters", "shooters", "gone", "gone"]),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.lock().unwrap().roles,
+            HashSet::from([shooters.role_id.to_owned()]),
+            "the role is kept even with no reachable room"
+        );
+        assert_eq!(
+            mock.requests()
+                .iter()
+                .filter(|request| request.method == "PUT")
+                .count(),
+            1,
+            "a repeated key grants its role once"
+        );
+        let reply: Value = serde_json::from_slice(&replies(&mock).last().unwrap().body).unwrap();
+        let content = reply["content"].as_str().unwrap();
+        assert!(content.starts_with("Game roles saved."), "{content}");
+        assert!(content.contains("No channel is available to you right now."));
+        assert_eq!(
+            content.matches("**Shooters**").count(),
+            1,
+            "one line per distinct pick"
+        );
+        assert!(
+            !content.contains("<#") && !content.contains("discord.com/channels"),
+            "no link to a room the member cannot open: {content}"
+        );
+        assert_eq!(db.count(EVENT_GAME_ROLES_SELECTED).await, 1);
+        assert_eq!(
+            db.count(EVENT_CHANNEL_ROUTED).await,
+            0,
+            "no reachable destination is not a successful route"
+        );
+        let metadata: String =
+            sqlx::query_scalar("SELECT metadata FROM events WHERE event_type = $1")
+                .bind(EVENT_GAME_ROLES_SELECTED)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let selected: Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(selected["picks"], json!(["shooters"]));
+
+        // Mixed visibility: shooters opens its own room once the role lands;
+        // the hub-only pick has nowhere to go and is named as unavailable.
+        state.lock().unwrap().dark_primary = false;
+        live.handle(
+            component(GAME_SELECT_ID, &["rocketleague", "shooters"]),
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+        let reply: Value = serde_json::from_slice(&replies(&mock).last().unwrap().body).unwrap();
+        let content = reply["content"].as_str().unwrap();
+        assert!(
+            content.starts_with("Done. Here is where to go:"),
+            "{content}"
+        );
+        assert!(content.contains(primary));
+        assert!(!content.contains(GAME_HUB_CHANNEL_ID));
+        assert!(content.contains("No channel is available to you right now."));
+        assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 1);
+        let metadata: String =
+            sqlx::query_scalar("SELECT metadata FROM events WHERE event_type = $1")
+                .bind(EVENT_CHANNEL_ROUTED)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let routed: Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(
+            routed,
+            json!({"channels":[primary],"degraded":0,"unavailable":["rocketleague"]})
         );
     })
     .catch_unwind()

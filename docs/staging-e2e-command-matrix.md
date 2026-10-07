@@ -9,7 +9,7 @@ the harness slices define HOW it runs. Derived from code, not from a guild:
 The `e2e_matrix_coverage` integration test fails when a command ships without
 a matrix row and when this doc drops one.
 
-Scope: 27 built-in slash commands (core + scorecard + automation +
+Scope: 28 built-in slash commands (core + scorecard + automation +
 announcement + moderation — the set `docs/commands.md` renders). No guild was
 touched, no staging secrets used, no credentials created.
 
@@ -33,6 +33,7 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | --- | --- | --- | --- | --- | --- |
 | 1 | `/rank` | always | Everyone | Ephemeral text with XP, level, server rank | — |
 | 2 | `/leaderboard` | always | Everyone | Public mention-suppressed top ten | — |
+| 31 | `/help` | always | Everyone | Immediate ephemeral list of the live published commands, grouped by audience with permission hints (no defer, no store read) | — |
 | 12 | `/attendance` | `TWO_COMMUNITY_SCORECARD` | ManageEvents | Ephemeral confirmation/refusal; records verified attendee | `ScorecardDisabled`, `ManageEventsRequired`, `event-occurrence` required ≤128, `member` required |
 | 14 | `/command` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `name`/`template` required |
 | 15 | `/command-remove` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `name` required |
@@ -68,7 +69,8 @@ UTF-16 units on every moderation row.
 
 - Voice `/create /setup /ping /invite /textchannels /access /reclaim
   /transfer /logging /export /import /position /group /inheritpermissions
-  /defaultlimit /alwaysprivate /kick` (separate `TWO_VOICE` slice; its
+  /defaultlimit /alwaysprivate /kick /name /private /public /limit /unlimit`
+  (separate `TWO_VOICE` slice; its
   `kick` loses the merge to moderation first-wins — runtime dispatch decides).
   The published voice set is pinned separately by the `voice` section of
   `crates/core/tests/fixtures/staging_published_commands.json`.

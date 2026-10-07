@@ -4,7 +4,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, readdirSync, mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -181,6 +181,125 @@ test("Wrangler runbook examples exist in npm scripts and pinned CLI help", () =>
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
+});
+
+function checkLocalLinks(markdown: string): number {
+  let checked = 0;
+  for (const match of markdown.matchAll(/\[[^\]]*\]\(([^)\s]+)\)/g)) {
+    const href = match[1];
+    if (/^(?:https?:\/\/|\/TOG\/)/.test(href)) continue; // Offline check; not remote availability.
+    const [path, anchor] = href.split("#");
+    const target = new URL(path || "runbook.md", new URL("docs/", root));
+    assert.ok(existsSync(target), `missing local runbook link: ${href}`);
+    if (anchor && target.pathname.endsWith(".md")) {
+      const headings = [...readFileSync(target, "utf8").matchAll(/^#{1,6} (.+)$/gm)]
+        .map((heading) => heading[1].toLowerCase().replace(/[^\w\s-]/g, "").replace(/\s/g, "-"));
+      assert.ok(headings.includes(anchor), `missing runbook heading: ${href}`);
+    }
+    checked++;
+  }
+  return checked;
+}
+
+test("runbook local file links and Markdown heading anchors resolve", () => {
+  assert.ok(checkLocalLinks(runbook) > 20);
+  assert.ok(checkLocalLinks(read("docs/incident-tabletop-2026-10-01.md")) > 0);
+  assert.ok(checkLocalLinks(read("docs/incident-tabletop-2026-10-06.md")) > 0);
+  assert.throws(() => checkLocalLinks("[missing](does-not-exist.md)"), /missing local/);
+  assert.throws(() => checkLocalLinks("[missing](#does-not-exist)"), /missing runbook heading/);
+});
+
+test("public tabletop evidence contains no private tracker references", () => {
+  for (const doc of ["docs/incident-tabletop-2026-10-01.md", "docs/incident-tabletop-2026-10-06.md"]) {
+    assert.doesNotMatch(read(doc),
+      /\b(?:TOG|PAP)-\d+\b|\/(?:TOG|PAP)\/(?:issues|agents|projects|approvals|runs)\//);
+  }
+});
+
+test("incident playbooks cite emitted metrics and selected literal log messages", () => {
+  const incidents = runbook.split("## Incident playbooks\n")[1]?.split("## Secret inventory:")[0];
+  assert.ok(incidents, "missing incident playbooks");
+  const metrics = read("crates/core/src/metrics.rs");
+  const names = new Set([...incidents.matchAll(/\btwo_bot_[a-z_]+\b/g)].map((match) => match[0]));
+  assert.ok(names.size >= 8, "incident signals must name their existing metric families");
+  for (const name of names) {
+    assert.ok(metrics.includes(`"${name}"`), `metric not emitted by the registry: ${name}`);
+  }
+  const logs: [string, string][] = [
+    ["crates/bot/src/gateway.rs", "gateway reconnect failed; Twilight will retry"],
+    ["crates/bot/src/gateway.rs", "gateway ready; checkpoint committed"],
+    ["crates/bot/src/main.rs", "durable gateway initialized; shard connecting"],
+    ["crates/bot/src/main.rs", "durable gateway failed; checkpoint unchanged, readiness unavailable"],
+    ["crates/bot/src/jobs.rs", "periodic job failed"],
+    ["crates/bot/src/command_runtime.rs", "sticky lookup failed; skipping activity"],
+    ["crates/bot/src/command_runtime.rs", "sticky claim failed; skipping activity"],
+    ["wrangler/src/index.ts", "two-bot container stopped"],
+    ["crates/bot/src/server.rs", "SIGTERM received; draining"],
+    ["crates/discord/src/ratelimit_guard.rs", "Discord refused the bot token; REST disabled until restart"],
+  ];
+  for (const [path, message] of logs) {
+    assert.ok(incidents.includes(message), `missing incident signal: ${message}`);
+    assert.ok(read(path).includes(`"${message}"`), `log no longer emitted in ${path}: ${message}`);
+  }
+});
+
+// Documentation regression guards, not proof of runtime behavior, a deployed
+// control or recovery. Fixtures also reject stale claims beside corrected prose.
+const incidentContracts: [string, string, string, string][] = [
+  ["persistent containment", "persistent ownership fence", "no authenticated HTTP stop route or persistent incident-pause control", "wrangler/src/ownership.ts"],
+  ["activated writers", "Moderation and automod are implemented and gated", "these moderation action slices and Worker flag forwarding are absent", "wrangler/src/container-env.ts"],
+  ["conditional live redirects", "With `REDIRECT_DB`, the Worker supplies `connectPostgres`", "the Worker constructs its RedirectStore with an undefined connector", "wrangler/src/redirect-store.ts"],
+  ["DML-only jobs", "lazy jobs also use `skip_migrations=true`", "the lazy jobs connection currently requests migrations and the web contract DDL", "crates/bot/src/website_jobs.rs"],
+  ["durable send admission", "token-wide durable `PgSendAdmission`", "Current send admission is per executor, not shared per token", "crates/core/src/send_admission/postgres.rs"],
+  ["shared process guard", "process-wide `process_guard`", "There is no wired token-wide cooldown/queue/breaker", "crates/discord/src/ratelimit_guard.rs"],
+  ["database readiness", "`database` component performs a bounded live ping", "There is no DB-ready component or DB-error metric", "crates/bot/src/server.rs"],
+  ["authorized metrics proxy", "authenticated `GET /ops/metrics`", "the Worker and DO do not proxy it", "wrangler/src/index.ts"],
+  ["job success coverage", "Every supervised job success updates", "the six periodic jobs do not populate that success metric", "crates/bot/src/jobs.rs"],
+  ["current archive coverage", "current writer is v4", "does not include gateway_sessions or website tables", "crates/core/src/backup/dump_file.rs"],
+  ["durable scorecard retries", "three durable attempt slots, five minutes apart", "the scorecard consumes its weekly attempt before DB work", "crates/bot/src/community_scorecard_retry.rs"],
+  ["default-dark action ingress", "`POST /internal/actions` is implemented but staging-only and default-dark", "Internal-action endpoints and /voice/ownership/health are not wired bot endpoints", "wrangler/src/index.ts"],
+];
+
+function guidanceText(markdown: string): string {
+  return markdown.replace(/[`*]/g, "").replace(/\s+/g, " ").toLowerCase();
+}
+
+function checkIncidentContract(markdown: string, contract: (typeof incidentContracts)[number]): void {
+  const [name, claim, stale, source] = contract;
+  const text = guidanceText(markdown);
+  assert.ok(text.includes(guidanceText(claim)), `missing current incident contract: ${name}`);
+  assert.ok(!text.includes(guidanceText(stale)), `stale incident claim: ${name}`);
+  assert.ok(markdown.includes(source), `missing source reference: ${source}`);
+}
+
+for (const contract of incidentContracts) {
+  const [name, claim, stale] = contract;
+  test(`incident guidance preserves ${name} rather than historical absence claims`, () => {
+    checkIncidentContract(runbook, contract);
+    // Replacing all wrapped/repeated corrective prose must fail, and adding
+    // the old claim beside the correction must not silently pass either.
+    assert.throws(() => checkIncidentContract(runbook.replace(/\s+/g, " ").replaceAll(claim, stale), contract),
+      /missing current incident contract/);
+    assert.throws(() => checkIncidentContract(`${runbook}\n${stale}`, contract), /stale incident claim/);
+  });
+}
+
+test("historical tabletop cannot substitute for current wiring or staging acceptance", () => {
+  const history = read("docs/incident-tabletop-2026-10-01.md");
+  assert.match(history, /historical findings at the October-1 source baseline/);
+  assert.match(history, /not current\s+wiring guidance/);
+  assert.match(history, /Local source walkthrough completed; staging walkthrough blocked/);
+  assert.match(history, /successful source tests do not fill this gate/);
+});
+
+test("staging tabletop record stays a dry run with explicit open gaps", () => {
+  const record = read("docs/incident-tabletop-2026-10-06.md");
+  assert.match(record, /no outage was injected/);
+  assert.match(record, /It is not cutover acceptance/);
+  assert.match(record, /## Gaps found/);
+  assert.match(record, /Image provenance for this head is unproven/);
+  assert.ok(runbook.includes("(incident-tabletop-2026-10-06.md)"), "runbook must link the staging record");
+  assert.doesNotMatch(record, /(?:token|secret)\s*[:=]\s*[A-Za-z0-9_-]{16,}/i);
 });
 
 test("ownership runbook examples use only the covered staging control client", () => {

@@ -15,9 +15,12 @@ included in that request and never patched afterwards.
   cannot be planned leaves the position to Discord (append) instead of blocking
   the join. `/group` is not wired yet (see below).
 - **Permission inheritance.** The creator's stored source (creator channel,
-  category, or a chosen channel) supplies the overrides that are copied. The
-  owner gets the V8a owner grant on their own room only; private rooms deny
-  Connect to @everyone. A missing chosen source channel is refused.
+  category, or a chosen channel) supplies the overrides. Every emitted allow
+  excludes Manage Roles, including inherited role/member, owner and bot
+  targets. Source denies (including Manage Roles) are retained; deny still
+  wins on a target. The owner gets the V8a owner grant on their own room only;
+  private rooms deny Connect to @everyone. A missing chosen source channel is
+  refused.
 - **No Manage Roles.** The bot cannot set overrides, so none are sent and the
   room is created inside the category, which syncs it. A creator whose default
   is private is refused (`AccessDenied`) instead of producing a public room.

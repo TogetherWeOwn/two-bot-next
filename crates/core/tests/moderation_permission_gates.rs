@@ -124,7 +124,7 @@ fn policy_request(
             permissions,
         },
         target: Some(target),
-        bot_highest_role_position: Some(100),
+        bot_highest_role_position: 100,
         reason: "parity gate fixture".to_owned(),
         duration_seconds: None,
         count: None,
@@ -310,5 +310,8 @@ fn owen_target_stays_protected_for_every_role_and_action() {
             );
         }
     }
-    assert_eq!(PolicyError::TargetOwen.to_string(), "Owen is protected",);
+    assert_eq!(
+        PolicyError::TargetOwen.to_string(),
+        "This target cannot be moderated",
+    );
 }

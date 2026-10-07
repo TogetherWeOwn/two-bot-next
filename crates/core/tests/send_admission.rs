@@ -2,7 +2,9 @@
 #![cfg(feature = "db")]
 
 use std::{sync::Arc, time::Duration};
-use two_bot_core::send_admission::{AdmissionError, PgSendAdmission, SendAdmission, SendCooldown};
+use two_bot_core::send_admission::{
+    AdmissionError, PgSendAdmission, SendAdmission, SendCooldown, IN_FLIGHT_LEASE_MS,
+};
 use two_bot_testsupport::TestDatabase;
 
 async fn database() -> TestDatabase {
@@ -153,7 +155,9 @@ async fn stale_completion_cannot_release_a_new_generation_and_finite_hold_expire
     let db = database().await;
     let gate = PgSendAdmission::new(db.pool().clone(), "fixture-token").unwrap();
     let permit = gate.admit().await.unwrap();
-    // Model explicit reconciliation/replacement, not a time-based lease expiry.
+    // Model explicit generation replacement: bumping the generation fences the
+    // old permit even though its holder is fresh (the lease heals only dead
+    // holders, never a live generation).
     sqlx::query("UPDATE public.discord_send_admission SET generation = generation + 1")
         .execute(db.pool())
         .await
@@ -171,5 +175,118 @@ async fn stale_completion_cannot_release_a_new_generation_and_finite_hold_expire
     assert!(matches!(finite.admit().await, Err(AdmissionError::Blocked)));
     tokio::time::sleep(Duration::from_millis(550)).await;
     finite.admit().await.unwrap().complete(None).await.unwrap();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb or CI service"]
+async fn completion_outage_then_next_boot_proceeds() {
+    // Replay of the 2026-10-05 staging wedge: a completion lost to a storage
+    // outage left the single lane row occupied, and every later boot's
+    // admission was refused, so the container never served. The lease must
+    // keep blocking fresh holders yet let the next boot reclaim the dead one.
+    let db = database().await;
+    let outage = db.independent_pool().await.unwrap();
+    let first = PgSendAdmission::new(outage.clone(), "fixture-token").unwrap();
+    let permit = first.admit().await.unwrap();
+    outage.close().await;
+    assert_eq!(permit.complete(None).await, Err(AdmissionError::Storage));
+    let reboot = PgSendAdmission::new(db.pool().clone(), "fixture-token").unwrap();
+    // A just-taken lane still blocks: the lease never steals a live holder.
+    assert!(matches!(reboot.admit().await, Err(AdmissionError::Blocked)));
+    // Stand in for the crashed boot retries without sleeping the real lease:
+    // age the dead holder's stamp just past it on the database clock.
+    sqlx::query(
+        "UPDATE public.discord_send_admission SET in_flight_since_ms = \
+           (extract(epoch FROM clock_timestamp()) * 1000)::bigint - $1 - 1 \
+         WHERE in_flight",
+    )
+    .bind(IN_FLIGHT_LEASE_MS)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    // The next boot proceeds with a fresh generation and releases normally.
+    reboot.admit().await.unwrap().complete(None).await.unwrap();
+    reboot.admit().await.unwrap().complete(None).await.unwrap();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb or CI service"]
+async fn admit_without_lease_column_falls_back_to_legacy_lane() {
+    // Replay of the 2026-10-05 staging outage: the build shipped lease-stamped
+    // SQL while the ledger still ended at 0418, so every boot admission failed
+    // with a storage error and the container never served. The runtime is
+    // DML-only, so a missing lease column must degrade to the pre-lease
+    // take-or-block lane instead of failing boot.
+    let db = database().await;
+    sqlx::query("ALTER TABLE public.discord_send_admission DROP COLUMN in_flight_since_ms")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let gate = PgSendAdmission::new(db.pool().clone(), "fixture-token").unwrap();
+    // First admit takes the free lane through the legacy path.
+    let permit = gate.admit().await.unwrap();
+    // A live holder still blocks; no reclaim is attempted without the column.
+    let second = PgSendAdmission::new(db.pool().clone(), "fixture-token").unwrap();
+    assert!(matches!(second.admit().await, Err(AdmissionError::Blocked)));
+    permit.complete(None).await.unwrap();
+    // After release the lane admits again.
+    second.admit().await.unwrap().complete(None).await.unwrap();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb or CI service"]
+async fn lease_backfill_fences_legacy_held_lane() {
+    // Fence proof for the production 0419 apply: a lane held through the
+    // legacy (pre-lease) path keeps stamp 0, which reads as older than the
+    // 60 s lease. Without the 0420 backfill the next admit reclaims a live
+    // sender; with it the live holder keeps blocking.
+    let db = database().await;
+    // Fenced lane first: legacy-held stamp, then the real 0420 backfill file.
+    let fenced = PgSendAdmission::new(db.pool().clone(), "fenced-token").unwrap();
+    let fenced_permit = fenced.admit().await.unwrap();
+    sqlx::query("UPDATE public.discord_send_admission SET in_flight_since_ms = 0 WHERE in_flight")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../cutover/migrations/0420_send_admission_lease_backfill.sql"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let fenced_next = PgSendAdmission::new(db.pool().clone(), "fenced-token").unwrap();
+    assert!(matches!(
+        fenced_next.admit().await,
+        Err(AdmissionError::Blocked)
+    ));
+    fenced_permit.complete(None).await.unwrap();
+    // The lane is healthy again after release.
+    fenced_next
+        .admit()
+        .await
+        .unwrap()
+        .complete(None)
+        .await
+        .unwrap();
+    // Hazard lane: the same legacy-held state with no backfill is reclaimed,
+    // which in production would be two senders on one Discord token.
+    let hazard = PgSendAdmission::new(db.pool().clone(), "hazard-token").unwrap();
+    let hazard_permit = hazard.admit().await.unwrap();
+    sqlx::query("UPDATE public.discord_send_admission SET in_flight_since_ms = 0 WHERE in_flight")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let hazard_next = PgSendAdmission::new(db.pool().clone(), "hazard-token").unwrap();
+    hazard_next
+        .admit()
+        .await
+        .unwrap()
+        .complete(None)
+        .await
+        .unwrap();
+    drop(hazard_permit);
     db.close().await.unwrap();
 }

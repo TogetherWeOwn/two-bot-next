@@ -148,7 +148,8 @@ async fn main() {
 
     let mut early: HashMap<String, MemberMessages> = HashMap::new();
     let mut last_active: HashMap<String, String> = HashMap::new();
-    let (mut channels_scanned, mut threads_scanned, mut messages_read) = (0usize, 0usize, 0usize);
+    let (mut channels_scanned, mut threads_scanned, mut messages_read, mut malformed) =
+        (0usize, 0usize, 0usize, 0usize);
     let mut truncated: Vec<String> = Vec::new();
     let mut scan_report = ScanReport::default();
     let mut scanned_back_to: Option<String> = None;
@@ -202,12 +203,13 @@ async fn main() {
                 author_is_bot: m.author.bot,
             })
             .collect();
-        fold_messages(
+        let (_, bad) = fold_messages(
             &mut early,
             &mut last_active,
             &target.get().to_string(),
             &batch,
         );
+        malformed += bad;
     }
 
     let (_early_map, summary) = find_early_messages(
@@ -216,6 +218,7 @@ async fn main() {
         channels_scanned,
         threads_scanned,
         messages_read,
+        malformed,
         truncated.clone(),
         scanned_back_to.clone(),
     );
@@ -228,6 +231,10 @@ async fn main() {
     println!("  channels scanned      {}", pad(summary.channels_scanned));
     println!("  threads scanned       {}", pad(summary.threads_scanned));
     println!("  messages read         {}", pad(summary.messages_read));
+    println!(
+        "  malformed rows        {}   (refused a ladder slot, never written)",
+        pad(summary.malformed)
+    );
     println!("  members who ever posted {}", pad(summary.authors_seen));
     println!(
         "  members with 3+ posts   {}   (AM7 text bar, {})",

@@ -58,6 +58,9 @@ import urllib.request
 
 BODY_CAP = 64 << 10
 DEFAULT_TIMEOUT_SECONDS = 10
+# Cloudflare rejects the default "Python-urllib/x.y" agent at the edge with 403
+# (error 1010), so an explicit agent is required for the probe to reach the Worker.
+USER_AGENT = "two-bot-next-staging-rollout/1.0"
 KNOWN_STATUSES = ("ready", "starting", "down")
 REQUIRED_COMPONENTS = ("process", "gateway")
 
@@ -118,7 +121,8 @@ def fetch(url, timeout):
     """One GET without redirects; returns (status, body bytes)."""
     opener = urllib.request.build_opener(_NoRedirect)
     try:
-        with opener.open(urllib.request.Request(url, method="GET"),
+        with opener.open(urllib.request.Request(url, headers={"User-Agent": USER_AGENT},
+                                               method="GET"),
                          timeout=timeout) as response:
             return response.status, response.read(BODY_CAP + 1)
     except urllib.error.HTTPError as e:

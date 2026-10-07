@@ -41,11 +41,21 @@ management UI or contact deployed services.
 
 Configuration errors log only `invite_redirect_invalid_config` plus the fixed
 `errorClass` `invalid_fallback` or `invalid_snapshot`; neither config values nor
-JSON parse fragments are logged. Lookup errors log the validated, bounded slug
-and one of `TypeError`, `RangeError`, `SyntaxError`, `Error`, `Unknown`.
-Arbitrary thrown strings, error names/messages/stacks, connection strings,
-visitor IP, query string, user agent and referrer are not included. Invalid
-stored codes and click-write failures also use class-only diagnostics.
+JSON parse fragments are logged. Lookup errors log
+`invite_redirect_lookup_failed` with the validated, bounded slug and exactly one
+of two classes: `db_unavailable` (the store's own connect/query deadline fired)
+or `internal` (everything else, including non-`Error` throws and errors whose
+`name` is attacker-influenced; see `redirectErrorClass` in
+`wrangler/src/redirect.ts`). Arbitrary thrown strings, error names/messages/stacks,
+connection strings, visitor IP, query string, user agent and referrer are not
+included. Invalid stored codes and click-write failures also use class-only
+diagnostics.
+
+Divergence from legacy `b62ff28`: the Node service also logged
+`invite_redirect_decode_failed` with the raw request path when a percent-escape
+did not decode. The Worker does not: a malformed escape, like any other invalid
+slug, answers 404 with no lookup and no log line. Only a validated slug is ever
+logged, and the raw request path never is.
 
 Rate limiting still uses only Cloudflare's `CF-Connecting-IP` edge header (or
 `unknown`); generic proxy headers are not trusted. Successful redirects remain

@@ -7,7 +7,7 @@
 # Multi-platform manifest digests keep tag names readable for Dependabot while
 # making both stages immutable. The builder and distroless runtime are both
 # Debian 13 (trixie), so the binary links against the same glibc it runs on.
-FROM rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c AS builder
+FROM rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 AS builder
 
 WORKDIR /app
 
@@ -55,7 +55,7 @@ COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot
 
 # Liveness + readiness (also the DO keepalive targets, see wrangler/).
 EXPOSE 8080
-ENV LISTEN_ADDR=0.0.0.0:8080
+ENV LISTEN_ADDR=0.0.0.0:8080 LOG_FORMAT=json
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["/home/nonroot/two-bot", "--healthcheck"]

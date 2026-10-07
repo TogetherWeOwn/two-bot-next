@@ -9,8 +9,8 @@
 //! The five: `rank`, `leaderboard` (open core), `rsvp` (open announcements),
 //! `lfg` (permission-gated announcements), `ban` (permission-gated
 //! moderation). One command per routing family, so every fence → gate →
-//! permission branch the smoke harness can hit is pinned. (`help`/`ping`
-//! appear in older smoke notes but are not slash commands on this tree.)
+//! permission branch the smoke harness can hit is pinned. `/help` is also
+//! covered as an always-on discovery command; `/ping` remains unpublished.
 //!
 //! Per command this pins input class → routing outcome → exact user-facing
 //! reply text and error class:
@@ -219,11 +219,12 @@ fn top_five_route_to_their_handlers_with_no_router_owned_reply() {
 #[test]
 fn open_commands_serve_members_without_special_bits() {
     let router = InteractionRouter::new(all_on());
-    // `rank`, `leaderboard` and `rsvp` require no permission bits: a bare
+    // Open core commands and `rsvp` require no permission bits: a bare
     // member (or an interaction with no resolved permissions) still routes.
     for (name, handler) in [
         ("rank", HandlerId::Rank),
         ("leaderboard", HandlerId::Leaderboard),
+        ("help", HandlerId::Help),
         ("rsvp", HandlerId::Rsvp),
     ] {
         for permissions in [None, Some(0)] {
@@ -244,7 +245,7 @@ fn open_commands_serve_members_without_special_bits() {
 fn disabled_features_refuse_with_documented_copy() {
     let off = InteractionRouter::new(all_off());
     // Always-on core keeps routing while every feature is off.
-    for name in ["rank", "leaderboard"] {
+    for name in ["rank", "leaderboard", "help"] {
         assert!(
             matches!(slash_outcome(&off, name), SlashOutcome::Handled { .. }),
             "/{name} stays live while features are off",
@@ -361,8 +362,8 @@ fn every_primary_refusal_is_ephemeral_without_mentions() {
 #[test]
 fn unknown_names_get_the_unknown_command_reply() {
     let router = InteractionRouter::new(all_on());
-    for name in ["definitely-not-a-command", "help", "ping"] {
-        // Neither legacy name exists as a slash command on this tree.
+    for name in ["definitely-not-a-command", "helpdesk", "ping"] {
+        // Unknown names, including the unpublished legacy `ping`, answer alike.
         let outcome = slash_outcome(&router, name);
         assert_eq!(outcome, SlashOutcome::Unknown, "{name} is unknown");
         let response = response_for_slash(&outcome).expect("unknown answers");
@@ -373,11 +374,11 @@ fn unknown_names_get_the_unknown_command_reply() {
 }
 
 #[test]
-fn guild_fence_holds_for_all_five() {
+fn guild_fence_holds_for_all_five_and_help() {
     let router = InteractionRouter::new(all_on());
     // Foreign and missing guilds are fenced everywhere except moderation,
     // which answers with its documented guild-restriction refusal.
-    for name in ["rank", "leaderboard", "rsvp", "lfg"] {
+    for name in ["rank", "leaderboard", "help", "rsvp", "lfg"] {
         for guild in [Some(FOREIGN_GUILD_ID), None] {
             let interaction = slash_in(name, Some(u64::MAX), guild);
             assert_eq!(

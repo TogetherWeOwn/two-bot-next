@@ -50,6 +50,9 @@ impl RoomWrites for DeleteOnly {
     async fn rename(&self, _: u64, _: &str) -> Result<(), RoomHttpError> {
         panic!("reconciliation must not rename a room");
     }
+    async fn set_user_limit(&self, _: u64, _: u32, _: WriteGuard) -> Result<(), RoomHttpError> {
+        panic!("reconciliation must not change a room limit");
+    }
     async fn download_attachment(&self, _: &str, _: usize) -> Result<Vec<u8>, RoomHttpError> {
         panic!("reconciliation must not download an import file");
     }
@@ -213,11 +216,14 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
     let deletions = writes.0.clone();
     let store = rooms.clone();
     let voice = Arc::new(RecordingVoice {
+        // Real-time reconcile proof: shorten the grace the paused-time guard
+        // tests pin at 60 s.
         runtime: VoiceRuntime::new(
             move || (store.clone(), writes.clone()),
             Duration::from_millis(10),
             true,
-        ),
+        )
+        .with_empty_grace(Duration::ZERO),
         leaves: AtomicU64::new(0),
         disconnects: AtomicU64::new(0),
     });
@@ -236,6 +242,7 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
         pipeline.clone(),
         state.clone(),
         db.store.clone(),
+        None,
         None,
         None,
         None,

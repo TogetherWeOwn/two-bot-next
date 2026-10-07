@@ -1,11 +1,13 @@
 //! Token-wide outbound admission, separate from inbound throttles and effect claims.
 //!
-//! Acquire immediately before each wire attempt. A permit has no expiry and no
-//! drop-release: cancellation/crash leaves an occupied row pending reconciliation.
-//! Complete only after proving a definite effect/no-effect at the mutation
-//! boundary, installing any 429 cooldown before releasing admission. A complete
-//! 5xx or invalid success receipt is still uncertain. Reads have no mutation
-//! effect. A permit is NOT an idempotency/execution lease.
+//! Acquire immediately before each wire attempt. A permit has no drop-release:
+//! cancellation/crash leaves an occupied row, and a take stamps the database
+//! clock so a holder dead past [`IN_FLIGHT_LEASE_MS`] is reclaimed by the next
+//! `admit` (fresh holders still block; indefinite/cooldown holds never
+//! reclaim). Complete only after proving a definite effect/no-effect at the
+//! mutation boundary, installing any 429 cooldown before releasing admission.
+//! A complete 5xx or invalid success receipt is still uncertain. Reads have no
+//! mutation effect. A permit is NOT an idempotency/execution lease.
 
 use sha2::{Digest, Sha256};
 use std::{fmt, future::Future, pin::Pin};
@@ -122,7 +124,7 @@ pub fn is_loopback_http(origin: &str) -> bool {
 #[cfg(feature = "db")]
 mod postgres;
 #[cfg(feature = "db")]
-pub use postgres::PgSendAdmission;
+pub use postgres::{PgSendAdmission, IN_FLIGHT_LEASE_MS};
 
 #[cfg(test)]
 mod tests {

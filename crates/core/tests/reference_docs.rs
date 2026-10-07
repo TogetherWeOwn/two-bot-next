@@ -59,6 +59,11 @@ and `intents_from_env` (`TWO_AUTOMOD`, `DISCORD_TICKET_CATEGORY_ID`,\n\
 `DISCORD_GATEWAY_URL` as a loopback-only test override. Rows for storable keys\n\
 read this way say “env at boot”; every other storable row's stored value is\n\
 unwired, and `env_only` rows are never dashboard-stored.\n\
+When voice is enabled, `build_production_runtime` also reads\n\
+`DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`, `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`,\n\
+`TWO_TEMP_VOICE_CATEGORY_ID` and `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` solely\n\
+for delete protection, not creator provisioning. Its empty grace is fixed at\n\
+60 seconds; `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` remains unwired.\n\
 Onboarding, automod, scorecard and classifier typed loaders exist but are not\n\
 called during boot; their defaults below come from empty-map calls. The separate\n\
 `preflight` operator CLI validates further catalog keys from the environment\n\
@@ -108,6 +113,10 @@ const BOOT_ENV: &[&str] = &[
     "DISCORD_TICKET_CATEGORY_ID",
     "DISCORD_TICKET_STAFF_ROLE_ID",
     "DISCORD_TICKET_PANEL_CHANNEL_ID",
+    "DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID",
+    "TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID",
+    "TWO_TEMP_VOICE_CATEGORY_ID",
+    "TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS",
 ];
 
 fn repository_root() -> PathBuf {

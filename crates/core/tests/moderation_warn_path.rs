@@ -9,8 +9,8 @@
 //! - policy/executor (`MemberModerationService::execute`): the verb-agnostic
 //!   member policy order (permission, target present, self-target, protection,
 //!   bot hierarchy, actor hierarchy), then the audit reason, each refusal
-//!   carrying its exact user-facing copy. A refused warn records nothing and
-//!   never claims the idempotency key.
+//!   carrying its exact user-facing copy. A policy refusal records a denial
+//!   audit, never a warning or an idempotency claim.
 //! - recording: a successful warn writes exactly one warning row and one
 //!   `moderation_audit` row shaped like the kick one (`moderation.warn` /
 //!   `warned`), and makes zero Discord calls. Warn is the one member verb
@@ -51,11 +51,11 @@ const STAFF_ROLE_ID: &str = "444444444444444444";
 const WARN_DENIED_COPY: &str = "You need the Moderate Members permission to use /warn. Ask a server moderator or admin to grant it.";
 const WARN_POLICY_DENIED_COPY: &str = "Missing required permission for moderation.warn";
 const MISSING_TARGET_COPY: &str = "This moderation action requires a target";
-const SELF_COPY: &str = "You cannot moderate yourself";
-const GUILD_OWNER_COPY: &str = "The guild owner is protected";
-const OWEN_COPY: &str = "Owen is protected";
-const BOT_COPY: &str = "Bots are protected";
-const STAFF_COPY: &str = "Staff roles are protected";
+const SELF_COPY: &str = "This target cannot be moderated";
+const GUILD_OWNER_COPY: &str = SELF_COPY;
+const OWEN_COPY: &str = SELF_COPY;
+const BOT_COPY: &str = SELF_COPY;
+const STAFF_COPY: &str = SELF_COPY;
 const BOT_HIERARCHY_COPY: &str = "The target is equal to or above Owen's highest role";
 const ACTOR_HIERARCHY_COPY: &str = "The target is equal to or above your highest role";
 const EMPTY_REASON_COPY: &str = "\"reason\" must be a non-empty string";
@@ -114,7 +114,7 @@ fn warn_execution_keyed(key: &str) -> MemberExecution {
         guild_id: GUILD_ID.to_owned(),
         actor: actor_with(PERM_MODERATE_MEMBERS, 50),
         target: Some(plain_target(10)),
-        bot_highest_role_position: Some(100),
+        bot_highest_role_position: 100,
         reason: "  repeated spam in #general  ".to_owned(),
         duration_seconds: None,
         request_id: key.to_owned(),
@@ -284,7 +284,11 @@ async fn warn_executor_refuses_missing_permission_with_legacy_copy() {
         );
         assert_eq!(err.to_string(), WARN_POLICY_DENIED_COPY);
     }
-    assert_untouched(&discord, &store);
+    assert!(discord.calls().is_empty());
+    assert!(store.warnings().is_empty());
+    assert_eq!(store.audits().len(), 1);
+    assert_eq!(store.audits()[0].outcome, "denied");
+    assert_eq!(store.audits()[0].actor_id, ACTOR_ID);
 }
 
 #[tokio::test]
@@ -302,7 +306,7 @@ async fn warn_policy_order_peels_one_refusal_at_a_time() {
     let mut exec = warn_execution();
     exec.actor.permissions = 0;
     exec.target = None;
-    exec.bot_highest_role_position = Some(10);
+    exec.bot_highest_role_position = 10;
     exec.reason = "   ".to_owned();
 
     let expect = |label: &str, err: MemberError, want: MemberError, copy: &str| {
@@ -407,7 +411,7 @@ async fn warn_policy_order_peels_one_refusal_at_a_time() {
     );
 
     // 9. Actor hierarchy (Owen now clears the target, the invoker does not).
-    exec.bot_highest_role_position = Some(100);
+    exec.bot_highest_role_position = 100;
     let err = svc.execute(&exec).await.expect_err("actor hierarchy");
     expect(
         "actor hierarchy",
@@ -426,8 +430,12 @@ async fn warn_policy_order_peels_one_refusal_at_a_time() {
         EMPTY_REASON_COPY,
     );
 
-    // None of the ten refusals recorded, called Discord, or claimed the key.
-    assert_untouched(&discord, &store);
+    // Policy refusals audit once per request id, never warn or claim the key.
+    assert!(discord.calls().is_empty());
+    assert!(store.warnings().is_empty());
+    assert_eq!(store.audits().len(), 1);
+    assert_eq!(store.audits()[0].outcome, "denied");
+    assert_eq!(store.audits()[0].actor_id, ACTOR_ID);
 
     // 11. Repaired: the same key now executes for real (not `InFlight`, not
     //     `KeyMismatch`, not a replay).
@@ -438,30 +446,30 @@ async fn warn_policy_order_peels_one_refusal_at_a_time() {
 }
 
 #[tokio::test]
-async fn warn_bot_hierarchy_applies_only_when_owens_role_is_known() {
-    // Warn never calls Discord, yet the shared policy still compares the
-    // target with Owen's highest role when it is known and skips the compare
-    // when it is not.
+async fn warn_requires_bot_hierarchy_clearance_even_without_a_discord_call() {
+    // The position is required: unknown bot hierarchy cannot form a request.
     let discord = MockMemberDiscord::new();
     let store = MemMemberStore::new();
     let svc = service_with(discord.clone(), store.clone());
 
     let mut known = warn_execution_keyed("req-warn-known");
-    known.bot_highest_role_position = Some(10);
+    known.bot_highest_role_position = 10;
     let err = svc
         .execute(&known)
         .await
         .expect_err("target at Owen's role refuses");
     assert_eq!(err, MemberError::Policy(PolicyError::BotHierarchy));
     assert_eq!(err.to_string(), BOT_HIERARCHY_COPY);
-    assert_untouched(&discord, &store);
+    assert!(discord.calls().is_empty());
+    assert!(store.warnings().is_empty());
+    assert_eq!(store.audits()[0].outcome, "denied");
 
-    let mut unknown = warn_execution_keyed("req-warn-unknown");
-    unknown.bot_highest_role_position = None;
+    let mut cleared = warn_execution_keyed("req-warn-cleared");
+    cleared.bot_highest_role_position = 100;
     let result = svc
-        .execute(&unknown)
+        .execute(&cleared)
         .await
-        .expect("unknown Owen role skips the bot compare");
+        .expect("resolved higher bot position permits the action");
     assert_eq!(result.outcome, MemberOutcome::Warned);
     assert_eq!(store.warnings().len(), 1);
     assert!(discord.calls().is_empty());

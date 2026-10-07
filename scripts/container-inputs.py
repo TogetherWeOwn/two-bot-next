@@ -62,7 +62,9 @@ IMAGE_INPUT_SCRIPTS = frozenset({
     "scripts/container-inputs.py",
     "scripts/check-docker-manifests.py",
     "scripts/test-docker-deps.py",
+    "scripts/test_check_docker_manifests.py",
     "scripts/test_container_smoke.py",
+    "scripts/test-logging-container.py",
     "scripts/test_container_inputs.py",
 })
 
@@ -155,9 +157,13 @@ def needs_image_build(changed):
 
 
 def changed_files(base_ref, head_ref, root=ROOT):
-    """Repo-relative paths changed between two refs (two-dot diff)."""
+    """Repo-relative paths changed between two refs (two-dot diff).
+
+    --no-renames: with rename detection ``git mv src/x.rs docs/x.md`` lists
+    only the new path, and an image input would be classified as docs.
+    """
     output = subprocess.run(
-        ["git", "-C", str(root), "diff", "--name-only",
+        ["git", "-C", str(root), "diff", "--name-only", "--no-renames",
          f"{base_ref}..{head_ref}"],
         capture_output=True, text=True, check=True,
     )

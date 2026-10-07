@@ -13,7 +13,8 @@
 //! credentials. The database URL arrives only through the mode's fixed
 //! environment binding ([`PLAN_URL_ENV`] for plan, [`URL_ENV`] for apply) and
 //! is never printed. Plan refuses when the RO binding is absent, even when a
-//! migrator URL is set elsewhere.
+//! migrator URL is set elsewhere, and refuses before reading the ledger when
+//! its login also holds [`MIGRATOR_ROLE`] (the plan credential is RO only).
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -433,6 +434,30 @@ fn reconcile_against(ledger: &[LedgerRow], known: &[(i64, String)]) -> Result<Ve
         .collect())
 }
 
+/// Plan must run as a login that holds only [`READ_ONLY_ROLE`]. `session_user`
+/// is unaffected by the per-connection `SET ROLE`, so this tests the login
+/// itself: a login that could also `SET ROLE` to [`MIGRATOR_ROLE`] (directly,
+/// by inheritance, or as a superuser) is not a read-only credential and is
+/// refused. Fails closed: a failed check refuses too. Names the role, never the
+/// login or the URL.
+async fn refuse_migrator_member_plan_login(conn: &mut PgConnection) -> Result<(), RunError> {
+    let holds_migrator: bool =
+        sqlx::query_scalar("SELECT pg_has_role(session_user, $1::name, 'MEMBER')")
+            .bind(MIGRATOR_ROLE)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|_| {
+                RunError::Failed("plan login role check failed".to_owned(), Value::Null)
+            })?;
+    if holds_migrator {
+        return refuse(format!(
+            "plan login holds the {MIGRATOR_ROLE} group; the plan binding must be a login \
+             that holds only {READ_ONLY_ROLE}"
+        ));
+    }
+    Ok(())
+}
+
 async fn read_ledger(conn: &mut PgConnection) -> Result<Vec<LedgerRow>, sqlx::Error> {
     let exists: bool =
         sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations') IS NOT NULL")
@@ -544,6 +569,11 @@ async fn run_on_pool(
         .acquire()
         .await
         .map_err(|_| failed("pool acquire failed"))?;
+    // "RO only" is enforced, not just documented: a plan login that also holds
+    // the migrator group is refused before the ledger is read.
+    if !req.apply {
+        refuse_migrator_member_plan_login(&mut conn).await?;
+    }
     let before = read_ledger(&mut conn)
         .await
         .map_err(|_| failed("ledger read failed"))?;
@@ -641,6 +671,42 @@ mod tests {
                 checksum_hex: hex::encode(&m.checksum),
             })
             .collect()
+    }
+
+    #[test]
+    fn claim_transport_projection_fixture_matches_rust() {
+        use sqlx::{
+            migrate::{Migration, MigrationType},
+            SqlSafeStr,
+        };
+        // Synthetic SQL, no database. The shared consumer vector contains an
+        // i64 above JS's safe-integer bound and a UTF-8 description.
+        let migrator = Migrator::with_migrations(vec![
+            Migration::new(
+                1,
+                "first fixture".into(),
+                MigrationType::Simple,
+                "SELECT 1;".into_sql_str(),
+                false,
+            ),
+            Migration::new(
+                9_007_199_254_740_993,
+                "fixture résumé".into(),
+                MigrationType::Simple,
+                "SELECT 2;".into_sql_str(),
+                false,
+            ),
+        ]);
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/staging-migrate-plan.json"))
+                .unwrap();
+        let pending = [1, 9_007_199_254_740_993];
+        assert_eq!(fixture["source_migrations"], source_manifest(&migrator));
+        assert_eq!(fixture["pending_before"], json!(pending));
+        assert_eq!(
+            fixture["plan_manifest_sha256"],
+            manifest_hash(&"a".repeat(40), &pending, &migrator)
+        );
     }
 
     #[test]

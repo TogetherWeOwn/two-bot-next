@@ -34,14 +34,40 @@ room-lifecycle runtime are introduced.
   own channel is in the supplied list is the parent's routing decision
   (exclude it for renames).
 
+## Runtime wiring
+
+`/limit [count]` and `/unlimit` are wired through the room worker
+(`crates/bot/src/voice_rooms_limit.rs`). The worker resolves the caller's
+current room from live voice state and reuses the `/transfer` owner gate
+(`voice_ownership::require_room_owner`): the owner or an admin standing in the
+room may act; anyone else, a caller outside voice and a caller in an unmanaged
+channel are refused. The human headcount (bots excluded) feeds `parse_limit`,
+which gives `0` = unlimited, `1..=99` as set, a refusal above 99, and a lock at
+the headcount when no count is given. The decided value is queued as
+`RoomAction::SetUserLimit` on the guild's ordered queue, so a 429 returns to the
+queue with its retry-after and ten failed attempts dead-letter in the `limit`
+family of `two_bot_voice_dead_letters_total`. The reply is ephemeral and waits
+briefly for the write: a terminal Discord refusal says so, and a write still
+waiting on the queue is reported as queued. Both commands are role-restrictable
+through `/access restrict` like every other voice command.
+
 ## Residual parent integration (not parity evidence)
 
-The parent still owns slash routing, ephemeral replies, authoritative fact
-gathering (current headcount, tier maximum, channel name list), permission
-gates (owner-only commands, admin override), persistence of the decided limit
-/ preferences / names, Join-channel and privacy wiring, template expansion for
-`/name`, and Discord writes (user limit, bitrate, renames). No live channel
-update is performed or verified by this component's tests.
+The parent still owns bitrate preferences and their persistence, the `/name`
+panel with template expansion and the unique-names check, `/private`,
+`/public` and the Join-channel wiring, and the registry publish of the
+`/limit` and `/unlimit` definitions (they are in `voice_commands()` but not yet
+published to a guild). No live channel update is performed or verified by this
+component's tests.
+
+`/name` is wired: see [`voice-name-panel.md`](voice-name-panel.md). `/private`
+and `/public` are wired with the Join channel: see
+[`voice-private-core.md`](voice-private-core.md#runtime-wiring-private-and-public).
+The join-request buttons are wired too: see
+[`voice-private-core.md`](voice-private-core.md#runtime-wiring-join-requests).
+`/limit` and `/unlimit` are runtime-wired as described above but not yet
+guild-published (see the residual parent integration note); the bitrate
+preference is not wired.
 
 ## Hermetic verification
 

@@ -1,12 +1,20 @@
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use two_bot_core::commands::OCCURRENCE_ID_MAX_CHARS;
+use two_bot_core::commands::{CommandDefinition, HELP_DESCRIPTION, OCCURRENCE_ID_MAX_CHARS};
 use two_bot_core::router::{InteractionRouter, RouterGates};
 
 pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("rsvp-attendance", "docs/parity.md §1 #12 / #25"),
     ("rota-acknowledge", "docs/parity.md §1 #13 / §9 drop 1"),
     ("attendance", "docs/parity.md §1 #12 bound"),
+    ("help", "docs/parity.md §1 help"),
+    ("tempban", "docs/parity.md §1 #4 duration ceiling"),
+    ("timeout", "docs/parity.md §1 #6 duration ceiling"),
+    ("attendance", "docs/parity.md §1 #12 copy"),
+    ("rsvp", "docs/parity.md §1 #24 copy"),
+    ("rsvp-attendance", "docs/parity.md §1 #25 copy"),
+    ("lfg", "docs/parity.md §1 #26 copy"),
+    ("lfg-close", "docs/parity.md §1 #27 copy"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -62,11 +70,88 @@ pub fn expected_registry() -> Value {
         .find(|c| c["name"] == "attendance" && c["options"][0]["name"] == "event-occurrence")
         .expect(INTENTIONAL_DIFFERENCES[2].1);
     scorecard["options"][0]["max_length"] = json!(OCCURRENCE_ID_MAX_CHARS);
+    // Duration exceptions add ONLY the service ceiling to each picker option;
+    // preserve the frozen legacy payload and compare every other field strictly.
+    for (name, max, reference) in [
+        ("tempban", 31_536_000_i64, INTENTIONAL_DIFFERENCES[3].1),
+        ("timeout", 2_419_200_i64, INTENTIONAL_DIFFERENCES[4].1),
+    ] {
+        let command = commands
+            .iter_mut()
+            .find(|c| c["name"] == name)
+            .expect(reference);
+        let duration = command["options"]
+            .as_array_mut()
+            .expect("legacy options array")
+            .iter_mut()
+            .find(|o| o["name"] == "duration_seconds")
+            .expect(reference);
+        assert_eq!(duration["min_value"], json!(60));
+        assert!(duration["max_value"].is_null());
+        duration["max_value"] = json!(max);
+    }
     let rota = commands
         .iter()
         .position(|c| c["name"] == INTENTIONAL_DIFFERENCES[1].0)
         .expect(INTENTIONAL_DIFFERENCES[1].1);
     commands.remove(rota);
+    // Next-only `/help` discovery surface: no legacy counterpart. Insert at
+    // the publish position (third, after the leveling core) as the exact
+    // published definition, so parity pins its shape too.
+    let help = serde_json::to_value(CommandDefinition::new("help", HELP_DESCRIPTION))
+        .expect("help serializes");
+    commands.insert(2, help);
+    // Picker-copy exceptions (registry golden exceptions table): command and
+    // option descriptions intentionally differ from legacy. Pointers mirror
+    // the published option order.
+    for (name, pointer, value) in [
+        (
+            "attendance",
+            "/description",
+            "Check in a verified human attendee for a scheduled event (scorecard)",
+        ),
+        (
+            "attendance",
+            "/options/0/description",
+            "Event id (number in the event URL) or occurrence id, e.g. 12345 or weekly-standup-2026-10-03",
+        ),
+        (
+            "rsvp",
+            "/options/0/description",
+            "Discord scheduled event id (number in the event URL), e.g. 12345",
+        ),
+        (
+            "rsvp-attendance",
+            "/description",
+            "Show RSVP totals for a scheduled event",
+        ),
+        (
+            "rsvp-attendance",
+            "/options/0/description",
+            "Discord scheduled event id (number in the event URL), e.g. 12345",
+        ),
+        (
+            "lfg",
+            "/options/1/description",
+            "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
+        ),
+        (
+            "lfg",
+            "/options/2/description",
+            "Role slots as role:Label:count, comma-separated, e.g. tank:Tank:2,dps:DPS:6",
+        ),
+        (
+            "lfg-close",
+            "/options/0/description",
+            "LFG id from the posted signup",
+        ),
+    ] {
+        let command = commands
+            .iter_mut()
+            .find(|c| c["name"] == name)
+            .expect("copy exception names a published command");
+        *command.pointer_mut(pointer).expect("copy field exists") = json!(value);
+    }
     canonical_registry(json!(commands))
 }
 
