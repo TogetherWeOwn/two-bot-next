@@ -132,10 +132,11 @@ a tested revision nor a usable deploy run id the run prints its results, writes
 
 ### What it does not prove
 
-- **No slash command is invoked.** Discord creates interactions only for real
-  users and the Worker has no HTTP interaction ingress, so no bot token can
-  prove a reply. Reply content and timing stay with the offline harness above
-  and the human-tester steps in the command matrix.
+- **No slash command is invoked.** This GET-only smoke does not discharge
+  B2's required slash event family; live slash coverage remains **NOT
+  VERIFIED** until the existing reviewed evidence path and applicable
+  authorization are independently verified. Do not synthesize interactions,
+  claim a bot/webhook as a human, or add an ingress or receipt mechanism.
 - Registry presence is not behaviour: a published `/rank` can still fail its
   database read. `GET /readyz` covers the database component, not a query.
 - It does not enable a gate. `/attendance` stays `skipped` until

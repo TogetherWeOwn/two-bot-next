@@ -1,16 +1,20 @@
 # Expected/processed event evidence route (B2 soak)
 
-The B2 soak ([staging-soak.md](staging-soak.md)) needs **zero missed gateway
-events** for join / voice / message. Counters (`two_bot_gateway_*`, see
-[metrics.md](metrics.md)) and funnel milestones cannot prove that on their own:
-the funnel keeps only the first three messages per member, and checkpoint
-sequences include unrelated dispatches. This route pairs an independently
-witnessed **expected** action list against the bot's **durably committed**
-funnel rows and reports every expected action as matched, excluded, failed or
-a gap. ([TOG-11019](/TOG/issues/TOG-11019).)
+The B2 soak ([staging-soak.md](staging-soak.md)) requires **zero missed
+events** across joins, voice, messages and slash. Counters
+(`two_bot_gateway_*`, see [metrics.md](metrics.md)) and funnel milestones
+cannot prove that on their own: the funnel keeps only the first three messages
+per member, and checkpoint sequences include unrelated dispatches. The source
+route described here covers join / voice / message only; it does not cover
+slash or establish current live coverage.
 
-`crates/core/src/evidence.rs` holds the offline seam; this page is the
-collection procedure that uses it.
+`crates/core/src/evidence.rs` holds an offline seam. The documented live
+collection example is not current runtime evidence and does not replace the
+existing reviewed read workflow or protected binding; their current application
+remains **NOT VERIFIED**. Use those existing paths only after their independent
+verification. This page does not authorize a new collector, receipt path,
+origin, overflow path or live fault/dispatch method. The current deployed build,
+health, bindings, ACL state and live outcomes remain **NOT VERIFIED**.
 
 ## What the seam does
 
@@ -191,17 +195,19 @@ channel or substitute credentials.
 Offline fixture runs (`cargo test -p two-bot-core --lib evidence`) prove the
 seam, not staging coverage. Only a packet from step 3 is live evidence.
 
-## Reconnect and RSS
+## Reconnect and memory observations
 
-- **Reconnect gap:** on the next deployment that is justified on its own,
-  record deploy finish to first `/readyz` 200 (see
-  [staging-soak.md](staging-soak.md)), plus the
+- **Workflow interval:** deploy finish to first `/readyz` 200, plus the
   `two_bot_gateway_reconnects_total` / `two_bot_gateway_resumes_total`
-  deltas from `/metrics`. Until then it is NOT MEASURED.
-- **RSS:** `crates/core/examples/metrics_rss.rs` measures instrumentation
+  deltas from `/metrics`, is a deployment/reconnect observation only. It is
+  **not** outage-start-to-verified-recovery and cannot prove B2's under-60-second
+  recovery requirement. Until observed, it is NOT MEASURED.
+- **Memory:** `crates/core/examples/metrics_rss.rs` measures instrumentation
   cost only ([metrics.md](metrics.md#cardinality-and-memory)). Whole-bot
-  loaded-guild RSS still comes from B1's placement measurement; it is not
-  claimed here.
+  loaded-guild RSS in B1 is historical evidence, not a numeric B2 criterion;
+  flat memory remains required and numeric RSS/error definitions are unaccepted.
 
-Intervals without a packet stay UNKNOWN. The September 30 attempt is not the
-soak clock; QA records a new start T only after healthy, observable staging.
+Intervals without a packet stay UNKNOWN. The September 30 attempt remains a
+failed historical attempt, not the soak clock. `T` stays unset until all
+qualifying preconditions and the reviewed live evidence routes are independently
+verified.

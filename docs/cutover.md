@@ -48,9 +48,13 @@ Create a B4 evidence manifest before scheduling:
   implementation: every non-DROP behavior has merged runtime wiring and passing
   acceptance evidence, or an explicitly approved waiver. Moderation, automation,
   scheduled unbans and internal actions cannot be silently waived.
-- [ ] [B2 soak](staging-soak.md) is signed off: seven consecutive days with zero
-  missed gateway events, measured redeploy gap under 60 seconds and acceptable
-  memory placement. Include feature/voice soak evidence, not just health polls.
+- [ ] [B2 soak](staging-soak.md) is signed off: four fully evidenced ACTIVE
+  hours with zero missed events across joins, voice, messages and slash; every
+  actual outage recovers in under 60 seconds from outage start to verified
+  recovery; hours 3–4 include 120 expected one-minute samples. Flat memory and
+  no error spikes remain required (numeric RSS/error criteria are unaccepted).
+  Include feature/voice evidence, not just health polls; deploy-finish-to-ready
+  is not outage-recovery evidence.
 - [ ] W16 all-warm rollback rehearsal has passed and shared Neon data/region,
   schema compatibility and backups are signed off. B4 runs **last**. The old
   migration plan's TypeScript/no-copy assumptions are not evidence for the Rust
