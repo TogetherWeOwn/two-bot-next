@@ -263,13 +263,29 @@ class SmokeRunTests(unittest.TestCase):
                          smoke.SIGNATURE_DB_BEHIND)
 
     def test_build_revision_mismatch_fails(self):
-        code, _ = self.drive(extra=("--expected-sha", OTHER_SHA))
+        code, _ = self.drive(extra=("--expected-sha", OTHER_SHA, "--deploy-run-id", "42"))
         self.assertEqual(code, 1)
         record = self.written()
         self.assertEqual(self.rows(record)["readyz build identity"]["failure_signature"],
                          smoke.SIGNATURE_BUILD)
-        # The record names the revision the tester meant to verify.
+        # The record names the revision the tester meant to verify and the
+        # run the tester named for it.
         self.assertEqual(record["deployment"]["revision"], OTHER_SHA)
+        self.assertEqual(record["deployment"]["deploy_staging_run_id"], "42")
+
+    def test_mismatched_revision_never_borrows_the_serving_builds_run_id(self):
+        # The readyz build id is the run that deployed the serving revision.
+        # Pairing it with a different expected revision would misattribute the run.
+        code, out = self.drive(extra=("--expected-sha", OTHER_SHA))
+        self.assertEqual(code, 1)
+        self.assertFalse(self.record.exists())
+        self.assertIn("no run record written", out)
+        self.assertIn("FAIL    readyz build identity", out)
+
+    def test_matching_expected_revision_may_use_the_build_id_run(self):
+        code, _ = self.drive(extra=("--expected-sha", SHA))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.written()["deployment"]["deploy_staging_run_id"], "37512552064")
 
     def test_missing_core_surface_fails_the_run(self):
         for missing in smoke.CORE_SURFACES:

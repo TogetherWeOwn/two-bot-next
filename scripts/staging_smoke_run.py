@@ -241,7 +241,9 @@ def build_record(args, run, started, ended):
     if revision is None:
         return None
     deploy_run = args.deploy_run_id
-    if not deploy_run:
+    if not deploy_run and revision == run.build_revision:
+        # The build id names the run that deployed the serving build, so it
+        # only answers for the recorded revision when that is the serving one.
         match = BUILD_ID_RE.fullmatch(run.build_id or "")
         deploy_run = match.group(1) if match else None
     if deploy_run is None:
@@ -291,7 +293,8 @@ def parse_args(argv):
     parser.add_argument("--expected-sha", default=os.environ.get("EXPECTED_SHA"),
                         help="deployed commit SHA under test; the build row fails on mismatch")
     parser.add_argument("--deploy-run-id", default=os.environ.get("DEPLOY_STAGING_RUN_ID"),
-                        help="deploy-staging run id (default: the readyz build_id prefix)")
+                        help="deploy-staging run id (default: the readyz build_id prefix when the "
+                             "recorded revision is the serving build)")
     parser.add_argument("--tester", default="staging_smoke_run.py (read-only)",
                         help="role or handle recorded as the tester; never a credential")
     parser.add_argument("--record", default="staging-smoke-run-record.json",
@@ -320,7 +323,8 @@ def main(argv=None, health_fetch=None, discord_fetch=None):
     record = build_record(args, run, started, ended)
     if record is None:
         print("staging smoke run: no run record written (no tested revision or deploy run id "
-              "known: pass --expected-sha and --deploy-run-id)")
+              "known: pass --expected-sha and --deploy-run-id; the serving build's run id "
+              "only counts for the serving revision)")
         return 1
     errors = validate_record(record)
     if errors:

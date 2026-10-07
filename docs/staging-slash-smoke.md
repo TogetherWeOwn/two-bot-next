@@ -122,10 +122,13 @@ this proves the build answers readiness and the guild publishes the surface.
 | every other built-in | listed (`pass`) or unpublished (`skipped`, gate off or publish pending) | none: a skip is visible in the verdict, not a failure |
 
 The record's deploy run id defaults to the `readyz` `build_id` prefix (the build
-id is `RUN_ID-RUN_ATTEMPT` of the `deploy-staging` run that built the image);
-`--deploy-run-id` overrides it. With neither a tested revision nor a deploy run
-id the run prints its results, writes **no record** and exits 1: a missing
-revision is NEEDS WORK, not a waiver.
+id is `RUN_ID-RUN_ATTEMPT` of the `deploy-staging` run that built the image), but
+only when the recorded revision is the serving build: that run deployed the
+serving revision, so it cannot vouch for a different `--expected-sha`. When the
+two differ, pass `--deploy-run-id` for the run that should have deployed the
+expected revision. `--deploy-run-id` always overrides the default. With neither
+a tested revision nor a usable deploy run id the run prints its results, writes
+**no record** and exits 1: a missing revision is NEEDS WORK, not a waiver.
 
 ### What it does not prove
 
