@@ -3705,7 +3705,7 @@ mod tests {
         assert!(waited >= Duration::from_millis(BOOT_ADMISSION_BUDGET_MS));
         assert!(waited < Duration::from_millis(BOOT_ADMISSION_BUDGET_MS + 1_000));
         // `IN_FLIGHT_LEASE_MS` (60 s) lives behind the core `db` feature.
-        assert!(BOOT_ADMISSION_BUDGET_MS > 60_000);
+        const { assert!(BOOT_ADMISSION_BUDGET_MS > 60_000) };
         let attempts = attempts.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
             (200..=300).contains(&attempts),
