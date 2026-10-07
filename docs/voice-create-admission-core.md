@@ -61,13 +61,74 @@ reservations, including ones whose rooms are since gone. Window and cooldown
 subtraction saturate; a `last_created_at_secs` in the future refuses under any
 positive cooldown, as legacy's millisecond comparison does.
 
+## Durable runtime wiring
+
+The pure core is now called by the runtime with persisted history:
+
+- **Table.** `crates/cutover/migrations/0422_voice_create_reservations.sql`
+  stores one row per accepted create (`guild_id`, `user_id`, `created_at`, plus
+  `channel_id` and `settled_at`). Rows are never deleted when a room is deleted,
+  a create is rolled back or the bot restarts, so the burst window and the
+  per-member cooldown count accepted creates, not live rooms.
+- **Claim.** `PgRoomStore::claim_create` opens one transaction, takes a
+  per-guild advisory lock (`voice_create:<guild>`), reads the caps inputs and
+  burst history, calls `decide_admission` and, only when allowed, inserts the
+  reservation. Two concurrent joins (in one process or two) therefore cannot
+  both pass the guild cap. A refusal writes nothing. Cap counts are live rooms
+  (`voice_rooms`) plus **all** unsettled reservations (`settled_at IS NULL`).
+  The caller supplies `now_secs` for history, not capacity expiry. Age cannot
+  distinguish a crashed process, a slow live 429 waiter or an unknown POST
+  outcome, so no TTL refunds capacity (superseding the initial migration's
+  expiry commentary).
+- **Transfer/settle.** `PgRoomStore::persist_create` inserts the room and binds
+  its reservation in one transaction under the same guild lock as claimers.
+  No missing or double-counted capacity is visible between those writes; an
+  insert/UPDATE failure rolls both back. Exact replay is idempotent while the
+  room exists, but cannot recreate a deleted room. `bind_create_channel` writes
+  the Discord channel id onto the claim as soon as the create returns, before the
+  room row, so the channel has a durable witness. `settle_create` only releases a
+  claim after known no-side-effect failure, confirmed channel absence or a
+  successful guarded delete, and never while its channel is a tracked live room.
+  `orphaned_create_channels` lists unsettled claims bound to a channel with no
+  room. Either way the row stays for burst/cooldown history.
+- **Worker.** `GuildRoomWorker::dispatch_one` claims after its cheap checks and
+  before the only Discord create call. A refusal records
+  `LifecycleFailure::CreateRefused` (stable `RefusalReason::code`, legacy
+  `user_message`) and never calls Discord; a claim-time store error records a
+  persistence failure, also without calling Discord. A long/repeated 429 requeue
+  keeps its one non-expiring claim without counting a second burst attempt.
+  Unknown creates never retry the POST or refund their hold. The worker binds
+  the returned channel to its claim, then persists the room; a failure of either
+  retains the hold through delayed, denied or occupied-channel compensation, and
+  releases it only when the delete/absence is confirmed. `GuildRoomWorker::load`
+  reads the orphaned claims, so after a restart the first authoritative
+  reconcile deletes each held channel (or confirms its absence in the snapshot)
+  and only then settles the claim.
+  A join cancelled before a retry is a confirmed no-effect outcome. Settlement
+  errors reach the bounded setup failure report; a credential refusal halts all
+  subsequent writes. A transient compensation settlement error retries only SQL
+  after the channel is known gone. A refusal is a policy outcome, not a lifecycle
+  failure, so it adds no `two_bot_voice_operations_total` outcome.
+
 ## Residual parent work
 
-Serializing concurrent claims per guild (legacy's advisory lock), persisting
-the reservation row, the `create_reservation` audit row and the
-`temp_voice_creates` timestamp, translating refusals into replies, naming,
-permissions, ownership and room lifecycle remain outside this slice. Unit tests
-establish domain behaviour only, not runtime wiring or staging readiness.
+Caps and cooldown use the legacy defaults (1 room per member, 40 per guild,
+30 s) through `CreateAdmissionConfig::default`; wiring the `TWO_TEMP_VOICE_MAX_PER_USER`,
+`TWO_TEMP_VOICE_MAX_PER_GUILD` and `TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS`
+settings into `GuildRoomWorker::set_admission_config` is not part of this slice.
+A refusal reaches the operator as a `/setup` failure line and a notice; there
+is no per-member reply on a gateway voice join. No retention job prunes
+`voice_create_reservations`. Unknown-outcome and crash-orphan holds are
+conservative capacity debt across restarts, not automatically expired leases.
+They require evidence-led reconciliation before release; this slice adds no
+operator release API or automatic reconciliation for unknown POSTs. A crash
+after the channel is bound is recovered at the next load; only a crash between
+Discord's response and the bind (or an unknown POST outcome) leaves a hold with
+no channel witness, and that hold is retained, not refunded. Transient settlement errors on cancelled/no-effect creates
+also retain the hold for reconciliation. This trades availability for the cap
+invariant; do not clear holds based solely on age. Naming, permissions, ownership
+and room lifecycle are separate slices, and unit and database tests establish behaviour only, not
+staging readiness (staging proof stays on the voice acceptance card).
 
 ## Hermetic verification
 
@@ -76,10 +137,15 @@ cargo fmt --all -- --check
 python3 scripts/cargo_cache.py run -- check -p two-bot-core
 python3 scripts/cargo_cache.py run -- clippy -p two-bot-core --all-targets -- -D warnings
 python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_create_admission
+python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- admission_
+# disposable agent-testdb database only; the test creates and drops its own
+TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_ci \
+  python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test voice_create_admission_store -- --ignored
 ```
 
 The fixture pins the refusal order, cap equality, the exact-cooldown pass,
 cooldown-0 disabling, the strict window edge, burst counting of deleted rooms'
 reservations, the current attempt never counting, every config bound edge, the
-stable codes and the legacy messages. No test uses a database, Redis, Discord
-or a staging identity.
+stable codes and the legacy messages. The core fixture and the worker tests use
+no database, Redis, Discord or staging identity; the store test uses only a
+disposable database on the CI/agent test service.

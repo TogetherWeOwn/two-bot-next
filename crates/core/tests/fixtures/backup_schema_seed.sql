@@ -400,6 +400,15 @@ VALUES ('100000000000000001', '100000000000000033', '100000000000000030',
         '2026-08-01T10:00:00.123456Z'),
        ('100000000000000001', '100000000000000034', '100000000000000035',
         '100000000000000003', '100000000000000002', '7', '2026-08-02T10:00:00Z');
+-- Accepted create reservations (0422): one bound to the room above, one
+-- rolled back (no channel), both settled; plus one still in flight.
+INSERT INTO voice_create_reservations (guild_id, user_id, created_at, channel_id, settled_at)
+VALUES ('100000000000000001', '100000000000000002', '2026-08-01T09:59:58Z',
+        '100000000000000033', '2026-08-01T10:00:00Z'),
+       ('100000000000000001', '100000000000000003', '2026-08-02T09:59:58Z',
+        NULL, '2026-08-02T10:00:00Z'),
+       ('100000000000000001', '100000000000000002', '2026-08-03T10:00:00Z',
+        NULL, NULL);
 -- V3 privacy (0416): the second room is private with a Join channel and one
 -- blocked member; the first stays public with an empty block list.
 UPDATE voice_rooms

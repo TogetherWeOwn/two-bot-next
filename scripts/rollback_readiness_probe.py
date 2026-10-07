@@ -4,7 +4,7 @@
 Four checks, one PASS/FAIL line each; exit 1 if any fails, 0 if all pass:
 
   manifest       the newest `two-funnel-*.ndjson.gz` in the backup directory
-                 (the drill's `ls -1t` selector) has a parseable v3/v4 manifest
+                 (the drill's `ls -1t` selector) has a parseable v3/v4/v5 manifest
                  and an end marker whose row total matches the manifest counts.
   sequences      every live serial/identity sequence, from a saved result of
                  SEQUENCES_QUERY, has a manifest high-water at or past its live
@@ -47,7 +47,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "wrangler/wrangler.toml"
 ARCHIVE_PREFIX = "two-funnel-"
 ARCHIVE_SUFFIX = ".ndjson.gz"
-DUMP_VERSIONS = (3, 4)
+DUMP_VERSIONS = (3, 4, 5)
 # Same budgets as the Rust reader (crates/core/src/backup/dump_file.rs).
 COMPRESSED_CAP = 1 << 30
 LINE_CAP = 8 << 20
