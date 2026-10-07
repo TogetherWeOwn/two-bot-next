@@ -586,13 +586,17 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             Err(error) if matches!(error.kind(), twilight_gateway::error::ReceiveMessageErrorType::Reconnect) => {
                                 transport_disconnected(&state, &generation).await;
                                 voice_disconnected(voice.as_ref());
-                                warn!("gateway reconnect failed; Twilight will retry");
+                                warn!(
+                                    msg = "gateway_reconnect_failed",
+                                    "gateway reconnect failed; Twilight will retry"
+                                );
                                 continue;
                             }
                             Err(_) => return Err(sqlx::Error::InvalidArgument("gateway receive failed".into())),
                         };
                         observer.observe(&message, &shard);
                         let Message::Text(text) = message else {
+                            crate::logging::shard_closed(&message);
                             transport_disconnected(&state, &generation).await;
                             voice_disconnected(voice.as_ref());
                             let rejected = matches!(message, Message::Close(Some(ref frame)) if matches!(frame.code, 4007 | 4009));
@@ -756,7 +760,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             }
         },
     );
-    info!(shard = ?ShardId::ONE, "gateway shard loop started");
+    info!(msg = "gateway_started", shard = ?ShardId::ONE, "gateway shard loop started");
     let handle = tokio::runtime::Handle::current();
     let worker_state = Arc::clone(&state);
     let worker_voice = voice;
@@ -781,6 +785,11 @@ pub async fn run_shard<I: InviteSource + 'static>(
             Arc::clone(&writer_drained),
         )
     });
+    // The blocking dispatch worker inherits no span context: capture the
+    // serving task's gateway span (child of the run span) and re-enter it per
+    // dispatch so lifecycle events keep guild_id/run_id correlation
+    // (docs/logging.md). Without this, ready/gateway_resumed ship bare.
+    let dispatch_span = tracing::Span::current();
     let dispatch = crate::dispatch::dispatch_bounded(
         // Ending reception is cooperative: dispatch_bounded keeps supervising
         // and draining its blocking writer instead of being aborted/dropped.
@@ -792,6 +801,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
         }),
         crate::dispatch::DISPATCH_BACKLOG,
         move |work| {
+            let _dispatch_guard = dispatch_span.enter();
             // Already-running work may finish; queued funnel effects are not
             // admitted after a fatal worker error. A cooperative shutdown still
             // drains queued accepted work. Accepted RSVP has its own drain.
@@ -817,7 +827,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         committed,
                     } => {
                         let timer = crate::gateway_metrics::DispatchTimer::start();
-                        let mut connected = false;
+                        let mut connected: Option<&str> = None;
                         let mut onboarding_job = None;
                         // Automod decides first, in gateway order, once per delivery.
                         let disposition = automod.as_ref().and_then(|automod| {
@@ -847,8 +857,11 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         let mut audit_events = Vec::new();
                         if let Some(dispatch) = dispatch {
                             // A cold voice RESUME is followed by IDENTIFY; READY connects.
-                            connected = matches!(dispatch.event, Event::Ready(_) | Event::Resumed)
-                                && committed.is_none();
+                            connected = match &dispatch.event {
+                                Event::Ready(_) if committed.is_none() => Some("ready"),
+                                Event::Resumed if committed.is_none() => Some("gateway_resumed"),
+                                _ => None,
+                            };
                             // Capture member state before the cache pipeline mutates it.
                             onboarding_job = writer_onboarding
                                 .as_ref()
@@ -983,14 +996,16 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                     }
                                     writer_signal.notify_one();
                                 }
-                                if connected {
+                                if let Some(msg) = connected {
                                     let mut state = handle.block_on(worker_state.write());
                                     if *state != GatewayState::Draining
                                         && generation.load(Ordering::Acquire) == observed_generation
                                     {
                                         *state = GatewayState::Connected;
                                         info!(
+                                            msg,
                                             sequence = checkpoint.sequence,
+                                            shard = ?ShardId::ONE,
                                             "gateway ready; checkpoint committed"
                                         );
                                     }

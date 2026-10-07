@@ -718,7 +718,7 @@ impl CommandRuntime {
                 .answer_interaction(target.interaction_id, &target.token, &ephemeral(BUSY_REPLY))
                 .await
             {
-                warn!(interaction_id = target.interaction_id, %error, "busy reply failed");
+                warn!(interaction_id = target.interaction_id.to_string(), %error, "busy reply failed");
             }
         });
     }
@@ -1093,7 +1093,7 @@ impl CommandRuntime {
                 .is_err()
             {
                 warn!(
-                    interaction_id = interaction.id.get(),
+                    interaction_id = interaction.id.get().to_string(),
                     "LFG execution failed; details withheld"
                 );
             }

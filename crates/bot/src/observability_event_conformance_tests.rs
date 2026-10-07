@@ -55,10 +55,12 @@ const MAIN_RS_ERROR_STRINGS: [&str; 2] = [
 ];
 
 /// `crates/bot/src/server.rs`.
-const SERVER_RS_EVENTS: [&str; 3] = [
+const SERVER_RS_EVENTS: [&str; 5] = [
     "listening",
     "SIGTERM received; draining",
     "SIGINT received; draining",
+    "shutdown_completed",
+    "response failed",
 ];
 
 /// `crates/bot/src/shutdown.rs`.

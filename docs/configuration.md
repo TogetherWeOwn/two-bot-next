@@ -100,7 +100,7 @@ Catalog entries: 122.
 | `DISCORD_TICKET_STAFF_ROLE_ID` | hot | Not specified in Next | env at boot; stored unwired | Staff role used by ticket authorization. |
 | `DISCORD_TOKEN` | env_only | Not rendered (secret) | environment only | Container Discord authentication token; never stored in guild settings. |
 | `DISCORD_VOICE_LOG_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Destination for voice-session logs. |
-| `LOG_LEVEL` | cold | Not specified in Next | stored unwired | Legacy logging filter with no Next reader; Container tracing reads RUST_LOG. |
+| `LOG_LEVEL` | cold | Not specified in Next | stored unwired | Container two_bot tracing level when RUST_LOG is unset (info default); RUST_LOG overrides. |
 | `TEMP_VOICE_ENABLED` | cold | Not specified in Next | stored unwired | Legacy temporary-voice enable flag; classification does not imply runtime wiring. |
 | `TWO_ANNOUNCEMENTS` | cold | `false` | env at boot; stored unwired | Enable announcement command publication and routing. |
 | `TWO_ANTI_NUKE` | cold | Not specified in Next | stored unwired | Enable anti-nuke protection. |

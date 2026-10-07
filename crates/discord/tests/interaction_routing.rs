@@ -310,7 +310,7 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
     let events = audit.0.lock().unwrap();
     assert_eq!(events.len(), restricted.len() * 3);
     for (row, events) in restricted.iter().zip(events.as_chunks::<3>().0) {
-        for event in events {
+        for (index, event) in events.iter().enumerate() {
             assert_eq!(event["message"], "command_permission_denied");
             assert_eq!(event["target"], "two_bot_core::command_permissions");
             assert_eq!(event["command"], row.command);
@@ -318,23 +318,37 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
                 event["required_permissions"],
                 row.required_permissions.to_string()
             );
-            assert_eq!(event["guild_id"], format!("Some({GUILD_ID})"));
+            // IDs are decimal strings, never debug Some(..) (docs/logging.md).
+            assert_eq!(event["guild_id"], GUILD_ID.to_string());
             // Exact metadata allowlist excludes tokens, options and user text.
+            // A missing permission set leaves no key at all.
+            let mut expected = vec![
+                "command",
+                "guild_id",
+                "message",
+                "required_permissions",
+                "target",
+            ];
+            if index > 0 {
+                expected.insert(0, "actor_permissions");
+            }
             assert_eq!(
                 event.keys().map(String::as_str).collect::<Vec<_>>(),
-                vec![
-                    "actor_permissions",
-                    "command",
-                    "guild_id",
-                    "message",
-                    "required_permissions",
-                    "target"
-                ]
+                expected
             );
             assert!(!format!("{event:?}").contains("routing-test-token"));
         }
-        assert_eq!(events[0]["actor_permissions"], "None");
-        assert_eq!(events[1]["actor_permissions"], "Some(0)");
+        assert!(!events[0].contains_key("actor_permissions"));
+        assert_eq!(events[1]["actor_permissions"], "0");
+        // The slash helper builds member permissions via
+        // Permissions::from_bits_truncate, so unknown high bits never reach
+        // the audit path; pin the truncated decimal, not the raw !bits.
+        assert_eq!(
+            events[2]["actor_permissions"],
+            Permissions::from_bits_truncate(!row.required_permissions)
+                .bits()
+                .to_string()
+        );
     }
 }
 

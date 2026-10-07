@@ -61,6 +61,12 @@ pub fn route_interaction(
     interaction: &Interaction,
     custom_row: Option<bool>,
 ) -> RoutedInteraction {
+    let _span = tracing::info_span!(
+        "interaction",
+        interaction_id = %interaction.id,
+        guild_id = interaction.guild_id.map(|id| id.to_string()),
+    )
+    .entered();
     let guild_id = interaction.guild_id.map(|id| id.get());
     let actor_permissions = interaction
         .member
@@ -560,7 +566,7 @@ impl InteractionRuntime {
             }
             Err(_) => {
                 tracing::warn!(
-                    interaction_id = interaction.id.get(),
+                    interaction_id = interaction.id.get().to_string(),
                     "LFG operation failed; details withheld"
                 );
                 "LFG operation failed; check the saved state before retrying.".into()

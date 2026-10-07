@@ -56,6 +56,7 @@ class SelectionTests(unittest.TestCase):
             "scripts/test-docker-deps.py",
             "scripts/test_check_docker_manifests.py",
             "scripts/test_container_smoke.py",
+            "scripts/test-logging-container.py",
             "scripts/test_container_inputs.py",
         ]
         for path in build:
