@@ -159,6 +159,24 @@ the lease activates on its own once the migration lands. Fence the production
 0 otherwise reads as older than the 60 s lease and the next admit reclaims a
 live sender.
 
+<a id="boot-window"></a>
+**Boot window.** The gateway's bootstrap reads (`GET /oauth2/applications/@me`,
+`GET /guilds/{id}`) and the boot registry publish race the supervised jobs'
+first reads for this single-flight lane, and a predecessor killed mid-request
+leaves its occupancy for up to the lease. A refusal there fails the gateway,
+which lingers 15 s and exits for a container restart (October 2026: three to four
+starts and a 92-139 s staging redeploy; `custom_commands_init_failed` after every
+deploy). For `BOOT_WINDOW_MS` (120 s) after an executor is built,
+`current_application_id`, `guild_name` and `publish_guild_commands` therefore
+re-attempt **only** a pre-wire `Blocked` refusal, polling every
+`BOOT_BLOCKED_RETRY_SLEEP_MS` (250 ms) for up to `BOOT_ADMISSION_BUDGET_MS`
+(65 s, just above the 60 s lease so a dead holder always clears inside the wait).
+A `Blocked` attempt never reached the wire, so nothing is resent and the lease
+argument above is untouched; every other error returns at once, and past the
+window every caller gets the single bounded attempt as before. Indefinite and
+finite-cooldown holds still never clear, so they now fail after the wait instead
+of after the first refusal.
+
 Indefinite holds require explicitly authorized reconciliation. There is
 intentionally no startup reset or "force send" switch. Before any manual
 release, fence **all** credential users, prove the old send cannot continue,

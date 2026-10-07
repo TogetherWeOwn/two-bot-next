@@ -77,6 +77,18 @@ pub const MODERATION_TIMEOUT_MS: u64 = 5_000;
 pub const RECEIPT_ADMISSION_BUDGET_MS: u64 = 2_500;
 /// Backoff between admission-Blocked retries, ms.
 pub const BLOCKED_RETRY_SLEEP_MS: u64 = 20;
+/// Boot window, ms after the executor is built, in which the registry reads
+/// and publish that gate gateway startup wait out a held send lane instead of
+/// failing the gateway on the first refusal.
+pub const BOOT_WINDOW_MS: u64 = 120_000;
+/// Admission-wait budget for those boot-window calls, ms. Just above the 60 s
+/// lane lease (`IN_FLIGHT_LEASE_MS`), so a dead predecessor's occupancy always
+/// self-heals inside the wait. Only provably pre-wire Blocked refusals consume
+/// it; any other error returns at once.
+pub const BOOT_ADMISSION_BUDGET_MS: u64 = 65_000;
+/// Backoff between boot-window Blocked retries, ms. Slower than the receipt
+/// callback's so a stale holder costs a few polls per second, not fifty.
+pub const BOOT_BLOCKED_RETRY_SLEEP_MS: u64 = 250;
 /// Bound response-body collection, including the otherwise untimed GET/kick
 /// lanes, so a stalled global response cannot retain pending admission forever.
 pub const RESPONSE_BODY_TIMEOUT_MS: u64 = 5_000;
@@ -120,6 +132,25 @@ pub enum DiscordError {
 }
 
 impl DiscordError {
+    /// Fixed-vocabulary cause for logs. Never the error text: `Unavailable`
+    /// can carry transport detail and `Rejected` provider text.
+    #[must_use]
+    pub fn cause(&self) -> &'static str {
+        if self.is_admission_blocked() {
+            return "admission_blocked";
+        }
+        match self {
+            Self::Rejected(_) => "rejected",
+            Self::Timeout => "timeout",
+            Self::Unavailable(_) => "unavailable",
+            Self::RateLimited => "rate_limited",
+            Self::Guard(GuardError::CircuitOpen) => "guard_circuit_open",
+            Self::Guard(GuardError::TokenInvalid) => "guard_token_invalid",
+            Self::Guard(GuardError::AdmissionTimeout) => "guard_admission_timeout",
+            Self::Guard(GuardError::GlobalPaused) => "guard_global_paused",
+        }
+    }
+
     /// True only for failures that prove no mutation happened (legacy
     /// `isSafePreMutationFailure`).
     #[must_use]
@@ -734,6 +765,8 @@ struct ExecutorInner {
     pace_interval: Duration,
     kick_interval: Duration,
     moderation_timeout: Duration,
+    /// End of the boot window; see [`BOOT_WINDOW_MS`].
+    boot_until: tokio::time::Instant,
     pace_last_at: tokio::sync::Mutex<tokio::time::Instant>,
     kick_last_at: tokio::sync::Mutex<tokio::time::Instant>,
     #[cfg(test)]
@@ -825,6 +858,7 @@ impl ActionExecutor {
                 pace_interval: Duration::from_millis(PACE_INTERVAL_MS),
                 kick_interval: Duration::from_millis(KICK_INTERVAL_MS),
                 moderation_timeout: Duration::from_millis(MODERATION_TIMEOUT_MS),
+                boot_until: tokio::time::Instant::now() + Duration::from_millis(BOOT_WINDOW_MS),
                 pace_last_at: tokio::sync::Mutex::new(
                     tokio::time::Instant::now() - Duration::from_secs(60),
                 ),
@@ -925,6 +959,18 @@ impl ActionExecutor {
         self.inner
             .requests
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// One admitted send bounded by `timeout` (the wire budget only: callers
+    /// have already passed local admission).
+    async fn send_admitted_within(
+        &self,
+        request: &Request,
+        timeout: Duration,
+    ) -> Result<(RawResponse, bool), DiscordError> {
+        tokio::time::timeout(timeout, self.send_admitted(request))
+            .await
+            .map_err(|_| DiscordError::Timeout)?
     }
 
     async fn send_admitted(&self, request: &Request) -> Result<(RawResponse, bool), DiscordError> {
@@ -1065,7 +1111,20 @@ impl ActionExecutor {
         accepted: &[u16],
         lane: Option<bool>,
     ) -> Result<RawResponse, DiscordError> {
-        let (res, _) = self.send_with_timeout(&request, lane).await?;
+        self.call_once_raw_lane_for(&request, accepted, lane, self.inner.moderation_timeout)
+            .await
+    }
+
+    /// One attempt bounded by `timeout`, borrowing the request so a caller can
+    /// re-attempt it after a pre-wire refusal.
+    async fn call_once_raw_lane_for(
+        &self,
+        request: &Request,
+        accepted: &[u16],
+        lane: Option<bool>,
+        timeout: Duration,
+    ) -> Result<RawResponse, DiscordError> {
+        let (res, _) = self.send_with_timeout_for(request, lane, timeout).await?;
         if accepted.contains(&res.status) {
             return Ok(res);
         }
@@ -2754,8 +2813,18 @@ impl ActionExecutor {
 
     /// One paced, bounded bootstrap read: only 200 accepted; an unreadable
     /// body is `None` so callers can refuse with their own fixed error.
+    ///
+    /// Inside the boot window a held send lane is waited out (see
+    /// [`Self::retry_blocked_at_boot`]): the gateway's bootstrap races the
+    /// supervised jobs' first reads for the single-flight lane, and a dead
+    /// predecessor can hold it up to the lease. Failing the gateway on the
+    /// first refusal costs a container restart per attempt.
     async fn bootstrap_doc(&self, req: Request) -> Result<Option<serde_json::Value>, DiscordError> {
-        let mut res = self.call_once_raw_paced(req, &[200]).await?;
+        let mut res = self
+            .retry_blocked_at_boot(|timeout| {
+                self.call_once_raw_lane_for(&req, &[200], Some(false), timeout)
+            })
+            .await?;
         let doc = serde_json::from_slice(&res.body).ok();
         res.complete().await;
         Ok(doc)
@@ -2789,10 +2858,9 @@ impl ActionExecutor {
             // Idempotent sync may wait out any global pause; the five-second
             // wire budget starts after paced admission, unlike moderation.
             self.admit(&req, Some(false)).await?;
-            let (mut res, global) =
-                tokio::time::timeout(self.inner.moderation_timeout, self.send_admitted(&req))
-                    .await
-                    .map_err(|_| DiscordError::Timeout)??;
+            let (mut res, global) = self
+                .retry_blocked_at_boot(|timeout| self.send_admitted_within(&req, timeout))
+                .await?;
             match res.status {
                 200 => {
                     let parsed: Result<
@@ -2896,14 +2964,31 @@ impl ActionExecutor {
     /// cannot overrun the budget with its own transport wait. A Blocked
     /// attempt never reached the wire, so retrying it cannot double-send;
     /// every other error returns immediately with no retry.
-    async fn retry_admission_blocked<T, F, Fut>(&self, mut attempt: F) -> Result<T, DiscordError>
+    async fn retry_admission_blocked<T, F, Fut>(&self, attempt: F) -> Result<T, DiscordError>
+    where
+        F: FnMut(Duration) -> Fut,
+        Fut: std::future::Future<Output = Result<T, DiscordError>>,
+    {
+        self.retry_admission_blocked_within(
+            Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS),
+            Duration::from_millis(BLOCKED_RETRY_SLEEP_MS),
+            attempt,
+        )
+        .await
+    }
+
+    /// [`Self::retry_admission_blocked`] with the caller's budget and backoff.
+    async fn retry_admission_blocked_within<T, F, Fut>(
+        &self,
+        budget: Duration,
+        sleep: Duration,
+        mut attempt: F,
+    ) -> Result<T, DiscordError>
     where
         F: FnMut(Duration) -> Fut,
         Fut: std::future::Future<Output = Result<T, DiscordError>>,
     {
         let start = tokio::time::Instant::now();
-        let budget = Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS);
-        let sleep = Duration::from_millis(BLOCKED_RETRY_SLEEP_MS);
         let mut blocked: Option<DiscordError> = None;
         loop {
             let elapsed = start.elapsed();
@@ -2922,6 +3007,52 @@ impl ActionExecutor {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Boot-window wrapper for the reads and registry publish that gate
+    /// gateway startup. Within [`BOOT_WINDOW_MS`] of construction it re-attempts
+    /// ONLY provably pre-wire admission-Blocked refusals for up to
+    /// [`BOOT_ADMISSION_BUDGET_MS`]; a Blocked attempt never reached the wire,
+    /// so no intent is ever resent. Past the window, or on any other error, it
+    /// is the single bounded attempt every other caller gets.
+    async fn retry_blocked_at_boot<T, F, Fut>(&self, mut attempt: F) -> Result<T, DiscordError>
+    where
+        F: FnMut(Duration) -> Fut,
+        Fut: std::future::Future<Output = Result<T, DiscordError>>,
+    {
+        if tokio::time::Instant::now() >= self.inner.boot_until {
+            return attempt(self.inner.moderation_timeout).await;
+        }
+        let blocked = std::sync::atomic::AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let result = self
+            .retry_admission_blocked_within(
+                Duration::from_millis(BOOT_ADMISSION_BUDGET_MS),
+                Duration::from_millis(BOOT_BLOCKED_RETRY_SLEEP_MS),
+                |timeout| {
+                    let pending = attempt(timeout);
+                    let blocked = &blocked;
+                    async move {
+                        let outcome = pending.await;
+                        if matches!(&outcome, Err(error) if error.is_admission_blocked()) {
+                            blocked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        outcome
+                    }
+                },
+            )
+            .await;
+        let attempts = blocked.load(std::sync::atomic::Ordering::Relaxed);
+        if attempts > 0 {
+            // Fixed fields only: counts and a duration, never provider text.
+            tracing::warn!(
+                blocked_attempts = attempts,
+                waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                recovered = result.is_ok(),
+                "boot send admission was held; waited for the lane"
+            );
+        }
+        result
     }
 
     /// Bounded receipt-callback retry for governed-lane occupancy: re-attempts
@@ -3545,6 +3676,103 @@ mod tests {
         ] {
             assert!(!error.is_admission_blocked(), "{error:?}");
         }
+    }
+
+    fn boot_executor() -> ActionExecutor {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let token = "fixture-boot-wait-token";
+        ActionExecutor::with_admission(token.to_owned(), None, never_send_admission(token)).unwrap()
+    }
+
+    fn blocked() -> DiscordError {
+        DiscordError::Unavailable(AdmissionError::Blocked.to_string())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn boot_wait_outlasts_the_lane_lease_then_gives_up() {
+        let executor = boot_executor();
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let result: Result<(), DiscordError> = executor
+            .retry_blocked_at_boot(|_| {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(blocked()) }
+            })
+            .await;
+        assert!(result.unwrap_err().is_admission_blocked());
+        let waited = started.elapsed();
+        // Budget sits just above the 60 s lease so a dead holder always clears.
+        assert!(waited >= Duration::from_millis(BOOT_ADMISSION_BUDGET_MS));
+        assert!(waited < Duration::from_millis(BOOT_ADMISSION_BUDGET_MS + 1_000));
+        // `IN_FLIGHT_LEASE_MS` (60 s) lives behind the core `db` feature.
+        assert!(BOOT_ADMISSION_BUDGET_MS > 60_000);
+        let attempts = attempts.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (200..=300).contains(&attempts),
+            "poll cadence stays near 4/s: {attempts}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn boot_wait_returns_at_once_on_any_other_error() {
+        let executor = boot_executor();
+        for error in [
+            DiscordError::Timeout,
+            DiscordError::RateLimited,
+            DiscordError::Rejected("discord refused the request with 403".to_owned()),
+            DiscordError::Unavailable("Discord returned 503".to_owned()),
+        ] {
+            let attempts = std::sync::atomic::AtomicU32::new(0);
+            let started = tokio::time::Instant::now();
+            let result: Result<(), DiscordError> = executor
+                .retry_blocked_at_boot(|_| {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let error = error.clone();
+                    async move { Err(error) }
+                })
+                .await;
+            assert_eq!(result.unwrap_err(), error);
+            assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(started.elapsed(), Duration::ZERO);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn boot_wait_ends_with_the_boot_window() {
+        let executor = boot_executor();
+        tokio::time::advance(Duration::from_millis(BOOT_WINDOW_MS + 1)).await;
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let result: Result<(), DiscordError> = executor
+            .retry_blocked_at_boot(|_| {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(blocked()) }
+            })
+            .await;
+        // Runtime callers keep the single bounded attempt.
+        assert!(result.unwrap_err().is_admission_blocked());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[test]
+    fn error_causes_are_fixed_tokens() {
+        assert_eq!(blocked().cause(), "admission_blocked");
+        assert_eq!(DiscordError::Timeout.cause(), "timeout");
+        assert_eq!(DiscordError::RateLimited.cause(), "rate_limited");
+        // Transport and provider text never reaches the token.
+        assert_eq!(
+            DiscordError::Unavailable("transport: secret-host.invalid".to_owned()).cause(),
+            "unavailable"
+        );
+        assert_eq!(
+            DiscordError::Rejected("private body".to_owned()).cause(),
+            "rejected"
+        );
+        assert_eq!(
+            DiscordError::Guard(GuardError::TokenInvalid).cause(),
+            "guard_token_invalid"
+        );
     }
 
     #[test]
