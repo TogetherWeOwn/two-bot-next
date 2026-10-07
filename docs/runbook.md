@@ -859,6 +859,8 @@ would permit recovery. Do not actually disconnect Discord, change a Neon/
 Hyperdrive binding, delete a checkpoint, send a moderation action, or stop the
 staging container. [Tabletop evidence](incident-tabletop-2026-10-01.md) separates
 local source rehearsal, actual staging observations and unfinished acceptance.
+The [October-6 staging record](incident-tabletop-2026-10-06.md) is the Discord and
+Neon dry run against the live staging baseline, with its open evidence gaps.
 A denied observation or successful offline test is not a completed staging drill.
 
 ### Discord gateway or API outage
