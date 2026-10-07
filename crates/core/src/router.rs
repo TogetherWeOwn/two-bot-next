@@ -1412,9 +1412,9 @@ mod tests {
         assert!(gates.voice && gates.voice_assistant);
     }
 
-    /// The 17 voice names in published order (pinned independently in
+    /// The 22 voice names in published order (pinned independently in
     /// `voice_rooms::tests::voice_command_shapes_and_gates`).
-    const VOICE_NAMES: [&str; 17] = [
+    const VOICE_NAMES: [&str; 22] = [
         "create",
         "setup",
         "ping",
@@ -1432,6 +1432,11 @@ mod tests {
         "defaultlimit",
         "alwaysprivate",
         "kick",
+        "name",
+        "private",
+        "public",
+        "limit",
+        "unlimit",
     ];
 
     fn voice_on() -> RouterGates {
@@ -1461,9 +1466,9 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 28 builtins keep their order; the 16 voice names that survive
+        // 28 builtins keep their order; the 21 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 44);
+        assert_eq!(on.len(), 49);
         assert_eq!(on_names[..28], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
@@ -1525,7 +1530,7 @@ mod tests {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 44);
+        assert_eq!(both.len(), 50);
         let last = both.last().expect("non-empty");
         assert_eq!(last.name, "templateassistant");
         assert_eq!(

@@ -69,7 +69,8 @@ UTF-16 units on every moderation row.
 
 - Voice `/create /setup /ping /invite /textchannels /access /reclaim
   /transfer /logging /export /import /position /group /inheritpermissions
-  /defaultlimit /alwaysprivate /kick` (separate `TWO_VOICE` slice; its
+  /defaultlimit /alwaysprivate /kick /name /private /public /limit /unlimit`
+  (separate `TWO_VOICE` slice; its
   `kick` loses the merge to moderation first-wins — runtime dispatch decides).
   The published voice set is pinned separately by the `voice` section of
   `crates/core/tests/fixtures/staging_published_commands.json`.

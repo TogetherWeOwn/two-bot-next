@@ -338,6 +338,7 @@ impl CommandRuntime {
     /// sink actually built (not just `TWO_VOICE=1`): the voice commands publish
     /// only while something is there to answer them.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn from_env(
         pool: Pool<Postgres>,
         token: &str,

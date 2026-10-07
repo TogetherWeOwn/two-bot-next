@@ -19,7 +19,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 45.
+Built-in commands: 50.
 
 ## `/access`
 
@@ -276,6 +276,17 @@ Close a raid/LFG signup
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `id` | string | true | — | — | — | — | LFG id from the posted signup |
 
+## `/limit`
+
+Set your room's user limit (no number locks it at the current headcount)
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `count` | integer | false | 0 | 99 | — | — | Limit 0-99 (0 is unlimited; leave empty to lock at who is here now) |
+
 ## `/lockdown`
 
 Prevent @everyone from sending messages
@@ -304,6 +315,15 @@ Set where room health notices go and how much they say
 | `mention` | subcommand | false | — | — | — | — | Set or clear the role mentioned on errors |
 | `mention role` | role | false | — | — | — | — | Role to mention; leave empty to clear it |
 
+## `/name`
+
+Set a custom name for your temporary voice room, or restore the template name
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
+
 ## `/ping`
 
 Show the bot's response latency
@@ -324,7 +344,25 @@ Set where new rooms appear and the first room number
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
 | `position` | string | false | — | — | — | Above = `"above"`; Below = `"below"` | New rooms go above or below the creator channel |
-| `first-number` | integer | false | 1 | — | — | — | First room number (numbering starts here) |
+| `first-number` | integer | false | 1 | 4294967295 | — | — | First room number (numbering starts here) |
+
+## `/private`
+
+Deny new members from joining your voice room and open a Join channel
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
+
+## `/public`
+
+Let anyone join your voice room again and remove its Join channel
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
 
 ## `/purge`
 
@@ -517,6 +555,15 @@ Hand your temporary voice room to a member in it
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `member` | user | true | — | — | — | — | Member in the room to make the new owner |
+
+## `/unlimit`
+
+Remove your room's user limit
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
 
 ## `/unlock`
 

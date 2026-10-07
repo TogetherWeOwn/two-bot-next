@@ -211,10 +211,10 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 28 legacy builtins plus the 16 gated voice commands and
+        // 28 legacy builtins plus the 21 gated voice commands and
         // `/templateassistant` (voice `kick` loses first-wins to moderation
         // `/kick`): matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (45 live)"));
+        assert!(text.contains("**Server commands** (50 live)"));
         assert!(text.len() < 2000, "fits Discord's content ceiling");
     }
 
