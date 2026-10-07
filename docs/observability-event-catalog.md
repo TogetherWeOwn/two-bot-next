@@ -43,6 +43,8 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `listening` | `crates/bot/src/server.rs:176` | HTTP listener bound; one line per process start |
 | `SIGTERM received; draining` | `crates/bot/src/server.rs:221` | SIGTERM observed; effects drain before exit |
 | `SIGINT received; draining` | `crates/bot/src/server.rs:222` | SIGINT observed; effects drain before exit |
+| `shutdown_completed` | `crates/bot/src/server.rs:254` | HTTP graceful drain completed; stable `msg` name with no human message |
+| `response failed` | `crates/bot/src/server.rs:85,93` | HTTP 5xx response from the trace layer; DEBUG for the routine `/readyz` 503, ERROR otherwise |
 | `second shutdown signal received; exiting immediately` | `crates/bot/src/shutdown.rs:62` | Second signal during drain; process exits at once |
 | `invalid shutdown timeout; using default` | `crates/bot/src/shutdown.rs:36` | `SHUTDOWN_TIMEOUT_SECONDS` unparsable; default deadline kept |
 | `periodic job failed` | `crates/bot/src/jobs.rs:127` | Completed scheduled-job attempt failed; `job` and `error_class` name the job |

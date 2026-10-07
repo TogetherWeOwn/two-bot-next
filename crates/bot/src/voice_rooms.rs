@@ -2536,7 +2536,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             Ok(OwnershipDecision::Changed { next, .. }) => next,
             Ok(_) => return false,
             Err(error) => {
-                warn!(channel_id = channel, %error, "voice succession refused");
+                warn!(channel_id = channel.to_string(), %error, "voice succession refused");
                 return false;
             }
         };
@@ -3179,7 +3179,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             Err(error) => {
                 // Unreadable settings: send nothing, look again next interval.
                 warn!(
-                    guild = self.live.guild_id,
+                    guild = self.live.guild_id.to_string(),
                     ?error,
                     "voice notice settings unreadable"
                 );
@@ -3195,7 +3195,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let delivered = self.deliver_notice(&settings, &text).await;
         if !delivered {
             warn!(
-                guild = self.live.guild_id,
+                guild = self.live.guild_id.to_string(),
                 "voice notice had no working destination"
             );
         }
@@ -3331,7 +3331,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             Ok(_) => true,
             Err(error) => {
                 warn!(
-                    guild = self.live.guild_id,
+                    guild = self.live.guild_id.to_string(),
                     ?error,
                     "voice create reservation settle failed"
                 );
@@ -8408,7 +8408,7 @@ where
         }
         ImportDecision::Apply { .. } => {
             warn!(
-                guild_id,
+                guild_id = guild_id.to_string(),
                 "import preview planned an apply; refusing without writing"
             );
             reply(ephemeral_response(
@@ -8761,7 +8761,7 @@ where
                 Self::capture_response(runtime, interaction, invite_code, inventory.as_ref()).await;
             if let Some(response) = response {
                 if let Err(error) = replies.respond(interaction, response).await {
-                    warn!(interaction_id = interaction.id.get(), %error,
+                    warn!(interaction_id = interaction.id.get().to_string(), %error,
                         "voice ballot response failed; not retried");
                 }
             }
@@ -8789,14 +8789,14 @@ where
             let response = answered.lock().unwrap().take();
             if let Some(response) = response {
                 if let Err(error) = replies.respond(interaction, response).await {
-                    warn!(interaction_id = interaction.id.get(), %error,
+                    warn!(interaction_id = interaction.id.get().to_string(), %error,
                         "voice name modal response failed; not retried");
                 }
             }
             return;
         }
         if let Err(error) = replies.defer(interaction).await {
-            warn!(interaction_id = interaction.id.get(), %error,
+            warn!(interaction_id = interaction.id.get().to_string(), %error,
                 "voice acknowledgement failed; command not executed");
             return;
         }
@@ -8808,7 +8808,7 @@ where
             &names,
             |response| async move {
                 if let Err(error) = replies.complete(interaction, response).await {
-                    warn!(interaction_id = interaction.id.get(), %error,
+                    warn!(interaction_id = interaction.id.get().to_string(), %error,
                         "voice response completion failed; not retried");
                 }
             },
@@ -8849,7 +8849,7 @@ where
             return false;
         };
         if let Err(error) = replies.respond(interaction, response).await {
-            warn!(interaction_id = interaction.id.get(), %error,
+            warn!(interaction_id = interaction.id.get().to_string(), %error,
                 "voice vote response failed; not retried");
         }
         true

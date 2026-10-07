@@ -1,8 +1,10 @@
 """Cutover acceptance probe regressions: fixture doubles only, no network or databases."""
 
+import http.server
 import io
 import json
 import sys
+import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -42,6 +44,37 @@ def run(fetch_fn, *argv):
     with redirect_stdout(out):
         code = probe.main(list(argv), fetch_fn=fetch_fn)
     return code, out.getvalue()
+
+
+class UserAgentTest(unittest.TestCase):
+    """The default urllib agent is refused by the edge (Cloudflare 1010), so a
+    real fetch must name itself. Loopback server only; no external network."""
+
+    def test_fetch_sends_a_named_agent(self):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.headers.get("User-Agent"))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            status, _ = probe.fetch(f"http://127.0.0.1:{server.server_port}/health", 5)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(5)
+        self.assertEqual(status, 200)
+        self.assertEqual(seen, [probe.USER_AGENT])
+        self.assertNotIn("Python-urllib", probe.USER_AGENT)
 
 
 class BaseUrlTest(unittest.TestCase):

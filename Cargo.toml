@@ -102,7 +102,7 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 tower-service = "0.3"
 tower-http = { version = "0.7", default-features = false, features = ["trace"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 # S2 prototype only (dev-dependency of two-bot-discord): mock Discord gateway
 # double. Same WS stack twilight-gateway itself uses; `server` for the mock
 # listener, `sha1_smol` (BSD-3-Clause, allowed in deny.toml) for the handshake.

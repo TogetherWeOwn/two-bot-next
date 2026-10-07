@@ -117,8 +117,9 @@ No Cloudflare API reaches container stdout either, so voice-event emission has
 no CI read path; follow [staging voice-event verification](staging-voice-event-verification.md)
 for the dashboard procedure.
 
-Rust uses formatted `tracing` logs, configured by `RUST_LOG`, fallback
-`two_bot=info`; it does not consume legacy `LOG_LEVEL`. This wrapper currently
+Rust uses JSON `tracing` logs, configured by `RUST_LOG`, fallback
+`error,two_bot={LOG_LEVEL:-info}` (dependency crates stay ERROR-only unless
+`RUST_LOG` opts in); `/readyz` 503s log at DEBUG, not ERROR. This wrapper currently
 forwards **only** `DISCORD_TOKEN`, `DATABASE_URL`, `GUILD_ID` and its computed
 `LISTEN_ADDR`, not `RUST_LOG` or arbitrary `TWO_*` flags. Adding a Worker var
 alone will not configure the container. Do not dump env or HTTP headers to
@@ -859,6 +860,8 @@ would permit recovery. Do not actually disconnect Discord, change a Neon/
 Hyperdrive binding, delete a checkpoint, send a moderation action, or stop the
 staging container. [Tabletop evidence](incident-tabletop-2026-10-01.md) separates
 local source rehearsal, actual staging observations and unfinished acceptance.
+The [October-6 staging record](incident-tabletop-2026-10-06.md) is the Discord and
+Neon dry run against the live staging baseline, with its open evidence gaps.
 A denied observation or successful offline test is not a completed staging drill.
 
 ### Discord gateway or API outage
