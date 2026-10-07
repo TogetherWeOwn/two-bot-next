@@ -281,6 +281,11 @@ so production voice stays an Operator-approved binding.
   0412-0414 and 0416-0418) before the var ships: apply through `staging-migrate`,
   then re-apply the role plan so the runtime role holds the new tables. Merge
   the flip only after a post-apply plan shows no pending migrations.
+- **Check the custom-command count first.** The 100-command guild limit leaves
+  room for 50 stored custom commands beside the published builtins, voice set
+  and `/templateassistant`. A guild that already stores more makes the gateway
+  registry sync refuse (`TotalLimit`) and the gateway task fail at boot, rather
+  than degrading; trim the extra rows before the flip.
 - **Permanent channels stay untouched.** `reconcile` iterates the rooms the
   store tracks and nothing else, so the guild's three permanent voice
   channels (`Lobby`, `Squad`, `Voice 1`) are never deleted: with zero tracked
