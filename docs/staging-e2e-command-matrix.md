@@ -10,7 +10,8 @@ The `e2e_matrix_coverage` integration test fails when a command ships without
 a matrix row and when this doc drops one.
 
 Scope: 28 built-in slash commands (core + scorecard + automation +
-announcement + moderation — the set `docs/commands.md` renders). No guild was
+announcement + moderation — the commands `docs/commands.md` renders ahead of
+the voice set; with the voice gates on it renders 50). No guild was
 touched, no staging secrets used, no credentials created.
 
 Staging env the live suite needs: `TWO_COMMUNITY_SCORECARD=1`,

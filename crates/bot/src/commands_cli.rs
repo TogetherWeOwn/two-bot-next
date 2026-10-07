@@ -130,17 +130,6 @@ fn desired_definitions(
     .map_err(|e| e.to_string())
 }
 
-/// Early boot sync precedes voice construction. Keep that provisional registry
-/// voice-free; the later gateway registry sync uses the built sink's presence.
-fn boot_definitions(
-    guild: u64,
-    vars: &HashMap<String, String>,
-) -> Result<Vec<CommandDefinition>, String> {
-    let mut boot_vars = vars.clone();
-    boot_vars.remove("TWO_VOICE");
-    desired_definitions(guild, &boot_vars)
-}
-
 /// Two-stage admission mirror of `preflight::admission_transport`: live (non-
 /// loopback) targets build `PgSendAdmission` from TWO_DATABASE_URL and route
 /// the executor through it; the explicit loopback fixture stays offline and
@@ -268,7 +257,7 @@ pub async fn publish_on_boot(token: &str, guild: u64) -> Result<(), String> {
         vars.get("DISCORD_APPLICATION_ID").map(String::as_str),
         "DISCORD_APPLICATION_ID",
     )?;
-    let defs = boot_definitions(guild, &vars)?;
+    let defs = desired_definitions(guild, &vars)?;
     let executor = executor(token, &vars)
         .await
         .map_err(|error| format!("cannot configure command REST client: {error}"))?;
@@ -405,7 +394,6 @@ mod tests {
                 assert_eq!(names.contains(&definition.name.as_str()), voice == "1");
             }
             assert_eq!(names.contains(&"templateassistant"), assistant);
-            assert_eq!(boot_definitions(2222, &env).unwrap().len(), 3);
         }
     }
 

@@ -25,8 +25,9 @@ rollout approval separately.
 The desired set is the compiled builtins enabled by the same publishing gates:
 `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`, `TWO_MODERATION=1` (including its existing
 `TWO_OWEN_USER_ID`/protected-role validation), and `TWO_COMMUNITY_SCORECARD=1`.
-`TWO_VOICE=1` adds the temporary-voice set after moderation (21 new names; the
-voice `kick` loses first-wins to moderation `/kick`), and `/templateassistant`
+`TWO_VOICE=1` adds the temporary-voice set after moderation (21 new names with
+moderation on, because the voice `kick` loses first-wins to moderation `/kick`;
+22 with moderation off), and `/templateassistant`
 joins it only when `TWO_ASSISTANT_ENDPOINT` is also configured. The running bot
 publishes the voice set only while its voice sink actually built; this CLI reads
 the same env flags and cannot see that, so a diff against a bot whose voice
@@ -102,13 +103,14 @@ Boot uses the normal `GUILD_ID`, `DISCORD_TOKEN`, and feature bindings. Normal
 gateway prerequisites (including `DATABASE_URL`) still apply. If enabled,
 publication/refusal happens before opening the gateway database or connecting
 the shard; failure stops the configured gateway task rather than continuing with
-an unknown registry. This provisional early-boot set excludes voice and the
-assistant because the voice sink has not been constructed yet. The later governed
-gateway registry sync adds voice definitions only after the sink builds; failed
-voice construction leaves them out. This sync runs before shard polling, rather
-than waiting for READY. A healthy restart can therefore briefly withdraw voice
-commands between the early sync and gateway publication. With the opt-in absent,
-the early sync is skipped; gateway publication still runs.
+an unknown registry. The early sync reads the same env flags as the CLI, so with
+`TWO_VOICE=1` it already carries the voice set; keeping it there means a healthy
+restart does not delete and recreate the voice commands (which would drop their
+command IDs and permission overrides). It runs before the voice sink is built,
+so if the sink then fails to build, the voice commands stay published until the
+gateway's own registry sync, which runs before shard polling and uses the built
+sink's presence, withdraws them. With the opt-in absent, the early sync is
+skipped; gateway publication still runs.
 
 This synchronizes command definitions only; it does not wire missing interaction
 handlers or certify a command cutover. Keep it disabled until the required

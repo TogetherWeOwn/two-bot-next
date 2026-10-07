@@ -99,6 +99,34 @@ const HELP_GROUPS: &[HelpGroup] = &[
         requires: Some("Manage Channels"),
         commands: &["slowmode", "lockdown", "unlock"],
     },
+    HelpGroup {
+        title: "Voice rooms",
+        requires: None,
+        commands: &[
+            "setup", "ping", "invite", "reclaim", "transfer", "name", "private", "public", "limit",
+            "unlimit",
+        ],
+    },
+    HelpGroup {
+        title: "Voice room admin",
+        requires: Some("Manage Channels"),
+        commands: &[
+            "create",
+            "textchannels",
+            "access",
+            "logging",
+            "position",
+            "group",
+            "inheritpermissions",
+            "defaultlimit",
+            "alwaysprivate",
+        ],
+    },
+    HelpGroup {
+        title: "Voice room settings and assistant",
+        requires: Some("Manage Server"),
+        commands: &["export", "import", "templateassistant"],
+    },
 ];
 
 /// Render the ephemeral `/help` reply for the given live publish set.
@@ -215,6 +243,10 @@ mod tests {
         // `/templateassistant` (voice `kick` loses first-wins to moderation
         // `/kick`): matches the regenerated `docs/commands.md` total.
         assert!(text.contains("**Server commands** (50 live)"));
+        assert!(
+            !text.contains("**Custom**"),
+            "every published name is grouped"
+        );
         assert!(text.len() < 2000, "fits Discord's content ceiling");
     }
 
@@ -229,6 +261,8 @@ mod tests {
             ("Feed relays", "Manage Server"),
             ("Bans", "Ban Members"),
             ("Message cleanup", "Manage Messages"),
+            ("Voice room admin", "Manage Channels"),
+            ("Voice room settings and assistant", "Manage Server"),
         ] {
             assert!(
                 text.contains(&format!("**{group}** — needs {perm}")),
@@ -271,13 +305,12 @@ mod tests {
             }])
             .expect("set with custom");
         let text = help_text(&defs);
-        // The gated voice set has no help group yet, so it shares the Custom
-        // section ahead of the DB row; the row still renders under Custom.
+        // The voice set is grouped, so the Custom section holds only the row.
         let custom = text
             .split("**Custom**\n")
             .nth(1)
             .expect("custom section renders");
-        assert!(custom.contains("/faq"), "custom row renders under Custom");
+        assert!(custom.starts_with("/faq\n"), "{custom}");
     }
 
     #[test]
@@ -298,8 +331,10 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 27 legacy builtins plus the Next-only help command.
-        assert_eq!(grouped.len(), 28);
+        // 27 legacy builtins plus the Next-only help command, then the 21
+        // voice names (voice `kick` shares the Kick group) and
+        // `/templateassistant`.
+        assert_eq!(grouped.len(), 50);
         for name in [
             "rank",
             "leaderboard",
@@ -322,7 +357,15 @@ mod tests {
             "slowmode",
             "lockdown",
             "unlock",
-        ] {
+        ]
+        .into_iter()
+        .chain(
+            crate::voice_rooms::voice_commands()
+                .iter()
+                .map(|def| def.name.as_str()),
+        )
+        .chain(["templateassistant"])
+        {
             assert!(grouped.contains(name), "{name} has a help group");
         }
     }
