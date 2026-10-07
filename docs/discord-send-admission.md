@@ -168,7 +168,8 @@ which lingers 15 s and exits for a container restart (October 2026: three to fou
 starts and a 92-139 s staging redeploy; `custom_commands_init_failed` after every
 deploy). For `BOOT_WINDOW_MS` (120 s) after an executor is built,
 `current_application_id`, `guild_name` and `publish_guild_commands` therefore
-re-attempt **only** a pre-wire `Blocked` refusal, polling every
+re-attempt **only** a pre-wire `Blocked` refusal (the publish only on its first
+send: a retry after its own 429/5xx re-checks admission once and refuses), polling every
 `BOOT_BLOCKED_RETRY_SLEEP_MS` (250 ms) for up to `BOOT_ADMISSION_BUDGET_MS`
 (65 s, just above the 60 s lease so a dead holder always clears inside the wait).
 A `Blocked` attempt never reached the wire, so nothing is resent and the lease

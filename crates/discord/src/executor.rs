@@ -2858,9 +2858,16 @@ impl ActionExecutor {
             // Idempotent sync may wait out any global pause; the five-second
             // wire budget starts after paced admission, unlike moderation.
             self.admit(&req, Some(false)).await?;
-            let (mut res, global) = self
-                .retry_blocked_at_boot(|timeout| self.send_admitted_within(&req, timeout))
-                .await?;
+            // Only the first send waits out a held lane at boot. A retry follows
+            // this publish's own 429/5xx, which may itself have installed the
+            // hold: it must re-check admission once and refuse, not wait.
+            let (mut res, global) = if attempts == 0 {
+                self.retry_blocked_at_boot(|timeout| self.send_admitted_within(&req, timeout))
+                    .await?
+            } else {
+                self.send_admitted_within(&req, self.inner.moderation_timeout)
+                    .await?
+            };
             match res.status {
                 200 => {
                     let parsed: Result<
