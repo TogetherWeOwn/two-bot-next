@@ -124,6 +124,64 @@ try {
   assert.equal(all.code, 1);
   assert.match(all.out, /Parsed 3 commit\(s\) since the first commit/, 'No tag means the whole history');
   assert.match(all.out, new RegExp(before.slice(0, 12)));
+
+  // 7b. release-please also parses the body of the PR that introduced each
+  //     commit, and a BEGIN_COMMIT_OVERRIDE there replaces the message. Range
+  //     mode reads those bodies (GH_REPO) through `gh api`; a fake gh serves them.
+  const ghDir = path.join(scratch, 'gh');
+  fs.mkdirSync(path.join(ghDir, 'prs'), {recursive: true});
+  fs.writeFileSync(path.join(ghDir, 'gh'), [
+    '#!/bin/sh',
+    'for endpoint; do :; done',
+    '[ "$1" = api ] || exit 2',
+    '[ -z "$FAKE_GH_FAIL" ] || { echo "gh: HTTP 502" >&2; exit 1; }',
+    'echo "$endpoint" >> "$FAKE_GH_DIR/calls"',
+    'path=${endpoint%%\\?*}; sha=${path%/pulls}; sha=${sha##*/}',
+    'if [ -f "$FAKE_GH_DIR/prs/$sha.json" ]; then cat "$FAKE_GH_DIR/prs/$sha.json"; else echo "[]"; fi',
+  ].join('\n') + '\n', {mode: 0o755});
+  const servePullRequest = (sha, number, body, mergeSha = sha) => fs.writeFileSync(path.join(ghDir, 'prs', `${sha}.json`),
+    JSON.stringify([{number, body, merge_commit_sha: mergeSha}]));
+  const withGh = (extra = {}) => run({
+    GH_REPO: 'fixture/repo', FAKE_GH_DIR: ghDir, PATH: `${ghDir}${path.delimiter}${process.env.PATH}`, ...extra,
+  });
+  const rescued = `${HOSTILE_BODY}\nBEGIN_COMMIT_OVERRIDE\n${TITLE}\nEND_COMMIT_OVERRIDE\n`;
+
+  const noPr = withGh();
+  assert.equal(noPr.code, 1, 'A commit with no pull request is parsed alone');
+  assert.match(noPr.out, /Parsed 2 commit\(s\) since v0\.1\.0 with release-please \(0 with a pull request body\)/);
+
+  servePullRequest(bad, 3, HOSTILE_BODY);
+  assert.equal(withGh().code, 1, 'A pull request body without an override does not rescue the commit');
+
+  servePullRequest(bad, 3, rescued);
+  const overridden = withGh();
+  assert.equal(overridden.code, 0, 'A BEGIN_COMMIT_OVERRIDE in the merged pull request rescues the commit, as in release-please');
+  assert.match(overridden.out, /\(1 with a pull request body\)/);
+  assert.equal(releaseNotesEntries(hostileMessage).length, 0, 'premise: the bare message is still dropped');
+  const rescuedEntries = parseConventionalCommits([{sha: bad, message: hostileMessage, files: [], pullRequest: {body: rescued}}], silent);
+  assert.equal(rescuedEntries.length, 1, 'premise: release-please keeps the commit once the override is attached');
+
+  servePullRequest(bad, 3, rescued, 'f'.repeat(40));
+  assert.equal(withGh().code, 0, 'With no merge-commit match the first associated pull request is used, as release-please does');
+  fs.writeFileSync(path.join(ghDir, 'prs', `${bad}.json`), JSON.stringify([
+    {number: 4, body: HOSTILE_BODY, merge_commit_sha: 'e'.repeat(40)}, {number: 3, body: rescued, merge_commit_sha: bad}]));
+  assert.equal(withGh().code, 0, 'The pull request whose merge commit is this commit wins');
+  fs.rmSync(path.join(ghDir, 'prs', `${bad}.json`));
+
+  // The marker in prose breaks an otherwise parseable commit: only the PR body shows it.
+  const prose = `${NORMAL_BODY}\nThe marker BEGIN_COMMIT_OVERRIDE is parsed as a commit message.\n`;
+  const fine = commit(squashMessage('feat(fine): parses alone', 4, NORMAL_BODY));
+  servePullRequest(fine, 4, prose);
+  servePullRequest(bad, 3, rescued);
+  const poisonedPr = withGh();
+  assert.equal(poisonedPr.code, 1, 'A pull request body that poisons its own commit fails the range');
+  assert.match(poisonedPr.out, new RegExp(`::error title=Unparseable commit::.*${fine.slice(0, 12)}`));
+  assert.doesNotMatch(poisonedPr.out, new RegExp(`::error[^\\n]*${bad.slice(0, 12)}`), 'The rescued commit is not reported');
+  fs.rmSync(path.join(ghDir, 'prs', `${fine}.json`));
+  assert.equal(withGh().code, 0);
+  assert.equal(withGh({FAKE_GH_FAIL: '1'}).code, 1, 'An unreadable pull request fails closed, not open');
+  assert.match(withGh({FAKE_GH_FAIL: '1'}).err, /commit-parse-guard/);
+  assert.match(fs.readFileSync(path.join(ghDir, 'calls'), 'utf8'), /^repos\/fixture\/repo\/commits\/[0-9a-f]{40}\/pulls\?per_page=10$/m);
 } finally {
   fs.rmSync(scratch, {recursive: true, force: true});
 }
@@ -163,10 +221,27 @@ const prStep = supply.slice(supply.indexOf('- name: Check the squash commit pars
 assert(prStep.includes("if: steps.pr.outputs.event == 'pull_request'"), 'The PR guard skips push events');
 assert(prStep.slice(0, prStep.indexOf('\n  gitleaks:')).includes('commit-parse-guard.cjs pr'), 'pr-lint runs the PR guard');
 assert(supply.indexOf('commit-parse-guard.cjs pr') < supply.indexOf('\n  gitleaks:'), 'The PR guard is inside the pr-lint job');
-const guardStep = release.indexOf('- name: Fail on commits release-please cannot parse');
-assert(guardStep > 0 && guardStep < release.indexOf('googleapis/release-please-action@'), 'The range guard precedes release-please');
+const guardStep = release.indexOf('- name: Check that release-please can parse every commit');
+const action = release.indexOf('googleapis/release-please-action@');
+assert(guardStep > 0 && guardStep < action, 'The range guard precedes release-please');
 const guardBlock = release.slice(guardStep, release.indexOf('- name: Inspect existing release PR'));
 assert(guardBlock.includes("if: github.event_name != 'push'") && guardBlock.includes('commit-parse-guard.cjs range'));
+assert(guardBlock.includes('id: parse_guard') && guardBlock.includes('continue-on-error: true'),
+  'A guard failure must not stop publication: the action runs after it');
+assert(guardBlock.includes('GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}') && guardBlock.includes('GH_REPO: ${{ github.repository }}'),
+  'Range mode reads pull request bodies, so it needs the repo and token');
+// A failed guard skips only the PR regeneration and the steps that follow it, then fails the job last.
+const skipLine = release.match(/skip-github-pull-request: \$\{\{ (.+) \}\}/)[1];
+assert(skipLine.includes("steps.parse_guard.outcome == 'failure'"), 'A failed guard skips PR regeneration, not publication');
+assert(!release.includes('skip-github-release:'), 'Publication stays enabled');
+const failStep = release.indexOf('- name: Fail the run when release-please could not parse every commit');
+assert(failStep > action && failStep < release.indexOf('\n  dispatch-checks:'), 'The failing step is last in the release-please job');
+const failBlock = release.slice(failStep, release.indexOf('\n  dispatch-checks:'));
+assert(failBlock.includes("if: ${{ !cancelled() && steps.parse_guard.outcome == 'failure' }}") && failBlock.includes('exit 1'));
+assert(!/needs: release-please\n\s+if: [^\n]*(always|failure)\(/.test(release.slice(release.indexOf('\n  dispatch-checks:'), release.indexOf('\n  sbom-target:'))),
+  'dispatch-checks keeps the success() gate, so a failed guard never dispatches checks');
+const sbomTarget = release.slice(release.indexOf('\n  sbom-target:'), release.indexOf('\n  release-sbom:'));
+assert(sbomTarget.includes('!cancelled()') && sbomTarget.includes("release_created == 'true'"), 'SBOM publication survives the failing last step');
 assert(release.includes("fetch-depth: ${{ github.event_name == 'push' && 1 || 0 }}"), 'The range guard needs the tag history');
 assert(release.indexOf('dispatch-checks:') > guardStep && /dispatch-checks:[\s\S]*?needs: release-please/.test(release),
   'dispatch-checks needs the job that runs the guard');

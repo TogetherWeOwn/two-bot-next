@@ -58,10 +58,17 @@ jobs:
           # The parse guard reads the commits since the last release tag.
           fetch-depth: ${{ github.event_name == 'push' && 1 || 0 }}
       # release-please drops a commit its strict parser rejects and still
-      # succeeds, so notes lose a change with no signal. Fail the regeneration
-      # instead (and with it dispatch-checks); see docs/releases.md.
-      - name: Fail on commits release-please cannot parse
+      # succeeds, so notes lose a change with no signal. A failure here skips
+      # only the release PR regeneration; the action still publishes a merged
+      # release and the last step fails the job, so dispatch-checks never
+      # starts. See docs/releases.md, "Unparseable commits".
+      - name: Check that release-please can parse every commit
+        id: parse_guard
         if: github.event_name != 'push'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: | # zizmor: ignore[adhoc-packages] pinned release-please parser only
           npm install --prefix "$RUNNER_TEMP/release-parse" --ignore-scripts --no-audit --no-fund release-please@17.6.0
           NODE_PATH="$RUNNER_TEMP/release-parse/node_modules" node .github/scripts/commit-parse-guard.cjs range
@@ -81,8 +88,10 @@ jobs:
           manifest-file: .release-please-manifest.json
           # Keep publication enabled on every event. A push never regenerates
           # the PR; schedule/dispatch skip it only when its branch already
-          # includes this main snapshot, including our migrated notes.
-          skip-github-pull-request: ${{ github.event_name == 'push' || steps.plan.outputs.reuse_pr == 'true' }}
+          # includes this main snapshot, including our migrated notes, or when
+          # the parse guard failed (a stale PR must not be rebuilt from commits
+          # whose notes would silently drop).
+          skip-github-pull-request: ${{ github.event_name == 'push' || steps.parse_guard.outcome == 'failure' || steps.plan.outputs.reuse_pr == 'true' }}
 
       # Query independently of prs_created: a failed migration can leave an
       # unchanged native PR, so action outputs alone cannot drive recovery.
@@ -93,16 +102,17 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: node scripts/release-pr-state.cjs select
 
-      # Reconciliation and its checkout only follow a regeneration, never a push.
+      # Reconciliation and its checkout only follow a regeneration, never a push
+      # and never a run whose parse guard failed (nothing was regenerated).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name != 'push' && steps.select.outputs.pr_available == 'true'
+        if: github.event_name != 'push' && steps.parse_guard.outcome != 'failure' && steps.select.outputs.pr_available == 'true'
         with:
           persist-credentials: false
           ref: ${{ fromJSON(steps.select.outputs.pr).headBranchName }}
       # Env expressions are evaluated even on a skipped step. Selection emits
       # valid {} JSON when publication leaves no open PR; the guard stays false.
       - name: Preserve bootstrap release notes
-        if: github.event_name != 'push' && steps.select.outputs.pr_available == 'true'
+        if: github.event_name != 'push' && steps.parse_guard.outcome != 'failure' && steps.select.outputs.pr_available == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -193,6 +203,14 @@ jobs:
             python3 -c 'import json, pathlib, sys; print(json.dumps({"body": pathlib.Path(sys.argv[1]).read_text()}))' "$BODY_FILE" > "$BODY_FILE.json"
             gh api --method PATCH "repos/$GH_REPO/pulls/$PR_NUMBER" --input "$BODY_FILE.json" --silent
           fi
+
+      # Last, so publication above is never blocked. Failing the job keeps
+      # dispatch-checks (default success() gate) from running on a stale PR.
+      - name: Fail the run when release-please could not parse every commit
+        if: ${{ !cancelled() && steps.parse_guard.outcome == 'failure' }}
+        run: |
+          echo "::error title=Release PR not regenerated::A commit since the last release tag cannot be parsed by release-please. Publication ran; the release PR was left as it was. Fix the commit's PR body as docs/releases.md (Unparseable commits) says, then dispatch again."
+          exit 1
 
   dispatch-checks:
     name: dispatch-checks

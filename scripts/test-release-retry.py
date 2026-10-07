@@ -217,9 +217,10 @@ def evaluate(expression, context):
 class ReleaseTriggerShapeTests(unittest.TestCase):
     """TOG-12931: push publishes only; schedule/dispatch regenerate and dispatch checks."""
 
-    def context(self, event, pr_available="true", reuse_pr=""):
+    def context(self, event, pr_available="true", reuse_pr="", parse_guard="success"):
         return {
             "github.event_name": event,
+            "steps.parse_guard.outcome": parse_guard,
             "steps.select.outputs.pr_available": pr_available,
             "needs.release-please.outputs.pr_available": pr_available,
             "steps.plan.outputs.reuse_pr": reuse_pr,
@@ -270,6 +271,42 @@ class ReleaseTriggerShapeTests(unittest.TestCase):
                     context = self.context(event, pr_available, "false")
                     for name in ("checkout", "preserve", "dispatch"):
                         self.assertEqual(evaluate(conditions[name], context), pr_available == "true", name)
+
+    def test_failed_parse_guard_skips_regeneration_but_not_publication(self):
+        skip, conditions = self.skip_expression(), self.conditions()
+        for event in ("schedule", "workflow_dispatch"):
+            for reuse_pr in ("", "true", "false"):
+                with self.subTest(event=event, reuse_pr=reuse_pr):
+                    context = self.context(event, "true", reuse_pr, parse_guard="failure")
+                    self.assertTrue(evaluate(skip, context), "a failed guard must not rebuild the release PR")
+                    for name in ("checkout", "preserve"):
+                        self.assertFalse(evaluate(conditions[name], context), f"{name} follows a regeneration only")
+        # A guard that was skipped (push) or passed leaves the regeneration rules unchanged.
+        for outcome in ("success", "skipped"):
+            context = self.context("schedule", "true", "false", parse_guard=outcome)
+            self.assertFalse(evaluate(skip, context))
+            self.assertTrue(evaluate(conditions["checkout"], context))
+        text = workflow_text()
+        self.assertNotIn("skip-github-release:", text, "publication stays enabled when the guard fails")
+        guard = step_with("release-please", "id: parse_guard")
+        self.assertIn("continue-on-error: true", guard, "the guard must not stop the publishing action")
+        self.assertLess(text.index("id: parse_guard"), text.index("googleapis/release-please-action@"))
+
+    def test_failed_parse_guard_fails_the_job_after_publication(self):
+        steps = job_steps("release-please")
+        final = steps[-1]
+        self.assertIn("name: Fail the run when release-please could not parse every commit", final)
+        self.assertEqual(step_condition(final), "${{ !cancelled() && steps.parse_guard.outcome == 'failure' }}")
+        self.assertIn("exit 1", final)
+        action = next(index for index, step in enumerate(steps) if "googleapis/release-please-action@" in step)
+        self.assertGreater(len(steps) - 1, action, "the failing step comes after the publishing action")
+        # dispatch-checks keeps the implicit success() gate, so the failed job never dispatches checks;
+        # sbom-target runs under !cancelled() and still reads release_created.
+        dispatch = re.search(r"(?ms)^  dispatch-checks:\n(.*?)(?=^  [\w-]+:\n)", workflow_text()).group(1)
+        self.assertNotRegex(dispatch, r"(?m)^    if: .*(always|failure|cancelled)\(")
+        sbom = re.search(r"(?ms)^  sbom-target:\n(.*?)(?=^  [\w-]+:\n)", workflow_text()).group(1)
+        self.assertIn("!cancelled()", sbom)
+        self.assertIn("needs.release-please.outputs.release_created == 'true'", sbom)
 
     def test_publication_path_and_permissions_are_untouched(self):
         workflow = workflow_text()

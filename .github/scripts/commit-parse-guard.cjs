@@ -12,9 +12,13 @@
 //   range  the commits since the last release tag. Runs in the release
 //          workflow before the release PR is regenerated, so a commit that
 //          reached main anyway (a body edited at merge time) fails the run.
+//          release-please parses the body of the PR that introduced each
+//          commit (a BEGIN_COMMIT_OVERRIDE section replaces the commit
+//          message), so range mode reads those bodies too when GH_REPO is set.
 //
 // Needs release-please@17.6.0 resolvable through NODE_PATH, the version the
-// pinned release action bundles. Writes nothing and needs no token.
+// pinned release action bundles. Writes nothing. `pr` mode needs no token;
+// `range` mode reads PR bodies through `gh api` (GH_REPO, GH_TOKEN).
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -103,6 +107,22 @@ function lastReleaseTag() {
   }
 }
 
+// Same pick as release-please's merge-commit iterator: the PR whose merge
+// commit is this commit, else the first associated PR. Its body is what the
+// library searches for a commit override. A commit with no PR is parsed alone.
+function pullRequestBodyLookup(repo, run = ghApi) {
+  return sha => {
+    const prs = JSON.parse(run(`repos/${repo}/commits/${sha}/pulls?per_page=10`));
+    if (!Array.isArray(prs)) throw new Error(`unexpected reply listing the pull requests of ${sha}`);
+    const pr = prs.find(candidate => candidate.merge_commit_sha === sha) || prs[0];
+    return pr ? {number: pr.number, body: pr.body || ''} : null;
+  };
+}
+
+function ghApi(endpoint) {
+  return execFileSync('gh', ['api', endpoint], {encoding: 'utf8', maxBuffer: 1 << 26});
+}
+
 function listCommits(base) {
   const range = base ? [`${base}..HEAD`] : ['HEAD'];
   return git(['log', '-z', '--format=%H%x1f%B', ...range]).split('\0').filter(Boolean).map(record => {
@@ -111,11 +131,18 @@ function listCommits(base) {
   });
 }
 
-function checkRange({base, exceptions}, parseConventionalCommits) {
-  const commits = listCommits(base);
+function checkRange({base, exceptions, pullRequestFor}, parseConventionalCommits) {
+  let withPullRequest = 0;
+  const commits = listCommits(base).map(commit => {
+    const pullRequest = pullRequestFor ? pullRequestFor(commit.sha) : null;
+    if (!pullRequest) return commit;
+    withPullRequest++;
+    return {...commit, pullRequest: {body: pullRequest.body}};
+  });
   const failures = findUnparseable(commits, parseConventionalCommits);
   return {
     checked: commits.length,
+    withPullRequest,
     failed: failures.filter(failure => !exceptions.has(failure.sha)),
     acknowledged: failures.filter(failure => exceptions.has(failure.sha)),
   };
@@ -157,14 +184,19 @@ function main(argv, env = process.env) {
   }
   if (mode === 'range') {
     const base = env.RELEASE_BASE_REF !== undefined ? env.RELEASE_BASE_REF : lastReleaseTag();
-    const {checked, failed, acknowledged} = checkRange({base, exceptions: readExceptions(env.EXCEPTIONS_FILE || EXCEPTIONS_FILE)}, parse);
-    console.log(`Parsed ${checked} commit(s) since ${base || 'the first commit'} with release-please.`);
+    const pullRequestFor = env.GH_REPO ? pullRequestBodyLookup(env.GH_REPO) : null;
+    const {checked, withPullRequest, failed, acknowledged} = checkRange({
+      base, exceptions: readExceptions(env.EXCEPTIONS_FILE || EXCEPTIONS_FILE), pullRequestFor,
+    }, parse);
+    console.log(`Parsed ${checked} commit(s) since ${base || 'the first commit'} with release-please`
+      + (pullRequestFor ? ` (${withPullRequest} with a pull request body).` : ' (no pull request bodies: GH_REPO is unset).'));
     for (const failure of acknowledged) {
       console.log(`::warning title=Acknowledged unparseable commit::${failure.sha} ${failure.subject}`);
     }
     if (!failed.length) return 0;
     report(failed, 'commit');
-    console.error('If the note was added to the release by hand, record the SHA in .github/release-parse-exceptions.txt.');
+    console.error('Fix: add a BEGIN_COMMIT_OVERRIDE section with a parseable message to the body of the pull request that merged it,');
+    console.error('then re-run. The release guard reads that body. See docs/releases.md, "Unparseable commits".');
     return 1;
   }
   console.error('usage: commit-parse-guard.cjs pr | range');
@@ -181,6 +213,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-  findUnparseable, squashMessage, checkPullRequest, checkRange, readExceptions,
+  findUnparseable, squashMessage, checkPullRequest, checkRange, readExceptions, pullRequestBodyLookup,
   RELEASE_PR_HEAD_PREFIX, EXCEPTIONS_FILE,
 };

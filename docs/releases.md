@@ -89,7 +89,8 @@ GitHub writes.
 `node scripts/test-commit-parse-guard.cjs` (same `NODE_PATH`) proves the
 parse guard described under [Unparseable commits](#unparseable-commits): a
 hostile squash body is caught, a normal one passes, and a throwaway repository
-exercises the range check and its exceptions file.
+(with a fake `gh` serving PR bodies) exercises the range check, a
+`BEGIN_COMMIT_OVERRIDE` rescue and its exceptions file.
 
 `python3 scripts/test-pr-lint.py` executes the workflow's actual inline scripts
 with mocked PR metadata, including delimiter collisions and stale/foreign PR
@@ -129,10 +130,11 @@ in neither release's notes).
    that nothing merges to `main` until the freeze is lifted, and confirms no
    merge is in flight.
 2. **Dispatch regeneration.** `gh workflow run release.yml --ref main`, then wait
-   for the run. It first fails if any commit since the last tag is unparseable
-   (see [Unparseable commits](#unparseable-commits)); otherwise it regenerates
-   the PR from the current `main`, preserves the bootstrap notes and dispatches
-   `check.yml` and `supply-chain.yml` on the head.
+   for the run. It first checks that every commit since the last tag parses (see
+   [Unparseable commits](#unparseable-commits)); if one does not, the PR is left
+   as it was and the run fails. Otherwise it regenerates the PR from the current
+   `main`, preserves the bootstrap notes and dispatches `check.yml` and
+   `supply-chain.yml` on the head.
 3. **Confirm the PR is fresh.** From a checkout of `main`:
    ```sh
    GH_REPO=<owner>/<repo> GITHUB_SHA="$(gh api "repos/<owner>/<repo>/commits/main" --jq .sha)" \
@@ -184,17 +186,40 @@ code, test names and function signatures are the usual source.
   after it as the commit message.
 - **The release workflow** parses every commit since the last `vX.Y.Z` tag
   before it regenerates the release PR (`schedule` and `workflow_dispatch`;
-  never on a push). A failure stops the run, so `dispatch-checks` never starts.
-  This catches a commit that reached `main` anyway, for example a merge call
-  that supplied its own message.
+  never on a push). release-please also reads the body of the PR that merged
+  each commit, and a `BEGIN_COMMIT_OVERRIDE` section there replaces the commit
+  message, so the guard looks up that PR through `gh api` and parses the same
+  text. A failure does not block publication: the guard step is
+  `continue-on-error`, the action still tags and publishes a merged release
+  (including one a failed push run missed), and `skip-github-pull-request` is
+  set so the release PR is left as it was rather than rebuilt without the
+  dropped note. The last step of the job then fails it, so `dispatch-checks`
+  never starts. This catches a commit that reached `main` anyway, for example a
+  merge call that supplied its own message.
 
 When the release guard fails, the named commit is missing from the generated
-notes. Add its note to the release PR by hand, then record the full SHA in
-`.github/release-parse-exceptions.txt` (one SHA and a reason per line) through a
-normal PR; during a freeze, that PR is the one permitted merge. Dispatch again
-afterwards. The guard keeps printing a warning annotation for every recorded
-SHA, so the gap stays visible until the release that carries it ships. Remove
-the entry after that.
+notes. The lasting fix is the one release-please supports natively: edit the
+body of the pull request that merged the commit and add a section
+
+```text
+BEGIN_COMMIT_OVERRIDE
+fix(scope): the message the release notes should carry
+END_COMMIT_OVERRIDE
+```
+
+then dispatch again. The guard reads that body and passes, and release-please
+generates the note from it on every regeneration, so nothing is lost when the
+release PR is rebuilt. A note typed into the release PR by hand is not a fix: the
+next regeneration (a dispatch or Monday run after `main` has moved) replaces the
+body and deletes it.
+
+`.github/release-parse-exceptions.txt` (one full SHA and a reason per line,
+added through a normal PR) is the escape hatch for a commit whose PR body cannot
+be edited. It only silences the guard: merge the entry (the one merge a freeze
+permits), dispatch, and only then add the note to the release PR by hand,
+because that dispatch is the last regeneration before the release merges. The
+guard keeps printing a warning annotation for every recorded SHA, so the gap
+stays visible. Remove the entry once the release that carries the note ships.
 
 ## Retry-safe PR reconciliation
 
