@@ -4917,6 +4917,17 @@ where
     /// Missing/disconnected snapshots fail closed, including for admin claims.
     /// Source: <https://docs.discord.com/developers/resources/guild#guild-member-object>
     fn guild_permissions(&self, interaction: &Interaction) -> Option<Permissions> {
+        self.guild_permissions_at(
+            interaction,
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000,
+        )
+    }
+
+    fn guild_permissions_at(
+        &self,
+        interaction: &Interaction,
+        now_micros: i128,
+    ) -> Option<Permissions> {
         let guild = interaction_guild(interaction)?;
         let member = interaction.member.as_ref()?;
         let member_id = member.user.as_ref()?.id.get();
@@ -4926,14 +4937,26 @@ where
             return None;
         }
         let bot = live.bot.as_ref()?;
-        effective_permissions(
+        let mut permissions = effective_permissions(
             guild,
             bot.guild_owner_id,
             member_id,
             &member.roles,
             &bot.roles,
             &[],
-        )
+        )?;
+        // Discord exempts the guild owner and Administrator, both of which
+        // effective_permissions resolves to all bits. Other timed-out members
+        // retain only their existing View Channel and Read Message History bits.
+        // Source: <https://docs.discord.com/developers/topics/permissions#permissions-for-timed-out-members>
+        if !permissions.contains(Permissions::ADMINISTRATOR)
+            && member
+                .communication_disabled_until
+                .is_some_and(|until| i128::from(until.as_micros()) > now_micros)
+        {
+            permissions &= Permissions::VIEW_CHANNEL | Permissions::READ_MESSAGE_HISTORY;
+        }
+        Some(permissions)
     }
 
     fn ensure_actor(&self, guild: Snowflake) -> Option<GuildActor> {

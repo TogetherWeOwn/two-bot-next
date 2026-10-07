@@ -4205,6 +4205,195 @@ async fn guild_role_admins_and_owner_pass_without_channel_manage_channels() {
 }
 
 #[tokio::test]
+async fn guild_timeout_active_removes_role_derived_administrative_authority() {
+    use twilight_model::util::Timestamp;
+
+    let runtime = test_runtime(Trace::default());
+    let mut guild = command_snapshot();
+    let readable_admin = Permissions::VIEW_CHANNEL
+        | Permissions::READ_MESSAGE_HISTORY
+        | Permissions::MANAGE_CHANNELS
+        | Permissions::MANAGE_GUILD;
+    guild.bot.roles.push(role_with(12_345, readable_admin));
+    assert!(runtime.publish_snapshot(GUILD, guild));
+    let now = Timestamp::parse(NOW).unwrap().as_micros();
+    for (role_id, expected) in [
+        (
+            10_000 + Permissions::MANAGE_CHANNELS.bits(),
+            Permissions::empty(),
+        ),
+        (
+            10_000 + Permissions::MANAGE_GUILD.bits(),
+            Permissions::empty(),
+        ),
+        (
+            10_000 + (Permissions::MANAGE_CHANNELS | Permissions::MANAGE_GUILD).bits(),
+            Permissions::empty(),
+        ),
+        (
+            12_345,
+            Permissions::VIEW_CHANNEL | Permissions::READ_MESSAGE_HISTORY,
+        ),
+    ] {
+        let mut interaction = voice_interaction(
+            Some(command_data("access", vec![])),
+            Some(Permissions::ADMINISTRATOR),
+            true,
+        );
+        let member = interaction.member.as_mut().unwrap();
+        member.roles = vec![Id::new(role_id)];
+        member.communication_disabled_until = Some(Timestamp::from_micros(now + 1).unwrap());
+        let permissions = runtime.guild_permissions_at(&interaction, i128::from(now));
+        assert_eq!(permissions, Some(expected), "role {role_id}");
+        assert!(!is_voice_admin(permissions));
+        assert!(!may_manage_server(permissions));
+    }
+}
+
+#[tokio::test]
+async fn guild_timeout_absent_expired_and_boundary_leave_authority_unchanged() {
+    use twilight_model::util::Timestamp;
+
+    let runtime = test_runtime(Trace::default());
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    let now = Timestamp::parse(NOW).unwrap().as_micros();
+    let expected = Permissions::MANAGE_CHANNELS | Permissions::MANAGE_GUILD;
+    for until in [None, Some(now - 1), Some(now)] {
+        let mut interaction = voice_interaction(Some(command_data("access", vec![])), None, true);
+        let member = interaction.member.as_mut().unwrap();
+        member.roles = vec![Id::new(10_000 + expected.bits())];
+        member.communication_disabled_until = until.map(|at| Timestamp::from_micros(at).unwrap());
+        let permissions = runtime.guild_permissions_at(&interaction, i128::from(now));
+        assert_eq!(permissions, Some(expected));
+        assert!(is_voice_admin(permissions));
+        assert!(may_manage_server(permissions));
+    }
+}
+
+#[tokio::test]
+async fn guild_timeout_preserves_discord_owner_and_administrator_exemptions() {
+    use twilight_model::util::Timestamp;
+
+    let runtime = test_runtime(Trace::default());
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    let now = Timestamp::parse(NOW).unwrap().as_micros();
+    for (id, roles) in [
+        (
+            MEMBER,
+            vec![Id::new(10_000 + Permissions::ADMINISTRATOR.bits())],
+        ),
+        (998, vec![]),
+    ] {
+        let mut interaction = voice_interaction_as(Some(command_data("access", vec![])), None, id);
+        let member = interaction.member.as_mut().unwrap();
+        member.roles = roles;
+        member.communication_disabled_until = Some(Timestamp::from_micros(now + 1).unwrap());
+        let permissions = runtime.guild_permissions_at(&interaction, i128::from(now));
+        assert_eq!(permissions, Some(Permissions::all()));
+        assert!(is_voice_admin(permissions));
+        assert!(may_manage_server(permissions));
+    }
+}
+
+#[tokio::test]
+async fn guild_timeout_does_not_supply_missing_authority_facts() {
+    use twilight_model::util::Timestamp;
+
+    let runtime = test_runtime(Trace::default());
+    let now = Timestamp::parse(NOW).unwrap().as_micros();
+    let mut interaction = voice_interaction(
+        Some(command_data("access", vec![])),
+        Some(Permissions::ADMINISTRATOR),
+        true,
+    );
+    interaction
+        .member
+        .as_mut()
+        .unwrap()
+        .communication_disabled_until = Some(Timestamp::from_micros(now + 1).unwrap());
+    assert_eq!(
+        runtime.guild_permissions_at(&interaction, i128::from(now)),
+        None
+    );
+    let mut guild = command_snapshot();
+    guild
+        .bot
+        .roles
+        .retain(|role| role.id.get() != 10_000 + Permissions::ADMINISTRATOR.bits());
+    assert!(runtime.publish_snapshot(GUILD, guild));
+    assert_eq!(
+        runtime.guild_permissions_at(&interaction, i128::from(now)),
+        None
+    );
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    let mut missing_user = interaction.clone();
+    missing_user.member.as_mut().unwrap().user = None;
+    assert_eq!(
+        runtime.guild_permissions_at(&missing_user, i128::from(now)),
+        None
+    );
+    let mut missing_member = interaction.clone();
+    missing_member.member = None;
+    assert_eq!(
+        runtime.guild_permissions_at(&missing_member, i128::from(now)),
+        None
+    );
+    let mut missing_guild = interaction.clone();
+    missing_guild.guild_id = None;
+    assert_eq!(
+        runtime.guild_permissions_at(&missing_guild, i128::from(now)),
+        None
+    );
+    runtime.live_actor(GUILD).unwrap().live.disconnect();
+    assert_eq!(
+        runtime.guild_permissions_at(&interaction, i128::from(now)),
+        None
+    );
+}
+
+#[tokio::test]
+async fn guild_timeout_admin_commands_are_refused_before_effects() {
+    use twilight_model::util::Timestamp;
+
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    let until = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000
+        + 28 * 24 * 60 * 60 * 1_000_000;
+    for (name, permissions, refusal) in [
+        (
+            "access",
+            Permissions::MANAGE_CHANNELS,
+            "You need Manage Channels",
+        ),
+        (
+            "export",
+            Permissions::MANAGE_GUILD,
+            "You need Manage Server",
+        ),
+    ] {
+        let options = if name == "access" {
+            vec![sub_option("role", vec![role_option("role", 9)])]
+        } else {
+            vec![]
+        };
+        let mut interaction =
+            voice_interaction(Some(command_data(name, options)), Some(permissions), true);
+        interaction
+            .member
+            .as_mut()
+            .unwrap()
+            .communication_disabled_until =
+            Some(Timestamp::from_micros(i64::try_from(until).unwrap()).unwrap());
+        let inventory = config_inventory();
+        let (_, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+        let text = response_text(&response.unwrap());
+        assert!(text.contains(refusal), "{name}: {text}");
+    }
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn refreshed_guild_owner_and_role_permissions_revoke_old_admin_authority() {
     let runtime = test_runtime(Trace::default());
     assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
