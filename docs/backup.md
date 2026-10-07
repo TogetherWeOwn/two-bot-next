@@ -17,7 +17,8 @@ require `--force`. This confirmation is not authorization to target production.
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v4**; the reader also accepts frozen **v3**. Other versions refuse.
+write **v5** (including durable voice-create reservations); the reader also
+accepts frozen **v3** and pre-reservation **v4**. Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
 source's applied migrations and `sequenceMarks`: for every serial, identity and
@@ -49,21 +50,28 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-### Coverage and recovery semantics (v4, TOG-11142)
+### Coverage and recovery semantics (v4 and v5)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
-inventory for both dump and restore. It includes **80 durable tables from the
+inventory for both dump and restore. It includes **82 durable tables from the
 current cutover migrations**, including the bot-owned website-contract backing
 tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchanges`) plus their uncertainty baselines
 (`self_role_exchange_baselines`), the automod delivery claims, the gateway
 boot directives, the member-erasure audit, the internal clock high-water
-mark and the voice configuration tables. `OPTIONAL_LEGACY_TABLES` is empty: the
-coverage test fails if a covered table is not migrated. A dump from a fresh Rust
-schema has 80 table entries. A missing current table refuses a dump/restore:
-migrate the target first.
-A v4 archive written before a table joined the inventory is refused at inspect
-("manifest is missing tables"); take a fresh dump after upgrading.
+mark, the voice configuration tables and the accepted voice-room create history
+(`voice_create_reservations`). `OPTIONAL_LEGACY_TABLES` is empty: the coverage
+test fails if a covered table is not migrated. A dump from a fresh Rust schema
+has 82 table entries. A missing current table refuses a dump/restore: migrate
+the target first.
+A v4 archive must declare every covered table except the ones v5 added
+(`V5_ADDED_TABLES`), so recovery points written before create-reservation
+persistence remain inspectable and restorable. A v4 archive written before any
+other table joined the inventory is refused at inspect ("manifest is missing
+tables"); take a fresh dump after upgrading. V5 requires the full current
+inventory; an incomplete new archive refuses at inspection. Restoring a
+pre-reservation archive clears the destination's reservation table, as with
+other tables absent from an older version.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.

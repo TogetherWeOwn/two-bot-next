@@ -2,13 +2,38 @@ name: deploy-staging
 
 # Staging only. Accept the intended new rollout + serving image, never an old
 # healthy singleton. Production deploys remain manual and cutover-owned.
-# Active (TOG-12856): runs on every push to main and on manual dispatch to
-# unblock the TOG-12852 rehearsal. The deploy job runs unconditionally in the
-# `staging` environment; `release_fence` only releases an uninitialized/parked
-# singleton after handoff authorization and defaults to false.
+# Active (TOG-12856): runs on a push to main that changes runtime inputs, and
+# on manual dispatch. The deploy job runs unconditionally in the `staging`
+# environment; `release_fence` only releases an uninitialized/parked singleton
+# after handoff authorization and defaults to false.
+#
+# Each deploy restarts the bot container and drops the gateway for 95-139 s, so
+# a push that only touches the paths below starts no run at all: the B2 soak
+# needs a stable gateway, and a docs merge changes nothing it serves. A
+# deny-list (`paths-ignore`), not an allow-list, so a path nobody classified
+# (a new top-level directory, a nested README under crates/) still deploys.
+# GitHub skips the run only when EVERY changed path matches, so a merge that
+# mixes docs with `crates/**`, `wrangler/**`, Cargo or workflow files deploys.
+# `deploy-staging` is not a required check, so a workflow-level filter cannot
+# strand a PR. scripts/ci/test_workflows.py pins this list against sample
+# runtime paths; the same non-runtime set is vetted in scripts/container-inputs.py.
+# Consequence: `deploy-production` needs a green run on its exact SHA, so pin
+# the latest runtime-affecting commit, or dispatch this workflow for a docs head.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md' # root markdown only; `*` never crosses `/`, so nested READMEs still deploy
+      - LICENSE
+      - .editorconfig
+      - .gitignore
+      - .gitleaks.toml
+      - .gitleaksignore
+      - .github/ISSUE_TEMPLATE/**
+      - .github/pull_request_template.md
+      - .github/CODEOWNERS
+      - .github/dependabot.yml
   workflow_dispatch:
     inputs:
       release_fence:

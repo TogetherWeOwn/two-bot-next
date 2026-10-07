@@ -43,7 +43,12 @@ pagination and a run/attempt change during validation fail closed. If a partial
 rerun omits a required job from the current attempt, rerun **all jobs**; do not
 reuse the earlier attempt's receipt. The summary records the admitted run/attempt.
 Staging runs queue in a single concurrency group, so an intermediate commit may
-never stage. Pick one that did.
+never stage. Pick one that did. A push to `main` that touches only docs, root
+markdown or repository chrome (the `paths-ignore` list in `deploy-staging.yml`)
+starts no staging run either, so the newest `main` commit may have no
+`deploy-staging` run: pin the latest commit that changes runtime inputs, or
+dispatch `deploy-staging` for the head you need. Docs-only commits after a
+staged commit change nothing the Worker or container serves.
 After the reviewer approves, the job:
 
 1. checks out exactly that commit and re-verifies that it is on `origin/main`;

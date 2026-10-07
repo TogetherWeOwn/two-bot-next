@@ -11,6 +11,7 @@ CLI_MODULES = {
     "crates/bot/src/moderation_cli.rs",
     "crates/bot/src/preflight.rs",
     "crates/core/examples/metrics_rss.rs",
+    "crates/core/examples/evidence_reconcile.rs",
     "crates/cutover/src/bin/legacy_copy.rs",
     "crates/cutover/src/bin/legacy_verify.rs",
     "crates/cutover/src/bin/backfill.rs",

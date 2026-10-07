@@ -219,6 +219,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         table: "voice_rooms",
         measure: TableMeasure::Columns(&["created_at", "owner_touched_at", "name_touched_at", "privacy_touched_at"]),
     },
+    // Capture both accepted creates and post-baseline bindings/rollbacks of
+    // reservations created before the baseline (migration 0422).
+    TableSpec { table: "voice_create_reservations", measure: TableMeasure::Columns(&["created_at", "settled_at"]) },
     TableSpec { table: "voice_owner_grants", measure: TableMeasure::Columns(&["touched_at"]) },
     // Same insert-once shape as voice_rooms (PgRoomStore::add_companion never
     // overwrites the creation snapshot).

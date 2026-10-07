@@ -2939,17 +2939,18 @@
           "[e2ffdf0](https://github.com/TogetherWeOwn/two-bot/commit/e2ffdf057b84ff6286f258d2d89775611c26cbe9)",
           "`src/tempVoice/`",
           "feat(tempvoice): enforce durable rolling create burst limits (#308)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
-        "TOG-15336",
+        "TOG-10093",
         "TOG-10119"
       ],
-      "status": "manual",
-      "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Create rooms past the configured rolling burst limit with disposable members, across the TOG-10119 restart.",
-      "expected": "Creates beyond the limit are refused with a named reason, and the count survives restart.",
-      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
+      "status": "automated",
+      "action": "Run the pure admission fixture `crates/core/tests/voice_create_admission.rs`, the worker admission regressions in `crates/bot/src/voice_rooms_tests.rs` and the disposable-database store test `crates/cutover/tests/voice_create_admission_store.rs` (set `TWO_TEST_DATABASE_URL` to the agent-testdb CI service; it creates and drops its own database).",
+      "expected": "Accepted creates persist one row each; a refusal never reaches Discord; burst history survives deletion/restart. Unsettled holds never expire by age, unknown creates never repost/refund, compensation retains capacity until absence, live-room transfers are atomic under the guild lock, and a created channel is bound to its claim before the room row so a restart rediscovers it and frees the slot only after a delete or confirmed absence. Credential-refused settlement halts writes. Fixture proof only, not staging acceptance.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with the test names; fixture proof only. Staging proof (refused creates past the limit across the TOG-10119 restart) stays on [TOG-10119](/TOG/issues/TOG-10119); do not infer PASS from this row.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_create_admission && python3 scripts/cargo_cache.py run -- test -p two-bot --lib voice_rooms::tests:: && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test voice_create_admission_store -- --ignored",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
     },
     {
