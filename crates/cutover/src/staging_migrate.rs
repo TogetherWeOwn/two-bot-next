@@ -677,11 +677,7 @@ async fn run_on_pool(
 
     // Plan-only readout inside one READ ONLY transaction. Apply skips it: that
     // login is the migrator, not the read-only readout.
-    let audit = if req.apply {
-        Value::Null
-    } else {
-        read_audit(pool).await
-    };
+    let audit = if req.apply { Value::Null } else { read_audit(pool).await };
 
     let mut applied = 0usize;
     let mut after = before.clone();
