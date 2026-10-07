@@ -1,14 +1,14 @@
 //! Runnable B2 soak reconciler (`docs/evidence-route.md` step 3).
 //!
-//! Reads (1) the QA expected-actions JSON `[{alias, family, at,
-//! disposition?, reason?}]` and (2) the sanitized rows artifact from the
+//! Reads (1) QA JSON `[{alias, family, event_type?, at, disposition?,
+//! reason?}]` (event kind required unless declared) and (2) sanitized rows from the
 //! staging-events-read workflow (`{rows: [{ordinal, event_type,
 //! recorded_at}], truncated}`), builds an `EvidenceLedger` with the deployed
 //! revision, assigns opaque per-row keys (`r<ordinal>`), and writes `export()`
 //! to `evidence-soak_expected_committed-{window}.json`.
 //!
-//! Fails closed: exit 1 when `gaps > 0` or any overflow/truncation flag is
-//! set (the window is not proven); exit 2 on malformed input, IO failure or
+//! Fails closed: exit 1 for gaps, declared failures or overflow/truncation
+//! (the window is not proven); exit 2 on malformed input, IO failure or
 //! bad usage, in which case nothing is written.
 //!
 //! Build with `cargo build -p two-bot-core --example evidence_reconcile
@@ -117,6 +117,12 @@ fn main() -> ExitCode {
         .as_bool()
         .unwrap_or(true);
     let truncated = expected_overflow || receipts_overflow;
+    let failed = packet["items"].as_array().map_or(1, |items| {
+        items
+            .iter()
+            .filter(|item| item["disposition"] == "failed")
+            .count()
+    });
     let filename = evidence_packet_filename(SOAK_LEDGER_RULE_ID, &args.window);
     let path = args.out_dir.join(&filename);
     if let Some(parent) = path.parent() {
@@ -138,10 +144,10 @@ fn main() -> ExitCode {
     let matched = packet["counts"]["matched"].as_u64().unwrap_or(0);
     let expected = packet["counts"]["expected"].as_u64().unwrap_or(0);
     println!(
-        "wrote {} expected={expected} matched={matched} gaps={gaps} truncated={truncated}",
+        "wrote {} expected={expected} matched={matched} gaps={gaps} failed={failed} truncated={truncated}",
         path.display()
     );
-    if gaps > 0 || truncated {
+    if gaps > 0 || truncated || failed > 0 {
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS

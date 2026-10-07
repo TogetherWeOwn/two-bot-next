@@ -358,7 +358,9 @@ this client rejects production origins. Never roll back to an unfenced wrapper.
   Versions are not Git SHAs. Check whether migrations or resource changes make
   the old code incompatible; rollback does not rewind Postgres or DO storage.
 - Check the current staging workflow result. `deploy-staging.yml` runs on merge
-  to `main`, and also allows manual dispatch, but currently accepts a 503
+  to `main` unless the merge touches only docs, root markdown or repository
+  chrome (then no run starts and staging keeps serving the previous runtime
+  commit), and also allows manual dispatch, but currently accepts a 503
   readiness response as a scaffold-era gate. **Workflow green is not gateway
   ready**: require your own first `/readyz` 200 observation and feature evidence.
 - Gateway startup connects DML-only and does not migrate; lazy jobs also use
