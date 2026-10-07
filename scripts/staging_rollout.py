@@ -30,11 +30,15 @@ USER_AGENT = "two-bot-next-staging-rollout/1.0"
 # whose only deviation is a `LAG_COUNTS` instance-counter shape is accepted. Each pass re-checks every identity and
 # runtime probe; any non-passing poll resets the streak.
 ACTIVE_LAG_CONFIRMATIONS = 2
-# Polls (5s apart) tolerated while a completed rollout's target image is not
-# yet reflected by the application listing. The listing is read separately from
-# the rollout record and can trail it right after a deploy; a persistent
-# mismatch still fails closed as `application_image_drift`.
-APPLICATION_IMAGE_STALE_POLLS = 12
+# Polls tolerated while a completed rollout's target image is not yet reflected
+# by the application listing. The listing is read separately from the rollout
+# record and can trail it right after a deploy; a persistent mismatch still
+# fails closed as `application_image_drift`. A poll cycle runs about 11s in CI
+# (5s sleep plus the control-plane reads), so 24 polls is roughly 4.5 minutes
+# inside the 300s verify deadline. Twelve (about 2.5 minutes) sat in the middle
+# of the observed lag: on 10-05..10-07 completed verify steps ran up to 192s
+# while eight runs with a healthy, exact-build container failed at 129-186s.
+APPLICATION_IMAGE_STALE_POLLS = 24
 TOKEN = re.compile(r"[a-z0-9_]{1,32}")
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 IMAGE = rf"registry\.cloudflare\.com/[^/@\s]+/{APPLICATION}@sha256:[0-9a-f]{{64}}"

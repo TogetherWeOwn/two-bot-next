@@ -1490,6 +1490,23 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(self.clock.sleeps[:2], [5, 5])
         self.assert_no_secret_saved_or_printed()
 
+    def test_listing_lag_beyond_the_former_twelve_poll_cap_still_passes(self):
+        # Observed in CI: the listing trails a deploy by more than 12 polls while
+        # the container already serves the exact build (TOG-15905).
+        self.assertGreater(rollout.APPLICATION_IMAGE_STALE_POLLS, 12)
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        stale = app()
+        stale["configuration"] = {"image": OLD_IMAGE}
+        client.api_routes[APP_PATH] = [[stale]] * 20 + [[app()]]
+        client.deadline = 1000
+        rollout.verify(self.args, client)
+        evidence = json.loads(Path(self.args.evidence).read_text())
+        self.assertEqual(evidence["image"], IMAGE)
+        self.assertEqual(self.clock.sleeps[:20], [5] * 20)
+        self.assert_no_secret_saved_or_printed()
+
     def test_stale_application_image_is_reported_and_never_accepted(self):
         self.prepare_baseline()
         self.write_deploy_output()
