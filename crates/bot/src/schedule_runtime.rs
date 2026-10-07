@@ -321,7 +321,7 @@ async fn audit(
 /// Complete the original ephemeral defer, never issue a second callback.
 async fn finish(executor: &ActionExecutor, interaction: &Interaction, content: impl AsRef<str>) {
     if let Err(err) = executor
-        .edit_interaction_response(
+        .edit_interaction_response_with_blocked_retry(
             interaction.application_id.get(),
             &interaction.token,
             content.as_ref(),

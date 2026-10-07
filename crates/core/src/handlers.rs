@@ -889,6 +889,7 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink> FunnelHandlers<S, L, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse_iso_millis;
 
     const G: Snowflake = 1;
     const M: Snowflake = 2;
@@ -1126,6 +1127,140 @@ mod tests {
             .filter(|r| r.event_type == EventType::VoiceSessionStart)
             .count();
         assert_eq!(starts, 2);
+    }
+
+    /// One `award_voice` call: guild, member, seconds, stamp, channel.
+    type VoiceAward = (Snowflake, Snowflake, u64, String, Snowflake);
+
+    /// Records every voice award so a test can prove the hook was (not) called.
+    #[derive(Debug, Default)]
+    struct RecordingLeveling {
+        voice: Mutex<Vec<VoiceAward>>,
+    }
+
+    impl LevelingHook for &RecordingLeveling {
+        fn award_message(&self, _: Snowflake, _: Snowflake, _: &str, _: Snowflake) -> LevelOutcome {
+            LevelOutcome {
+                leveled_up: false,
+                level: 0,
+            }
+        }
+
+        fn award_voice(
+            &self,
+            guild_id: Snowflake,
+            member_id: Snowflake,
+            duration_seconds: u64,
+            at: &str,
+            channel_id: Snowflake,
+        ) -> LevelOutcome {
+            self.voice.lock().expect("voice awards").push((
+                guild_id,
+                member_id,
+                duration_seconds,
+                at.to_owned(),
+                channel_id,
+            ));
+            LevelOutcome {
+                leveled_up: false,
+                level: 0,
+            }
+        }
+    }
+
+    /// Legacy `3c3e7e8` (#265), handler effect: a malformed leave stamp with
+    /// the session start on record writes ONE unknown-start end row stamped
+    /// with processing time, closes the session, and awards no voice XP.
+    #[test]
+    fn malformed_leave_with_open_session_writes_one_unknown_start_end_and_no_xp() {
+        let xp = RecordingLeveling::default();
+        let h = FunnelHandlers::new(MemStore::new(), Some(&xp), Some(NoopFacts));
+        h.on_voice_join(VoiceInput {
+            guild_id: G,
+            member_id: M,
+            is_bot: false,
+            channel_id: 10,
+            occurred_at: Some("2026-09-20T12:00:00.000Z".to_owned()),
+        });
+        assert_eq!(h.voice_sessions.lock().expect("lock").open_count(), 1);
+
+        let before = parse_iso_millis(&now_iso()).expect("now parses");
+        let out = h.on_voice_leave(VoiceInput {
+            guild_id: G,
+            member_id: M,
+            is_bot: false,
+            channel_id: 99,
+            occurred_at: Some("garbage".to_owned()),
+        });
+        let after = parse_iso_millis(&now_iso()).expect("now parses");
+
+        let ends: Vec<_> = h
+            .store
+            .rows()
+            .into_iter()
+            .filter(|r| r.event_type == EventType::VoiceSessionEnd)
+            .collect();
+        assert_eq!(ends.len(), 1, "exactly one end row");
+        let end = &ends[0];
+        // Credited to the session's channel, not the leave frame's.
+        assert_eq!(end.source, "channel:10");
+        assert_ne!(end.occurred_at, "garbage", "garbage is never stored");
+        let stamped = parse_iso_millis(&end.occurred_at).expect("stamp parses");
+        assert!(
+            (before..=after).contains(&stamped),
+            "end is stamped with processing time: {} not in {before}..={after}",
+            end.occurred_at
+        );
+        assert_eq!(
+            end.metadata,
+            Some(serde_json::json!({
+                "startKnown": false,
+                "startedAt": null,
+                "durationSeconds": null,
+            }))
+        );
+        assert_eq!(
+            out.event.map(|e| e.occurred_at),
+            Some(end.occurred_at.clone())
+        );
+        assert!(out.leveled_up_to.is_none());
+        assert_eq!(
+            h.voice_sessions.lock().expect("lock").open_count(),
+            0,
+            "the unmeasurable session is closed, not left to leak"
+        );
+        assert!(
+            xp.voice.lock().expect("voice awards").is_empty(),
+            "no duration, no XP"
+        );
+        // Recency moves to the stamped time, never the garbage.
+        assert_eq!(h.store.activity(G, M), Some(end.occurred_at.clone()));
+    }
+
+    /// Control for the test above: the same flow with a readable stamp DOES
+    /// award, so the recording double cannot pass vacuously.
+    #[test]
+    fn well_formed_leave_with_open_session_awards_the_measured_seconds() {
+        let xp = RecordingLeveling::default();
+        let h = FunnelHandlers::new(MemStore::new(), Some(&xp), Some(NoopFacts));
+        h.on_voice_join(VoiceInput {
+            guild_id: G,
+            member_id: M,
+            is_bot: false,
+            channel_id: 10,
+            occurred_at: Some("2026-09-20T12:00:00.000Z".to_owned()),
+        });
+        h.on_voice_leave(VoiceInput {
+            guild_id: G,
+            member_id: M,
+            is_bot: false,
+            channel_id: 10,
+            occurred_at: Some("2026-09-20T12:05:30.000Z".to_owned()),
+        });
+        assert_eq!(
+            *xp.voice.lock().expect("voice awards"),
+            vec![(G, M, 330, "2026-09-20T12:05:30.000Z".to_owned(), 10)]
+        );
     }
 
     #[test]

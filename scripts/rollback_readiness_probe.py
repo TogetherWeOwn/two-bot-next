@@ -4,7 +4,7 @@
 Four checks, one PASS/FAIL line each; exit 1 if any fails, 0 if all pass:
 
   manifest       the newest `two-funnel-*.ndjson.gz` in the backup directory
-                 (the drill's `ls -1t` selector) has a parseable v3/v4 manifest
+                 (the drill's `ls -1t` selector) has a parseable v3/v4/v5 manifest
                  and an end marker whose row total matches the manifest counts.
   sequences      every live serial/identity sequence, from a saved result of
                  SEQUENCES_QUERY, has a manifest high-water at or past its live
@@ -47,7 +47,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "wrangler/wrangler.toml"
 ARCHIVE_PREFIX = "two-funnel-"
 ARCHIVE_SUFFIX = ".ndjson.gz"
-DUMP_VERSIONS = (3, 4)
+DUMP_VERSIONS = (3, 4, 5)
 # Same budgets as the Rust reader (crates/core/src/backup/dump_file.rs).
 COMPRESSED_CAP = 1 << 30
 LINE_CAP = 8 << 20
@@ -60,6 +60,9 @@ REQUIRED_TWO_KEYS = ("TWO_GUILD_NAME",)
 STAGING_HOST = re.compile(r"two-bot-next-staging\.[a-z0-9-]+\.workers\.dev")
 READYZ_TIMEOUT_SECONDS = 10
 READYZ_BODY_CAP = 64 << 10
+# Cloudflare rejects the default "Python-urllib/x.y" agent at the edge with 403
+# (error 1010), so an explicit agent is required for the probe to reach the Worker.
+USER_AGENT = "two-bot-next-staging-rollout/1.0"
 # Owned serial/identity sequences via pg_get_serial_sequence, plus the standalone
 # guild_settings_version_seq (guarded by to_regclass), mirroring the restore
 # (crates/core/src/backup/dump.rs). Also reports whether last_value is readable:
@@ -275,7 +278,8 @@ def fetch(url):
     """One GET without redirects; returns (status, body bytes)."""
     opener = urllib.request.build_opener(_NoRedirect)
     try:
-        with opener.open(urllib.request.Request(url, method="GET"),
+        with opener.open(urllib.request.Request(url, headers={"User-Agent": USER_AGENT},
+                                               method="GET"),
                          timeout=READYZ_TIMEOUT_SECONDS) as response:
             return response.status, response.read(READYZ_BODY_CAP)
     except urllib.error.HTTPError as e:

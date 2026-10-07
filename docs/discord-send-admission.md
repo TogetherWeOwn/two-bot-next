@@ -126,7 +126,7 @@ old/external programs or databases deliberately configured as a second authority
 
 ## Cancellation, crash, unavailable storage and recovery
 
-Permits have **no TTL and no drop-release**. The database does not hold a
+Permits have **no drop-release**. The database does not hold a
 transaction/connection across HTTP. Dropping/cancelling a send, losing the
 process, an uncertain exchange, or losing completion storage leaves durable
 occupancy. A failed completion cannot silently open another lane: its single
@@ -134,15 +134,60 @@ statement either installs the hold and clears occupancy together, or the old
 occupied row remains. A lost completion acknowledgement does not justify
 replaying the effect. Unknown or old generations are not execution leases.
 
-Indefinite holds and abandoned claims require explicitly authorized
-reconciliation. There is intentionally no automatic expiry, startup reset, or
-"force send" switch. Before any manual release, fence **all** credential users,
-prove the old send cannot continue, reconcile the effect/provider cooldown,
-and record evidence for the exact generation. Do not delete/reset the lane,
-rotate a credential, or release an indefinite hold merely because a process is
-old or a receiver idempotency claim is stale. Those operations are not authorized
-by this implementation. Persist this table across restarts and authority
-failover; a blank replacement database is not recovery evidence.
+A held lane carries a 60 s self-heal lease (`in_flight_since_ms`, migration
+0419, constant `IN_FLIGHT_LEASE_MS`). The next `admit` past the lease reclaims
+the lane with a fresh generation, so the dead holder's late completion lands
+as `StaleClaim` instead of releasing the new holder; fresh holders still
+block, and indefinite/finite-cooldown holds never reclaim. The lease exists
+because a storage outage during completion wedged staging boot forever in
+October 2026: every restart's admission was refused and the container never
+served. The 60 s value is load-bearing, not arbitrary: one admitted attempt
+holds the lane for a single HTTP exchange, and every in-process retry loop is
+bounded (5 tries at 5 s plus 500/1000/2000/4000 ms backoffs: under 35 s
+all-in), so the same process can never retry the same intent across the lease
+boundary. Only a new process past 60 s can reclaim, and those carry new
+intents — except the idempotent boot registry PUT and effect-claim-governed
+resume paths, which own intent safety at their own layer (nonces, idempotent
+verbs, claim fences). Cross-restart resend of an uncertain mutation is the
+consciously accepted trade for never wedging boot forever. When the lease
+column itself is absent (build deployed ahead of migration 0419; the runtime
+is DML-only and never self-migrates), `admit` degrades to the pre-lease
+take-or-block lane with a one-per-process warning instead of failing boot;
+the lease activates on its own once the migration lands. Fence the production
+0419 apply: pause every send-lane consumer while 0419 lands, or let migration
+0420 stamp legacy-held rows with the apply-time clock first — a legacy stamp of
+0 otherwise reads as older than the 60 s lease and the next admit reclaims a
+live sender.
+
+<a id="boot-window"></a>
+**Boot window.** The gateway's bootstrap reads (`GET /oauth2/applications/@me`,
+`GET /guilds/{id}`) and the boot registry publish race the supervised jobs'
+first reads for this single-flight lane, and a predecessor killed mid-request
+leaves its occupancy for up to the lease. A refusal there fails the gateway,
+which lingers 15 s and exits for a container restart (October 2026: three to four
+starts and a 92-139 s staging redeploy; `custom_commands_init_failed` after every
+deploy). For `BOOT_WINDOW_MS` (120 s) after an executor is built,
+`current_application_id`, `guild_name` and `publish_guild_commands` therefore
+re-attempt **only** a pre-wire `Blocked` refusal (the publish only on its first
+send: a retry after its own 429/5xx re-checks admission once and refuses), polling every
+`BOOT_BLOCKED_RETRY_SLEEP_MS` (250 ms) for up to `BOOT_ADMISSION_BUDGET_MS`
+(65 s, just above the 60 s lease so a dead holder always clears inside the wait).
+A `Blocked` attempt never reached the wire, so nothing is resent and the lease
+argument above is untouched; every other error returns at once, and past the
+window every caller gets the single bounded attempt as before. An indefinite
+hold never clears, so it now fails after the wait instead of after the first
+refusal; a finite cooldown clears when it expires, inside the wait if it is shorter
+than the budget.
+
+Indefinite holds require explicitly authorized reconciliation. There is
+intentionally no startup reset or "force send" switch. Before any manual
+release, fence **all** credential users, prove the old send cannot continue,
+reconcile the effect/provider cooldown, and record evidence for the exact
+generation. Do not delete/reset the lane, rotate a credential, or release an
+indefinite hold merely because a process is old or a receiver idempotency
+claim is stale. Those operations are not authorized by this implementation.
+Persist this table across restarts and authority failover; a blank replacement
+database is not recovery evidence.
 
 The existing receiver HMAC provisioning, staging/production deployment and
 activation holds remain unchanged.

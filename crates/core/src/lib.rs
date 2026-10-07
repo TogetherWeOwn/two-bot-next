@@ -63,6 +63,7 @@ pub mod gateway_funnel;
 pub mod gateway_session;
 pub mod handlers;
 pub mod health;
+pub mod help;
 pub mod inactivity;
 #[cfg(feature = "db")]
 pub mod inactivity_store;
@@ -149,6 +150,7 @@ pub mod voice_template_lint;
 pub mod voice_text_channel;
 pub mod voice_utilities;
 pub mod voice_vote_kick;
+pub mod voice_vote_kick_audit;
 #[cfg(feature = "db")]
 pub mod website_store;
 
@@ -221,10 +223,11 @@ pub use custom_commands::{
 };
 pub use events::{CoreEvent, VoiceSessionDelta};
 pub use evidence::{
-    evidence_packet_filename, family_of, Disposition, EventFamily, EvidenceLedger, ExpectedAction,
-    ReceiptingStore, ReconciledItem, Reconciliation, StoreReceipt, ALERT_RULE_IDS,
-    EVIDENCE_SCHEMA_VERSION, MATCH_WINDOW_MS, MAX_EXPECTED_ACTIONS, MAX_RECEIPTS,
-    SOAK_LEDGER_RULE_ID,
+    build_soak_ledger, evidence_packet_filename, family_of, parse_expected_actions,
+    parse_sanitized_rows, Disposition, EventFamily, EvidenceLedger, ExpectedAction, ExpectedInput,
+    ParsedSanitizedRows, ReceiptingStore, ReconciledItem, Reconciliation, SanitizedRow,
+    SanitizedRowsFile, StoreReceipt, ALERT_RULE_IDS, EVIDENCE_SCHEMA_VERSION, MATCH_WINDOW_MS,
+    MAX_EXPECTED_ACTIONS, MAX_RECEIPTS, SOAK_LEDGER_RULE_ID,
 };
 pub use expected_joins::{ExpectedJoins, EXPECTED_JOIN_TTL_SECONDS, WEB_ONE_CLICK_SOURCE};
 pub use feature_commands::{
@@ -245,6 +248,7 @@ pub use health::{
     classify_voice_error, ComponentStatus, HealthReport, VoiceComponent, VoiceDiagnostic,
     VoiceFailureKind, VoiceHealthReport, VoicePermission, VoicePermissionScope, VoiceReadiness,
 };
+pub use help::help_text;
 pub use inactivity::{
     flag_inactive, inactivity_cutoff_ms, member_inactive_event_key, parse_inactivity_days,
     select_inactive, should_flag, FlaggedMember, InactivityCandidate, InactivityOutcome,

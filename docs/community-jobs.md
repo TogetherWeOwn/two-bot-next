@@ -114,6 +114,14 @@ module registers them on the job supervisor inside `bot::website_jobs::serve`
 (TOG-10897), so the shipped binary drives them on their legacy cadences under
 the env gates below.
 
+The live-identity capability fence (`activation.rs`) does not narrow these three
+jobs, by decision rather than omission: none of them writes to Discord. The
+presence probe only reads the guild and roster, and the scorecard and inactivity
+sweep touch Postgres alone, so there is no `LiveCapability` to bind them to. The
+scheduled-message ticker and the feed poller do post, and are fenced. The test
+`community_jobs_have_no_discord_write_path` fails if a community job gains a
+write verb; bind that job to a capability in `BootActivation` before it ships.
+
 ## Modules
 
 - `core::presence` — hourly probe decision (`decide_probe_cycle`), bot-floor

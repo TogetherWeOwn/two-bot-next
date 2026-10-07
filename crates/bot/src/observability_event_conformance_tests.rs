@@ -16,8 +16,8 @@ use std::collections::BTreeSet;
 // them to. The message string (last argument to the `tracing` macro) is the
 // event name; fields such as `sequence` or `guild_id` are context, not names.
 
-/// `crates/bot/src/gateway.rs`: all twelve traced in the file are cataloged.
-const GATEWAY_RS_EVENTS: [&str; 12] = [
+/// `crates/bot/src/gateway.rs`: all fifteen traced in the file are cataloged.
+const GATEWAY_RS_EVENTS: [&str; 15] = [
     "cold resume committed; requesting voice snapshot via identify",
     "gateway reconnect failed; Twilight will retry",
     "gateway shard loop started",
@@ -30,15 +30,20 @@ const GATEWAY_RS_EVENTS: [&str; 12] = [
     "voice database unavailable; voice rooms disabled",
     "voice rooms enabled; gateway sink attached",
     "voice HTTP setup failed; voice rooms disabled",
+    "interaction acknowledgement blocked; advancing past lost callback",
+    "interaction response failed; not replaying command",
+    "READY identity differs from boot token; ordered identity not armed",
 ];
 
-/// `crates/bot/src/main.rs`: the five cataloged `tracing` messages.
-const MAIN_RS_TRACED_EVENTS: [&str; 5] = [
+/// `crates/bot/src/main.rs`: the seven cataloged `tracing` messages.
+const MAIN_RS_TRACED_EVENTS: [&str; 7] = [
     "durable gateway initialized; shard connecting",
     "gateway prerequisites missing; gateway parked, /readyz reports down",
     "container service failed",
     "durable gateway failed; checkpoint unchanged, readiness unavailable",
     "shutdown_deadline_exceeded: abandoning in-flight work",
+    "feature gates invalid; ordered interaction surface parked",
+    "moderation gates invalid; ordered interaction surface parked",
 ];
 
 /// `crates/bot/src/main.rs`: cataloged drain outcomes that surface as
@@ -50,10 +55,12 @@ const MAIN_RS_ERROR_STRINGS: [&str; 2] = [
 ];
 
 /// `crates/bot/src/server.rs`.
-const SERVER_RS_EVENTS: [&str; 3] = [
+const SERVER_RS_EVENTS: [&str; 5] = [
     "listening",
     "SIGTERM received; draining",
     "SIGINT received; draining",
+    "shutdown_completed",
+    "response failed",
 ];
 
 /// `crates/bot/src/shutdown.rs`.
@@ -162,10 +169,11 @@ const MAIN_RS_ADJACENT: [&str; 13] = [
 
 // `crates/bot/src/voice_rooms.rs`: per-command voice UX receipts, not gateway
 // session events.
-const VOICE_RS_ADJACENT: [&str; 9] = [
+const VOICE_RS_ADJACENT: [&str; 10] = [
     "voice succession refused",
     "voice notice settings unreadable",
     "voice notice had no working destination",
+    "voice create reservation settle failed",
     "import preview planned an apply; refusing without writing",
     "voice vote response failed; not retried",
     "voice ballot response failed; not retried",

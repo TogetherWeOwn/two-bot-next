@@ -20,7 +20,7 @@ use twilight_model::{
         },
         interaction::{Interaction, InteractionData, InteractionType},
     },
-    channel::message::MessageFlags,
+    channel::message::{embed::Embed, MessageFlags},
     guild::Permissions,
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
@@ -61,6 +61,12 @@ pub fn route_interaction(
     interaction: &Interaction,
     custom_row: Option<bool>,
 ) -> RoutedInteraction {
+    let _span = tracing::info_span!(
+        "interaction",
+        interaction_id = %interaction.id,
+        guild_id = interaction.guild_id.map(|id| id.to_string()),
+    )
+    .entered();
     let guild_id = interaction.guild_id.map(|id| id.get());
     let actor_permissions = interaction
         .member
@@ -122,6 +128,41 @@ pub fn text_response(reply: InteractionReply) -> InteractionResponse {
     }
 }
 
+/// One immediate ephemeral discovery reply, preserving every published name.
+/// Large registries use an embed instead of truncating the content at 2000.
+/// <https://docs.discord.com/developers/resources/message#embed-limits>
+#[must_use]
+pub fn help_response(defs: &[CommandDefinition]) -> InteractionResponse {
+    let text = two_bot_core::help::help_text(defs);
+    if two_bot_core::message_safety::text_len(&text) <= two_bot_core::message_safety::CONTENT_LIMIT
+    {
+        return text_response(InteractionReply::new(text, true));
+    }
+    InteractionResponse {
+        kind: InteractionResponseType::ChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            allowed_mentions: Some(Default::default()),
+            embeds: Some(vec![Embed {
+                author: None,
+                color: None,
+                description: Some(text),
+                fields: Vec::new(),
+                footer: None,
+                image: None,
+                kind: "rich".to_owned(),
+                provider: None,
+                thumbnail: None,
+                timestamp: None,
+                title: None,
+                url: None,
+                video: None,
+            }]),
+            flags: Some(MessageFlags::EPHEMERAL),
+            ..Default::default()
+        }),
+    }
+}
+
 #[must_use]
 pub fn deferred_response(ephemeral: bool) -> InteractionResponse {
     InteractionResponse {
@@ -156,7 +197,8 @@ pub fn response_for_slash(outcome: &SlashOutcome) -> Option<InteractionResponse>
 }
 
 /// Shared execution runtime: route once, acknowledge promptly, then run the
-/// registered feature through the shared REST executor. Unsupported features
+/// registered feature (RSVP/attendance totals and host check-in, LFG, and the
+/// other wired slices) through the shared REST executor. Unsupported features
 /// remain owned by their integration slices, not by a second dispatcher.
 #[cfg(feature = "db")]
 #[derive(Debug)]
@@ -165,7 +207,9 @@ pub struct InteractionRuntime {
     /// example the custom-command execution seam): registrations are complete
     /// once `with_router` returns, so every `Arc` clone reads the same set.
     pub router: std::sync::Arc<InteractionRouter>,
-    executor: crate::ActionExecutor,
+    pub pool: sqlx::Pool<sqlx::Postgres>,
+    pub executor: crate::ActionExecutor,
+    pub classifier: two_bot_core::ClassifierConfig,
     lfg: crate::lfg_interactions::LfgInteractions,
     bot_user_id: std::sync::atomic::AtomicU64,
     application_id: std::sync::atomic::AtomicU64,
@@ -173,13 +217,123 @@ pub struct InteractionRuntime {
 
 #[cfg(feature = "db")]
 impl InteractionRuntime {
+    /// Returns false for interactions owned by another feature or guild: LFG
+    /// outcomes run through the shared LFG executor path, RSVP/attendance
+    /// interactions run through the RSVP path, anything else stays silent.
+    pub async fn handle(&self, interaction: &Interaction) -> Result<bool, crate::DiscordError> {
+        let application_id = self
+            .application_id
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if application_id != 0 && interaction.application_id.get() != application_id {
+            return Ok(false);
+        }
+        let routed = route_interaction(&self.router, interaction, None);
+        if matches!(
+            &routed,
+            RoutedInteraction::Slash {
+                outcome: SlashOutcome::Handled {
+                    handler: two_bot_core::HandlerId::Lfg | two_bot_core::HandlerId::LfgClose,
+                },
+                ..
+            } | RoutedInteraction::Component {
+                outcome: two_bot_core::ComponentOutcome::Handled {
+                    handler: two_bot_core::ComponentHandler::LfgSignup,
+                },
+                ..
+            }
+        ) {
+            return self.handle_routed(interaction, routed).await;
+        }
+        // A refusal for a non-RSVP command (LFG permission or feature gates)
+        // must still be answered. The RSVP path ignores those names, so it
+        // would drop the denial silently; RSVP refusals stay on the RSVP
+        // path, which answers the identical refusal.
+        let refusal_for_other = match &routed {
+            RoutedInteraction::Slash {
+                name,
+                outcome: SlashOutcome::Refuse { .. },
+            } => !crate::rsvp::is_rsvp_command(name),
+            _ => false,
+        };
+        if refusal_for_other {
+            return self.handle_routed(interaction, routed).await;
+        }
+        crate::rsvp::handle_rsvp_interaction(
+            &self.router,
+            &self.pool,
+            &self.executor,
+            &self.classifier,
+            interaction,
+        )
+        .await
+    }
+
+    pub async fn prepare(
+        &self,
+        interaction: Interaction,
+    ) -> Result<crate::rsvp::PreparedRsvp, crate::DiscordError> {
+        // Same application-identity refusal as `handle`/`handle_routed`, before
+        // any callback or store work: the callback route carries no app check.
+        let application_id = self
+            .application_id
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if application_id != 0 && interaction.application_id.get() != application_id {
+            return Ok(crate::rsvp::PreparedRsvp::ignored());
+        }
+        crate::rsvp::prepare_rsvp_interaction(&self.router, &self.executor, interaction).await
+    }
+
+    pub async fn complete(
+        &self,
+        prepared: crate::rsvp::PreparedRsvp,
+    ) -> Result<bool, crate::DiscordError> {
+        crate::rsvp::complete_rsvp_interaction(
+            prepared,
+            &self.pool,
+            &self.executor,
+            &self.classifier,
+        )
+        .await
+    }
+
+    /// Boot sync also covers persisted-session RESUMED, which has no application
+    /// payload. Resolve the identity with the shared executor before connecting,
+    /// and arm this runtime's application fence from the same lookup.
+    pub async fn publish_current(&self) -> Result<(), crate::DiscordError> {
+        let application_id = self.executor.current_application_id().await?;
+        self.set_application_id(application_id);
+        self.publish(application_id).await
+    }
+
+    /// One full registry sync, never an RSVP-only partial replacement.
+    pub async fn publish(&self, application_id: u64) -> Result<(), crate::DiscordError> {
+        let guild_id =
+            self.router.gates().configured_guild.ok_or_else(|| {
+                crate::DiscordError::Rejected("missing configured guild".to_owned())
+            })?;
+        let definitions = self
+            .router
+            .publish_set(&[])
+            .map_err(|_| crate::DiscordError::Rejected("invalid command registry".to_owned()))?;
+        self.executor
+            .publish_guild_commands(application_id, guild_id, &publish_commands(&definitions))
+            .await
+    }
+
     pub fn new(
         gates: two_bot_core::RouterGates,
         pool: sqlx::PgPool,
         executor: crate::ActionExecutor,
         bot_user_id: u64,
+        classifier: two_bot_core::ClassifierConfig,
     ) -> Self {
-        Self::with_router(InteractionRouter::new(gates), pool, executor, bot_user_id)
+        Self::with_router(
+            InteractionRouter::new(gates),
+            pool,
+            executor,
+            bot_user_id,
+            classifier,
+        )
     }
 
     /// Compose LFG with the bot's existing feature registrations in ONE router.
@@ -188,6 +342,7 @@ impl InteractionRuntime {
         pool: sqlx::PgPool,
         executor: crate::ActionExecutor,
         bot_user_id: u64,
+        classifier: two_bot_core::ClassifierConfig,
     ) -> Self {
         #[derive(Debug)]
         struct LfgRegistration(two_bot_core::HandlerId);
@@ -200,7 +355,9 @@ impl InteractionRuntime {
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgClose)));
         Self {
             router: std::sync::Arc::new(router),
+            pool: pool.clone(),
             executor,
+            classifier,
             lfg: crate::lfg_interactions::LfgInteractions::new(pool),
             bot_user_id: std::sync::atomic::AtomicU64::new(bot_user_id),
             application_id: std::sync::atomic::AtomicU64::new(0),
@@ -233,16 +390,38 @@ impl InteractionRuntime {
             .store(id, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Returns false for interactions owned by another feature or guild.
-    pub async fn handle(&self, interaction: &Interaction) -> Result<bool, crate::DiscordError> {
-        let application_id = self
-            .application_id
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if application_id != 0 && interaction.application_id.get() != application_id {
-            return Ok(false);
+    /// Current application pin (0 = unpinned). READY callers check this before
+    /// arming identity so a mismatched payload cannot replace the boot pin.
+    pub fn application_pin(&self) -> u64 {
+        self.application_id
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Arm READY identity only when the boot pin confirms the payload (or no
+    /// pin exists). Returns false and changes nothing on mismatch.
+    pub fn try_arm_ready_identity(&self, bot_user_id: u64, application_id: u64) -> bool {
+        let pinned = self.application_pin();
+        if pinned != 0 && pinned != application_id {
+            return false;
         }
-        let routed = route_interaction(&self.router, interaction, None);
-        self.handle_routed(interaction, routed).await
+        self.set_bot_user_id(bot_user_id);
+        self.set_application_id(application_id);
+        true
+    }
+
+    pub fn test_bot_user_id(&self) -> u64 {
+        self.bot_user_id.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn test_application_id(&self) -> u64 {
+        self.application_id
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test-only lazy bot-user resolution: proves a READY-stored identity is
+    /// retained without HTTP even when the identity lookup would fail.
+    pub async fn test_resolved_bot_user_id(&self) -> u64 {
+        self.bot_user_id().await
     }
 
     /// Execute an outcome from this runtime's shared router without routing twice.
@@ -267,7 +446,7 @@ impl InteractionRuntime {
                 ..
             } => {
                 self.executor
-                    .answer_interaction(
+                    .answer_interaction_with_blocked_retry(
                         interaction.id.get(),
                         &interaction.token,
                         &refusal_response(refusal),
@@ -357,7 +536,11 @@ impl InteractionRuntime {
         // Acknowledge before locks, SQL or paced REST can exceed Discord's 3 s window.
         // https://docs.discord.com/developers/interactions/receiving-and-responding#interaction-response
         self.executor
-            .answer_interaction(interaction.id.get(), &interaction.token, &deferred)
+            .answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &deferred,
+            )
             .await?;
         let result = match request {
             Ok(request) => {
@@ -377,12 +560,13 @@ impl InteractionRuntime {
         let reply = match result {
             Ok(reply) => reply,
             Err(LfgError::Invalid(reply)) => reply,
+            Err(busy @ LfgError::Busy) => busy.to_string(),
             Err(LfgError::Uncertain) => {
                 "LFG post acceptance is uncertain; saved state retained for nonce recovery.".into()
             }
             Err(_) => {
                 tracing::warn!(
-                    interaction_id = interaction.id.get(),
+                    interaction_id = interaction.id.get().to_string(),
                     "LFG operation failed; details withheld"
                 );
                 "LFG operation failed; check the saved state before retrying.".into()
@@ -545,7 +729,13 @@ fn option_to_twilight(opt: &two_bot_core::commands::CommandOption) -> CommandOpt
     };
     CommandOption {
         autocomplete: None,
-        channel_types: None,
+        channel_types: (!opt.channel_types.is_empty()).then(|| {
+            opt.channel_types
+                .iter()
+                .copied()
+                .map(twilight_model::channel::ChannelType::from)
+                .collect()
+        }),
         choices: if opt.choices.is_empty() {
             None
         } else {
@@ -584,4 +774,82 @@ fn option_to_twilight(opt: &two_bot_core::commands::CommandOption) -> CommandOpt
 #[must_use]
 pub fn publish_commands(defs: &[CommandDefinition]) -> Vec<Command> {
     defs.iter().map(command_to_twilight).collect()
+}
+
+#[cfg(test)]
+mod help_response_tests {
+    use super::*;
+    use two_bot_core::commands::{merge_commands, CustomCommand, GUILD_COMMAND_LIMIT};
+    use two_bot_core::message_safety::{text_len, CONTENT_LIMIT, EMBED_DESCRIPTION_LIMIT};
+
+    #[test]
+    fn small_discovery_reply_keeps_the_ephemeral_text_shape() {
+        let defs = merge_commands(&[], &[]).expect("core registry");
+        let safe = crate::message_safety::interaction_response(&help_response(&defs))
+            .expect("sanitized help reply");
+        let wire = serde_json::to_value(safe).expect("serializes");
+        assert_eq!(wire["type"], 4);
+        assert_eq!(wire["data"]["flags"], 64);
+        assert_eq!(
+            wire["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            wire["data"]["content"],
+            two_bot_core::help::help_text(&defs)
+        );
+        assert!(wire["data"]["embeds"].is_null());
+    }
+
+    #[test]
+    fn maximal_discovery_registry_survives_the_executor_sanitizer() {
+        for additional in [
+            Vec::new(),
+            vec![
+                two_bot_core::feature_commands::feature_commands(),
+                two_bot_core::moderation::moderation_commands(),
+            ],
+        ] {
+            let builtins = merge_commands(&additional, &[]).expect("builtins");
+            let custom: Vec<_> = (0..GUILD_COMMAND_LIMIT - builtins.len())
+                .map(|i| CustomCommand {
+                    name: format!("custom_{i:025}"),
+                    description: "Custom command".to_owned(),
+                    enabled: true,
+                })
+                .collect();
+            assert!(custom.iter().all(|cmd| {
+                cmd.name.len() == 32 && two_bot_core::leveling::valid_command_name(&cmd.name)
+            }));
+            let defs = merge_commands(&additional, &custom).expect("full registry");
+            assert_eq!(defs.len(), GUILD_COMMAND_LIMIT);
+            let text = two_bot_core::help::help_text(&defs);
+            assert!(text_len(&text) > CONTENT_LIMIT);
+            assert!(text_len(&text) <= EMBED_DESCRIPTION_LIMIT);
+            let safe = crate::message_safety::interaction_response(&help_response(&defs))
+                .expect("sanitized help reply");
+            let wire = serde_json::to_value(safe).expect("serializes");
+            assert_eq!(wire["type"], 4);
+            assert_eq!(wire["data"]["flags"], 64);
+            assert_eq!(
+                wire["data"]["allowed_mentions"]["parse"],
+                serde_json::json!([])
+            );
+            assert!(wire["data"]["content"].is_null());
+            assert_eq!(wire["data"]["embeds"].as_array().unwrap().len(), 1);
+            let description = wire["data"]["embeds"][0]["description"]
+                .as_str()
+                .expect("embed description");
+            assert_eq!(description, text, "no truncation at the REST boundary");
+            let tokens: Vec<_> = description
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_'))
+                .filter(|token| token.starts_with('/') && token.len() > 1)
+                .collect();
+            assert_eq!(tokens.len(), defs.len());
+            for def in &defs {
+                let token = format!("/{}", def.name);
+                assert_eq!(tokens.iter().filter(|name| **name == token).count(), 1);
+            }
+        }
+    }
 }

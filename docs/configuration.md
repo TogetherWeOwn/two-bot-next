@@ -30,6 +30,11 @@ and `intents_from_env` (`TWO_AUTOMOD`, `DISCORD_TICKET_CATEGORY_ID`,
 `DISCORD_GATEWAY_URL` as a loopback-only test override. Rows for storable keys
 read this way say “env at boot”; every other storable row's stored value is
 unwired, and `env_only` rows are never dashboard-stored.
+When voice is enabled, `build_production_runtime` also reads
+`DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`, `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`,
+`TWO_TEMP_VOICE_CATEGORY_ID` and `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` solely
+for delete protection, not creator provisioning. Its empty grace is fixed at
+60 seconds; `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` remains unwired.
 Onboarding, automod, scorecard and classifier typed loaders exist but are not
 called during boot; their defaults below come from empty-map calls. The separate
 `preflight` operator CLI validates further catalog keys from the environment
@@ -72,7 +77,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 121.
+Catalog entries: 122.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
@@ -85,7 +90,7 @@ Catalog entries: 121.
 | `DISCORD_GUILD_ID` | env_only | Not specified in Next | environment only | Legacy managed guild identifier; distinct from Container GUILD_ID. |
 | `DISCORD_LANDING_CHANNEL_IDS` | hot | Not specified in Next | stored unwired (reload-report hot) | Onboarding landing destinations for game-picker routing. |
 | `DISCORD_MODERATION_LOG_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Destination for moderation logs. |
-| `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Voice lobby offered by session onboarding. |
+| `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID` | hot | Not specified in Next | env at boot; stored unwired | Voice lobby offered by session onboarding. |
 | `DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Looking-to-play destination offered by session onboarding. |
 | `DISCORD_STAFF_ALERT_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Destination for staff alerts. |
 | `DISCORD_STAGING_BOT_TOKEN` | env_only | Not rendered (secret) | environment only | Staging Discord authentication token; never rendered. |
@@ -95,7 +100,7 @@ Catalog entries: 121.
 | `DISCORD_TICKET_STAFF_ROLE_ID` | hot | Not specified in Next | env at boot; stored unwired | Staff role used by ticket authorization. |
 | `DISCORD_TOKEN` | env_only | Not rendered (secret) | environment only | Container Discord authentication token; never stored in guild settings. |
 | `DISCORD_VOICE_LOG_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Destination for voice-session logs. |
-| `LOG_LEVEL` | cold | Not specified in Next | stored unwired | Legacy logging filter with no Next reader; Container tracing reads RUST_LOG. |
+| `LOG_LEVEL` | cold | Not specified in Next | stored unwired | Container two_bot tracing level when RUST_LOG is unset (info default); RUST_LOG overrides. |
 | `TEMP_VOICE_ENABLED` | cold | Not specified in Next | stored unwired | Legacy temporary-voice enable flag; classification does not imply runtime wiring. |
 | `TWO_ANNOUNCEMENTS` | cold | `false` | env at boot; stored unwired | Enable announcement command publication and routing. |
 | `TWO_ANTI_NUKE` | cold | Not specified in Next | stored unwired | Enable anti-nuke protection. |
@@ -152,10 +157,11 @@ Catalog entries: 121.
 | `TWO_INTERNAL_ALLOW_EVENT_READ` | env_only | Not specified in Next | environment only | Capability gate for event reads. |
 | `TWO_INTERNAL_ALLOW_MODERATION` | env_only | Not specified in Next | environment only | Capability gate for internal moderation actions. |
 | `TWO_INTERNAL_ALLOW_SETTINGS` | env_only | Not specified in Next | environment only | Capability gate for internal settings actions. |
-| `TWO_INTERNAL_BIND` | env_only | Not specified in Next | environment only | Canonical combined private IP:port for receiver configuration; no default or Container bootstrap wiring. |
+| `TWO_INTERNAL_BIND` | env_only | Not specified in Next | environment only | Canonical combined IP:port for receiver configuration; a wildcard bind requires the Worker-set container marker (TOG-16851). |
 | `TWO_INTERNAL_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy split internal-action listener interface; receiver configuration uses TWO_INTERNAL_BIND instead. |
 | `TWO_INTERNAL_CALLERS` | env_only | Not specified in Next | environment only | Signing-key-to-stable-caller mappings for receiver configuration; environment-only identity boundary, not loaded by Container bootstrap. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | env_only | Not specified in Next | environment only | Logical channel-key allowlist for internal actions. |
+| `TWO_INTERNAL_CONTAINER` | env_only | Not specified in Next | environment only | Worker-set marker admitting a wildcard receiver bind; the container network is presumed private but unverified (TOG-16851). |
 | `TWO_INTERNAL_PORT` | env_only | Not specified in Next | environment only | Legacy split internal-action listener port; receiver configuration uses TWO_INTERNAL_BIND instead. |
 | `TWO_INTERNAL_ROLE_KEYS` | env_only | Not specified in Next | environment only | Logical role-key allowlist for internal actions. |
 | `TWO_JOIN_RISK_THRESHOLD` | hot | Not specified in Next | stored unwired | Join-risk threshold for protection decisions. |
@@ -184,16 +190,16 @@ Catalog entries: 121.
 | `TWO_STAGING_RESTART_CONTAINMENT` | env_only | Not specified in Next | environment only | Staging restart containment gate; legacy boot input with no Next reader. |
 | `TWO_STAGING_RESTART_SYNTHETIC_ACTORS` | env_only | Not specified in Next | environment only | Synthetic-actor allowlist for staging restart containment; legacy input with no Next reader. |
 | `TWO_TEMP_VOICE` | cold | Not specified in Next | stored unwired | Temporary-voice capability flag; classification does not imply runtime wiring. |
-| `TWO_TEMP_VOICE_CATEGORY_ID` | cold | Not specified in Next | stored unwired | Category for generated temporary voice rooms. |
+| `TWO_TEMP_VOICE_CATEGORY_ID` | cold | Not specified in Next | env at boot; stored unwired | Category for generated temporary voice rooms. |
 | `TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS` | cold | Not specified in Next | stored unwired | Cooldown between a member's temporary-room creations. |
 | `TWO_TEMP_VOICE_DISABLED_CONTROLS` | cold | Not specified in Next | stored unwired | Temporary-room controls; classification does not imply runtime wiring. |
 | `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` | cold | Not specified in Next | stored unwired | Grace period before an empty temporary room is removed. |
-| `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID` | cold | Not specified in Next | stored unwired | Voice channel used to request a temporary room. |
+| `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID` | cold | Not specified in Next | env at boot; stored unwired | Voice channel used to request a temporary room. |
 | `TWO_TEMP_VOICE_MAX_PER_GUILD` | cold | Not specified in Next | stored unwired | Maximum temporary rooms per guild. |
 | `TWO_TEMP_VOICE_MAX_PER_USER` | cold | Not specified in Next | stored unwired | Maximum temporary rooms owned by one member. |
 | `TWO_TEMP_VOICE_NAME_TEMPLATE` | cold | Not specified in Next | stored unwired | Temporary-room naming template; classification does not imply runtime wiring. |
 | `TWO_TEMP_VOICE_PANEL_CHANNEL_ID` | cold | Not specified in Next | stored unwired | Destination for temporary-room control panels. |
-| `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` | cold | Not specified in Next | stored unwired | Channels temporary-room cleanup may not remove. |
+| `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` | cold | Not specified in Next | env at boot; stored unwired | Channels temporary-room cleanup may not remove. |
 | `TWO_TEMP_VOICE_SWEEP_SECONDS` | cold | Not specified in Next | stored unwired | Temporary-room cleanup sweep interval. |
 | `TWO_TEXT_COMMANDS` | cold | `false` | env at boot; stored unwired | Enable optional text triggers only while automations are enabled. |
 | `TWO_TICKET_COOLDOWN_SECONDS` | cold | Not specified in Next | stored unwired | Cooldown between ticket openings. |

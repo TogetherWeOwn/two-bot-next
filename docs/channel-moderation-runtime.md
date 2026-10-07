@@ -36,11 +36,21 @@ executor and synchronizes once per process. Failed publication remains retryable
 on a later connection event. The current registry has no custom-command store;
 when that slice lands, its reader must join the shared full-set publication.
 
-Gateway dispatch admits tasks synchronously into three independently bounded
-lanes: 16 message workers, 16 interaction workers and one registry worker. It
-never waits for command SQL/REST or creates queued/spawned waiters. At saturation,
-events are not admitted and cannot cause effects. Overlapping READY/RESUMED syncs
-coalesce while publication is in progress. A scope guard aborts admitted work
+Gateway dispatch admits tasks synchronously into five independently bounded
+lanes: 16 message workers, 16 interaction workers, one registry worker, eight
+reserved interaction workers and eight busy-reply workers. It never waits for
+command SQL/REST or creates queued/spawned waiters. At saturation, events are not
+admitted and cannot cause effects.
+
+Interaction admission has three rules (`interaction_admission.rs`). One member
+holds at most three admitted interactions. A built-in slash command whose
+permission row requires guild permissions, invoked by a member whose resolved
+permission bits satisfy that row, tries the reserved lane first and may spill into
+the shared one; open commands, custom commands and component selects never enter
+the reserved lane, so a burst of them cannot starve moderation. A refused member
+or a full lane gets one ephemeral "busy, try again" callback on the busy-reply
+lane; if that lane is full too the event is dropped with a log line only.
+Overlapping READY/RESUMED syncs coalesce while publication is in progress. A scope guard aborts admitted work
 when the shard exits or its supervisor cancels it. Interrupted channel work
 retains durable uncertainty; cancellation never releases an ambiguous effect.
 

@@ -423,7 +423,7 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
     );
     assert_eq!(
         metrics::VOICE_DEAD_ACTIONS.len(),
-        8,
+        9,
         "voice dead-letter family grew; update the cardinality budget and the guard doc"
     );
     assert_eq!(
@@ -466,9 +466,9 @@ fn exposition_series_count_matches_the_cardinality_budget() {
     let text = metrics::Metrics::default().render(None);
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 278,
-        "exposition grew past the 278-sample budget (18 events + 4 scalars + 1 latency \
-         + 11 histogram + 156 rest + 48 jobs + 30 voice + 2 db-errors + 4 send-admissions + 4 pool); \
+        series, 279,
+        "exposition grew past the 279-sample budget (18 events + 4 scalars + 1 latency \
+         + 11 histogram + 156 rest + 48 jobs + 31 voice + 2 db-errors + 4 send-admissions + 4 pool); \
          update docs/log-volume-guard.md with the new series"
     );
 }

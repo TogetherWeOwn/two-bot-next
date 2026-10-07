@@ -153,6 +153,13 @@ class RollbackReadinessProbeTests(unittest.TestCase):
         self.assertEqual(code, 0, results)
         self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v4", results["PASS manifest"])
 
+    def test_current_dump_version_5_manifest_passes(self):
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=5)),
+                              mtime=2_050_000_000)
+        code, results, _ = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v5", results["PASS manifest"])
+
     def test_single_failure_fails_only_that_check(self):
         missing_guild = CONFIG.replace('TWO_GUILD_NAME = "TogetherWeOwn"\n', "")
         cases = {
@@ -245,7 +252,7 @@ class RollbackReadinessProbeTests(unittest.TestCase):
             "empty archive": ([], None, "is empty"),
             "manifest not JSON": ([b"{manifest", *good[1:]], None, "manifest line is not JSON"),
             "row before manifest": (good[1:], None, "first line is not a manifest"),
-            "unknown version": (lines(version=5), None, "manifest version 5 is not one of (3, 4)"),
+            "unknown version": (lines(version=6), None, "manifest version 6 is not one of (3, 4, 5)"),
             "boolean version": (lines(version=True), None, "manifest version True"),
             "no createdAt": (lines(createdAt=None), None, "no createdAt timestamp"),
             "negative eventsSequence": (lines(eventsSequence=-1), None, "invalid eventsSequence"),
@@ -338,6 +345,30 @@ class RollbackReadinessProbeTests(unittest.TestCase):
     def test_repository_deploy_config_declares_required_keys(self):
         self.assertIn("TWO_GUILD_NAME",
                       probe.check_deploy_config(probe.DEFAULT_CONFIG, probe.DEFAULT_ENVS, []))
+
+
+class UserAgentTests(unittest.TestCase):
+    def test_fetch_sends_an_explicit_user_agent(self):
+        seen = []
+
+        class Response(io.BytesIO):
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class Opener:
+            def open(self, request, timeout=None):
+                seen.append(request.get_header("User-agent"))
+                return Response(b"{}")
+
+        with mock.patch.object(probe.urllib.request, "build_opener", return_value=Opener()):
+            probe.fetch("https://two-bot-next-staging.example-sub.workers.dev/readyz")
+        self.assertEqual(seen, [probe.USER_AGENT])
+        self.assertFalse(seen[0].startswith("Python-urllib"))
 
 
 if __name__ == "__main__":

@@ -1391,6 +1391,52 @@ async fn restore_sql_failures_and_late_sequence_exhaustion_roll_back_data_guards
 }
 
 #[tokio::test]
+async fn pre_reservation_v4_restores_and_clears_newer_reservation_rows() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM voice_create_reservations")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(count > 0, "target contains newer reservation history");
+    let directory = ArchiveDirectory::new();
+    let source = directory.path("pre-reservation-v4.ndjson.gz");
+    let mut encoder = two_bot_core::backup::dump_file::new_encoder();
+    use std::io::Write as _;
+    encoder
+        .write_all(include_bytes!("fixtures/pre-reservation-v4.ndjson"))
+        .unwrap();
+    std::fs::write(
+        &source,
+        two_bot_core::backup::dump_file::finish_gzip(encoder).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(inspect(&source).unwrap().manifest.version, 4);
+    // Restore fences a destination holding moderation history; this scenario
+    // deliberately replaces a reused rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &source).await.unwrap();
+    assert!(report.ok);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM voice_create_reservations")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "old archives must not retain newer target history"
+    );
+    let channel: String = sqlx::query_scalar("SELECT channel_id FROM voice_rooms")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(channel, "500", "the archived room is restored");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn v3_prefix_restores_into_migrated_schema_without_retaining_newer_target_data() {
     let Some(db) = database().await else {
         return;

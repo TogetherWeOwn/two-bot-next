@@ -17,15 +17,24 @@ shell source. The deploy job does not restore caches from PR checks.
 
 AUTOMATED staging deployment is ACTIVE (TOG-12856, unblocking the TOG-12852
 rehearsal): the `deploy` job in `deploy-staging.yml` runs unconditionally on
-every push to `main` and on manual `workflow_dispatch`, in the GitHub
-`staging` environment, with the single fenced `release_fence` dispatch input
-(opt-in boolean, defaults to false). There is no job-level `if:` — a condition
-there (including the old `if: ${{ false }}` suspension, removed here) would
-silently skip deploys on some SHAs and leave the production guard refusing
-those SHAs with no deploy ever running. A skipped job is **not** deployment,
-readiness, protected-environment or E2E success; only a `success` conclusion
-with the intended-rollout evidence counts. Existing running staging resources
-are unchanged; no alternate manual deploy route is authorized.
+every push to `main` that changes a runtime input, and on manual
+`workflow_dispatch`, in the GitHub `staging` environment, with the single
+fenced `release_fence` dispatch input (opt-in boolean, defaults to false). The
+push trigger carries a workflow-level `paths-ignore` deny-list of non-runtime
+paths (`docs/**`, root `*.md`, license, editor/ignore/gitleaks config, issue and
+PR templates, CODEOWNERS, dependabot config). GitHub skips the run only when
+every changed path matches, so a mixed push, an unclassified path or any
+workflow, Cargo, `crates/**` or `wrangler/**` change still deploys, and a
+skipped push creates **no run at all** (not a skipped job). There is no
+job-level `if:` — a condition there (including the old `if: ${{ false }}`
+suspension, removed here) would silently skip deploys on some SHAs and leave
+the production guard refusing those SHAs with no deploy ever running. The
+deny-list is the one reviewed exception: it skips only SHAs whose diff cannot
+change the Worker or container, and `scripts/ci/test_workflows.py` pins it
+against sample runtime paths. A skipped job is **not** deployment, readiness,
+protected-environment or E2E success; only a `success` conclusion with the
+intended-rollout evidence counts. Existing running staging resources are
+unchanged; no alternate manual deploy route is authorized.
 
 CISO accepted the prior disabled CI-only scope in TOG-10958 and TOG-11179 plan
 revision 2. This re-activation ships as a reviewed workflow PR with exact-head
@@ -58,6 +67,35 @@ environment-scoped with no unintended fallback:
 - The existing deployment/approval principal can still deploy and the
   `STAGING_WORKER_URL` variable resolves in that environment.
 
+## Staging rollback drill (manual)
+
+`staging-rollback-drill.yml` is a manual, staging-only workflow that runs the
+reviewed [Worker-version rollback](runbook.md#worker-version-rollback) drill
+without giving any agent the staging ownership token. The regression pins it as
+`workflow_dispatch`-only with one required `target_version` input (no default,
+never "latest"). Its single `drill` job runs only from `main`, in the `staging`
+environment, on the routed runner for job `drill`, and shares the
+`deploy-staging` concurrency group without cancelling, so a push deploy cannot
+interleave with a drill. It has exactly three unconditional steps: pinned
+checkout, pinned setup-node, and one Run step that passes the input through the
+environment to `scripts/staging_rollback_drill.py`. The four existing `staging`
+bindings (`STAGING_WORKER_URL`, `STAGING_OWNERSHIP_CONTROL_TOKEN`,
+`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`) are scoped to that step alone.
+It creates, rotates and exports no credential and has no production path.
+
+The script fences the singleton, moves the Worker to the target with one
+Cloudflare deployment request, hands ownership to it, times the first `/readyz`
+200 against the 60 s budget, then restores the original version the same way.
+The deployment request never sends `force`, so a target whose secrets changed
+since it was deployed is refused; Wrangler's non-interactive rollback would
+answer yes to that prompt. The request sets `code_update_strategy` to
+`immediate` because Wrangler 4.147's default is `deferred` with a 300 s maximum
+delay, which would keep the old Durable Object code serving for up to five
+minutes. A 401/403 stops the run and skips the restore; it never retries with
+another credential. Recovery then is a `deploy-staging` dispatch with
+`release_fence=true` once the binding is fixed. Only allowlisted ids, integers,
+statuses and timestamps reach the log, the job summary and the evidence file.
+
 ## Production route
 
 `deploy-production.yml` (main #243) is the one live deployment workflow. The
@@ -70,10 +108,15 @@ Environment. Negative fixtures cover extra triggers, removed `needs` or
 environment, a bypass condition, deploy steps in the guard, and dropping those
 checks.
 
-With staging active (TOG-12856), every `main` push runs deploy-staging on its
-SHA; the guard accepts only a run that concluded `success` on that SHA, so a
-`skipped` or failed run still refuses production for that SHA. This fails
-closed. This change does not authorize a production bypass.
+With staging active (TOG-12856), every `main` push that changes a runtime input
+runs deploy-staging on its SHA; the guard accepts only a run that concluded
+`success` on that SHA, so a `skipped` or failed run still refuses production
+for that SHA. A docs-only push (the `paths-ignore` list above) starts no run, so
+the guard also refuses a docs-only head with `deploy-staging has no successful
+run`. This fails closed and is the intended trade: pin the latest
+runtime-affecting commit, or dispatch `deploy-staging` for the head you need
+([production-deploy.md](production-deploy.md)). This change does not authorize
+a production bypass.
 
 `supply-chain.yml` holds the required `pr-lint` and `gitleaks` jobs (main #187).
 The permitted same-repo reusable calls are the `pipeline-benchmark` call in

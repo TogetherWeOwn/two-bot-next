@@ -165,6 +165,9 @@ impl Disposition {
 pub struct ExpectedAction {
     pub alias: String,
     pub family: EventFamily,
+    /// Pin the semantic event kind when known; never exported. The soak CLI
+    /// requires this for every action that is not procedure-declared.
+    pub event_type: Option<EventType>,
     pub expected_at: String,
     pub key_hint: Option<String>,
 }
@@ -175,6 +178,7 @@ pub struct ExpectedAction {
 pub struct StoreReceipt {
     pub key: String,
     pub family: Option<EventFamily>,
+    pub event_type: EventType,
     pub received_at: String,
     pub inserted: bool,
 }
@@ -271,6 +275,7 @@ impl EvidenceLedger {
         self.receipts.push(StoreReceipt {
             key,
             family: family_of(event_type),
+            event_type,
             received_at,
             inserted,
         });
@@ -316,7 +321,8 @@ impl EvidenceLedger {
 
     /// Pair every expected action against receipts: exact idempotency-key match
     /// first, then nearest unclaimed same-family receipt inside
-    /// [`MATCH_WINDOW_MS`]. Each receipt is claimed at most once.
+    /// [`MATCH_WINDOW_MS`]. Both paths respect an event-kind pin when supplied.
+    /// Each receipt is claimed at most once.
     #[must_use]
     pub fn reconcile(&self) -> Reconciliation {
         let mut claimed: HashSet<usize> = HashSet::new();
@@ -327,21 +333,25 @@ impl EvidenceLedger {
                 items.push(declared.clone());
                 continue;
             }
+            let compatible = |r: &StoreReceipt| {
+                r.family == Some(action.family)
+                    && action.event_type.is_none_or(|kind| r.event_type == kind)
+            };
             let mut best: Option<usize> = None;
-            // Pass 1: exact key hint.
+            // Pass 1: exact key hint, without overriding the event-kind pin.
             if let Some(hint) = action.key_hint.as_deref() {
                 best = self
                     .receipts
                     .iter()
                     .enumerate()
-                    .position(|(i, r)| !claimed.contains(&i) && r.key == hint);
+                    .position(|(i, r)| !claimed.contains(&i) && r.key == hint && compatible(r));
             }
             // Pass 2: nearest same-family receipt inside the window.
             if best.is_none() {
                 let expected_ms = parse_iso_millis(&action.expected_at);
                 let mut best_dist = i64::MAX;
                 for (i, r) in self.receipts.iter().enumerate() {
-                    if claimed.contains(&i) || r.family != Some(action.family) {
+                    if claimed.contains(&i) || !compatible(r) {
                         continue;
                     }
                     let dist = match (expected_ms, parse_iso_millis(&r.received_at)) {
@@ -371,9 +381,9 @@ impl EvidenceLedger {
                     let mut committed = r.inserted;
                     let received_at = r.received_at.clone();
                     let key = r.key.clone();
-                    let family = r.family;
+                    let event_type = r.event_type;
                     for (j, o) in self.receipts.iter().enumerate() {
-                        if !claimed.contains(&j) && o.key == key && o.family == family {
+                        if !claimed.contains(&j) && o.key == key && o.event_type == event_type {
                             claimed.insert(j);
                             committed |= o.inserted;
                         }
@@ -452,6 +462,201 @@ impl EvidenceLedger {
     }
 }
 
+/// One QA expected action, as read from the QA JSON file:
+/// `[{alias, family, event_type?, at, disposition?, reason?}]`. `family` is
+/// `join` / `voice` / `message`; `event_type` pins the independently witnessed
+/// semantic kind (required unless declared); `at` is the witnessed UTC time.
+/// `disposition`, when present, is procedure-declared only (`excluded` or
+/// `failed` with a reason code such as `bot_authored` — never inferred).
+/// Unknown fields (notably `key_hint` or any raw identifier) are refused at
+/// the boundary so key material can never ride into the ledger this way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedInput {
+    pub alias: String,
+    pub family: EventFamily,
+    /// Privacy-safe semantic kind, required unless excluded/failed. A family
+    /// alone cannot distinguish a missed join from an observed leave.
+    #[serde(default)]
+    pub event_type: Option<EventType>,
+    #[serde(rename = "at")]
+    pub expected_at: String,
+    #[serde(default)]
+    pub disposition: Option<Disposition>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// One sanitized staging row from the staging-events-read workflow:
+/// `{ordinal, event_type, recorded_at}` where `event_type` is the legacy
+/// wire string (e.g. `member_join`). There are deliberately no idempotency
+/// keys and no guild/member/channel/message IDs here; unknown fields are
+/// refused at the boundary so a privacy-violating artifact fails closed
+/// instead of flowing into the packet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SanitizedRow {
+    pub ordinal: u64,
+    pub event_type: String,
+    pub recorded_at: String,
+}
+
+/// Sanitized rows artifact envelope from the staging-events-read workflow:
+/// `{rows: [...], truncated}`. A bare array is also accepted and reads as
+/// one untruncated row list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SanitizedRowsFile {
+    pub rows: Vec<SanitizedRow>,
+    pub truncated: bool,
+}
+
+/// Parse and validate the QA expected-actions file. Refuses malformed JSON,
+/// a non-array top level, empty or duplicate aliases, unwitnessable
+/// timestamps, inferred dispositions (`committed`, `duplicate`, `unknown`),
+/// a declared disposition without a reason code, and a reason code without
+/// a declared disposition.
+pub fn parse_expected_actions(json: &str) -> Result<Vec<ExpectedInput>, String> {
+    let mut items: Vec<ExpectedInput> =
+        serde_json::from_str(json).map_err(|_| "expected actions: malformed JSON".to_owned())?;
+    let mut seen = HashSet::new();
+    for item in &mut items {
+        if item.alias.is_empty() {
+            return Err("expected actions: empty alias".to_owned());
+        }
+        if !seen.insert(item.alias.clone()) {
+            return Err("expected actions: duplicate alias".to_owned());
+        }
+        let Some(expected_at) = canonical_utc_timestamp(&item.expected_at) else {
+            return Err("expected actions: unparsable timestamp (UTC RFC3339 required)".to_owned());
+        };
+        item.expected_at = expected_at;
+        if item
+            .event_type
+            .is_some_and(|kind| family_of(kind) != Some(item.family))
+        {
+            return Err("expected actions: event_type does not belong to family".to_owned());
+        }
+        match item.disposition {
+            None => {
+                if item.event_type.is_none() {
+                    return Err(
+                        "expected actions: undeclared action requires event_type".to_owned()
+                    );
+                }
+                if item.reason.is_some() {
+                    return Err(
+                        "expected actions: reason without a declared disposition".to_owned()
+                    );
+                }
+            }
+            Some(Disposition::Excluded | Disposition::Failed) => {
+                if !item.reason.as_deref().is_some_and(|r| !r.is_empty()) {
+                    return Err("expected actions: disposition without a reason code".to_owned());
+                }
+            }
+            Some(_) => {
+                return Err(
+                    "expected actions: disposition is never declared (only excluded/failed)"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    Ok(items)
+}
+
+// Parse the entire boundary string, then format the parsed instant so the
+// legacy matcher receives at most nanosecond precision. No parser details or
+// untrusted strings may reach diagnostics.
+fn canonical_utc_timestamp(value: &str) -> Option<String> {
+    let format = time::format_description::well_known::Rfc3339;
+    let at = time::OffsetDateTime::parse(value, &format).ok()?;
+    if at.offset() != time::UtcOffset::UTC {
+        return None;
+    }
+    at.format(&format).ok()
+}
+
+/// Parsed sanitized rows: `(ordinal, event type, receipt time)` triples plus
+/// the workflow's own truncation flag.
+pub type ParsedSanitizedRows = (Vec<(u64, EventType, String)>, bool);
+
+/// Parse and validate the sanitized rows artifact. Returns the rows as
+/// `(ordinal, event type, receipt time)` triples plus the workflow's own
+/// truncation flag. Refuses malformed JSON, unknown `event_type` wire
+/// strings, unparsable receipt times, duplicate ordinals, and any extra
+/// per-row field (idempotency keys, raw IDs).
+pub fn parse_sanitized_rows(json: &str) -> Result<ParsedSanitizedRows, String> {
+    let file: SanitizedRowsFile = match serde_json::from_str(json) {
+        Ok(file) => file,
+        Err(_) => match serde_json::from_str::<Vec<SanitizedRow>>(json) {
+            Ok(rows) => SanitizedRowsFile {
+                rows,
+                truncated: false,
+            },
+            Err(_) => return Err("sanitized rows: malformed JSON".to_owned()),
+        },
+    };
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(file.rows.len());
+    for row in &file.rows {
+        if !seen.insert(row.ordinal) {
+            return Err("sanitized rows: duplicate ordinal".to_owned());
+        }
+        let Some(event_type) = EventType::from_wire(&row.event_type) else {
+            return Err("sanitized rows: unknown event_type".to_owned());
+        };
+        let Some(recorded_at) = canonical_utc_timestamp(&row.recorded_at) else {
+            return Err(
+                "sanitized rows: unparsable receipt time (UTC RFC3339 required)".to_owned(),
+            );
+        };
+        out.push((row.ordinal, event_type, recorded_at));
+    }
+    Ok((out, file.truncated))
+}
+
+/// Build a soak [`EvidenceLedger`] from both input files: expected actions
+/// recorded in file order, procedure-declared dispositions applied, one
+/// committed receipt per sanitized row under the opaque key `r<ordinal>`,
+/// and the workflow's truncation flag propagated so a truncated read can
+/// never export as zero-loss. `revision` is the deployed bot revision the
+/// rows were read from; it must be non-empty so the packet stays
+/// attributable.
+pub fn build_soak_ledger(
+    revision: String,
+    expected_json: &str,
+    rows_json: &str,
+) -> Result<EvidenceLedger, String> {
+    if revision.is_empty() {
+        return Err("soak ledger: revision must not be empty".to_owned());
+    }
+    let expected = parse_expected_actions(expected_json)?;
+    let (rows, truncated) = parse_sanitized_rows(rows_json)?;
+    let mut ledger = EvidenceLedger::new(revision);
+    for item in &expected {
+        ledger.expect(ExpectedAction {
+            alias: item.alias.clone(),
+            family: item.family,
+            event_type: item.event_type,
+            expected_at: item.expected_at.clone(),
+            // No key material: only a receipt of the witnessed event kind can
+            // match inside the window. Sibling milestones stay collateral.
+            key_hint: None,
+        });
+        if let Some(disposition) = item.disposition {
+            let reason = item.reason.clone().unwrap_or_default();
+            ledger.declare(&item.alias, disposition, &reason);
+        }
+    }
+    for (ordinal, event_type, recorded_at) in rows {
+        ledger.record_store_receipt(format!("r{ordinal}"), event_type, recorded_at, true);
+    }
+    // Propagate the workflow's own overflow flag with no new receipts.
+    ledger.ingest(Vec::new(), truncated);
+    Ok(ledger)
+}
+
 /// [`FunnelStore`] decorator capturing per-write receipts: `inserted: true`
 /// means the write committed (durable receipt), `false` means idempotent
 /// redelivery. Drain with [`ReceiptingStore::drain_receipts`] and feed the
@@ -499,7 +704,8 @@ impl<S: FunnelStore> FunnelStore for ReceiptingStore<S> {
 
     fn record(&self, event: FunnelEvent) -> RecordOutcome {
         let key = idempotency_key(&event);
-        let family = family_of(event.event_type);
+        let event_type = event.event_type;
+        let family = family_of(event_type);
         let outcome = self.inner.record(event);
         let mut log = self.receipts.lock().expect("receipts lock");
         if log.receipts.len() >= MAX_RECEIPTS {
@@ -508,6 +714,7 @@ impl<S: FunnelStore> FunnelStore for ReceiptingStore<S> {
             log.receipts.push(StoreReceipt {
                 key,
                 family,
+                event_type,
                 received_at: now_iso(),
                 inserted: outcome.inserted,
             });
@@ -547,6 +754,7 @@ mod tests {
         ExpectedAction {
             alias: alias.to_owned(),
             family,
+            event_type: None,
             expected_at: at.to_owned(),
             key_hint: None,
         }
@@ -607,6 +815,32 @@ mod tests {
             r.items[0].received_at.as_deref(),
             Some("2026-09-20T12:00:02.000Z")
         );
+        assert_eq!(r.collateral_committed, 1);
+    }
+
+    #[test]
+    fn event_kind_pin_applies_to_key_hints_and_redelivery_sets() {
+        let mut ledger = EvidenceLedger::new("rev-test".to_owned());
+        ledger.expect(ExpectedAction {
+            event_type: Some(EventType::MemberJoin),
+            key_hint: Some("same-key".to_owned()),
+            ..action("j1", EventFamily::Join, "2026-09-20T12:00:00.000Z")
+        });
+        ledger.record_store_receipt(
+            "same-key".to_owned(),
+            EventType::MemberLeave,
+            "2026-09-20T12:00:00.000Z".to_owned(),
+            true,
+        );
+        assert_eq!(ledger.reconcile().gaps(), 1);
+        ledger.record_store_receipt(
+            "same-key".to_owned(),
+            EventType::MemberJoin,
+            "2026-09-20T12:00:01.000Z".to_owned(),
+            false,
+        );
+        let r = ledger.reconcile();
+        assert_eq!(r.items[0].disposition, Disposition::Duplicate);
         assert_eq!(r.collateral_committed, 1);
     }
 
@@ -735,6 +969,7 @@ mod tests {
         ledger.expect(ExpectedAction {
             alias: "m1".to_owned(),
             family: EventFamily::Message,
+            event_type: Some(EventType::FirstMessage),
             expected_at: "2026-09-20T12:01:00.000Z".to_owned(),
             key_hint: Some(
                 "100000000000000001:900000000000001111:first_message:2026-09-20T12:01:00.000Z"
@@ -885,6 +1120,7 @@ mod tests {
             ledger.expect(ExpectedAction {
                 alias: alias.to_owned(),
                 family,
+                event_type: Some(event.event_type),
                 expected_at: at.to_owned(),
                 key_hint: Some(idempotency_key(&event)),
             });
@@ -918,5 +1154,313 @@ mod tests {
         assert!(!raw.contains("fixture-m1"), "message id leaked");
         assert!(!raw.contains("invite:fixture"), "source material leaked");
         assert!(!raw.contains(":100:"), "member id leaked");
+    }
+
+    const SOAK_EXPECTED: &str = r#"[
+        {"alias": "j1", "family": "join", "event_type": "member_join", "at": "2026-10-09T20:00:00.000Z"},
+        {"alias": "m1", "family": "message", "event_type": "first_message", "at": "2026-10-09T20:01:00.000Z"},
+        {"alias": "x1", "family": "message", "event_type": "first_message", "at": "2026-10-09T20:01:00.000Z",
+         "disposition": "excluded", "reason": "bot_authored"}
+    ]"#;
+
+    const SOAK_ROWS: &str = r#"{"rows": [
+        {"ordinal": 0, "event_type": "member_join", "recorded_at": "2026-10-09T20:00:01.000Z"},
+        {"ordinal": 1, "event_type": "first_message", "recorded_at": "2026-10-09T20:01:02.000Z"}
+    ], "truncated": false}"#;
+
+    #[test]
+    fn soak_inputs_reconcile_through_window_match() {
+        let ledger =
+            build_soak_ledger("rev-soak".to_owned(), SOAK_EXPECTED, SOAK_ROWS).expect("valid");
+        let r = ledger.reconcile();
+        assert_eq!(r.matched(), 2);
+        assert_eq!(r.gaps(), 0);
+        assert_eq!(r.items[2].disposition, Disposition::Excluded);
+        assert_eq!(r.items[2].reason.as_deref(), Some("bot_authored"));
+        let packet = ledger.export();
+        assert_eq!(packet["counts"]["expected"], 3);
+        assert_eq!(packet["counts"]["matched"], 2);
+        assert_eq!(packet["counts"]["gaps"], 0);
+        assert_eq!(packet["truncated"]["expected_overflow"], false);
+        assert_eq!(packet["truncated"]["receipts_overflow"], false);
+    }
+
+    #[test]
+    fn soak_inputs_sibling_event_cannot_clear_a_gap() {
+        for (family, expected_kind, sibling) in [
+            ("join", "member_join", "member_leave"),
+            ("join", "member_join", "gate_cleared"),
+            ("voice", "voice_session_start", "voice_session_end"),
+            ("voice", "voice_session_start", "first_voice_session"),
+            ("message", "second_message", "first_message"),
+            ("message", "third_message", "second_message"),
+        ] {
+            let expected = serde_json::json!([{
+                "alias": "a1", "family": family, "event_type": expected_kind,
+                "at": "2026-10-09T20:00:00.000Z",
+            }])
+            .to_string();
+            let rows = serde_json::json!({"rows": [{
+                "ordinal": 0, "event_type": sibling,
+                "recorded_at": "2026-10-09T20:00:01.000Z",
+            }], "truncated": false})
+            .to_string();
+            let ledger =
+                build_soak_ledger("rev-soak".to_owned(), &expected, &rows).expect("valid siblings");
+            let r = ledger.reconcile();
+            assert_eq!(r.gaps(), 1, "{sibling} cannot stand for {expected_kind}");
+            assert_eq!(r.matched(), 0);
+            assert_eq!(r.collateral_committed, 1);
+        }
+    }
+
+    #[test]
+    fn soak_inputs_select_correct_kind_even_when_sibling_is_closer() {
+        let rows = r#"{"rows": [
+            {"ordinal": 0, "event_type": "member_leave", "recorded_at": "2026-10-09T20:00:00.000Z"},
+            {"ordinal": 1, "event_type": "member_join", "recorded_at": "2026-10-09T20:00:02.000Z"}
+        ], "truncated": false}"#;
+        let ledger = build_soak_ledger("rev-soak".to_owned(), SOAK_EXPECTED, rows).expect("valid");
+        let r = ledger.reconcile();
+        assert_eq!(
+            r.items[0].received_at.as_deref(),
+            Some("2026-10-09T20:00:02Z")
+        );
+        assert_eq!(r.collateral_committed, 1);
+        assert_eq!(r.gaps(), 1); // the independent message is still missing
+    }
+
+    #[test]
+    fn soak_inputs_require_compatible_event_kind() {
+        for expected in [
+            r#"[{"alias":"j1","family":"join","at":"2026-10-09T20:00:00.000Z"}]"#,
+            r#"[{"alias":"j1","family":"join","event_type":"first_message","at":"2026-10-09T20:00:00.000Z"}]"#,
+            r#"[{"alias":"j1","family":"join","event_type":"invite_click","at":"2026-10-09T20:00:00.000Z"}]"#,
+        ] {
+            assert!(build_soak_ledger("rev-soak".to_owned(), expected, SOAK_ROWS).is_err());
+        }
+        let excluded = r#"[{"alias":"x1","family":"message","at":"2026-10-09T20:00:00.000Z",
+            "disposition":"excluded","reason":"bot_authored"}]"#;
+        assert!(build_soak_ledger("rev-soak".to_owned(), excluded, SOAK_ROWS).is_ok());
+    }
+
+    #[test]
+    fn soak_inputs_gap_when_row_missing() {
+        let expected = r#"[{"alias": "ghost", "family": "join", "event_type": "member_join", "at": "2026-10-09T20:06:00.000Z"}]"#;
+        let rows = r#"{"rows": [], "truncated": false}"#;
+        let ledger = build_soak_ledger("rev-soak".to_owned(), expected, rows).expect("valid");
+        let r = ledger.reconcile();
+        assert_eq!(r.gaps(), 1);
+        assert_eq!(r.items[0].disposition, Disposition::Unknown);
+        assert_eq!(ledger.export()["counts"]["gaps"], 1);
+    }
+
+    #[test]
+    fn soak_inputs_truncated_flag_propagates_to_packet() {
+        let rows = r#"{"rows": [], "truncated": true}"#;
+        let ledger = build_soak_ledger("rev-soak".to_owned(), SOAK_EXPECTED, rows).expect("valid");
+        let packet = ledger.export();
+        assert_eq!(packet["truncated"]["receipts_overflow"], true);
+    }
+
+    #[test]
+    fn soak_inputs_malformed_are_refused() {
+        let good_expected = SOAK_EXPECTED;
+        let good_rows = SOAK_ROWS;
+        // Each pair replaces one side with a malformed input; the other side
+        // stays valid so the failure pins to the bad side.
+        let bad_expected = [
+            ("not json", "malformed JSON"),
+            (r#"{"alias": "j1"}"#, "malformed JSON"),
+            (
+                r#"[{"alias": "", "family": "join", "event_type": "member_join", "at": "2026-10-09T20:00:00.000Z"}]"#,
+                "empty alias",
+            ),
+            (
+                r#"[{"alias": "j1", "family": "join", "event_type": "member_join", "at": "2026-10-09T20:00:00.000Z"},
+                    {"alias": "j1", "family": "voice", "at": "2026-10-09T20:02:00.000Z"}]"#,
+                "duplicate alias",
+            ),
+            (
+                r#"[{"alias": "j1", "family": "party", "at": "2026-10-09T20:00:00.000Z"}]"#,
+                "malformed JSON",
+            ),
+            (
+                r#"[{"alias": "j1", "family": "join", "event_type": "member_join", "at": "not-a-time"}]"#,
+                "unparsable timestamp",
+            ),
+            (
+                r#"[{"alias": "j1", "family": "join", "event_type": "member_join", "at": "2026-10-09T20:00:00.000Z",
+                    "disposition": "committed"}]"#,
+                "never declared",
+            ),
+            (
+                r#"[{"alias": "j1", "family": "join", "event_type": "member_join", "at": "2026-10-09T20:00:00.000Z",
+                    "disposition": "excluded"}]"#,
+                "without a reason code",
+            ),
+            (
+                r#"[{"alias": "j1", "family": "join", "event_type": "member_join", "at": "2026-10-09T20:00:00.000Z",
+                    "reason": "bot_authored"}]"#,
+                "without a declared disposition",
+            ),
+            (
+                r#"[{"alias": "j1", "family": "join", "event_type": "member_join", "at": "2026-10-09T20:00:00.000Z",
+                    "key_hint": "k1"}]"#,
+                "malformed JSON",
+            ),
+        ];
+        for (json, hint) in bad_expected {
+            let err = build_soak_ledger("rev-soak".to_owned(), json, good_rows)
+                .expect_err("expected input must be refused");
+            assert!(err.contains(hint), "missing {hint:?} in {err:?}");
+        }
+        assert!(build_soak_ledger(String::new(), good_expected, good_rows)
+            .expect_err("empty revision must be refused")
+            .contains("revision"));
+        let bad_rows = [
+            (r#"{}"#, "malformed JSON"),
+            (r#"{"rows": []}"#, "malformed JSON"),
+            (r#"{"truncated": false}"#, "malformed JSON"),
+            (
+                r#"{"rows": [{"ordinal": 0, "event_type": "member_join",
+                    "recorded_at": "2026-10-09T20:00:01.000Z", "idempotency_key": "k"}], "truncated": false}"#,
+                "malformed JSON",
+            ),
+            (
+                r#"{"rows": [{"ordinal": 0, "event_type": "member_join",
+                    "recorded_at": "2026-10-09T20:00:01.000Z", "member_id": "123"}], "truncated": false}"#,
+                "malformed JSON",
+            ),
+            (
+                r#"{"rows": [{"ordinal": 0, "event_type": "magic_join",
+                    "recorded_at": "2026-10-09T20:00:01.000Z"}], "truncated": false}"#,
+                "unknown event_type",
+            ),
+            (
+                r#"{"rows": [{"ordinal": 0, "event_type": "member_join",
+                    "recorded_at": "yesterday"}], "truncated": false}"#,
+                "unparsable receipt time",
+            ),
+            (
+                r#"{"rows": [{"ordinal": 7, "event_type": "member_join",
+                    "recorded_at": "2026-10-09T20:00:01.000Z"},
+                    {"ordinal": 7, "event_type": "member_leave",
+                    "recorded_at": "2026-10-09T20:00:02.000Z"}], "truncated": false}"#,
+                "duplicate ordinal",
+            ),
+        ];
+        for (json, hint) in bad_rows {
+            let err = build_soak_ledger("rev-soak".to_owned(), good_expected, json)
+                .expect_err("rows input must be refused");
+            assert!(err.contains(hint), "missing {hint:?} in {err:?}");
+        }
+    }
+
+    #[test]
+    fn soak_boundary_timestamps_must_be_complete_utc_rfc3339() {
+        for bad in [
+            "2026-10-09T20:00:00.000.EXTRA_SENTINELZ",
+            "2026-10-09T20:00:00.000,EXTRA_SENTINELZ",
+            "2026-02-30T20:00:00.000Z",
+            "2026-10-09T20:00:00.000Z EXTRA_SENTINEL",
+            "2026-10-09T20:00:00+01:00",
+            "2026-10-09T20:00:00",
+        ] {
+            let mut expected: serde_json::Value = serde_json::from_str(SOAK_EXPECTED).unwrap();
+            expected[0]["at"] = bad.into();
+            let err = parse_expected_actions(&expected.to_string()).expect_err("bad QA time");
+            assert!(!err.contains("EXTRA_SENTINEL"));
+            let mut rows: serde_json::Value = serde_json::from_str(SOAK_ROWS).unwrap();
+            rows["rows"][0]["recorded_at"] = bad.into();
+            let err = parse_sanitized_rows(&rows.to_string()).expect_err("bad receipt time");
+            assert!(!err.contains("EXTRA_SENTINEL"));
+        }
+        for good in [
+            "2026-10-09T20:00:00Z",
+            "2026-10-09T20:00:00.123Z",
+            "2026-10-09T20:00:00.123456+00:00",
+        ] {
+            assert!(canonical_utc_timestamp(good).is_some());
+        }
+    }
+
+    #[test]
+    fn soak_long_fraction_timestamps_match_at_canonical_precision() {
+        let short = "2026-10-09T20:00:00.123Z";
+        let long = "2026-10-09T20:00:00.123456789012345Z";
+        for (expected_at, received_at) in [(long, short), (short, long), (long, long)] {
+            let expected = serde_json::json!([{
+                "alias": "j1", "family": "join", "event_type": "member_join",
+                "at": expected_at,
+            }]);
+            let rows = serde_json::json!({
+                "rows": [{"ordinal": 0, "event_type": "member_join",
+                    "recorded_at": received_at}],
+                "truncated": false,
+            });
+            let ledger = build_soak_ledger(
+                "rev-soak".to_owned(),
+                &expected.to_string(),
+                &rows.to_string(),
+            )
+            .expect("valid long fractions");
+            let packet = ledger.export();
+            assert_eq!(packet["counts"]["matched"], 1);
+            assert_eq!(packet["counts"]["gaps"], 0);
+            for field in ["expected_at", "received_at"] {
+                assert!(parse_iso_millis(packet["items"][0][field].as_str().unwrap()).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn soak_rejection_diagnostics_do_not_echo_input() {
+        const SENTINEL: &str = "RAW_KEY_SENTINEL:900000000000001111";
+        let mut rows: serde_json::Value = serde_json::from_str(SOAK_ROWS).unwrap();
+        rows["rows"][0]["event_type"] = SENTINEL.into();
+        assert_eq!(
+            parse_sanitized_rows(&rows.to_string()).unwrap_err(),
+            "sanitized rows: unknown event_type"
+        );
+        rows["rows"][0][SENTINEL] = "anything".into();
+        assert_eq!(
+            parse_sanitized_rows(&rows.to_string()).unwrap_err(),
+            "sanitized rows: malformed JSON"
+        );
+        let mut expected: serde_json::Value = serde_json::from_str(SOAK_EXPECTED).unwrap();
+        expected[0]["event_type"] = SENTINEL.into();
+        assert_eq!(
+            parse_expected_actions(&expected.to_string()).unwrap_err(),
+            "expected actions: malformed JSON"
+        );
+        expected[0]["event_type"] = "member_join".into();
+        expected[0]["alias"] = SENTINEL.into();
+        expected[1]["alias"] = SENTINEL.into();
+        assert_eq!(
+            parse_expected_actions(&expected.to_string()).unwrap_err(),
+            "expected actions: duplicate alias"
+        );
+    }
+
+    #[test]
+    fn soak_packet_carries_no_opaque_keys_or_wire_types() {
+        let ledger =
+            build_soak_ledger("rev-soak".to_owned(), SOAK_EXPECTED, SOAK_ROWS).expect("valid");
+        let raw = serde_json::to_string(&ledger.export()).expect("serializes");
+        // Opaque per-row keys (`r<ordinal>`) live in memory only.
+        assert!(!raw.contains("\"r0\""), "row key leaked");
+        assert!(!raw.contains("\"r1\""), "row key leaked");
+        // Wire event types never enter the packet; only family names do.
+        assert!(!raw.contains("member_join"), "wire type leaked");
+        assert!(!raw.contains("first_message"), "wire type leaked");
+        assert!(raw.contains("\"join\""), "family missing");
+        // A bare-array rows artifact reads as one untruncated row list.
+        let bare = r#"[{"ordinal": 0, "event_type": "member_join",
+            "recorded_at": "2026-10-09T20:00:01.000Z"}]"#;
+        let expected = r#"[{"alias": "j1", "family": "join", "event_type": "member_join", "at": "2026-10-09T20:00:00.000Z"}]"#;
+        let ledger = build_soak_ledger("rev-soak".to_owned(), expected, bare).expect("valid");
+        assert_eq!(ledger.reconcile().matched(), 1);
+        assert_eq!(ledger.export()["truncated"]["receipts_overflow"], false);
     }
 }

@@ -5,6 +5,17 @@ name: check
 
 on:
   pull_request:
+    # Pinned minimal PR surface: with no `types`, GitHub fires only on
+    # opened/synchronize/reopened (label, assignment, review-request and
+    # close events never run this workflow), so the explicit list below is
+    # identical to the bare trigger. It is written out so the offline trigger
+    # test can lock it: check.yml never reads the PR title or body, so
+    # `edited` would only re-run (and, via cancel-in-progress, restart) the
+    # full matrix on an unchanged SHA, and `ready_for_review` would re-run
+    # the same SHA with no draft gating. Every new head SHA arrives via
+    # opened or synchronize, so the gate always reports. Title re-lint on
+    # `edited` lives in supply-chain.yml, where it belongs.
+    types: [opened, synchronize, reopened]
   push:
     branches: [main]
   # Weekly full run (CI standard rule 6, TOG-14881): the supply-chain
@@ -195,6 +206,7 @@ jobs:
       - name: soak evidence parser (offline, fixtures only)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_evidence.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_sanitize_evidence_rows.py' -v
 
       - name: staging E2E run-record template (offline)
         run: |
@@ -244,6 +256,11 @@ jobs:
       - name: Docker dependency-layer manifests (offline)
         if: needs.job-inputs.outputs.rust != 'false'
         run: python3 scripts/check-docker-manifests.py
+
+      # Fail-closed fixtures for the validator above: stdlib only, no cargo,
+      # so this runs unguarded next to the offline layer-shape check.
+      - name: Docker manifest validator fixtures (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_docker_manifests.py' -v
 
       # Lint lane: its own entry (compile-only artifacts), saved on pushes to main only.
       - name: Restore cargo cache
@@ -467,6 +484,9 @@ jobs:
       - name: cargo test (integration, including website acceptance and backup round trip)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+          # RSVP runtime acceptance isolates per-test schemas, so it shares the
+          # consolidated bootstrap; no slice-specific bootstrap names.
+          TWO_RSVP_RUNTIME_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
           TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_ci
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
         # The publication regression has its own guarded DB and actual binary
@@ -955,6 +975,11 @@ jobs:
       - name: Voice configuration store (CI service container only)
         run: cargo test -p two-bot-cutover --test voice_config_store --locked -- --ignored
 
+      - name: Voice create admission store (isolated DBs, CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-cutover --test voice_create_admission_store --locked -- --ignored
+
       - name: legacy copy acceptance (two owned databases on CI service only)
         run: cargo test -p two-bot-cutover --test legacy_copy_db --locked -- --ignored
 
@@ -1248,6 +1273,8 @@ jobs:
           persist-credentials: false
       - name: Offline smoke-test regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke.py' -v
+      - name: Offline JSON-log smoke parser regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-logging-container.py --self-test
       # A skipped build still reports success: the offline tests above ran,
       # and container smoke is not a required check, so the check stays
       # green without hiding anything the branch protection demands.
@@ -1279,6 +1306,14 @@ jobs:
         env:
           IMAGE_ID: ${{ steps.build.outputs.imageid }}
         run: python3 scripts/container-smoke.py "$IMAGE_ID"
+      # Structured-log contract on the image just built: token-free, network
+      # disabled, every combined stdout/stderr line must be a JSON object
+      # (docs/logging.md). Reuses this job's image, so no second build.
+      - name: Structured JSON log smoke (token-free, no network)
+        if: needs.container-inputs.outputs.build == 'true'
+        env:
+          IMAGE_ID: ${{ steps.build.outputs.imageid }}
+        run: python3 scripts/test-logging-container.py "$IMAGE_ID"
       - name: Prove deliberate budget breakage fails
         if: needs.container-inputs.outputs.build == 'true'
         env:
@@ -1510,6 +1545,10 @@ jobs:
       # pins this step with no `if:` (test_required_worker_ci_runs_this_offline_suite).
       - name: Verify staging rollout provenance (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollout.py -v
+      - name: Verify staging rollback drill (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollback_drill.py -v
+      - name: Verify staging container backout/restore drill (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill.py -v
       - name: Verify staging ownership-takeover retry (offline fixtures)
         run: node --test scripts/test-ownership-control.mjs
       - name: Verify staging redirect smoke (offline fixtures)
@@ -1517,6 +1556,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_redirect_smoke.py -v
       - name: Verify staging automation read smoke (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_automation_read_smoke.py -v
+      - name: Verify staging voice smoke (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_smoke.py -v
       - name: Verify staging health-contract probe (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_health_contract_probe.py -v
       - name: Verify voice denied-copy fixtures (offline fixtures)
@@ -1525,6 +1566,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_guild_e2e_prep.py -v
       - name: Verify staging smoke edge-case fixtures (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_edge_cases.py -v
+      - name: Verify staging smoke run (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_smoke_run.py -v
       - name: Verify cutover acceptance probes (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_qa_cutover_probes.py -v
       - name: Verify runner routing for every workflow job

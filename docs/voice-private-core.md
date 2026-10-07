@@ -77,6 +77,110 @@ Stale snapshots and delayed event replays are **not** detected by this pure
 core. No exactly-once Discord effects or crash recovery are claimed by these
 tests.
 
+## Runtime wiring: `/private` and `/public`
+
+`crates/bot/src/voice_rooms/private_runtime.rs` runs this core inside the
+guild worker. It covers the two owner commands, the persisted privacy state and
+the Join channel. The join-request flow is in
+[Runtime wiring: join requests](#runtime-wiring-join-requests).
+
+- **Gate.** The caller must be in the room and be its owner or hold Manage
+  Channels (`require_room_owner`). Both commands are idempotent and reply
+  ephemerally with what was queued, not that Discord finished; a failed write is
+  recorded as a lifecycle failure and shows in `/setup`.
+- **Discord first, state after.** `/private` and `/public` queue one
+  `RoomAction::SetEveryoneConnect`. The private flag, the Join-channel plan and
+  the stored record change only after that write lands, so a refused write
+  leaves the room as it was. A repeated `/private` on a private room whose
+  @everyone overwrite no longer denies Connect re-asserts it. `/public` on a
+  room whose stored flag is public but whose @everyone overwrite still denies
+  Connect (a room an `/alwaysprivate` creator made) lifts that deny; with no
+  deny it changes nothing.
+- **The overwrite.** Only the Connect bit moves; every other @everyone bit (View
+  Channel included) is carried over unchanged, because the write replaces the
+  whole entry. Manage Roles is never emitted as an allow, on any overwrite
+  this slice writes. When denying @everyone would leave the bot unable to manage
+  the room, a bot-member allow for exactly the missing bits is written first.
+  `/public` removes only the Connect deny; an explicit @everyone Connect allow
+  that `/private` stripped is not re-added.
+- **The Join channel.** Created once in the room's category, directly after the
+  room, with no overwrites (it syncs to the category). A retry after an unknown
+  outcome adopts the channel the live snapshot shows instead of creating a second
+  one. It is deleted on `/public`, and with its room (ahead of the row, so a
+  failed delete retries the whole room delete instead of leaking it). On
+  `/public` the delete runs inside the same retried action, after the Connect
+  write and before the flag flips and the record is saved, so the stored Join id
+  outlives a restart until the channel is gone and `/public` can run again to
+  finish the job. The Join channel's name carries the owner's display name only
+  after it is sanitized like a `/create` name and passes the name filter. The
+  worker only deletes Join channel ids it created or loaded from its own store.
+- **Persistence** (`0416_voice_room_privacy`). `voice_rooms.private` and
+  `join_channel_id`, plus `voice_room_blocks` rows that cascade with the room.
+  `PrivacyRecord` is the durable subset of `PrivateRoom`; a corrupt record is
+  refused at load rather than repaired.
+- **Restart.** A stored Join channel that is in the live snapshot is adopted;
+  one that is not is forgotten and the forgetting persisted. The room stays
+  private; `/private` plans a new Join channel. Nothing is forgotten without an
+  authoritative snapshot that still shows the room.
+- **Grants are durable.** Approved members' Connect allows are witnessed in
+  `voice_join_grants` (one row per room member, written before the grant PUT
+  and retired only after the revoke lands or the grant is refused), so a
+  restart cannot strand a Connect allow past `/public`. Worker load hydrates
+  private rooms' grants and re-queues revocations for grants whose room is
+  public or gone. Revocation clears only the Connect bit and keeps every other
+  allow/deny bit, including vote-kick denies.
+
+## Runtime wiring: join requests
+
+`crates/bot/src/voice_rooms/join_requests.rs` runs `enter_join_channel` and
+`decide` inside the same worker.
+
+- **Entry.** Each reconcile looks at who sits in a private room's Join channel.
+  A member counts as having *entered* when the gateway recorded a new
+  transition for them, so one stay raises one request: an owner's Deny does not
+  raise the same member again every tick. Leaving and coming back asks again
+  under a fresh id. Bots are skipped; the core already ignores the owner,
+  occupants, approved members and blocked members (silently).
+- **Prompt.** One `RoomAction::AskJoinOwner` posts a message in the room's own
+  chat with three buttons,
+  `two:voice:join-approve|deny|block:<room>:<request>`. Only the owner is pinged;
+  the requester is named by id. There is no DM fallback: a press on a DM carries
+  no guild, so it could not be routed or role-gated. A request answered or
+  withdrawn before the queue reaches the prompt posts nothing. When the bot
+  cannot post in the room's chat the request is dropped (the failure shows in
+  `/setup`) instead of sitting pending behind buttons nobody got.
+- **Answer.** A press runs the guild's `/private` role gate, then the worker
+  checks the room's *current* owner (admins do not count) and the request's
+  current state. A stale, answered or withdrawn button, and one minted before a
+  restart, is answered with an ephemeral refusal and changes nothing; the
+  worker never stays silent on a press it owns. Ids outside the three join
+  verbs stay with their own handlers. The answer replaces the prompt in place
+  (no buttons, no pings).
+  - *Approve* queues one write: a Connect allow for that member on the room
+    only (never Manage Roles, other bits kept), then a move from the Join
+    channel, but only if the member is still there. It refuses when the member
+    carries a Connect deny from a passed vote-kick: an owner cannot undo a vote.
+    A refused grant is not claimed, so the member can ask again.
+  - *Deny* writes nothing.
+  - *Block* persists through the privacy record (`voice_room_blocks`), so it
+    survives a restart and `/public`.
+- **Withdrawal.** An ownership change withdraws requests raised to the previous
+  owner, retires their buttons and asks the new owner about everyone still
+  waiting. `/public` takes approved members' Connect allow back and retires
+  open prompts. A room delete forgets the state; its prompts go with the
+  channel.
+- **Request ids.** Pending requests, grants and prompts are runtime-only. Each
+  button appends the worker's fresh 128-bit CSPRNG epoch to the numeric core
+  request id. The worker refuses a different or missing epoch before deciding,
+  so a reset counter or a repeated/backward wall clock cannot revive an old
+  button. Epochs are collision-resistant, not clock-based; ids remain within
+  Discord's 100-character limit even with maximum-width numeric fields.
+- **Grants are durable.** The approval intent is recorded in
+  `voice_join_grants` before the Connect PUT; a refused grant retires its row
+  so the member can ask again, while an unknown grant or revoke outcome keeps
+  its row so a retry or a restart can still revoke. Only a successful revoke
+  (or a refused grant) retires the witness.
+
 ## Residual parent work
 
 V1 room storage, V2 ownership tracking, `/nick` resolution, Discord permission

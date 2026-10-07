@@ -10,6 +10,7 @@ use std::{
 
 use sqlx::PgPool;
 use two_bot_core::{
+    activation::LiveCapability,
     feeds::{
         delivery_action, parse_xml_feed, poll_candidates, DeliveryAction, DeliveryClaim, FeedItem,
         FeedPollSchedule, FeedPost, FeedRelay, MAX_FEED_POSTS_PER_POLL,
@@ -22,6 +23,7 @@ use two_bot_core::{
 use two_bot_discord::{ActionExecutor, DiscordError};
 
 use crate::{
+    activation::BootActivation,
     command_runtime::new_id,
     jobs::{ErrorClass, Job, JobAction},
     website_jobs::Context,
@@ -93,7 +95,9 @@ pub(crate) fn scheduled_job(seconds: u64, action: JobAction) -> Result<Job, Erro
     })
 }
 
-pub(crate) fn register(context: Arc<Context>) -> Option<Job> {
+/// The feed poller, or `None` while `TWO_ANNOUNCEMENTS` is off or the boot
+/// identity does not permit announcements (the live-identity fence, TOG-15758).
+pub(crate) fn register(context: Arc<Context>, activation: &BootActivation) -> Option<Job> {
     let gates = match FeatureGates::from_env() {
         Ok(gates) => gates,
         Err(_) => {
@@ -104,8 +108,9 @@ pub(crate) fn register(context: Arc<Context>) -> Option<Job> {
             return None;
         }
     };
-    register_gated(
+    register_fenced(
         gates,
+        activation,
         Arc::new(move || {
             let context = context.clone();
             Box::pin(async move {
@@ -119,6 +124,24 @@ pub(crate) fn register(context: Arc<Context>) -> Option<Job> {
             })
         }),
     )
+}
+
+/// Identity can only narrow the env gate: the poller posts under the token's
+/// identity, exactly like the announcement verbs the router refuses there.
+pub(crate) fn register_fenced(
+    gates: FeatureGates,
+    activation: &BootActivation,
+    action: JobAction,
+) -> Option<Job> {
+    let fenced = activation.constrain_features(gates);
+    if gates.announcements && !fenced.announcements {
+        tracing::warn!(
+            job = NAME,
+            capability = LiveCapability::Announcements.as_str(),
+            "feed poller parked: live activation refused"
+        );
+    }
+    register_gated(fenced, action)
 }
 
 fn register_gated(gates: FeatureGates, action: JobAction) -> Option<Job> {

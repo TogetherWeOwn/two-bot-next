@@ -57,8 +57,9 @@ README. Staging deploys from `main`; production is a separate manual gate.
   failure handling and rollback.
 - [Staging soak acceptance](docs/staging-soak.md): the evidence required before
   cutover; deployment alone is not acceptance.
-- [Offline staging slash smoke](docs/staging-slash-smoke.md): fixture-only router/reply
-  checks, explicit staging fences and honest coverage gaps; not live E2E evidence.
+- [Staging slash smoke](docs/staging-slash-smoke.md): fixture-only router/reply
+  checks, plus a fenced GET-only live smoke run (health, build identity, guild
+  command registry) that writes a run record; neither invokes a slash command.
 - [Backup/restore runbook](docs/backup.md) and [parity matrix](docs/parity.md).
 - [Channel lane reconciliation](docs/channel-lane-reconciliation.md): inspection-first
   operator release of an uncertain moderation lane, with explicit confirmation,

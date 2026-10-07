@@ -117,8 +117,9 @@ No Cloudflare API reaches container stdout either, so voice-event emission has
 no CI read path; follow [staging voice-event verification](staging-voice-event-verification.md)
 for the dashboard procedure.
 
-Rust uses formatted `tracing` logs, configured by `RUST_LOG`, fallback
-`two_bot=info`; it does not consume legacy `LOG_LEVEL`. This wrapper currently
+Rust uses JSON `tracing` logs, configured by `RUST_LOG`, fallback
+`error,two_bot={LOG_LEVEL:-info}` (dependency crates stay ERROR-only unless
+`RUST_LOG` opts in); `/readyz` 503s log at DEBUG, not ERROR. This wrapper currently
 forwards **only** `DISCORD_TOKEN`, `DATABASE_URL`, `GUILD_ID` and its computed
 `LISTEN_ADDR`, not `RUST_LOG` or arbitrary `TWO_*` flags. Adding a Worker var
 alone will not configure the container. Do not dump env or HTTP headers to
@@ -159,8 +160,10 @@ that monitoring is armed.
 ### Metrics alerts
 
 The Container DO pulls the container-internal `/metrics` on every keepalive tick,
-evaluates the rules in `wrangler/src/alert-rules.ts`, and posts one message per
-transition (fire, resolve) to `OPS_ALERT_WEBHOOK_URL`. See
+evaluates the rules in `wrangler/src/alert-rules.ts`, and logs/persists each
+transition (fire, resolve). It posts to `OPS_ALERT_WEBHOOK_URL` only when
+`OPS_ALERT_FORWARDING` is exactly `"on"` (default `"off"`); turning forwarding off
+retains the credential and monitoring. See
 [metrics](metrics.md#off-container-scrape-and-alert-rules). Fetch the live data
 with `curl -H "Authorization: Bearer $METRICS_SCRAPE_TOKEN" "$WORKER_URL/ops/metrics"`.
 
@@ -355,7 +358,9 @@ this client rejects production origins. Never roll back to an unfenced wrapper.
   Versions are not Git SHAs. Check whether migrations or resource changes make
   the old code incompatible; rollback does not rewind Postgres or DO storage.
 - Check the current staging workflow result. `deploy-staging.yml` runs on merge
-  to `main`, and also allows manual dispatch, but currently accepts a 503
+  to `main` unless the merge touches only docs, root markdown or repository
+  chrome (then no run starts and staging keeps serving the previous runtime
+  commit), and also allows manual dispatch, but currently accepts a 503
   readiness response as a scaffold-era gate. **Workflow green is not gateway
   ready**: require your own first `/readyz` 200 observation and feature evidence.
 - Gateway startup connects DML-only and does not migrate; lazy jobs also use
@@ -523,7 +528,11 @@ npm --prefix wrangler run deployments -- list --env staging
 ```
 
 Read the interactive target and confirm the incident's known-good version.
-Do not add `--yes` or override warnings. If Wrangler reports changed secrets,
+Do not add `--yes` or override warnings. Wrangler 4.147 updates Durable Object
+code with `deferred` mode and a 300 s maximum delay by default, so a bare
+rollback can leave the old code serving for up to five minutes. For a manual
+incident rollback add `--durable-objects-code-update-mode immediate`, and expect
+a time-to-ready that includes the restart. If Wrangler reports changed secrets,
 DO lifecycle changes, missing bindings, or an access denial, **stop**; do not
 force the rollback or revive/replace credentials. Escalate the compatibility
 or authorization decision with names and the error code, never secret values.
@@ -543,6 +552,64 @@ ownership, explicitly take over the current epoch under the incident's handoff
 authorization, then repeat health/readiness/log observations. Confirm only one
 gateway session and record version, image, first ready time and remaining
 limitations. None of these examples were a live rollback drill.
+
+**Staging drill.** The manual `staging-rollback-drill` workflow (dispatch from
+`main`, input `target_version`) runs this procedure end to end in the protected
+`staging` environment: fence, one unforced Cloudflare deployment of the target
+with `code_update_strategy: immediate`, epoch-checked takeover, a 2 s
+`/readyz` + `/health` poll, then the same sequence back to the original version.
+Pick the target from the deployment list: a version that already served staging
+traffic, not the serving one, compatible with the current schema (the script
+refuses an unknown or never-deployed id). The job summary and evidence file hold
+the fence, rollback, takeover and first-ready times, the time-to-ready against
+the 60 s budget, probe counts, the container image digest and instance counts.
+Gateway-session count is not observable from probes; read the Worker logs for it.
+If the run stops on a 401/403 it skips the restore: recover with a
+`deploy-staging` dispatch with `release_fence=true` after the binding is fixed.
+
+**Container-image backout/restore drill.** The manual `staging-container-drill`
+workflow (dispatch from `main` only) backouts staging to a previously reviewed
+Rust source/image pair and restores the baseline through the FULL container
+rollout path. It is the answer to the Worker-only drill's gap (same image on
+both legs, no session witness): every leg fences the singleton, runs a full
+`wrangler deploy` of the pinned pre-built image, takes over with an
+epoch-checked handoff, and verifies a converged `full_auto` rollout plus the
+exact Worker version, source revision, build id and running image digest
+before timing first ready. Old source is never checked out and no Dockerfile
+is rebuilt: the deploy config is generated from the reviewed `wrangler.toml`
+on `main` with only the container image overridden to the digest-pinned
+registry reference.
+
+Dispatch contract (all pins immutable; `latest` and mutable tags are refused):
+`backout_source_sha` (40-hex), `backout_build_id`, `backout_image`
+(`registry...@sha256:...`), `backout_worker_version` (UUID),
+`backout_rollout_id` (prior completed staging rollout that served the image),
+`backout_review_ref` (format `PR-<n>:ci-ok-<shortsha>`, strict tokens only),
+`backout_staging_run_id` (prior successful staging deployment run),
+`compatibility_note` (format `schema-<id>+DO-<state>+flags-<state>`, strict
+tokens only), and optional `session_attestation` (counts and windows only;
+see below). Before dispatch, recheck the pair with read-only calls: the
+source commit is on `main` with green required checks and an independent
+review; the staging run's evidence shows the same digest serving; the schema,
+Durable Object state, bindings and enabled flags are unchanged since that
+pair (no DB or storage rewind and no migrations happen in the drill, by
+construction). The script cross-checks live what it can (prior rollout
+completed with the image, Worker version served traffic, same namespace
+binding, baseline healthy with a proven revision) and refuses same-image,
+never-served and incompatible pairs before any change.
+
+Session witness: one healthy instance or `/readyz` is not acceptance. The
+script records a temporally complete probe timeline per leg and requires a
+covering operator log-count attestation of exactly one distinct gateway
+session across each handoff window (`fenced` to `first_ready` in the
+evidence). Obtain the counts from the staging Worker logs over those UTC
+windows and record only the counts, never session identifiers, tokens,
+bodies or member content. Without that attestation the witness is
+NOT_PROVEN and the drill fails acceptance while still restoring the
+baseline; mark missing coverage NOT_PROVEN, never PASS. Same-image evidence
+is rejected as container-drill acceptance. On a 401/403 the restore is
+skipped with no credential fallback: recover with a `deploy-staging`
+dispatch with `release_fence=true` after the binding is fixed.
 
 Cloudflare references:
 [Worker rollbacks and resource limits](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/),
@@ -796,6 +863,8 @@ would permit recovery. Do not actually disconnect Discord, change a Neon/
 Hyperdrive binding, delete a checkpoint, send a moderation action, or stop the
 staging container. [Tabletop evidence](incident-tabletop-2026-10-01.md) separates
 local source rehearsal, actual staging observations and unfinished acceptance.
+The [October-6 staging record](incident-tabletop-2026-10-06.md) is the Discord and
+Neon dry run against the live staging baseline, with its open evidence gaps.
 A denied observation or successful offline test is not a completed staging drill.
 
 ### Discord gateway or API outage

@@ -352,6 +352,59 @@ async fn rename_429_returns_to_the_queue_instead_of_delaying_room_deletion() {
 }
 
 #[tokio::test]
+async fn set_room_user_limit_patches_only_the_limit() {
+    let mock = Mock::start(vec![
+        response(200, created_channel()),
+        response(200, created_channel()),
+    ])
+    .await;
+    mock.api.set_room_user_limit(600, 7, || true).await.unwrap();
+    // Unlimited is the Discord value 0, never an omitted field.
+    mock.api.set_room_user_limit(600, 0, || true).await.unwrap();
+    let requests = mock.state.recorded.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, Method::PATCH);
+    assert_eq!(requests[0].body, json!({"user_limit": 7}));
+    assert_eq!(requests[1].body, json!({"user_limit": 0}));
+}
+
+#[tokio::test]
+async fn set_room_user_limit_refuses_out_of_range_before_any_request() {
+    let mock = Mock::start(Vec::new()).await;
+    assert_eq!(
+        mock.api.set_room_user_limit(600, 100, || true).await,
+        Err(RoomHttpError::InvalidRequest)
+    );
+    assert_eq!(
+        mock.api.set_room_user_limit(600, u32::MAX, || true).await,
+        Err(RoomHttpError::InvalidRequest)
+    );
+    assert_eq!(
+        mock.api.set_room_user_limit(0, 5, || true).await,
+        Err(RoomHttpError::InvalidRequest)
+    );
+    assert!(mock.state.recorded.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn set_room_user_limit_429_returns_to_the_queue() {
+    let mock = Mock::start(vec![ScriptedResponse {
+        status: 429,
+        body: json!({"retry_after": 2.5, "global": false}),
+        headers: vec![("retry-after", "2.5"), ("x-ratelimit-scope", "shared")],
+    }])
+    .await;
+    assert_eq!(
+        mock.api.set_room_user_limit(600, 3, || true).await,
+        Err(RoomHttpError::RateLimited {
+            retry_after_ms: 2500,
+            global: false
+        })
+    );
+    assert_eq!(mock.state.recorded.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn global_retry_after_is_shared_across_clones_and_occupancy_is_checked_after_waiting() {
     let mock = Mock::start(vec![
         ScriptedResponse {
@@ -484,4 +537,162 @@ async fn vote_kick_deny_is_member_scoped_connect_only_on_that_room() {
         })
     );
     assert!(requests[0].bot_authenticated);
+}
+
+fn join_buttons() -> Vec<Component> {
+    use twilight_model::channel::message::component::{ActionRow, Button, ButtonStyle};
+    vec![Component::ActionRow(ActionRow {
+        id: None,
+        components: vec![Component::Button(Button {
+            id: None,
+            custom_id: Some("two:voice:join-approve:500:7".to_owned()),
+            disabled: false,
+            emoji: None,
+            label: Some("Approve".to_owned()),
+            style: ButtonStyle::Success,
+            url: None,
+            sku_id: None,
+        })],
+    })]
+}
+
+#[tokio::test]
+async fn join_prompt_posts_buttons_pings_only_the_owner_and_returns_the_message() {
+    let mock = Mock::start(vec![response(
+        200,
+        json!({"id": "9001", "channel_id": "500"}),
+    )])
+    .await;
+    let posted = mock
+        .api
+        .post_component_message(
+            500,
+            "<@300>, <@401> is waiting.",
+            Some(300),
+            &join_buttons(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        posted,
+        MessageRef {
+            channel_id: 500,
+            message_id: 9001
+        }
+    );
+    let requests = mock.state.recorded.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, Method::POST);
+    assert_eq!(requests[0].path, "/api/v10/channels/500/messages");
+    assert_eq!(requests[0].body["content"], "<@300>, <@401> is waiting.");
+    // The owner is the only user who can be pinged by the text.
+    assert_eq!(
+        requests[0].body["allowed_mentions"]["users"],
+        json!(["300"])
+    );
+    assert_eq!(requests[0].body["allowed_mentions"]["parse"], json!([]));
+    assert_eq!(
+        requests[0].body["components"][0]["components"][0]["custom_id"],
+        "two:voice:join-approve:500:7"
+    );
+    assert!(requests[0].bot_authenticated);
+}
+
+#[tokio::test]
+async fn a_bodyless_success_is_never_a_message_id() {
+    let mock = Mock::start(vec![
+        response(200, json!({})),
+        response(200, json!({"id": "0"})),
+    ])
+    .await;
+    // A 2xx that names no message (or message zero) is an unknown outcome.
+    for _ in 0..2 {
+        assert_eq!(
+            mock.api
+                .post_component_message(500, "hi", None, &join_buttons())
+                .await,
+            Err(RoomHttpError::UnknownOutcome)
+        );
+    }
+    assert_eq!(
+        mock.api
+            .post_component_message(0, "hi", None, &join_buttons())
+            .await,
+        Err(RoomHttpError::InvalidRequest)
+    );
+    assert_eq!(mock.state.recorded.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn retiring_a_join_prompt_edits_it_to_no_buttons_and_no_mentions() {
+    let mock = Mock::start(vec![
+        response(200, json!({"id": "9001"})),
+        response(404, json!({"code": 10008})),
+    ])
+    .await;
+    let message = MessageRef {
+        channel_id: 500,
+        message_id: 9001,
+    };
+    mock.api
+        .edit_component_message(message, "This join request is no longer pending.", &[])
+        .await
+        .unwrap();
+    // A message that is already gone is reported, not hidden.
+    assert_eq!(
+        mock.api.edit_component_message(message, "x", &[]).await,
+        Err(RoomHttpError::NotFound)
+    );
+    assert_eq!(
+        mock.api
+            .edit_component_message(
+                MessageRef {
+                    channel_id: 0,
+                    message_id: 1
+                },
+                "x",
+                &[]
+            )
+            .await,
+        Err(RoomHttpError::InvalidRequest)
+    );
+    let requests = mock.state.recorded.lock().unwrap();
+    assert_eq!(requests[0].method, Method::PATCH);
+    assert_eq!(requests[0].path, "/api/v10/channels/500/messages/9001");
+    assert_eq!(
+        requests[0].body["content"],
+        "This join request is no longer pending."
+    );
+    assert_eq!(requests[0].body["components"], json!([]));
+    assert_eq!(requests[0].body["allowed_mentions"]["parse"], json!([]));
+}
+
+#[tokio::test]
+async fn deleting_a_member_overwrite_treats_an_absent_one_as_done() {
+    let mock = Mock::start(vec![
+        response(204, Value::Null),
+        response(404, json!({"code": 10009})),
+        response(403, json!({"code": 50013})),
+    ])
+    .await;
+    mock.api
+        .delete_member_overwrite(500, 401, || true)
+        .await
+        .unwrap();
+    mock.api
+        .delete_member_overwrite(500, 402, || true)
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.api.delete_member_overwrite(500, 403, || true).await,
+        Err(RoomHttpError::AccessDenied)
+    );
+    assert_eq!(
+        mock.api.delete_member_overwrite(0, 401, || true).await,
+        Err(RoomHttpError::InvalidRequest)
+    );
+    let requests = mock.state.recorded.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method, Method::DELETE);
+    assert_eq!(requests[0].path, "/api/v10/channels/500/permissions/401");
 }

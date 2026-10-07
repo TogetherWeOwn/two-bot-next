@@ -121,6 +121,7 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_INTERNAL_BIND_HOST", SettingClass::EnvOnly),
     ("TWO_INTERNAL_CALLERS", SettingClass::EnvOnly),
     ("TWO_INTERNAL_CHANNEL_KEYS", SettingClass::EnvOnly),
+    ("TWO_INTERNAL_CONTAINER", SettingClass::EnvOnly),
     ("TWO_INTERNAL_PORT", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ROLE_KEYS", SettingClass::EnvOnly),
     // --- capability gates outside the namespace (TOG-3183 finding) ---
@@ -897,6 +898,7 @@ mod tests {
         "TWO_INTERNAL_BIND_HOST",
         "TWO_INTERNAL_CALLERS",
         "TWO_INTERNAL_CHANNEL_KEYS",
+        "TWO_INTERNAL_CONTAINER",
         "TWO_INTERNAL_PORT",
         "TWO_INTERNAL_ROLE_KEYS",
         "TWO_MODERATION",
@@ -929,7 +931,7 @@ mod tests {
             assert_eq!(classify_key(key), Some(SettingClass::EnvOnly), "{key}");
         }
         let expected_total = EXPECTED_HOT.len() + EXPECTED_COLD.len() + EXPECTED_ENV_ONLY.len();
-        assert_eq!(expected_total, 121, "tripwire lists must stay complete");
+        assert_eq!(expected_total, 122, "tripwire lists must stay complete");
         assert_eq!(
             SETTING_CLASSES.len(),
             expected_total,

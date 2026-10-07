@@ -110,6 +110,7 @@ pub const SCORECARD_DISABLED_REPLY: &str = "Attendance capture is not enabled on
 pub enum HandlerId {
     Rank,
     Leaderboard,
+    Help,
     ScorecardAttendance,
     AutomationAdmin,
     AutomationCustom,
@@ -354,9 +355,9 @@ impl InteractionRouter {
         tracing::warn!(
             target: "two_bot_core::command_permissions",
             command = row.command,
-            guild_id = ?guild_id,
+            guild_id = guild_id.map(|id| id.to_string()),
             required_permissions = row.required_permissions,
-            actor_permissions = ?actor_permissions,
+            actor_permissions = actor_permissions.map(|id| id.to_string()),
             "command_permission_denied"
         );
         false
@@ -468,6 +469,13 @@ impl InteractionRouter {
             },
             "leaderboard" => Row {
                 handler: HandlerId::Leaderboard,
+                gate: RowGate::Always,
+                permission_refusal: None,
+            },
+            // Next-only discovery surface: always on, open to
+            // everyone, answered from the live publish set.
+            "help" => Row {
+                handler: HandlerId::Help,
                 gate: RowGate::Always,
                 permission_refusal: None,
             },
@@ -710,6 +718,7 @@ mod tests {
         let cases: &[(&str, HandlerId)] = &[
             ("rank", HandlerId::Rank),
             ("leaderboard", HandlerId::Leaderboard),
+            ("help", HandlerId::Help),
             ("ban", HandlerId::Moderation(ModerationAction::Ban)),
             ("tempban", HandlerId::Moderation(ModerationAction::TempBan)),
             ("kick", HandlerId::Moderation(ModerationAction::Kick)),
@@ -742,7 +751,7 @@ mod tests {
             ("feed-remove", HandlerId::FeedRemove),
             ("feed-list", HandlerId::FeedList),
         ];
-        assert_eq!(cases.len(), 27, "all 27 builtins covered");
+        assert_eq!(cases.len(), 28, "all 28 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1217,20 +1226,20 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 2 core + 1 scorecard + 8 automation + 7 announcement + 9 moderation
-        // + 1 custom = 28, in legacy publish order, guild-only throughout.
-        assert_eq!(set.len(), 28);
-        assert_eq!(&names[..3], ["rank", "leaderboard", "attendance"]);
+        // 3 core + 1 scorecard + 8 automation + 7 announcement + 9 moderation
+        // + 1 custom = 29, in legacy publish order, guild-only throughout.
+        assert_eq!(set.len(), 29);
+        assert_eq!(&names[..4], ["rank", "leaderboard", "help", "attendance"]);
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
         assert_eq!(
-            &names[18..27],
+            &names[19..28],
             [
                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(names[27], "faq");
+        assert_eq!(names[28], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1245,7 +1254,7 @@ mod tests {
         });
         let set = off.publish_set(&[]).expect("core-only set");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard"]);
+        assert_eq!(names, ["rank", "leaderboard", "help"]);
     }
 
     #[test]
@@ -1266,7 +1275,7 @@ mod tests {
         // invocation refuses at dispatch, so publishing burns the ceiling.
         let set = off.publish_set(&[row()]).expect("core-only set");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard"]);
+        assert_eq!(names, ["rank", "leaderboard", "help"]);
         // Over-limit stored catalogs no longer fail the publish either.
         let crowded: Vec<_> = (0..99)
             .map(|i| CustomCommand {
@@ -1276,7 +1285,7 @@ mod tests {
             })
             .collect();
         let set = off.publish_set(&crowded).expect("core-only set");
-        assert_eq!(set.len(), 2);
+        assert_eq!(set.len(), 3);
     }
 
     #[test]
@@ -1329,5 +1338,76 @@ mod tests {
         );
         assert!(!gates.automations && gates.announcements && !gates.moderation);
         assert!(gates.scorecard && !gates.tickets && gates.onboarding_picker);
+    }
+
+    /// `command_permission_denied` must log Discord IDs as decimal strings
+    /// (`docs/logging.md`), never `Some(…)` or JSON numbers.
+    #[test]
+    fn permission_denied_logs_decimal_string_ids() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+        struct Guard<'a>(std::sync::MutexGuard<'a, Vec<u8>>);
+
+        impl std::io::Write for Guard<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for SharedBuf {
+            type Writer = Guard<'a>;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                Guard(self.0.lock().unwrap_or_else(|e| e.into_inner()))
+            }
+        }
+
+        let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(buf.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!InteractionRouter::permission_allowed(
+                "purge",
+                Some(GUILD),
+                Some(0)
+            ));
+        });
+        let text = String::from_utf8(buf.0.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .expect("log output is utf-8");
+        let denied = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| {
+                event
+                    .get("fields")
+                    .and_then(|fields| fields.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("command_permission_denied")
+            })
+            .expect("permission denial is logged");
+        let fields = denied.get("fields").expect("json fields envelope");
+        assert_eq!(
+            fields.get("guild_id").and_then(serde_json::Value::as_str),
+            Some("2222"),
+            "guild id must be a decimal string, not Some(…)"
+        );
+        assert_eq!(
+            fields
+                .get("actor_permissions")
+                .and_then(serde_json::Value::as_str),
+            Some("0"),
+            "actor permissions must be a decimal string"
+        );
     }
 }
