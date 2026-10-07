@@ -30,11 +30,22 @@ USER_AGENT = "two-bot-next-staging-rollout/1.0"
 # whose only deviation is a `LAG_COUNTS` instance-counter shape is accepted. Each pass re-checks every identity and
 # runtime probe; any non-passing poll resets the streak.
 ACTIVE_LAG_CONFIRMATIONS = 2
-# Polls (5s apart) tolerated while a completed rollout's target image is not
-# yet reflected by the application listing. The listing is read separately from
-# the rollout record and can trail it right after a deploy; a persistent
-# mismatch still fails closed as `application_image_drift`.
-APPLICATION_IMAGE_STALE_POLLS = 12
+# Polls tolerated while a completed rollout's target image is not yet reflected
+# by the application listing. The listing is read separately from the rollout
+# record and can trail it right after a deploy; a persistent mismatch still
+# fails closed as `application_image_drift`. A poll cycle runs about 11s in CI
+# (5s sleep plus the control-plane reads), so 24 polls is roughly 4.5 minutes.
+# Stale polls only count once the rollout completes while the 300s verify
+# deadline runs from the start, so the deadline usually ends a mismatch that
+# never clears before this cap does; verify reports that as the same drift
+# (see `IMAGE_DRIFT_DIAGNOSTIC_SECONDS`). Twelve (about 2.5 minutes) sat in the
+# middle of the observed lag: on 10-05..10-07 completed verify steps ran up to
+# 192s while eight runs with a healthy, exact-build container failed at 129-186s.
+APPLICATION_IMAGE_STALE_POLLS = 24
+# Extra time after the verify deadline for the control-plane read behind the
+# drift diagnostic, including when an in-flight poll read reaches the deadline.
+# It cannot accept a rollout; it only labels the failure.
+IMAGE_DRIFT_DIAGNOSTIC_SECONDS = 15
 TOKEN = re.compile(r"[a-z0-9_]{1,32}")
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 IMAGE = rf"registry\.cloudflare\.com/[^/@\s]+/{APPLICATION}@sha256:[0-9a-f]{{64}}"
@@ -537,15 +548,17 @@ def image_drift_detail(client, app, row, image):
     rollout (`target`, its pre-deploy `baseline`, or `other`) and whether a
     rollout created after the pinned one exists, with its target class. Tokens
     and integers only; digests, configurations and ids never reach the log.
-    Returns None rather than raising, so it cannot mask the gate failure.
+    If a supplemental read fails, keep the listing tokens already collected;
+    return None only when no diagnostic can be built.
     """
     def kind(candidate, before):
         return ("target" if candidate == image
                 else "baseline" if candidate is not None and candidate == before else "other")
 
+    parts = []
     try:
         before = mapping(row.get("current_configuration")).get("image")
-        parts = [f"listing_image={kind(mapping(app.get('configuration')).get('image'), before)}"]
+        parts.append(f"listing_image={kind(mapping(app.get('configuration')).get('image'), before)}")
         version = app.get("version")
         target = number(row.get("target_version"))
         if type(version) is int:
@@ -562,9 +575,25 @@ def image_drift_detail(client, app, row, image):
                          + (status if status in ("pending", "progressing", "completed", "replaced",
                                                  "reverted") else "unknown")
                          + ":" + kind(mapping(newest.get("target_configuration")).get("image"), before))
-        return " ".join(parts)
     except Exception:
-        return None
+        return " ".join(parts) or None
+    return " ".join(parts) or None
+
+
+def deadline_aware_read(client, read, app, row, image, drift_candidate):
+    """Classify only expired poll reads backed by an observed stale rollout."""
+    try:
+        return read()
+    except GateError as error:
+        if str(error) not in ("api_transport_failure", "rollout_timeout"):
+            raise
+        if (time.monotonic() < client.deadline or not drift_candidate or app is None or row is None
+                or mapping(app.get("configuration")).get("image") == image):
+            raise
+        if "gateway_failure=" in (client.observation or ""):
+            raise GateError("rollout_timeout") from None
+        client.deadline = time.monotonic() + IMAGE_DRIFT_DIAGNOSTIC_SECONDS
+        raise GateError("application_image_drift", image_drift_detail(client, app, row, image)) from None
 
 
 def verify(args, client):
@@ -576,27 +605,34 @@ def verify(args, client):
     pinned = None
     lag_streak = 0
     image_stale = 0
+    drift_candidate = False
+    app = row = None
     while time.monotonic() < client.deadline:
         probed = False
         passed = False
-        app = application(client)
+        app = deadline_aware_read(
+            client, lambda: application(client), app, row, image, drift_candidate)
         require(app["id"] == baseline["application_id"]
                 and app["durable_objects"]["namespace_id"] == baseline["namespace_id"], "application_identity_drift")
         if pinned is None:
             pinned = select_rollout(rollouts(client, app["id"]), baseline, image)
             client.observation = "no_new_rollout"
         if pinned is not None:
-            row = mapping(client.api(f"/containers/applications/{app['id']}/rollouts/{identifier(pinned['id'])}"))
+            path = f"/containers/applications/{app['id']}/rollouts/{identifier(pinned['id'])}"
+            row = mapping(deadline_aware_read(
+                client, lambda: client.api(path), app, row, image, drift_candidate))
             require(row.get("id") == pinned["id"], "rollout_identity_drift")
             complete = converged(row, image, number(pinned.get("target_version")))
             lag = False if complete else active_lag(row, image, number(pinned.get("target_version")))
             client.observation = rollout_observation(row)
             if not (complete or lag):
+                drift_candidate = False
                 # An out-of-band Worker version (secret put outside the deploy)
                 # invalidates the ownership record, so this rollout can never
                 # converge: fail fast instead of burning the verify budget.
                 active_worker(client, version)
             stale = (complete or lag) and mapping(app.get("configuration")).get("image") != image
+            drift_candidate = stale
             if stale:
                 image_stale += 1
                 client.observation += f" application_image=stale polls={image_stale}"
@@ -648,15 +684,26 @@ def verify(args, client):
                         lag_streak += 1
                         passed = True
         # Warming is allowed, but never acceptance evidence; discard the body.
-        client.request(url + "/health")
+        deadline_aware_read(
+            client, lambda: client.request(url + "/health"), app, row, image, drift_candidate)
         # Only once this build's rollout exists: before that nothing of ours runs.
         if pinned is not None and not probed:
-            failure = unconverged_failure(client, url, version, baseline["revision"], baseline["build_id"])
+            failure = deadline_aware_read(
+                client, lambda: unconverged_failure(
+                    client, url, version, baseline["revision"], baseline["build_id"]),
+                app, row, image, drift_candidate)
             if failure:
                 client.observation += " gateway_failure=" + failure
         if not passed:
             lag_streak = 0
         time.sleep(max(0, min(5, client.deadline - time.monotonic())))
+    # The deadline ran out while the listing still trailed a completed rollout:
+    # that is the drift, not a bare timeout, so report it with its diagnostic.
+    # A gateway failure named in the last observation keeps `rollout_timeout`,
+    # because the rollback triggers key on that class plus the named failure.
+    if image_stale and "gateway_failure=" not in (client.observation or ""):
+        client.deadline = time.monotonic() + IMAGE_DRIFT_DIAGNOSTIC_SECONDS
+        raise GateError("application_image_drift", image_drift_detail(client, app, row, image))
     raise GateError("rollout_timeout")
 
 
