@@ -34,5 +34,13 @@
   "plan_manifest_sha256": "e4a3136346ca546df4f1f4f654322c278ff7df1d5902ec5685cd43036b41beea",
   "plan_run_id": "",
   "plan_provenance_verified": false,
-  "applied_count": 0
+  "applied_count": 0,
+  "audit": {
+    "ledger_owner": "two_bot_migrator",
+    "ledger_counts": {"successful_rows": 0, "max_version": null, "failed_rows": 0},
+    "memberships": [{"login": "two_bot_migrator_ro_plan", "member_of": "two_bot_migrator_ro"}],
+    "verify_findings": [],
+    "matrix_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "verify_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
 }

@@ -618,6 +618,17 @@ async fn real_sqlx_runner_cases() -> TestResult {
         .collect();
     assert_eq!(pending_list(&m["pending_before"]), expected);
     assert_eq!(m["ledger_before"].as_array().unwrap().len(), 29);
+    // The plan-only readout ran under the read-only role: it reports the ledger
+    // owner, counts and verifier findings, and never an error.
+    let audit = &m["audit"];
+    assert!(audit["error"].is_null(), "readout failed: {}", audit["error"]);
+    assert!(audit["ledger_owner"].as_str().is_some());
+    assert_eq!(audit["ledger_counts"]["successful_rows"], 29);
+    assert_eq!(audit["ledger_counts"]["failed_rows"], 0);
+    assert!(audit["memberships"].is_array());
+    assert!(audit["verify_findings"].is_array());
+    assert_eq!(audit["matrix_sha256"].as_str().map(str::len), Some(64));
+    assert_eq!(audit["verify_sha256"].as_str().map(str::len), Some(64));
     // Pending spans both sides of the ledger max: versions below 390 were
     // never applied, yet SQLx must still pick them up.
     assert!(expected.contains(&201), "below-max gap must be pending");
@@ -709,6 +720,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
     assert_eq!(m["applied_count"], expected.len() as u64);
     assert_eq!(m["role"], "two_bot_migrator", "apply path is unchanged");
     assert_eq!(m["plan_provenance_verified"], true);
+    assert!(m["audit"].is_null(), "apply emits no plan readout");
     assert!(m["role_verified_connections"].as_u64().unwrap() >= 1);
     assert_eq!(m["ledger_after"].as_array().unwrap().len() as u64, total);
     assert!(!out.contains("postgres://"), "manifest must not echo URLs");
