@@ -1581,6 +1581,7 @@ jobs:
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release.cjs
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release-publication.cjs
+          NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-commit-parse-guard.cjs
 
   # Single always-run aggregator for the path-filtered matrix. GitHub counts
   # a skipped job as passing and leaves a required context pending when its
