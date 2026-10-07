@@ -79,13 +79,36 @@ channel or substitute credentials.
    recorded_at`). The DB cannot show redeliveries, so `duplicate` stays a
    fixture-only disposition. Raw rows stay with the reader and are discarded
    after the export.
-3. **Reconcile.** Feed both lists to `EvidenceLedger` with the deployed
-   revision and attach `export()` to the soak card, stamped as
-   `evidence-soak_expected_committed-{window}.json` (see
+3. **Reconcile.** Run the runnable reconciler over both files with the
+   deployed revision and the window start (QA is an agent and cannot call
+   the `EvidenceLedger` library directly):
+
+   ```sh
+   cargo build -p two-bot-core --example evidence_reconcile --locked
+   ./target/debug/examples/evidence_reconcile \
+     --expected qa_expected.json --rows staging_rows.json \
+     --revision <deploy-sha> --window 2026-10-09T20-11-06Z
+   ```
+
+   (On the persistent controller, route the build through the cache
+   wrapper per [build-cache.md](build-cache.md) and run the example
+   binary it produces; the wrapper does not take `run`.)
+
+   `--expected` is the QA JSON array
+   (`[{alias, family, at, disposition?, reason?}]`, family one of
+   `join` / `voice` / `message`, `disposition` only ever `excluded` or
+   `failed` with a reason code); `--rows` is the sanitized rows artifact
+   (`{rows: [{ordinal, event_type, recorded_at}], truncated}`, no
+   idempotency keys and no raw IDs — extra per-row fields are refused).
+   The runner assigns opaque per-row keys (`r<ordinal>`), writes `export()`
+   to `evidence-soak_expected_committed-{window}.json` (see
    `evidence_packet_filename` and the rule-id spelling in
-   [metrics.md](metrics.md)). `gaps > 0` or any
-   overflow flag fails that window. File a card; do not restart anything
-   only to fill a table.
+   [metrics.md](metrics.md)), and prints one summary line with the
+   expected / matched / gaps counts. Exit 0 means the window is clean;
+   exit 1 means `gaps > 0` or an overflow/truncation flag is set (attach
+   the packet to the soak card and file a card; do not restart anything
+   only to fill a table); exit 2 means malformed input or an IO failure,
+   in which case nothing is written.
 
 Offline fixture runs (`cargo test -p two-bot-core --lib evidence`) prove the
 seam, not staging coverage. Only a packet from step 3 is live evidence.
