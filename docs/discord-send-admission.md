@@ -174,9 +174,10 @@ send: a retry after its own 429/5xx re-checks admission once and refuses), polli
 (65 s, just above the 60 s lease so a dead holder always clears inside the wait).
 A `Blocked` attempt never reached the wire, so nothing is resent and the lease
 argument above is untouched; every other error returns at once, and past the
-window every caller gets the single bounded attempt as before. Indefinite and
-finite-cooldown holds still never clear, so they now fail after the wait instead
-of after the first refusal.
+window every caller gets the single bounded attempt as before. An indefinite
+hold never clears, so it now fails after the wait instead of after the first
+refusal; a finite cooldown clears when it expires, inside the wait if it is shorter
+than the budget.
 
 Indefinite holds require explicitly authorized reconciliation. There is
 intentionally no startup reset or "force send" switch. Before any manual
