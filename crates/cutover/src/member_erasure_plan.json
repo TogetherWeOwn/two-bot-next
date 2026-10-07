@@ -53,12 +53,12 @@
     {
       "table": "moderation_idempotency",
       "columns": ["result_json", "idempotency_key"],
-      "predicate": "guild_id = $1 AND (state IS DISTINCT FROM 'done' OR outcome IS DISTINCT FROM 'operator_released') AND (result_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR idempotency_key IN (SELECT idempotency_key FROM moderation_audit WHERE guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR metadata_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))))"
+      "predicate": "guild_id = $1 AND (state IS DISTINCT FROM 'done' OR outcome IS DISTINCT FROM 'operator_released') AND (result_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR idempotency_key ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR idempotency_key IN (SELECT idempotency_key FROM moderation_audit WHERE guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR reason ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR metadata_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))))"
     },
     {
       "table": "moderation_audit",
-      "columns": ["actor_id", "target_id", "metadata_json"],
-      "predicate": "guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR metadata_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))"
+      "columns": ["actor_id", "target_id", "idempotency_key", "reason", "metadata_json"],
+      "predicate": "guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR idempotency_key ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR reason ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR metadata_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))"
     },
     {
       "table": "moderation_warnings",
@@ -270,12 +270,17 @@
     {
       "table": "moderation_idempotency",
       "column": "idempotency_key",
-      "reason": "An operator-released request must retain its request key as a replay fence so delayed delivery cannot repeat the uncertain Discord mutation."
+      "reason": "An operator-released request must retain its caller-supplied key as a replay fence, even if it is a member snowflake; removing or changing this indefinite identity-bearing exception could let delayed delivery repeat the uncertain Discord mutation."
+    },
+    {
+      "table": "moderation_idempotency",
+      "column": "claim_token",
+      "reason": "An operator-released request replaces its obsolete ownership token with the fixed non-identity operator_released marker; no live claim can be resumed."
     },
     {
       "table": "moderation_idempotency",
       "column": "request_hash",
-      "reason": "An operator-released request retains only the fixed non-identity operator_released marker; its actor-derived request hash is overwritten and redacted from inspection/audit snapshots."
+      "reason": "An operator-released request replaces its actor-derived request hash with the fixed non-identity operator_released marker, redacted from inspection/audit snapshots."
     }
   ]
 }

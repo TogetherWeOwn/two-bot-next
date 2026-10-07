@@ -90,14 +90,20 @@ async fn release_audits_previous_state_preserves_seed_and_prevents_old_key_repla
         .unwrap()
         .unwrap();
     assert_eq!(store.get_lockdown(CHANNEL).await.unwrap(), Some(seed));
-    let released_hash: String = sqlx::query_scalar(
-        "SELECT request_hash FROM moderation_idempotency WHERE guild_id = $1 AND idempotency_key = 'wedged'",
+    let released_markers: (String, String) = sqlx::query_as(
+        "SELECT claim_token, request_hash FROM moderation_idempotency WHERE guild_id = $1 AND idempotency_key = 'wedged'",
     )
     .bind(GUILD)
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(released_hash, "operator_released");
+    assert_eq!(
+        released_markers,
+        (
+            "operator_released".to_owned(),
+            "operator_released".to_owned()
+        )
+    );
     assert!(store
         .inspect_channel_lane(GUILD, CHANNEL, "wedged")
         .await

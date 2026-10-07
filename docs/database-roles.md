@@ -74,11 +74,15 @@ PostgreSQL login and effective role. No public/slash/website release route exist
 
 The ledger is retained as a terminal replay tombstone, not deleted, and the
 member-erasure plan skips it (`done` / `operator_released`), so the personal audit
-rows can be erased without re-arming the old key. Release replaces the
-actor-derived request hash with the fixed `operator_released` marker; the original
-value is redacted from the inspection and audit snapshot. A read-only
-login cannot confirm release; `two_web_reader` cannot inspect or release these
-base tables. No new privilege is required. Follow the
+rows can be erased without re-arming the old key. The caller-supplied key may
+itself be a member snowflake; if so, it remains as an identity-bearing replay
+fence because changing it could let delayed delivery repeat the uncertain
+mutation. The linked audit row, including matching keys and free-text reasons,
+remains covered by the erasure manifest. Release replaces the obsolete ownership
+token and actor-derived request hash with fixed `operator_released` markers; the
+original token and hash are redacted from inspection and audit snapshots. A
+read-only login cannot confirm release; `two_web_reader` cannot inspect or
+release these base tables. No new privilege is required. Follow the
 [channel reconciliation checklist](channel-lane-reconciliation.md) before any
 confirmation; a database grant is not incident approval.
 

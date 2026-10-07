@@ -159,7 +159,8 @@ impl ChannelModerationStore {
         });
         let retired = sqlx::query(
             "UPDATE moderation_idempotency
-                SET state = 'done', outcome = 'operator_released', request_hash = 'operator_released',
+                SET state = 'done', outcome = 'operator_released',
+                    claim_token = 'operator_released', request_hash = 'operator_released',
                     result_json = $1, completed_at = NOW()
               WHERE guild_id = $2 AND idempotency_key = $3 AND claim_token = $4
                 AND state = 'in_flight' AND action = $5 AND request_hash = $6

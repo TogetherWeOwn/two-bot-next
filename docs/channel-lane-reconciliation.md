@@ -41,9 +41,15 @@ existing approval gates; integration tests use only disposable test services.
    byte-for-byte and retires the old request to `done/operator_released`, so old
    redelivery replays a no-mutation result. Member erasure (operator or original
    actor) erases their member-linked audit rows but never this `operator_released`
-   ledger row: it is the replay fence, holding only the key, action, fixed
-   `operator_released` request-hash marker, generic result and timestamps. The
-   actor-derived hash is redacted from inspection and audit snapshots. Resume
+   ledger row: it is the replay fence, retaining the guild/key scope, action,
+   `done/operator_released` state, generic result and timestamps. The
+   caller-supplied key may itself be a member snowflake; if so, it remains in this
+   tombstone after erasure so delayed delivery cannot claim afresh. This is an
+   indefinite identity-bearing retention exception. The linked audit row, including
+   a matching key or free-text reason, remains covered by the erasure manifest.
+   Release replaces the obsolete ownership token and actor-derived request hash
+   with fixed `operator_released` markers; the original token and hash are redacted
+   from inspection and audit snapshots. Resume
    workers only when safe. A new `/unlock` uses the surviving seed and a new
    request key; do not unlock a newer lockdown based on an old incident. Re-observe Discord after any authorized
    follow-up. Releasing a lane does not itself restore masks or reset slowmode.

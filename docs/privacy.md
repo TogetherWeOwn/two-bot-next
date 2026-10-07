@@ -67,10 +67,14 @@ are outside this implementation's scope.
   operator reconciled and released (`moderation_idempotency`, `done` /
   `operator_released`). Its Discord effect was never proven, so the row is the
   replay fence that keeps a delayed delivery of the old key from repeating the
-  mutation. It holds only the website or interaction key, action, a fixed
-  non-identity `operator_released` request-hash marker, generic result and
-  timestamps. Release overwrites the actor-derived request hash and redacts it
-  from inspection and audit snapshots. Member-linked moderation audit rows remain
+  mutation. It retains guild/key scope, action, terminal state/outcome, generic
+  result and timestamps. The caller-supplied key may itself be a member snowflake;
+  if so, that identity-bearing key remains in this tombstone after erasure because
+  changing or deleting it could let delayed delivery repeat the uncertain
+  mutation. Release replaces both the obsolete ownership token and actor-derived
+  request hash with fixed non-identity `operator_released` markers; the original
+  token and hash are redacted from inspection and audit snapshots. Linked
+  `moderation_audit` rows, including matching keys and free-text reasons, remain
   covered by the erasure manifest.
 - Internal action/replay ledgers store actor/target/resource IDs and outcomes,
   with hashed keys/nonces/event identities. Settings and immutable settings audit
@@ -103,7 +107,7 @@ The manifest explicitly retains these control-plane records:
 | `guild_settings_audit.actor`, `old_value`, `new_value` | Immutable configuration history; the database refuses DELETE, UPDATE and TRUNCATE, even a zero-row DELETE. No trigger disabling or audit bypass is permitted. IDs in prior/current policy remain here. |
 | `audit_kill_switch.engaged_by` | Global incident-control attribution, with no guild scope. Member erasure never disengages or rewrites the halt. |
 | `member_erasure_audit.actor` | Minimal operator accountability, retained independently of member activity. It is not the erased subject field. |
-| `moderation_idempotency` rows with `done` / `operator_released` | Indefinite replay fence for an uncertain Discord mutation. It retains the request key, action, fixed `operator_released` marker, generic result and timestamps; the actor-derived request hash is overwritten, and the inspection/audit snapshot redacts it. |
+| `moderation_idempotency` rows with `done` / `operator_released` | Indefinite replay fence for an uncertain Discord mutation. It retains the guild-scoped caller key, which may itself be a member snowflake and therefore remains as identity-bearing data, plus action, fixed `claim_token` and `request_hash` markers, generic result and timestamps. The obsolete ownership token and actor-derived request hash are replaced, and the original hash is redacted from inspection/audit snapshots. |
 
 These exceptions currently have **no enforced expiry**. This CLI is not a claim
 that all personal data is gone. A request involving retained policy/audit data
