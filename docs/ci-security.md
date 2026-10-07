@@ -87,6 +87,33 @@ another credential. Recovery then is a `deploy-staging` dispatch with
 `release_fence=true` once the binding is fixed. Only allowlisted ids, integers,
 statuses and timestamps reach the log, the job summary and the evidence file.
 
+## Staging events read (manual)
+
+`staging-events-read.yml` is a manual, staging-only, read-only workflow that
+gives the B2 soak its processed-side evidence ([evidence-route.md](evidence-route.md)
+step 2) without handing any agent a database credential. The regression pins it
+as `workflow_dispatch`-only with exactly two required string inputs
+(`window_start`, `window_end`; no member, guild or default). Its single `read`
+job runs only from `main`, in the `staging-events-read` environment, on the
+routed runner for job `read`, with `contents: read`, a 5-minute timeout and its
+own non-cancelling concurrency group. It has exactly three unconditional steps:
+pinned checkout without persisted credentials, one Run step that passes the
+inputs through the environment (never an inline expression) to
+`scripts/staging_events_read.py`, and the 14-day upload of
+`staging-events-read-<run_id>.json`. The only secrets it may name are
+`TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL` (role `two_bot_events_ro`, column-limited
+`SELECT` on `events`) and `STAGING_FIXTURE_MEMBER_ID`, scoped to that Run step.
+The member is a secret rather than a variable because a step's `env` block
+prints variable values on the public run page. No `set -x`, no wrangler, no
+production path.
+
+The script refuses before connecting unless the window is a past UTC window of
+at most 15 minutes, the guild is the pinned TWO Staging guild (the live guild
+refuses), and the login names role `two_bot_events_ro` on database `two_bot` at a
+host that is not production-like. It keeps the password out of the process list,
+runs every statement in a `READ ONLY` transaction, never echoes the client's
+error text, and writes only an ordinal, `event_type` and `recorded_at` per row.
+
 ## Production route
 
 `deploy-production.yml` (main #243) is the one live deployment workflow. The

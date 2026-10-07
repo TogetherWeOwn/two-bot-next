@@ -1,0 +1,73 @@
+name: staging-events-read
+
+# Manual, staging-only, read-only `events` read for the B2 soak
+# (docs/evidence-route.md step 2). It hands QA the processed side of the
+# evidence without handing any agent a database credential. Never runs
+# automatically and has no production path. It reads only the
+# `staging-events-read` environment's existing bindings: the secret
+# TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL (role two_bot_events_ro, column-limited
+# SELECT on `events`) and the secret STAGING_FIXTURE_MEMBER_ID. It creates or
+# changes no credential. A missing environment fails the job; a missing
+# binding is refused before any connection.
+#
+# The fixture member is a secret, not a dispatch input and not a variable: a
+# step's env block is printed on the (public) run page with variable values in
+# clear, and a dispatcher must not be able to aim the read at another member.
+# The artifact carries only ordinal, event_type and recorded_at; the
+# idempotency key (it embeds guild:member), member, guild, source and metadata
+# never reach the artifact, the log or the step summary.
+on:
+  workflow_dispatch:
+    inputs:
+      window_start:
+        description: Window start, UTC, like 2026-10-07T14:00:00Z
+        type: string
+        required: true
+      window_end:
+        description: Window end, UTC, like 2026-10-07T14:15:00Z (after the start, at most 15 minutes later, already past)
+        type: string
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: staging-events-read
+  cancel-in-progress: false
+
+jobs:
+  read:
+    name: staging events read
+    permissions:
+      contents: read
+    # Dispatch from main only. The bindings are scoped to the
+    # staging-events-read environment (main-only deployment branches, no
+    # reviewer: the job is read-only, column-limited and row-capped) so a
+    # workflow edited on another branch cannot read them.
+    if: github.ref == 'refs/heads/main'
+    environment: staging-events-read
+    # Runner routing: see the note on `check` in check.yml. The script needs
+    # `psql`, which GitHub-hosted runners ship.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'read') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Read the fixture member's committed events
+        env:
+          # Must already exist as staging-events-read environment secrets;
+          # absent means refusal before any connection. Secrets print as ***.
+          TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL: ${{ secrets.TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL }}
+          STAGING_FIXTURE_MEMBER_ID: ${{ secrets.STAGING_FIXTURE_MEMBER_ID }}
+          WINDOW_START: ${{ inputs.window_start }}
+          WINDOW_END: ${{ inputs.window_end }}
+          RUN_ID: ${{ github.run_id }}
+        run: python3 scripts/staging_events_read.py --window-start "$WINDOW_START" --window-end "$WINDOW_END" --output "staging-events-read-$RUN_ID.json"
+      - name: Upload the sanitized read
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staging-events-read-${{ github.run_id }}
+          path: staging-events-read-${{ github.run_id }}.json
+          if-no-files-found: error
+          retention-days: 14

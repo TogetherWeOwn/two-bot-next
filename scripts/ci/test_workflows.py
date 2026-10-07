@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from pathlib import Path
+import re
 import tomllib
 import unittest
 
@@ -28,6 +29,8 @@ JOB_INVENTORY = {
     "staging-rollback-drill.yml": {"drill"},
     # Container-image backout/restore drill: manual, staging-only, pinned shape below.
     "staging-container-drill.yml": {"container-drill"},
+    # Manual read-only staging events read for the B2 soak; pinned shape below.
+    "staging-events-read.yml": {"read"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
     # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
     # `image` builds/scans the untrusted ref with pinned actions only; `verify`
@@ -509,6 +512,99 @@ def staging_container_drill_errors(workflow):
     return errors
 
 
+EVENTS_READ_ENV = {
+    "TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL": "${{ secrets.TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL }}",
+    "STAGING_FIXTURE_MEMBER_ID": "${{ secrets.STAGING_FIXTURE_MEMBER_ID }}",
+    "WINDOW_START": "${{ inputs.window_start }}",
+    "WINDOW_END": "${{ inputs.window_end }}",
+    "RUN_ID": "${{ github.run_id }}",
+}
+EVENTS_READ_COMMAND = ('python3 scripts/staging_events_read.py --window-start "$WINDOW_START" '
+                       '--window-end "$WINDOW_END" --output "staging-events-read-$RUN_ID.json"')
+
+
+def staging_events_read_errors(workflow):
+    """Manual staging-only read-only events read for the B2 soak.
+
+    Dispatch-only with exactly two required string inputs, the UTC window. The
+    fixture member is never an input and never a variable (a step's env block
+    prints variable values on the public run page): it is an environment
+    secret, like the read-only database login. One job runs only from main
+    through the `staging-events-read` environment, on the routed runner for job
+    `read`, with its own non-cancelling concurrency group and a 5 minute
+    timeout. Exactly three unconditional steps: pinned checkout without
+    persisted credentials, one Run step that passes the inputs through the
+    environment (never an inline expression) to the reviewed script, and the
+    14 day artifact upload of the sanitized file. Both bindings are scoped to
+    that Run step alone. No wrangler, no production path, no `set -x`.
+    """
+    name = "staging-events-read.yml"
+    errors = []
+    on = workflow.get("on") or {}
+    if set(on) != {"workflow_dispatch"}:
+        errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
+    dispatch = on.get("workflow_dispatch") or {}
+    inputs = dispatch.get("inputs") or {}
+    if set(dispatch) != {"inputs"} or set(inputs) != {"window_start", "window_end"}:
+        errors.append(f"{name}: workflow_dispatch must carry exactly window_start and window_end")
+    else:
+        for key, field in inputs.items():
+            field = field or {}
+            if (field.get("type") != "string" or str(field.get("required")).lower() != "true"
+                    or "default" in field):
+                errors.append(f"{name}: {key} must be a required string with no default")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    if workflow.get("concurrency") != {"group": "staging-events-read", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must use its own staging-events-read group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"read"}:
+        errors.append(f"{name}: jobs must be exactly read")
+        return errors
+    job = jobs["read"]
+    if job.get("environment") != "staging-events-read":
+        errors.append(f"{name}:read: must read the staging-events-read Environment bindings")
+    if job.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:read: must run only from main")
+    if job.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:read: must keep contents:read only")
+    if job.get("timeout-minutes") != "5":
+        errors.append(f"{name}:read: timeout must stay 5 minutes")
+    if not runner_allowed("read", job.get("runs-on")):
+        errors.append(f"{name}:read: must use the routed runner expression for job 'read'")
+    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        if key in job:
+            errors.append(f"{name}:read: must not set {key} (bindings stay on the single Run step)")
+    text = str(job).lower().replace(" ", "")
+    for marker in ("wrangler", "production", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
+                   "vars.staging_fixture_member_id", "inputs.member", "inputs.fixture"):
+        if marker in text:
+            errors.append(f"{name}:read: must not contain {marker!r}")
+    secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
+    if secrets != {"two_bot_staging_events_ro_database_url", "staging_fixture_member_id"}:
+        errors.append(f"{name}:read: must read exactly the two events-read secrets")
+    if set(re.findall(r"inputs\.([a-z0-9_]+)", text)) != {"window_start", "window_end"}:
+        errors.append(f"{name}:read: may reference only the two window inputs")
+    steps = job.get("steps") or []
+    if len(steps) != 3 or any(key in step for step in steps for key in ("if", "continue-on-error")):
+        errors.append(f"{name}:read: must run exactly checkout, the read and the upload, unconditionally")
+        return errors
+    checkout, run, upload = steps
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or (checkout.get("with") or {}).get("persist-credentials") != "false":
+        errors.append(f"{name}:read: checkout must be pinned and must not persist credentials")
+    if run.get("env") != EVENTS_READ_ENV:
+        errors.append(f"{name}:read: Run step must bind exactly the two secrets, the two windows and the run id")
+    if run.get("run") != EVENTS_READ_COMMAND or "uses" in run or "shell" in run:
+        errors.append(f"{name}:read: Run step must call the script with the inputs via the environment only")
+    if not str(upload.get("uses", "")).startswith("actions/upload-artifact@") or upload.get("with") != {
+            "name": "staging-events-read-${{ github.run_id }}",
+            "path": "staging-events-read-${{ github.run_id }}.json",
+            "if-no-files-found": "error", "retention-days": "14"}:
+        errors.append(f"{name}:read: must upload only the run's json for 14 days and fail if absent")
+    return errors
+
+
 def production_errors(workflow):
     """deploy-production is the one live route: dispatch-only, human-gated, chained to staging."""
     name = "deploy-production.yml"
@@ -591,6 +687,11 @@ def workflow_policy_errors(workflows):
             # environment/marker scan below would flag its staging binding
             # and the wrangler binary path the reviewed script drives.
             errors.extend(staging_container_drill_errors(workflow))
+            continue
+        if name == "staging-events-read.yml":
+            # Manual read-only events read: pinned shape above; the generic
+            # environment scan below would flag its Environment binding.
+            errors.extend(staging_events_read_errors(workflow))
             continue
         if name == "staging-migrate.yml":
             # Manual runner (TOG-11572): pinned shape above, not the
@@ -1028,6 +1129,83 @@ class WorkflowTests(unittest.TestCase):
         # The inventory pin fails closed if the workflow disappears or gains a job.
         missing = deepcopy(workflows)
         del missing["staging-container-drill.yml"]
+        self.assertTrue(workflow_policy_errors(missing))
+        self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_staging_events_read_shape_is_pinned(self):
+        workflows = self.workflows
+        self.assertEqual(staging_events_read_errors(workflows["staging-events-read.yml"]), [])
+
+        def mutate(change):
+            copy = deepcopy(workflows["staging-events-read.yml"])
+            change(copy)
+            return staging_events_read_errors(copy)
+
+        def job(copy):
+            return copy["jobs"]["read"]
+
+        changes = {
+            "push trigger": lambda w: w["on"].update({"push": {"branches": ["main"]}}),
+            "schedule trigger": lambda w: w["on"].update({"schedule": [{"cron": "0 * * * *"}]}),
+            "member input": lambda w: w["on"]["workflow_dispatch"]["inputs"].update(
+                {"fixture_member": {"type": "string", "required": "true"}}),
+            "guild input": lambda w: w["on"]["workflow_dispatch"]["inputs"].update(
+                {"guild": {"type": "string", "required": "true"}}),
+            "dropped end input": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("window_end"),
+            "window default": lambda w: w["on"]["workflow_dispatch"]["inputs"]["window_start"].update(
+                {"default": "2026-10-07T00:00:00Z"}),
+            "optional window": lambda w: w["on"]["workflow_dispatch"]["inputs"]["window_end"].update(
+                {"required": "false"}),
+            "top-level permissions": lambda w: w.update({"permissions": {"contents": "read"}}),
+            "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
+            "shared concurrency group": lambda w: w["concurrency"].update({"group": "deploy-staging"}),
+            "second job": lambda w: w["jobs"].update({"again": deepcopy(job(w))}),
+            "wrong environment": lambda w: job(w).update({"environment": "staging"}),
+            "production environment": lambda w: job(w).update({"environment": "production"}),
+            "no environment": lambda w: job(w).pop("environment"),
+            "branch condition removed": lambda w: job(w).pop("if"),
+            "any branch": lambda w: job(w).update({"if": "github.ref != ''"}),
+            "write grant": lambda w: job(w).update({"permissions": {"contents": "write"}}),
+            "longer timeout": lambda w: job(w).update({"timeout-minutes": "30"}),
+            "unrouted runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
+            "other job's routing": lambda w: job(w).update(
+                {"runs-on": ROUTED_RUNNER.format(job="check")}),
+            "job-level secret": lambda w: job(w).update(
+                {"env": {"T": "${{ secrets.TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL }}"}}),
+            "container": lambda w: job(w).update({"container": {"image": "postgres"}}),
+            "step condition": lambda w: job(w)["steps"][1].update({"if": "always()"}),
+            "continue on error": lambda w: job(w)["steps"][1].update({"continue-on-error": "true"}),
+            "extra step": lambda w: job(w)["steps"].append({"run": "echo done"}),
+            "persisted credentials": lambda w: job(w)["steps"][0]["with"].update(
+                {"persist-credentials": "true"}),
+            "extra secret": lambda w: job(w)["steps"][1]["env"].update(
+                {"X": "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"}),
+            "dropped login secret": lambda w: job(w)["steps"][1]["env"].pop(
+                "TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL"),
+            "blanket secrets": lambda w: job(w)["steps"][1]["env"].update({"ALL": "${{ toJSON(secrets) }}"}),
+            "member as variable": lambda w: job(w)["steps"][1]["env"].update(
+                {"STAGING_FIXTURE_MEMBER_ID": "${{ vars.STAGING_FIXTURE_MEMBER_ID }}"}),
+            "member as input": lambda w: job(w)["steps"][1]["env"].update(
+                {"STAGING_FIXTURE_MEMBER_ID": "${{ inputs.member }}"}),
+            "inline expression": lambda w: job(w)["steps"][1].update(
+                {"run": 'python3 scripts/staging_events_read.py --window-start "${{ inputs.window_start }}" '
+                        '--window-end "$WINDOW_END" --output "staging-events-read-$RUN_ID.json"'}),
+            "shell trace": lambda w: job(w)["steps"][1].update({"run": "set -x\n" + EVENTS_READ_COMMAND}),
+            "other script": lambda w: job(w)["steps"][1].update(
+                {"run": EVENTS_READ_COMMAND.replace("staging_events_read", "other")}),
+            "wrangler action": lambda w: job(w)["steps"].insert(
+                1, {"uses": "cloudflare/wrangler-action@pinned"}),
+            "upload other file": lambda w: job(w)["steps"][2]["with"].update({"path": "*.json"}),
+            "upload without retention": lambda w: job(w)["steps"][2]["with"].pop("retention-days"),
+            "upload longer retention": lambda w: job(w)["steps"][2]["with"].update({"retention-days": "90"}),
+            "upload may be empty": lambda w: job(w)["steps"][2]["with"].update({"if-no-files-found": "warn"}),
+        }
+        for label, change in changes.items():
+            with self.subTest(change=label):
+                self.assertTrue(mutate(change))
+        # The inventory pin fails closed if the workflow disappears or gains a job.
+        missing = deepcopy(workflows)
+        del missing["staging-events-read.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 

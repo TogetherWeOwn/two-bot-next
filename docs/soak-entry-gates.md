@@ -16,8 +16,9 @@ Companions: [staging-soak.md](staging-soak.md) (lifecycle and acceptance),
 - Staging only: the TWO Staging guild and the staging bot identity. The
   production bot and production guild are never touched.
 - No tests, SQL, probes, migrations, imports, backup or restore against
-  staging/production databases, except the single operator-held read-only
-  query in [evidence-route.md](evidence-route.md) step 2.
+  staging/production databases, except the single read-only query that the
+  `staging-events-read` workflow runs ([evidence-route.md](evidence-route.md)
+  step 2).
 - After any credential denial: stop, record the exact error and owner, never
   substitute another credential.
 
