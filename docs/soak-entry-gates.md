@@ -47,6 +47,17 @@ build and health, current bindings, database identity, migration/ACL state, and
 an existing reviewed evidence path for joins, voice, messages and slash. A
 missing, failed or unknown fact keeps the gate closed and `T` unset.
 
+The approved policy does not operationally define an ACTIVE hour, the source or
+record shape for its required one-minute samples, or a sample cadence for hours
+1–2. The existing evidence seam is offline, is not wired into the running bot,
+and omits slash; no currently verified reviewed route supplies the required
+four-family live evidence and 120 samples. These terms and sources remain NOT
+VERIFIED, so this gate stays closed. The approved policy names no owner for
+defining or authorizing a live sample method. The separate existing
+technical-policy question remains pending with the CTO; the CEO-held fixture
+authorization is an execution hold, not a definition of the missing terms. No
+new owner or evidence method is assigned here.
+
 The previously documented 60-minute window is retired, not replaced by a new
 timing rule. Do not treat elapsed time, a first `/readyz` 200, source-level
 fixtures, historical packets or this document as proof of live coverage. The
@@ -105,8 +116,17 @@ and historical records remain intact.
 - Every actual outage must recover in **under 60 seconds**, measured from the
   actual outage start to verified recovery. Deploy-finish-to-first-ready remains
   a separate workflow interval and cannot substitute for that recovery
-  measurement. The historical **95–139-second workflow estimate** remains
-  labelled historical/estimated, not as an outage measurement.
+  measurement.
+- The staging deploy workflow documents a **95–139-second gateway drop per
+  deploy**, and a separate historical staging note records a **92–139-second
+  redeploy**. These are documented historical interruption ranges, not a
+  verified outage-start-to-recovery measurement; both exceed 60 seconds if a
+  planned redeploy is in scope. The approved policy does not classify planned
+  redeploys as actual outages or name an owner for that classification. The
+  existing technical-policy question remains pending with the CTO; the
+  CEO-held fixture authorization remains the separate execution hold. Until the
+  existing policy path resolves classification and an under-60-second recovery
+  is independently measured, these redeploy exercises cannot establish PASS.
 - Flat memory and no error spikes remain requirements. Numeric RSS/error
   definitions are unaccepted; the historical B1 RSS receipt is not a new B2
   numeric criterion.

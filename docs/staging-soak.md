@@ -27,6 +27,47 @@ source documentation or historical evidence is not a substitute.
 - Security, release and production gates remain in force. No new collector,
   receipt/origin/overflow path or fault method is authorized by this runbook.
 
+## Unresolved acceptance terms and evidence gaps
+
+The approved policy specifies four ACTIVE hours, zero loss across all four event
+families, and 120 expected one-minute samples in hours 3–4, but it does not
+operationally define what makes an hour ACTIVE, the source or record shape of a
+one-minute sample, or a sampling requirement for hours 1–2. Do not infer an
+activity threshold, a `/readyz`-based definition, or an unapproved cadence. The
+four-family zero-loss requirement remains in force throughout; the first-two-hour
+sample rule is unspecified, not waived.
+
+The existing documented evidence route is an offline seam, is not wired into the
+running bot, and does not cover slash. Its bounded 15-minute packet example does
+not identify a reviewed live source or schema for the required one-minute
+samples. The GET-only smoke invokes no slash command and supplies no such
+samples. No currently verified reviewed route establishes the four-family live
+evidence or the required 120 samples. These gaps keep the acceptance **NOT
+VERIFIED** and `T` unset; they do not authorize a new collector, receipt path,
+origin, overflow path or fault method. The approved policy names no owner for
+defining or authorizing a live sample method. The separate existing
+technical-policy question remains pending with the CTO; the CEO-held fixture
+authorization remains an execution hold. Neither is treated as the missing
+method's owner or as resolved or widened by this document.
+
+## Deployment interruption and recovery gap
+
+The current staging deploy workflow documents a **95–139-second gateway drop
+per deploy** ([workflow comment](../.github/workflows/deploy-staging.yml#L10)); a
+separate historical staging note records a **92–139-second redeploy**
+([boot window](discord-send-admission.md#boot-window)). Keep both labelled as
+documented historical interruption ranges, not as a verified
+outage-start-to-recovery measurement. They exceed the 60-second limit if the
+planned redeploy interruption is in scope. The approved policy does not say
+whether a planned redeploy is an “actual outage,” and names no owner for that
+classification. The separate existing technical-policy question remains
+pending with the CTO; the CEO-held fixture authorization is the execution hold,
+not an interpretation of the recovery rule. Do not infer a classification or
+assign a new owner here. Until the existing policy path resolves classification
+and a qualifying under-60-second recovery is independently measured, these
+redeploy exercises cannot establish a B2 PASS. Workflow finish-to-first-ready
+remains distinct from outage-start-to-verified-recovery.
+
 ## Provisioning (operator, once)
 
 Secrets are GitHub Actions secrets on the repo and Worker secrets per
@@ -85,8 +126,11 @@ environment. Names only — values never go in cards, logs, or PRs:
   are not accepted by this policy.
 - Hours 3–4 include all **120 expected one-minute samples**; missing or
   unverified samples mean the evidence is incomplete.
-- Historical measurements and the **95–139-second workflow estimate** remain
-  labelled historical/estimated; neither establishes outage-start recovery.
+- Keep the **95–139-second documented per-deploy gateway-drop range** and the
+  **92–139-second historical redeploy record** labelled historical/estimated.
+  Both exceed 60 seconds if a planned redeploy is in scope; neither provides an
+  exact outage-start-to-verified-recovery measurement. Classification remains
+  unresolved as above.
 
 The approved exercise set—three redeploys, two drops, Neon idle-hit and actual
 429 categories—still requires exact reviewed budgets, an independent stop and

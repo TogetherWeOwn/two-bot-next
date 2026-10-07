@@ -16,6 +16,18 @@ verification. This page does not authorize a new collector, receipt path,
 origin, overflow path or live fault/dispatch method. The current deployed build,
 health, bindings, ACL state and live outcomes remain **NOT VERIFIED**.
 
+The approved policy does not define an operational ACTIVE hour, the source or
+record shape for the 120 expected one-minute samples in hours 3–4, or any
+one-minute sample cadence for hours 1–2. The route documented here is an offline
+seam, is not wired into the running bot, and covers join / voice / message only;
+it does not establish slash coverage or provide a verified live source for the
+120 samples. Its 15-minute packet bounds are not a substitute for a defined,
+reviewed live sampling route. No currently verified route satisfies these
+requirements; keep B2 **NOT VERIFIED** and `T` unset. The approved policy names
+no owner for defining or authorizing a live sample method. The separate existing
+technical-policy question remains pending with the CTO; this page does not
+assign a new owner or approve a new evidence method.
+
 ## What the seam does
 
 - `EvidenceLedger` takes expected actions keyed by **opaque aliases** (`j1`,

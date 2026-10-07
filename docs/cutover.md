@@ -54,7 +54,15 @@ Create a B4 evidence manifest before scheduling:
   recovery; hours 3–4 include 120 expected one-minute samples. Flat memory and
   no error spikes remain required (numeric RSS/error criteria are unaccepted).
   Include feature/voice evidence, not just health polls; deploy-finish-to-ready
-  is not outage-recovery evidence.
+  is not outage-recovery evidence. The approved policy does not operationally
+  define ACTIVE hours, the required samples' source/shape, or the hours 1–2
+  sample rule; no verified live route currently proves the four-family evidence
+  or 120 samples, so B2 remains NOT VERIFIED and cannot be signed off on the
+  current documentation. The documented staging redeploy interruption is
+  95–139 seconds (with a separate historical 92–139-second staging note); if
+  the approved policy counts planned redeploys as actual outages, these exceed
+  the 60-second limit. That classification is unresolved and no owner is named
+  in the approved text; do not infer a PASS.
 - [ ] W16 all-warm rollback rehearsal has passed and shared Neon data/region,
   schema compatibility and backups are signed off. B4 runs **last**. The old
   migration plan's TypeScript/no-copy assumptions are not evidence for the Rust
