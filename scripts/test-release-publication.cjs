@@ -101,7 +101,7 @@ const github = new Proxy({
   // Mirrors release-please-action v5.0.0 src/index.ts main(): releases unless
   // skip-github-release, pull requests unless skip-github-pull-request.
   const workflow = read('.github/workflows/release.yml');
-  assert(workflow.includes("skip-github-pull-request: ${{ github.event_name == 'push' || steps.plan.outputs.reuse_pr == 'true' }}"), 'push must skip PR generation');
+  assert(workflow.includes("skip-github-pull-request: ${{ github.event_name == 'push' || steps.parse_guard.outcome == 'failure' || steps.plan.outputs.reuse_pr == 'true' }}"), 'push must skip PR generation');
   assert(!workflow.includes('skip-github-release:'), 'publication must stay enabled on every event');
   const pushInputs = {skipGitHubRelease: undefined, skipGitHubPullRequest: true};
   const pushState = {labels: ['autorelease: pending'], created: [], comments: [], removed: [], added: []};
