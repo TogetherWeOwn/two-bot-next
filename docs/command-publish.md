@@ -102,7 +102,13 @@ Boot uses the normal `GUILD_ID`, `DISCORD_TOKEN`, and feature bindings. Normal
 gateway prerequisites (including `DATABASE_URL`) still apply. If enabled,
 publication/refusal happens before opening the gateway database or connecting
 the shard; failure stops the configured gateway task rather than continuing with
-an unknown registry. With the opt-in absent, existing server behavior is unchanged.
+an unknown registry. This provisional early-boot set excludes voice and the
+assistant because the voice sink has not been constructed yet. The later governed
+gateway registry sync adds voice definitions only after the sink builds; failed
+voice construction leaves them out. This sync runs before shard polling, rather
+than waiting for READY. A healthy restart can therefore briefly withdraw voice
+commands between the early sync and gateway publication. With the opt-in absent,
+the early sync is skipped; gateway publication still runs.
 
 This synchronizes command definitions only; it does not wire missing interaction
 handlers or certify a command cutover. Keep it disabled until the required

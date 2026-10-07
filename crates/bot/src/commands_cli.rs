@@ -130,6 +130,17 @@ fn desired_definitions(
     .map_err(|e| e.to_string())
 }
 
+/// Early boot sync precedes voice construction. Keep that provisional registry
+/// voice-free; the later gateway registry sync uses the built sink's presence.
+fn boot_definitions(
+    guild: u64,
+    vars: &HashMap<String, String>,
+) -> Result<Vec<CommandDefinition>, String> {
+    let mut boot_vars = vars.clone();
+    boot_vars.remove("TWO_VOICE");
+    desired_definitions(guild, &boot_vars)
+}
+
 /// Two-stage admission mirror of `preflight::admission_transport`: live (non-
 /// loopback) targets build `PgSendAdmission` from TWO_DATABASE_URL and route
 /// the executor through it; the explicit loopback fixture stays offline and
@@ -257,7 +268,7 @@ pub async fn publish_on_boot(token: &str, guild: u64) -> Result<(), String> {
         vars.get("DISCORD_APPLICATION_ID").map(String::as_str),
         "DISCORD_APPLICATION_ID",
     )?;
-    let defs = desired_definitions(guild, &vars)?;
+    let defs = boot_definitions(guild, &vars)?;
     let executor = executor(token, &vars)
         .await
         .map_err(|error| format!("cannot configure command REST client: {error}"))?;
@@ -375,6 +386,27 @@ mod tests {
             rendered.contains("Discord send admission storage unavailable"),
             "cause attached, got: {rendered}"
         );
+    }
+
+    #[test]
+    fn desired_registry_reads_voice_and_assistant_gates_without_io() {
+        for (voice, endpoint, assistant) in [
+            ("0", "https://example.invalid/assistant", false),
+            ("1", "", false),
+            ("1", "file:///assistant", false),
+            ("1", "https://example.invalid/assistant", true),
+        ] {
+            let mut env = vars();
+            env.insert("TWO_VOICE".into(), voice.into());
+            env.insert("TWO_ASSISTANT_ENDPOINT".into(), endpoint.into());
+            let definitions = desired_definitions(2222, &env).unwrap();
+            let names: Vec<_> = definitions.iter().map(|def| def.name.as_str()).collect();
+            for definition in two_bot_core::voice_rooms::voice_commands() {
+                assert_eq!(names.contains(&definition.name.as_str()), voice == "1");
+            }
+            assert_eq!(names.contains(&"templateassistant"), assistant);
+            assert_eq!(boot_definitions(2222, &env).unwrap().len(), 3);
+        }
     }
 
     #[test]

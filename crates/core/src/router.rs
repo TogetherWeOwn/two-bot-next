@@ -361,6 +361,15 @@ impl InteractionRouter {
         self.gates
     }
 
+    /// Whether an active voice sink owns this slash name before shared
+    /// interaction admission. Builtins stay with the router (notably `/kick`).
+    #[must_use]
+    pub fn voice_owns_command(&self, name: &str) -> bool {
+        self.gates.voice
+            && voice_command_names().contains(name)
+            && self.route_builtin(name, None, None).is_none()
+    }
+
     fn guild_ok(&self, guild_id: Option<u64>) -> bool {
         guild_id.is_some_and(|g| Some(g) == self.gates.configured_guild)
     }
@@ -402,6 +411,16 @@ impl InteractionRouter {
         // names stay free for custom commands.
         if self.gates.voice && voice_command_names().contains(ctx.name) {
             return SlashOutcome::Ignore;
+        }
+        // The published assistant has no handler yet. Keep the explicit
+        // unknown-command reply, rather than executing a pre-existing custom
+        // row under a name won by the compiled assistant definition.
+        if self.gates.voice && self.gates.voice_assistant && ctx.name == "templateassistant" {
+            return if self.guild_ok(ctx.guild_id) {
+                SlashOutcome::Unknown
+            } else {
+                SlashOutcome::Ignore
+            };
         }
         // Dynamic DB-backed custom commands (#22): everyone while automations
         // are on; explicit refusal while off. Missing/disabled rows in the
@@ -1481,6 +1500,17 @@ mod tests {
     }
 
     #[test]
+    fn voice_admission_yield_respects_the_gate_and_builtin_precedence() {
+        let off = InteractionRouter::new(all_on());
+        assert!(!off.voice_owns_command("ping"));
+
+        let on = InteractionRouter::new(voice_on());
+        assert!(on.voice_owns_command("ping"));
+        assert!(!on.voice_owns_command("kick"));
+        assert!(!on.voice_owns_command("sticky"));
+    }
+
+    #[test]
     fn voice_kick_loses_first_wins_to_moderation_kick() {
         use crate::commands::PERM_KICK_MEMBERS;
         let on = published(voice_on());
@@ -1616,6 +1646,46 @@ mod tests {
                 handler: HandlerId::AutomationCustom
             }
         );
+    }
+
+    #[test]
+    fn published_assistant_never_executes_a_stored_custom_row() {
+        for (voice, voice_assistant) in [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let router = InteractionRouter::new(RouterGates {
+                voice,
+                voice_assistant,
+                ..all_on()
+            });
+            let row = CustomCommand {
+                name: "templateassistant".to_owned(),
+                description: "Stored custom row".to_owned(),
+                enabled: true,
+            };
+            let definitions = router.publish_set(&[row]).unwrap();
+            let assistant = definitions
+                .iter()
+                .find(|def| def.name == "templateassistant")
+                .unwrap();
+            assert_eq!(
+                assistant.description == "Stored custom row",
+                !(voice && voice_assistant)
+            );
+            let context = SlashContext {
+                custom_row: Some(true),
+                ..ctx("templateassistant", Some(GUILD), Some(0))
+            };
+            assert_eq!(
+                router.route_slash(&context),
+                if voice && voice_assistant {
+                    SlashOutcome::Unknown
+                } else {
+                    SlashOutcome::Handled {
+                        handler: HandlerId::AutomationCustom,
+                    }
+                }
+            );
+        }
     }
 
     /// `command_permission_denied` must log Discord IDs as decimal strings

@@ -27,8 +27,8 @@
 //! (the V12a [`crate::voice_assistant_cap`] ledger consumes the persisted
 //! row), the endpoint call with the validated V12b payload, the six-scenario
 //! V12c validation before the admin sees output, the Apply/Refine/Cancel
-//! flow, the credential binding for the endpoint, and publish wiring for
-//! this command alongside the V1 `voice_command_set` path.
+//! flow and the credential binding for the endpoint. Publication already runs
+//! through `InteractionRouter::publish_set` while both gates are on.
 
 use std::collections::HashMap;
 

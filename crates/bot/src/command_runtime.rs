@@ -799,6 +799,22 @@ impl CommandRuntime {
         self.tickets.as_ref().and_then(|tickets| tickets.start())
     }
 
+    fn voice_owns_interaction(&self, interaction: &Interaction) -> bool {
+        let application_id = self.application_id.load(Ordering::Relaxed);
+        if application_id != 0 && interaction.application_id.get() != application_id {
+            return false;
+        }
+        if interaction.kind
+            != twilight_model::application::interaction::InteractionType::ApplicationCommand
+        {
+            return false;
+        }
+        let Some(InteractionData::ApplicationCommand(command)) = interaction.data.as_ref() else {
+            return false;
+        };
+        self.interactions.router.voice_owns_command(&command.name)
+    }
+
     /// Admit before spawning, without waiting on SQL/REST in the shard loop.
     /// Saturated lanes drop events without effects, queued waiters or tokens in
     /// logs. READY/RESUMED publication has independent capacity; overlapping
@@ -824,6 +840,12 @@ impl CommandRuntime {
                 })
             }
             Event::InteractionCreate(interaction) => {
+                // The gateway also delivers these to the live voice sink. Yield
+                // before user-slot/lane admission so overload cannot answer a
+                // voice-owned command with the shared runtime's busy callback.
+                if self.voice_owns_interaction(&interaction.0) {
+                    return true;
+                }
                 let runtime = Arc::clone(self);
                 let interaction = interaction.0.clone();
                 let is_ticket = matches!(

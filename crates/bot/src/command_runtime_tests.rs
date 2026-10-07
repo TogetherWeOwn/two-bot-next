@@ -1361,9 +1361,9 @@ async fn leveling_interaction_fence_precedes_any_store_read() {
     mock.shutdown().await;
 }
 
-/// The 16 voice names that publish beside the builtins (`kick` is
+/// The 21 voice names that publish beside the builtins (`kick` is
 /// moderation's under first-wins).
-const VOICE_ONLY_NAMES: [&str; 16] = [
+const VOICE_ONLY_NAMES: [&str; 21] = [
     "create",
     "setup",
     "ping",
@@ -1380,6 +1380,11 @@ const VOICE_ONLY_NAMES: [&str; 16] = [
     "inheritpermissions",
     "defaultlimit",
     "alwaysprivate",
+    "name",
+    "private",
+    "public",
+    "limit",
+    "unlimit",
 ];
 
 #[tokio::test]
@@ -1675,6 +1680,89 @@ async fn saturated_interaction_lane_still_answers_a_moderator_command() {
         reply["data"]["content"],
         RouterRefusal::ModerationDisabled.message(),
         "the router, not admission, answered the command"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn voice_owned_command_yields_before_per_member_admission() {
+    let cap = crate::interaction_admission::PER_USER_IN_FLIGHT;
+    let (mock, origin) = MockRest::start_script(held_callbacks(cap)).await;
+    let router = RouterGates {
+        voice: true,
+        ..gates(false, false)
+    };
+    let runtime = runtime_without_db(router, false, origin);
+    let _guard = runtime.dispatch_guard();
+    for _ in 0..cap {
+        assert!(runtime.dispatch(&open_command(42)));
+    }
+    wait_for(
+        || {
+            mock.requests()
+                .iter()
+                .filter(|request| request.path.contains("/token-42/"))
+                .count()
+                == cap
+        },
+        "per-member lane filled",
+    )
+    .await;
+
+    let voice = interaction_event(from_member(
+        slash("ping", Some(CHANNEL), Vec::new()),
+        42,
+        Permissions::empty(),
+    ));
+    assert!(runtime.dispatch(&voice), "the voice sink owns /ping");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        mock.requests()
+            .iter()
+            .filter(|request| request.path.contains("/token-42/"))
+            .count(),
+        cap,
+        "voice does not receive a competing busy callback"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn voice_owned_command_yields_before_shared_lane_saturation() {
+    let (mock, origin) = MockRest::start_script(held_callbacks(16)).await;
+    let router = RouterGates {
+        voice: true,
+        ..gates(false, false)
+    };
+    let runtime = runtime_without_db(router, false, origin);
+    let _guard = runtime.dispatch_guard();
+    for member in 1..=16 {
+        assert!(runtime.dispatch(&open_command(member)));
+    }
+    wait_for(
+        || {
+            mock.requests()
+                .iter()
+                .filter(|request| request.path.contains("/callback"))
+                .count()
+                == 16
+        },
+        "shared interaction lane filled",
+    )
+    .await;
+
+    let voice = interaction_event(from_member(
+        slash("ping", Some(CHANNEL), Vec::new()),
+        900,
+        Permissions::empty(),
+    ));
+    assert!(runtime.dispatch(&voice), "the voice sink owns /ping");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        mock.requests()
+            .iter()
+            .all(|request| !request.path.contains("/token-900/")),
+        "saturation must not send a busy callback for a voice command"
     );
     mock.shutdown().await;
 }
@@ -2594,6 +2682,18 @@ async fn ready_publish_carries_the_voice_set_only_while_voice_is_live() {
             voice && assistant,
             "/templateassistant needs both gates (voice={voice} assistant={assistant})"
         );
+        if voice {
+            let import = body
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|command| command["name"] == "import")
+                .unwrap();
+            assert_eq!(
+                import["options"][0]["type"], 11,
+                "upload stays an attachment"
+            );
+        }
         // The non-voice registry is untouched either way.
         for expected in ["rank", "leaderboard", "sticky", "rsvp", "feed-list"] {
             assert!(names.contains(&expected), "{expected} must still publish");
