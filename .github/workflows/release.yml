@@ -55,6 +55,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The parse guard reads the commits since the last release tag.
+          fetch-depth: ${{ github.event_name == 'push' && 1 || 0 }}
+      # release-please drops a commit its strict parser rejects and still
+      # succeeds, so notes lose a change with no signal. Fail the regeneration
+      # instead (and with it dispatch-checks); see docs/releases.md.
+      - name: Fail on commits release-please cannot parse
+        if: github.event_name != 'push'
+        run: | # zizmor: ignore[adhoc-packages] pinned release-please parser only
+          npm install --prefix "$RUNNER_TEMP/release-parse" --ignore-scripts --no-audit --no-fund release-please@17.6.0
+          NODE_PATH="$RUNNER_TEMP/release-parse/node_modules" node .github/scripts/commit-parse-guard.cjs range
       - name: Inspect existing release PR
         id: plan
         # A push never regenerates the PR, so it has no reuse decision to make.

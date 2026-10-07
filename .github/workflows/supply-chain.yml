@@ -224,6 +224,24 @@ jobs:
                   os.environ["BODY"] = handle.read()
           sys.exit(pr_standards.main())
 
+      # release-please silently drops a commit its strict parser rejects, so the
+      # squash commit this PR becomes (title + body) must parse. Same library
+      # and version as the release action; see docs/releases.md.
+      - name: Check the squash commit parses for release notes
+        if: steps.pr.outputs.event == 'pull_request'
+        env:
+          TITLE: ${{ steps.pr.outputs.title }}
+          BODY_FILE: ${{ steps.pr.outputs.body_file }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: | # zizmor: ignore[adhoc-packages] pinned release-please parser only
+          for attempt in 1 2 3; do
+            npm install --prefix "$RUNNER_TEMP/release-parse" --ignore-scripts --no-audit --no-fund release-please@17.6.0 && break
+            [ "$attempt" -lt 3 ] || exit 1
+            sleep 5
+          done
+          NODE_PATH="$RUNNER_TEMP/release-parse/node_modules" node .github/scripts/commit-parse-guard.cjs pr
+
   # name pinned equal to the required-check context: `gitleaks` is required
   # on main. Runs after pr-lint in the same workflow so the pair holds one
   # runner slot at a time instead of two.

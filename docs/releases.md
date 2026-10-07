@@ -86,6 +86,11 @@ not restore a link to a nonexistent tag.
 Cargo CI still validates compilation and the real release flow still validates
 GitHub writes.
 
+`node scripts/test-commit-parse-guard.cjs` (same `NODE_PATH`) proves the
+parse guard described under [Unparseable commits](#unparseable-commits): a
+hostile squash body is caught, a normal one passes, and a throwaway repository
+exercises the range check and its exceptions file.
+
 `python3 scripts/test-pr-lint.py` executes the workflow's actual inline scripts
 with mocked PR metadata, including delimiter collisions and stale/foreign PR
 rejection. `python3 scripts/test-docker-deps.py` recreates the manifest/stub
@@ -124,8 +129,10 @@ in neither release's notes).
    that nothing merges to `main` until the freeze is lifted, and confirms no
    merge is in flight.
 2. **Dispatch regeneration.** `gh workflow run release.yml --ref main`, then wait
-   for the run. It regenerates the PR from the current `main`, preserves the
-   bootstrap notes and dispatches `check.yml` and `supply-chain.yml` on the head.
+   for the run. It first fails if any commit since the last tag is unparseable
+   (see [Unparseable commits](#unparseable-commits)); otherwise it regenerates
+   the PR from the current `main`, preserves the bootstrap notes and dispatches
+   `check.yml` and `supply-chain.yml` on the head.
 3. **Confirm the PR is fresh.** From a checkout of `main`:
    ```sh
    GH_REPO=<owner>/<repo> GITHUB_SHA="$(gh api "repos/<owner>/<repo>/commits/main" --jq .sha)" \
@@ -146,6 +153,46 @@ in neither release's notes).
 
 The freeze is the exception path for the cut, not a standing hold: outside steps
 1-6 `main` merges freely and nothing rewrites the release PR.
+
+## Unparseable commits
+
+release-please feeds every commit on `main` to a strict
+[conventional-commits](https://github.com/conventional-commits/parser) parser.
+A message the parser rejects is skipped: its change is missing from the release
+notes and from the version bump, the library logs only
+`commit could not be parsed: <sha> <header>` at debug level, and the run still
+succeeds. The commit still ships in the tag, so nothing signals the gap. One
+such commit, a feature, was missing from the 0.4.0 notes.
+
+The squash commit is the PR title plus the PR body, so the body is what breaks
+it. The parser rejects a line that starts with a word (or a backtick) and `(`
+and holds a second `(` before its first `)`, for example
+`` `hashtext(lock('key', 0))` `` or `from_env(pool.clone(), token)`, wherever it
+sits in the body. Start such a line with `- ` or a space, or reword it. Pasted
+code, test names and function signatures are the usual source.
+
+`.github/scripts/commit-parse-guard.cjs` runs the same library code
+(`release-please@17.6.0`, the version the pinned action bundles) in two places:
+
+- **`pr-lint`** parses `<title> (#N)` plus the PR body, as written and with CRLF
+  normalized, and fails with the parser position in that message (the title is
+  line 1, a blank line is line 2, so PR body line N is position N+2). The body
+  is checked again on every edit, so fixing the text turns the check green.
+  Release PRs are exempt: their merge commit is the release itself. A
+  `BEGIN_COMMIT_OVERRIDE` section is honored exactly as release-please honors it.
+- **The release workflow** parses every commit since the last `vX.Y.Z` tag
+  before it regenerates the release PR (`schedule` and `workflow_dispatch`;
+  never on a push). A failure stops the run, so `dispatch-checks` never starts.
+  This catches a commit that reached `main` anyway, for example a merge call
+  that supplied its own message.
+
+When the release guard fails, the named commit is missing from the generated
+notes. Add its note to the release PR by hand, then record the full SHA in
+`.github/release-parse-exceptions.txt` (one SHA and a reason per line) through a
+normal PR; during a freeze, that PR is the one permitted merge. Dispatch again
+afterwards. The guard keeps printing a warning annotation for every recorded
+SHA, so the gap stays visible until the release that carries it ships. Remove
+the entry after that.
 
 ## Retry-safe PR reconciliation
 
