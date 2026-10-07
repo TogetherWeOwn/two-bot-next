@@ -1,6 +1,7 @@
 //! Full-schema erasure acceptance, only on the guarded disposable test service.
 
 use sqlx::PgPool;
+use two_bot_core::{ChannelAuditRow, ChannelClaim, ChannelModerationStore};
 use two_bot_cutover::member_erasure::{erase_member, plan, schema_gaps, ErasureMode};
 use two_bot_testsupport::TestDatabase;
 
@@ -451,5 +452,422 @@ async fn nested_inviter_session_keys_and_owned_children_are_included() {
     assert_eq!(snapshot(db.pool(), "events").await.len(), 3);
     assert_eq!(snapshot(db.pool(), "community_facts").await.len(), 3);
     assert_eq!(snapshot(db.pool(), "lfg_signups").await.len(), 3);
+    db.close().await.unwrap();
+}
+
+/// An operator-released request never had its Discord effect proven. Its ledger
+/// row is the only thing that makes a delayed delivery of the old key refuse
+/// instead of claiming afresh and repeating the mutation, so no erasure may
+/// remove it, whether the member is the operator or the original actor.
+#[tokio::test]
+async fn operator_released_request_survives_operator_and_actor_erasure_as_replay_fence() {
+    const CHANNEL: &str = "999999999999999991";
+    const KEY: &str = "wedged-original-key";
+    const ORIGINAL_HASH: &str = "sensitive-original-actor-hash";
+    const TIME: &str = "2026-10-04T00:00:00.000Z";
+    let Some(db) = database().await else { return };
+    let store = ChannelModerationStore::from_pool(db.pool().clone());
+    let ChannelClaim::Claimed { ticket } = store
+        .claim(GUILD, KEY, "moderation.lockdown", ORIGINAL_HASH, TIME)
+        .await
+        .unwrap()
+    else {
+        panic!("expected a new claim");
+    };
+    assert!(store.claim_channel(&ticket, CHANNEL).await.unwrap());
+    // The original actor's audit is selected by member ID, the operator's by
+    // actor ID; the shared ledger row is reachable through either audit key.
+    sqlx::query(
+        "INSERT INTO moderation_audit
+           (request_id, guild_id, actor_id, action, target_id, channel_id, reason, outcome,
+            idempotency_key, metadata_json, created_at)
+         VALUES ('original-request', $1, $2, 'moderation.lockdown', NULL, $3, 'fixture',
+                 'in_progress', $4, '{}', '2026-10-04T00:00:00Z')",
+    )
+    .bind(GUILD)
+    .bind(USER)
+    .bind(CHANNEL)
+    .bind(KEY)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let inspection = store
+        .inspect_channel_lane(GUILD, CHANNEL, KEY)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .force_release_channel_lane(&inspection, OTHER, "REST settled; channel reconciled")
+        .await
+        .unwrap()
+        .unwrap();
+
+    for (erased, audit_actor) in [(OTHER, "operator"), (USER, "original actor")] {
+        let dry = erase_member(db.pool(), GUILD, erased, ErasureMode::DryRun)
+            .await
+            .unwrap();
+        let rows = |table: &str| dry.iter().find(|row| row.table == table).unwrap().rows;
+        assert_eq!(
+            rows("moderation_idempotency"),
+            0,
+            "{audit_actor} dry run must not select the replay fence"
+        );
+        assert_eq!(rows("moderation_audit"), 1, "{audit_actor} audit is erased");
+        erase_member(
+            db.pool(),
+            GUILD,
+            erased,
+            ErasureMode::Execute { actor: ACTOR },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{audit_actor} erasure must not be refused: {error}"));
+        let audits: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM moderation_audit WHERE actor_id = $1")
+                .bind(erased)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(audits, 0, "{audit_actor} personal audit data must be gone");
+        let fence: (String, Option<String>, String, String) = sqlx::query_as(
+            "SELECT state, outcome, request_hash, claim_token FROM moderation_idempotency
+              WHERE guild_id = $1 AND idempotency_key = $2",
+        )
+        .bind(GUILD)
+        .bind(KEY)
+        .fetch_one(db.pool())
+        .await
+        .unwrap_or_else(|_| panic!("{audit_actor} erasure deleted the replay fence"));
+        assert_eq!(
+            fence,
+            (
+                "done".to_owned(),
+                Some("operator_released".to_owned()),
+                "operator_released".to_owned(),
+                "operator_released".to_owned(),
+            )
+        );
+        assert_eq!(
+            store
+                .claim(GUILD, KEY, "moderation.lockdown", ORIGINAL_HASH, TIME)
+                .await
+                .unwrap(),
+            ChannelClaim::Mismatch,
+            "the retired key must fail closed after {audit_actor} erasure"
+        );
+        assert_eq!(
+            store
+                .claim(
+                    GUILD,
+                    KEY,
+                    "moderation.lockdown",
+                    "different-content-hash",
+                    TIME
+                )
+                .await
+                .unwrap(),
+            ChannelClaim::Mismatch,
+            "different content under the retired key must not be reported as replay"
+        );
+    }
+    // The released lane stays free for a new request on the same channel.
+    let ChannelClaim::Claimed { ticket } = store
+        .claim(GUILD, "next-attempt", "moderation.unlock", "hash", TIME)
+        .await
+        .unwrap()
+    else {
+        panic!("a new key must claim");
+    };
+    assert!(store.claim_channel(&ticket, CHANNEL).await.unwrap());
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn member_snowflake_in_moderation_key_blocks_unresolved_erasure_then_erases_settled_row() {
+    const CHANNEL: &str = "999999999999999991";
+    const KEY: &str = USER;
+    const TIME: &str = "2026-10-04T00:00:00.000Z";
+    let Some(db) = database().await else { return };
+    let store = ChannelModerationStore::from_pool(db.pool().clone());
+    let ChannelClaim::Claimed { ticket } = store
+        .claim(GUILD, KEY, "moderation.lockdown", "actor-hash", TIME)
+        .await
+        .unwrap()
+    else {
+        panic!("expected a new claim");
+    };
+
+    let dry = erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+        .await
+        .unwrap();
+    let rows = |table: &str| dry.iter().find(|row| row.table == table).unwrap().rows;
+    assert_eq!(rows("moderation_idempotency"), 1);
+    assert_eq!(rows("moderation_audit"), 0);
+    assert!(erase_member(
+        db.pool(),
+        GUILD,
+        USER,
+        ErasureMode::Execute { actor: ACTOR },
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        dry,
+        erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+            .await
+            .unwrap()
+    );
+
+    let audit = ChannelAuditRow {
+        request_id: "member-key-request".to_owned(),
+        guild_id: GUILD.to_owned(),
+        actor_id: OTHER.to_owned(),
+        action: "moderation.lockdown".to_owned(),
+        channel_id: Some(CHANNEL.to_owned()),
+        reason: "ordinary completion".to_owned(),
+        outcome: "locked_down".to_owned(),
+        idempotency_key: KEY.to_owned(),
+        metadata_json: "{}".to_owned(),
+        created_at: TIME.to_owned(),
+    };
+    assert!(store
+        .finish(&ticket, &audit, r#"{"outcome":"locked_down"}"#, None)
+        .await
+        .unwrap());
+    let dry = erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+        .await
+        .unwrap();
+    let rows = |table: &str| dry.iter().find(|row| row.table == table).unwrap().rows;
+    assert_eq!(rows("moderation_idempotency"), 1);
+    assert_eq!(rows("moderation_audit"), 1);
+    assert_eq!(
+        erase_member(
+            db.pool(),
+            GUILD,
+            USER,
+            ErasureMode::Execute { actor: ACTOR },
+        )
+        .await
+        .unwrap(),
+        dry
+    );
+    let ledger_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM moderation_idempotency WHERE guild_id = $1 AND idempotency_key = $2",
+    )
+    .bind(GUILD)
+    .bind(KEY)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let audit_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM moderation_audit WHERE guild_id = $1 AND idempotency_key = $2",
+    )
+    .bind(GUILD)
+    .bind(KEY)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(ledger_rows, 0);
+    assert_eq!(audit_rows, 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn settled_moderation_ledger_linked_by_audit_reason_is_erased() {
+    const CHANNEL: &str = "999999999999999991";
+    const KEY: &str = "reason-linked-key";
+    const TIME: &str = "2026-10-04T00:00:00.000Z";
+    let Some(db) = database().await else { return };
+    let store = ChannelModerationStore::from_pool(db.pool().clone());
+    let ChannelClaim::Claimed { ticket } = store
+        .claim(GUILD, KEY, "moderation.lockdown", "actor-hash", TIME)
+        .await
+        .unwrap()
+    else {
+        panic!("expected a new claim");
+    };
+    let audit = ChannelAuditRow {
+        request_id: "reason-linked-request".to_owned(),
+        guild_id: GUILD.to_owned(),
+        actor_id: OTHER.to_owned(),
+        action: "moderation.lockdown".to_owned(),
+        channel_id: Some(CHANNEL.to_owned()),
+        reason: format!("ordinary completion mentions member {USER}"),
+        outcome: "locked_down".to_owned(),
+        idempotency_key: KEY.to_owned(),
+        metadata_json: "{}".to_owned(),
+        created_at: TIME.to_owned(),
+    };
+    assert!(store
+        .finish(&ticket, &audit, r#"{"outcome":"locked_down"}"#, None)
+        .await
+        .unwrap());
+
+    let dry = erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+        .await
+        .unwrap();
+    let rows = |table: &str| dry.iter().find(|row| row.table == table).unwrap().rows;
+    assert_eq!(rows("moderation_idempotency"), 1);
+    assert_eq!(rows("moderation_audit"), 1);
+    assert_eq!(
+        erase_member(
+            db.pool(),
+            GUILD,
+            USER,
+            ErasureMode::Execute { actor: ACTOR },
+        )
+        .await
+        .unwrap(),
+        dry
+    );
+    let ledger_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM moderation_idempotency WHERE guild_id = $1 AND idempotency_key = $2",
+    )
+    .bind(GUILD)
+    .bind(KEY)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let audit_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM moderation_audit WHERE guild_id = $1 AND idempotency_key = $2",
+    )
+    .bind(GUILD)
+    .bind(KEY)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(ledger_rows, 0);
+    assert_eq!(audit_rows, 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn operator_release_reason_snowflake_is_erased_but_replay_fence_survives() {
+    const CHANNEL: &str = "999999999999999991";
+    const KEY: &str = "reason-member-key";
+    const ORIGINAL_HASH: &str = "sensitive-original-actor-hash";
+    const TIME: &str = "2026-10-04T00:00:00.000Z";
+    let Some(db) = database().await else { return };
+    let store = ChannelModerationStore::from_pool(db.pool().clone());
+    let ChannelClaim::Claimed { ticket } = store
+        .claim(GUILD, KEY, "moderation.lockdown", ORIGINAL_HASH, TIME)
+        .await
+        .unwrap()
+    else {
+        panic!("expected a new claim");
+    };
+    assert!(store.claim_channel(&ticket, CHANNEL).await.unwrap());
+    let inspection = store
+        .inspect_channel_lane(GUILD, CHANNEL, KEY)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .force_release_channel_lane(
+            &inspection,
+            OTHER,
+            &format!("Old request settled after member {USER} was reconciled"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let dry = erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+        .await
+        .unwrap();
+    let rows = |table: &str| dry.iter().find(|row| row.table == table).unwrap().rows;
+    assert_eq!(rows("moderation_audit"), 1);
+    assert_eq!(rows("moderation_idempotency"), 0);
+    assert_eq!(
+        erase_member(
+            db.pool(),
+            GUILD,
+            USER,
+            ErasureMode::Execute { actor: ACTOR },
+        )
+        .await
+        .unwrap(),
+        dry
+    );
+    let audit_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM moderation_audit WHERE guild_id = $1 AND idempotency_key = $2",
+    )
+    .bind(GUILD)
+    .bind(KEY)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(audit_rows, 0);
+    assert_eq!(
+        store
+            .claim(GUILD, KEY, "moderation.lockdown", ORIGINAL_HASH, TIME)
+            .await
+            .unwrap(),
+        ChannelClaim::Mismatch,
+        "reason erasure must preserve the retired-key fence"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn member_snowflake_idempotency_key_is_erased_from_audit_but_retained_for_replay() {
+    const CHANNEL: &str = "999999999999999991";
+    const KEY: &str = USER;
+    const ORIGINAL_HASH: &str = "sensitive-original-actor-hash";
+    const TIME: &str = "2026-10-04T00:00:00.000Z";
+    let Some(db) = database().await else { return };
+    let store = ChannelModerationStore::from_pool(db.pool().clone());
+    let ChannelClaim::Claimed { ticket } = store
+        .claim(GUILD, KEY, "moderation.lockdown", ORIGINAL_HASH, TIME)
+        .await
+        .unwrap()
+    else {
+        panic!("expected a new claim");
+    };
+    assert!(store.claim_channel(&ticket, CHANNEL).await.unwrap());
+    let inspection = store
+        .inspect_channel_lane(GUILD, CHANNEL, KEY)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .force_release_channel_lane(&inspection, OTHER, "REST settled; channel reconciled")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let dry = erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+        .await
+        .unwrap();
+    let rows = |table: &str| dry.iter().find(|row| row.table == table).unwrap().rows;
+    assert_eq!(rows("moderation_audit"), 1);
+    assert_eq!(rows("moderation_idempotency"), 0);
+    assert_eq!(
+        erase_member(
+            db.pool(),
+            GUILD,
+            USER,
+            ErasureMode::Execute { actor: ACTOR },
+        )
+        .await
+        .unwrap(),
+        dry
+    );
+    let audit_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM moderation_audit WHERE guild_id = $1 AND idempotency_key = $2",
+    )
+    .bind(GUILD)
+    .bind(KEY)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(audit_rows, 0);
+    assert_eq!(
+        store
+            .claim(GUILD, KEY, "moderation.lockdown", ORIGINAL_HASH, TIME)
+            .await
+            .unwrap(),
+        ChannelClaim::Mismatch,
+        "erasure must retain the member-key fence"
+    );
     db.close().await.unwrap();
 }
