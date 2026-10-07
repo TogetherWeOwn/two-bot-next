@@ -1252,7 +1252,9 @@ async fn plan_preserves_memberships(
 }
 
 /// Scenarios for the provisioning identity's direct migrator membership, run
-/// in order against one fully migrated scratch database.
+/// in order against one fully migrated scratch database. With
+/// `creation_self_grant` set, only the first scenario runs, with that
+/// `createrole_self_grant` value active while the plan creates the groups.
 async fn migrator_membership_scenarios(
     admin: &PgPool,
     provisioner_pool: &PgPool,
@@ -1260,12 +1262,25 @@ async fn migrator_membership_scenarios(
     roles: &[String],
     provisioner: &str,
     superuser: &str,
+    creation_self_grant: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     let migrator = &roles[0];
     // 1. Absent membership: the plan creates the group; the creator's own
-    // ADMIN-only row (distinct grantor) stays, and no temporary grant by the
-    // provisioning identity survives COMMIT.
-    run_plan(provisioner_pool, roles).await?;
+    // ADMIN-only row (distinct grantor) stays, and no membership granted by the
+    // provisioning identity survives COMMIT, including the usable self-grant
+    // PostgreSQL adds on CREATE ROLE when `createrole_self_grant` is set.
+    if let Some(options) = creation_self_grant {
+        execute(
+            provisioner_pool,
+            format!("SET createrole_self_grant = '{options}'"),
+        )
+        .await?;
+    }
+    let created = run_plan(provisioner_pool, roles).await;
+    if creation_self_grant.is_some() {
+        execute(provisioner_pool, "RESET createrole_self_grant".to_owned()).await?;
+    }
+    created?;
     let rows = memberships(admin, migrator).await?;
     require(
         rows.iter()
@@ -1278,6 +1293,9 @@ async fn migrator_membership_scenarios(
         "temporary self-grant survived the plan",
     )?;
     cannot_set_role(provisioner_pool, migrator).await?;
+    if creation_self_grant.is_some() {
+        return Ok(());
+    }
     // 2. Re-run over the unusable ADMIN-only row: it needs a temporary grant,
     // which must be distinct from, and removed without touching, that row.
     plan_preserves_memberships(admin, provisioner_pool, roles, "ADMIN-only row").await?;
@@ -1353,6 +1371,17 @@ async fn migrator_membership_scenarios(
 
 #[tokio::test]
 async fn scratch_plan_preserves_preexisting_migrator_membership() {
+    scratch_membership_run(None).await;
+}
+
+/// `createrole_self_grant` (PostgreSQL 16+) makes `CREATE ROLE` give the
+/// creator a usable membership it granted itself; the plan must not leave it.
+#[tokio::test]
+async fn scratch_plan_removes_createrole_self_grant_membership() {
+    scratch_membership_run(Some("set, inherit")).await;
+}
+
+async fn scratch_membership_run(creation_self_grant: Option<&str>) {
     let url = match std::env::var("TWO_ROLES_TEST_DATABASE_URL") {
         Ok(url) => url,
         Err(_) if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") => TEST_URL.to_owned(),
@@ -1416,6 +1445,7 @@ async fn scratch_plan_preserves_preexisting_migrator_membership() {
             &roles,
             &provisioner,
             &superuser,
+            creation_self_grant,
         )
         .await
     }

@@ -200,11 +200,27 @@ ALTER DEFAULT PRIVILEGES FOR ROLE two_bot_migrator REVOKE EXECUTE ON FUNCTIONS F
 ALTER DEFAULT PRIVILEGES FOR ROLE two_bot_migrator REVOKE ALL ON TABLES FROM PUBLIC, two_bot_runtime, two_web_reader, two_bot_migrator_ro;
 ALTER DEFAULT PRIVILEGES FOR ROLE two_bot_migrator REVOKE ALL ON SEQUENCES FROM PUBLIC, two_bot_runtime, two_web_reader, two_bot_migrator_ro;
 
--- Drop only the explicit temporary grant made above. Existing grantor rows,
--- including the creator ADMIN OPTION membership, remain unchanged.
+-- Drop only rows this plan put in place under the executing identity's own
+-- grantor. That is the explicit temporary grant made above, and, when the
+-- identity held no direct membership before the plan, the usable self-grant
+-- that PostgreSQL 16+ adds on CREATE ROLE when `createrole_self_grant` is set.
+-- Rows with another grantor, including the creator ADMIN OPTION membership,
+-- and every row that existed before the plan, remain unchanged.
 DO $membership_cleanup$
 BEGIN
-    IF current_setting('two_bot.roles.ephemeral_migrator_membership', true) = 'true' THEN
+    IF current_setting('two_bot.roles.ephemeral_migrator_membership', true) = 'true'
+       OR (
+            current_setting('two_bot.roles.preexisting_migrator_membership', true) = 'false'
+            AND EXISTS (
+                SELECT FROM pg_auth_members m
+                JOIN pg_roles granted ON granted.oid = m.roleid
+                JOIN pg_roles member ON member.oid = m.member
+                JOIN pg_roles grantor ON grantor.oid = m.grantor
+                WHERE granted.rolname = 'two_bot_migrator'
+                  AND member.rolname = current_user
+                  AND grantor.rolname = current_user
+            )
+       ) THEN
         EXECUTE format('REVOKE %I FROM %I GRANTED BY CURRENT_USER', 'two_bot_migrator', current_user);
     END IF;
 END

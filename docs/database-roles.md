@@ -76,9 +76,16 @@ PostgreSQL 16+, plain `GRANT` on 15) and only that grant is revoked before
 non-superuser provisioning identity fails at `ALTER SCHEMA public OWNER TO
 two_bot_migrator` and loses `public` access once ownership flips. If the
 identity's own unusable grant (granted by itself) would need its options changed
-for the plan to proceed, the plan refuses without changing the membership. PostgreSQL 16+ automatically gives a CREATEROLE creator an
-ADMIN-only membership on a newly created role; that membership is distinct from
-the plan's temporary grant and is preserved. The bootstrap render differs from
+for the plan to proceed, the plan refuses without changing the membership.
+PostgreSQL 16+ automatically gives a CREATEROLE creator an ADMIN-only membership
+on a newly created role; that membership is distinct from the plan's temporary
+grant and is preserved. When the identity held no direct membership before the
+plan, the plan also revokes any membership granted by the identity itself at
+the end, which covers the usable self-grant that `CREATE ROLE` adds when the
+identity's `createrole_self_grant` setting is non-empty (PostgreSQL 16+); that
+row is never one the operator put there. Memberships the same setting adds in
+the runtime, web reader and read-only migrator groups are outside this rule and
+are not touched. The bootstrap render differs from
 the default (`full`) render only by the skip lines; neither render contains a
 password or a login grant.
 
