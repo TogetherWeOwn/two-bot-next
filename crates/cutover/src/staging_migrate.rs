@@ -43,6 +43,30 @@ pub const READ_ONLY_ROLE: &str = "two_bot_migrator_ro";
 pub const SQLX_VERSION: &str = "0.9.0";
 pub const RUNNER_VERSION: u32 = 1;
 
+/// Read-only audit inputs: the matrix and verifier compiled from the source SHA
+/// the workflow checked out and built, rendered the way
+/// `two_bot_core::database_roles::verify` renders them. Their SHA-256 digests
+/// are echoed in the manifest so a reviewer can compare them with the files at
+/// any other SHA.
+const AUDIT_MATRIX: &str = include_str!("../../../sql/database_role_matrix.sql");
+const AUDIT_VERIFY: &str = include_str!("../../../sql/verify_database_roles.sql");
+/// Membership entries for the four migrator logins. Driven from `VALUES` with a
+/// `LEFT JOIN`, so a login that does not exist still reports an entry with
+/// `exists` false instead of vanishing from the readout. Direct memberships
+/// are aggregated per login; the two transitive flags mirror the plan guard's
+/// `pg_has_role` check (`refuse_migrator_member_plan_login`).
+const AUDIT_MEMBERSHIP_SQL: &str = "SELECT e.login, (r.oid IS NOT NULL) AS login_exists, \
+     COALESCE(array_agg(m.rolname::text ORDER BY m.rolname) \
+     FILTER (WHERE m.rolname IS NOT NULL), '{}') AS direct_memberships, \
+     COALESCE(pg_has_role(r.oid, 'two_bot_migrator', 'MEMBER'), false) AS member_of_migrator, \
+     COALESCE(pg_has_role(r.oid, 'two_bot_migrator_ro', 'MEMBER'), false) AS member_of_ro \
+     FROM (VALUES ('two_bot_migrator'), ('two_bot_migrator_ro'), \
+     ('two_bot_migrator_ro_plan'), ('two_bot_migrator_apply')) AS e(login) \
+     LEFT JOIN pg_roles r ON r.rolname = e.login \
+     LEFT JOIN pg_auth_members am ON am.member = r.oid \
+     LEFT JOIN pg_roles m ON m.oid = am.roleid \
+     GROUP BY e.login, r.oid ORDER BY e.login";
+
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Debug, thiserror::Error)]
@@ -509,6 +533,80 @@ fn source_manifest(migrator: &Migrator) -> Value {
     )
 }
 
+/// Bounded read-only readout for the plan manifest, plan mode only.
+///
+/// Reports the ledger owner, the ledger successful/max/failed counts, one
+/// membership entry per migrator login (existence, direct memberships and the
+/// two transitive flags) and the repo verifier findings (rendered with the
+/// compiled matrix). Names, counts and findings only: never passwords, URLs or
+/// key material. A failed readout is reported as a fixed `error` string and
+/// never fails the plan, because the plan manifest is also the apply binding.
+async fn read_audit(pool: &PgPool) -> Value {
+    match audit_queries(pool).await {
+        Ok(audit) => audit,
+        Err(reason) => json!({"error": reason}),
+    }
+}
+
+/// Runs the readout inside one explicit `READ ONLY` transaction on the plan
+/// pool, whose connections already hold only [`READ_ONLY_ROLE`]. A missing
+/// ledger reports null/zero, so a pre-bootstrap plan still prints a readout.
+async fn audit_queries(pool: &PgPool) -> Result<Value, &'static str> {
+    let mut tx = pool.begin().await.map_err(|_| "audit acquire failed")?;
+    sqlx::raw_sql("SET TRANSACTION READ ONLY; SET LOCAL search_path = pg_catalog, pg_temp;")
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| "audit read-only transaction failed")?;
+    let owner: Option<String> = sqlx::query_scalar(
+        "SELECT r.rolname::text FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner \
+         WHERE c.relnamespace = 'public'::regnamespace AND c.relname = '_sqlx_migrations'",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| "audit ledger owner read failed")?;
+    let counts = if owner.is_some() {
+        let row: (i64, Option<i64>, i64) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE success), max(version) FILTER (WHERE success), \
+             count(*) FILTER (WHERE NOT success) FROM public._sqlx_migrations",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| "audit ledger counts read failed")?;
+        json!({"successful_rows": row.0, "max_version": row.1, "failed_rows": row.2})
+    } else {
+        json!({"successful_rows": 0, "max_version": Value::Null, "failed_rows": 0})
+    };
+    let memberships: Vec<(String, bool, Vec<String>, bool, bool)> =
+        sqlx::query_as(AUDIT_MEMBERSHIP_SQL)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|_| "audit membership read failed")?;
+    let rendered = AUDIT_VERIFY.replace("-- @matrix", AUDIT_MATRIX);
+    let findings: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(rendered))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| "audit verify read failed")?;
+    tx.rollback().await.map_err(|_| "audit rollback failed")?;
+    let mut membership_entries = Vec::with_capacity(memberships.len());
+    for (login, exists, member_of, of_migrator, of_ro) in &memberships {
+        membership_entries.push(json!({
+            "login": login,
+            "exists": exists,
+            "member_of": member_of,
+            "member_of_migrator": of_migrator,
+            "member_of_ro": of_ro,
+        }));
+    }
+    Ok(json!({
+        "ledger_owner": owner,
+        "ledger_counts": counts,
+        "memberships": membership_entries,
+        "verify_findings": findings,
+        "matrix_sha256": hex::encode(Sha256::digest(AUDIT_MATRIX.as_bytes())),
+        "verify_sha256": hex::encode(Sha256::digest(AUDIT_VERIFY.as_bytes())),
+    }))
+}
+
 async fn connect(
     options: sqlx::postgres::PgConnectOptions,
     role: &'static str,
@@ -593,6 +691,14 @@ async fn run_on_pool(
     // hash the named producing plan run uploaded. Both refuse before any DDL.
     check_plan_provenance(req, &computed_hash)?;
 
+    // Plan-only readout inside one READ ONLY transaction. Apply skips it: that
+    // login is the migrator, not the read-only readout.
+    let audit = if req.apply {
+        Value::Null
+    } else {
+        read_audit(pool).await
+    };
+
     let mut applied = 0usize;
     let mut after = before.clone();
     if req.apply && !pending.is_empty() {
@@ -654,6 +760,10 @@ async fn run_on_pool(
         // proven to come from the named producing plan run.
         "plan_provenance_verified": req.apply,
         "applied_count": applied,
+        // Plan-only readout (null for apply): ledger owner and counts,
+        // four-login memberships and verifier findings from one READ ONLY
+        // transaction. Not part of `plan_manifest_sha256`.
+        "audit": audit,
     }))
 }
 
@@ -1321,5 +1431,26 @@ mod tests {
             Err(RunError::Refused(_))
         ));
         assert!(matches!(verify_target(&pooler), Err(RunError::Refused(_))));
+    }
+
+    #[test]
+    fn audit_names_the_four_logins_and_renders_the_compiled_verifier() {
+        for login in [
+            "two_bot_migrator",
+            "two_bot_migrator_ro",
+            "two_bot_migrator_ro_plan",
+            "two_bot_migrator_apply",
+        ] {
+            assert!(AUDIT_MEMBERSHIP_SQL.contains(&format!("'{login}'")));
+        }
+        assert!(AUDIT_MEMBERSHIP_SQL.contains("LEFT JOIN pg_roles"));
+        assert!(AUDIT_MEMBERSHIP_SQL.contains("pg_has_role"));
+        assert!(AUDIT_MEMBERSHIP_SQL.contains("ORDER BY e.login"));
+        assert!(AUDIT_MATRIX.contains("'public', '_sqlx_migrations', 'ledger'"));
+        assert!(AUDIT_VERIFY.contains("SELECT finding FROM findings ORDER BY finding;"));
+        assert!(AUDIT_VERIFY.contains("-- @matrix"));
+        let rendered = AUDIT_VERIFY.replace("-- @matrix", AUDIT_MATRIX);
+        assert!(!rendered.contains("-- @matrix"));
+        assert!(rendered.contains("'public', '_sqlx_migrations', 'ledger'"));
     }
 }
