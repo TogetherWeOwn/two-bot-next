@@ -17,6 +17,9 @@ identity, cleanup result and the verdict. One run, one record. This is a
   checked-in mock example on every push.
 - Mock example: `scripts/fixtures/staging_e2e_run_record_mock.json`
   (clearly labelled `"mock": true`; it proves the shape, not staging).
+- Generator for the read-mostly smoke: `python3 scripts/staging_smoke_run.py`
+  writes a validated record (see
+  [Live read-mostly smoke run](staging-slash-smoke.md#live-read-mostly-smoke-run)).
 
 ## What this template does not do
 

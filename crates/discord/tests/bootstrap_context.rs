@@ -5,10 +5,16 @@
 #[allow(dead_code)]
 mod common;
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::{MockRest, ScriptedResponse, APP_ID, GUILD_ID};
 use serde_json::json;
+use two_bot_core::send_admission::{
+    AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, SendCompletion, SendCooldown,
+    TokenKey,
+};
 use two_bot_discord::{ActionExecutor, DiscordError, MODERATION_TIMEOUT_MS};
 
 const APPLICATION_PATH: &str = "/api/v10/applications/@me";
@@ -223,6 +229,119 @@ async fn both_metadata_reads_use_the_shared_five_second_abort() {
             .filter(|request| request.path == GUILD_PATH)
             .count(),
         1
+    );
+    mock.shutdown().await;
+}
+
+const TOKEN: &str = "bootstrap-test-token";
+
+/// A lane that refuses its first `blocked` admissions and then admits, the way
+/// a held single-flight row clears once its holder completes.
+#[derive(Debug)]
+struct HeldThenFree {
+    key: TokenKey,
+    blocked: u32,
+    calls: AtomicU32,
+}
+
+struct Release;
+
+impl SendCompletion for Release {
+    fn complete(
+        self: Box<Self>,
+        _cooldown: Option<SendCooldown>,
+    ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl SendAdmission for HeldThenFree {
+    fn token_key(&self) -> &TokenKey {
+        &self.key
+    }
+
+    fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let admitted = call >= self.blocked;
+        Box::pin(async move {
+            if admitted {
+                Ok(AdmissionPermit::new(Box::new(Release)))
+            } else {
+                Err(AdmissionError::Blocked)
+            }
+        })
+    }
+}
+
+fn governed_executor(mock: &MockRest, blocked: u32) -> (ActionExecutor, Arc<HeldThenFree>) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let lane = Arc::new(HeldThenFree {
+        key: TokenKey::for_bot_token(TOKEN).unwrap(),
+        blocked,
+        calls: AtomicU32::new(0),
+    });
+    let executor = ActionExecutor::with_admission(
+        TOKEN.to_owned(),
+        Some(mock.origin()),
+        Arc::clone(&lane) as Arc<dyn SendAdmission>,
+    )
+    .expect("governed executor builds against loopback");
+    (executor, lane)
+}
+
+#[tokio::test]
+async fn boot_reads_wait_out_a_held_lane_instead_of_failing_the_gateway() {
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!({"id": APP_ID.to_string()})),
+            ScriptedResponse::json(200, json!({"id": GUILD_ID.to_string(), "name": "TWO"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    // Three refusals ahead of the first read: a startup job still holds the
+    // lane when the gateway's bootstrap asks for it.
+    let (executor, lane) = governed_executor(&mock, 3);
+
+    assert_eq!(executor.current_application_id().await.unwrap(), APP_ID);
+    assert_eq!(executor.guild_name(GUILD_ID).await.unwrap(), "TWO");
+
+    // Refused attempts never reached the wire, so no read was resent.
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2, "one wire request per read");
+    assert_eq!(requests[0].path, APPLICATION_PATH);
+    assert_eq!(requests[1].path, GUILD_PATH);
+    assert_eq!(
+        lane.calls.load(Ordering::SeqCst),
+        5,
+        "3 refused + 2 admitted"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn boot_waiting_retries_only_the_pre_wire_refusal() {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(403), ScriptedResponse::status(503)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let (executor, lane) = governed_executor(&mock, 1);
+
+    // The refusal is waited out once; the 403 that follows is final.
+    assert_eq!(
+        executor.current_application_id().await.unwrap_err(),
+        DiscordError::Rejected("Discord refused the request with 403".to_owned())
+    );
+    assert_eq!(
+        executor.guild_name(GUILD_ID).await.unwrap_err(),
+        DiscordError::Unavailable("Discord returned 503".to_owned())
+    );
+    assert_eq!(mock.requests().len(), 2, "no status is retried");
+    assert_eq!(
+        lane.calls.load(Ordering::SeqCst),
+        3,
+        "1 refused + 2 admitted"
     );
     mock.shutdown().await;
 }

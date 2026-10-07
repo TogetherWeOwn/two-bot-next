@@ -4,6 +4,7 @@ use std::fmt;
 
 use serde_json::{Map, Value};
 use tracing::{Event, Subscriber};
+use tracing_log::NormalizeEvent;
 use tracing_subscriber::{
     filter::{FilterExt, LevelFilter},
     fmt::{
@@ -178,6 +179,16 @@ where
             .format_fields(Writer::new(&mut encoded), event)?;
         let mut fields: Map<String, Value> =
             serde_json::from_str(&encoded).map_err(|_| fmt::Error)?;
+        // `.init()` bridges `log` records (sqlx, hyper, ...) through tracing-log,
+        // which gives them the synthetic target `log` and carries the real
+        // target/module/file/line in `log.*` fields. Report the real target, as
+        // the stock formatters do, and keep the envelope free of `log.*` keys.
+        // https://docs.rs/tracing-log/0.2.0/tracing_log/trait.NormalizeEvent.html
+        let normalized = event.normalized_metadata();
+        let metadata = normalized.as_ref().unwrap_or_else(|| event.metadata());
+        if event.is_log() {
+            fields.retain(|key, _| !key.starts_with("log."));
+        }
         let mut spans = Vec::new();
         if let Some(scope) = ctx.event_scope() {
             for span in scope.from_root() {
@@ -240,10 +251,10 @@ where
         fields.insert("ts".into(), ts.into());
         fields.insert(
             "level".into(),
-            event.metadata().level().as_str().to_lowercase().into(),
+            metadata.level().as_str().to_lowercase().into(),
         );
         fields.insert("msg".into(), msg.into());
-        fields.insert("target".into(), event.metadata().target().into());
+        fields.insert("target".into(), metadata.target().into());
         let line = serde_json::to_string(&fields).map_err(|_| fmt::Error)?;
         writeln!(writer, "{line}")
     }
@@ -373,6 +384,46 @@ mod tests {
         assert_eq!(lines[0]["spans"][0]["name"], "run");
         assert_eq!(lines[0]["spans"][1]["guild_id"], "456");
         assert_eq!(lines[1]["guild_id"], "explicit");
+    }
+
+    #[test]
+    fn bridged_log_records_report_their_real_target_without_log_fields() {
+        // `log::error!` from a dependency reaches us as a tracing event whose
+        // metadata target is the synthetic "log"; docs/logging.md promises the
+        // real module target. Dispatch through tracing-log's own bridge so the
+        // event has the exact production shape (`log.*` fields included).
+        let capture = Capture::default();
+        tracing::subscriber::with_default(
+            subscriber(LogFormat::Json, filter(None, None), capture.clone()),
+            || {
+                tracing_log::format_trace(
+                    &tracing_log::log::Record::builder()
+                        .args(format_args!("pool timed out"))
+                        .level(tracing_log::log::Level::Error)
+                        .target("sqlx::pool")
+                        .module_path(Some("sqlx::pool"))
+                        .file(Some("pool.rs"))
+                        .line(Some(7))
+                        .build(),
+                )
+                .unwrap();
+                tracing::error!(msg = "settings_reloaded", log.target = "app_field");
+            },
+        );
+        let lines = capture.lines();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["target"], "sqlx::pool");
+        assert_eq!(lines[0]["level"], "error");
+        assert_eq!(lines[0]["msg"], "tracing_event");
+        assert_eq!(lines[0]["message"], "pool timed out");
+        assert!(lines[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| !key.starts_with("log.")));
+        // Native events keep their own target, and their fields are untouched.
+        assert!(lines[1]["target"].as_str().unwrap().starts_with("two_bot"));
+        assert_eq!(lines[1]["log.target"], "app_field");
     }
 
     #[test]

@@ -153,6 +153,13 @@ class RollbackReadinessProbeTests(unittest.TestCase):
         self.assertEqual(code, 0, results)
         self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v4", results["PASS manifest"])
 
+    def test_current_dump_version_5_manifest_passes(self):
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=5)),
+                              mtime=2_050_000_000)
+        code, results, _ = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v5", results["PASS manifest"])
+
     def test_single_failure_fails_only_that_check(self):
         missing_guild = CONFIG.replace('TWO_GUILD_NAME = "TogetherWeOwn"\n', "")
         cases = {
@@ -245,7 +252,7 @@ class RollbackReadinessProbeTests(unittest.TestCase):
             "empty archive": ([], None, "is empty"),
             "manifest not JSON": ([b"{manifest", *good[1:]], None, "manifest line is not JSON"),
             "row before manifest": (good[1:], None, "first line is not a manifest"),
-            "unknown version": (lines(version=5), None, "manifest version 5 is not one of (3, 4)"),
+            "unknown version": (lines(version=6), None, "manifest version 6 is not one of (3, 4, 5)"),
             "boolean version": (lines(version=True), None, "manifest version True"),
             "no createdAt": (lines(createdAt=None), None, "no createdAt timestamp"),
             "negative eventsSequence": (lines(eventsSequence=-1), None, "invalid eventsSequence"),
