@@ -149,6 +149,8 @@ async fn cli_releases_a_503_wedge_then_unlock_restores_the_surviving_seed() {
     let mut router = InteractionRouter::new(RouterGates {
         configured_guild: Some(GUILD.parse().unwrap()),
         moderation: true,
+        voice: false,
+        voice_assistant: false,
         scorecard: false,
         automations: false,
         announcements: false,
