@@ -93,7 +93,11 @@ not production authorization or a migration tool.
    from the rollout record and can briefly trail it, so a completed rollout whose
    target digest the listing does not yet show is not accepted and not failed
    immediately: `verify` keeps polling (last observation `application_image=stale`)
-   for up to twenty-four polls (about 4.5 minutes), then fails closed as `application_image_drift`. That
+   for up to twenty-four polls (about 4.5 minutes) or until the 300s verify deadline,
+   whichever comes first, then fails closed as `application_image_drift` (the deadline
+   usually ends it first, since the polls only count once the rollout completes; a
+   gateway failure named in the last observation keeps `rollout_timeout` instead,
+   because the rollback triggers key on it). That
    failure (also raised if the listing stops matching on the final re-read) prints
    a fixed-vocabulary diagnostic: `listing_image=target|baseline|other` (where the
    listing points, `baseline` being the pre-deploy image), `app_version=behind|equal|ahead`

@@ -34,11 +34,17 @@ ACTIVE_LAG_CONFIRMATIONS = 2
 # by the application listing. The listing is read separately from the rollout
 # record and can trail it right after a deploy; a persistent mismatch still
 # fails closed as `application_image_drift`. A poll cycle runs about 11s in CI
-# (5s sleep plus the control-plane reads), so 24 polls is roughly 4.5 minutes
-# inside the 300s verify deadline. Twelve (about 2.5 minutes) sat in the middle
-# of the observed lag: on 10-05..10-07 completed verify steps ran up to 192s
-# while eight runs with a healthy, exact-build container failed at 129-186s.
+# (5s sleep plus the control-plane reads), so 24 polls is roughly 4.5 minutes.
+# Stale polls only count once the rollout completes while the 300s verify
+# deadline runs from the start, so the deadline usually ends a mismatch that
+# never clears before this cap does; verify reports that as the same drift
+# (see `IMAGE_DRIFT_DIAGNOSTIC_SECONDS`). Twelve (about 2.5 minutes) sat in the
+# middle of the observed lag: on 10-05..10-07 completed verify steps ran up to
+# 192s while eight runs with a healthy, exact-build container failed at 129-186s.
 APPLICATION_IMAGE_STALE_POLLS = 24
+# Extra time, after the verify deadline, for the one control-plane read behind
+# the drift diagnostic. It cannot accept a rollout; it only labels the failure.
+IMAGE_DRIFT_DIAGNOSTIC_SECONDS = 15
 TOKEN = re.compile(r"[a-z0-9_]{1,32}")
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 IMAGE = rf"registry\.cloudflare\.com/[^/@\s]+/{APPLICATION}@sha256:[0-9a-f]{{64}}"
@@ -580,6 +586,7 @@ def verify(args, client):
     pinned = None
     lag_streak = 0
     image_stale = 0
+    app = row = None
     while time.monotonic() < client.deadline:
         probed = False
         passed = False
@@ -661,6 +668,13 @@ def verify(args, client):
         if not passed:
             lag_streak = 0
         time.sleep(max(0, min(5, client.deadline - time.monotonic())))
+    # The deadline ran out while the listing still trailed a completed rollout:
+    # that is the drift, not a bare timeout, so report it with its diagnostic.
+    # A gateway failure named in the last observation keeps `rollout_timeout`,
+    # because the rollback triggers key on that class plus the named failure.
+    if image_stale and "gateway_failure=" not in (client.observation or ""):
+        client.deadline = time.monotonic() + IMAGE_DRIFT_DIAGNOSTIC_SECONDS
+        raise GateError("application_image_drift", image_drift_detail(client, app, row, image))
     raise GateError("rollout_timeout")
 
 
