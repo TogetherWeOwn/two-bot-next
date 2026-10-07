@@ -17,16 +17,18 @@ Fail-closed rules, each pinned by scripts/test_staging_container_drill.py:
   prior completed rollout id). Mutable tags, `latest` and non-matching
   values are refused before any change.
 - The backout image must differ from the serving image, must equal the image
-  of a named prior rollout that completed on staging, and the named Worker
+  of a named prior rollout that proved convergence on staging (`completed`,
+  or `replaced` with a matching image plus served-worker history plus every
+  step completed and every instance updated in the row), and the named Worker
   version must have served staging traffic with the same durable-object
   namespace as the baseline. Same-image, never-served and
   binding-incompatible pairs are refused before any change. The named-rollout
   proof is three separate refusals: `backout_rollout_absent` (pin missing
   from the live rollouts page, including pins aged out of it),
-  `backout_rollout_not_completed` (`status=<allowlisted>`; `replaced` and
-  `reverted` stay unproven even when the image matches, so pins expire on
-  any newer rollout and the target stays the newest completed rollout with
-  a differing image), and `backout_rollout_image_mismatch`.
+  `backout_rollout_not_completed` (`status=<allowlisted>`; only `completed`
+  and converged `replaced` rows are proven, so pins expire on any newer
+  rollout and the target stays the newest non-live rollout with a differing
+  image), and `backout_rollout_image_mismatch`.
 - The restore leg returns to the live-captured healthy baseline (serving
   Worker version, serving image, `/readyz` revision/build); the final
   running image must equal the baseline image or the drill fails.
@@ -171,6 +173,32 @@ def mapping_status(row):
 def rollout_image(row):
     image = rollout.mapping(row.get("target_configuration")).get("image")
     return image if isinstance(image, str) and IMAGE.fullmatch(image) else None
+
+
+def replaced_converged(row):
+    """Convergence evidence for a `replaced` backout row.
+
+    A rollout can be `replaced` before it finishes (superseded in flight),
+    so status alone never proves the image rolled out. Accept only rows
+    whose record shows every step completed and every instance updated.
+    Any malformed shape reads as unconverged: fail closed.
+    """
+    try:
+        record = rollout.mapping(row)
+        steps = rollout.sequence(record.get("steps"))
+        progress = rollout.mapping(record.get("progress"))
+        total_steps = rollout.number(progress.get("total_steps"))
+        total = rollout.number(progress.get("total_instances"))
+        updated = rollout.number(progress.get("updated_instances"))
+        steps_done = all(rollout.mapping(step).get("status") == "completed"
+                         for step in steps)
+    except GateError:
+        return False
+    if not steps or total_steps <= 0 or len(steps) != total_steps:
+        return False
+    if not steps_done:
+        return False
+    return total > 0 and total == updated
 
 
 def serving_image(client, app):
@@ -442,15 +470,23 @@ class Drill:
         # newest completed rollout with a differing image).
         require(pin["rollout_id"] in rows, "backout_rollout_absent")
         proven = rows[pin["rollout_id"]]
-        # Strict: `replaced` with a matching image stays unproven. A replaced
-        # rollout was superseded (run 5: pin present, image matched, status
-        # `replaced` after 5 newer rollouts), so its convergence proof no
-        # longer belongs to it. The detail names the allowlisted status.
+        # Accepted: `completed`, or `replaced` with a matching image plus
+        # served-worker history plus completed-convergence shape in the row
+        # (the platform marks the predecessor `replaced` whenever a newer
+        # head completes, so a `completed`-only gate can never dispatch; but
+        # a rollout can also be `replaced` before it finishes, so an
+        # unconverged `replaced` row stays unproven). `reverted`, `pending`,
+        # `progressing` and unknown stay unproven. The detail names the
+        # allowlisted status.
         proven_status = mapping_status(proven)
-        require(proven_status == "completed", "backout_rollout_not_completed",
+        require(proven_status in ("completed", "replaced"),
+                "backout_rollout_not_completed",
                 "status=" + (proven_status if proven_status in
                               ("pending", "progressing", "completed",
                                "replaced", "reverted") else "unknown"))
+        if proven_status == "replaced":
+            require(replaced_converged(proven), "backout_rollout_not_completed",
+                    "status=replaced,unconverged")
         require(rollout_image(proven) == pin["image"], "backout_rollout_image_mismatch")
         namespace = rollout.identifier(
             rollout.mapping(app.get("durable_objects")).get("namespace_id"))

@@ -2943,7 +2943,7 @@
         ]
       },
       "owner": [
-        "TOG-10093",
+        "TOG-15336",
         "TOG-10119"
       ],
       "status": "manual",
@@ -3207,18 +3207,17 @@
           "[3400bb2](https://github.com/TogetherWeOwn/two-bot/commit/3400bb220ab9933d4bbbe4c92219770ee94f50e9)",
           "`src/analytics/`",
           "feat(analytics): add member_leave backfill gap sweep (#343)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
-        "TOG-11152"
+        "TOG-10119"
       ],
-      "status": "waived",
-      "action": "Run TOG-11152’s member_leave backfill gap sweep on a test-container fixture with leave gaps.",
-      "expected": "Each gap is reported read-only; nothing is backfilled.",
-      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "automated",
+      "action": "Run the leave-gap sweep pins in `crates/cutover/src/leave_gap.rs` and `crates/core/tests/voice_integrity_acceptance.rs`. The read-only CLI check `crates/cutover/tests/report_cli.rs::leave_gap_matches_legacy_fixtures_read_only` is DB-backed and is not part of this chain: it skips without the exported `TWO_TEST_DATABASE_URL` and runs in CI on a disposable agent-testdb database. No application, staging or production database.",
+      "expected": "Each gap is classified and reported with proposed fills only; nothing is backfilled. A skipped DB-backed CLI test is never counted as PASS here; its table-snapshot read-only assertion is CI evidence only.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib -- leave_gap::tests::seeded_gaps_cover_every_path && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_integrity_acceptance"
     },
     {
       "id": "s13-f5e62b7",
@@ -3433,18 +3432,17 @@
           "[35aac83](https://github.com/TogetherWeOwn/two-bot/commit/35aac8351ba8160215b925351dc63c6d5b81e7c9)",
           "`src/analytics/`",
           "fix(analytics): compare leave-gap timestamps by instant (#411)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
-        "TOG-11152"
+        "TOG-10119"
       ],
-      "status": "waived",
-      "action": "Run TOG-11152’s leave-gap comparison on fixture timestamps with different offsets for one instant.",
-      "expected": "Timestamps compare by instant, not text.",
-      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
-      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
-      "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
+      "status": "automated",
+      "action": "Run the offset-spelling pins in `crates/cutover/src/leave_gap.rs` and `crates/core/src/member_leave_gap.rs`.",
+      "expected": "Timestamps that spell one instant with different UTC offsets classify, order and fill identically; comparison is by instant, not text.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib -- leave_gap::tests::coverage_uses_instants_for_equivalent_spellings leave_gap::tests::raid_uses_instants_for_equivalent_spellings leave_gap::tests::offset_joins_with_reversed_string_order_yield_chronological_fills leave_gap::tests::gap_members_sort_by_last_join_instant_with_member_tiebreak && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib -- member_leave_gap::tests::offset_timestamps_compare_by_instant_not_string"
     },
     {
       "id": "s13-8b5d1e1",

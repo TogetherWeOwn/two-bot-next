@@ -267,8 +267,10 @@ class ContainerSmokeTests(unittest.TestCase):
         self.assertIn("IMAGE: two-bot-next:smoke-${{ github.run_id }}-${{ github.run_attempt }}", job)
         self.assertIn("id: build", job)
         self.assertIn("tags: ${{ env.IMAGE }}", job)
-        self.assertEqual(job.count("IMAGE_ID: ${{ steps.build.outputs.imageid }}"), 2)
+        # container-smoke, its deliberate-breakage proof, and the JSON-log smoke.
+        self.assertEqual(job.count("IMAGE_ID: ${{ steps.build.outputs.imageid }}"), 3)
         self.assertIn('python3 scripts/container-smoke.py "$IMAGE_ID"', job)
+        self.assertIn('python3 scripts/test-logging-container.py "$IMAGE_ID"', job)
         self.assertIn('python3 scripts/container-smoke.py "$IMAGE_ID" "--$budget-max-bytes" 1', job)
         self.assertIn('docker image rm "$IMAGE"', job)
         self.assertNotIn("docker image prune", job)

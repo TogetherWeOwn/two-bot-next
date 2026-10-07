@@ -1453,6 +1453,127 @@ async fn dispatch_spawns_interaction_work_off_the_shard_loop() {
 }
 
 #[tokio::test]
+async fn dispatch_remaining_keeps_rsvp_replies_and_registry_with_the_ordered_owner() {
+    for announcements in [false, true] {
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        let runtime = runtime_without_db(gates(false, announcements), false, origin);
+        runtime.dispatch_remaining(&ready());
+        runtime.dispatch_remaining(&Event::Resumed);
+        for name in ["rsvp", "rsvp-attendance", "attendance"] {
+            for permissions in [Permissions::empty(), Permissions::all()] {
+                let mut interaction = slash(name, Some(CHANNEL), Vec::new());
+                interaction.member.as_mut().unwrap().permissions = Some(permissions);
+                runtime.dispatch_remaining(&Event::InteractionCreate(Box::new(InteractionCreate(
+                    interaction,
+                ))));
+            }
+        }
+        // Unowned sticky refusals must still use detached shared dispatch.
+        runtime.dispatch_remaining(&Event::InteractionCreate(Box::new(InteractionCreate(
+            slash("sticky-remove", Some(CHANNEL), Vec::new()),
+        ))));
+        wait_for(|| !mock.requests().is_empty(), "remaining sticky refusal").await;
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "no RSVP callback or registry replacement"
+        );
+        let reply: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(reply["type"], 4);
+        assert_eq!(reply["data"]["flags"], 64);
+        assert_eq!(reply["data"]["content"], AUTOMATIONS_DISABLED_REPLY);
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn dispatch_remaining_ready_initializes_identity_without_registry_or_tickets() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(false, false), false, origin);
+    runtime.dispatch_remaining(&ready());
+    // The ordered surface owns publication; identity still initializes here so
+    // LFG keeps READY's ids without a REST read.
+    assert_eq!(runtime.test_interactions().test_bot_user_id(), 1111);
+    assert_eq!(runtime.test_interactions().test_application_id(), 1111);
+    assert_eq!(
+        runtime
+            .test_interactions()
+            .test_resolved_bot_user_id()
+            .await,
+        1111
+    );
+    assert!(mock.requests().is_empty(), "no registry or identity HTTP");
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn dispatch_remaining_ready_mismatch_keeps_boot_pin_unarmed() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(false, false), false, origin);
+    // Boot token pins the application identity on both the runtime and the
+    // ordered surface; the bot user stays unknown until a matching READY.
+    // `ready()` carries a foreign application (1111).
+    runtime.set_identity(0, 2222);
+    runtime.dispatch_remaining(&ready());
+    // Mismatch: the old pin survives, the bot user never arms, and no
+    // registry or store work runs under the foreign identity.
+    assert_eq!(runtime.test_interactions().test_application_id(), 2222);
+    assert_eq!(runtime.test_interactions().test_bot_user_id(), 0);
+    assert!(mock.requests().is_empty(), "no registry or identity HTTP");
+    // A READY matching the boot pin still initializes the bot user.
+    let mut matching = ready();
+    if let Event::Ready(ref mut ready) = matching {
+        ready.application.id = Id::new(2222);
+        ready.user.id = Id::new(2222);
+    }
+    runtime.dispatch_remaining(&matching);
+    assert_eq!(runtime.test_interactions().test_application_id(), 2222);
+    assert_eq!(runtime.test_interactions().test_bot_user_id(), 2222);
+    assert!(mock.requests().is_empty(), "no registry or identity HTTP");
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn dispatch_remaining_ready_wakes_tickets_and_survives_failed_lookup() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    let executor =
+        ActionExecutor::with_proxy("test-token".to_owned(), Some(origin)).expect("mock executor");
+    let tickets = Arc::new(
+        crate::ticket_runtime::TicketRuntime::new(
+            pool.clone(),
+            executor.clone(),
+            crate::ticket_runtime::TicketConfig {
+                guild_id: "100".into(),
+                category_id: "200".into(),
+                panel_channel_id: "700".into(),
+                staff_role_id: "300".into(),
+                cooldown_seconds: 15,
+            },
+        )
+        .unwrap(),
+    );
+    let runtime = CommandRuntime::with_tickets(pool, executor, Arc::clone(&tickets));
+    runtime.dispatch_remaining(&ready());
+    // Tickets wake from READY's bot id with no registry publication.
+    assert_eq!(tickets.readiness_for_test(), (1111, 1));
+    assert!(mock.requests().is_empty(), "no registry HTTP");
+    // The mock is gone: any identity HTTP lookup would fail, but READY's
+    // cached bot id is retained for LFG nonce recovery.
+    mock.shutdown().await;
+    assert_eq!(
+        runtime
+            .test_interactions()
+            .test_resolved_bot_user_id()
+            .await,
+        1111
+    );
+}
+
+#[tokio::test]
 async fn bounded_dispatch_keeps_publication_independent_and_cancels_on_gateway_exit() {
     let (mock, origin) = MockRest::start_script(held_callbacks(17)).await;
     let runtime = runtime_without_db(gates(false, false), false, origin);
@@ -3161,6 +3282,7 @@ async fn gateway_keeps_checkpointing_and_heartbeating_during_channel_rest_work()
         Arc::new(crate::gateway::build_pipeline(Vec::new(), None)),
         Arc::new(RwLock::new(crate::gateway::GatewayState::Armed)),
         store.clone(),
+        None,
         None,
         Some(Arc::clone(&runtime)),
         None,

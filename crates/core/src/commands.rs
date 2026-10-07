@@ -96,6 +96,9 @@ pub struct CommandOption {
     pub max_length: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub choices: Vec<CommandChoice>,
+    /// Allowed Discord channel type integers for a channel picker.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub channel_types: Vec<u8>,
     /// Nested options of a sub-command; empty for every other option.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub options: Vec<CommandOption>,
@@ -114,6 +117,7 @@ impl CommandOption {
             max_value: None,
             max_length: None,
             choices: Vec::new(),
+            channel_types: Vec::new(),
             options: Vec::new(),
         }
     }
@@ -150,6 +154,14 @@ impl CommandOption {
     #[must_use]
     pub fn max_length(mut self, max: u32) -> Self {
         self.max_length = Some(max);
+        self
+    }
+
+    /// Restrict a channel picker; the runtime must still validate the target.
+    /// <https://docs.discord.com/developers/interactions/application-commands#application-command-object-application-command-option-structure>
+    #[must_use]
+    pub fn channel_types(mut self, channel_types: Vec<u8>) -> Self {
+        self.channel_types = channel_types;
         self
     }
 
@@ -315,6 +327,32 @@ pub enum RegistryError {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn logging_channel_picker_serializes_only_guild_text() {
+        let definition = crate::voice_rooms::voice_commands()
+            .into_iter()
+            .find(|command| command.name == "logging")
+            .unwrap();
+        let wire = serde_json::to_value(&definition).unwrap();
+        let sub = wire["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|option| option["name"] == "channel")
+            .unwrap();
+        assert_eq!(sub["options"][0]["type"], 7);
+        assert_eq!(sub["options"][0]["channel_types"], serde_json::json!([0]));
+        let decoded: CommandDefinition = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded, definition);
+        let unrestricted = CommandOption::new("channel", "Any channel", CommandOptionType::Channel);
+        let old_wire = serde_json::to_value(&unrestricted).unwrap();
+        assert!(old_wire.get("channel_types").is_none());
+        assert_eq!(
+            serde_json::from_value::<CommandOption>(old_wire).unwrap(),
+            unrestricted
+        );
+    }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]

@@ -483,6 +483,9 @@ jobs:
       - name: cargo test (integration, including website acceptance and backup round trip)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+          # RSVP runtime acceptance isolates per-test schemas, so it shares the
+          # consolidated bootstrap; no slice-specific bootstrap names.
+          TWO_RSVP_RUNTIME_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
           TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_ci
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
         # The publication regression has its own guarded DB and actual binary
@@ -1264,6 +1267,8 @@ jobs:
           persist-credentials: false
       - name: Offline smoke-test regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke.py' -v
+      - name: Offline JSON-log smoke parser regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-logging-container.py --self-test
       # A skipped build still reports success: the offline tests above ran,
       # and container smoke is not a required check, so the check stays
       # green without hiding anything the branch protection demands.
@@ -1295,6 +1300,14 @@ jobs:
         env:
           IMAGE_ID: ${{ steps.build.outputs.imageid }}
         run: python3 scripts/container-smoke.py "$IMAGE_ID"
+      # Structured-log contract on the image just built: token-free, network
+      # disabled, every combined stdout/stderr line must be a JSON object
+      # (docs/logging.md). Reuses this job's image, so no second build.
+      - name: Structured JSON log smoke (token-free, no network)
+        if: needs.container-inputs.outputs.build == 'true'
+        env:
+          IMAGE_ID: ${{ steps.build.outputs.imageid }}
+        run: python3 scripts/test-logging-container.py "$IMAGE_ID"
       - name: Prove deliberate budget breakage fails
         if: needs.container-inputs.outputs.build == 'true'
         env:
