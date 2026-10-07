@@ -128,6 +128,27 @@ impl Fixture {
         )))
         .execute(&mut admin)
         .await?;
+        // Card-named audit logins: fixed names, so concurrent suites share
+        // them. The plan login holds the RO group; the apply login is bare.
+        // Both prove the audit decodes `exists` true with exact memberships.
+        for role in ["two_bot_migrator_ro_plan", "two_bot_migrator_apply"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DO $$ BEGIN CREATE ROLE {role} NOLOGIN; \
+                 EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
+            )))
+            .execute(&mut admin)
+            .await?;
+        }
+        sqlx::query(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_auth_members am \
+             JOIN pg_roles r ON r.oid = am.member \
+             JOIN pg_roles m ON m.oid = am.roleid \
+             WHERE r.rolname = 'two_bot_migrator_ro_plan' \
+             AND m.rolname = 'two_bot_migrator_ro') THEN \
+             GRANT two_bot_migrator_ro TO two_bot_migrator_ro_plan; END IF; END $$",
+        )
+        .execute(&mut admin)
+        .await?;
         let mut scratch = PgConnection::connect_with(&admin_options(host, &database)).await?;
         sqlx::query("ALTER SCHEMA public OWNER TO two_bot_migrator")
             .execute(&mut scratch)
@@ -629,7 +650,24 @@ async fn real_sqlx_runner_cases() -> TestResult {
     assert!(audit["ledger_owner"].as_str().is_some());
     assert_eq!(audit["ledger_counts"]["successful_rows"], 29);
     assert_eq!(audit["ledger_counts"]["failed_rows"], 0);
-    assert!(audit["memberships"].is_array());
+    // Every card login reports an entry, even the apply login that holds
+    // nothing: `exists` separates "missing login" from "no memberships".
+    let entries = audit["memberships"].as_array().unwrap();
+    assert_eq!(entries.len(), 4);
+    let entry = |login: &str| entries.iter().find(|e| e["login"] == login).unwrap();
+    let plan_entry = entry("two_bot_migrator_ro_plan");
+    assert!(plan_entry["exists"].as_bool().unwrap());
+    let plan_groups = plan_entry["member_of"].as_array().unwrap();
+    assert!(plan_groups.iter().any(|m| m == "two_bot_migrator_ro"));
+    assert!(plan_entry["member_of_ro"].as_bool().unwrap());
+    assert!(!plan_entry["member_of_migrator"].as_bool().unwrap());
+    let apply_entry = entry("two_bot_migrator_apply");
+    assert!(apply_entry["exists"].as_bool().unwrap());
+    assert!(apply_entry["member_of"].as_array().unwrap().is_empty());
+    assert!(!apply_entry["member_of_ro"].as_bool().unwrap());
+    assert!(!apply_entry["member_of_migrator"].as_bool().unwrap());
+    assert!(entry("two_bot_migrator")["exists"].as_bool().unwrap());
+    assert!(entry("two_bot_migrator_ro")["exists"].as_bool().unwrap());
     assert!(audit["verify_findings"].is_array());
     assert_eq!(audit["matrix_sha256"].as_str().map(str::len), Some(64));
     assert_eq!(audit["verify_sha256"].as_str().map(str::len), Some(64));

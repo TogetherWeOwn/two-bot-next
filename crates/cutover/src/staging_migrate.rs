@@ -50,13 +50,22 @@ pub const RUNNER_VERSION: u32 = 1;
 /// any other SHA.
 const AUDIT_MATRIX: &str = include_str!("../../../sql/database_role_matrix.sql");
 const AUDIT_VERIFY: &str = include_str!("../../../sql/verify_database_roles.sql");
-/// Memberships of the four migrator logins. A login that does not exist
-/// reports no rows instead of an error.
-const AUDIT_MEMBERSHIP_SQL: &str = "SELECT r.rolname::text, m.rolname::text FROM pg_roles r \
-     JOIN pg_auth_members am ON am.member = r.oid \
-     JOIN pg_roles m ON m.oid = am.roleid \
-     WHERE r.rolname IN ('two_bot_migrator', 'two_bot_migrator_ro', \
-     'two_bot_migrator_ro_plan', 'two_bot_migrator_apply') ORDER BY 1, 2";
+/// Membership entries for the four migrator logins. Driven from `VALUES` with a
+/// `LEFT JOIN`, so a login that does not exist still reports an entry with
+/// `exists` false instead of vanishing from the readout. Direct memberships
+/// are aggregated per login; the two transitive flags mirror the plan guard's
+/// `pg_has_role` check (`refuse_migrator_member_plan_login`).
+const AUDIT_MEMBERSHIP_SQL: &str = "SELECT e.login, (r.oid IS NOT NULL) AS login_exists, \
+     COALESCE(array_agg(m.rolname::text ORDER BY m.rolname) \
+     FILTER (WHERE m.rolname IS NOT NULL), '{}') AS direct_memberships, \
+     COALESCE(pg_has_role(r.oid, 'two_bot_migrator', 'MEMBER'), false) AS member_of_migrator, \
+     COALESCE(pg_has_role(r.oid, 'two_bot_migrator_ro', 'MEMBER'), false) AS member_of_ro \
+     FROM (VALUES ('two_bot_migrator'), ('two_bot_migrator_ro'), \
+     ('two_bot_migrator_ro_plan'), ('two_bot_migrator_apply')) AS e(login) \
+     LEFT JOIN pg_roles r ON r.rolname = e.login \
+     LEFT JOIN pg_auth_members am ON am.member = r.oid \
+     LEFT JOIN pg_roles m ON m.oid = am.roleid \
+     GROUP BY e.login, r.oid ORDER BY e.login";
 
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
@@ -526,12 +535,12 @@ fn source_manifest(migrator: &Migrator) -> Value {
 
 /// Bounded read-only readout for the plan manifest, plan mode only.
 ///
-/// Reports the ledger owner, the ledger successful/max/failed counts, the
-/// memberships of the four migrator logins and the repo verifier findings
-/// (rendered with the compiled matrix). Names, counts and findings only: never
-/// passwords, URLs or key material. A failed readout is reported as a fixed
-/// `error` string and never fails the plan, because the plan manifest is also
-/// the apply binding.
+/// Reports the ledger owner, the ledger successful/max/failed counts, one
+/// membership entry per migrator login (existence, direct memberships and the
+/// two transitive flags) and the repo verifier findings (rendered with the
+/// compiled matrix). Names, counts and findings only: never passwords, URLs or
+/// key material. A failed readout is reported as a fixed `error` string and
+/// never fails the plan, because the plan manifest is also the apply binding.
 async fn read_audit(pool: &PgPool) -> Value {
     match audit_queries(pool).await {
         Ok(audit) => audit,
@@ -567,24 +576,31 @@ async fn audit_queries(pool: &PgPool) -> Result<Value, &'static str> {
     } else {
         json!({"successful_rows": 0, "max_version": Value::Null, "failed_rows": 0})
     };
-    let memberships: Vec<(String, String)> = sqlx::query_as(AUDIT_MEMBERSHIP_SQL)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|_| "audit membership read failed")?;
+    let memberships: Vec<(String, bool, Vec<String>, bool, bool)> =
+        sqlx::query_as(AUDIT_MEMBERSHIP_SQL)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|_| "audit membership read failed")?;
     let rendered = AUDIT_VERIFY.replace("-- @matrix", AUDIT_MATRIX);
     let findings: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(rendered))
         .fetch_all(&mut *tx)
         .await
         .map_err(|_| "audit verify read failed")?;
     tx.rollback().await.map_err(|_| "audit rollback failed")?;
-    let memberships: Vec<Value> = memberships
-        .iter()
-        .map(|(login, member_of)| json!({"login": login, "member_of": member_of}))
-        .collect();
+    let mut membership_entries = Vec::with_capacity(memberships.len());
+    for (login, exists, member_of, of_migrator, of_ro) in &memberships {
+        membership_entries.push(json!({
+            "login": login,
+            "exists": exists,
+            "member_of": member_of,
+            "member_of_migrator": of_migrator,
+            "member_of_ro": of_ro,
+        }));
+    }
     Ok(json!({
         "ledger_owner": owner,
         "ledger_counts": counts,
-        "memberships": memberships,
+        "memberships": membership_entries,
         "verify_findings": findings,
         "matrix_sha256": hex::encode(Sha256::digest(AUDIT_MATRIX.as_bytes())),
         "verify_sha256": hex::encode(Sha256::digest(AUDIT_VERIFY.as_bytes())),
@@ -1427,7 +1443,9 @@ mod tests {
         ] {
             assert!(AUDIT_MEMBERSHIP_SQL.contains(&format!("'{login}'")));
         }
-        assert!(AUDIT_MEMBERSHIP_SQL.contains("ORDER BY 1, 2"));
+        assert!(AUDIT_MEMBERSHIP_SQL.contains("LEFT JOIN pg_roles"));
+        assert!(AUDIT_MEMBERSHIP_SQL.contains("pg_has_role"));
+        assert!(AUDIT_MEMBERSHIP_SQL.contains("ORDER BY e.login"));
         assert!(AUDIT_MATRIX.contains("'public', '_sqlx_migrations', 'ledger'"));
         assert!(AUDIT_VERIFY.contains("SELECT finding FROM findings ORDER BY finding;"));
         assert!(AUDIT_VERIFY.contains("-- @matrix"));

@@ -38,7 +38,7 @@
   "audit": {
     "ledger_owner": "two_bot_migrator",
     "ledger_counts": {"successful_rows": 0, "max_version": null, "failed_rows": 0},
-    "memberships": [{"login": "two_bot_migrator_ro_plan", "member_of": "two_bot_migrator_ro"}],
+    "memberships": [{"login": "two_bot_migrator_ro_plan", "exists": true, "member_of": ["two_bot_migrator_ro"], "member_of_migrator": false, "member_of_ro": true}],
     "verify_findings": [],
     "matrix_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
     "verify_sha256": "0000000000000000000000000000000000000000000000000000000000000000"

@@ -433,8 +433,11 @@ A passing apply records `"plan_provenance_verified": true` in its manifest.
 `--plan` also fills an `audit` block (`null` for apply) from one explicit
 `READ ONLY` transaction on the same read-only login: the ledger owner
 (`ledger_owner`), `ledger_counts` (successful rows, max successful version,
-failed rows), `memberships` of the four migrator logins (`two_bot_migrator`,
-`two_bot_migrator_ro`, `two_bot_migrator_ro_plan`, `two_bot_migrator_apply`) and
+failed rows), one `memberships` entry per migrator login (`two_bot_migrator`,
+`two_bot_migrator_ro`, `two_bot_migrator_ro_plan`, `two_bot_migrator_apply`):
+an `exists` flag (so a missing login reads `false` instead of vanishing), the
+aggregated direct `member_of` list, and the transitive `member_of_migrator` /
+`member_of_ro` flags that mirror the plan login guard, plus
 `verify_findings`, the output of `sql/verify_database_roles.sql` rendered with
 `sql/database_role_matrix.sql` (empty means no drift). The files are the ones
 compiled from the dispatched `source_sha`, and their SHA-256 digests
