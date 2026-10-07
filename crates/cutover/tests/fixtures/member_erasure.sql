@@ -130,6 +130,8 @@ BEGIN
       INSERT INTO voice_rooms
         (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at)
         VALUES (g, 'v-' || k, 'vc-' || g, u, u, '7', '2026-10-01T00:00:00Z');
+      INSERT INTO voice_create_reservations (guild_id, user_id, created_at)
+        VALUES (g, u, '2026-10-01T00:00:00Z');
       INSERT INTO voice_room_blocks (guild_id, room_channel_id, blocked_member_id)
         VALUES (g, 'v-' || k, u);
       INSERT INTO voice_join_grants (guild_id, room_channel_id, member_id)

@@ -316,6 +316,10 @@
     "crates/cutover/migrations/0421_voice_first_number_bound.sql": {
       "sha256": "0dfe81e30d3a5ec067b26a99598468d30fcc0443ce35775e940cb307bf197439",
       "justification": "Bound voice first_room_number to 1..=4294967295 (u32 export codec): clamp existing rows, then CHECK beside 0224."
+    },
+    "crates/cutover/migrations/0422_voice_create_reservations.sql": {
+      "sha256": "8c0d98f0b5dd3e45770a05b5fe211fcd29b67352a23b802658b5cf81b7e47883",
+      "justification": "Durable voice room-create admission: one reservation row per accepted create, so burst and cooldown history survives room deletion and restarts."
     }
   }
 }

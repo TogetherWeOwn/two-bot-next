@@ -8,7 +8,6 @@ connection. The login URL and member id below are synthetic.
 
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
-import hashlib
 import io
 import json
 import os
@@ -31,22 +30,21 @@ URL = (f"postgresql://two_bot_events_ro:{PASSWORD}@ep-staging-example.us-east-2.
        "?sslmode=require&channel_binding=require")
 IDENTITY = "two_bot_events_ro,two_bot\n"
 FAKE_PSQL = """#!/usr/bin/env python3
-import hashlib, json, os, pathlib, sys
+import json, os, pathlib, sys
 here = pathlib.Path(__file__).parent
 behavior = json.loads((here / "behavior.json").read_text())
 stdin = sys.stdin.read()
-# The login password must never reach a file in clear: log a marker plus a
-# hash the test compares, so a leaked log still proves nothing.
+# Record presence only; the in-process database_target test checks the value.
 logged = dict(os.environ)
-secret = logged.pop("PGPASSWORD", None)
-if secret is not None:
-    logged["PGPASSWORD_SHA256"] = hashlib.sha256(secret.encode()).hexdigest()
+if "PGPASSWORD" in logged:
     logged["PGPASSWORD"] = "REDACTED"
 with open(here / "calls.jsonl", "a") as log:
     log.write(json.dumps({"argv": sys.argv[1:], "stdin": stdin, "environ": logged}) + "\\n")
 # Failure text is built here from the live process values, never stored in
 # behavior.json: that file is clear text and must not hold a credential.
 kind = behavior.get("fail_kind")
+if behavior.get("fail_on_query") and "current_user" in stdin:
+    kind = None
 if kind:
     values = {"member": "", "password": os.environ.get("PGPASSWORD", ""),
               "guild": "1545644954272137297"}
@@ -81,13 +79,15 @@ def rows_csv(count, event_type="message_created"):
 class Fixture:
     """A temp dir holding the fake psql and its behavior, plus a runner for main()."""
 
-    def __init__(self, test, rows="", identity=IDENTITY, fail=None, fail_kind=None, exit_code=2):
+    def __init__(self, test, rows="", identity=IDENTITY, fail=None, fail_kind=None,
+                 fail_on_query=False, exit_code=2):
         self.dir = Path(tempfile.mkdtemp(prefix="events-read-test-"))
         test.addCleanup(self.cleanup)
         self.psql = self.dir / "psql"
         self.psql.write_text(FAKE_PSQL)
         self.psql.chmod(self.psql.stat().st_mode | stat.S_IXUSR)
-        self.set(rows=rows, identity=identity, fail=fail, fail_kind=fail_kind, exit=exit_code)
+        self.set(rows=rows, identity=identity, fail=fail, fail_kind=fail_kind,
+                 fail_on_query=fail_on_query, exit=exit_code)
         self.output = self.dir / "out.json"
         self.summary = self.dir / "summary.md"
 
@@ -279,7 +279,12 @@ class ReadTests(unittest.TestCase):
 
     def test_variables_and_flags_reach_psql_and_no_secret_does(self):
         fixture = Fixture(self, rows=rows_csv(1))
-        fixture.run()
+        with mock.patch.object(reader.subprocess, "run", wraps=reader.subprocess.run) as run:
+            code, _, err = fixture.run()
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(run.call_count, 2)
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs["env"]["PGPASSWORD"], PASSWORD)
         identity_call, rows_call = fixture.calls()
         self.assertEqual(identity_call["argv"], ["-X", "-q", "-t", "--csv", "-v", "ON_ERROR_STOP=1", "-f", "-"])
         self.assertEqual(rows_call["argv"], [
@@ -294,8 +299,6 @@ class ReadTests(unittest.TestCase):
             self.assertNotIn(PASSWORD, call["stdin"])
             environ = call["environ"]
             self.assertEqual(environ["PGPASSWORD"], "REDACTED")
-            self.assertEqual(environ["PGPASSWORD_SHA256"],
-                             hashlib.sha256(PASSWORD.encode()).hexdigest())
             self.assertEqual(environ["PGUSER"], "two_bot_events_ro")
             self.assertEqual(environ["PGDATABASE"], "two_bot")
             self.assertNotIn("GH_TOKEN", environ)
@@ -354,21 +357,27 @@ class ReadTests(unittest.TestCase):
                 self.assertIn("refusing", err)
 
     def test_psql_stderr_is_never_echoed(self):
-        # The fake builds each stderr from its live process values, so the
-        # synthetic credential never sits in behavior.json in clear text.
-        for kind, phrase in (("permission", "permission denied for the read-only role"),
-                             ("auth", "authentication failed"),
-                             ("refused", "could not connect"),
-                             ("timeout", "statement timeout"),
-                             ("strange", "psql failed")):
-            with self.subTest(phrase=phrase):
-                fixture = Fixture(self, fail_kind=kind, exit_code=2)
-                code, out, err = fixture.run()
-                self.assertEqual(code, 1)
-                self.assertIn(phrase, err)
-                for secret in (MEMBER, PASSWORD, "1545644954272137297", "LINE 5"):
-                    self.assertNotIn(secret, out + err)
-                self.assertFalse(fixture.output.exists())
+        # Exercise failures on both connections; only the rows query carries
+        # member=, so its runtime-built stderr must exercise the member fence.
+        for fail_on_query in (False, True):
+            for kind, phrase in (("permission", "permission denied for the read-only role"),
+                                 ("auth", "authentication failed"),
+                                 ("refused", "could not connect"),
+                                 ("timeout", "statement timeout"),
+                                 ("strange", "psql failed")):
+                with self.subTest(phrase=phrase, fail_on_query=fail_on_query):
+                    fixture = Fixture(self, fail_kind=kind, fail_on_query=fail_on_query, exit_code=2)
+                    code, out, err = fixture.run()
+                    self.assertEqual(code, 1)
+                    self.assertEqual(out, "")
+                    self.assertEqual(err, f"failed: {phrase} (psql exit 2)\n")
+                    calls = fixture.calls()
+                    self.assertEqual(len(calls), 2 if fail_on_query else 1)
+                    if fail_on_query:
+                        self.assertIn(f"member={MEMBER}", calls[-1]["argv"])
+                    for secret in (MEMBER, PASSWORD, "1545644954272137297", "LINE 5"):
+                        self.assertNotIn(secret, out + err)
+                    self.assertFalse(fixture.output.exists())
 
     def test_an_unexpected_exception_does_not_print_a_traceback(self):
         fixture = Fixture(self, rows=rows_csv(1))

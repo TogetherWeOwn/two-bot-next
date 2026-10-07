@@ -7,8 +7,8 @@ name: staging-events-read
 # `staging-events-read` environment's existing bindings: the secret
 # TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL (role two_bot_events_ro, column-limited
 # SELECT on `events`) and the secret STAGING_FIXTURE_MEMBER_ID. It creates or
-# changes no credential. A missing environment fails the job; a missing
-# binding is refused before any connection.
+# changes no credential. A missing binding is refused before any connection;
+# the environment's main-only policy must be verified during setup.
 #
 # The fixture member is a secret, not a dispatch input and not a variable: a
 # step's env block is printed on the (public) run page with variable values in

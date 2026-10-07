@@ -114,10 +114,22 @@ impl GatewayCommands {
             .configured_guild
             .and_then(Id::new_checked)
             .ok_or_else(config_error)?;
-        let application_id = executor.current_application_id().await.map_err(|_| {
+        // The cause is a fixed token (never the error text), so a failed boot
+        // names the read and why without exposing provider or transport detail.
+        let application_id = executor.current_application_id().await.map_err(|error| {
+            tracing::warn!(
+                step = "application_lookup",
+                cause = error.cause(),
+                "gateway bootstrap read failed"
+            );
             sqlx::Error::InvalidArgument("gateway application context unavailable".into())
         })?;
-        let bootstrap_guild_name = executor.guild_name(guild_id.get()).await.map_err(|_| {
+        let bootstrap_guild_name = executor.guild_name(guild_id.get()).await.map_err(|error| {
+            tracing::warn!(
+                step = "guild_lookup",
+                cause = error.cause(),
+                "gateway bootstrap read failed"
+            );
             sqlx::Error::InvalidArgument("gateway guild context unavailable".into())
         })?;
         let runtime = CustomCommandRuntime::new(pool, router, executor, application_id);

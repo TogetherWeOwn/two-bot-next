@@ -22,7 +22,10 @@ are outside this implementation's scope.
   incident is a replay/block guard and makes erasure refuse until it settles.
 - Tickets: `tickets` and `ticket_transcripts` (opener or claimer; 90-day transcript purge applies independently).
 - Temporary voice rooms: each tracked room stores its current owner and original
-  creator IDs (`voice_rooms`), erased by either. Erasure removes the tracking row
+  creator IDs (`voice_rooms`), erased by either. Each accepted room create also
+  leaves a reservation row with the requesting member's ID and a timestamp
+  (`voice_create_reservations`, the rolling burst and cooldown history), erased
+  with that member. Erasure removes the tracking rows
   only, never the Discord channel. Creator-channel configuration
   (`voice_creators`, including V9 text-channel name/viewer-role settings) and
   companion text-channel records (`voice_text_companions`, Discord channel IDs

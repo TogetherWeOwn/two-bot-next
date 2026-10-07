@@ -974,6 +974,11 @@ jobs:
       - name: Voice configuration store (CI service container only)
         run: cargo test -p two-bot-cutover --test voice_config_store --locked -- --ignored
 
+      - name: Voice create admission store (isolated DBs, CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-cutover --test voice_create_admission_store --locked -- --ignored
+
       - name: legacy copy acceptance (two owned databases on CI service only)
         run: cargo test -p two-bot-cutover --test legacy_copy_db --locked -- --ignored
 
