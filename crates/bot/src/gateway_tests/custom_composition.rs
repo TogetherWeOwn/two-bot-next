@@ -370,8 +370,9 @@ async fn mixed_rsvp_custom_command_survives_brief_lane_contention() {
     ws.send(Message::text(faq_packet(3, 3, "mock-faq-3").to_string()))
         .await
         .unwrap();
-    // One final custom edit lands; the healthy shutdown drain below then
-    // proves the accepted work completed instead of wedging.
+    // One final custom edit has reached MockRest. It records the PATCH before
+    // responding, so wait for the post-response audit before shutdown can
+    // cancel the detached command task.
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let done = rest
@@ -386,6 +387,22 @@ async fn mixed_rsvp_custom_command_survives_brief_lane_contention() {
     })
     .await
     .expect("custom completion deadline");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let runs: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM automation_audit_log WHERE target_key = 'faq' AND action = 'command.run'",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            if runs >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("custom command audit deadline");
     shutdown.send_replace(true);
     tokio::time::timeout(Duration::from_secs(30), runner)
         .await
