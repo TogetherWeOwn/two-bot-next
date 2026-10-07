@@ -44,6 +44,8 @@ fn staging_gates() -> RouterGates {
         automations: true,
         announcements: true,
         moderation: true,
+        voice: false,
+        voice_assistant: false,
         tickets: true,
         self_roles: true,
         onboarding_picker: true,
@@ -150,4 +152,115 @@ fn dynamic_rows_never_shadow_builtin_names() {
         1,
         "the builtin keeps the name; the dynamic shadow stays out: {names:?}"
     );
+}
+
+fn voice_manifest() -> Value {
+    manifest()["voice"].clone()
+}
+
+/// A manifest permission cell: JSON null is "no default permission gate".
+fn permission_cell(cell: &Value) -> Option<String> {
+    cell.as_str().map(str::to_owned)
+}
+
+fn voice_router(voice: bool, assistant: bool) -> InteractionRouter {
+    InteractionRouter::new(RouterGates {
+        voice,
+        voice_assistant: assistant,
+        ..staging_gates()
+    })
+}
+
+#[test]
+fn voice_set_matches_manifest_names_and_permissions() {
+    let voice = voice_manifest();
+    let rows = voice["published_after_builtins"]
+        .as_array()
+        .expect("manifest voice rows");
+    let mut expected = manifest_names("builtins_in_publish_order");
+    expected.extend(
+        rows.iter()
+            .map(|row| row["name"].as_str().expect("voice row name").to_owned()),
+    );
+    let set = voice_router(true, false)
+        .publish_set(&[])
+        .expect("staging voice set assembles");
+    let names: Vec<String> = set.iter().map(|def| def.name.clone()).collect();
+    assert_eq!(
+        names, expected,
+        "router-advertised voice set drifted from the manifest: update the fixture \
+         from publish_set output, never hand-edit names",
+    );
+    for row in rows {
+        let name = row["name"].as_str().expect("voice row name");
+        let def = set
+            .iter()
+            .find(|def| def.name == name)
+            .unwrap_or_else(|| panic!("/{name} missing from the voice publish set"));
+        assert_eq!(
+            def.default_member_permissions,
+            permission_cell(&row["default_member_permissions"]),
+            "/{name} default permissions drifted from the manifest",
+        );
+        assert!(!def.dm_permission, "/{name} must stay guild-only");
+    }
+}
+
+#[test]
+fn voice_kick_is_shadowed_by_moderation_kick() {
+    let voice = voice_manifest();
+    let shadowed: Vec<&str> = voice["shadowed_by_first_wins"]
+        .as_array()
+        .expect("manifest shadowed list")
+        .iter()
+        .map(|name| name.as_str().expect("shadowed name"))
+        .collect();
+    assert_eq!(shadowed, ["kick"]);
+    let set = voice_router(true, true)
+        .publish_set(&[])
+        .expect("staging voice set assembles");
+    for name in shadowed {
+        let defs: Vec<_> = set.iter().filter(|def| def.name == name).collect();
+        assert_eq!(defs.len(), 1, "/{name} must publish exactly once");
+        assert_eq!(
+            defs[0].default_member_permissions,
+            permission_cell(&voice["shadow_winner_default_member_permissions"]),
+            "/{name} must keep the moderation shape, not the voice one",
+        );
+        assert!(defs[0].options.iter().any(|option| option.name == "target"));
+    }
+}
+
+#[test]
+fn templateassistant_publishes_last_only_with_both_gates() {
+    let voice = voice_manifest();
+    let assistant = &voice["assistant"];
+    let name = assistant["name"].as_str().expect("assistant name");
+    for (voice_gate, assistant_gate) in [(false, false), (false, true), (true, false)] {
+        let set = voice_router(voice_gate, assistant_gate)
+            .publish_set(&[])
+            .expect("staging set assembles");
+        assert!(
+            !set.iter().any(|def| def.name == name),
+            "/{name} must not publish with voice={voice_gate} assistant={assistant_gate}",
+        );
+    }
+    let set = voice_router(true, true)
+        .publish_set(&[])
+        .expect("staging set assembles");
+    let last = set.last().expect("non-empty publish set");
+    assert_eq!(last.name, name, "/{name} publishes after the voice set");
+    assert_eq!(
+        last.default_member_permissions,
+        permission_cell(&assistant["default_member_permissions"]),
+    );
+}
+
+#[test]
+fn voice_gate_off_keeps_the_voice_names_out_of_the_staging_set() {
+    let set = voice_router(false, true)
+        .publish_set(&[])
+        .expect("staging set assembles");
+    let names: Vec<String> = set.iter().map(|def| def.name.clone()).collect();
+    assert_eq!(names, manifest_names("builtins_in_publish_order"));
 }

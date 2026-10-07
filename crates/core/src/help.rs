@@ -11,7 +11,9 @@
 //! read. Failed refreshes retain the last confirmed snapshot. Groups render
 //! in publish order; a group renders only while at least one of its commands
 //! is live. Names outside the table (DB custom rows, or a future builtin this
-//! table predates) render under Custom rather than being dropped.
+//! table predates) render under Custom rather than being dropped. The voice
+//! groups also wait for the voice set itself, so a stored custom row that
+//! shares a voice name stays under Custom while voice is off.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -24,6 +26,10 @@ struct HelpGroup {
     /// Permission hint for the group header; `None` means everyone.
     requires: Option<&'static str>,
     commands: &'static [&'static str],
+    /// The group renders only while this name is also live. Voice names are
+    /// ordinary user-choosable words (`/ping`, `/invite`), so with voice off a
+    /// stored custom row of that name must stay under Custom.
+    anchor: Option<&'static str>,
 }
 
 /// Groups in publish order. The `requires` labels mirror the legacy refusal
@@ -34,16 +40,19 @@ const HELP_GROUPS: &[HelpGroup] = &[
         title: "Leveling",
         requires: None,
         commands: &["rank", "leaderboard"],
+        anchor: None,
     },
     HelpGroup {
         title: "Discovery",
         requires: None,
         commands: &["help"],
+        anchor: None,
     },
     HelpGroup {
         title: "Community check-in",
         requires: Some("Manage Events"),
         commands: &["attendance"],
+        anchor: None,
     },
     HelpGroup {
         title: "Automations",
@@ -58,46 +67,86 @@ const HELP_GROUPS: &[HelpGroup] = &[
             "sticky",
             "sticky-remove",
         ],
+        anchor: None,
     },
     HelpGroup {
         title: "RSVPs",
         requires: None,
         commands: &["rsvp", "rsvp-attendance"],
+        anchor: None,
     },
     HelpGroup {
         title: "Looking for group",
         requires: Some("Manage Events"),
         commands: &["lfg", "lfg-close"],
+        anchor: None,
     },
     HelpGroup {
         title: "Feed relays",
         requires: Some("Manage Server"),
         commands: &["feed-add", "feed-remove", "feed-list"],
+        anchor: None,
     },
     HelpGroup {
         title: "Bans",
         requires: Some("Ban Members"),
         commands: &["ban", "tempban"],
+        anchor: None,
     },
     HelpGroup {
         title: "Kick",
         requires: Some("Kick Members, or a tracked voice room for a vote"),
         commands: &["kick"],
+        anchor: None,
     },
     HelpGroup {
         title: "Timeouts and warnings",
         requires: Some("Moderate Members"),
         commands: &["timeout", "warn"],
+        anchor: None,
     },
     HelpGroup {
         title: "Message cleanup",
         requires: Some("Manage Messages"),
         commands: &["purge"],
+        anchor: None,
     },
     HelpGroup {
         title: "Channel slowmode and locks",
         requires: Some("Manage Channels"),
         commands: &["slowmode", "lockdown", "unlock"],
+        anchor: None,
+    },
+    HelpGroup {
+        title: "Voice rooms",
+        requires: None,
+        commands: &[
+            "setup", "ping", "invite", "reclaim", "transfer", "name", "private", "public", "limit",
+            "unlimit",
+        ],
+        anchor: Some("textchannels"),
+    },
+    HelpGroup {
+        title: "Voice room admin",
+        requires: Some("Manage Channels"),
+        commands: &[
+            "create",
+            "textchannels",
+            "access",
+            "logging",
+            "position",
+            "group",
+            "inheritpermissions",
+            "defaultlimit",
+            "alwaysprivate",
+        ],
+        anchor: Some("textchannels"),
+    },
+    HelpGroup {
+        title: "Voice room settings and assistant",
+        requires: Some("Manage Server"),
+        commands: &["export", "import", "templateassistant"],
+        anchor: Some("textchannels"),
     },
 ];
 
@@ -112,7 +161,11 @@ pub fn help_text(defs: &[CommandDefinition]) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "**Server commands** ({} live)", live.len(),);
     out.push_str("Gated commands need the listed permission.\n");
+    let mut rendered: HashSet<&str> = HashSet::new();
     for group in HELP_GROUPS {
+        if group.anchor.is_some_and(|anchor| !live.contains(anchor)) {
+            continue;
+        }
         let present: Vec<_> = group
             .commands
             .iter()
@@ -121,6 +174,7 @@ pub fn help_text(defs: &[CommandDefinition]) -> String {
         if present.is_empty() {
             continue;
         }
+        rendered.extend(present.iter().map(|name| **name));
         out.push('\n');
         match group.requires {
             Some(perm) => {
@@ -137,13 +191,9 @@ pub fn help_text(defs: &[CommandDefinition]) -> String {
     // DB custom rows publish alongside the builtins; anything else ungrouped
     // (a future builtin this table predates) still renders rather than
     // vanishing from discovery.
-    let grouped: HashSet<&str> = HELP_GROUPS
-        .iter()
-        .flat_map(|g| g.commands.iter().copied())
-        .collect();
     let mut custom = Vec::new();
     for def in defs {
-        if !grouped.contains(def.name.as_str()) {
+        if !rendered.contains(def.name.as_str()) {
             custom.push(def.name.as_str());
         }
     }
@@ -181,6 +231,8 @@ mod tests {
             automations: true,
             announcements: true,
             moderation: true,
+            voice: true,
+            voice_assistant: true,
             tickets: true,
             self_roles: true,
             onboarding_picker: true,
@@ -209,7 +261,14 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        assert!(text.contains("**Server commands** (28 live)"));
+        // 28 legacy builtins plus the 21 gated voice commands and
+        // `/templateassistant` (voice `kick` loses first-wins to moderation
+        // `/kick`): matches the regenerated `docs/commands.md` total.
+        assert!(text.contains("**Server commands** (50 live)"));
+        assert!(
+            !text.contains("**Custom**"),
+            "every published name is grouped"
+        );
         assert!(text.len() < 2000, "fits Discord's content ceiling");
     }
 
@@ -224,11 +283,20 @@ mod tests {
             ("Feed relays", "Manage Server"),
             ("Bans", "Ban Members"),
             ("Message cleanup", "Manage Messages"),
+            ("Voice room admin", "Manage Channels"),
+            ("Voice room settings and assistant", "Manage Server"),
         ] {
             assert!(
                 text.contains(&format!("**{group}** — needs {perm}")),
                 "{group} hint missing"
             );
+        }
+        for line in [
+            "**Voice rooms**\n/setup · /ping · /invite · /reclaim · /transfer · /name · /private · /public · /limit · /unlimit\n",
+            "**Voice room admin** — needs Manage Channels\n/create · /textchannels · /access · /logging · /position · /group · /inheritpermissions · /defaultlimit · /alwaysprivate\n",
+            "**Voice room settings and assistant** — needs Manage Server\n/export · /import · /templateassistant\n",
+        ] {
+            assert!(text.contains(line), "{line}");
         }
         // Open groups carry no gate.
         assert!(text.contains("**Leveling**\n"));
@@ -242,6 +310,8 @@ mod tests {
             automations: false,
             announcements: false,
             moderation: false,
+            voice: false,
+            voice_assistant: false,
             ..all_on()
         });
         let defs = off.publish_set(&[]).expect("core-only set");
@@ -264,7 +334,36 @@ mod tests {
             }])
             .expect("set with custom");
         let text = help_text(&defs);
-        assert!(text.contains("**Custom**\n/faq\n"));
+        // The voice set is grouped, so the Custom section holds only the row.
+        let custom = text
+            .split("**Custom**\n")
+            .nth(1)
+            .expect("custom section renders");
+        assert!(custom.starts_with("/faq\n"), "{custom}");
+    }
+
+    #[test]
+    fn voice_named_custom_rows_stay_custom_while_voice_is_off() {
+        let rows: Vec<_> = ["ping", "export", "invite"]
+            .into_iter()
+            .map(|name| crate::commands::CustomCommand {
+                name: name.to_owned(),
+                description: "Stored before the voice reservation".to_owned(),
+                enabled: true,
+            })
+            .collect();
+        let off = InteractionRouter::new(RouterGates {
+            voice: false,
+            voice_assistant: false,
+            ..all_on()
+        });
+        let text = help_text(&off.publish_set(&rows).expect("set with rows"));
+        assert!(!text.contains("Voice room"), "{text}");
+        let custom = text.split("**Custom**\n").nth(1).expect("custom section");
+        assert!(
+            custom.starts_with("/ping · /export · /invite\n"),
+            "{custom}"
+        );
     }
 
     #[test]
@@ -285,8 +384,10 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 27 legacy builtins plus the Next-only help command.
-        assert_eq!(grouped.len(), 28);
+        // 27 legacy builtins plus the Next-only help command, then the 21
+        // voice names (voice `kick` shares the Kick group) and
+        // `/templateassistant`.
+        assert_eq!(grouped.len(), 50);
         for name in [
             "rank",
             "leaderboard",
@@ -309,7 +410,15 @@ mod tests {
             "slowmode",
             "lockdown",
             "unlock",
-        ] {
+        ]
+        .into_iter()
+        .chain(
+            crate::voice_rooms::voice_commands()
+                .iter()
+                .map(|def| def.name.as_str()),
+        )
+        .chain(["templateassistant"])
+        {
             assert!(grouped.contains(name), "{name} has a help group");
         }
     }

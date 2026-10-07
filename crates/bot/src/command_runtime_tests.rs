@@ -266,6 +266,8 @@ fn gates(automations: bool, announcements: bool) -> RouterGates {
         automations,
         announcements,
         moderation: false,
+        voice: false,
+        voice_assistant: false,
         tickets: false,
         self_roles: false,
         onboarding_picker: false,
@@ -807,6 +809,7 @@ async fn activation_boot_from_env_fixture() {
         },
         None,
         &activation,
+        false,
     );
     if expected == "invalid" {
         assert!(
@@ -1358,6 +1361,63 @@ async fn leveling_interaction_fence_precedes_any_store_read() {
     mock.shutdown().await;
 }
 
+/// The 21 voice names that publish beside the builtins (`kick` is
+/// moderation's under first-wins).
+const VOICE_ONLY_NAMES: [&str; 21] = [
+    "create",
+    "setup",
+    "ping",
+    "invite",
+    "textchannels",
+    "access",
+    "reclaim",
+    "transfer",
+    "logging",
+    "export",
+    "import",
+    "position",
+    "group",
+    "inheritpermissions",
+    "defaultlimit",
+    "alwaysprivate",
+    "name",
+    "private",
+    "public",
+    "limit",
+    "unlimit",
+];
+
+#[tokio::test]
+async fn voice_commands_stay_silent_for_the_voice_sink_only_while_voice_is_live() {
+    // Voice live: the sink answers every voice name, so the shared runtime
+    // sends neither a callback nor any other REST effect.
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let live = RouterGates {
+        voice: true,
+        ..gates(true, true)
+    };
+    let runtime = runtime_without_db(live, true, origin);
+    for name in VOICE_ONLY_NAMES {
+        runtime
+            .on_interaction(&slash(name, Some(CHANNEL), Vec::new()))
+            .await;
+    }
+    assert!(
+        mock.requests().is_empty(),
+        "the router yields voice names to the sink"
+    );
+    mock.shutdown().await;
+
+    // Voice off (or the sink failed to build): unchanged unknown-command reply.
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash("create", Some(CHANNEL), Vec::new()))
+        .await;
+    assert_eq!(mock.posts_to("/callback").await.len(), 1);
+    mock.shutdown().await;
+}
+
 #[tokio::test]
 async fn foreign_moderation_preserves_the_router_guild_refusal() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
@@ -1620,6 +1680,89 @@ async fn saturated_interaction_lane_still_answers_a_moderator_command() {
         reply["data"]["content"],
         RouterRefusal::ModerationDisabled.message(),
         "the router, not admission, answered the command"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn voice_owned_command_yields_before_per_member_admission() {
+    let cap = crate::interaction_admission::PER_USER_IN_FLIGHT;
+    let (mock, origin) = MockRest::start_script(held_callbacks(cap)).await;
+    let router = RouterGates {
+        voice: true,
+        ..gates(false, false)
+    };
+    let runtime = runtime_without_db(router, false, origin);
+    let _guard = runtime.dispatch_guard();
+    for _ in 0..cap {
+        assert!(runtime.dispatch(&open_command(42)));
+    }
+    wait_for(
+        || {
+            mock.requests()
+                .iter()
+                .filter(|request| request.path.contains("/token-42/"))
+                .count()
+                == cap
+        },
+        "per-member lane filled",
+    )
+    .await;
+
+    let voice = interaction_event(from_member(
+        slash("ping", Some(CHANNEL), Vec::new()),
+        42,
+        Permissions::empty(),
+    ));
+    assert!(runtime.dispatch(&voice), "the voice sink owns /ping");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        mock.requests()
+            .iter()
+            .filter(|request| request.path.contains("/token-42/"))
+            .count(),
+        cap,
+        "voice does not receive a competing busy callback"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn voice_owned_command_yields_before_shared_lane_saturation() {
+    let (mock, origin) = MockRest::start_script(held_callbacks(16)).await;
+    let router = RouterGates {
+        voice: true,
+        ..gates(false, false)
+    };
+    let runtime = runtime_without_db(router, false, origin);
+    let _guard = runtime.dispatch_guard();
+    for member in 1..=16 {
+        assert!(runtime.dispatch(&open_command(member)));
+    }
+    wait_for(
+        || {
+            mock.requests()
+                .iter()
+                .filter(|request| request.path.contains("/callback"))
+                .count()
+                == 16
+        },
+        "shared interaction lane filled",
+    )
+    .await;
+
+    let voice = interaction_event(from_member(
+        slash("ping", Some(CHANNEL), Vec::new()),
+        900,
+        Permissions::empty(),
+    ));
+    assert!(runtime.dispatch(&voice), "the voice sink owns /ping");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        mock.requests()
+            .iter()
+            .all(|request| !request.path.contains("/token-900/")),
+        "saturation must not send a busy callback for a voice command"
     );
     mock.shutdown().await;
 }
@@ -2493,6 +2636,70 @@ async fn ready_publish_withholds_gated_off_feed_commands() {
         );
     }
     mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn ready_publish_carries_the_voice_set_only_while_voice_is_live() {
+    for (voice, assistant) in [(false, true), (true, false), (true, true)] {
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        let runtime = runtime_without_db(
+            RouterGates {
+                voice,
+                voice_assistant: assistant,
+                ..gates(true, true)
+            },
+            true,
+            origin,
+        );
+        runtime.dispatch(&ready());
+        wait_for(
+            || mock.requests().iter().any(|r| r.method == "PUT"),
+            "registry publish PUT",
+        )
+        .await;
+        let puts: Vec<_> = mock
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PUT")
+            .collect();
+        assert_eq!(puts.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&puts[0].body).expect("publish body");
+        let names: Vec<&str> = body
+            .as_array()
+            .expect("command array")
+            .iter()
+            .map(|command| command["name"].as_str().expect("name"))
+            .collect();
+        for name in VOICE_ONLY_NAMES {
+            assert_eq!(
+                names.contains(&name),
+                voice,
+                "/{name} publishes iff voice is live (voice={voice})"
+            );
+        }
+        assert_eq!(
+            names.contains(&"templateassistant"),
+            voice && assistant,
+            "/templateassistant needs both gates (voice={voice} assistant={assistant})"
+        );
+        if voice {
+            let import = body
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|command| command["name"] == "import")
+                .unwrap();
+            assert_eq!(
+                import["options"][0]["type"], 11,
+                "upload stays an attachment"
+            );
+        }
+        // The non-voice registry is untouched either way.
+        for expected in ["rank", "leaderboard", "sticky", "rsvp", "feed-list"] {
+            assert!(names.contains(&expected), "{expected} must still publish");
+        }
+        mock.shutdown().await;
+    }
 }
 
 #[tokio::test]

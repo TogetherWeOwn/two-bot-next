@@ -42,8 +42,9 @@
 //!
 //! Residual parent work (later slices): the real HTTPS transport with the
 //! endpoint credential binding, the per-guild monthly-cap ledger check before
-//! calling, the Apply/Refine/Cancel flow around the returned build, and
-//! publish wiring alongside the V1 `voice_command_set` path.
+//! calling, and the Apply/Refine/Cancel flow around the returned build.
+//! Publication already runs through `InteractionRouter::publish_set` while
+//! both voice gates are on.
 
 use std::future::Future;
 
