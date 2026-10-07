@@ -389,9 +389,21 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         as_role(pool, &roles[2], &format!("SELECT * FROM web_v1.{view}")).await?;
     }
     admission_as_runtime(pool, &roles[1]).await?;
+    as_role(
+        pool,
+        &roles[1],
+        "INSERT INTO public.voice_create_reservations (id, guild_id, user_id, created_at) \
+         VALUES ('role-probe', '1', '2', now()); \
+         SELECT id FROM public.voice_create_reservations WHERE id = 'role-probe'; \
+         UPDATE public.voice_create_reservations SET channel_id = '3', settled_at = now() \
+         WHERE id = 'role-probe'",
+    )
+    .await?;
     for sql in [
         "DELETE FROM public.discord_send_admission",
         "TRUNCATE public.discord_send_admission",
+        "DELETE FROM public.voice_create_reservations",
+        "TRUNCATE public.voice_create_reservations",
         "CREATE TABLE public.runtime_probe (id int)",
         "CREATE SCHEMA runtime_probe",
         "CREATE TEMP TABLE runtime_probe (id int)",
@@ -412,6 +424,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "INSERT INTO public.discord_send_admission (token_key) VALUES ('offline')",
         "UPDATE public.discord_send_admission SET in_flight = FALSE",
         "DELETE FROM public.discord_send_admission",
+        "SELECT * FROM public.voice_create_reservations",
+        "INSERT INTO public.voice_create_reservations (id, guild_id, user_id, created_at) VALUES ('reader', '1', '2', now())",
         "SELECT * FROM public.members",
         "SELECT * FROM public.gateway_onboarding_jobs",
         "INSERT INTO public.gateway_onboarding_jobs (guild_id, shard_id, session_id, seq, occurred_at_ms) VALUES ('reader', 0, 'reader', 1, 0)",
@@ -455,6 +469,10 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
          format!("GRANT UPDATE ON public.discord_send_admission TO {runtime}")),
         (format!("GRANT DELETE ON public.discord_send_admission TO {runtime}"),
          format!("REVOKE DELETE ON public.discord_send_admission FROM {runtime}")),
+        (format!("GRANT DELETE ON public.voice_create_reservations TO {runtime}"),
+         format!("REVOKE DELETE ON public.voice_create_reservations FROM {runtime}")),
+        ("GRANT SELECT ON public.voice_create_reservations TO PUBLIC".to_owned(),
+         "REVOKE SELECT ON public.voice_create_reservations FROM PUBLIC".to_owned()),
         (format!("GRANT TRUNCATE ON public.discord_send_admission TO {runtime}"),
          format!("REVOKE TRUNCATE ON public.discord_send_admission FROM {runtime}")),
         ("GRANT SELECT ON public.discord_send_admission TO PUBLIC".to_owned(),
@@ -974,7 +992,8 @@ async fn migrator_ro_probes(pool: &PgPool, roles: &[String]) -> Result<(), sqlx:
         pool,
         ro,
         "SELECT version FROM public._sqlx_migrations; SELECT * FROM public.members; \
-         SELECT * FROM public.discord_send_admission; SELECT * FROM public.events",
+         SELECT * FROM public.discord_send_admission; \
+         SELECT * FROM public.voice_create_reservations; SELECT * FROM public.events",
     )
     .await?;
     require(
@@ -982,6 +1001,8 @@ async fn migrator_ro_probes(pool: &PgPool, roles: &[String]) -> Result<(), sqlx:
             r#"SELECT has_table_privilege($1::text, 'public.members', 'SELECT')
                 AND has_table_privilege($1::text, 'public._sqlx_migrations', 'SELECT')
                 AND has_table_privilege($1::text, 'public.discord_send_admission', 'SELECT')
+                AND has_table_privilege($1::text, 'public.voice_create_reservations', 'SELECT')
+                AND NOT has_table_privilege($1::text, 'public.voice_create_reservations', 'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
                 AND NOT has_table_privilege($1::text, 'public.members', 'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
                 AND NOT has_table_privilege($1::text, 'public.member_erasure_audit', 'SELECT')
                 AND NOT has_table_privilege($1::text, 'public.invite_campaigns', 'SELECT')
@@ -1004,6 +1025,10 @@ async fn migrator_ro_probes(pool: &PgPool, roles: &[String]) -> Result<(), sqlx:
         "DELETE FROM public.members",
         "TRUNCATE public.members",
         "INSERT INTO public.discord_send_admission (token_key) VALUES ('ro-probe')",
+        "INSERT INTO public.voice_create_reservations (id, guild_id, user_id, created_at) VALUES ('ro-probe', '1', '2', now())",
+        "UPDATE public.voice_create_reservations SET settled_at = now()",
+        "DELETE FROM public.voice_create_reservations",
+        "TRUNCATE public.voice_create_reservations",
         "INSERT INTO public._sqlx_migrations (version) VALUES (-1)",
         // DDL is never allowed.
         "CREATE TABLE public.ro_probe (id int)",
@@ -1179,6 +1204,265 @@ async fn cannot_set_role(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
             "{role} membership was not revoked"
         ))),
     }
+}
+
+/// One direct `pg_auth_members` row of the migrator group:
+/// (member, grantor, ADMIN, INHERIT, SET). Cluster-wide, PostgreSQL 16+.
+type Membership = (String, String, bool, bool, bool);
+
+async fn memberships(admin: &PgPool, group: &str) -> Result<Vec<Membership>, sqlx::Error> {
+    sqlx::query_as::<_, Membership>(
+        "SELECT member_role.rolname, grantor.rolname, m.admin_option, m.inherit_option, m.set_option \
+         FROM pg_auth_members m \
+         JOIN pg_roles group_role ON group_role.oid = m.roleid \
+         JOIN pg_roles member_role ON member_role.oid = m.member \
+         JOIN pg_roles grantor ON grantor.oid = m.grantor \
+         WHERE group_role.rolname = $1 \
+         ORDER BY member_role.rolname, grantor.rolname",
+    )
+    .bind(group)
+    .fetch_all(admin)
+    .await
+}
+
+/// Run the full plan as one identity; a refused plan leaves the pooled
+/// connection inside an aborted BEGIN, so roll back before returning.
+async fn run_plan(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
+    let result = execute(pool, isolated(&database_roles::plan(), roles)).await;
+    if result.is_err() {
+        sqlx::raw_sql("ROLLBACK").execute(pool).await?;
+    }
+    result
+}
+
+/// The plan must leave every direct row of the migrator group exactly as it
+/// found it: same member, grantor and ADMIN/INHERIT/SET options.
+async fn plan_preserves_memberships(
+    admin: &PgPool,
+    pool: &PgPool,
+    roles: &[String],
+    scenario: &str,
+) -> Result<(), sqlx::Error> {
+    let before = memberships(admin, &roles[0]).await?;
+    run_plan(pool, roles).await?;
+    require(
+        memberships(admin, &roles[0]).await? == before,
+        &format!("{scenario}: plan changed a pre-existing migrator membership"),
+    )
+}
+
+/// Scenarios for the provisioning identity's direct migrator membership, run
+/// in order against one fully migrated scratch database. With
+/// `creation_self_grant` set, only the first scenario runs, with that
+/// `createrole_self_grant` value active while the plan creates the groups.
+async fn migrator_membership_scenarios(
+    admin: &PgPool,
+    provisioner_pool: &PgPool,
+    superuser_pool: &PgPool,
+    roles: &[String],
+    provisioner: &str,
+    superuser: &str,
+    creation_self_grant: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let migrator = &roles[0];
+    // 1. Absent membership: the plan creates the group; the creator's own
+    // ADMIN-only row (distinct grantor) stays, and no membership granted by the
+    // provisioning identity survives COMMIT, including the usable self-grant
+    // PostgreSQL adds on CREATE ROLE when `createrole_self_grant` is set.
+    if let Some(options) = creation_self_grant {
+        execute(
+            provisioner_pool,
+            format!("SET createrole_self_grant = '{options}'"),
+        )
+        .await?;
+    }
+    let created = run_plan(provisioner_pool, roles).await;
+    if creation_self_grant.is_some() {
+        execute(provisioner_pool, "RESET createrole_self_grant".to_owned()).await?;
+    }
+    created?;
+    let rows = memberships(admin, migrator).await?;
+    require(
+        rows.iter()
+            .any(|(member, _, admin_option, _, _)| member == provisioner && *admin_option),
+        "creator ADMIN membership was not preserved",
+    )?;
+    require(
+        rows.iter()
+            .all(|(_, grantor, _, _, _)| grantor != provisioner),
+        "temporary self-grant survived the plan",
+    )?;
+    cannot_set_role(provisioner_pool, migrator).await?;
+    if creation_self_grant.is_some() {
+        return Ok(());
+    }
+    // 2. Re-run over the unusable ADMIN-only row: it needs a temporary grant,
+    // which must be distinct from, and removed without touching, that row.
+    plan_preserves_memberships(admin, provisioner_pool, roles, "ADMIN-only row").await?;
+    cannot_set_role(provisioner_pool, migrator).await?;
+    // 3. A usable direct membership granted by someone else keeps its options.
+    execute(
+        admin,
+        format!("GRANT {migrator} TO {provisioner} WITH ADMIN FALSE, INHERIT TRUE, SET TRUE"),
+    )
+    .await?;
+    plan_preserves_memberships(admin, provisioner_pool, roles, "operator-granted row").await?;
+    // 4. A usable membership the identity granted itself: the old unconditional
+    // `REVOKE ... FROM CURRENT_USER` deleted exactly this row.
+    execute(admin, format!("REVOKE {migrator} FROM {provisioner}")).await?;
+    execute(
+        admin,
+        format!("GRANT {migrator} TO {provisioner} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE"),
+    )
+    .await?;
+    execute(
+        provisioner_pool,
+        format!(
+            "GRANT {migrator} TO {provisioner} WITH ADMIN FALSE, INHERIT TRUE, SET TRUE \
+             GRANTED BY {provisioner}"
+        ),
+    )
+    .await?;
+    plan_preserves_memberships(admin, provisioner_pool, roles, "self-granted usable row").await?;
+    // 5. A superuser provisioner with an explicit membership: the old revoke
+    // ran with the bootstrap superuser as grantor and removed that row.
+    execute(
+        admin,
+        format!("GRANT {migrator} TO {superuser} WITH ADMIN FALSE, INHERIT TRUE, SET TRUE"),
+    )
+    .await?;
+    plan_preserves_memberships(admin, superuser_pool, roles, "superuser membership").await?;
+    // 6. A self-granted membership that cannot be used would need its options
+    // rewritten to proceed: refuse, and change nothing.
+    execute(
+        admin,
+        format!("REVOKE {migrator} FROM {provisioner} GRANTED BY {provisioner}"),
+    )
+    .await?;
+    execute(admin, format!("REVOKE {migrator} FROM {provisioner}")).await?;
+    execute(
+        admin,
+        format!("GRANT {migrator} TO {provisioner} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE"),
+    )
+    .await?;
+    execute(
+        provisioner_pool,
+        format!(
+            "GRANT {migrator} TO {provisioner} WITH ADMIN FALSE, INHERIT FALSE, SET FALSE \
+             GRANTED BY {provisioner}"
+        ),
+    )
+    .await?;
+    let before = memberships(admin, migrator).await?;
+    match run_plan(provisioner_pool, roles).await {
+        Err(sqlx::Error::Database(error))
+            if error.message().contains("refusing to change its options") => {}
+        other => {
+            return Err(sqlx::Error::InvalidArgument(format!(
+                "unusable self-granted membership was not refused: {other:?}"
+            )))
+        }
+    }
+    require(
+        memberships(admin, migrator).await? == before,
+        "refused plan changed a membership",
+    )
+}
+
+#[tokio::test]
+async fn scratch_plan_preserves_preexisting_migrator_membership() {
+    scratch_membership_run(None).await;
+}
+
+/// `createrole_self_grant` (PostgreSQL 16+) makes `CREATE ROLE` give the
+/// creator a usable membership it granted itself; the plan must not leave it.
+#[tokio::test]
+async fn scratch_plan_removes_createrole_self_grant_membership() {
+    scratch_membership_run(Some("set, inherit")).await;
+}
+
+async fn scratch_membership_run(creation_self_grant: Option<&str>) {
+    let url = match std::env::var("TWO_ROLES_TEST_DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") => TEST_URL.to_owned(),
+        Err(_) => return, // Offline suite: explicitly requested and CI tests never skip.
+    };
+    let options = test_database::test_options(&url).expect("refusing non-test-container target");
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    let modern: bool =
+        sqlx::query_scalar("SELECT current_setting('server_version_num')::integer >= 160000")
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    require(modern, "membership options need PostgreSQL 16 or newer").unwrap();
+    let (name, roles) = names();
+    let provisioner = format!("{name}_p");
+    let superuser = format!("{name}_s");
+    execute(
+        &admin,
+        format!("CREATE ROLE {provisioner} LOGIN CREATEROLE"),
+    )
+    .await
+    .unwrap();
+    execute(&admin, format!("CREATE ROLE {superuser} LOGIN SUPERUSER"))
+        .await
+        .unwrap();
+    execute(
+        &admin,
+        format!("CREATE DATABASE {name} OWNER {provisioner}"),
+    )
+    .await
+    .unwrap();
+    let provisioner_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone().username(&provisioner).database(&name))
+        .await
+        .unwrap();
+    let superuser_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone().username(&superuser).database(&name))
+        .await
+        .unwrap();
+    // The fully migrated state, built by the non-superuser database owner.
+    let setup = async {
+        for (_, migration) in migration_files() {
+            execute(&provisioner_pool, isolated(&migration, &roles)).await?;
+        }
+        sqlx::raw_sql("CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);")
+            .execute(&provisioner_pool)
+            .await?;
+        sqlx::raw_sql(include_str!("../../../sql/web_v1.sql"))
+            .execute(&provisioner_pool)
+            .await?;
+        migrator_membership_scenarios(
+            &admin,
+            &provisioner_pool,
+            &superuser_pool,
+            &roles,
+            &provisioner,
+            &superuser,
+            creation_self_grant,
+        )
+        .await
+    }
+    .await;
+    provisioner_pool.close().await;
+    superuser_pool.close().await;
+    // Clean up even if a scenario failed. Only generated owned names.
+    execute(&admin, format!("DROP DATABASE {name}"))
+        .await
+        .unwrap();
+    for role in roles.iter().chain([&provisioner, &superuser]) {
+        execute(&admin, format!("DROP ROLE IF EXISTS {role}"))
+            .await
+            .unwrap();
+    }
+    admin.close().await;
+    setup.unwrap();
 }
 
 #[tokio::test]

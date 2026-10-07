@@ -32,6 +32,8 @@ sequences AS (
     JOIN objects o ON d.refobjid = o.oid AND o.kind = 'table'
     WHERE c.relkind = 'S' AND d.deptype IN ('a', 'i')
 ),
+-- Admission objects, including durable voice-create reservations, preserve
+-- SELECT/INSERT/UPDATE while never granting runtime DELETE.
 table_grants(role_name, oid, privilege) AS (
     SELECT 'two_bot_runtime', o.oid, p.name FROM objects o
     CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE')) p(name)
