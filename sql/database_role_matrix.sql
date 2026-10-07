@@ -42,7 +42,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'gateway_onboarding_jobs', 'table'),
     ('public', 'voice_creators', 'table'),
     ('public', 'voice_rooms', 'table'),
-    ('public', 'voice_create_reservations', 'table'),
+    ('public', 'voice_create_reservations', 'admission'),
     ('public', 'voice_room_blocks', 'table'),
     ('public', 'voice_join_grants', 'table'),
     ('public', 'voice_owner_grants', 'table'),
