@@ -61,6 +61,9 @@ README. Staging deploys from `main`; production is a separate manual gate.
   checks, plus a fenced GET-only live smoke run (health, build identity, guild
   command registry) that writes a run record; neither invokes a slash command.
 - [Backup/restore runbook](docs/backup.md) and [parity matrix](docs/parity.md).
+- [Channel lane reconciliation](docs/channel-lane-reconciliation.md): inspection-first
+  operator release of an uncertain moderation lane, with explicit confirmation,
+  generation fencing, atomic audit and preserved lockdown recovery.
 - [Command registry drift](docs/command-publish.md): dry-run-first
   `two-bot commands diff|publish` and opt-in boot publication for cutover.
 

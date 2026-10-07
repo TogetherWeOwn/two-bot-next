@@ -22,6 +22,8 @@ pub mod automod_store;
 pub mod backup;
 pub mod channel_moderation;
 #[cfg(feature = "db")]
+pub mod channel_moderation_release;
+#[cfg(feature = "db")]
 pub mod channel_moderation_store;
 pub mod classify;
 pub mod clock_guard;
