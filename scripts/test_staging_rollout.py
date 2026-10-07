@@ -1490,6 +1490,23 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(self.clock.sleeps[:2], [5, 5])
         self.assert_no_secret_saved_or_printed()
 
+    def test_listing_lag_beyond_the_former_twelve_poll_cap_still_passes(self):
+        # Observed in CI: the listing trails a deploy by more than 12 polls while
+        # the container already serves the exact build (TOG-15905).
+        self.assertGreater(rollout.APPLICATION_IMAGE_STALE_POLLS, 12)
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        stale = app()
+        stale["configuration"] = {"image": OLD_IMAGE}
+        client.api_routes[APP_PATH] = [[stale]] * 20 + [[app()]]
+        client.deadline = 1000
+        rollout.verify(self.args, client)
+        evidence = json.loads(Path(self.args.evidence).read_text())
+        self.assertEqual(evidence["image"], IMAGE)
+        self.assertEqual(self.clock.sleeps[:20], [5] * 20)
+        self.assert_no_secret_saved_or_printed()
+
     def test_stale_application_image_is_reported_and_never_accepted(self):
         self.prepare_baseline()
         self.write_deploy_output()
@@ -1497,9 +1514,184 @@ class OrchestrationTests(OfflineTestCase):
         stale = app()
         stale["configuration"] = {"image": OLD_IMAGE}
         client.api_routes[APP_PATH] = [[stale]]
-        client.deadline = 100 + 5 * 3  # times out before the tolerance runs out
-        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        client.deadline = 100 + 5 * 3  # the deadline ends it before the tolerance runs out
+        error = self.drift_error(client)
+        self.assertEqual(error.detail, "listing_image=baseline later_rollouts=0")
         self.assertIn("application_image=stale", client.observation)
+        self.assertLess(client.calls.count(("api", APP_PATH)), rollout.APPLICATION_IMAGE_STALE_POLLS)
+        self.assert_no_evidence()
+
+    def test_real_deadline_ends_a_persistent_stale_listing_as_drift_with_its_diagnostic(self):
+        # Reviewer probe: each poll costs ~11s (5s sleep + control-plane reads), so
+        # 24 stale polls (~264s) outlast what is left of the real 300s deadline once
+        # the rollout completes; the diagnostic must still be printed.
+        clock = self.clock
+
+        class Slow(FakeClient):
+            def api(self, path):
+                clock.now += 1.5
+                return super().api(path)
+
+            def request(self, url, authenticated=False):
+                clock.now += 1.5
+                return super().request(url, authenticated)
+
+        self.prepare_baseline()
+        self.write_deploy_output()
+        base = verify_client()
+        client = Slow(base.api_routes, base.request_routes, deadline=clock.now + 300)
+        pending = completed_row()
+        pending["status"] = "progressing"
+        pending["health"] = {"instances": {"active": 0, "healthy": 0, "failed": 0, "starting": 1,
+                                           "scheduling": 0}}
+        client.api_routes[DETAIL_PATH] = [pending] * 4 + [completed_row()]  # completes ~45s in
+        stale = app()
+        stale["configuration"] = {"image": OLD_IMAGE}
+        client.api_routes[APP_PATH] = [[stale]]
+        error = self.drift_error(client)
+        self.assertEqual(error.detail, "listing_image=baseline later_rollouts=0")
+        self.assertIn("application_image=stale polls=", client.observation)
+        stale_polls = int(re.search(r"application_image=stale polls=(\d+)", client.observation).group(1))
+        self.assertLess(stale_polls, rollout.APPLICATION_IMAGE_STALE_POLLS)  # the deadline, not the cap
+        self.assertLessEqual(clock.now, 100 + 300 + rollout.IMAGE_DRIFT_DIAGNOSTIC_SECONDS + 11)
+        self.assert_no_evidence()
+
+    def client_with_real_deadline_reads(self, gateway_failure=None):
+        test_case = self
+        clock = self.clock
+        read_seconds = 2
+        detail_reads = 0
+        timeouts = []
+        pending = completed_row()
+        pending["status"] = "progressing"
+        pending["health"] = {"instances": {
+            "active": 0, "healthy": 0, "failed": 0, "starting": 1, "scheduling": 0,
+        }}
+        stale = app(OLD_IMAGE)
+
+        class Response(io.BytesIO):
+            def __init__(self, body, status=200, headers=None):
+                super().__init__(body)
+                self.status = status
+                self.headers = headers or {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class Opener:
+            def open(self, request, timeout):
+                nonlocal detail_reads
+                url = request.full_url
+                timeouts.append((url, timeout))
+                if timeout <= read_seconds:
+                    clock.now += timeout
+                    raise TimeoutError("synthetic read timeout")
+                clock.now += read_seconds
+                if url.startswith(client.base):
+                    path = url[len(client.base):]
+                    if path == NAMESPACE_PATH:
+                        result = bindings()
+                    elif path == APP_PATH:
+                        result = [stale]
+                    elif path == ROWS_PATH:
+                        result = [old_row(), completed_row()]
+                    elif path == DETAIL_PATH:
+                        detail_reads += 1
+                        result = pending if detail_reads <= 4 else completed_row()
+                    elif path == DEPLOYMENTS_PATH:
+                        result = deployment()
+                    else:
+                        raise AssertionError(f"unexpected API path: {path}")
+                    body = json.dumps({"success": True, "result": result}).encode()
+                    return Response(body)
+                if url == URL + "/health":
+                    return Response(b"ok")
+                if url == URL + "/readyz":
+                    if gateway_failure is not None:
+                        return Response(
+                            test_case.readyz_body(gateway_failure), 503,
+                            {"x-two-worker-version": VERSION},
+                        )
+                    status, headers, body = ready_response()
+                    return Response(body, status, headers)
+                raise AssertionError(f"unexpected runtime URL: {url}")
+
+        client = rollout.Client(ACCOUNT, SENTINEL, deadline=clock.now + 300)
+        client.opener = Opener()
+        return client, timeouts
+
+    def test_deadline_transport_timeout_during_read_keeps_stale_listing_drift_detail(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client, timeouts = self.client_with_real_deadline_reads()
+        error = self.drift_error(client)
+        self.assertEqual(error.detail, "listing_image=baseline later_rollouts=0")
+        self.assertIn("application_image=stale polls=", client.observation)
+        self.assertTrue(any(url == client.base + APP_PATH and timeout <= 2 for url, timeout in timeouts))
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_deadline_transport_timeout_keeps_gateway_failure_rollback_class(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        failure = {"phase": "durable_gateway", "class": "checkpoint_load_failed"}
+        client, _ = self.client_with_real_deadline_reads(failure)
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertIn("gateway_failure=durable_gateway:checkpoint_load_failed", client.observation)
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_deadline_expiring_during_warm_read_keeps_stale_listing_drift(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client, timeouts = self.client_with_real_deadline_reads()
+        client.deadline += 4  # let the final stale poll reach its warm health probe
+        error = self.drift_error(client)
+        self.assertEqual(error.detail, "listing_image=baseline later_rollouts=0")
+        self.assertTrue(any(url == URL + "/health" and timeout <= 2 for url, timeout in timeouts))
+        self.assertIn("application_image=stale polls=", client.observation)
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_deadline_aware_reads_cover_deadline_offsets_across_stale_poll(self):
+        expiring_reads = set()
+        for offset in [index / 2 for index in range(27)]:
+            with self.subTest(offset=offset):
+                self.clock.now = 100.0
+                self.clock.sleeps.clear()
+                for path in (self.args.receipt, self.args.output, self.args.deploy_config):
+                    Path(path).unlink(missing_ok=True)
+                self.prepare_baseline()
+                self.write_deploy_output()
+                client, timeouts = self.client_with_real_deadline_reads()
+                client.deadline -= offset
+                error = self.drift_error(client)
+                self.assertEqual(error.detail, "listing_image=baseline later_rollouts=0")
+                self.assertIn("application_image=stale polls=", client.observation)
+                expiring_reads.update(url for url, timeout in timeouts if timeout <= 2)
+                self.assert_no_evidence()
+                self.assert_no_secret_saved_or_printed()
+        self.assertTrue({
+            client.base + APP_PATH, client.base + DETAIL_PATH,
+            URL + "/health", URL + "/readyz",
+        } <= expiring_reads)
+
+    def test_stale_listing_at_the_deadline_keeps_rollout_timeout_when_a_gateway_failure_is_named(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        stale = app()
+        stale["configuration"] = {"image": OLD_IMAGE}
+        client.api_routes[APP_PATH] = [[stale]]
+        failure = {"phase": "durable_gateway", "class": "checkpoint_load_failed"}
+        client.request_routes[URL + "/readyz"] = [
+            (503, {"x-two-worker-version": VERSION}, self.readyz_body(failure))]
+        client.deadline = 100 + 5 * 3
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertIn("gateway_failure=durable_gateway:checkpoint_load_failed", client.observation)
         self.assert_no_evidence()
 
     def test_persistent_stale_application_image_fails_as_drift_after_the_tolerance(self):
@@ -1574,7 +1766,7 @@ class OrchestrationTests(OfflineTestCase):
         client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
         client.api_routes[ROWS_PATH] = [[old_row(), completed_row()], RuntimeError(SENTINEL)]
         client.deadline = 1000
-        self.assertIsNone(self.drift_error(client).detail)
+        self.assertEqual(self.drift_error(client).detail, "listing_image=baseline")
 
     def test_main_prints_the_drift_detail_and_last_observation(self):
         self.prepare_baseline()
