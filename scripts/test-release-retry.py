@@ -421,7 +421,7 @@ class ReleaseRetryTests(unittest.TestCase):
         before = self.state()
         self.assertEqual(self.outputs("plan"), {"reuse_pr": "true"})
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        self.assertIn("skip-github-pull-request: ${{ github.event_name == 'push' || steps.plan.outputs.reuse_pr == 'true' }}", workflow)
+        self.assertIn("skip-github-pull-request: ${{ github.event_name == 'push' || steps.parse_guard.outcome == 'failure' || steps.plan.outputs.reuse_pr == 'true' }}", workflow)
         self.assertNotIn("skip-github-release:", workflow)
         self.fresh_checkout()
         self.reconcile()
@@ -608,7 +608,7 @@ class ReleaseRetryTests(unittest.TestCase):
         with self.assertRaises(json.JSONDecodeError):
             json.loads("")  # Negative control: original post-publication value.
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        self.assertEqual(workflow.count("if: github.event_name != 'push' && steps.select.outputs.pr_available == 'true'"), 2)
+        self.assertEqual(workflow.count("if: github.event_name != 'push' && steps.parse_guard.outcome != 'failure' && steps.select.outputs.pr_available == 'true'"), 2)
         self.assertIn("if: github.event_name != 'push' && needs.release-please.outputs.pr_available == 'true'", workflow)
         self.assertNotIn("skip-github-release:", workflow)
         self.assertEqual(self.state(), before, "No push, PATCH, notes PUT or branch creation")
