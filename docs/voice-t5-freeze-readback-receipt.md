@@ -88,14 +88,21 @@ For the voice window the target pins:
    routing sample. State the fixture source revision and the reviewed head
    actually compared; drift between them is reconciled, never assumed away.
 2. **Voice published set** for `TWO_VOICE=1`
-   (`voice_command_set` when the gate is enabled, empty otherwise): 17
+   (`voice_command_set` when the gate is enabled, empty otherwise): 22
    definitions at the reviewed head — `create`, `setup`, `ping`, `invite`,
    `textchannels`, `access`, `reclaim`, `transfer`, `logging`, `export`,
    `import`, `position`, `group`, `inheritpermissions`, `defaultlimit`,
-   `alwaysprivate`, `kick` — merged first-wins into the guild registry.
+   `alwaysprivate`, `kick`, `name`, `private`, `public`, `limit`,
+   `unlimit` — merged first-wins into the guild registry by
+   `InteractionRouter::publish_set` (`RouterGates::voice`; the published
+   names and permissions are pinned by the `voice` section of
+   `crates/core/tests/fixtures/staging_published_commands.json`).
    Admin shapes carry Manage Channels, except `export`/`import` which carry
    Manage Guild; member shapes (`setup`, `ping`, `invite`, `reclaim`,
-   `transfer`, `kick`) carry no default permission gate. Plus the
+   `transfer`, `name`, `private`, `public`, `limit`, `unlimit`, and the voice
+   `kick` definition) carry no default permission gate. With moderation on,
+   the published `/kick` is moderation's (Kick Members), so 21 voice names
+   publish beside the builtins. Plus the
    `templateassistant` command (Manage Guild, one required `request` option)
    only when **both** the voice gate and the assistant endpoint gate are on.
 3. **Restrictable set** (`VOICE_COMMANDS`, 26 names): the exact-lowercase
@@ -166,7 +173,7 @@ inconsistent capture, or any unresolved default/sync mismatch.
 1. Open the filled §6 table and the B4 Registry row: confirm `T_r` is
    recorded and all four snapshot classes (§2) are present with hashes.
 2. Open the reconciled target: confirm the T0 fixture revision, the voice
-   published set at the reviewed head (17 names), the restrictable set (26
+   published set at the reviewed head (22 definitions), the restrictable set (26
    names), the access-controls target, and the watch-edit list.
 3. Spot-check two rows (one admin-gated, one member shape): recompute the
    definition hash from the pinned source and confirm the permission tuples

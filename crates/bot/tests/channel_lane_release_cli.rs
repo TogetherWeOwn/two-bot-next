@@ -196,8 +196,11 @@ async fn cli_releases_a_503_wedge_then_unlock_restores_the_surviving_seed() {
     assert!(String::from_utf8_lossy(&release.stdout).contains("\"released\":true"));
     assert_eq!(store.get_lockdown(CHANNEL).await.unwrap(), Some(seed));
     let old = runtime.execute(&router, &lock).await.unwrap().unwrap();
-    assert!(old.replayed);
-    assert_eq!(old.outcome, "operator_released");
+    assert_eq!(old.outcome, "refused");
+    assert_eq!(
+        old.text,
+        "This request id is already used or retired; use a new request id."
+    );
     assert_eq!(
         mock.requests().len(),
         2,

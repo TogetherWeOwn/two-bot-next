@@ -215,7 +215,7 @@ impl InternalChannelExecutor {
             ChannelClaim::Mismatch => {
                 return Err(error(
                     ErrorCode::Malformed,
-                    "idempotency key was used for different moderation content",
+                    "idempotency key is already used or retired; use a new key",
                 ))
             }
             ChannelClaim::Claimed { ticket } => ticket,

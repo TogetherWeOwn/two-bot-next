@@ -456,7 +456,7 @@ async fn nested_inviter_session_keys_and_owned_children_are_included() {
 }
 
 /// An operator-released request never had its Discord effect proven. Its ledger
-/// row is the only thing that makes a delayed delivery of the old key replay
+/// row is the only thing that makes a delayed delivery of the old key refuse
 /// instead of claiming afresh and repeating the mutation, so no erasure may
 /// remove it, whether the member is the operator or the original actor.
 #[tokio::test]
@@ -546,14 +546,28 @@ async fn operator_released_request_survives_operator_and_actor_erasure_as_replay
                 "operator_released".to_owned(),
             )
         );
-        let ChannelClaim::Replayed { outcome, .. } = store
-            .claim(GUILD, KEY, "moderation.lockdown", ORIGINAL_HASH, TIME)
-            .await
-            .unwrap()
-        else {
-            panic!("old key must replay, not win a fresh claim, after {audit_actor} erasure");
-        };
-        assert_eq!(outcome, "operator_released");
+        assert_eq!(
+            store
+                .claim(GUILD, KEY, "moderation.lockdown", ORIGINAL_HASH, TIME)
+                .await
+                .unwrap(),
+            ChannelClaim::Mismatch,
+            "the retired key must fail closed after {audit_actor} erasure"
+        );
+        assert_eq!(
+            store
+                .claim(
+                    GUILD,
+                    KEY,
+                    "moderation.lockdown",
+                    "different-content-hash",
+                    TIME
+                )
+                .await
+                .unwrap(),
+            ChannelClaim::Mismatch,
+            "different content under the retired key must not be reported as replay"
+        );
     }
     // The released lane stays free for a new request on the same channel.
     let ChannelClaim::Claimed { ticket } = store
@@ -783,14 +797,14 @@ async fn operator_release_reason_snowflake_is_erased_but_replay_fence_survives()
     .await
     .unwrap();
     assert_eq!(audit_rows, 0);
-    let ChannelClaim::Replayed { outcome, .. } = store
-        .claim(GUILD, KEY, "moderation.lockdown", ORIGINAL_HASH, TIME)
-        .await
-        .unwrap()
-    else {
-        panic!("reason erasure must preserve the old-key replay fence");
-    };
-    assert_eq!(outcome, "operator_released");
+    assert_eq!(
+        store
+            .claim(GUILD, KEY, "moderation.lockdown", ORIGINAL_HASH, TIME)
+            .await
+            .unwrap(),
+        ChannelClaim::Mismatch,
+        "reason erasure must preserve the retired-key fence"
+    );
     db.close().await.unwrap();
 }
 
@@ -847,13 +861,13 @@ async fn member_snowflake_idempotency_key_is_erased_from_audit_but_retained_for_
     .await
     .unwrap();
     assert_eq!(audit_rows, 0);
-    let ChannelClaim::Replayed { outcome, .. } = store
-        .claim(GUILD, KEY, "moderation.lockdown", ORIGINAL_HASH, TIME)
-        .await
-        .unwrap()
-    else {
-        panic!("erasure must retain the member-key replay fence");
-    };
-    assert_eq!(outcome, "operator_released");
+    assert_eq!(
+        store
+            .claim(GUILD, KEY, "moderation.lockdown", ORIGINAL_HASH, TIME)
+            .await
+            .unwrap(),
+        ChannelClaim::Mismatch,
+        "erasure must retain the member-key fence"
+    );
     db.close().await.unwrap();
 }

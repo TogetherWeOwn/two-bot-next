@@ -151,7 +151,7 @@ impl ChannelModerationStore {
         if removed.rows_affected() != 1 {
             return Ok(None);
         }
-        // This shape replays safely through both slash and website executors.
+        // The erased request hash makes claim() refuse every reuse of this key.
         let result = json!({
             "text": "An operator reconciled and released this attempt; no Discord mutation was retried.",
             "outcome": "operator_released",

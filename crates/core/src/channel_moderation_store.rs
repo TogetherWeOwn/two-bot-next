@@ -42,7 +42,7 @@ pub enum ChannelClaim {
     },
     /// An earlier attempt is still uncertain; caller must refuse `in_progress`.
     InFlight,
-    /// Key was used for different request content; caller must refuse `malformed`.
+    /// Key is retired or was used for different request content; caller must refuse.
     Mismatch,
 }
 
@@ -294,11 +294,8 @@ impl ChannelModerationStore {
             return Ok(ChannelClaim::Mismatch);
         }
         if state == "done" && outcome.as_deref() == Some("operator_released") {
-            let result_json: Option<String> = row.get("result_json");
-            return Ok(ChannelClaim::Replayed {
-                outcome: "operator_released".to_owned(),
-                result_json: result_json.unwrap_or_else(|| "{}".to_owned()),
-            });
+            // The original hash is erased, so this key cannot be proven identical.
+            return Ok(ChannelClaim::Mismatch);
         }
         let stored_hash: String = row.get("request_hash");
         if stored_hash != request_hash {

@@ -38,8 +38,8 @@ existing approval gates; integration tests use only disposable test services.
    bounded explanation of the reconciliation. A changed generation/state refuses
    without committing release; inspect again, do not blindly reuse confirmation.
 6. Verify the released audit receipt. The CLI preserves `moderation_lockdowns`
-   byte-for-byte and retires the old request to `done/operator_released`, so old
-   redelivery replays a no-mutation result. Member erasure (operator or original
+   byte-for-byte and retires the old request to `done/operator_released`, so any
+   old-key redelivery is refused without repeating the Discord mutation. Member erasure (operator or original
    actor) erases their member-linked audit rows but never this `operator_released`
    ledger row: it is the replay fence, retaining the guild/key scope, action,
    `done/operator_released` state, generic result and timestamps. The
@@ -111,10 +111,10 @@ not change any executor's error classification or authorize automatic release.
 ## Verification
 
 `crates/core/tests/channel_lane_release.rs` covers scoped inspection, redaction,
-stale/done/inconsistent claims, audit rollback, recovery preservation and terminal
-replay. `crates/cutover/tests/member_erasure.rs` proves that erasing the releasing
+stale/done/inconsistent claims, audit rollback, recovery preservation and retired-key
+refusal. `crates/cutover/tests/member_erasure.rs` proves that erasing the releasing
 operator, then the original actor, deletes their audit rows yet leaves the old key
-replaying instead of winning a fresh claim. `crates/bot/tests/channel_lane_release_cli.rs` exercises the real binary:
+refused instead of winning a fresh claim. `crates/bot/tests/channel_lane_release_cli.rs` exercises the real binary:
 a mocked overwrite PUT returns 503, inspection writes nothing, confirmed release
 preserves the seed, old delivery does not repeat the PUT, and a new `/unlock`
 restores the exact original masks. All database connections use the guarded

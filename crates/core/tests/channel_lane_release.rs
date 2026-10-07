@@ -30,7 +30,7 @@ async fn claim(store: &ChannelModerationStore, key: &str) -> ChannelClaimTicket 
 }
 
 #[tokio::test]
-async fn release_audits_previous_state_preserves_seed_and_prevents_old_key_replay() {
+async fn release_audits_previous_state_preserves_seed_and_prevents_old_key_reuse() {
     let db = database().await;
     let store = ChannelModerationStore::from_pool(db.pool().clone());
     let ChannelClaim::Claimed { ticket } = store
@@ -120,19 +120,28 @@ async fn release_audits_previous_state_preserves_seed_and_prevents_old_key_repla
             .unwrap(),
         ChannelClaim::Mismatch
     ));
-    let ChannelClaim::Replayed {
-        outcome,
-        result_json,
-    } = store
-        .claim(GUILD, "wedged", "moderation.lockdown", ORIGINAL_HASH, TIME)
-        .await
-        .unwrap()
-    else {
-        panic!("released intent must replay, not execute");
-    };
-    assert_eq!(outcome, "operator_released");
-    let replay: Value = serde_json::from_str(&result_json).unwrap();
-    assert_eq!(replay["outcome"], "operator_released");
+    assert_eq!(
+        store
+            .claim(GUILD, "wedged", "moderation.lockdown", ORIGINAL_HASH, TIME)
+            .await
+            .unwrap(),
+        ChannelClaim::Mismatch,
+        "the retired key must not claim or replay after its original hash is erased"
+    );
+    assert_eq!(
+        store
+            .claim(
+                GUILD,
+                "wedged",
+                "moderation.lockdown",
+                "different-content-hash",
+                TIME
+            )
+            .await
+            .unwrap(),
+        ChannelClaim::Mismatch,
+        "reusing a retired key for different content must also be refused"
+    );
     let audit: (String, String, String, String) = sqlx::query_as(
         "SELECT actor_id, idempotency_key, action, metadata_json FROM moderation_audit WHERE request_id = $1",
     ).bind(audit_id).fetch_one(db.pool()).await.unwrap();

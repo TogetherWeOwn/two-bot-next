@@ -281,15 +281,22 @@ so production voice stays an Operator-approved binding.
   0412-0414 and 0416-0418) before the var ships: apply through `staging-migrate`,
   then re-apply the role plan so the runtime role holds the new tables. Merge
   the flip only after a post-apply plan shows no pending migrations.
+- **Check the custom-command count first.** The 100-command guild limit leaves
+  room for 50 stored custom commands beside the published builtins, voice set
+  and `/templateassistant`. A guild that already stores more makes the gateway
+  registry sync refuse (`TotalLimit`) and the gateway task fail at boot, rather
+  than degrading; trim the extra rows before the flip.
 - **Permanent channels stay untouched.** `reconcile` iterates the rooms the
   store tracks and nothing else, so the guild's three permanent voice
   channels (`Lobby`, `Squad`, `Voice 1`) are never deleted: with zero tracked
   rows the live ghost count reads `untracked_present=[3]`, which is the
   documented residual baseline for staging until a creator channel exists.
-- **No commands yet.** The gate attaches the sink and the reconciler; the
-  guild registry only gains the voice commands once the registry wiring
-  publishes them behind the same gate. Live create/move/delete practice (§4)
-  needs both that and a second human account in the staging guild.
+- **Commands publish with the sink.** The gate attaches the sink and the
+  reconciler, and the guild registry gains the voice commands through
+  `InteractionRouter::publish_set` (`RouterGates::voice`) while the sink is
+  built. The deployed registry read-back is staging acceptance. Live
+  create/move/delete practice (§4) also needs a second human account in the
+  staging guild.
 - **Rollback.** Delete the `TWO_VOICE` line and redeploy `deploy-staging`.
   Tracked rooms stay in the database; any whose channel has gone are
   forgotten by the first reconcile after the gate is back on.

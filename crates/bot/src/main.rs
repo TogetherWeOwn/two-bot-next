@@ -403,6 +403,7 @@ async fn run(cli_args: &[String]) {
                         gates,
                         member,
                         &activation,
+                        voice.is_some(),
                     );
                     // Ordered RSVP surface over the runtime's governed executor.
                     // `None` whenever the command runtime is parked; the gateway

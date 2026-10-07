@@ -28,6 +28,8 @@ fn gates(enabled: bool) -> RouterGates {
         configured_guild: Some(2222),
         automations: enabled,
         moderation: false,
+        voice: false,
+        voice_assistant: false,
         scorecard: false,
         announcements: false,
         tickets: false,

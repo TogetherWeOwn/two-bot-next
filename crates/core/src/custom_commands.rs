@@ -297,8 +297,8 @@ pub fn builtin_command_names() -> HashSet<String> {
 }
 
 /// Names a custom command may not be *written* under: every builtin plus the
-/// voice-room set. The voice sink dispatches by name, so a custom command named
-/// `setup` or `export` would reach the voice handlers the moment `TWO_VOICE`
+/// voice-room and assistant sets. The voice sink dispatches by name, so a custom
+/// command named `setup` or `export` would reach the voice handlers the moment `TWO_VOICE`
 /// turns on, even if it was created while voice was off. This guards writes
 /// only (`/command`, imports). Dispatch keeps [`builtin_command_names`], so a
 /// stored row that predates the reservation keeps running while voice is off.
@@ -308,6 +308,7 @@ pub fn reserved_command_names() -> HashSet<String> {
     names.extend(
         super::voice_rooms::voice_commands()
             .into_iter()
+            .chain(super::voice_assistant::assistant_commands())
             .map(|def| def.name),
     );
     names
@@ -836,6 +837,51 @@ mod tests {
                 def.name
             );
         }
+    }
+
+    #[test]
+    fn write_reservations_cover_the_maximal_publish_set_and_capacity() {
+        use crate::commands::CustomCommand;
+        use crate::router::{InteractionRouter, RouterGates};
+
+        let router = InteractionRouter::new(RouterGates {
+            scorecard: true,
+            automations: true,
+            announcements: true,
+            moderation: true,
+            voice: true,
+            voice_assistant: true,
+            configured_guild: Some(1),
+            tickets: false,
+            self_roles: false,
+            onboarding_picker: false,
+            session_picker: false,
+        });
+        let reserved = reserved_command_names();
+        let definitions = router.publish_set(&[]).unwrap();
+        let published: HashSet<_> = definitions.iter().map(|def| def.name.clone()).collect();
+        assert_eq!(reserved, published);
+        assert!(reserved.contains("templateassistant"));
+        assert_eq!(
+            validate_put_input(&put_input("templateassistant"), &reserved),
+            Err(CommandError::ReservedName("templateassistant".to_owned()))
+        );
+        let capacity = max_custom_commands(reserved.len());
+        let custom: Vec<_> = (0..capacity)
+            .map(|index| CustomCommand {
+                name: format!("custom-{index}"),
+                description: "Custom command".to_owned(),
+                enabled: true,
+            })
+            .collect();
+        assert_eq!(
+            router.publish_set(&custom).unwrap().len(),
+            GUILD_COMMAND_LIMIT
+        );
+        assert_eq!(
+            check_capacity(capacity, true, reserved.len()),
+            Err(CommandError::OverCapacity(capacity))
+        );
     }
 
     #[test]
