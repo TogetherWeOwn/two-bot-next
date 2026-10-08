@@ -23,12 +23,17 @@ Fences, all before the first connection (exit 2, nothing was sent):
   * the fixture member comes only from $STAGING_FIXTURE_MEMBER_ID (digits,
     15-22), never from an input, so a dispatcher cannot aim the job at another
     member;
+  * each returned event type must be in the known funnel vocabulary; unknown
+    values fail closed before an artifact is written;
   * the database login comes only from $TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL
-    and must name role two_bot_events_ro on database two_bot at a host that is
-    not production-like (the same rule as crates/cutover/src/staging_migrate.rs).
-    Only sslmode, channel_binding and connect_timeout may ride on the URL, and
-    the URL is turned into PG* environment variables for psql, so the password
-    never appears in a process list.
+    and must name role two_bot_events_ro on database two_bot at the exact host
+    pinned in $STAGING_EVENTS_READ_EXPECTED_HOST. The URL port is omitted or
+    5432, and a production-like host also refuses. Only sslmode, channel_binding
+    and connect_timeout may ride on the
+    URL; psql always uses verify-full with the runner's system CA bundle, so the
+    certificate must authenticate that pinned hostname. The URL is turned into
+    PG* environment variables for psql, so the password never appears in a
+    process list.
 After connecting, the server must also report current_user and
 current_database() as that role and database before the rows are read.
 
@@ -61,9 +66,11 @@ import staging_automation_read_smoke as pins  # noqa: E402
 
 SCHEMA_VERSION = 1
 URL_ENV = "TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL"
+HOST_ENV = "STAGING_EVENTS_READ_EXPECTED_HOST"
 MEMBER_ENV = "STAGING_FIXTURE_MEMBER_ID"
 DB_ROLE = "two_bot_events_ro"
 DB_NAME = "two_bot"
+SYSTEM_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 MAX_WINDOW = timedelta(minutes=15)
 ROW_CAP = 60
 QUERY_LIMIT = ROW_CAP + 1  # one extra row detects overflow
@@ -71,7 +78,13 @@ PSQL_TIMEOUT_SECONDS = 60
 
 INSTANT_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,3})?Z")
 MEMBER_RE = re.compile(r"[0-9]{15,22}")
-EVENT_TYPE_RE = re.compile(r"[a-z][a-z0-9_]{0,47}")
+# Keep this in sync with EventType::from_wire in crates/core/src/funnel.rs.
+EVENT_TYPES = frozenset({
+    "invite_click", "member_join", "gate_cleared", "onboarding_prompted",
+    "game_roles_selected", "channel_routed", "first_message", "second_message",
+    "third_message", "first_voice_session", "voice_session_start", "voice_session_end",
+    "member_inactive", "member_leave",
+})
 RECORDED_AT_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z")
 # libpq parameters a login URL may carry. Anything else (host=, options=,
 # service=, passfile=, ...) could redirect the connection or change the session.
@@ -172,8 +185,16 @@ def database_target(env):
         raise Refused("refusing: the database login is not a valid postgres URL")
     if parts.scheme not in ("postgres", "postgresql") or not host or "," in parts.netloc.rpartition("@")[2]:
         raise Refused("refusing: the database login must be one postgres:// host")
+    if port not in (None, 5432):
+        raise Refused("refusing: the database port must be the PostgreSQL endpoint port")
     if "/" in host or "@" in host:
         raise Refused("refusing: the database host must be a bare name")
+    expected_host = env.get(HOST_ENV, "")
+    if (not expected_host or not expected_host.isascii() or expected_host != expected_host.strip()
+            or any(character in expected_host for character in "/@,?#")):
+        raise Refused(f"refusing: no valid staging host pin bound (${HOST_ENV})")
+    if host.lower() != expected_host.lower():
+        raise Refused("refusing: the database host does not match the pinned staging endpoint")
     if prod_like(host):
         raise Refused("refusing: the database host is production-like")
     user = unquote(parts.username or "")
@@ -188,7 +209,8 @@ def database_target(env):
     if database != DB_NAME:
         raise Refused(f"refusing: the database must be {DB_NAME}")
     pg = {"PGHOST": host, "PGUSER": user, "PGPASSWORD": password, "PGDATABASE": database,
-          "PGSSLMODE": "require", "PGCONNECT_TIMEOUT": "10"}
+          "PGSSLMODE": "verify-full", "PGSSLROOTCERT": SYSTEM_CA_BUNDLE,
+          "PGCONNECT_TIMEOUT": "10"}
     if port is not None:
         pg["PGPORT"] = str(port)
     try:
@@ -201,7 +223,10 @@ def database_target(env):
         allowed = URL_PARAMS[key]
         if (allowed is not None and value not in allowed) or (allowed is None and not value.isdigit()):
             raise Refused(f"refusing: the database login has a bad {key}")
-        pg[{"sslmode": "PGSSLMODE", "channel_binding": "PGCHANNELBINDING",
+        if key == "sslmode":
+            # Upgrade every accepted mode to authenticated hostname verification.
+            continue
+        pg[{"channel_binding": "PGCHANNELBINDING",
             "connect_timeout": "PGCONNECT_TIMEOUT"}[key]] = value
     return pg
 
@@ -257,7 +282,7 @@ def check_identity(output):
 def parse_rows(output):
     rows = []
     for raw in csv_rows(output):
-        if len(raw) != 2 or not EVENT_TYPE_RE.fullmatch(raw[0]) or not RECORDED_AT_RE.fullmatch(raw[1]):
+        if len(raw) != 2 or raw[0] not in EVENT_TYPES or not RECORDED_AT_RE.fullmatch(raw[1]):
             raise ReadFailed("a row had an unexpected shape; nothing was written")
         rows.append({"event_type": raw[0], "recorded_at": raw[1]})
     if len(rows) > QUERY_LIMIT:
@@ -296,7 +321,8 @@ def artifact_errors(artifact):
         errors.append("truncated")
     for index, row in enumerate(rows, start=1):
         if (not isinstance(row, dict) or set(row) != {"ordinal", "event_type", "recorded_at"}
-                or row["ordinal"] != index or not EVENT_TYPE_RE.fullmatch(str(row["event_type"]))
+                or row["ordinal"] != index or not isinstance(row["event_type"], str)
+                or row["event_type"] not in EVENT_TYPES
                 or not RECORDED_AT_RE.fullmatch(str(row["recorded_at"]))):
             errors.append(f"row {index}")
     return errors

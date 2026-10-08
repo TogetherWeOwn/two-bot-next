@@ -6,8 +6,9 @@ name: staging-events-read
 # automatically and has no production path. It reads only the
 # `staging-events-read` environment's existing bindings: the secret
 # TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL (role two_bot_events_ro, column-limited
-# SELECT on `events`) and the secret STAGING_FIXTURE_MEMBER_ID. It creates or
-# changes no credential. A missing binding is refused before any connection;
+# SELECT on `events`), the secret STAGING_EVENTS_READ_EXPECTED_HOST pin, and
+# the secret STAGING_FIXTURE_MEMBER_ID. It creates or changes no credential.
+# A missing binding is refused before any connection;
 # the environment's main-only policy must be verified during setup.
 #
 # The fixture member is a secret, not a dispatch input and not a variable: a
@@ -59,6 +60,7 @@ jobs:
           # Must already exist as staging-events-read environment secrets;
           # absent means refusal before any connection. Secrets print as ***.
           TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL: ${{ secrets.TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL }}
+          STAGING_EVENTS_READ_EXPECTED_HOST: ${{ secrets.STAGING_EVENTS_READ_EXPECTED_HOST }}
           STAGING_FIXTURE_MEMBER_ID: ${{ secrets.STAGING_FIXTURE_MEMBER_ID }}
           WINDOW_START: ${{ inputs.window_start }}
           WINDOW_END: ${{ inputs.window_end }}

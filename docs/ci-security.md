@@ -109,19 +109,23 @@ own non-cancelling concurrency group. It has exactly three unconditional steps:
 pinned checkout without persisted credentials, one Run step that passes the
 inputs through the environment (never an inline expression) to
 `scripts/staging_events_read.py`, and the 14-day upload of
-`staging-events-read-<run_id>.json`. The only secrets it may name are
+`staging-events-read-<run_id>.json`. Its three secrets are
 `TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL` (role `two_bot_events_ro`, column-limited
-`SELECT` on `events`) and `STAGING_FIXTURE_MEMBER_ID`, scoped to that Run step.
-The member is a secret rather than a variable because a step's `env` block
-prints variable values on the public run page. No `set -x`, no wrangler, no
-production path.
+`SELECT` on `events`), `STAGING_EVENTS_READ_EXPECTED_HOST` (independently pinned
+staging endpoint hostname), and `STAGING_FIXTURE_MEMBER_ID`, scoped to that Run
+step. The host and member are secrets rather than variables because a step's
+`env` block prints variable values on the public run page. No `set -x`, no
+wrangler, no production path.
 
 The script refuses before connecting unless the window is a past UTC window of
 at most 15 minutes, the guild is the pinned TWO Staging guild (the live guild
-refuses), and the login names role `two_bot_events_ro` on database `two_bot` at a
-host that is not production-like. It keeps the password out of the process list,
-runs every statement in a `READ ONLY` transaction, never echoes the client's
-error text, and writes only an ordinal, `event_type` and `recorded_at` per row.
+refuses), the login names role `two_bot_events_ro` on database `two_bot`, and
+the URL host exactly matches the independent staging-host pin. It forces
+libpq `sslmode=verify-full` with the runner's system CA bundle, so the server
+certificate must authenticate that host. It keeps the password out of the
+process list, runs every statement in a `READ ONLY` transaction, never echoes
+the client's error text, and writes only an ordinal, `event_type` and
+`recorded_at` per row.
 
 ## Production route
 

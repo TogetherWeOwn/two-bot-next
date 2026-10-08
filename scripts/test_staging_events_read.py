@@ -26,7 +26,8 @@ NOW = datetime(2026, 10, 7, 16, 0, 0, tzinfo=timezone.utc)
 START, END = "2026-10-07T14:00:00Z", "2026-10-07T14:15:00Z"
 MEMBER = "123456789012345678"
 PASSWORD = "s3cr3t-Pa55word"
-URL = (f"postgresql://two_bot_events_ro:{PASSWORD}@ep-staging-example.us-east-2.aws.neon.tech/two_bot"
+STAGING_HOST = "ep-staging-example.us-east-2.aws.neon.tech"
+URL = (f"postgresql://two_bot_events_ro:{PASSWORD}@{STAGING_HOST}/two_bot"
        "?sslmode=require&channel_binding=require")
 IDENTITY = "two_bot_events_ro,two_bot\n"
 FAKE_PSQL = """#!/usr/bin/env python3
@@ -71,7 +72,7 @@ sys.stdout.write(behavior["identity"] if "current_user" in stdin else behavior["
 """
 
 
-def rows_csv(count, event_type="message_created"):
+def rows_csv(count, event_type="first_message"):
     return "".join(f"{event_type},2026-10-07T14:{index // 60:02d}:{index % 60:02d}.250Z\n"
                    for index in range(count))
 
@@ -106,7 +107,8 @@ class Fixture:
     def run(self, env=None, start=START, end=END, psql="fake"):
         # psql="" stands for a runner without psql (None would fall back to PATH).
         merged = {"PATH": os.environ.get("PATH", ""), "GH_TOKEN": "gh-token-must-not-reach-psql",
-                  reader.URL_ENV: URL, reader.MEMBER_ENV: MEMBER, "GITHUB_STEP_SUMMARY": str(self.summary)}
+                  reader.URL_ENV: URL, reader.HOST_ENV: STAGING_HOST,
+                  reader.MEMBER_ENV: MEMBER, "GITHUB_STEP_SUMMARY": str(self.summary)}
         merged.update(env or {})
         merged = {key: value for key, value in merged.items() if value is not None}
         out, err = io.StringIO(), io.StringIO()
@@ -182,25 +184,58 @@ class MemberAndGuildTests(unittest.TestCase):
 
 
 class DatabaseTargetTests(unittest.TestCase):
-    def target(self, url):
-        return reader.database_target({reader.URL_ENV: url})
+    def target(self, url, expected_host=STAGING_HOST):
+        env = {reader.URL_ENV: url}
+        if expected_host is not None:
+            env[reader.HOST_ENV] = expected_host
+        return reader.database_target(env)
 
     def test_the_login_becomes_pg_variables_with_no_url_left_behind(self):
         pg = self.target(URL)
-        self.assertEqual(pg, {"PGHOST": "ep-staging-example.us-east-2.aws.neon.tech",
+        self.assertEqual(pg, {"PGHOST": STAGING_HOST,
                               "PGUSER": "two_bot_events_ro", "PGPASSWORD": PASSWORD,
-                              "PGDATABASE": "two_bot", "PGSSLMODE": "require",
+                              "PGDATABASE": "two_bot", "PGSSLMODE": "verify-full",
+                              "PGSSLROOTCERT": reader.SYSTEM_CA_BUNDLE,
                               "PGCONNECT_TIMEOUT": "10", "PGCHANNELBINDING": "require"})
 
-    def test_port_percent_encoded_password_and_default_sslmode(self):
-        pg = self.target("postgres://two_bot_events_ro:p%40ss%3Aw%2Frd@staging-db.example.net:6543/two_bot")
-        self.assertEqual((pg["PGPORT"], pg["PGPASSWORD"], pg["PGSSLMODE"]), ("6543", "p@ss:w/rd", "require"))
+    def test_sslmode_is_upgraded_to_authenticated_hostname_verification(self):
+        for suffix in ("", "?sslmode=require", "?sslmode=verify-ca"):
+            with self.subTest(sslmode=suffix):
+                pg = self.target(
+                    f"postgres://two_bot_events_ro:p%40ss%3Aw%2Frd@{STAGING_HOST}/two_bot{suffix}"
+                )
+                self.assertEqual(pg["PGSSLMODE"], "verify-full")
+                self.assertEqual(pg["PGSSLROOTCERT"], reader.SYSTEM_CA_BUNDLE)
 
-    def test_the_pooler_host_is_allowed_because_the_read_is_one_plain_select(self):
-        self.target("postgresql://two_bot_events_ro:pw@ep-staging-example-pooler.neon.tech/two_bot")
+    def test_default_port_and_percent_encoded_password_are_preserved(self):
+        pg = self.target(
+            f"postgres://two_bot_events_ro:p%40ss%3Aw%2Frd@{STAGING_HOST}:5432/two_bot"
+        )
+        self.assertEqual((pg["PGPORT"], pg["PGPASSWORD"]), ("5432", "p@ss:w/rd"))
+
+    def test_non_default_port_refuses(self):
+        with self.assertRaises(reader.Refused):
+            self.target(f"postgres://two_bot_events_ro:pw@{STAGING_HOST}:6543/two_bot")
+
+    def test_the_pinned_host_must_match_the_database_url(self):
+        with self.assertRaises(reader.Refused):
+            self.target("postgresql://two_bot_events_ro:pw@database.example.net/two_bot")
+        with self.assertRaises(reader.Refused):
+            self.target(URL, expected_host="database.example.net")
+        with self.assertRaises(reader.Refused):
+            self.target(URL, expected_host=None)
+
+    def test_a_production_like_pinned_host_still_refuses(self):
+        host = "ep-production-example.neon.tech"
+        with self.assertRaises(reader.Refused):
+            self.target(f"postgresql://two_bot_events_ro:pw@{host}/two_bot", expected_host=host)
+
+    def test_the_pooler_host_is_allowed_when_it_is_the_pinned_endpoint(self):
+        host = "ep-staging-example-pooler.neon.tech"
+        self.target(f"postgresql://two_bot_events_ro:pw@{host}/two_bot", expected_host=host)
 
     def test_refusals(self):
-        good = "postgresql://two_bot_events_ro:pw@ep-staging-example.neon.tech/two_bot"
+        good = f"postgresql://two_bot_events_ro:pw@{STAGING_HOST}/two_bot"
         cases = {
             "missing": None,
             "empty": "",
@@ -210,7 +245,7 @@ class DatabaseTargetTests(unittest.TestCase):
             "migrator role": good.replace("two_bot_events_ro", "two_bot_migrator"),
             "runtime role": good.replace("two_bot_events_ro", "two_bot_runtime"),
             "ro migrator": good.replace("two_bot_events_ro", "two_bot_migrator_ro"),
-            "no password": "postgresql://two_bot_events_ro@ep-staging-example.neon.tech/two_bot",
+            "no password": f"postgresql://two_bot_events_ro@{STAGING_HOST}/two_bot",
             "other database": good.replace("/two_bot", "/neondb"),
             "prod database": good.replace("/two_bot", "/two_bot_prod"),
             "no database": good.replace("/two_bot", ""),
@@ -227,16 +262,28 @@ class DatabaseTargetTests(unittest.TestCase):
             "malformed query": good + "?sslmode",
         }
         for label, url in cases.items():
+            env = {} if url is None else {reader.URL_ENV: url, reader.HOST_ENV: STAGING_HOST}
             with self.subTest(case=label), self.assertRaises(reader.Refused) as caught:
-                reader.database_target({} if url is None else {reader.URL_ENV: url})
+                reader.database_target(env)
             self.assertNotIn("pw@", str(caught.exception), "a refusal must not echo the login")
 
 
 class ReadTests(unittest.TestCase):
+    def test_missing_or_mismatched_host_pin_refuses_before_connection(self):
+        for host_pin in ("", "database.example.net"):
+            with self.subTest(host_pin=host_pin):
+                fixture = Fixture(self)
+                code, _, err = fixture.run(env={reader.HOST_ENV: host_pin})
+                self.assertEqual(code, 2)
+                self.assertTrue(err.startswith("refusing:"))
+                self.assertEqual(fixture.calls(), [])
+                if host_pin:
+                    self.assertNotIn(host_pin, err)
+
     def test_a_read_writes_only_ordinal_type_and_time(self):
         fixture = Fixture(self, rows="member_join,2026-10-07T14:01:00.000Z\n"
-                                     "message_created,2026-10-07T14:02:03.250Z\n"
-                                     "voice_join,2026-10-07T14:05:00.500Z\n")
+                                     "first_message,2026-10-07T14:02:03.250Z\n"
+                                     "voice_session_start,2026-10-07T14:05:00.500Z\n")
         code, out, err = fixture.run()
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(fixture.artifact(), {
@@ -244,10 +291,20 @@ class ReadTests(unittest.TestCase):
             "window": {"start": "2026-10-07T14:00:00.000Z", "end": "2026-10-07T14:15:00.000Z"},
             "row_count": 3, "truncated": False,
             "rows": [{"ordinal": 1, "event_type": "member_join", "recorded_at": "2026-10-07T14:01:00.000Z"},
-                     {"ordinal": 2, "event_type": "message_created", "recorded_at": "2026-10-07T14:02:03.250Z"},
-                     {"ordinal": 3, "event_type": "voice_join", "recorded_at": "2026-10-07T14:05:00.500Z"}]})
+                     {"ordinal": 2, "event_type": "first_message", "recorded_at": "2026-10-07T14:02:03.250Z"},
+                     {"ordinal": 3, "event_type": "voice_session_start", "recorded_at": "2026-10-07T14:05:00.500Z"}]})
         self.assertEqual(reader.artifact_errors(fixture.artifact()), [])
         self.assertEqual(out, "ok: 3 rows, truncated=false\n")
+
+    def test_unknown_identifier_like_event_type_fails_without_writing(self):
+        leaked = "member_123456789012345678"
+        fixture = Fixture(self, rows=f"{leaked},2026-10-07T14:01:00.000Z\n")
+        code, out, err = fixture.run()
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("unexpected shape", err)
+        self.assertNotIn(leaked, err)
+        self.assertFalse(fixture.output.exists())
 
     def test_nothing_identifying_reaches_the_artifact_the_log_or_the_summary(self):
         fixture = Fixture(self, rows=rows_csv(5))
@@ -257,7 +314,7 @@ class ReadTests(unittest.TestCase):
         for forbidden in (MEMBER, reader.pins.STAGING_GUILD_ID, PASSWORD, "idempotency", "metadata",
                           "source", "guild", "member", "neon.tech", "two_bot_events_ro"):
             self.assertNotIn(forbidden, written)
-        self.assertIn("message_created: 5", fixture.summary.read_text())
+        self.assertIn("first_message: 5", fixture.summary.read_text())
 
     def test_the_sql_selects_only_what_the_artifact_carries_and_is_read_only_and_capped(self):
         fixture = Fixture(self, rows=rows_csv(1))
@@ -285,6 +342,8 @@ class ReadTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         for call in run.call_args_list:
             self.assertEqual(call.kwargs["env"]["PGPASSWORD"], PASSWORD)
+            self.assertEqual(call.kwargs["env"]["PGSSLMODE"], "verify-full")
+            self.assertEqual(call.kwargs["env"]["PGSSLROOTCERT"], reader.SYSTEM_CA_BUNDLE)
         identity_call, rows_call = fixture.calls()
         self.assertEqual(identity_call["argv"], ["-X", "-q", "-t", "--csv", "-v", "ON_ERROR_STOP=1", "-f", "-"])
         self.assertEqual(rows_call["argv"], [
@@ -448,6 +507,8 @@ class ShapeTests(unittest.TestCase):
         for label, change in {
             "top-level key": lambda a: a.update({"member": MEMBER}),
             "row key": lambda a: a["rows"][0].update({"idempotency_key": "k"}),
+            "unknown event type": lambda a: a["rows"][0].update(
+                {"event_type": "member_123456789012345678"}),
             "window key": lambda a: a["window"].update({"guild": "1"}),
             "row count": lambda a: a.update({"row_count": 2}),
             "ordinal": lambda a: a["rows"][0].update({"ordinal": 2}),

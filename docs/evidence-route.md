@@ -112,7 +112,9 @@ channel or substitute credentials.
    binding missing or aimed at another role, database, or host instead of the
    independently pinned staging endpoint, the live guild, or failed TLS
    verification) fails the job before any rows are read; a database error
-   prints one fixed phrase, never the client's message.
+   prints one fixed phrase, never the client's message. Only the known funnel
+   `event_type` vocabulary is exported; an unknown event type fails closed
+   before the artifact is written.
 3. **Reconcile.** The workflow artifact is already sanitized; pass
    it directly as `--rows` to `evidence_reconcile`. It contains `rows` and
    `truncated` alongside its schema version, witnessed window and row count.
@@ -198,7 +200,9 @@ Setup is an Operator step and creates nothing from the workflow itself:
 1. On staging `two_bot`, create the login role `two_bot_events_ro`
    (`default_transaction_read_only = on`, `statement_timeout = '10s'`,
    connection limit 2) with column-level `SELECT (id, event_type, member_id,
-   guild_id, recorded_at, idempotency_key)` on `public.events` and nothing else.
+   guild_id, recorded_at)` on `public.events` and nothing else. Do not grant
+   `SELECT` on `idempotency_key`; this route does not need it and it can contain
+   identity-bearing data.
 2. Create the environment with a `main`-only deployment-branch policy and three
    environment **secrets**: `TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL` (direct
    endpoint URL; port omitted or 5432),

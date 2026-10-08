@@ -581,6 +581,7 @@ def staging_container_drill_errors(workflow):
 
 EVENTS_READ_ENV = {
     "TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL": "${{ secrets.TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL }}",
+    "STAGING_EVENTS_READ_EXPECTED_HOST": "${{ secrets.STAGING_EVENTS_READ_EXPECTED_HOST }}",
     "STAGING_FIXTURE_MEMBER_ID": "${{ secrets.STAGING_FIXTURE_MEMBER_ID }}",
     "WINDOW_START": "${{ inputs.window_start }}",
     "WINDOW_END": "${{ inputs.window_end }}",
@@ -595,18 +596,22 @@ def staging_events_read_errors(workflow):
 
     Dispatch-only with exactly two required string inputs, the UTC window. The
     fixture member is never an input and never a variable (a step's env block
-    prints variable values on the public run page): it is an environment
-    secret, like the read-only database login. One job runs only from main
+    prints variable values on the public run page). The read-only database
+    login, the independently pinned staging host and the fixture member are
+    environment secrets. One job runs only from main
     through the `staging-events-read` environment, on the routed runner for job
     `read`, with its own non-cancelling concurrency group and a 5 minute
     timeout. Exactly three unconditional steps: pinned checkout without
     persisted credentials, one Run step that passes the inputs through the
     environment (never an inline expression) to the reviewed script, and the
-    14 day artifact upload of the sanitized file. Both bindings are scoped to
-    that Run step alone. No wrangler, no production path, no `set -x`.
+    14 day artifact upload of the sanitized file. All three environment
+    secrets are scoped to that Run step alone. No wrangler, no
+    production path, no `set -x`.
     """
     name = "staging-events-read.yml"
     errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent; secrets belong only on the Run step")
     on = workflow.get("on") or {}
     if set(on) != {"workflow_dispatch"}:
         errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
@@ -648,8 +653,9 @@ def staging_events_read_errors(workflow):
         if marker in text:
             errors.append(f"{name}:read: must not contain {marker!r}")
     secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
-    if secrets != {"two_bot_staging_events_ro_database_url", "staging_fixture_member_id"}:
-        errors.append(f"{name}:read: must read exactly the two events-read secrets")
+    if secrets != {"two_bot_staging_events_ro_database_url", "staging_events_read_expected_host",
+                   "staging_fixture_member_id"}:
+        errors.append(f"{name}:read: must read exactly the three events-read secrets")
     if set(re.findall(r"inputs\.([a-z0-9_]+)", text)) != {"window_start", "window_end"}:
         errors.append(f"{name}:read: may reference only the two window inputs")
     steps = job.get("steps") or []
@@ -661,7 +667,7 @@ def staging_events_read_errors(workflow):
             or (checkout.get("with") or {}).get("persist-credentials") != "false":
         errors.append(f"{name}:read: checkout must be pinned and must not persist credentials")
     if run.get("env") != EVENTS_READ_ENV:
-        errors.append(f"{name}:read: Run step must bind exactly the two secrets, the two windows and the run id")
+        errors.append(f"{name}:read: Run step must bind exactly the three secrets, the two windows and the run id")
     if run.get("run") != EVENTS_READ_COMMAND or "uses" in run or "shell" in run:
         errors.append(f"{name}:read: Run step must call the script with the inputs via the environment only")
     if not str(upload.get("uses", "")).startswith("actions/upload-artifact@") or upload.get("with") != {
@@ -1259,6 +1265,8 @@ class WorkflowTests(unittest.TestCase):
             "optional window": lambda w: w["on"]["workflow_dispatch"]["inputs"]["window_end"].update(
                 {"required": "false"}),
             "top-level permissions": lambda w: w.update({"permissions": {"contents": "read"}}),
+            "workflow-level secret": lambda w: w.update(
+                {"env": {"T": "${{ secrets.TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL }}"}}),
             "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
             "shared concurrency group": lambda w: w["concurrency"].update({"group": "deploy-staging"}),
             "second job": lambda w: w["jobs"].update({"again": deepcopy(job(w))}),
@@ -1284,6 +1292,8 @@ class WorkflowTests(unittest.TestCase):
                 {"X": "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"}),
             "dropped login secret": lambda w: job(w)["steps"][1]["env"].pop(
                 "TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL"),
+            "dropped host pin": lambda w: job(w)["steps"][1]["env"].pop(
+                "STAGING_EVENTS_READ_EXPECTED_HOST"),
             "blanket secrets": lambda w: job(w)["steps"][1]["env"].update({"ALL": "${{ toJSON(secrets) }}"}),
             "member as variable": lambda w: job(w)["steps"][1]["env"].update(
                 {"STAGING_FIXTURE_MEMBER_ID": "${{ vars.STAGING_FIXTURE_MEMBER_ID }}"}),
