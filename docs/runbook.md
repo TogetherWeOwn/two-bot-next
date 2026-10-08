@@ -753,6 +753,32 @@ Source: [`automod.rs`](../crates/core/src/automod.rs),
 Do not enable new writes until runtime wiring, environment propagation,
 containment, authorization and staging evidence exist.
 
+### Automation definition quotas
+
+Ordinary store-backed creation permits **25 schedules**, **25 feed relays** and
+**20 open LFG posts per guild**. Disabled feeds and disabled/completed schedules
+still count toward their definition limits. Remove an unused definition with
+`/feed-remove` or `/schedule-remove`; close an open post with `/lfg-close`.
+The command replies name the exhausted limit and the command that frees a slot.
+No Discord post is attempted for a quota-refused LFG creation.
+
+Capacity checks and writes share a short transaction-scoped guild/resource lock.
+Schedule replacements and open LFG updates do not consume another slot;
+reopening a closed LFG post does. Feed creation remains insert-only. Existing
+rows above a limit are preserved, and existing schedule/LFG definitions can
+still be updated. These are application CRUD limits, not schema constraints:
+operator backup/restore preserves historical rows and is not quota-truncated.
+
+This change does not add retention, trigger/signup cooldowns or feed-poll
+fairness. Audit replay markers and uncertain delivery state must remain durable
+when implementing those separately. No automatic purge or live-data cleanup is
+authorized by these limits.
+
+Source: [`automation_quota.rs`](../crates/core/src/automation_quota.rs),
+[`scheduled_store.rs`](../crates/core/src/scheduled_store.rs),
+[`feeds_store.rs`](../crates/core/src/feeds_store.rs),
+[`lfg_store.rs`](../crates/core/src/lfg_store.rs).
+
 ## Backup, restore and drill commands
 
 [Backup procedures and formats](backup.md) are the detailed contract. These

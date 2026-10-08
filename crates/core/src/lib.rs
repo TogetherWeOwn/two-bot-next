@@ -14,6 +14,8 @@ pub mod audit_mirror;
 pub mod audit_service;
 #[cfg(feature = "db")]
 pub mod audit_store;
+#[cfg(feature = "db")]
+pub mod automation_quota;
 pub mod automation_transfer;
 pub mod automod;
 pub mod automod_runtime;

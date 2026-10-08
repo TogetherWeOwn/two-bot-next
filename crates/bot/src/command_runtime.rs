@@ -1654,8 +1654,12 @@ impl CommandRuntime {
         match plan_command(&context, command) {
             Ok(FeedCommandPlan::Add(relay)) => {
                 if let Err(err) = add_feed(&self.pool, &relay).await {
-                    warn!(error = %err, "feed insert failed");
-                    self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                    if let two_bot_core::feeds_store::FeedStoreError::Capacity(quota) = err {
+                        self.finish(interaction, quota.to_string()).await;
+                    } else {
+                        warn!(error = %err, "feed insert failed");
+                        self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                    }
                     return;
                 }
                 self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str())

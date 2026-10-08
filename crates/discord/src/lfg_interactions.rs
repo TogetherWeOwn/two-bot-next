@@ -29,6 +29,8 @@ pub enum LfgError {
     Audit(#[from] rsvp_store::RsvpStoreError),
     #[error("LFG Discord operation failed")]
     Discord(#[from] DiscordError),
+    #[error(transparent)]
+    Definition(#[from] two_bot_core::automation_quota::QuotaWriteError),
     #[error("LFG acceptance is uncertain; durable state retained for nonce recovery")]
     Uncertain,
     #[error("LFG is busy right now; try again in a few seconds.")]
