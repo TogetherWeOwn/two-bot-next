@@ -69,6 +69,7 @@ Full rules: CONTRIBUTING.md, "Pull request standards".
 - [ ] I ran the tests locally and they pass
 - [ ] I added or updated tests where applicable
 - [ ] I updated the documentation this change touches
+- [ ] For vote-kick, template assistant or RSVP/attendance wiring, I linked the applicable [security requirement IDs](https://github.com/TogetherWeOwn/two-bot-next/blob/main/docs/command-wiring-security.md) and exact-head regression tests, or stated why this is not applicable
 - [ ] No secret, token or credential is in the diff, the title, the body or the branch name
 - [ ] No internal ticket id, instance link or private host is in the title, body, commits or branch name
 - [ ] CI is green on the exact head before I ask for review
