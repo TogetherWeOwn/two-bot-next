@@ -64,6 +64,42 @@ fn registered_id_wins_and_unknown_ids_cannot_spoof_known_names() {
 }
 
 #[test]
+fn resolved_interaction_changes_only_the_name_and_keeps_components_untouched() {
+    use std::borrow::Cow;
+
+    let identities = CommandIdentities::default();
+    identities
+        .replace_guild(1111, 2222, &[registered("ping", Some(9001))])
+        .unwrap();
+    let original = interaction(9001, "rsvp", Some(2222));
+    let resolved = identities.resolve_interaction(&original).unwrap();
+    let mut expected = serde_json::to_value(&original).unwrap();
+    expected["data"]["name"] = json!("ping");
+    assert_eq!(serde_json::to_value(resolved.as_ref()).unwrap(), expected);
+    assert_eq!(
+        serde_json::to_value(&original).unwrap()["data"]["name"],
+        "rsvp"
+    );
+    assert!(matches!(resolved, Cow::Owned(_)));
+    assert!(matches!(
+        identities.resolve_interaction(&interaction(9001, "ping", Some(2222))),
+        Some(Cow::Borrowed(_))
+    ));
+    assert!(identities
+        .resolve_interaction(&interaction(9999, "ping", Some(2222)))
+        .is_none());
+
+    let mut wire = serde_json::to_value(&original).unwrap();
+    wire["type"] = json!(3);
+    wire["data"] = json!({"component_type": 2, "custom_id": "voice-ballot-fixture", "values": []});
+    let component: Interaction = serde_json::from_value(wire).unwrap();
+    assert!(matches!(
+        identities.resolve_interaction(&component),
+        Some(Cow::Borrowed(_))
+    ));
+}
+
+#[test]
 fn fallback_is_limited_to_unknown_registration_identity() {
     let identities = CommandIdentities::default();
     assert_eq!(

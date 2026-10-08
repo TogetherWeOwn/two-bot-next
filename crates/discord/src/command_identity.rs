@@ -1,6 +1,7 @@
 //! Registration identity is separate from the ID-free command drift hash.
 
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     sync::{Arc, RwLock},
 };
@@ -20,8 +21,10 @@ struct RegisteredCommand {
 /// replaces a scope, so removed and recreated IDs cannot accumulate.
 #[derive(Debug, Clone, Default)]
 pub struct CommandIdentities {
-    guilds: Arc<RwLock<BTreeMap<(u64, u64), Vec<RegisteredCommand>>>>,
+    guilds: Arc<RwLock<GuildRegistrations>>,
 }
+
+type GuildRegistrations = BTreeMap<(u64, u64), Vec<RegisteredCommand>>;
 
 impl CommandIdentities {
     /// Install one successful REST receipt atomically. Twilight also represents
@@ -59,6 +62,30 @@ impl CommandIdentities {
             .map_err(|_| "command identity lock unavailable")?
             .insert((application_id, guild_id), registered);
         Ok(())
+    }
+
+    /// Canonicalize slash names for existing routers without changing tokens,
+    /// options or authority. Other interaction types pass through unchanged.
+    #[must_use]
+    pub fn resolve_interaction<'a>(
+        &self,
+        interaction: &'a Interaction,
+    ) -> Option<Cow<'a, Interaction>> {
+        if interaction.kind != InteractionType::ApplicationCommand {
+            return Some(Cow::Borrowed(interaction));
+        }
+        let name = self.slash_name(interaction)?;
+        let Some(InteractionData::ApplicationCommand(command)) = interaction.data.as_ref() else {
+            return None;
+        };
+        if name == command.name {
+            return Some(Cow::Borrowed(interaction));
+        }
+        let mut resolved = interaction.clone();
+        if let Some(InteractionData::ApplicationCommand(command)) = resolved.data.as_mut() {
+            command.name = name;
+        }
+        Some(Cow::Owned(resolved))
     }
 
     /// Resolve slash identity before either admission or voice parsing.

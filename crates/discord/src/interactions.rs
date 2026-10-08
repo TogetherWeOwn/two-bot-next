@@ -227,6 +227,14 @@ impl InteractionRuntime {
         if application_id != 0 && interaction.application_id.get() != application_id {
             return Ok(false);
         }
+        let Some(interaction) = self
+            .executor
+            .command_identities()
+            .resolve_interaction(interaction)
+        else {
+            return Ok(false);
+        };
+        let interaction = interaction.as_ref();
         let routed = route_interaction(&self.router, interaction, None);
         if matches!(
             &routed,
@@ -280,6 +288,14 @@ impl InteractionRuntime {
         if application_id != 0 && interaction.application_id.get() != application_id {
             return Ok(crate::rsvp::PreparedRsvp::ignored());
         }
+        let Some(interaction) = self
+            .executor
+            .command_identities()
+            .resolve_interaction(&interaction)
+            .map(std::borrow::Cow::into_owned)
+        else {
+            return Ok(crate::rsvp::PreparedRsvp::ignored());
+        };
         crate::rsvp::prepare_rsvp_interaction(&self.router, &self.executor, interaction).await
     }
 

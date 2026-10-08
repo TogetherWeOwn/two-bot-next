@@ -109,6 +109,238 @@ impl VoiceEventSink for RecordingVoice {
     }
 }
 
+struct GatewayVoiceReplies(two_bot_discord::ActionExecutor);
+
+impl two_bot::voice_rooms::InteractionReplies for GatewayVoiceReplies {
+    async fn defer(
+        &self,
+        interaction: &twilight_model::application::interaction::Interaction,
+    ) -> Result<(), RoomHttpError> {
+        use twilight_model::http::interaction::{
+            InteractionResponse, InteractionResponseData, InteractionResponseType,
+        };
+        self.respond(
+            interaction,
+            InteractionResponse {
+                kind: InteractionResponseType::DeferredChannelMessageWithSource,
+                data: Some(InteractionResponseData {
+                    flags: Some(twilight_model::channel::message::MessageFlags::EPHEMERAL),
+                    ..Default::default()
+                }),
+            },
+        )
+        .await
+    }
+
+    async fn complete(
+        &self,
+        interaction: &twilight_model::application::interaction::Interaction,
+        response: twilight_model::http::interaction::InteractionResponse,
+    ) -> Result<(), RoomHttpError> {
+        self.0
+            .edit_interaction_response(
+                interaction.application_id.get(),
+                &interaction.token,
+                response
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.content.as_deref())
+                    .unwrap_or_default(),
+            )
+            .await
+            .map_err(|_| RoomHttpError::InvalidRequest)
+    }
+
+    async fn respond(
+        &self,
+        interaction: &twilight_model::application::interaction::Interaction,
+        response: twilight_model::http::interaction::InteractionResponse,
+    ) -> Result<(), RoomHttpError> {
+        self.0
+            .answer_interaction(interaction.id.get(), &interaction.token, &response)
+            .await
+            .map_err(|_| RoomHttpError::InvalidRequest)
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires an authorized disposable gateway test database"]
+async fn registered_voice_id_with_rsvp_payload_has_one_voice_callback() {
+    use two_bot_core::{ClassifierConfig, InteractionRouter, RouterGates};
+    use two_bot_discord::{interactions::InteractionRuntime, ActionExecutor};
+
+    let db = TestDb::new().await;
+    let rest = crate::discord_test_common::MockRest::with_responder(|request| {
+        use crate::discord_test_common::ScriptedResponse;
+        if request.method == "GET" && request.path.ends_with("/applications/@me") {
+            return ScriptedResponse::json(200, json!({"id":"1111"}));
+        }
+        if request.method == "GET" && request.path.contains("/commands") {
+            return ScriptedResponse::json(200, json!([]));
+        }
+        if request.method == "PUT" && request.path.ends_with("/commands") {
+            let mut commands: Value = serde_json::from_slice(&request.body).unwrap();
+            for (index, command) in commands.as_array_mut().unwrap().iter_mut().enumerate() {
+                let id = if command["name"] == "ping" {
+                    9001
+                } else {
+                    10000 + index
+                };
+                command["id"] = json!(id.to_string());
+                command["application_id"] = json!("1111");
+                command["guild_id"] = json!(GUILD);
+                command["version"] = json!("9999");
+            }
+            return ScriptedResponse::json(200, commands);
+        }
+        if request.path.ends_with("/callback") {
+            return ScriptedResponse::status(204);
+        }
+        if request.method == "PATCH" && request.path.ends_with("/messages/@original") {
+            return ScriptedResponse::json(200, json!({"id":"99"}));
+        }
+        ScriptedResponse::status(403)
+    })
+    .await;
+    let gates = RouterGates {
+        configured_guild: Some(GUILD.parse().unwrap()),
+        scorecard: false,
+        automations: false,
+        announcements: false,
+        moderation: false,
+        voice: true,
+        voice_assistant: false,
+        tickets: false,
+        self_roles: false,
+        onboarding_picker: false,
+        session_picker: false,
+    };
+    let executor = ActionExecutor::with_proxy(TOKEN.into(), Some(rest.origin())).unwrap();
+    let ordered = Arc::new(InteractionRuntime::with_router(
+        InteractionRouter::new(gates),
+        db.pool.clone(),
+        executor.clone(),
+        0,
+        ClassifierConfig::default(),
+    ));
+    let commands = crate::command_runtime::CommandRuntime::new(
+        db.pool.clone(),
+        executor.clone(),
+        crate::command_runtime::router_with_commands(gates),
+        GUILD.parse().unwrap(),
+        false,
+    );
+    let rooms = PgRoomStore::new(db.pool.clone());
+    let voice = Arc::new(two_bot::voice_rooms::VoiceResponder::new(
+        Arc::new(VoiceRuntime::new(
+            move || (rooms.clone(), DeleteOnly::default()),
+            Duration::from_secs(60),
+            true,
+        )),
+        Arc::new(GatewayVoiceReplies(executor)),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    ensure_crypto_provider();
+    let shard = crate::gateway::build_shard(TOKEN.into(), Intents::empty(), None, Some(&url));
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let runner = tokio::spawn(run_shard(
+        shard,
+        Arc::new(build_pipeline(db.store.milestones().await.unwrap(), None)),
+        Arc::new(RwLock::new(GatewayState::Armed)),
+        db.store.clone(),
+        Some(ordered),
+        None,
+        Some(commands),
+        None,
+        Some(voice),
+        crate::server::shutdown_requested(receiver),
+    ));
+    let (socket, _) = listener.accept().await.unwrap();
+    let (_, mut ws) = ServerBuilder::new().accept(socket).await.unwrap();
+    ws.send(Message::text(
+        json!({"op":10,"d":{"heartbeat_interval":45000}}).to_string(),
+    ))
+    .await
+    .unwrap();
+    loop {
+        let message = ws.next().await.unwrap().unwrap();
+        if !message.is_text() {
+            continue;
+        }
+        let packet: Value = serde_json::from_str(message.as_text().unwrap()).unwrap();
+        if packet["op"] == 2 {
+            break;
+        }
+        if packet["op"] == 1 {
+            ws.send(Message::text("{\"op\":11,\"d\":null}".to_owned()))
+                .await
+                .unwrap();
+        }
+    }
+    ws.send(Message::text(
+        ready(&url, "voice-identity-session").to_string(),
+    ))
+    .await
+    .unwrap();
+    wait_sequence(&db.store, 1).await;
+    ws.send(Message::text(
+        json!({"op":0,"s":2,"t":"INTERACTION_CREATE","d":{
+            "application_id":"1111", "authorizing_integration_owners":{"0":GUILD},
+            "id":"7000", "token":"voice-identity-fixture", "type":2, "version":1,
+            "guild_id":GUILD, "entitlements":[],
+            "member":{"permissions":"0","roles":[],"deaf":false,"mute":false,"flags":0,
+                "user":{"id":"77","username":"human","discriminator":"0"}},
+            "data":{"id":"9001","name":"rsvp","type":1,"guild_id":GUILD,"options":[]}
+        }})
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    wait_sequence(&db.store, 2).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !rest
+            .requests()
+            .iter()
+            .any(|request| request.method == "PATCH")
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("voice completion deadline");
+    shutdown.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(15), runner)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let requests = rest.requests();
+    let callbacks: Vec<_> = requests
+        .iter()
+        .filter(|request| request.path.ends_with("/callback"))
+        .collect();
+    assert_eq!(
+        callbacks.len(),
+        1,
+        "RSVP must not compete with voice's callback"
+    );
+    let callback: Value = serde_json::from_slice(&callbacks[0].body).unwrap();
+    assert_eq!(callback["type"], 5, "the voice responder owns the defer");
+    let edit = requests
+        .iter()
+        .find(|request| request.method == "PATCH")
+        .unwrap();
+    let edit: Value = serde_json::from_slice(&edit.body).unwrap();
+    assert!(edit["content"]
+        .as_str()
+        .unwrap()
+        .to_lowercase()
+        .contains("pong"));
+    rest.shutdown().await;
+    db.close().await;
+}
+
 async fn cold_voice_gateway(release_ready: Arc<Notify>) -> MockGateway {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
