@@ -1709,11 +1709,23 @@ async fn voice_owned_command_yields_before_per_member_admission() {
     )
     .await;
 
-    let voice = interaction_event(from_member(
-        slash("ping", Some(CHANNEL), Vec::new()),
-        42,
-        Permissions::empty(),
-    ));
+    let mut published = two_bot_discord::publish_commands(&[two_bot_core::CommandDefinition::new(
+        "ping",
+        "Synthetic voice ping.",
+    )]);
+    published[0].id = Some(Id::new(9001));
+    runtime
+        .executor()
+        .command_identities()
+        .replace_guild(1111, GUILD, &published)
+        .unwrap();
+    let mut invocation = slash("help", Some(CHANNEL), Vec::new());
+    let Some(InteractionData::ApplicationCommand(command)) = invocation.data.as_mut() else {
+        unreachable!();
+    };
+    command.id = Id::new(9001);
+    command.guild_id = Some(Id::new(GUILD));
+    let voice = interaction_event(from_member(invocation, 42, Permissions::empty()));
     assert!(runtime.dispatch(&voice), "the voice sink owns /ping");
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
@@ -4631,6 +4643,72 @@ async fn refused_kick_hands_the_interaction_to_the_voice_delegate() {
 // Voice declines (the invoker is not in the target's room, the target left
 // between reads, or voice is off): the router refusal is the single reply.
 // The same holds with no delegate wired at all.
+#[tokio::test]
+async fn registered_kick_with_a_mismatched_name_keeps_moderation_first_dispatch() {
+    for payload_name in ["ping", "rsvp"] {
+        for moderator in [true, false] {
+            let (mock, origin) = MockRest::start(Vec::new()).await;
+            let mut gates = kick_gates(true);
+            gates.voice = true;
+            let runtime = runtime_without_db(gates, false, origin);
+            let mut registered =
+                two_bot_discord::publish_commands(&[two_bot_core::CommandDefinition::new(
+                    "kick",
+                    "Synthetic kick command.",
+                )]);
+            registered[0].id = Some(Id::new(9001));
+            runtime
+                .executor()
+                .command_identities()
+                .replace_guild(1111, GUILD, &registered)
+                .unwrap();
+            let calls = wire_kick_vote(&runtime, true);
+            let permissions = if moderator {
+                Permissions::all()
+            } else {
+                Permissions::empty()
+            };
+            let mut interaction = kick_as(permissions, GUILD);
+            let Some(InteractionData::ApplicationCommand(command)) = interaction.data.as_mut()
+            else {
+                unreachable!("slash fixture");
+            };
+            command.id = Id::new(9001);
+            command.guild_id = Some(Id::new(GUILD));
+            command.name = payload_name.into();
+            runtime.dispatch_remaining(&Event::InteractionCreate(Box::new(InteractionCreate(
+                interaction,
+            ))));
+            wait_for(
+                || {
+                    if moderator {
+                        !mock.requests().is_empty()
+                    } else {
+                        calls.load(Ordering::Relaxed) == 1
+                    }
+                },
+                "identity-resolved kick dispatch",
+            )
+            .await;
+            let _dispatch_guard = runtime.dispatch_guard();
+            if moderator {
+                assert_eq!(calls.load(Ordering::Relaxed), 0, "moderation owns kick");
+                assert_eq!(
+                    sole_ephemeral_reply(&mock, payload_name).await,
+                    "This command is not available in this build yet."
+                );
+            } else {
+                assert_eq!(calls.load(Ordering::Relaxed), 1, "voice vote asked once");
+                assert!(
+                    mock.requests().is_empty(),
+                    "the router sends no competing callback"
+                );
+            }
+            mock.shutdown().await;
+        }
+    }
+}
+
 #[tokio::test]
 async fn declined_kick_gets_the_router_refusal_exactly_once() {
     let cases = [

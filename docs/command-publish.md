@@ -136,6 +136,20 @@ fetch-and-compare approach needs no DB publication-hash table, works across
 process restarts, and detects out-of-band edits instead of trusting a stale
 cached success. Boot logs only the desired hash and whether it applied a write.
 
+The gateway keeps command identity separately from the drift hash. Successful
+bulk PUT receipts replace the application/guild snapshot, including custom-command
+republishes; a matching GET that skips PUT also hydrates it. Failed publication
+keeps the last successful snapshot. Voice admission and parsing, the shared
+router and ordered RSVP preparation share this map: a known slash command ID
+selects its registered name, not the payload's name. Canonical names reach
+existing ownership and permission checks, preventing competing callbacks while
+keeping moderation-first `/kick` and its vote delegate intact.
+Unknown or removed IDs cannot claim known voice names. Name fallback is limited
+to a registration scope not yet read, or a registration with no ID metadata.
+Guild/global scope and command type remain distinct; guild publication does not
+hydrate global registrations. Components still use their own custom IDs, and
+`/kick` remains owned by the shared router's moderation-first dispatch.
+
 Canonicalization ignores server IDs/versions, guild-irrelevant global settings,
 command-list order, object-key order, and null/empty/default-false optional
 fields. It preserves descriptions, localizations, permission bitfields, command
