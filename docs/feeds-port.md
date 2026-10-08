@@ -55,12 +55,12 @@ Read-only specification: TogetherWeOwn/two-bot `src/announcements/service.ts`,
   the shared REST sanitizer would rewrite (raw or obfuscated mass mentions) are
   filtered during XML parsing rather than changing `@` to `%40`, which could alter
   their destination. The match is a prefix match, so profile handles that begin
-  with `here` or `everyone` (for example `/@heresy/`) are filtered too. The
-  managed poller logs `feed items skipped: item URL contains @everyone or @here
-  text` with the relay id and the count on every pass that skips any; a relay
-  that polls cleanly but never posts should be checked for that line. Other `@`
-  data remains unchanged. URL budgets apply to the canonical URL. Posts require
-  empty allowed_mentions and enforce_nonce.
+  with `here` or `everyone` (for example `/@heresy/`) are filtered too. On every
+  pass that skips any, the managed poller logs the relay id and the count under
+  the message `feed items skipped: item URL contains @everyone or @here text`;
+  check for it when a relay polls cleanly but never posts. Other `@` data remains
+  unchanged. URL budgets apply to the canonical URL. Posts require empty
+  allowed_mentions and enforce_nonce.
 - Migration `0180_feeds.sql` preserves `feed_relays` and `feed_deliveries` column
   names/types, uniqueness/cascade, and legacy claim columns. It coexists with
   `0160_rsvp`'s shared `announcements_audit_log`. Adapter writes create/remove,
