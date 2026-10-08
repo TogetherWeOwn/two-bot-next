@@ -106,6 +106,7 @@ fn sources_reject_credentials_and_canonicalized_private_literals() {
         "http://example.org/",
         "file:///etc/passwd",
         "https://user:pass@example.org/",
+        "https://example.org:8443/",
         "https://localhost/",
         "https://LOCALHOST./",
         "https://127.1/",
@@ -117,6 +118,7 @@ fn sources_reject_credentials_and_canonicalized_private_literals() {
     ] {
         assert!(validate_source(source).is_err(), "accepted {source}");
     }
+    assert!(validate_source("https://example.org:443/feed").is_ok());
     assert_eq!(
         normalize_source(FeedKind::Youtube, "UCabcdefghijklmnopqrstuv").unwrap(),
         "https://www.youtube.com/feeds/videos.xml?channel_id=UCabcdefghijklmnopqrstuv"
@@ -137,14 +139,14 @@ fn dns_results_are_all_or_nothing_and_socket_targets_are_pinned() {
     // A new DNS lookup at a redirect/request boundary refuses a rebound host.
     assert!(PublicRequest::prepare(url, &[ip("127.0.0.1")]).is_err());
     assert_eq!(plan.addresses()[0].ip(), ip("8.8.8.8"));
-    let literal = validate_source("https://8.8.8.8:8443/feed").unwrap();
+    let literal = validate_source("https://8.8.8.8/feed").unwrap();
     assert!(PublicRequest::prepare(literal.clone(), &[ip("1.1.1.1")]).is_err());
     assert_eq!(
         PublicRequest::prepare(literal, &[ip("8.8.8.8")])
             .unwrap()
             .addresses()[0]
             .port(),
-        8443
+        443
     );
 }
 
@@ -824,6 +826,52 @@ fn rejects_xml_entities_malformed_size_and_item_explosion() {
 }
 
 #[test]
+fn feed_posts_escape_untrusted_titles_and_wrap_item_urls() {
+    let feed = relay(FeedKind::Rss);
+    let feed_item = FeedItem {
+        title: "x** [Claim](https://evil.example) **y\r\n@everyone".into(),
+        url: "https://example.org/post?x=1&y=2".into(),
+        ..item("rss-1")
+    };
+    let content = plan_post(&feed, &feed_item).unwrap().content;
+
+    assert!(!content.contains("]("));
+    assert!(content.contains(r"\[Claim\]\(https\://evil\.example\)"));
+    assert_eq!(content.lines().count(), 2);
+    assert!(content.ends_with("<https://example.org/post?x=1&y=2>"));
+
+    let long_title = FeedItem {
+        title: "*".repeat(1200),
+        url: "https://example.org/post?x=1&y=2".into(),
+        ..item("rss-long")
+    };
+    let long_content = plan_post(&feed, &long_title).unwrap().content;
+    assert!(long_content.encode_utf16().count() <= 2000);
+    assert!(long_content.contains("…**\n<https://example.org/post?x=1&y=2>"));
+    assert!(long_content.ends_with("<https://example.org/post?x=1&y=2>"));
+
+    let long_url = FeedItem {
+        url: format!("https://example.org/{}", "a".repeat(2000)),
+        ..item("rss-long-url")
+    };
+    assert!(matches!(
+        plan_post(&feed, &long_url),
+        Err(FeedError::InvalidItemUrl)
+    ));
+
+    assert!(matches!(
+        plan_post(
+            &feed,
+            &FeedItem {
+                url: "https://user@example.org/post".into(),
+                ..feed_item
+            }
+        ),
+        Err(FeedError::InvalidItemUrl)
+    ));
+}
+
+#[test]
 fn stable_keys_nonces_budget_and_mentions_survive_restart() {
     let feed = relay(FeedKind::Rss);
     let post = plan_post(&feed, &item("rss-1")).unwrap();
@@ -912,4 +960,58 @@ fn commands_require_enabled_configured_guild_and_manage_guild() {
         feed_list_text(&[feed]),
         "`feed-1` rss → <#channel-1> https://example.org/feed.xml"
     );
+}
+
+#[test]
+fn feed_list_truncates_each_source_before_combining_rows() {
+    let first = FeedRelay {
+        source: format!("https://example.org/{}", "a".repeat(5000)),
+        ..relay(FeedKind::Rss)
+    };
+    let second = FeedRelay {
+        id: "second".into(),
+        source: "https://example.org/second".into(),
+        ..relay(FeedKind::Rss)
+    };
+    let text = feed_list_text(&[first, second]);
+
+    assert!(text.contains("…\n`second`"));
+    assert!(text.encode_utf16().count() <= 2000);
+}
+
+#[test]
+fn feed_add_rejects_long_sources_and_nonstandard_ports() {
+    let context = FeedCommandContext {
+        enabled: true,
+        configured_guild_id: "guild-1",
+        guild_id: "guild-1",
+        channel_id: "channel-1",
+        actor_id: "actor",
+        can_manage_guild: true,
+        now_ms: 1234,
+    };
+    let expanded_source = format!("https://example.org/{}", "é".repeat(400));
+    assert!(expanded_source.len() < MAX_FEED_SOURCE_BYTES);
+    let sources = [
+        format!("https://example.org/{}", "a".repeat(MAX_FEED_SOURCE_BYTES)),
+        "https://example.org:8443/feed".into(),
+        expanded_source,
+    ];
+
+    for source in sources {
+        assert!(
+            matches!(
+                plan_command(
+                    &context,
+                    FeedCommand::Add {
+                        id: "feed-1".into(),
+                        kind: FeedKind::Rss,
+                        source: source.clone(),
+                    }
+                ),
+                Err(FeedError::Fetch(FetchError::InvalidSource))
+            ),
+            "accepted {source}"
+        );
+    }
 }

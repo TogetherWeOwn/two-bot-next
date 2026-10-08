@@ -1,7 +1,7 @@
 //! Framework-free feed commands, parsing and polling decisions.
 //! Side effects belong to the shared router/REST executor, not this module.
 
-use crate::feeds_http::{validate_source, FetchError, MAX_FEED_BYTES};
+use crate::feeds_http::{validate_source, FetchError, MAX_FEED_BYTES, MAX_FEED_SOURCE_BYTES};
 use roxmltree::{Document, Node, ParsingOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -57,6 +57,8 @@ pub enum FeedError {
     TooManyItems,
     #[error("Feed item has no stable key.")]
     MissingKey,
+    #[error("Feed item URL is invalid or too long to post.")]
+    InvalidItemUrl,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +165,9 @@ fn validate_id(id: &str) -> Result<(), FeedError> {
 }
 
 pub fn normalize_source(kind: FeedKind, source: &str) -> Result<String, FeedError> {
+    if source.len() > MAX_FEED_SOURCE_BYTES {
+        return Err(FetchError::InvalidSource.into());
+    }
     let source = source.trim();
     if kind == FeedKind::Youtube
         && (20..=32).contains(&source.len())
@@ -177,6 +182,20 @@ pub fn normalize_source(kind: FeedKind, source: &str) -> Result<String, FeedErro
     Ok(validate_source(source)?.to_string())
 }
 
+const MAX_FEED_LIST_SOURCE_UNITS: usize = 128;
+
+fn truncate_feed_list_source(source: &str) -> String {
+    let truncated = truncate_utf16(source, MAX_FEED_LIST_SOURCE_UNITS);
+    if truncated == source {
+        truncated
+    } else {
+        format!(
+            "{}…",
+            truncate_utf16(&truncated, MAX_FEED_LIST_SOURCE_UNITS - 1)
+        )
+    }
+}
+
 pub fn feed_list_text(feeds: &[FeedRelay]) -> String {
     if feeds.is_empty() {
         return "No feed relays configured.".into();
@@ -185,12 +204,12 @@ pub fn feed_list_text(feeds: &[FeedRelay]) -> String {
         &feeds
             .iter()
             .map(|feed| {
+                let source = truncate_feed_list_source(&feed.source);
                 format!(
-                    "`{}` {} → <#{}> {}",
+                    "`{}` {} → <#{}> {source}",
                     feed.id,
                     feed.kind.as_str(),
-                    feed.channel_id,
-                    feed.source
+                    feed.channel_id
                 )
             })
             .collect::<Vec<_>>()
@@ -891,13 +910,17 @@ fn scan_attributes(tag: &str, visit: &mut dyn FnMut(&str, Option<&str>) -> bool)
     true
 }
 
-fn is_item_url(value: &str) -> bool {
-    url::Url::parse(value).is_ok_and(|url| {
+fn parse_item_url(value: &str) -> Option<url::Url> {
+    url::Url::parse(value).ok().filter(|url| {
         matches!(url.scheme(), "http" | "https")
             && url.host().is_some()
             && url.username().is_empty()
             && url.password().is_none()
     })
+}
+
+fn is_item_url(value: &str) -> bool {
+    parse_item_url(value).is_some()
 }
 
 pub fn item_key(item: &FeedItem) -> Result<String, FeedError> {
@@ -929,25 +952,71 @@ pub struct FeedPost {
 
 pub fn plan_post(feed: &FeedRelay, item: &FeedItem) -> Result<FeedPost, FeedError> {
     let key = item_key(item)?;
+    let item_url = parse_item_url(&item.url)
+        .ok_or(FeedError::InvalidItemUrl)?
+        .to_string();
     let prefix = match feed.kind {
         FeedKind::Youtube => "New YouTube upload",
         FeedKind::Twitch => "Twitch update",
         FeedKind::Rss => "New feed item",
     };
-    let title = if item.title.trim().is_empty() {
+    let raw_title = item.title.trim();
+    let raw_title = if raw_title.is_empty() {
         "Untitled"
     } else {
-        item.title.trim()
+        raw_title
     };
+    let fixed_units = format!("{prefix}: ****\n<{item_url}>")
+        .encode_utf16()
+        .count();
+    if fixed_units >= 2000 {
+        return Err(FeedError::InvalidItemUrl);
+    }
+    let title = truncate_escaped_markdown(raw_title, 2000 - fixed_units);
     Ok(FeedPost {
         feed_id: feed.id.clone(),
         channel_id: feed.channel_id.clone(),
         nonce: delivery_nonce(&feed.id, &key),
         item_key: key,
-        content: truncate_utf16(&format!("{prefix}: **{title}**\n{}", item.url), 2000),
+        content: truncate_utf16(&format!("{prefix}: **{title}**\n<{item_url}>"), 2000),
         suppress_mentions: true,
         enforce_nonce: true,
     })
+}
+
+/// Escape punctuation and flatten line breaks in feed-controlled text before
+/// inserting it into Discord's Markdown message content.
+fn escape_markdown(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\r' | '\n') {
+            escaped.push(' ');
+        } else {
+            if ch.is_ascii_punctuation() {
+                escaped.push('\\');
+            }
+            escaped.push(ch);
+        }
+    }
+    escaped
+}
+
+fn truncate_escaped_markdown(value: &str, limit: usize) -> String {
+    let escaped = escape_markdown(value);
+    if escaped.encode_utf16().count() <= limit {
+        return escaped;
+    }
+    if limit == 0 {
+        return String::new();
+    }
+
+    let mut truncated = truncate_utf16(&escaped, limit - 1);
+    let trailing_backslashes = truncated.chars().rev().take_while(|ch| *ch == '\\').count();
+    if trailing_backslashes % 2 == 1 {
+        truncated.pop();
+    }
+    truncated.push('…');
+    truncated
 }
 
 fn truncate_utf16(value: &str, limit: usize) -> String {
