@@ -56,9 +56,7 @@ use sqlx::{Pool, Postgres};
 use tracing::warn;
 use twilight_gateway::Event;
 use twilight_model::{
-    application::interaction::{
-        application_command::CommandOptionValue, Interaction, InteractionData,
-    },
+    application::interaction::{application_command::CommandOptionValue, Interaction},
     channel::message::{Message, MessageFlags},
     gateway::GatewayReaction,
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
@@ -603,17 +601,16 @@ impl CommandRuntime {
                 self.dispatch_ticket_connection(event);
                 return;
             }
-            Event::InteractionCreate(interaction) => {
+            Event::InteractionCreate(interaction)
                 if self
                     .executor
                     .command_identities()
                     .slash_name(&interaction.0)
                     .is_some_and(|name| {
                         matches!(name.as_str(), "rsvp" | "rsvp-attendance" | "attendance")
-                    })
-                {
-                    return;
-                }
+                    }) =>
+            {
+                return;
             }
             _ => {}
         }
