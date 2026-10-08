@@ -128,7 +128,13 @@ Before DB lookup, the adapter checks the configured guild, human/non-webhook
 author, both feature gates, acceptance, and a non-builtin first token. Leading
 whitespace does not trigger; arguments are ignored. Enabled guild-scoped rows
 render real user, username, server and channel context through the shared executor
-with mention suppression.
+with mention suppression. A process-local five-second guild+actor window admits
+non-builtin prefix candidates before that lookup, including unknown triggers;
+ordinary chat and builtin tokens do not consume it. Clones share the bounded
+map. Refused candidates produce no SQL, send or audit, and redelivery of the
+admitted message still reaches the permanent replay claim. See
+[automation actor admission](automation-admission.md) for expiry, capacity and
+the explicit restart contract.
 
 A committed, immutable `command.text_attempt` audit row reserves the source message
 ID before any POST. `ON CONFLICT (id) DO NOTHING` excludes concurrent/replayed

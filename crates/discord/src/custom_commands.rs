@@ -31,6 +31,7 @@ use two_bot_core::{
 };
 
 use crate::{
+    automation_admission::ActorCooldowns,
     interactions::{publish_commands, refusal_response, route_interaction, RoutedInteraction},
     ActionExecutor,
 };
@@ -55,6 +56,8 @@ pub enum CustomCommandError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextCommandOutcome {
     Ignored,
+    /// A distinct candidate from this actor is within the local window.
+    CoolingDown,
     /// A prior invocation may have sent a reply. Never resend automatically.
     AlreadyAttempted,
     Delivered,
@@ -80,6 +83,7 @@ pub struct CustomCommandRuntime {
     // All clones serialize mutation + read + publish, not just the HTTP PUT.
     // Otherwise an older full-set snapshot can overwrite a newer addition.
     registry: Arc<Mutex<()>>,
+    text_cooldowns: Arc<Mutex<ActorCooldowns>>,
     /// Exact merged set from the last confirmed full-registry PUT. Clones share
     /// this snapshot; committed DB changes alone must not advance discovery.
     published_commands: Arc<RwLock<PublishedCommands>>,
@@ -103,6 +107,7 @@ impl CustomCommandRuntime {
             executor,
             application_id,
             registry: Arc::new(Mutex::new(())),
+            text_cooldowns: Arc::new(Mutex::new(ActorCooldowns::default())),
             published_commands: Arc::new(RwLock::new(None)),
         }
     }
@@ -313,7 +318,18 @@ impl CustomCommandRuntime {
         ) else {
             return Ok(TextCommandOutcome::Ignored);
         };
-        let guild = message.guild_id.expect("fenced guild").to_string();
+        let guild_id = message.guild_id.expect("fenced guild").get();
+        // Bound even unknown prefix candidates before their SQL lookup. Clones
+        // share the window; the permanent attempt claim below is unchanged.
+        if !self.text_cooldowns.lock().await.admit(
+            guild_id,
+            message.author.id.get(),
+            message.id.get(),
+            tokio::time::Instant::now(),
+        ) {
+            return Ok(TextCommandOutcome::CoolingDown);
+        }
+        let guild = guild_id.to_string();
         let Some(row) = store::find_text_trigger(&self.pool, &guild, &trigger)
             .await
             .map_err(|_| CustomCommandError::Storage)?

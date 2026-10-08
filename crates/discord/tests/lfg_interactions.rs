@@ -186,6 +186,12 @@ impl TestDb {
     }
 }
 
+async fn expire_actor_window() {
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    tokio::time::resume();
+}
+
 fn body(request: &common::RestRequest) -> Value {
     serde_json::from_slice(&request.body).expect("JSON body")
 }
@@ -231,6 +237,7 @@ async fn router_runs_create_signup_full_switch_leave_close_with_audit() {
     let joined_at = store::list_lfg_signups(&db.pool, post).await.unwrap()[0]
         .joined_at
         .clone();
+    expire_actor_window().await;
     rt.handle(&select(7003, post, 3333, "tank")).await.unwrap();
     assert_eq!(
         store::list_lfg_signups(&db.pool, post).await.unwrap()[0].joined_at,
@@ -238,9 +245,11 @@ async fn router_runs_create_signup_full_switch_leave_close_with_audit() {
     );
     rt.handle(&select(7004, post, 3334, "tank")).await.unwrap();
     assert_eq!(last_reply(&mock), "LFG full.");
+    expire_actor_window().await;
     rt.handle(&select(7005, post, 3333, "dps")).await.unwrap();
     assert_eq!(last_reply(&mock), "LFG moved.");
     rt.handle(&select(7006, post, 3334, "tank")).await.unwrap();
+    expire_actor_window().await;
     rt.handle(&select(7007, post, 3334, "dps")).await.unwrap();
     assert_eq!(last_reply(&mock), "LFG full.");
     assert_eq!(
