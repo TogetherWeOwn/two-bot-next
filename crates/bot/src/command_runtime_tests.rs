@@ -2513,7 +2513,7 @@ async fn feed_add_with_non_https_source_replies_ssrf_guard_error() {
         .await;
     assert_eq!(
         mock.deferred_reply()["content"],
-        "Feed source must be an HTTPS URL without embedded credentials."
+        "Feed source must be an HTTPS URL on port 443, without credentials, and at most 2048 bytes."
     );
     mock.shutdown().await;
 }
