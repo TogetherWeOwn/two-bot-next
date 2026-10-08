@@ -3876,6 +3876,67 @@ async fn sticky_set_rejection_audits_rejected_and_still_replies() {
     db.close().await;
 }
 
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn automation_quota_refusals_reply_with_a_remedy_and_write_no_rows_or_audits() {
+    use two_bot_core::automation_quota::AutomationQuota;
+
+    let db = TestDb::new().await;
+    for n in 0..25 {
+        db.seed_schedule(GUILD_S, &format!("schedule-{n}")).await;
+        db.seed_feed(GUILD_S, &format!("feed-{n}"), "rss").await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+    runtime
+        .on_interaction(&slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("hello".to_owned())),
+                option("in-minutes", CommandOptionValue::Integer(30)),
+            ],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        AutomationQuota::Schedules.to_string()
+    );
+    assert!(!mock
+        .requests()
+        .iter()
+        .any(|request| request.path.starts_with("/api/v10/channels/")));
+    mock.shutdown().await;
+
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+    runtime
+        .on_interaction(&slash(
+            "feed-add",
+            Some(CHANNEL),
+            vec![
+                option("kind", CommandOptionValue::String("rss".to_owned())),
+                option(
+                    "source",
+                    CommandOptionValue::String("https://example.com/new.xml".to_owned()),
+                ),
+            ],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        AutomationQuota::Feeds.to_string()
+    );
+    assert_eq!(db.schedule_rows().await.len(), 25);
+    assert_eq!(db.feed_rows().await.len(), 25);
+    assert!(db.schedule_audits().await.is_empty());
+    assert!(db.feed_audits().await.is_empty());
+    assert!(!mock
+        .requests()
+        .iter()
+        .any(|request| request.path.starts_with("/api/v10/channels/")));
+    mock.shutdown().await;
+    db.close().await;
+}
+
 // --- feed slice: guild-scoped CRUD + announcements_audit_log ---------------
 
 #[tokio::test]

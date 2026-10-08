@@ -315,6 +315,58 @@ async fn router_runs_create_signup_full_switch_leave_close_with_audit() {
 
 #[tokio::test]
 #[ignore = "needs agent-testdb or the CI service container"]
+async fn router_refuses_lfg_capacity_before_posting_and_names_the_close_command() {
+    let db = TestDb::new().await;
+    for n in 0..20 {
+        let post = lfg::LfgPost {
+            id: format!("quota-{n}"),
+            guild_id: GUILD.into(),
+            channel_id: CHANNEL.into(),
+            message_id: None,
+            title: "Stored title".into(),
+            starts_at: "2099-09-11T20:00:00Z".into(),
+            status: lfg::LfgStatus::Open,
+            created_by: "3333".into(),
+            created_at: "2026-09-30T00:00:00.000Z".into(),
+            closed_at: None,
+        };
+        store::put_lfg(&db.pool, &post, &[], true).await.unwrap();
+    }
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204)],
+        ScriptedResponse::json(200, json!({"id": "5900"})),
+    )
+    .await;
+    let rt = runtime(db.pool.clone(), &mock, true);
+    rt.handle(&create(7199, PERM_MANAGE_EVENTS)).await.unwrap();
+    assert_eq!(
+        last_reply(&mock),
+        two_bot_core::automation_quota::AutomationQuota::OpenLfgPosts.to_string()
+    );
+    assert!(store::get_lfg(&db.pool, GUILD, "lfg-7199")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store::list_lfg_roles(&db.pool, "lfg-7199")
+        .await
+        .unwrap()
+        .is_empty());
+    let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM announcements_audit_log")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(audits, 0);
+    assert!(!mock
+        .requests()
+        .iter()
+        .any(|request| request.path.starts_with("/api/v10/channels/")));
+    mock.shutdown().await;
+    drop(rt);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "needs agent-testdb or the CI service container"]
 async fn router_persists_post_and_roles_before_discord_accepts() {
     let db = TestDb::new().await;
     let (mock, acceptance) = MockRest::start_gated(
