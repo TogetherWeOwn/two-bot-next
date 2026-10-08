@@ -8264,6 +8264,45 @@ async fn export_attaches_versioned_file_ephemerally() {
 }
 
 #[tokio::test]
+async fn export_refuses_a_configuration_import_would_reject_for_size() {
+    let trace = Trace::default();
+    let mut config = full_config();
+    // Valid under every field bound, yet far above the import cap once exported.
+    config.lists = (0..config_codec::MAX_LISTS)
+        .map(|list| config_codec::RandomList {
+            name: format!("list-{list:03}"),
+            choices: vec![
+                "x".repeat(config_codec::MAX_LIST_TEXT_CHARS);
+                config_codec::MAX_LIST_CHOICES
+            ],
+        })
+        .collect();
+    let (runtime, _) = import_harness(trace.clone(), config, Vec::new());
+    let interaction = with_user(
+        voice_interaction(Some(command_data("export", Vec::new())), manager(), true),
+        UPLOADER,
+    );
+    let inventory = config_inventory();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    let response = response.expect("refusal");
+    let text = response_text(&response);
+    assert!(text.contains("Could not export"), "{text}");
+    assert!(text.contains(&MAX_IMPORT_BYTES.to_string()), "{text}");
+    assert!(text.contains("Nothing was sent"), "{text}");
+    assert_eq!(
+        response.data.as_ref().and_then(|data| data.flags),
+        Some(MessageFlags::EPHEMERAL)
+    );
+    assert!(response
+        .data
+        .as_ref()
+        .and_then(|data| data.attachments.as_ref())
+        .is_none());
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn export_and_import_refuse_without_guild_inventory() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());

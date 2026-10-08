@@ -194,6 +194,10 @@ pub enum VoiceConfigError {
     UnknownReference { field: String, kind: &'static str },
     #[error("cross-guild {kind} reference at {field}")]
     CrossGuildReference { field: String, kind: &'static str },
+    #[error(
+        "the configuration is {bytes} bytes as a file, over the {limit}-byte limit /import accepts, so it could not be imported back. Remove some random-list choices, then export again."
+    )]
+    ExportTooLarge { bytes: usize, limit: usize },
 }
 
 impl From<serde_json::Error> for VoiceConfigError {
@@ -235,12 +239,22 @@ pub fn decode_configuration(json: &[u8]) -> Result<VoiceConfiguration, VoiceConf
 
 /// Export uses the same validation contract as import and retains list order,
 /// strings and optional values. It does not include runtime room/owner state.
+/// The contract includes the size cap: the field bounds alone admit more than
+/// [`MAX_IMPORT_BYTES`], so a file that `decode_configuration` would refuse is
+/// refused here as [`VoiceConfigError::ExportTooLarge`] instead of being sent.
 pub fn export_configuration(
     config: &VoiceConfiguration,
     inventory: &GuildInventory,
 ) -> Result<Vec<u8>, VoiceConfigError> {
     validate_configuration(config, inventory)?;
-    Ok(serde_json::to_vec_pretty(config)?)
+    let bytes = serde_json::to_vec_pretty(config)?;
+    if bytes.len() > MAX_IMPORT_BYTES {
+        return Err(VoiceConfigError::ExportTooLarge {
+            bytes: bytes.len(),
+            limit: MAX_IMPORT_BYTES,
+        });
+    }
+    Ok(bytes)
 }
 
 pub fn validate_configuration(
