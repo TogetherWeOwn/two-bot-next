@@ -435,7 +435,7 @@ fn parse_xml_feed_with_url_limit(
             let key = decode_xml_entities(&raw_key);
             let url = decode_xml_entities(&raw_url);
             if key.is_empty() || !is_item_url(&url, max_url_utf16_units) {
-                if !key.is_empty() && has_mass_mention_url(&url) {
+                if has_mass_mention_url(&url) {
                     mention_urls_filtered.set(mention_urls_filtered.get() + 1);
                 }
                 return None;
