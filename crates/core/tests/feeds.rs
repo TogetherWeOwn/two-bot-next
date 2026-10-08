@@ -823,10 +823,90 @@ fn rejects_xml_entities_malformed_size_and_item_explosion() {
     assert!(matches!(parse_xml_feed(&xml), Err(FeedError::TooManyItems)));
     let xml = "<rss><channel><item><guid>1</guid><link>javascript:alert(1)</link></item><item><guid>2</guid><link>https://user:pass@example.org</link></item></channel></rss>";
     assert!(parse_xml_feed(xml).unwrap().is_empty());
+    let xml = format!(
+        "<rss><channel><item><guid>long</guid><link>https://example.org/{}</link></item></channel></rss>",
+        "a".repeat(2000)
+    );
+    assert!(parse_xml_feed(&xml).unwrap().is_empty());
 }
 
 #[test]
-fn feed_posts_escape_untrusted_titles_and_wrap_item_urls() {
+fn item_url_budget_matches_each_feed_kind() {
+    const URL_PREFIX: &str = "https://example.org/";
+    let url_with_units =
+        |units: usize| format!("{URL_PREFIX}{}", "a".repeat(units - URL_PREFIX.len()));
+
+    for (kind, prefix) in [
+        (FeedKind::Rss, "New feed item"),
+        (FeedKind::Youtube, "New YouTube upload"),
+        (FeedKind::Twitch, "Twitch update"),
+    ] {
+        let max_url_units = 2000 - format!("{prefix}: ****\n").encode_utf16().count() - 1;
+        let xml_for_url = |url: &str| {
+            match kind {
+            FeedKind::Youtube => format!(
+                "<feed><entry><id>key</id><title>x</title><link href=\"{url}\"/></entry></feed>"
+            ),
+            FeedKind::Rss | FeedKind::Twitch => format!(
+                "<rss><channel><item><guid>key</guid><title>x</title><link>{url}</link></item></channel></rss>"
+            ),
+        }
+        };
+
+        let accepted_url = url_with_units(max_url_units);
+        let parsed = parse_xml_feed_for_kind(&xml_for_url(&accepted_url), kind).unwrap();
+        assert_eq!(parsed.len(), 1, "kind: {kind:?}");
+        let post = plan_post(&relay(kind), &parsed[0]).unwrap();
+        assert_eq!(post.content.encode_utf16().count(), 2000, "kind: {kind:?}");
+
+        let over_budget_url = url_with_units(max_url_units + 1);
+        assert!(
+            parse_xml_feed_for_kind(&xml_for_url(&over_budget_url), kind)
+                .unwrap()
+                .is_empty()
+        );
+        let kind_agnostic = parse_xml_feed(&xml_for_url(&over_budget_url)).unwrap();
+        if kind == FeedKind::Youtube {
+            assert_eq!(
+                kind_agnostic.len(),
+                1,
+                "kind-agnostic parser uses the widest feed URL budget"
+            );
+        } else {
+            assert!(kind_agnostic.is_empty(), "kind-agnostic parser: {kind:?}");
+        }
+        let direct_item = FeedItem {
+            title: "x".into(),
+            url: over_budget_url,
+            ..item("over-budget")
+        };
+        assert!(matches!(
+            plan_post(&relay(kind), &direct_item),
+            Err(FeedError::InvalidItemUrl)
+        ));
+    }
+}
+
+#[test]
+fn message_safe_item_urls_preserve_unrelated_at_signs() {
+    let feed = relay(FeedKind::Rss);
+    let feed_item = FeedItem {
+        title: "Post".into(),
+        url: "https://example.org/@alice/post?next=@everyone&also=@here".into(),
+        ..item("mention-url")
+    };
+    let post = plan_post(&feed, &feed_item).unwrap();
+    let item_url = "https://example.org/@alice/post?next=%40everyone&also=%40here";
+
+    assert!(post.content.ends_with(item_url));
+    assert_eq!(
+        two_bot_core::message_safety::content(&post.content),
+        post.content
+    );
+}
+
+#[test]
+fn feed_posts_escape_untrusted_titles_and_preserve_item_url_previews() {
     let feed = relay(FeedKind::Rss);
     let feed_item = FeedItem {
         title: "x** [Claim](https://evil.example) **y\r\n@everyone".into(),
@@ -836,9 +916,10 @@ fn feed_posts_escape_untrusted_titles_and_wrap_item_urls() {
     let content = plan_post(&feed, &feed_item).unwrap().content;
 
     assert!(!content.contains("]("));
-    assert!(content.contains(r"\[Claim\]\(https\://evil\.example\)"));
+    assert!(content.contains(r"\[Claim\]\(https\:\/\/evil\.example\)"));
     assert_eq!(content.lines().count(), 2);
-    assert!(content.ends_with("<https://example.org/post?x=1&y=2>"));
+    assert!(content.ends_with("https://example.org/post?x=1&y=2"));
+    assert_eq!(two_bot_core::message_safety::content(&content), content);
 
     let long_title = FeedItem {
         title: "*".repeat(1200),
@@ -847,8 +928,30 @@ fn feed_posts_escape_untrusted_titles_and_wrap_item_urls() {
     };
     let long_content = plan_post(&feed, &long_title).unwrap().content;
     assert!(long_content.encode_utf16().count() <= 2000);
-    assert!(long_content.contains("…**\n<https://example.org/post?x=1&y=2>"));
-    assert!(long_content.ends_with("<https://example.org/post?x=1&y=2>"));
+    assert!(long_content.contains("…**\nhttps://example.org/post?x=1&y=2"));
+    assert!(long_content.ends_with("https://example.org/post?x=1&y=2"));
+    assert_eq!(
+        two_bot_core::message_safety::content(&long_content),
+        long_content
+    );
+
+    let url = format!(
+        "https://example.org/{}",
+        "a".repeat(1970 - "https://example.org/".len())
+    );
+    let near_limit_mention = FeedItem {
+        title: "@everyone".into(),
+        url: url.clone(),
+        ..item("rss-mention-boundary")
+    };
+    let near_limit_post = plan_post(&feed, &near_limit_mention).unwrap();
+    assert_eq!(near_limit_post.content.encode_utf16().count(), 2000);
+    assert!(near_limit_post.content.ends_with(&url));
+    assert!(near_limit_post.content.contains("…**\n"));
+    assert_eq!(
+        two_bot_core::message_safety::content(&near_limit_post.content),
+        near_limit_post.content
+    );
 
     let long_url = FeedItem {
         url: format!("https://example.org/{}", "a".repeat(2000)),
@@ -865,6 +968,36 @@ fn feed_posts_escape_untrusted_titles_and_wrap_item_urls() {
             &FeedItem {
                 url: "https://user@example.org/post".into(),
                 ..feed_item
+            }
+        ),
+        Err(FeedError::InvalidItemUrl)
+    ));
+}
+
+#[test]
+fn mention_expansion_in_item_urls_is_included_in_the_feed_kind_budget() {
+    let feed = relay(FeedKind::Rss);
+    let url_prefix = "https://example.org/";
+    let max_url_units = 2000 - "New feed item: ****\n".encode_utf16().count() - 1;
+    let mention = "@everyone";
+    let url = format!(
+        "{url_prefix}{}{mention}",
+        "a".repeat(max_url_units - url_prefix.len() - mention.len())
+    );
+    assert_eq!(url.encode_utf16().count(), max_url_units);
+
+    let xml = format!(
+        "<rss><channel><item><guid>key</guid><title>x</title><link>{url}</link></item></channel></rss>"
+    );
+    assert!(parse_xml_feed_for_kind(&xml, FeedKind::Rss)
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        plan_post(
+            &feed,
+            &FeedItem {
+                url,
+                ..item("over-budget-mention")
             }
         ),
         Err(FeedError::InvalidItemUrl)

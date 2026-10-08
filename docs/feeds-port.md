@@ -44,12 +44,18 @@ Read-only specification: TogetherWeOwn/two-bot `src/announcements/service.ts`,
   per pass. Apply the cap **after** checking claims; delivered rows must not
   consume the cap or hide the unseen tail. Deferred, never-sent claims release
   for the next pass. Replies/posts cap UTF-16 length at Discord's 2000 units;
-  an item URL too long to fit is skipped rather than posted partially. `/feed-list`
-  truncates each source to 128 units before its total message cap.
+  item URLs over their feed kind's message budget are filtered during XML parsing
+  rather than retried as poll failures. The kind-agnostic XML parser uses the
+  widest feed URL budget; the managed poller passes the feed kind explicitly.
+  `/feed-list` truncates each source to 128 units before its total message cap.
 - SHA-256 item-key fallback and 24-hex nonce are byte-compatible with legacy.
-  Feed titles escape ASCII punctuation and flatten CR/LF; item URLs are
-  canonicalized and wrapped in angle brackets. Posts require empty
-  allowed_mentions and enforce_nonce.
+  Feed titles neutralize mass mentions before escaping punctuation and flattening
+  CR/LF, so the shared REST sanitizer does not expand them past the message limit.
+  Canonical item URLs are posted bare to preserve Discord link previews; only a
+  mention-triggering `@` is percent-encoded when needed to prevent the shared REST
+  sanitizer from rewriting it. Other `@` characters remain unchanged. URL budgets
+  apply to the rendered safe URL. Posts require empty allowed_mentions and
+  enforce_nonce.
 - Migration `0180_feeds.sql` preserves `feed_relays` and `feed_deliveries` column
   names/types, uniqueness/cascade, and legacy claim columns. It coexists with
   `0160_rsvp`'s shared `announcements_audit_log`. Adapter writes create/remove,

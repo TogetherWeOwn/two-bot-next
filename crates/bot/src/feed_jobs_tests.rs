@@ -118,7 +118,7 @@ impl FeedFetch for FixtureHttp {
             let fetched = fetch_feed_with(&http, &http, &feed.source, &FetchOptions::default())
                 .await
                 .map_err(|_| ErrorClass::Feed)?;
-            parse_fetched(fetched)
+            parse_fetched(fetched, feed.kind)
         })
     }
 }

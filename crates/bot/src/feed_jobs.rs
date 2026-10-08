@@ -12,8 +12,8 @@ use sqlx::PgPool;
 use two_bot_core::{
     activation::LiveCapability,
     feeds::{
-        delivery_action, parse_xml_feed, poll_candidates, DeliveryAction, DeliveryClaim, FeedItem,
-        FeedPollSchedule, FeedPost, FeedRelay, MAX_FEED_POSTS_PER_POLL,
+        delivery_action, parse_xml_feed_for_kind, poll_candidates, DeliveryAction, DeliveryClaim,
+        FeedItem, FeedKind, FeedPollSchedule, FeedPost, FeedRelay, MAX_FEED_POSTS_PER_POLL,
     },
     feeds_connector::fetch_feed,
     feeds_store::{self as store, FeedAudit},
@@ -130,18 +130,19 @@ impl FeedFetch for PublicFeedFetch {
             let fetched = fetch_feed(&feed.source)
                 .await
                 .map_err(|_| ErrorClass::Feed)?;
-            parse_fetched(fetched)
+            parse_fetched(fetched, feed.kind)
         })
     }
 }
 
 fn parse_fetched(
     fetched: two_bot_core::feeds_connector::FetchedFeed,
+    kind: FeedKind,
 ) -> Result<Vec<FeedItem>, ErrorClass> {
     if !fetched.status.is_success() {
         return Err(ErrorClass::Feed);
     }
-    parse_xml_feed(&fetched.body).map_err(|_| ErrorClass::Feed)
+    parse_xml_feed_for_kind(&fetched.body, kind).map_err(|_| ErrorClass::Feed)
 }
 
 /// The existing supervisor owns spawning, timeout, cancellation and join. A
