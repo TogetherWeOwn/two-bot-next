@@ -954,13 +954,19 @@ async fn identity_only_budget_refusal_keeps_the_unsearched_row_first_next_pass()
     store::add_feed(db.pool(), &relay).await.unwrap();
     let unresolved = plan_post(&relay, &item(0)).unwrap();
     let confirmed = plan_post(&relay, &item(1)).unwrap();
-    for (index, post) in [&unresolved, &confirmed].into_iter().enumerate() {
+    // Keep the oldest-first recovery order explicit; equal millisecond claims
+    // fall back to item_key, which need not match source item order.
+    let now_ms = now_millis_for_test();
+    for (index, (post, age_ms)) in [(&unresolved, 180_000), (&confirmed, 120_000)]
+        .into_iter()
+        .enumerate()
+    {
         store::claim_delivery(
             db.pool(),
             GUILD,
             post,
             &format!("seed-{index}"),
-            now_millis_for_test() - 120_000,
+            now_ms - age_ms,
         )
         .await
         .unwrap();
