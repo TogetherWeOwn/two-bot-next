@@ -11,6 +11,12 @@ overwrites and is never an admin credential: owning a room does not authorize
 another room or guild-wide settings. Missing guild-role snapshots fail closed.
 See [Discord's member definition](https://docs.discord.com/developers/resources/guild#guild-member-object)
 and [base permission calculation](https://docs.discord.com/developers/topics/permissions#permission-hierarchy).
+An active communication timeout removes role-derived Manage Channels and Manage
+Server authority. Only existing View Channel and Read Message History permissions
+remain; the guild owner and guild-level Administrator are exempt, as required by
+[Discord's timeout rules](https://docs.discord.com/developers/topics/permissions#permissions-for-timed-out-members).
+An absent or expired timeout (including expiry equal to the current time) changes
+no authority. Timeout facts never replace missing guild/member/role evidence.
 Room state and per-guild settings
 are stored in Postgres (sqlx, bot migration range 0001–0999). Tests never touch
 production; DB tests run on agent-testdb.
