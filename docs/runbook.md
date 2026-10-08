@@ -430,6 +430,22 @@ unparseable or field-less file all refuse). `--plan` prints its own hash
 (`plan_manifest_sha256`) in the manifest and ignores the binding flags.
 A passing apply records `"plan_provenance_verified": true` in its manifest.
 
+`--plan` also fills an `audit` block (`null` for apply) from one explicit
+`READ ONLY` transaction on the same read-only login: the ledger owner
+(`ledger_owner`), `ledger_counts` (successful rows, max successful version,
+failed rows), one `memberships` entry per migrator login (`two_bot_migrator`,
+`two_bot_migrator_ro`, `two_bot_migrator_ro_plan`, `two_bot_migrator_apply`):
+an `exists` flag (so a missing login reads `false` instead of vanishing), the
+aggregated direct `member_of` list, and the transitive `member_of_migrator` /
+`member_of_ro` flags that mirror the plan login guard, plus
+`verify_findings`, the output of `sql/verify_database_roles.sql` rendered with
+`sql/database_role_matrix.sql` (empty means no drift). The files are the ones
+compiled from the dispatched `source_sha`, and their SHA-256 digests
+(`matrix_sha256`, `verify_sha256`) are echoed so a reviewer can compare them
+with another SHA. The block holds names, counts and findings only, sits
+outside `plan_manifest_sha256`, and a failed readout reports a fixed `error`
+string instead of failing the plan.
+
 It refuses (exit 2, before any DDL) when the binding is absent, the target does
 not equal the pinned staging host/database inputs, either pin is empty or looks
 like production, either host pin or the binding host is a pooler endpoint

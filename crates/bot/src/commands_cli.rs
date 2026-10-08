@@ -11,6 +11,8 @@ use two_bot_core::feature_commands::FeatureGates;
 use two_bot_core::moderation::ModerationGates;
 use two_bot_core::router::{InteractionRouter, RouterGates, SurfaceFlags};
 use two_bot_core::send_admission::{is_loopback_http, PgSendAdmission};
+use two_bot_core::voice_assistant::AssistantConfig;
+use two_bot_core::voice_rooms::VoiceGates;
 use two_bot_discord::{publish_commands, ActionExecutor};
 
 pub const USAGE: &str = "\
@@ -18,7 +20,8 @@ pub const USAGE: &str = "\
   two-bot commands publish [--apply] [--guild-id ID] [--application-id ID] [--allow-live-guild]
       Fetch and compare the guild command list against the compiled, feature-gated
       builtins. Both commands are read-only unless publish receives --apply.
-      Env: DISCORD_TOKEN, GUILD_ID, DISCORD_APPLICATION_ID; feature gates as on boot.
+      Env: DISCORD_TOKEN, GUILD_ID, DISCORD_APPLICATION_ID; feature gates as on boot
+      (TWO_VOICE=1 adds the voice set; TWO_ASSISTANT_ENDPOINT also adds /templateassistant).
       Live Discord targets additionally require TWO_DATABASE_URL (or DATABASE_URL
       when unset), the shared send-admission Postgres. No database is opened for
       loopback DISCORD_API_BASE fixtures, and no gateway is started.
@@ -113,6 +116,8 @@ fn desired_definitions(
         scorecard: vars
             .get("TWO_COMMUNITY_SCORECARD")
             .is_some_and(|v| v == "1"),
+        voice: VoiceGates::from_map(vars).enabled,
+        voice_assistant: AssistantConfig::from_map(vars).is_some(),
         ..SurfaceFlags::default()
     };
     InteractionRouter::new(RouterGates::from_slices(
@@ -370,6 +375,26 @@ mod tests {
             rendered.contains("Discord send admission storage unavailable"),
             "cause attached, got: {rendered}"
         );
+    }
+
+    #[test]
+    fn desired_registry_reads_voice_and_assistant_gates_without_io() {
+        for (voice, endpoint, assistant) in [
+            ("0", "https://example.invalid/assistant", false),
+            ("1", "", false),
+            ("1", "file:///assistant", false),
+            ("1", "https://example.invalid/assistant", true),
+        ] {
+            let mut env = vars();
+            env.insert("TWO_VOICE".into(), voice.into());
+            env.insert("TWO_ASSISTANT_ENDPOINT".into(), endpoint.into());
+            let definitions = desired_definitions(2222, &env).unwrap();
+            let names: Vec<_> = definitions.iter().map(|def| def.name.as_str()).collect();
+            for definition in two_bot_core::voice_rooms::voice_commands() {
+                assert_eq!(names.contains(&definition.name.as_str()), voice == "1");
+            }
+            assert_eq!(names.contains(&"templateassistant"), assistant);
+        }
     }
 
     #[test]

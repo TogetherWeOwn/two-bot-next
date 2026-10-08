@@ -10,7 +10,8 @@ The `e2e_matrix_coverage` integration test fails when a command ships without
 a matrix row and when this doc drops one.
 
 Scope: 28 built-in slash commands (core + scorecard + automation +
-announcement + moderation — the set `docs/commands.md` renders). No guild was
+announcement + moderation — the commands `docs/commands.md` renders ahead of
+the voice set; with the voice gates on it renders 50). No guild was
 touched, no staging secrets used, no credentials created.
 
 Staging env the live suite needs: `TWO_COMMUNITY_SCORECARD=1`,
@@ -68,9 +69,13 @@ UTF-16 units on every moderation row.
 ## Out of scope
 
 - Voice `/create /setup /ping /invite /textchannels /access /reclaim
-  /transfer /logging /export /import /kick` (separate `TWO_VOICE` slice; its
+  /transfer /logging /export /import /position /group /inheritpermissions
+  /defaultlimit /alwaysprivate /kick /name /private /public /limit /unlimit`
+  (separate `TWO_VOICE` slice; its
   `kick` loses the merge to moderation first-wins — runtime dispatch decides).
-- `/templateassistant` (voice + assistant gates).
+  The published voice set is pinned separately by the `voice` section of
+  `crates/core/tests/fixtures/staging_published_commands.json`.
+- `/templateassistant` (voice + assistant gates; same fixture section).
 - DB-backed custom commands and `!` prefix triggers (dynamic surfaces).
 - Component/modal surfaces (pickers, tickets, self-roles, LFG signup).
 - Dropped `/rota-acknowledge` (parity row 13, never published).

@@ -105,20 +105,82 @@ channel or substitute credentials.
    idempotency key (it embeds `guild:member`), member, guild, source and
    metadata are in no artifact, log or step summary: the repo is public. Each
    row is a committed receipt (`inserted: true`, `received_at =
-   recorded_at`) with an opaque ordinal key; QA reconciles by family and time,
-   as `reconcile()` already does after its exact-key-hint pass, and exact key
-   hints are not available on this route. The DB cannot show redeliveries, so
+   recorded_at`) with an opaque ordinal key; the reconciler supplies no
+   idempotency-key hint for these rows and matches the witnessed event kind
+   and time. The DB cannot show redeliveries, so
    `duplicate` stays a fixture-only disposition. A refusal (bad window, a
-   binding missing or aimed at another role, database or a production-like
-   host, the live guild) fails the job before any connection; a database error
+   binding missing or aimed at another role, database, or host instead of the
+   independently pinned staging endpoint, the live guild, or failed TLS
+   verification) fails the job before any rows are read; a database error
    prints one fixed phrase, never the client's message.
-3. **Reconcile.** Feed both lists to `EvidenceLedger` with the deployed
-   revision and attach `export()` to the soak card, stamped as
-   `evidence-soak_expected_committed-{window}.json` (see
-   `evidence_packet_filename` and the rule-id spelling in
-   [metrics.md](metrics.md)). `gaps > 0` or any
-   overflow flag fails that window. File a card; do not restart anything
-   only to fill a table.
+3. **Reconcile.** The workflow artifact is already sanitized; pass
+   it directly as `--rows` to `evidence_reconcile`. It contains `rows` and
+   `truncated` alongside its schema version, witnessed window and row count.
+   Do not perform a second database read or expose raw keys. Download the
+   `staging-events-read-<run_id>.json` artifact and set `EVENTS_READ_JSON` to
+   its path. QA supplies
+   `qa_expected.json` with the independently witnessed kind for each action,
+   not a kind inferred from the observed rows:
+
+   ```json
+   [
+     {"alias":"j1","family":"join","event_type":"member_join","at":"2026-10-09T20:00:00.000Z"},
+     {"alias":"m1","family":"message","event_type":"first_message","at":"2026-10-09T20:01:00.000Z"},
+     {"alias":"v1","family":"voice","event_type":"voice_session_start","at":"2026-10-09T20:02:00.000Z"},
+     {"alias":"v2","family":"voice","event_type":"voice_session_end","at":"2026-10-09T20:05:00.000Z"},
+     {"alias":"x1","family":"message","at":"2026-10-09T20:06:00.000Z","disposition":"excluded","reason":"bot_authored"}
+   ]
+   ```
+
+   `family` is `join` / `voice` / `message`; `event_type` must belong to that
+   family and is required unless the action is declared `excluded` or
+   `failed` with a reason code. Only that exact event kind can match within
+   60 s, even when a sibling-family event is closer. A missed join cannot
+   match `member_leave` or `gate_cleared`; voice boundaries and message
+   ladder rungs cannot substitute for one another. The kind is held only
+   in memory and is not exported in the packet.
+
+   Build and run with the deployed revision and witnessed window start:
+
+   ```sh
+   cargo build -p two-bot-core --example evidence_reconcile --locked
+   ./target/debug/examples/evidence_reconcile \
+     --expected qa_expected.json --rows "$EVENTS_READ_JSON" \
+     --revision "$DEPLOY_SHA" --window 2026-10-09T20-00-00Z
+   ```
+
+   On the persistent controller, build through the bounded wrapper and get
+   the actual executable path from Cargo's artifact message:
+
+   ```sh
+   set -o pipefail
+   BIN=$(python3 scripts/cargo_cache.py run -- build -p two-bot-core \
+     --example evidence_reconcile --message-format=json \
+     | jq -r 'select(.reason == "compiler-artifact" and .target.name == "evidence_reconcile" and .executable != null) | .executable')
+   test -n "$BIN" && "$BIN" \
+     --expected qa_expected.json --rows "$EVENTS_READ_JSON" \
+     --revision "$DEPLOY_SHA" --window 2026-10-09T20-00-00Z
+   ```
+
+   The wrapper does not take `run`; do not create a worktree-local target
+   ([build-cache.md](build-cache.md)). Artifact `executable` is documented
+   in [Cargo's JSON message contract](https://doc.rust-lang.org/cargo/reference/external-tools.html#json-messages).
+
+   Extra per-row fields are refused; object envelopes require both `rows`
+   and `truncated`. The runner assigns opaque per-row keys (`r<ordinal>`),
+   writes `export()` to `evidence-soak_expected_committed-{window}.json`
+   (see `evidence_packet_filename` and [metrics.md](metrics.md)), and prints
+   expected / matched / gaps counts. Exit 0 means clean reconciliation of
+   the witnessed actions, **not coverage of arbitrary gateway dispatches**.
+   Exit 1 means gaps, declared failures or overflow/truncation; attach the
+   packet and file a card, but do not restart anything only to fill a table.
+   Exit 2 means malformed input or an IO failure. No valid packet is produced
+   on exit 2. Both input files require complete UTC RFC3339 timestamps;
+   trailing text or extra fractional components are refused. Valid times are
+   canonicalized to the parsed instant's precision (at most nine fractional
+   digits) before matching, so longer valid fractions cannot become false
+   gaps. Parser diagnostics are fixed phrases that never quote rejected field
+   names, values, aliases or keys.
 
 Offline fixture runs (`cargo test -p two-bot-core --lib evidence`) prove the
 seam, not staging coverage. Only a packet from step 3 is live evidence.
@@ -137,21 +199,27 @@ Setup is an Operator step and creates nothing from the workflow itself:
    (`default_transaction_read_only = on`, `statement_timeout = '10s'`,
    connection limit 2) with column-level `SELECT (id, event_type, member_id,
    guild_id, recorded_at, idempotency_key)` on `public.events` and nothing else.
-2. Create the environment with a `main`-only deployment-branch policy and two
-   environment **secrets**: `TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL` (direct host,
-   `sslmode=require`; the script accepts only `sslmode`, `channel_binding` and
-   `connect_timeout` on the URL) and `STAGING_FIXTURE_MEMBER_ID` (digits, 15-22).
-   The member is a secret, not a variable, because a step's `env` block prints
-   variable values on the public run page and masks secrets.
+2. Create the environment with a `main`-only deployment-branch policy and three
+   environment **secrets**: `TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL` (direct
+   endpoint URL; port omitted or 5432),
+   `STAGING_EVENTS_READ_EXPECTED_HOST` (the independently
+   verified staging endpoint hostname), and `STAGING_FIXTURE_MEMBER_ID` (digits,
+   15-22). Verify the host from the staging provider's control plane; do not
+   derive the pin from the URL secret. The script requires an exact URL-host
+   match and forces libpq `sslmode=verify-full` against the runner's system CA
+   bundle, regardless of a weaker accepted `sslmode` parameter in the URL. The
+   member and host are secrets, not variables, because a step's `env` block
+   prints variable values on the public run page and masks secrets.
 
-The script checks the login before connecting (role `two_bot_events_ro`,
-database `two_bot`, not production-like) and again from the server
-(`current_user`, `current_database()`); every statement is a `READ ONLY`
-transaction with a 10 s timeout.
+The script refuses before connecting unless the login role is
+`two_bot_events_ro`, the database is `two_bot`, the URL host matches the
+independent staging-host pin, and its certificate validates for that hostname.
+After connecting it also checks `current_user` and `current_database()` from the
+server; every statement is a `READ ONLY` transaction with a 10 s timeout.
 
 Rollback: delete the workflow file. The Operator drops the role (`REVOKE` all,
 `DROP OWNED BY two_bot_events_ro; DROP ROLE two_bot_events_ro;`) and deletes the
-environment and its secrets. Nothing else changes.
+environment and its three secrets. Nothing else changes.
 
 ## Reconnect and RSS
 

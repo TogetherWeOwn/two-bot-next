@@ -334,8 +334,11 @@ impl CommandRuntime {
     /// boot-composed service shared with the recovery job; only its presence
     /// opens the self-role router surface. `member` is the boot-composed
     /// member-moderation consumer shared with the unban sweep; only its
-    /// presence opens the five member verbs.
+    /// presence opens the five member verbs. `voice_live` is whether the voice
+    /// sink actually built (not just `TWO_VOICE=1`): the voice commands publish
+    /// only while something is there to answer them.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn from_env(
         pool: Pool<Postgres>,
         token: &str,
@@ -344,6 +347,7 @@ impl CommandRuntime {
         onboarding: two_bot_core::OnboardingGates,
         member: Option<Arc<MemberRuntime>>,
         activation: &BootActivation,
+        voice_live: bool,
     ) -> Option<Arc<Self>> {
         let features = match FeatureGates::from_env() {
             Ok(features) => features,
@@ -378,6 +382,9 @@ impl CommandRuntime {
             &moderation,
             SurfaceFlags {
                 scorecard: std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|value| value == "1"),
+                voice: voice_live,
+                voice_assistant: two_bot_core::voice_assistant::AssistantConfig::from_env()
+                    .is_some(),
                 session_picker: onboarding.mode == two_bot_core::OnboardingMode::Session,
                 tickets: ticket_config.is_some(),
                 self_roles: self_roles.is_some(),
@@ -764,6 +771,8 @@ impl CommandRuntime {
             automations: false,
             announcements: false,
             moderation: false,
+            voice: false,
+            voice_assistant: false,
             self_roles: false,
             onboarding_picker: false,
             session_picker: false,
@@ -788,6 +797,22 @@ impl CommandRuntime {
 
     pub(crate) fn start_tickets(&self) -> Option<crate::ticket_runtime::TicketSupervisor> {
         self.tickets.as_ref().and_then(|tickets| tickets.start())
+    }
+
+    fn voice_owns_interaction(&self, interaction: &Interaction) -> bool {
+        let application_id = self.application_id.load(Ordering::Relaxed);
+        if application_id != 0 && interaction.application_id.get() != application_id {
+            return false;
+        }
+        if interaction.kind
+            != twilight_model::application::interaction::InteractionType::ApplicationCommand
+        {
+            return false;
+        }
+        let Some(InteractionData::ApplicationCommand(command)) = interaction.data.as_ref() else {
+            return false;
+        };
+        self.interactions.router.voice_owns_command(&command.name)
     }
 
     /// Admit before spawning, without waiting on SQL/REST in the shard loop.
@@ -815,6 +840,12 @@ impl CommandRuntime {
                 })
             }
             Event::InteractionCreate(interaction) => {
+                // The gateway also delivers these to the live voice sink. Yield
+                // before user-slot/lane admission so overload cannot answer a
+                // voice-owned command with the shared runtime's busy callback.
+                if self.voice_owns_interaction(&interaction.0) {
+                    return true;
+                }
                 let runtime = Arc::clone(self);
                 let interaction = interaction.0.clone();
                 let is_ticket = matches!(

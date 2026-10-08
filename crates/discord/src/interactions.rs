@@ -725,6 +725,7 @@ fn option_to_twilight(opt: &two_bot_core::commands::CommandOption) -> CommandOpt
         6 => CommandOptionType::User,
         7 => CommandOptionType::Channel,
         8 => CommandOptionType::Role,
+        11 => CommandOptionType::Attachment,
         _ => CommandOptionType::String,
     };
     CommandOption {
@@ -774,6 +775,30 @@ fn option_to_twilight(opt: &two_bot_core::commands::CommandOption) -> CommandOpt
 #[must_use]
 pub fn publish_commands(defs: &[CommandDefinition]) -> Vec<Command> {
     defs.iter().map(command_to_twilight).collect()
+}
+
+#[cfg(test)]
+mod command_publish_tests {
+    use super::*;
+
+    #[test]
+    fn voice_import_keeps_its_attachment_option_at_the_publish_boundary() {
+        let definitions = two_bot_core::voice_rooms::voice_commands();
+        let commands = publish_commands(&definitions);
+        let import = commands
+            .iter()
+            .find(|command| command.name == "import")
+            .unwrap();
+        let file = import
+            .options
+            .iter()
+            .find(|option| option.name == "file")
+            .unwrap();
+        assert_eq!(file.kind, CommandOptionType::Attachment);
+        let wire = serde_json::to_value(import).unwrap();
+        assert_eq!(wire["options"][0]["type"], 11);
+        assert_eq!(wire["options"][0]["required"], true);
+    }
 }
 
 #[cfg(test)]
