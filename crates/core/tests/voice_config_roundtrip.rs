@@ -302,7 +302,7 @@ fn wrong_versions_are_refused_on_import_and_export() {
     assert_eq!(import_configuration(&wire, &inventory).unwrap(), config);
 }
 
-// Replaces the lists with `choices` ASCII choices of full width, 100 per list,
+// Replaces the lists with `choices` ASCII choices of full length, 100 per list,
 // then shaves `shave` characters off the tail (every choice keeps one). The
 // result stays inside every field bound; only its exported size varies.
 fn padded(base: &VoiceConfiguration, choices: usize, shave: usize) -> VoiceConfiguration {
