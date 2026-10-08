@@ -8,7 +8,8 @@ pure core modules for validation: the V7b template lint and the V7a alias table.
 ## API and version 1
 
 - `export_configuration(&config, &inventory) -> Result<Vec<u8>, VoiceConfigError>`
-  validates and returns pretty-printed UTF-8 JSON.
+  validates and returns pretty-printed UTF-8 JSON. A file over `MAX_IMPORT_BYTES`
+  is refused with `ExportTooLarge`, so export never emits a file import rejects.
 - `import_configuration(bytes, &inventory) -> Result<VoiceConfiguration, VoiceConfigError>`
   parses and validates the entire document before returning any candidate.
 - `decode_configuration(bytes) -> Result<VoiceConfiguration, VoiceConfigError>` is
@@ -86,7 +87,9 @@ Further checks, each naming only the field (never the uploaded text):
   `voice_access::VOICE_COMMANDS`.
 Import accepts JSON only (YAML payloads fail as malformed) and refuses documents
 over `MAX_IMPORT_BYTES` (256 KiB) on the document before parsing, so an
-oversized upload can never partially apply.
+oversized upload can never partially apply. Export holds the same cap, because
+the field bounds alone (100 lists of 100 choices of 100 characters) admit about
+1 MB; the cap is inclusive on both sides.
 Empty templates are retained because V5 defines fallback for empty rendered
 names. Malformed JSON/type errors expose only line/column, not uploaded text.
 
