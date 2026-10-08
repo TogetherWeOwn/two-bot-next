@@ -14,8 +14,9 @@
 //!   validate/import leaves inputs untouched and a valid import still
 //!   succeeds afterwards);
 //! - versioned JSON: wrong versions refused on import and export; oversize
-//!   payloads refused at [`MAX_IMPORT_BYTES`] before parsing, and export
-//!   refuses any file that import would refuse for size.
+//!   payloads refused at [`MAX_IMPORT_BYTES`] before parsing; export prefers
+//!   pretty JSON, falls back to compact, and refuses only a file that even
+//!   compact JSON cannot fit under the cap.
 
 use std::collections::BTreeMap;
 
@@ -325,24 +326,24 @@ fn padded(base: &VoiceConfiguration, choices: usize, shave: usize) -> VoiceConfi
     config
 }
 
-fn exported_len(config: &VoiceConfiguration) -> usize {
-    serde_json::to_vec_pretty(config).unwrap().len()
+fn compact_len(config: &VoiceConfiguration) -> usize {
+    serde_json::to_vec(config).unwrap().len()
 }
 
-// A valid configuration whose exported file is exactly `target` bytes.
-fn exporting_exactly(base: &VoiceConfiguration, target: usize) -> VoiceConfiguration {
+// A valid configuration whose compact export is exactly `target` bytes.
+fn compact_exactly(base: &VoiceConfiguration, target: usize) -> VoiceConfiguration {
     let (mut low, mut high) = (1, MAX_LISTS * MAX_LIST_CHOICES);
     while low < high {
         let mid = (low + high) / 2;
-        if exported_len(&padded(base, mid, 0)) >= target {
+        if compact_len(&padded(base, mid, 0)) >= target {
             high = mid;
         } else {
             low = mid + 1;
         }
     }
-    let full = exported_len(&padded(base, low, 0));
+    let full = compact_len(&padded(base, low, 0));
     let config = padded(base, low, full - target);
-    assert_eq!(exported_len(&config), target);
+    assert_eq!(compact_len(&config), target);
     config
 }
 
@@ -365,7 +366,7 @@ fn export_refuses_a_valid_configuration_that_import_would_reject_for_size() {
     // far above the import cap.
     let config = padded(&base, MAX_LISTS * MAX_LIST_CHOICES, 0);
     validate_configuration(&config, &inventory).expect("within every field bound");
-    let size = exported_len(&config);
+    let size = compact_len(&config);
     assert!(
         size > MAX_IMPORT_BYTES,
         "bounds must admit an unimportable file"
@@ -385,19 +386,22 @@ fn export_refuses_a_valid_configuration_that_import_would_reject_for_size() {
     assert!(message.contains(&MAX_IMPORT_BYTES.to_string()), "{message}");
     assert!(message.contains("export again"), "{message}");
     // Refusing is the contract: the same bytes would not have imported.
-    assert_import_refuses_size(&serde_json::to_vec_pretty(&config).unwrap(), &inventory);
+    assert_import_refuses_size(&serde_json::to_vec(&config).unwrap(), &inventory);
 }
 
 #[test]
 fn export_at_exactly_the_import_cap_round_trips_and_one_byte_more_is_refused() {
     let (base, inventory) = fixture();
 
-    let at_cap = exporting_exactly(&base, MAX_IMPORT_BYTES);
+    // The pretty form is over the cap here, so this exercises the compact fallback.
+    let at_cap = compact_exactly(&base, MAX_IMPORT_BYTES);
+    assert!(serde_json::to_vec_pretty(&at_cap).unwrap().len() > MAX_IMPORT_BYTES);
     let wire = export_configuration(&at_cap, &inventory).expect("at the cap exports");
     assert_eq!(wire.len(), MAX_IMPORT_BYTES);
+    assert_eq!(wire, serde_json::to_vec(&at_cap).unwrap());
     assert_eq!(import_configuration(&wire, &inventory).unwrap(), at_cap);
 
-    let over = exporting_exactly(&base, MAX_IMPORT_BYTES + 1);
+    let over = compact_exactly(&base, MAX_IMPORT_BYTES + 1);
     let error = export_configuration(&over, &inventory).unwrap_err();
     assert!(
         matches!(
@@ -407,7 +411,15 @@ fn export_at_exactly_the_import_cap_round_trips_and_one_byte_more_is_refused() {
         ),
         "one byte over: got {error}"
     );
-    assert_import_refuses_size(&serde_json::to_vec_pretty(&over).unwrap(), &inventory);
+    assert_import_refuses_size(&serde_json::to_vec(&over).unwrap(), &inventory);
+}
+
+#[test]
+fn export_is_pretty_printed_whenever_the_pretty_file_fits() {
+    let (config, inventory) = fixture();
+    let pretty = serde_json::to_vec_pretty(&config).unwrap();
+    assert!(pretty.len() <= MAX_IMPORT_BYTES);
+    assert_eq!(export_configuration(&config, &inventory).unwrap(), pretty);
 }
 
 #[test]
