@@ -520,6 +520,33 @@ impl InteractionRuntime {
         let Some(actor) = interaction.author_id() else {
             return Ok(false);
         };
+        let request = match request {
+            Ok(request) => self
+                .lfg
+                .admit_signup(
+                    &request,
+                    &guild.to_string(),
+                    &actor.to_string(),
+                    interaction.id.get(),
+                )
+                .await
+                .map(|()| request),
+            Err(error) => Err(error),
+        };
+        if let Err(LfgError::CoolingDown) = &request {
+            // Refuse before defer, identity reads, SQL, or any channel effect.
+            self.executor
+                .answer_interaction_with_blocked_retry(
+                    interaction.id.get(),
+                    &interaction.token,
+                    &text_response(InteractionReply::new(
+                        LfgError::CoolingDown.to_string(),
+                        true,
+                    )),
+                )
+                .await?;
+            return Ok(true);
+        }
         let deferred = InteractionResponse {
             kind: InteractionResponseType::DeferredChannelMessageWithSource,
             data: Some(InteractionResponseData {
@@ -544,6 +571,13 @@ impl InteractionRuntime {
             .await?;
         let result = match request {
             Ok(request) => {
+                // Only create/nonce recovery needs the bot identity. Signup
+                // admission must not pay for an identity REST lookup first.
+                let bot_user_id = if matches!(&request, LfgRequest::Create { .. }) {
+                    self.bot_user_id().await
+                } else {
+                    0
+                };
                 self.lfg
                     .execute(
                         &self.executor,
@@ -551,7 +585,7 @@ impl InteractionRuntime {
                         &guild.to_string(),
                         &actor.to_string(),
                         interaction.id.get(),
-                        self.bot_user_id().await,
+                        bot_user_id,
                     )
                     .await
             }
@@ -560,7 +594,7 @@ impl InteractionRuntime {
         let reply = match result {
             Ok(reply) => reply,
             Err(LfgError::Invalid(reply)) => reply,
-            Err(busy @ LfgError::Busy) => busy.to_string(),
+            Err(busy @ (LfgError::Busy | LfgError::CoolingDown)) => busy.to_string(),
             Err(LfgError::Definition(
                 two_bot_core::automation_quota::QuotaWriteError::Capacity(quota),
             )) => quota.to_string(),
