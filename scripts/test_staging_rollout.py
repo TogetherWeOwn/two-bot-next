@@ -1404,7 +1404,7 @@ class OrchestrationTests(OfflineTestCase):
         client.api_routes[DETAIL_PATH] = [zero]
         _, headers, _ = ready_response()
         body = self.readyz_body(
-            None,
+            {"phase": "durable_gateway", "class": "checkpoint_load_failed"},
             components=[["process", "ready"], ["gateway", "starting"], ["database", SENTINEL]],
             phase=SENTINEL, reason=SENTINEL, jobs={"last_error": SENTINEL},
         )
@@ -1419,7 +1419,9 @@ class OrchestrationTests(OfflineTestCase):
             "staging rollout gate failed: rollout_timeout",
             "last observation before timeout: rollout=completed instances=active:0,healthy:0,failed:0,"
             "starting:0,scheduling:0 readyz=503 identity=match "
-            "components=process:ready,gateway:starting phase=rollout reason=zero_instances elapsed_s=10",
+            "components=process:ready,gateway:starting "
+            "gateway_failure=durable_gateway:checkpoint_load_failed "
+            "phase=rollout reason=zero_instances elapsed_s=10",
         ])
         self.assertEqual(client.calls.count(("request", URL + "/readyz")), 2)
         self.assertEqual(client.calls.count(("request", URL + "/health")), 2)
@@ -1443,6 +1445,29 @@ class OrchestrationTests(OfflineTestCase):
 
         client.request = expire_health
         self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertEqual(
+            client.observation,
+            "rollout=completed instances=active:0,healthy:0,failed:0,starting:0,scheduling:0 "
+            "phase=rollout reason=zero_instances elapsed_s=10",
+        )
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_zero_instance_timeout_diagnostic_survives_active_worker_deadline(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        zero = completed_row()
+        zero["health"]["instances"].update(active=0, healthy=0)
+        client = verify_client()
+        client.api_routes[DETAIL_PATH] = [zero]
+
+        def expire_active_worker(_client, _version):
+            self.clock.now = client.deadline
+            raise rollout.GateError("rollout_timeout")
+
+        with patch.object(rollout, "active_worker", side_effect=expire_active_worker):
+            self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertEqual(self.clock.now, client.deadline)
         self.assertEqual(
             client.observation,
             "rollout=completed instances=active:0,healthy:0,failed:0,starting:0,scheduling:0 "
