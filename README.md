@@ -40,9 +40,10 @@ failures. See also [backup procedures](docs/backup.md) and
   contract. Schema/cutover work lives in `sql/` and the cutover crate, not a second
   isolated website datastore.
 
-Targets remain one gateway session and less than 256 MiB RSS on the `lite`
-Container; these are deployment/soak gates, not a claim of measurements in this
-README. Staging deploys from `main`; production is a separate manual gate.
+The `lite` design target remains one gateway session and less than 256 MiB RSS.
+This placement/deployment reference is not B2 soak acceptance: B2 requires flat
+memory and defines no numeric RSS threshold. This README makes no measurement
+claim. Staging deploys from `main`; production is a separate manual gate.
 
 ## Operator references
 

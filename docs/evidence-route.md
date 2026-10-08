@@ -1,16 +1,32 @@
 # Expected/processed event evidence route (B2 soak)
 
-The B2 soak ([staging-soak.md](staging-soak.md)) needs **zero missed gateway
-events** for join / voice / message. Counters (`two_bot_gateway_*`, see
-[metrics.md](metrics.md)) and funnel milestones cannot prove that on their own:
-the funnel keeps only the first three messages per member, and checkpoint
-sequences include unrelated dispatches. This route pairs an independently
-witnessed **expected** action list against the bot's **durably committed**
-funnel rows and reports every expected action as matched, excluded, failed or
-a gap. ([TOG-11019](/TOG/issues/TOG-11019).)
+The B2 soak ([staging-soak.md](staging-soak.md)) requires **zero missed
+events** across joins, voice, messages and slash. Counters
+(`two_bot_gateway_*`, see [metrics.md](metrics.md)) and funnel milestones
+cannot prove that on their own: the funnel keeps only the first three messages
+per member, and checkpoint sequences include unrelated dispatches. The source
+route described here covers join / voice / message only; it does not cover
+slash or establish current live coverage.
 
-`crates/core/src/evidence.rs` holds the offline seam; this page is the
-collection procedure that uses it.
+`crates/core/src/evidence.rs` holds an offline seam. The documented live
+collection example is not current runtime evidence and does not replace the
+existing reviewed read workflow or protected binding; their current application
+remains **NOT VERIFIED**. Use those existing paths only after their independent
+verification. This page does not authorize a new collector, receipt path,
+origin, overflow path or live fault/dispatch method. The current deployed build,
+health, bindings, ACL state and live outcomes remain **NOT VERIFIED**.
+
+The approved policy does not define an operational ACTIVE hour, the source or
+record shape for the 120 expected one-minute samples in hours 3–4, or any
+one-minute sample cadence for hours 1–2. The route documented here is an offline
+seam, is not wired into the running bot, and covers join / voice / message only;
+it does not establish slash coverage or provide a verified live source for the
+120 samples. Its 15-minute packet bounds are not a substitute for a defined,
+reviewed live sampling route. No currently verified route satisfies these
+requirements; keep B2 **NOT VERIFIED** and `T` unset. The approved policy names
+no owner for defining or authorizing a live sample method. The separate existing
+technical-policy question remains pending with the CTO; this page does not
+assign a new owner or approve a new evidence method.
 
 ## What the seam does
 
@@ -47,11 +63,21 @@ but not observed, which is a soak gap until proven otherwise).
 Overflow sets `truncated.*_overflow` and stops recording. A truncated packet
 reads as UNKNOWN coverage, never as zero loss.
 
-## Live collection (staging only)
+## Live collection (staging only; B2 use is blocked)
 
-Prerequisites: staging verified healthy ([TOG-11131](/TOG/issues/TOG-11131)),
-the deployed revision is known (`/readyz` 200 plus the deploy run's SHA), and the
-existing authorized fixture identity acts in **TWO Staging**
+**Do not execute this procedure for B2 under the current policy.** The deployed
+build, health, bindings, migration/ACL state and live outcomes are **NOT
+VERIFIED**; this three-family source omits slash and does not define or supply
+the required 120 one-minute samples. The steps below are a conditional
+procedure, not execution authorization. Do not perform fixture actions, a
+staging SQL read or packet export for B2 until the existing reviewed live routes
+and applicable sample method are independently verified and the separately
+required authorization is recorded. No route, method or authorization is
+created here; keep `T` unset.
+
+Prerequisites for any separately authorized use: staging verified healthy,
+the deployed revision is known (`/readyz` 200 plus the deploy run's SHA), and
+the existing authorized fixture identity acts in **TWO Staging**
 (`1545644954272137297`). Production is out of scope. Never retry a denied
 channel or substitute credentials.
 
@@ -191,17 +217,19 @@ channel or substitute credentials.
 Offline fixture runs (`cargo test -p two-bot-core --lib evidence`) prove the
 seam, not staging coverage. Only a packet from step 3 is live evidence.
 
-## Reconnect and RSS
+## Reconnect and memory observations
 
-- **Reconnect gap:** on the next deployment that is justified on its own,
-  record deploy finish to first `/readyz` 200 (see
-  [staging-soak.md](staging-soak.md)), plus the
+- **Workflow interval:** deploy finish to first `/readyz` 200, plus the
   `two_bot_gateway_reconnects_total` / `two_bot_gateway_resumes_total`
-  deltas from `/metrics`. Until then it is NOT MEASURED.
-- **RSS:** `crates/core/examples/metrics_rss.rs` measures instrumentation
+  deltas from `/metrics`, is a deployment/reconnect observation only. It is
+  **not** outage-start-to-verified-recovery and cannot prove B2's under-60-second
+  recovery requirement. Until observed, it is NOT MEASURED.
+- **Memory:** `crates/core/examples/metrics_rss.rs` measures instrumentation
   cost only ([metrics.md](metrics.md#cardinality-and-memory)). Whole-bot
-  loaded-guild RSS still comes from B1's placement measurement; it is not
-  claimed here.
+  loaded-guild RSS in B1 is historical evidence, not a numeric B2 criterion;
+  flat memory remains required and numeric RSS/error definitions are unaccepted.
 
-Intervals without a packet stay UNKNOWN. The September 30 attempt is not the
-soak clock; QA records a new start T only after healthy, observable staging.
+Intervals without a packet stay UNKNOWN. The September 30 attempt remains a
+failed historical attempt, not the soak clock. `T` stays unset until all
+qualifying preconditions and the reviewed live evidence routes are independently
+verified.

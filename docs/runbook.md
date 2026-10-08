@@ -146,7 +146,8 @@ The DO renews activity and probes `/readyz` every `KEEPALIVE_SECONDS` (default
 60); `sleepAfter` is 30 minutes. Outbound gateway traffic alone does not keep
 an idle container awake. Do not disable the keepalive or increase capacity
 without measured evidence. `lite`, `max_instances=1` is the declared placement,
-not evidence of the measured RSS budget. See [staging soak](staging-soak.md).
+not a measurement or B2 acceptance criterion. B2 requires flat memory and has
+no accepted numeric RSS threshold; see [staging soak](staging-soak.md).
 
 ### Sustained-unready alerts
 
@@ -531,7 +532,8 @@ both Worker version and running image. Unlike CI's explicit handoff step, the
 bare deploy command does **not** transfer ownership: read control state, confirm
 old-process teardown, and perform the authorized takeover with its current epoch
 before any startup-capable probe. Then check `/health`, `/readyz` and startup
-logs; record finish-to-first-ready gap (soak target under 60 seconds). A container
+logs; record finish-to-first-ready as a separate deployment/workflow interval.
+It is not the B2 outage-start-to-verified-recovery measure. A container
 replacement can restart the shard; there is no promise of zero downtime.
 
 ### Worker-version rollback
@@ -578,7 +580,9 @@ Pick the target from the deployment list: a version that already served staging
 traffic, not the serving one, compatible with the current schema (the script
 refuses an unknown or never-deployed id). The job summary and evidence file hold
 the fence, rollback, takeover and first-ready times, the time-to-ready against
-the 60 s budget, probe counts, the container image digest and instance counts.
+the workflow's 60 s budget, probe counts, the container image digest and
+instance counts. This workflow interval is not an outage-start recovery
+measurement and cannot prove B2's under-60-second recovery criterion.
 Gateway-session count is not observable from probes; read the Worker logs for it.
 If the run stops on a 401/403 it skips the restore: recover with a
 `deploy-staging` dispatch with `release_fence=true` after the binding is fixed.
