@@ -945,9 +945,10 @@ fn parse_item_url(value: &str) -> Option<url::Url> {
 }
 
 fn is_item_url(value: &str, max_url_utf16_units: usize) -> bool {
-    parse_item_url(value)
-        .and_then(|url| item_url_for_message(&url))
-        .is_some_and(|url| url.encode_utf16().count() <= max_url_utf16_units)
+    parse_item_url(value).is_some_and(|url| {
+        item_url_for_message(&url)
+            .is_some_and(|message_url| message_url.encode_utf16().count() <= max_url_utf16_units)
+    })
 }
 
 /// Filter URLs that the shared REST sanitizer would rewrite; encoding `@` can
