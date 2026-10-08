@@ -1395,6 +1395,151 @@ class OrchestrationTests(OfflineTestCase):
                                  "rollout=progressing instances=active:0,healthy:0,failed:0,starting:1,scheduling:0")
         self.assert_no_secret_saved_or_printed()
 
+    def test_completed_zero_instance_timeout_prints_bounded_diagnostic_and_stays_failed(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        zero = completed_row()
+        zero["health"]["instances"].update(active=0, healthy=0)
+        client = verify_client()
+        client.api_routes[DETAIL_PATH] = [zero]
+        _, headers, _ = ready_response()
+        body = self.readyz_body(
+            {"phase": "durable_gateway", "class": "checkpoint_load_failed"},
+            components=[["process", "ready"], ["gateway", "starting"], ["database", SENTINEL]],
+            phase=SENTINEL, reason=SENTINEL, jobs={"last_error": SENTINEL},
+        )
+        client.request_routes[URL + "/readyz"] = [(503, headers, body)]
+        argv = ["staging_rollout.py", "verify", "--receipt", self.args.receipt,
+                "--output", self.args.output, "--evidence", self.args.evidence]
+        self.stdout.seek(0)
+        self.stdout.truncate()
+        with patch.object(sys, "argv", argv), patch.object(rollout, "Client", return_value=client):
+            self.assertEqual(rollout.main(), 1)
+        self.assertEqual(self.stdout.getvalue().splitlines(), [
+            "staging rollout gate failed: rollout_timeout",
+            "last observation before timeout: rollout=completed instances=active:0,healthy:0,failed:0,"
+            "starting:0,scheduling:0 readyz=503 identity=match "
+            "components=process:ready,gateway:starting "
+            "gateway_failure=durable_gateway:checkpoint_load_failed "
+            "phase=rollout reason=zero_instances elapsed_s=10",
+        ])
+        self.assertEqual(client.calls.count(("request", URL + "/readyz")), 2)
+        self.assertEqual(client.calls.count(("request", URL + "/health")), 2)
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_zero_instance_timeout_diagnostic_survives_an_in_flight_probe_timeout(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        zero = completed_row()
+        zero["health"]["instances"].update(active=0, healthy=0)
+        client = verify_client()
+        client.api_routes[DETAIL_PATH] = [zero]
+        original_request = client.request
+
+        def expire_health(url, authenticated=False):
+            if url == URL + "/health":
+                self.clock.now = client.deadline
+                raise rollout.GateError("rollout_timeout")
+            return original_request(url, authenticated)
+
+        client.request = expire_health
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertEqual(
+            client.observation,
+            "rollout=completed instances=active:0,healthy:0,failed:0,starting:0,scheduling:0 "
+            "phase=rollout reason=zero_instances elapsed_s=10",
+        )
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_zero_instance_timeout_diagnostic_survives_active_worker_deadline(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        zero = completed_row()
+        zero["health"]["instances"].update(active=0, healthy=0)
+        client = verify_client()
+        client.api_routes[DETAIL_PATH] = [zero]
+
+        def expire_active_worker(_client, _version):
+            self.clock.now = client.deadline
+            raise rollout.GateError("rollout_timeout")
+
+        with patch.object(rollout, "active_worker", side_effect=expire_active_worker):
+            self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertEqual(self.clock.now, client.deadline)
+        self.assertEqual(
+            client.observation,
+            "rollout=completed instances=active:0,healthy:0,failed:0,starting:0,scheduling:0 "
+            "phase=rollout reason=zero_instances elapsed_s=10",
+        )
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_zero_instance_readiness_uses_most_degraded_duplicate_state(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        zero = completed_row()
+        zero["health"]["instances"].update(active=0, healthy=0)
+        _, headers, _ = ready_response()
+        client = verify_client()
+        client.api_routes[DETAIL_PATH] = [zero]
+        client.request_routes[URL + "/readyz"] = [
+            (503, headers, self.readyz_body(
+                None, components=[["gateway", "ready"], ["gateway", "down"]]))
+        ]
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertIn("components=gateway:down", client.observation)
+        self.assertNotIn("gateway:ready", client.observation)
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_zero_instance_timeout_diagnostic_is_not_used_for_other_rollout_states(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        for row in [
+            {**completed_row(), "health": {"instances": {
+                "active": 0, "healthy": 0, "failed": 1, "starting": 0, "scheduling": 0,
+            }}},
+            {**completed_row(), "status": "progressing", "health": {"instances": {
+                "active": 0, "healthy": 0, "failed": 0, "starting": 0, "scheduling": 0,
+            }}},
+        ]:
+            with self.subTest(status=row["status"], counts=row["health"]["instances"]):
+                self.clock.now = 100
+                client = verify_client()
+                client.api_routes[DETAIL_PATH] = [row]
+                self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+                self.assertNotIn("reason=zero_instances", client.observation)
+                self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_zero_instance_timeout_diagnostic_drops_malformed_or_mismatched_readiness(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        zero = completed_row()
+        zero["health"]["instances"].update(active=0, healthy=0)
+        _, headers, _ = ready_response()
+        mismatched = json.dumps({
+            "build_revision": REVISION, "build_id": "999999-1",
+            "components": [["gateway", SENTINEL]],
+        }).encode()
+        for response in [(503, headers, SENTINEL.encode()),
+                         (503, {"x-two-worker-version": OLD_VERSION}, mismatched)]:
+            with self.subTest(headers=response[1]):
+                self.clock.now = 100
+                client = verify_client()
+                client.api_routes[DETAIL_PATH] = [zero]
+                client.request_routes[URL + "/readyz"] = [response]
+                self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+                self.assertEqual(
+                    client.observation,
+                    "rollout=completed instances=active:0,healthy:0,failed:0,starting:0,scheduling:0 "
+                    "phase=rollout reason=zero_instances elapsed_s=10",
+                )
+                self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
     def test_main_prints_the_gateway_failure_in_the_last_observation(self):
         self.prepare_baseline()
         self.write_deploy_output()
