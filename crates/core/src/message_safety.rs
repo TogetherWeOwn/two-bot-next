@@ -66,37 +66,6 @@ pub fn contains_mass_mention(text: &str) -> bool {
     neutralize_mentions(text) != text
 }
 
-/// Percent-encode only the `@` that the REST sanitizer would rewrite.
-pub(crate) fn encode_mass_mentions_for_url(text: &str) -> String {
-    if !contains_mass_mention(text) {
-        return text.to_owned();
-    }
-
-    let mut safe = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find('@') {
-        safe.push_str(&rest[..start]);
-        let after_at = &rest[start + 1..];
-        let needs_encoding = ["everyone", "here"].into_iter().any(|mention| {
-            if mention_end(after_at, mention).is_none() {
-                return false;
-            }
-            let already_neutralized = after_at
-                .strip_prefix('\u{200b}')
-                .is_some_and(|after_break| after_break.starts_with(mention));
-            !already_neutralized
-        });
-        if needs_encoding {
-            safe.push_str("%40");
-        } else {
-            safe.push('@');
-        }
-        rest = after_at;
-    }
-    safe.push_str(rest);
-    safe
-}
-
 fn mention_end(text: &str, mention: &str) -> Option<usize> {
     let mut chars = text
         .char_indices()
@@ -266,22 +235,6 @@ mod tests {
         ] {
             assert!(!contains_mass_mention(text), "{text:?} must be kept");
         }
-    }
-
-    #[test]
-    fn url_escaping_preserves_unrelated_and_already_neutralized_at_signs() {
-        let url = "https://example.org/@alice?notice=@everyone&already=@\u{200b}here&split=@h\u{200b}ere&also=@here";
-        let safe = encode_mass_mentions_for_url(url);
-
-        assert_eq!(
-            safe,
-            "https://example.org/@alice?notice=%40everyone&already=@\u{200b}here&split=%40h\u{200b}ere&also=%40here"
-        );
-        assert_eq!(content(&safe), safe);
-        assert_eq!(
-            encode_mass_mentions_for_url("https://example.org/@\u{200b}everyone"),
-            "https://example.org/@\u{200b}everyone"
-        );
     }
 
     #[test]

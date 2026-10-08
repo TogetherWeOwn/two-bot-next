@@ -892,7 +892,7 @@ fn message_safe_item_urls_preserve_unrelated_at_signs() {
     let feed = relay(FeedKind::Rss);
     let feed_item = FeedItem {
         title: "Post".into(),
-        url: "https://example.org/@alice/post?next=@everyone&also=@here".into(),
+        url: "https://example.org/@alice/post?next=%40everyone&also=%40here".into(),
         ..item("mention-url")
     };
     let post = plan_post(&feed, &feed_item).unwrap();
@@ -975,33 +975,51 @@ fn feed_posts_escape_untrusted_titles_and_preserve_item_url_previews() {
 }
 
 #[test]
-fn mention_expansion_in_item_urls_is_included_in_the_feed_kind_budget() {
+fn mass_mention_item_urls_are_filtered_before_delivery() {
     let feed = relay(FeedKind::Rss);
-    let url_prefix = "https://example.org/";
-    let max_url_units = 2000 - "New feed item: ****\n".encode_utf16().count() - 1;
-    let mention = "@everyone";
-    let url = format!(
-        "{url_prefix}{}{mention}",
-        "a".repeat(max_url_units - url_prefix.len() - mention.len())
-    );
-    assert_eq!(url.encode_utf16().count(), max_url_units);
+    for url in [
+        "https://example.org/@everyone",
+        "https://example.org/notice?search=@here",
+    ] {
+        let xml = format!(
+            "<rss><channel><item><guid>key</guid><title>x</title><link>{url}</link></item></channel></rss>"
+        );
+        assert!(parse_xml_feed_for_kind(&xml, FeedKind::Rss)
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            plan_post(
+                &feed,
+                &FeedItem {
+                    url: url.into(),
+                    ..item("unsafe-mention-url")
+                }
+            ),
+            Err(FeedError::InvalidItemUrl)
+        ));
+    }
 
+    let url = "https://example.org/%40everyone";
     let xml = format!(
         "<rss><channel><item><guid>key</guid><title>x</title><link>{url}</link></item></channel></rss>"
     );
-    assert!(parse_xml_feed_for_kind(&xml, FeedKind::Rss)
-        .unwrap()
-        .is_empty());
-    assert!(matches!(
-        plan_post(
-            &feed,
-            &FeedItem {
-                url,
-                ..item("over-budget-mention")
-            }
-        ),
-        Err(FeedError::InvalidItemUrl)
-    ));
+    let items = parse_xml_feed_for_kind(&xml, FeedKind::Rss).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].url, url);
+
+    let post = plan_post(
+        &feed,
+        &FeedItem {
+            url: url.into(),
+            ..item("encoded-mention-url")
+        },
+    )
+    .unwrap();
+    assert!(post.content.ends_with(url));
+    assert_eq!(
+        two_bot_core::message_safety::content(&post.content),
+        post.content
+    );
 }
 
 #[test]

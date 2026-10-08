@@ -51,11 +51,11 @@ Read-only specification: TogetherWeOwn/two-bot `src/announcements/service.ts`,
 - SHA-256 item-key fallback and 24-hex nonce are byte-compatible with legacy.
   Feed titles neutralize mass mentions before escaping punctuation and flattening
   CR/LF, so the shared REST sanitizer does not expand them past the message limit.
-  Canonical item URLs are posted bare to preserve Discord link previews; only a
-  mention-triggering `@` is percent-encoded when needed to prevent the shared REST
-  sanitizer from rewriting it. Other `@` characters remain unchanged. URL budgets
-  apply to the rendered safe URL. Posts require empty allowed_mentions and
-  enforce_nonce.
+  Canonical item URLs are posted bare to preserve Discord link previews. URLs that
+  the shared REST sanitizer would rewrite (raw or obfuscated mass mentions) are
+  filtered during XML parsing rather than changing `@` to `%40`, which could alter
+  their destination. Other `@` data remains unchanged. URL budgets apply to the
+  canonical URL. Posts require empty allowed_mentions and enforce_nonce.
 - Migration `0180_feeds.sql` preserves `feed_relays` and `feed_deliveries` column
   names/types, uniqueness/cascade, and legacy claim columns. It coexists with
   `0160_rsvp`'s shared `announcements_audit_log`. Adapter writes create/remove,

@@ -946,12 +946,15 @@ fn parse_item_url(value: &str) -> Option<url::Url> {
 
 fn is_item_url(value: &str, max_url_utf16_units: usize) -> bool {
     parse_item_url(value)
-        .is_some_and(|url| item_url_for_message(&url).encode_utf16().count() <= max_url_utf16_units)
+        .and_then(|url| item_url_for_message(&url))
+        .is_some_and(|url| url.encode_utf16().count() <= max_url_utf16_units)
 }
 
-/// Keep mention-like URL data intact through the shared REST message sanitizer.
-fn item_url_for_message(url: &url::Url) -> String {
-    crate::message_safety::encode_mass_mentions_for_url(url.as_str())
+/// Filter URLs that the shared REST sanitizer would rewrite; encoding `@` can
+/// change the destination of a path or query.
+fn item_url_for_message(url: &url::Url) -> Option<&str> {
+    let url = url.as_str();
+    (!crate::message_safety::contains_mass_mention(url)).then_some(url)
 }
 
 pub fn item_key(item: &FeedItem) -> Result<String, FeedError> {
@@ -984,7 +987,7 @@ pub struct FeedPost {
 pub fn plan_post(feed: &FeedRelay, item: &FeedItem) -> Result<FeedPost, FeedError> {
     let key = item_key(item)?;
     let parsed_url = parse_item_url(&item.url).ok_or(FeedError::InvalidItemUrl)?;
-    let item_url = item_url_for_message(&parsed_url);
+    let item_url = item_url_for_message(&parsed_url).ok_or(FeedError::InvalidItemUrl)?;
     if item_url.encode_utf16().count() > max_feed_item_url_utf16_units(feed.kind) {
         return Err(FeedError::InvalidItemUrl);
     }
