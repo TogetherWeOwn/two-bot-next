@@ -58,11 +58,44 @@ technical-policy question remains pending with the CTO; the CEO-held fixture
 authorization is an execution hold, not a definition of the missing terms. No
 new owner or evidence method is assigned here.
 
-The previously documented 60-minute window is retired, not replaced by a new
-timing rule. Do not treat elapsed time, a first `/readyz` 200, source-level
-fixtures, historical packets or this document as proof of live coverage. The
-existing protected-binding and migration/ACL verification work remains
-required; this page creates no duplicate route or task.
+The fixed 60-minute spacing is retired; there is no elapsed-time requirement or
+replacement timed window. Preserve the former window's non-timing stability
+checks between the Gate 1 readiness probe and the final pre-`T` probe:
+
+| Check | Verification | Expected value |
+|---|---|---|
+| No readiness alerts | Worker-log query for `container_unready_alert` between the two probes | `0`; a `container_unready_recovery` without a preceding alert is fine |
+| No deployment | Existing authorized workflow execution-attempt verification for `main` over the recorded probe interval, including reruns and executions spanning either probe | `0` deployment executions; missing or incomplete attempt evidence closes the gate |
+| Final readiness | Same `/readyz` curl as Gate 1, before writing `T` | `200` with all three components `ready` |
+
+Record the Gate 1 and final readiness probe timestamps as UTC in `GATE1_UTC`
+and `FINAL_UTC`. This paginated, explicitly read-only listing discovers
+main-branch runs for the staging workflow; it is **not** a no-deployment proof:
+
+```sh
+gh api --method GET --paginate repos/TogetherWeOwn/two-bot-next/actions/workflows/deploy-staging.yml/runs -f branch=main -F per_page=100
+```
+
+Do not count only runs whose `created_at` falls between the probes: an older run
+can be rerun during that interval, and an execution spanning a probe can deploy
+inside it. Require independently verified execution-attempt and overlap coverage
+through the existing authorized read path before recording zero deployments.
+A successful listing or zero newly created runs is not that coverage. Any
+query failure, deployment execution or missing/incomplete attempt evidence
+closes Gate 2 and keeps `T` unset. No new attempt collector, verification route
+or execution authority is supplied by this document.
+
+The alert query counts only emitted `container_unready_alert` records. Short
+failure streaks can recover below the configured threshold without an alert or
+recovery log ([readiness runbook](container-readiness.md)); an empty alert query
+does not prove there were no brief unready streaks.
+
+Any alert, deploy or non-200 probe closes Gate 2 until the cause is resolved
+and the Gate 1 preconditions pass again. Re-run the readiness checks; do not
+start a new fixed-duration window. Do not treat elapsed time, a first `/readyz`
+200, source-level fixtures, historical packets or this document as proof of
+live coverage. The existing protected-binding and migration/ACL verification
+work remains required; this page creates no duplicate route or task.
 
 ## Gate 3 — migrations applied to the pinned head
 
@@ -89,7 +122,7 @@ gate does not create a new receipt schema, collector, origin or overflow path.
 | Check | Verification | Expected value |
 |---|---|---|
 | Existing record | Inspect the approved soak record through its existing board view | It must preserve expected/processed evidence and gaps for all four families plus pinned deployment identity; whether it currently supports this is **NOT VERIFIED** |
-| Offline packet tooling | Existing offline suite, where applicable | It may verify offline reconciliation only; it does not prove a deployed build, live event coverage or staging acceptance |
+| Offline packet tooling | Existing offline evidence test suite on the pinned SHA | It must pass before packet tooling is used. If absent or failing, record tooling **NOT VERIFIED** and keep `T` unset. A pass verifies offline reconciliation only; it does not prove a deployed build, live event coverage or staging acceptance. |
 
 Record `T` in the existing approved record only after Gates 1–4 and every
 qualifying precondition pass, and only if that record and its route are

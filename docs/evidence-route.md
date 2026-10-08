@@ -63,11 +63,21 @@ but not observed, which is a soak gap until proven otherwise).
 Overflow sets `truncated.*_overflow` and stops recording. A truncated packet
 reads as UNKNOWN coverage, never as zero loss.
 
-## Live collection (staging only)
+## Live collection (staging only; B2 use is blocked)
 
-Prerequisites: staging verified healthy ([TOG-11131](/TOG/issues/TOG-11131)),
-the deployed revision is known (`/readyz` 200 plus the deploy run's SHA), and the
-existing authorized fixture identity acts in **TWO Staging**
+**Do not execute this procedure for B2 under the current policy.** The deployed
+build, health, bindings, migration/ACL state and live outcomes are **NOT
+VERIFIED**; this three-family source omits slash and does not define or supply
+the required 120 one-minute samples. The steps below are a conditional
+procedure, not execution authorization. Do not perform fixture actions, a
+staging SQL read or packet export for B2 until the existing reviewed live routes
+and applicable sample method are independently verified and the separately
+required authorization is recorded. No route, method or authorization is
+created here; keep `T` unset.
+
+Prerequisites for any separately authorized use: staging verified healthy,
+the deployed revision is known (`/readyz` 200 plus the deploy run's SHA), and
+the existing authorized fixture identity acts in **TWO Staging**
 (`1545644954272137297`). Production is out of scope. Never retry a denied
 channel or substitute credentials.
 

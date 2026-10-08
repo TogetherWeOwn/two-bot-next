@@ -146,7 +146,8 @@ The DO renews activity and probes `/readyz` every `KEEPALIVE_SECONDS` (default
 60); `sleepAfter` is 30 minutes. Outbound gateway traffic alone does not keep
 an idle container awake. Do not disable the keepalive or increase capacity
 without measured evidence. `lite`, `max_instances=1` is the declared placement,
-not evidence of the measured RSS budget. See [staging soak](staging-soak.md).
+not a measurement or B2 acceptance criterion. B2 requires flat memory and has
+no accepted numeric RSS threshold; see [staging soak](staging-soak.md).
 
 ### Sustained-unready alerts
 
