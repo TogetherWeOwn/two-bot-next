@@ -1023,6 +1023,32 @@ fn mass_mention_item_urls_are_filtered_before_delivery() {
 }
 
 #[test]
+fn parse_report_counts_only_items_filtered_for_mass_mention_urls() {
+    let entry = |key: &str, url: &str| {
+        format!("<item><guid>{key}</guid><title>x</title><link>{url}</link></item>")
+    };
+    // Literal mentions and handles that merely start with `here`/`everyone`
+    // are filtered and counted; a plain handle, an invalid URL and a
+    // credentialed URL are dropped or kept without touching the count.
+    let xml = format!(
+        "<rss><channel>{}{}{}{}{}</channel></rss>",
+        entry("a", "https://example.org/@everyone"),
+        entry("b", "https://mastodon.social/@heresy/1"),
+        entry("c", "https://mastodon.social/@alice/1"),
+        entry("d", "not a url"),
+        entry("e", "https://user@example.org/@here"),
+    );
+    let parsed = parse_xml_feed_report(&xml, FeedKind::Rss).unwrap();
+    assert_eq!(parsed.mention_urls_filtered, 2);
+    assert_eq!(parsed.items.len(), 1);
+    assert_eq!(parsed.items[0].url, "https://mastodon.social/@alice/1");
+    assert_eq!(
+        parse_xml_feed_for_kind(&xml, FeedKind::Rss).unwrap(),
+        parsed.items
+    );
+}
+
+#[test]
 fn stable_keys_nonces_budget_and_mentions_survive_restart() {
     let feed = relay(FeedKind::Rss);
     let post = plan_post(&feed, &item("rss-1")).unwrap();

@@ -5,6 +5,7 @@ use crate::feeds_http::{validate_source, FetchError, MAX_FEED_BYTES, MAX_FEED_SO
 use roxmltree::{Document, Node, ParsingOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::HashSet;
 use thiserror::Error;
 
@@ -299,16 +300,36 @@ fn bound_xml_resources(xml: &str) -> Result<(), FeedError> {
 
 pub fn parse_xml_feed(xml: &str) -> Result<Vec<FeedItem>, FeedError> {
     // Without the relay kind, use the widest budget accepted by any feed kind.
-    parse_xml_feed_with_url_limit(xml, MAX_RSS_TWITCH_ITEM_URL_UTF16_UNITS)
+    parse_xml_feed_with_url_limit(xml, MAX_RSS_TWITCH_ITEM_URL_UTF16_UNITS, &Cell::new(0))
 }
 
 pub fn parse_xml_feed_for_kind(xml: &str, kind: FeedKind) -> Result<Vec<FeedItem>, FeedError> {
-    parse_xml_feed_with_url_limit(xml, max_feed_item_url_utf16_units(kind))
+    parse_xml_feed_report(xml, kind).map(|parsed| parsed.items)
+}
+
+/// Parsed items plus how many entries the parser dropped only because their
+/// URL carries `@everyone`/`@here` text, which the shared REST sanitizer would
+/// rewrite. Handles that merely start with `here` or `everyone` match too, so
+/// the managed poller logs the count to make a silent relay diagnosable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedFeed {
+    pub items: Vec<FeedItem>,
+    pub mention_urls_filtered: usize,
+}
+
+pub fn parse_xml_feed_report(xml: &str, kind: FeedKind) -> Result<ParsedFeed, FeedError> {
+    let filtered = Cell::new(0);
+    let items = parse_xml_feed_with_url_limit(xml, max_feed_item_url_utf16_units(kind), &filtered)?;
+    Ok(ParsedFeed {
+        items,
+        mention_urls_filtered: filtered.get(),
+    })
 }
 
 fn parse_xml_feed_with_url_limit(
     xml: &str,
     max_url_utf16_units: usize,
+    mention_urls_filtered: &Cell<usize>,
 ) -> Result<Vec<FeedItem>, FeedError> {
     if xml.len() > MAX_FEED_BYTES {
         return Err(FetchError::TooLarge.into());
@@ -414,6 +435,9 @@ fn parse_xml_feed_with_url_limit(
             let key = decode_xml_entities(&raw_key);
             let url = decode_xml_entities(&raw_url);
             if key.is_empty() || !is_item_url(&url, max_url_utf16_units) {
+                if !key.is_empty() && has_mass_mention_url(&url) {
+                    mention_urls_filtered.set(mention_urls_filtered.get() + 1);
+                }
                 return None;
             }
             let raw_title = raw_scalar_field(xml, entry, "title");
@@ -956,6 +980,10 @@ fn is_item_url(value: &str, max_url_utf16_units: usize) -> bool {
 fn item_url_for_message(url: &url::Url) -> Option<&str> {
     let url = url.as_str();
     (!crate::message_safety::contains_mass_mention(url)).then_some(url)
+}
+
+fn has_mass_mention_url(value: &str) -> bool {
+    parse_item_url(value).is_some_and(|url| item_url_for_message(&url).is_none())
 }
 
 pub fn item_key(item: &FeedItem) -> Result<String, FeedError> {
