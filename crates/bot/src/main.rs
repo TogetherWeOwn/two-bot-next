@@ -56,6 +56,7 @@ mod member_cli;
 mod member_runtime;
 mod metrics_http;
 mod moderation_cli;
+mod moderation_release_cli;
 #[cfg(test)]
 mod observability_event_conformance_tests;
 mod onboarding;

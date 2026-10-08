@@ -21,9 +21,12 @@ Offline plus staging read-only; no writes were performed for this check.
 | 7 | Scope per target, released on departure | Guard keyed by guild + target (not room + target); `refresh` on target departure cancels with `TargetLeft` and room B can start at once; cancelled votes never revive | `voice_vote_kick.rs:234-238` (key), `:167-168` + `:316-328` (departure cancel via refresh) | `votes_in_room_a_never_block_other_targets_in_room_a_or_room_b`, `target_moving_to_room_b_is_released_by_room_a_departure_refresh` (room B refused before room A refreshes, starts at once after) | Match |
 | 8 | No post-terminal cooldown (intentional spec gap) | After expiry, pass or cancellation a fresh interaction ID starts immediately; no `Cooldown` error variant exists in `VoteKickError` | `voice_vote_kick.rs:108-132` (full variant list has no cooldown) | expiry/pass/cancel tests each start a fresh vote in the same clock tick | Match — documented gap, not a mismatch |
 
-No mismatches found, so no follow-up cards were filed. A longer
-post-failure cooldown or a per-initiator rate limit across targets would need
-a V4 spec change plus a core change; both are out of scope here.
+No mismatches with the active-vote specification were found in this check.
+That result does not establish security readiness: the
+[vote-kick security gates](command-wiring-security.md#vote-kick) require a
+post-terminal cooldown, a per-initiator limit across targets, protected staff
+targets and bounded ledgers. A new cooldown needs a V4 spec change plus a core
+change; implementing it remains outside this documentation check.
 
 ## Staging read-only check
 

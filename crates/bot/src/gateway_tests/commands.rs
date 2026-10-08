@@ -327,7 +327,11 @@ async fn ready_routes_custom_slash_and_accepted_prefix_before_checkpoint() {
 
     // A terminal runtime failure is not a shard failure and does not block
     // capture/checkpoint; its already-committed reservation still fences replay.
-    gateway.send(prefix(4, 52)).await;
+    let mut failed_prefix = prefix(4, 52);
+    // An independent actor bypasses neither moderation nor permanent replay,
+    // but has their own text-trigger cooldown window.
+    failed_prefix["d"]["author"]["id"] = json!("3334");
+    gateway.send(failed_prefix).await;
     wait_sequence(&db.store, 4).await;
     wait_requests(&rest, 7).await;
     wait_connected(&state).await;

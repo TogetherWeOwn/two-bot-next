@@ -141,6 +141,21 @@ normal return, panic, timeout or cancellation finishes the pass. Existing job
 ownership skips busy deadlines and cancels/joins active work during shutdown;
 gateway reconnects do not construct another feed job.
 
+Each relay has one 30-second deadline covering pending discovery/reconciliation,
+fetch/parse, claims, sends/completion, checked status and database audit. The pass
+has a 100-second budget below the supervisor's 120-second limit. A relay starts
+only if a full 30-second slot remains: repeatedly handing the boundary relay a
+short residual slot would itself cause starvation. A job-owned cursor advances
+**before** each relay starts in stable `(created_at, id)` order and resumes at its
+successor next pass, wrapping once. Deleting/disabling the cursor row does not
+reset progress; a process restart does reset this in-memory cursor. Relays run
+inline, never in detached tasks, so expiration drops the relay before another
+starts without increasing pool/send concurrency. Timeout logs a fixed message
+and returns `Timeout`; there is no post-deadline DB cleanup/audit, and checked
+status may remain unchanged. All claims left by cancellation stay pending for
+nonce reconciliation, even if a remote accepted response arrives late. These
+are cooperative async deadlines, not preemption of non-yielding Rust code.
+
 The adapter passes the production source only to `fetch_feed`, checks the final
 HTTP status before parsing, and applies the POST budget after ledger arbitration.
 Every send uses the exact 24-character string nonce through the shared executor's
@@ -151,8 +166,17 @@ not stop later items/feeds. Audit reasons are fixed classes or bounded count
 summaries; raw HTTP, source and database errors are not logged.
 
 Recovery separately discovers up to 20 expired ledger rows per feed/pass, even
-when HTTP fails or the item disappeared from XML. Oldest leases are selected
-first; reclaiming unresolved rows rotates their lease to avoid starving the
+when HTTP fails or the item disappeared from XML. The entire recovery phase has
+a 12-second budget, leaving at least 18 seconds of the relay deadline for fresh
+fetching/delivery. Each REST read starts only with six seconds remaining for the
+executor's five-second call deadline and a scheduling margin; ordinary slow
+history misses therefore drain before fresh polling rather than being cancelled
+mid-wire and retaining shared send admission. A budget refusal stops recovery
+without releasing/reposting pending rows. Recovery reads precede claim renewal:
+an identity-only read refused the history-call window leaves that row's lease
+unchanged, so it remains ahead of already-searched rows on the next pass.
+Oldest leases are selected first; a completed history attempt permits fenced
+claim renewal/completion and rotates unresolved leases to avoid starving the
 rest of the recovery queue. XML candidates use fresh-only arbitration: existing
 pending rows are left to that queue, never reclaimed without a history read
 because the pass's recovery budget ran out. New items retain their independent
@@ -169,6 +193,16 @@ Integration fixtures live in `crates/bot/src/feed_jobs_tests.rs`: injected feed
 HTTP still traverses `fetch_feed_with`'s pinned-request/body policy, Discord uses
 the existing scripted REST double, and ignored DB journeys reuse the shared
 strict `TestDatabase` fixture with independent pools. CI explicitly runs these
-against its disposable service. Runtime acceptance is **not certified by source
+against its disposable service. New non-ignored deadline tests run in the ordinary
+unit/binary step: 23 stalled relays followed by a 15-second healthy tail across
+eight truncated passes; abort/join of a registered action followed by cursor
+continuation; slow unresolved history misses across repeated passes while new
+items post through the same durable send admission and pending leases rotate;
+a slow identity-only read keeping an unsearched row first for a matching history
+lookup next pass; and cancellation during a delayed POST preserving delivered, pending and
+unvisited fresh items across a reopened pool, a history miss and later successful
+nonce reconciliation. The older overflow/restart fixture still
+pins the independent 20-attempt POST cap. All I/O uses REST doubles and disposable
+databases, never live Discord or a staging/production database. Runtime acceptance is **not certified by source
 or fixtures alone**: record the exact tested head, hosted results and independent
 review in the poller card before declaring it delivered. Default-off remains.

@@ -56,9 +56,7 @@ use sqlx::{Pool, Postgres};
 use tracing::warn;
 use twilight_gateway::Event;
 use twilight_model::{
-    application::interaction::{
-        application_command::CommandOptionValue, Interaction, InteractionData,
-    },
+    application::interaction::{application_command::CommandOptionValue, Interaction},
     channel::message::{Message, MessageFlags},
     gateway::GatewayReaction,
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
@@ -603,15 +601,16 @@ impl CommandRuntime {
                 self.dispatch_ticket_connection(event);
                 return;
             }
-            Event::InteractionCreate(interaction) => {
-                if let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_ref() {
-                    if matches!(
-                        data.name.as_str(),
-                        "rsvp" | "rsvp-attendance" | "attendance"
-                    ) {
-                        return;
-                    }
-                }
+            Event::InteractionCreate(interaction)
+                if self
+                    .executor
+                    .command_identities()
+                    .slash_name(&interaction.0)
+                    .is_some_and(|name| {
+                        matches!(name.as_str(), "rsvp" | "rsvp-attendance" | "attendance")
+                    }) =>
+            {
+                return;
             }
             _ => {}
         }
@@ -804,15 +803,10 @@ impl CommandRuntime {
         if application_id != 0 && interaction.application_id.get() != application_id {
             return false;
         }
-        if interaction.kind
-            != twilight_model::application::interaction::InteractionType::ApplicationCommand
-        {
-            return false;
-        }
-        let Some(InteractionData::ApplicationCommand(command)) = interaction.data.as_ref() else {
-            return false;
-        };
-        self.interactions.router.voice_owns_command(&command.name)
+        self.executor
+            .command_identities()
+            .slash_name(interaction)
+            .is_some_and(|name| self.interactions.router.voice_owns_command(&name))
     }
 
     /// Admit before spawning, without waiting on SQL/REST in the shard loop.
@@ -840,14 +834,21 @@ impl CommandRuntime {
                 })
             }
             Event::InteractionCreate(interaction) => {
+                let Some(interaction) = self
+                    .executor
+                    .command_identities()
+                    .resolve_interaction(&interaction.0)
+                else {
+                    return true;
+                };
                 // The gateway also delivers these to the live voice sink. Yield
                 // before user-slot/lane admission so overload cannot answer a
                 // voice-owned command with the shared runtime's busy callback.
-                if self.voice_owns_interaction(&interaction.0) {
+                if self.voice_owns_interaction(&interaction) {
                     return true;
                 }
                 let runtime = Arc::clone(self);
-                let interaction = interaction.0.clone();
+                let interaction = interaction.into_owned();
                 let is_ticket = matches!(
                     interaction.data.as_ref(),
                     Some(twilight_model::application::interaction::InteractionData::MessageComponent(component))
@@ -1092,6 +1093,14 @@ impl CommandRuntime {
         if application_id != 0 && interaction.application_id.get() != application_id {
             return;
         }
+        let Some(interaction) = self
+            .executor
+            .command_identities()
+            .resolve_interaction(interaction)
+        else {
+            return;
+        };
+        let interaction = interaction.as_ref();
         if ChannelModerationRuntime::accepts(interaction) {
             if let Err(error) = self
                 .channel
@@ -1654,8 +1663,12 @@ impl CommandRuntime {
         match plan_command(&context, command) {
             Ok(FeedCommandPlan::Add(relay)) => {
                 if let Err(err) = add_feed(&self.pool, &relay).await {
-                    warn!(error = %err, "feed insert failed");
-                    self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                    if let two_bot_core::feeds_store::FeedStoreError::Capacity(quota) = err {
+                        self.finish(interaction, quota.to_string()).await;
+                    } else {
+                        warn!(error = %err, "feed insert failed");
+                        self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                    }
                     return;
                 }
                 self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str())

@@ -162,10 +162,13 @@ refused without explicit dry-run `0` outside session mode, and R2 has no armed
 path. **Landed — containment:** `crates/bot/src/containment_runtime.rs`
 (audit-entry observer seam, fenced construction, verified application identity,
 dry-run-default plans, armed-only removals, shared-executor staff posts).
-**Remaining:** staging soak — 7 consecutive days with zero missed gateway events
-on TWO Staging behind `TWO_ANTI_NUKE=1` (dry-run default), recorded on the soak
-card; moderation stays staging-gated until it passes. The executor seam is TOG-10076; no
-private production HTTP client is added here. The transactional join-risk
+**Remaining:** B2 staging soak under the four-ACTIVE-hour policy, with zero
+missed events across joins, voice, messages and slash, including the required
+120 expected one-minute samples in hours 3–4. Every actual outage must recover
+in under 60 seconds from outage start to verified recovery. The feature remains
+behind `TWO_ANTI_NUKE=1` (dry-run default), and moderation stays staging-gated
+until acceptance is verified and recorded. No private production HTTP client
+is added here. The transactional join-risk
 claim store (`join_risk_store`, migration `0360_join_risk_flags.sql`, legacy
 0015 shape) serializes per-guild event-ID claims, counts prior rows by
 processing-time `created_at`, scores with the current join, and persists the

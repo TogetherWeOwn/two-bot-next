@@ -133,10 +133,14 @@ probes. Tests continue to run on test containers only.
       record funnel events and projections, with duplicate delivery deduped.
       Use operator-provided sanitized runtime evidence; do not run engineer
       tests, fixtures, probes or verification queries against staging databases.
-- [ ] Start the seven-day soak only after those gates pass. Record start/end UTC,
-      versioned image, restart/error counts, persisted attribution and database
-      readiness observations. Any data-loss/duplicate/contract regression stops
-      the soak and returns to the same implementation card.
+- [ ] Start the four-ACTIVE-hour B2 soak only after the qualifying preconditions,
+      approved record and evidence route are independently verified. Set `T`
+      through that record only after the gates pass; otherwise leave it unset.
+      The passive seven-day clock and passive 60-minute entry wait are retired;
+      this change does not waive any gate. Record only through the existing
+      reviewed evidence path. Any data-loss/duplicate/contract regression fails
+      acceptance; preserve the historical record and follow the separately
+      reviewed stop/restore disposition.
 - [ ] Record staging acceptance and retain the rollback artifact before requesting
       any production cutover. A passing local fixture is not staging acceptance.
 

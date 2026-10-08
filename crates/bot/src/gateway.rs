@@ -476,6 +476,19 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let _voice_connection = VoiceConnectionGuard(voice.clone());
     let generation = Arc::new(AtomicU64::new(0));
     let saved = checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, store.load()).await?;
+    if let Some(voice) = &voice {
+        let executor = runtime
+            .as_ref()
+            .map(|runtime| runtime.executor())
+            .or_else(|| {
+                interactions
+                    .as_ref()
+                    .map(|ordered| ordered.executor.clone())
+            });
+        if let Some(executor) = executor {
+            voice.set_command_identities(executor.command_identities());
+        }
+    }
     // ONE complete serialized registry owner at boot. The detached command
     // runtime's publisher merges persisted enabled custom rows with the
     // constrained builtin surface; the ordered `publish_current` path would

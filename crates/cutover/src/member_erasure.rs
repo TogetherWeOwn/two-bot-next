@@ -2,6 +2,17 @@
 //!
 //! The embedded plan is reviewed code, never operator input. Count and delete
 //! use the same predicate; a row matching several identity columns counts once.
+//!
+//! One row is deliberately never selected: a `moderation_idempotency` request
+//! an operator reconciled and released (`done` / `operator_released`). Its
+//! Discord effect was never proven, so that row is the replay fence that stops a
+//! delayed delivery of the same key from claiming afresh and repeating the
+//! mutation. It retains guild/key scope, action, terminal state/outcome, generic
+//! result, timestamps and fixed non-identity `claim_token` / `request_hash`
+//! markers. The caller-supplied key may itself be a member snowflake; that
+//! identity-bearing exception remains because changing it would let a delayed
+//! delivery claim afresh. The linked `moderation_audit` row, including matching
+//! key and free-text reason, remains covered by the erasure manifest.
 
 use serde::Deserialize;
 use sqlx::{PgConnection, PgPool};
