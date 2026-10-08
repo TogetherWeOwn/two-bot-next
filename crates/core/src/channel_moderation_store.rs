@@ -42,7 +42,7 @@ pub enum ChannelClaim {
     },
     /// An earlier attempt is still uncertain; caller must refuse `in_progress`.
     InFlight,
-    /// Key was used for different request content; caller must refuse `malformed`.
+    /// Key is retired or was used for different request content; caller must refuse.
     Mismatch,
 }
 
@@ -287,14 +287,21 @@ impl ChannelModerationStore {
             // attempt releasing its claim. Still running; the caller retries.
             return Ok(ChannelClaim::InFlight);
         };
+        let state: String = row.get("state");
+        let outcome: Option<String> = row.get("outcome");
         let stored_action: String = row.get("action");
-        let stored_hash: String = row.get("request_hash");
-        if stored_action != action || stored_hash != request_hash {
+        if stored_action != action {
             return Ok(ChannelClaim::Mismatch);
         }
-        let state: String = row.get("state");
+        if state == "done" && outcome.as_deref() == Some("operator_released") {
+            // The original hash is erased, so this key cannot be proven identical.
+            return Ok(ChannelClaim::Mismatch);
+        }
+        let stored_hash: String = row.get("request_hash");
+        if stored_hash != request_hash {
+            return Ok(ChannelClaim::Mismatch);
+        }
         if state == "done" {
-            let outcome: Option<String> = row.get("outcome");
             let result_json: Option<String> = row.get("result_json");
             return Ok(ChannelClaim::Replayed {
                 outcome: outcome.unwrap_or_else(|| "unknown".to_owned()),

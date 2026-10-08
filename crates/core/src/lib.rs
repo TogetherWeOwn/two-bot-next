@@ -14,6 +14,8 @@ pub mod audit_mirror;
 pub mod audit_service;
 #[cfg(feature = "db")]
 pub mod audit_store;
+#[cfg(feature = "db")]
+pub mod automation_quota;
 pub mod automation_transfer;
 pub mod automod;
 pub mod automod_runtime;
@@ -21,6 +23,8 @@ pub mod automod_runtime;
 pub mod automod_store;
 pub mod backup;
 pub mod channel_moderation;
+#[cfg(feature = "db")]
+pub mod channel_moderation_release;
 #[cfg(feature = "db")]
 pub mod channel_moderation_store;
 pub mod classify;

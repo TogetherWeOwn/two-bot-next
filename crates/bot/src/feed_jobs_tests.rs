@@ -20,6 +20,25 @@ use crate::{
 const GUILD: &str = "2222";
 const CHANNEL: &str = "3333";
 
+async fn run_once(
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    fetch: &dyn FeedFetch,
+) -> Result<(), ErrorClass> {
+    FeedPoller::default()
+        .run_once(pool, rest, guild, fetch)
+        .await
+}
+
+async fn reconcile(rest: &ActionExecutor, post: &FeedPost) -> Result<String, ErrorClass> {
+    let mut recovery = RecoveryBudget {
+        deadline: tokio::time::Instant::now() + RECOVERY_BUDGET,
+        reads: 0,
+    };
+    super::reconcile(rest, post, &mut recovery).await
+}
+
 fn executor(mock: &MockRest) -> ActionExecutor {
     crate::gateway::ensure_crypto_provider();
     ActionExecutor::with_proxy("synthetic-feed-test-token".to_owned(), Some(mock.origin())).unwrap()
@@ -839,6 +858,431 @@ async fn bounded_recovery_rotates_unresolved_rows_even_when_they_remain_in_xml()
         mock.requests().iter().filter(|r| r.method == "GET").count(),
         80
     );
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn slow_unresolved_history_leaves_fresh_progress_and_shared_admission_each_pass() {
+    let db = fixture().await;
+    let relay = feed("slow_recovery");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    for index in 0..8 {
+        let post = plan_post(&relay, &item(index)).unwrap();
+        assert_eq!(
+            store::claim_delivery(
+                db.pool(),
+                GUILD,
+                &post,
+                &format!("seed-{index}"),
+                now_millis_for_test() - 120_000,
+            )
+            .await
+            .unwrap(),
+            Some(DeliveryClaim::Fresh),
+        );
+    }
+    let sent = Arc::new(AtomicUsize::new(0));
+    let responses = sent.clone();
+    let mock = MockRest::with_responder(move |request| {
+        if request.method == "GET" && request.path.ends_with("/users/@me") {
+            me()
+        } else if request.method == "GET" && request.path.contains("/messages") {
+            // Eight misses would consume more than the full relay deadline.
+            // Each successful read still finishes inside the REST wire limit.
+            ScriptedResponse::json(200, json!([])).delayed(Duration::from_secs(4))
+        } else if request.method == "POST" && request.path.ends_with("/messages") {
+            let id = 9001 + responses.fetch_add(1, Ordering::SeqCst);
+            ScriptedResponse::json(200, json!({"id":id.to_string()}))
+        } else {
+            ScriptedResponse::status(500)
+        }
+    })
+    .await;
+    let token = "synthetic-feed-test-token";
+    let admission = Arc::new(
+        two_bot_core::send_admission::PgSendAdmission::new(db.pool().clone(), token).unwrap(),
+    );
+    crate::gateway::ensure_crypto_provider();
+    let rest =
+        ActionExecutor::with_admission(token.to_owned(), Some(mock.origin()), admission).unwrap();
+    let poller = FeedPoller::default();
+    let mut reclaimed = 0;
+    for pass in 0..2 {
+        // Simulate the default five-minute cadence, preserving lease order.
+        sqlx::query("UPDATE feed_deliveries SET claimed_at = claimed_at - interval '300 seconds' WHERE state = 'pending'")
+            .execute(db.pool()).await.unwrap();
+        assert_eq!(
+            poller
+                .run_once(db.pool(), &rest, GUILD, &Items(vec![item(8 + pass)]))
+                .await
+                .err(),
+            Some(ErrorClass::Timeout),
+        );
+        assert_eq!(states(db.pool()).await, ((pass + 1) as i64, 8));
+        assert_eq!(post_count(&mock), pass + 1, "only the new fresh item posts");
+        let searched: i64 = sqlx::query_scalar("SELECT count(*) FROM feed_deliveries WHERE state = 'pending' AND claim_token NOT LIKE 'seed-%'")
+            .fetch_one(db.pool()).await.unwrap();
+        assert!(
+            searched > reclaimed,
+            "unsearched pending rows get the next turn"
+        );
+        reclaimed = searched;
+    }
+    let posts = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .collect::<Vec<_>>();
+    for (index, request) in posts.iter().enumerate() {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let fresh = plan_post(&relay, &item(8 + index)).unwrap();
+        assert_eq!(
+            body["nonce"],
+            json!(fresh.nonce),
+            "no recovery row is reposted"
+        );
+    }
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn identity_only_budget_refusal_keeps_the_unsearched_row_first_next_pass() {
+    let db = fixture().await;
+    let relay = feed("identity_budget");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    let unresolved = plan_post(&relay, &item(0)).unwrap();
+    let confirmed = plan_post(&relay, &item(1)).unwrap();
+    // Keep the oldest-first recovery order explicit; equal millisecond claims
+    // fall back to item_key, which need not match source item order.
+    let now_ms = now_millis_for_test();
+    for (index, (post, age_ms)) in [(&unresolved, 180_000), (&confirmed, 120_000)]
+        .into_iter()
+        .enumerate()
+    {
+        store::claim_delivery(
+            db.pool(),
+            GUILD,
+            post,
+            &format!("seed-{index}"),
+            now_ms - age_ms,
+        )
+        .await
+        .unwrap();
+    }
+    let matching_history = history(&confirmed);
+    let mock = MockRest::with_responder(move |request| {
+        if request.method == "GET" && request.path.ends_with("/users/@me") {
+            me().delayed(Duration::from_secs(4))
+        } else if request.method == "GET" && request.path.contains("/messages") {
+            matching_history.clone().delayed(Duration::from_millis(400))
+        } else {
+            ScriptedResponse::status(500)
+        }
+    })
+    .await;
+    let rest = executor(&mock);
+    let poller = FeedPoller::default();
+    for pass in 0..2 {
+        assert_eq!(
+            poller
+                .run_once(db.pool(), &rest, GUILD, &Items(vec![]))
+                .await
+                .err(),
+            Some(ErrorClass::Timeout),
+        );
+        assert_eq!(states(db.pool()).await, (pass, 2 - pass));
+        assert_eq!(post_count(&mock), 0, "history recovery never posts");
+        if pass == 0 {
+            let token: String =
+                sqlx::query_scalar("SELECT claim_token FROM feed_deliveries WHERE item_key = $1")
+                    .bind(&confirmed.item_key)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                token, "seed-1",
+                "identity-only read must not renew the lease"
+            );
+            sqlx::query("UPDATE feed_deliveries SET claimed_at = claimed_at - interval '300 seconds' WHERE state = 'pending'")
+                .execute(db.pool()).await.unwrap();
+            let next =
+                store::pending_deliveries(db.pool(), &relay, now_millis_for_test(), RECOVERY_LIMIT)
+                    .await
+                    .unwrap();
+            assert_eq!(next[0].item_key, confirmed.item_key);
+        }
+    }
+    let message: String =
+        sqlx::query_scalar("SELECT message_id FROM feed_deliveries WHERE item_key = $1")
+            .bind(&confirmed.item_key)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(message, "9001");
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+#[test]
+fn cursor_uses_creation_order_and_survives_removal_or_disable() {
+    let poller = FeedPoller::default();
+    let mut newer = feed("a");
+    newer.created_at = 2;
+    let feeds = vec![feed("b"), feed("c"), newer];
+    assert_eq!(poller.start_index(&feeds), 0);
+    poller.advance(&feeds[0]);
+    assert_eq!(poller.start_index(&feeds), 1);
+    // The cursor need not remain in the enabled listing to find its successor.
+    assert_eq!(poller.start_index(&feeds[1..]), 0);
+    poller.advance(&feeds[1]);
+    assert_eq!(poller.start_index(&feeds), 2);
+    assert_eq!(poller.start_index(&[feeds[0].clone(), feeds[2].clone()]), 1);
+    poller.advance(&feeds[2]);
+    assert_eq!(poller.start_index(&feeds), 0, "wrap exactly once");
+    assert_eq!(poller.start_index(&[]), 0);
+    assert!(RELAY_TIMEOUT < PASS_BUDGET && PASS_BUDGET < JOB_TIMEOUT);
+}
+
+struct SlowFeeds {
+    healthy: String,
+    healthy_delay: Duration,
+    started: tokio::sync::mpsc::UnboundedSender<String>,
+    active: Arc<AtomicUsize>,
+}
+
+impl FeedFetch for SlowFeeds {
+    fn fetch(&self, feed: FeedRelay) -> FetchFuture {
+        let healthy = feed.id == self.healthy;
+        let healthy_delay = self.healthy_delay;
+        let started = self.started.clone();
+        let active = self.active.clone();
+        Box::pin(async move {
+            assert_eq!(
+                active.fetch_add(1, Ordering::SeqCst),
+                0,
+                "no overlapping fetch"
+            );
+            let _active = Active(active);
+            started.send(feed.id).unwrap();
+            if healthy {
+                tokio::time::sleep(healthy_delay).await;
+                Ok(vec![item(0)])
+            } else {
+                std::future::pending().await
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn repeated_deadline_passes_reach_a_healthy_tail_without_overlapping_relays() {
+    let db = fixture().await;
+    // A multiple of four exposes the old residual-slot trap: with 30+30+30+10
+    // seconds per pass, this 15-second tail would ALWAYS get only ten seconds.
+    for index in 0..24 {
+        store::add_feed(db.pool(), &feed(&format!("relay-{index:02}")))
+            .await
+            .unwrap();
+    }
+    let feeds = store::list_feeds(db.pool(), GUILD, true).await.unwrap();
+    let healthy = feeds.last().unwrap().id.clone();
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let active = Arc::new(AtomicUsize::new(0));
+    let fetch = SlowFeeds {
+        healthy: healthy.clone(),
+        healthy_delay: Duration::from_secs(15),
+        started,
+        active: active.clone(),
+    };
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"9001"}))).await;
+    let rest = executor(&mock);
+    let poller = FeedPoller::default();
+    let mut visited = Vec::new();
+    for _ in 0..8 {
+        let run = poller.run_once(db.pool(), &rest, GUILD, &fetch);
+        tokio::pin!(run);
+        let result = loop {
+            tokio::select! {
+                result = &mut run => break result,
+                id = starts.recv() => {
+                    let id = id.unwrap();
+                    visited.push(id.clone());
+                    // The injected fetch is pending; no DB/REST I/O is in
+                    // flight. Resume before polling the next DB operation.
+                    let delay = if id == healthy { fetch.healthy_delay } else { RELAY_TIMEOUT };
+                    tokio::time::pause();
+                    tokio::time::advance(delay + Duration::from_millis(1)).await;
+                    tokio::time::resume();
+                }
+            }
+        };
+        assert_eq!(result, Err(ErrorClass::Timeout));
+        assert_eq!(active.load(Ordering::SeqCst), 0, "timed-out work dropped");
+    }
+    assert_eq!(
+        &visited[..24],
+        &feeds.iter().map(|f| f.id.clone()).collect::<Vec<_>>(),
+        "continuation visits every relay in order before wrapping"
+    );
+    assert_eq!(post_count(&mock), 1, "healthy tail delivered");
+    assert_eq!(states(db.pool()).await, (1, 0));
+    let checked = store::list_feeds(db.pool(), GUILD, true).await.unwrap();
+    assert!(checked.last().unwrap().last_checked_at.is_some());
+    assert!(checked[..23].iter().all(|f| f.last_checked_at.is_none()));
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn aborted_registered_action_retains_cursor_and_drops_work_before_next_pass() {
+    let db = fixture().await;
+    for id in ["slow", "tail"] {
+        store::add_feed(db.pool(), &feed(id)).await.unwrap();
+    }
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let active = Arc::new(AtomicUsize::new(0));
+    let fetch = Arc::new(SlowFeeds {
+        healthy: "tail".to_owned(),
+        healthy_delay: Duration::ZERO,
+        started,
+        active: active.clone(),
+    });
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"9001"}))).await;
+    let rest = Arc::new(executor(&mock));
+    let poller = Arc::new(FeedPoller::default());
+    let job = scheduled_job(
+        60,
+        Arc::new({
+            let pool = db.pool().clone();
+            move || {
+                let pool = pool.clone();
+                let rest = rest.clone();
+                let fetch = fetch.clone();
+                let poller = poller.clone();
+                Box::pin(async move { poller.run_once(&pool, &rest, GUILD, fetch.as_ref()).await })
+            }
+        }),
+    )
+    .unwrap();
+    let run = tokio::spawn((job.action)());
+    assert_eq!(starts.recv().await.unwrap(), "slow");
+    run.abort();
+    assert!(run.await.unwrap_err().is_cancelled());
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::resume();
+    let run = tokio::spawn((job.action)());
+    assert_eq!(
+        starts.recv().await.unwrap(),
+        "tail",
+        "cursor retained by job"
+    );
+    assert_eq!(
+        starts.recv().await.unwrap(),
+        "slow",
+        "wrap after delivering tail"
+    );
+    run.abort();
+    assert!(run.await.unwrap_err().is_cancelled());
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert_eq!(post_count(&mock), 1);
+    assert_eq!(states(db.pool()).await, (1, 0));
+    drop(job);
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn relay_deadline_preserves_delivered_pending_and_fresh_items_across_restart() {
+    let db = fixture().await;
+    let relay = feed("send_deadline");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    let pending = plan_post(&relay, &item(1)).unwrap();
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!({"id":"9001"})),
+            // Shorter than the executor's wire deadline, longer than the relay's.
+            ScriptedResponse::json(200, json!({"id":"9002"})).delayed(Duration::from_secs(4)),
+            me(),
+            ScriptedResponse::json(200, json!([])),
+            ScriptedResponse::json(200, json!({"id":"9003"})),
+            me(),
+            ScriptedResponse::json(
+                200,
+                json!([{
+                    "id":"9002", "channel_id":CHANNEL,
+                    "author":{"id":"5555"}, "nonce":pending.nonce
+                }]),
+            ),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let rest = executor(&mock);
+    let poller = FeedPoller {
+        relay_timeout: Duration::from_secs(3),
+        ..FeedPoller::default()
+    };
+    assert_eq!(
+        poller
+            .run_once(db.pool(), &rest, GUILD, &FixtureHttp::items(3))
+            .await,
+        Err(ErrorClass::Timeout)
+    );
+    assert_eq!(
+        post_count(&mock),
+        2,
+        "relay cancelled during the second POST"
+    );
+    assert_eq!(
+        states(db.pool()).await,
+        (1, 1),
+        "confirmed receipt survives, ambiguous claim remains"
+    );
+    let fresh = plan_post(&relay, &item(2)).unwrap();
+    let fresh_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM feed_deliveries WHERE item_key = $1")
+            .bind(&fresh.item_key)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(fresh_rows, 0, "unvisited fresh item was not claimed");
+    expire(db.pool()).await;
+    let reopened = db.independent_pool().await.unwrap();
+    assert_eq!(
+        run_once(&reopened, &rest, GUILD, &FixtureHttp::items(3)).await,
+        Err(ErrorClass::RecoveryRequired)
+    );
+    assert_eq!(states(&reopened).await, (2, 1));
+    assert_eq!(
+        post_count(&mock),
+        3,
+        "history miss does not repost pending item"
+    );
+    expire(&reopened).await;
+    run_once(&reopened, &rest, GUILD, &FixtureHttp::items(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        states(&reopened).await,
+        (3, 0),
+        "late receipt reconciled without XML"
+    );
+    assert_eq!(post_count(&mock), 3);
+    let message: String =
+        sqlx::query_scalar("SELECT message_id FROM feed_deliveries WHERE item_key = $1")
+            .bind(&pending.item_key)
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+    assert_eq!(message, "9002");
+    let summaries: i64 = sqlx::query_scalar("SELECT count(*) FROM announcements_audit_log WHERE outcome = 'poll_result' AND reason LIKE '%reconciled=1%'")
+        .fetch_one(&reopened).await.unwrap();
+    assert_eq!(summaries, 1);
+    reopened.close().await;
     mock.shutdown().await;
     db.close().await.unwrap();
 }

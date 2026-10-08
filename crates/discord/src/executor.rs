@@ -762,6 +762,7 @@ struct ExecutorInner {
     /// encoding) and for publish/callback sends with default mention
     /// suppression.
     factory: TwilightClient,
+    command_identities: crate::command_identity::CommandIdentities,
     pace_interval: Duration,
     kick_interval: Duration,
     moderation_timeout: Duration,
@@ -855,6 +856,7 @@ impl ActionExecutor {
             inner: Arc::new(ExecutorInner {
                 transport,
                 factory: builder.build(),
+                command_identities: crate::command_identity::CommandIdentities::default(),
                 pace_interval: Duration::from_millis(PACE_INTERVAL_MS),
                 kick_interval: Duration::from_millis(KICK_INTERVAL_MS),
                 moderation_timeout: Duration::from_millis(MODERATION_TIMEOUT_MS),
@@ -870,6 +872,12 @@ impl ActionExecutor {
                 requests: std::sync::atomic::AtomicU64::new(0),
             }),
         })
+    }
+
+    /// Identity snapshots shared with interaction admission and voice handlers.
+    #[must_use]
+    pub fn command_identities(&self) -> crate::command_identity::CommandIdentities {
+        self.inner.command_identities.clone()
     }
 
     /// Requests made so far: the run's own Discord cost report.
@@ -2749,6 +2757,11 @@ impl ActionExecutor {
         if publish {
             self.publish_guild_commands(application_id, guild_id, commands)
                 .await?;
+        } else {
+            self.inner
+                .command_identities
+                .replace_guild(application_id, guild_id, &current)
+                .map_err(|error| DiscordError::Unavailable(error.to_owned()))?;
         }
         Ok((diff, publish))
     }
@@ -2888,6 +2901,10 @@ impl ActionExecutor {
                             "incomplete command registry receipt".to_owned(),
                         ));
                     }
+                    self.inner
+                        .command_identities
+                        .replace_guild(application_id, guild_id, &published)
+                        .map_err(|error| DiscordError::Unavailable(error.to_owned()))?;
                     return Ok(());
                 }
                 429 => {

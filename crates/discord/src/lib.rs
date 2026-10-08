@@ -7,11 +7,14 @@
 
 pub mod adapter;
 pub mod audit_mirror;
+#[cfg(feature = "db")]
+mod automation_admission;
 pub mod automod;
 pub mod automod_activation;
 pub mod channel_access;
 #[cfg(feature = "db")]
 pub mod channel_moderation;
+pub mod command_identity;
 pub mod command_registry;
 #[cfg(feature = "db")]
 pub mod custom_commands;

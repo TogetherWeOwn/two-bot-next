@@ -28,6 +28,8 @@ use two_bot_core::backup::{
 pub fn print_server_usage() {
     println!("{}", crate::preflight::USAGE);
     print!("{}", crate::erasure_cli::USAGE);
+    print!("{}", crate::moderation_cli::USAGE);
+    print!("{}", crate::moderation_release_cli::USAGE);
     print!("{}", crate::member_cli::USAGE);
 }
 

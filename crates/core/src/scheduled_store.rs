@@ -2,9 +2,9 @@
 //!
 //! Ports `src/automations/store.ts`'s scheduled-message and audit section from
 //! legacy `two-bot` (frozen `main`) to sqlx/Postgres, behind the crate's `db`
-//! feature so pure-domain unit tests never need a driver. Same discipline as
-//! the legacy store: NOTHING HERE DECIDES ANYTHING — one SQL statement (or a
-//! read-modify-write the database serialises per row) per method; validation
+//! feature so pure-domain unit tests never need a driver. Definition writes
+//! serialize guild capacity admission with their upsert; other methods use
+//! one SQL statement or a database-serialized read-modify-write. Validation
 //! lives in [`crate::scheduled`]; audit rows carry ids and outcomes, never
 //! message content.
 //!
@@ -24,6 +24,7 @@
 
 use sqlx::{Pool, Postgres};
 
+use crate::automation_quota::{lock_quota, AutomationQuota, QuotaWriteError};
 use crate::scheduled::advance_next_run_iso;
 
 /// One scheduled message row (legacy `ScheduledMessageRow`).
@@ -227,11 +228,35 @@ pub async fn retry_scheduled(
 /// upsert). Like legacy, a replace clears any live claim and nonce — the old
 /// occurrence is cancelled by definition — and preserves the original
 /// creator/creation time plus the last run facts. Returns `false` when the id
-/// belongs to another guild (legacy guild-scoped `WHERE` no-match).
+/// belongs to another guild (legacy guild-scoped `WHERE` no-match). New
+/// definitions are capped at 25 per guild, including disabled/completed rows;
+/// replacing an existing definition remains allowed at or above capacity.
 pub async fn put_scheduled(
     pool: &Pool<Postgres>,
     row: &ScheduledWrite,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, QuotaWriteError> {
+    let mut tx = pool.begin().await?;
+    lock_quota(&mut tx, &row.guild_id, AutomationQuota::Schedules).await?;
+    let owner: Option<String> =
+        sqlx::query_scalar("SELECT guild_id FROM scheduled_messages WHERE id = $1")
+            .bind(&row.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some(owner) = owner {
+        if owner != row.guild_id {
+            return Ok(false);
+        }
+    } else {
+        // Disabled and completed definitions still consume storage capacity.
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM scheduled_messages WHERE guild_id = $1")
+                .bind(&row.guild_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if count >= AutomationQuota::Schedules.limit() {
+            return Err(QuotaWriteError::Capacity(AutomationQuota::Schedules));
+        }
+    }
     let result = sqlx::query(
         "INSERT INTO scheduled_messages
            (id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
@@ -261,8 +286,9 @@ pub async fn put_scheduled(
     .bind(&row.created_at)
     .bind(&row.updated_by)
     .bind(&row.updated_at)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 

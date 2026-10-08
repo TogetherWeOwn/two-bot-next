@@ -42,6 +42,12 @@ fails on any new `TWO_*` literal in neither list.
 
 ## Residual parent work
 
+Before adding the handler or HTTP transport, satisfy the
+[template-assistant security gates](command-wiring-security.md#templateassistant):
+HTTPS to an approved environment-fixed destination, no redirects, credential
+binding and redaction, runtime authority and per-user limits. The permissive
+pure-core endpoint predicate and command publication do not satisfy these gates.
+
 The per-guild monthly-cap DB column (the V12a `voice_assistant_cap` ledger
 consumes the persisted row), the endpoint call with the validated V12b
 payload, the V12c six-scenario validation before the admin sees output, the

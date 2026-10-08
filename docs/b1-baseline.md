@@ -37,8 +37,10 @@ Peak measured RSS ≈ 153 MiB < 200 MiB nominally passes the lite gate — but t
 mock guild is ~3% of the real member count and discord.js caches (members,
 messages, voice states) grow with it. TOG-9408 already flagged "RSS likely
 >256 MiB → moves to basic ≈ $7–9". One OOM-kill of the gateway drops joins;
-the $5.30/mo lite→basic step is not worth that risk. **Ship `basic`.** Revisit
-`lite` only after the B2 staging-guild soak measures a real 107-member cache.
+the $5.30/mo lite→basic step is not worth that risk. **Ship `basic`.** Any
+later placement decision requires separate review; B2's four-ACTIVE-hour
+evidence does not establish numeric RSS acceptance criteria or authorize a
+placement change.
 
 ## Cost (Cloudflare Container pricing, per TOG-9408/ADR-0001 model)
 
@@ -58,8 +60,10 @@ Guild: ~84 humans / 107 members. Bot subscribes to 11 gateway event families
 ~1.5k–3.5k gateway dispatches/day (presence/typing noise excluded; Discord
 does not send those for these intents). At 2.5 dispatches/s in this soak, one
 day of traffic ≈ 10–25 min of processing; CPU is noise either way (<1% of even
-the 1/16-vCPU lite slice). B2's 7-day staging soak should replace this estimate
-with a counted number.
+the 1/16-vCPU lite slice). This remains a historical planning estimate, not a B2
+acceptance criterion. The four-ACTIVE-hour policy supersedes the former seven-day
+plan; any later verified counts belong in a separate record and do not replace
+this estimate retroactively.
 
 ## Container keepalive verdict: DO-alarm keepalive REQUIRED
 

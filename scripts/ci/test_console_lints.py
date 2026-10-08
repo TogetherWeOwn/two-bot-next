@@ -9,6 +9,7 @@ CLI_MODULES = {
     "crates/bot/src/commands_cli.rs",
     "crates/bot/src/database_roles_cli.rs",
     "crates/bot/src/moderation_cli.rs",
+    "crates/bot/src/moderation_release_cli.rs",
     "crates/bot/src/preflight.rs",
     "crates/core/examples/metrics_rss.rs",
     "crates/core/examples/evidence_reconcile.rs",
