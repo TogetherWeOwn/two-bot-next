@@ -4690,6 +4690,12 @@ fn elapsed_ms(now_ms: u64, started: Instant) -> u64 {
 /// complete. Live evidence is published synchronously before actor commands;
 /// network/database writes remain serialized on each guild actor's timer.
 pub trait VoiceEventSink: Send + Sync {
+    /// Share the registry publisher's live identity snapshots before dispatch.
+    fn set_command_identities(
+        &self,
+        _identities: two_bot_discord::command_identity::CommandIdentities,
+    ) {
+    }
     fn handle(&self, event: &Event, cache: &DefaultInMemoryCache);
     /// Invalidate occupancy immediately on connection loss, including while an
     /// actor is awaiting SQL, HTTP or token-global rate-limit backoff.
@@ -4852,6 +4858,7 @@ pub struct VoiceRuntime<S, H> {
     pending_imports: Mutex<HashMap<(Snowflake, Snowflake, String), PendingImport>>,
     /// Automod policy every room-name and `/create` name is filtered under.
     name_policy: Arc<AutomodPolicy>,
+    command_identities: RwLock<two_bot_discord::command_identity::CommandIdentities>,
 }
 
 impl<S, H> VoiceRuntime<S, H>
@@ -4878,7 +4885,15 @@ where
             access_lock: tokio::sync::Mutex::new(()),
             pending_imports: Mutex::new(HashMap::new()),
             name_policy: Arc::new(AutomodPolicy::default()),
+            command_identities: RwLock::new(
+                two_bot_discord::command_identity::CommandIdentities::default(),
+            ),
         }
+    }
+
+    fn parse_voice_command(&self, interaction: &Interaction) -> Option<VoiceCommand> {
+        let identities = self.command_identities.read().ok()?;
+        parse_voice_command_with_registry(interaction, &identities)
     }
 
     /// Install boot configuration before spawning any actors.
@@ -5279,6 +5294,16 @@ where
     S: RoomPersistence + Send + 'static,
     H: RoomWrites + Send + 'static,
 {
+    fn set_command_identities(
+        &self,
+        identities: two_bot_discord::command_identity::CommandIdentities,
+    ) {
+        *self
+            .command_identities
+            .write()
+            .expect("voice identity lock") = identities;
+    }
+
     fn handle(&self, event: &Event, cache: &DefaultInMemoryCache) {
         if !self.enabled {
             return;
@@ -6733,10 +6758,20 @@ pub fn interaction_guild(interaction: &Interaction) -> Option<Snowflake> {
     interaction.guild_id.map(|id| id.get())
 }
 
-/// Parse a voice command, or `None` for anything this slice does not own
-/// (non-command interactions, other commands, guild-less invocations).
+/// Parse with the unknown-registration name fallback. Production handlers use
+/// the runtime's shared registration snapshots instead.
 #[must_use]
 pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
+    parse_voice_command_with_registry(
+        interaction,
+        &two_bot_discord::command_identity::CommandIdentities::default(),
+    )
+}
+
+fn parse_voice_command_with_registry(
+    interaction: &Interaction,
+    identities: &two_bot_discord::command_identity::CommandIdentities,
+) -> Option<VoiceCommand> {
     // Ballot buttons bypass the slash parser: the custom ID carries the vote.
     // Unknown custom IDs stay silent here so the shared router keeps them.
     if interaction.kind == InteractionType::MessageComponent {
@@ -6753,7 +6788,8 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
         return None;
     };
     interaction_guild(interaction)?;
-    match command.name.as_str() {
+    let name = identities.slash_name(interaction)?;
+    match name.as_str() {
         "create" => {
             let name = command
                 .options
@@ -7723,7 +7759,7 @@ where
     if let Some(click) = join_component_action(interaction) {
         return handle_join_interaction(runtime, interaction, guild_id, click, reply).await;
     }
-    let Some(command) = parse_voice_command(interaction) else {
+    let Some(command) = runtime.parse_voice_command(interaction) else {
         return false;
     };
     // Guild-level role gate first. Settings that cannot be read fail closed for
@@ -8744,13 +8780,13 @@ where
         // then `kick_vote` for the occupants it refused). Acknowledging here
         // would race it and could answer twice.
         if matches!(
-            parse_voice_command(interaction),
+            runtime.parse_voice_command(interaction),
             Some(VoiceCommand::Kick { .. })
         ) {
             return;
         }
         if matches!(
-            parse_voice_command(interaction),
+            runtime.parse_voice_command(interaction),
             Some(VoiceCommand::Ballot { .. })
         ) || join_component_action(interaction).is_some()
         {
@@ -8831,7 +8867,8 @@ where
         if !runtime.enabled {
             return false;
         }
-        let Some(VoiceCommand::Kick { target, .. }) = parse_voice_command(interaction) else {
+        let Some(VoiceCommand::Kick { target, .. }) = runtime.parse_voice_command(interaction)
+        else {
             return false;
         };
         let (Some(guild), Some(initiator)) = (
@@ -8887,13 +8924,20 @@ where
     H: RoomWrites + 'static,
     R: InteractionReplies + 'static,
 {
+    fn set_command_identities(
+        &self,
+        identities: two_bot_discord::command_identity::CommandIdentities,
+    ) {
+        self.runtime.set_command_identities(identities);
+    }
+
     fn handle(&self, event: &Event, cache: &DefaultInMemoryCache) {
         self.runtime.handle(event, cache);
         if !self.runtime.enabled {
             return;
         }
         if let Event::InteractionCreate(created) = event {
-            let command = parse_voice_command(&created.0);
+            let command = self.runtime.parse_voice_command(&created.0);
             // The shared router answers `/kick`; see `kick_vote`.
             if matches!(command, Some(VoiceCommand::Kick { .. })) {
                 return;

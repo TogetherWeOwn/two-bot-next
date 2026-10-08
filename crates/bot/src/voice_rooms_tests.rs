@@ -3901,6 +3901,60 @@ fn parse_create_without_name_defaults_blank_for_refusal() {
     );
 }
 
+#[tokio::test]
+async fn registered_voice_identity_drives_parsing_and_refused_ids_have_no_effects() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let identities = two_bot_discord::command_identity::CommandIdentities::default();
+    let mut commands = two_bot_discord::publish_commands(&[
+        CommandDefinition::new("setup", "Synthetic setup."),
+        CommandDefinition::new("help", "Synthetic help."),
+        CommandDefinition::new("create", "Synthetic create."),
+    ]);
+    for (index, command) in commands.iter_mut().enumerate() {
+        command.id = Some(Id::new(9000 + index as u64));
+        command.application_id = Some(Id::new(1));
+        command.guild_id = Some(Id::new(GUILD));
+    }
+    identities.replace_guild(1, GUILD, &commands).unwrap();
+    runtime.set_command_identities(identities.clone());
+    let mut data = command_data("not-setup", Vec::new());
+    data.id = Id::new(9000);
+    data.guild_id = Some(Id::new(GUILD));
+    assert_eq!(
+        runtime.parse_voice_command(&voice_interaction(Some(data), None, true)),
+        Some(VoiceCommand::Setup)
+    );
+    for id in [9001, 9999] {
+        let mut data = command_data("create", vec![command_option("name", "lobby")]);
+        data.id = Id::new(id);
+        data.guild_id = Some(Id::new(GUILD));
+        let interaction = voice_interaction(Some(data), Some(Permissions::MANAGE_CHANNELS), true);
+        assert_eq!(runtime.parse_voice_command(&interaction), None);
+        let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
+        let writer = seen.clone();
+        let owned = handle_voice_interaction(&runtime, &interaction, move |response| {
+            *writer.lock().unwrap() = Some(response);
+            async {}
+        })
+        .await;
+        assert!(!owned);
+        assert!(seen.lock().unwrap().is_none());
+        assert!(
+            trace.lock().unwrap().is_empty(),
+            "refusal makes no store/Discord call"
+        );
+    }
+    identities.replace_guild(1, GUILD, &[]).unwrap();
+    let mut data = command_data("setup", Vec::new());
+    data.id = Id::new(9000);
+    data.guild_id = Some(Id::new(GUILD));
+    assert_eq!(
+        runtime.parse_voice_command(&voice_interaction(Some(data), None, true)),
+        None
+    );
+}
+
 #[test]
 fn parse_setup_command() {
     let interaction = voice_interaction(Some(command_data("setup", Vec::new())), None, true);

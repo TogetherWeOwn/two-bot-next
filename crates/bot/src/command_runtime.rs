@@ -804,15 +804,10 @@ impl CommandRuntime {
         if application_id != 0 && interaction.application_id.get() != application_id {
             return false;
         }
-        if interaction.kind
-            != twilight_model::application::interaction::InteractionType::ApplicationCommand
-        {
-            return false;
-        }
-        let Some(InteractionData::ApplicationCommand(command)) = interaction.data.as_ref() else {
-            return false;
-        };
-        self.interactions.router.voice_owns_command(&command.name)
+        self.executor
+            .command_identities()
+            .slash_name(interaction)
+            .is_some_and(|name| self.interactions.router.voice_owns_command(&name))
     }
 
     /// Admit before spawning, without waiting on SQL/REST in the shard loop.

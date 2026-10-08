@@ -1709,11 +1709,23 @@ async fn voice_owned_command_yields_before_per_member_admission() {
     )
     .await;
 
-    let voice = interaction_event(from_member(
-        slash("ping", Some(CHANNEL), Vec::new()),
-        42,
-        Permissions::empty(),
-    ));
+    let mut published = two_bot_discord::publish_commands(&[two_bot_core::CommandDefinition::new(
+        "ping",
+        "Synthetic voice ping.",
+    )]);
+    published[0].id = Some(Id::new(9001));
+    runtime
+        .executor()
+        .command_identities()
+        .replace_guild(1111, GUILD, &published)
+        .unwrap();
+    let mut invocation = slash("help", Some(CHANNEL), Vec::new());
+    let Some(InteractionData::ApplicationCommand(command)) = invocation.data.as_mut() else {
+        unreachable!();
+    };
+    command.id = Id::new(9001);
+    command.guild_id = Some(Id::new(GUILD));
+    let voice = interaction_event(from_member(invocation, 42, Permissions::empty()));
     assert!(runtime.dispatch(&voice), "the voice sink owns /ping");
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
