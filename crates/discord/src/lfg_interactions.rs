@@ -476,7 +476,11 @@ mod tests {
     async fn signup_refusal_precedes_queue_and_pool_and_exempts_recovery() {
         let service = service();
         service.pool.close().await;
-        let executor = ActionExecutor::new("lfg-admission-fixture".into()).unwrap();
+        let executor = ActionExecutor::with_proxy(
+            "lfg-admission-fixture".into(),
+            Some("http://127.0.0.1:1".into()),
+        )
+        .unwrap();
         let request = || {
             LfgRequest::Select(LfgSelectAction::Signup {
                 post_id: "post".into(),
