@@ -21,15 +21,99 @@ fn admission_lazy_pool_rejects_query_secrets_before_sqlx_logging() {
         rt.block_on(async {
             let error = admission_pool("postgres://fixture:fixture-password@127.0.0.1:1/fixture?api_key=fixture-admission-query-secret").unwrap_err();
             assert_eq!(error, "invalid admission authority");
-            let pool = admission_pool("postgres://fixture:fixture-password@127.0.0.1:1/fixture?sslmode=disable").unwrap();
-            assert_eq!(pool.size(), 0);
-            pool.close().await;
+            // Remote plaintext is refused under either policy (weak mode under
+            // `Required`, remote host under `LocalOnly`), so the env wrapper
+            // reads as the same redacted code regardless of process policy.
+            let error = admission_pool("postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=disable").unwrap_err();
+            assert_eq!(error, "invalid admission authority");
+            assert!(!error.contains("fixture"));
             tracing::warn!("website admission capture remains active");
         });
     });
     let text = capture.text();
     assert!(text.contains("website admission capture remains active"));
     assert!(!text.contains("fixture-admission-query-secret"));
+    assert!(!text.contains("fixture-db-password"));
+    assert!(!text.contains("ep-fixture-host"));
+    assert!(!text.contains("ignoring unrecognized connect parameter"));
+}
+
+/// Threat-model F6: the shared admission fence refuses plaintext, unverified
+/// and wrong-host URLs with fixed strings before SQLx parses or connects, and
+/// the `LocalOnly` happy path builds a lazy pool with no socket. Mirrors
+/// `crates/store/tests/tls_refusal.rs`.
+#[test]
+fn admission_pool_tls_fence_refuses_plaintext_and_wrong_hosts() {
+    use two_bot_core::database_tls::TlsPolicy;
+    let cases = [
+        (
+            "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=disable",
+            TlsPolicy::Required,
+            "database sslmode does not require TLS",
+        ),
+        (
+            "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=prefer",
+            TlsPolicy::Required,
+            "database sslmode does not require TLS",
+        ),
+        (
+            "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db",
+            TlsPolicy::Required,
+            "database URL must set sslmode under the required TLS policy",
+        ),
+        (
+            "postgres://fixture-user:fixture-db-password@fixture-host/fixture-db?sslmode=verify-full",
+            TlsPolicy::Required,
+            "local database host is refused under the required TLS policy",
+        ),
+        (
+            "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=verify-full",
+            TlsPolicy::LocalOnly,
+            "remote database host is refused under the local-only TLS policy",
+        ),
+        (
+            "postgres://fixture-user:fixture-db-password@fixture-host/fixture-db?sslmode=fixture-mode",
+            TlsPolicy::LocalOnly,
+            "unsupported database sslmode",
+        ),
+    ];
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for (url, policy, expected) in cases {
+                let error = admission_pool_with_tls(url, policy).unwrap_err();
+                assert_eq!(error, expected, "{url}");
+                assert!(!error.contains("fixture"), "TLS refusal echoed the URL");
+            }
+            // Happy paths: no socket opens (lazy), so no database is needed.
+            for (url, policy) in [
+                (
+                    "postgres://fixture:fixture-password@127.0.0.1:1/fixture?sslmode=disable",
+                    TlsPolicy::LocalOnly,
+                ),
+                (
+                    "postgres://fixture:fixture-password@127.0.0.1:1/fixture",
+                    TlsPolicy::LocalOnly,
+                ),
+                (
+                    "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=verify-full",
+                    TlsPolicy::Required,
+                ),
+            ] {
+                let pool = admission_pool_with_tls(url, policy).unwrap();
+                assert_eq!(pool.size(), 0);
+                pool.close().await;
+            }
+            tracing::warn!("website admission capture remains active");
+        });
+    });
+    let text = capture.text();
+    assert!(text.contains("website admission capture remains active"));
+    assert!(!text.contains("fixture"), "TLS refusal reached logs");
     assert!(!text.contains("ignoring unrecognized connect parameter"));
 }
 
