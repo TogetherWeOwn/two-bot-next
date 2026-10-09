@@ -497,6 +497,7 @@ test("cpu_math_exact: checked wide integers, one floor of the full numerator, no
   }
   // Two busy cores exceed 100% of one core and stay unclamped.
   assert.ok(BigInt(FIX.cpu_math[3]!.one_core) > 100_000_000n);
+  assert.equal(C.cpuRates(123456789012n, 987654321n, 100, null)?.one_core, 124999998873087500n, "exact beyond 2^53");
   // A result that does not fit u64 is unknown, never saturated; bad inputs are unknown too.
   assert.deepEqual(C.cpuRates(1n << 63n, 1n, 100, null), { one_core: null, allocated: null, overflow: true });
   assert.equal(C.cpuRates(1n, 0n, 100, null), null);
@@ -1278,7 +1279,8 @@ test("seal_crash_and_denial: a first denial is absorbing for the writer; crashes
     assert.deepEqual(opened, { opened: false, flags: mask("FAILED_WRITE", "AUTHORITY_MISSING") });
     assert.equal(writer.phase, "denied");
     assert.equal(store.log.length, 1);
-    assert.equal(writer.record(baseSlot(0)).status, "refused");
+    const post = writer.record(baseSlot(0));
+    assert.deepEqual([post.status, post.stopped, post.flags], ["refused", true, F.COLLECTOR_STOP]);
     assert.equal(store.log.length, 1, "no I/O after the denial");
   }
   // Denial at every record index.
