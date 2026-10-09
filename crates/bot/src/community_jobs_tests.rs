@@ -931,6 +931,13 @@ async fn scorecard_marks_only_captured_streams() {
         "the captured stream is not flagged"
     );
     assert_eq!(scorecard["intervention"]["code"], "INGESTION_INCOMPLETE");
+    let alerts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM community_scorecard_alerts WHERE guild_id=$1")
+            .bind(guild)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(alerts, 0, "no threshold alert on the degraded run");
 
     mock.shutdown().await;
     fixture

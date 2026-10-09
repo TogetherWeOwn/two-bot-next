@@ -1146,7 +1146,6 @@ mod tests {
         // The scorecard claims exactly the streams the runtime captures: a
         // stream in `CAPTURED_STREAMS` with no writer would invent coverage,
         // and a writer missing from the list would leave its stream unmarked.
-        use std::collections::HashSet;
         let registry: Vec<&str> = STREAM_WRITERS.iter().map(|(s, _)| *s).collect();
         assert_eq!(registry.len(), COMMUNITY_FACT_TYPES.len());
         for stream in COMMUNITY_FACT_TYPES {
