@@ -66,7 +66,9 @@ readbacks for the durable implementation under test.
 `PgFunnelStore` derives membership from its persisted `events` rows through the
 shared `project` helper. A duplicate reconfirmation takes the event row lock
 (`SELECT … FOR UPDATE`) and writes the new maximum only while the metadata still
-equals the locked value (`IS NOT DISTINCT FROM`, the compare-and-swap fallback).
+equals the locked value (`IS NOT DISTINCT FROM`, the compare-and-swap revision
+check); a zero-row update returns `RowNotFound` so a lost update fails loudly
+instead of reporting a quiet duplicate.
 Readbacks format `occurred_at AT TIME ZONE 'UTC'` with the `US` pattern, so text
 keeps microseconds whatever the session zone. The generic suite tests the
 observable guarantees, not this particular lock/CAS algorithm; the
@@ -111,7 +113,7 @@ The Rust harness groups parameterized scenarios rather than copying test names.
 | `test/unit.membership-replay.test.ts:81` | Reconfirmation vs genuine rejoin, original inviter/identity | `replay` |
 | `test/unit.membership-replay.test.ts:121` | Concurrent writes, new leave, stale duplicates | `concurrent` |
 | `test/unit.membership-replay.test.ts:160` | Delayed older duplicate cannot overwrite newer maximum | `concurrent` |
-| `test/unit.membership-replay.test.ts:217` | Five stale competing duplicates converge on newest stamp | `concurrent` (behavioral equivalent; SQL CAS-count test deferred) |
+| `test/unit.membership-replay.test.ts:217` | Five stale competing duplicates converge on newest stamp | `concurrent` plus `sqlx_membership_parallel_writer_cas` in `crates/store/tests/membership_pg.rs` (barrier-raced writers on one row; stale `IS NOT DISTINCT FROM` matches zero rows) |
 | `test/unit.membership-replay.test.ts:282` | Delayed leave / delayed invite-add completion | `dispatch_and_rest` (captured dispatch stamps) |
 | `test/unit.membership-clock.test.ts:5` | Same tick, advancing wall time, backward wall correction | `clock` |
 | `test/unit.membership-rest-observation.test.ts:9` | Request start survives delayed headers/body | `discord/tests/membership_observation.rs` plus store boundary fixture |
