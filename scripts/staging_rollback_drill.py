@@ -48,6 +48,8 @@ SAFE_CONTROL_LINE = re.compile(r"(Ownership control failed \(HTTP [0-9]{3}\)|"
                                r"OWNERSHIP_CONTROL_TOKEN is missing or invalid|"
                                r"Expected the approved two-bot-next-staging workers\.dev origin)")
 AUTH_STATUSES = ("401", "403")
+# Above the client's takeover window plus one attempt of two 15 s requests, so a takeover POST is never killed mid-flight.
+OWNERSHIP_CONTROL_TIMEOUT_SECONDS = 420
 
 
 class DrillClient(rollout.Client):
@@ -312,7 +314,7 @@ def ownership_control(token, url, actor, root=None):
                "OWNERSHIP_CONTROL_TOKEN": token, "OWNERSHIP_ACTOR": actor,
                "OWNERSHIP_RELEASE_FENCE": "true" if release_fence else "false"}
         try:
-            result = subprocess.run(command, env=env, capture_output=True, timeout=90, text=True)
+            result = subprocess.run(command, env=env, capture_output=True, timeout=OWNERSHIP_CONTROL_TIMEOUT_SECONDS, text=True)
         except (OSError, subprocess.SubprocessError):
             raise GateError("ownership_control_unavailable") from None
         if result.returncode != 0:

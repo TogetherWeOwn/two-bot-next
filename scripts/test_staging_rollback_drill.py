@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -555,6 +556,13 @@ class ClientAndControlTests(unittest.TestCase):
             ("Ownership control failed (HTTP 403); stop, do not change credentials", "ownership_auth_failed", None),
             ("Ownership control failed (HTTP 503); stop, do not change credentials", "ownership_control_failed",
              "Ownership control failed (HTTP 503)"),
+            ("Ownership control failed (HTTP 503) reason=deployment_mismatch attempts=12 elapsed=121s; "
+             "stop, do not change credentials", "ownership_control_failed", "Ownership control failed (HTTP 503)"),
+            ("Singleton is intentionally fenced or uninitialized; explicit staging release required; "
+             "earlier takeover refusal HTTP 503 reason=shutdown_unconfirmed attempts=2 elapsed=0s",
+             "ownership_control_failed", "Singleton is intentionally fenced or uninitialized"),
+            ("Ownership control failed; earlier takeover refusal HTTP 503 reason=deployment_mismatch "
+             "attempts=2 elapsed=0s; stop, do not change credentials", "ownership_control_failed", None),
             (f"boom {SENTINEL}", "ownership_control_failed", None),
         ]
         for line, code, detail in cases:
@@ -647,6 +655,14 @@ class SourcePinTests(unittest.TestCase):
     def test_worker_name_is_the_staging_worker_only(self):
         self.assertEqual(drill.WORKER, "two-bot-next-staging")
         self.assertNotIn("production", self.SOURCE.lower().replace("never production", ""))
+
+
+class OwnershipControlTimeoutTests(unittest.TestCase):
+    def test_timeout_outlasts_the_client_takeover_window(self):
+        client = (Path(__file__).resolve().parents[1] / "wrangler/scripts/ownership-control.mjs").read_text()
+        window_ms = int(re.search(r"takeoverWindowMs = (\d+)", client).group(1))
+        request_ms = int(re.search(r"AbortSignal\.timeout\((\d+)\)", client).group(1))
+        self.assertGreater(drill.OWNERSHIP_CONTROL_TIMEOUT_SECONDS * 1000, window_ms + 2 * request_ms)
 
 
 if __name__ == "__main__":
