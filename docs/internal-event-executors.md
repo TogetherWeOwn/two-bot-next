@@ -63,10 +63,12 @@ when present. A cancellation response must actually be cancelled. Unknown
 numeric status names remain supported by `event_status_name`, but cannot be
 persisted as a valid mirror row. Unreadable responses leave the prior row intact.
 
-`EventActionError::is_safe_pre_mutation()` is true only for a proven Discord/local
-refusal. Unreadable success and mirror failure are **not** safe claim-release
-signals: preserve the execution fence and require reconciliation, never create
-a second event to recover a missing acknowledgement. Mirror failures map to
+`EventActionError::is_safe_pre_mutation()` marks a proven Discord or local refusal.
+The receiver releases a claim only for the send guard and admission-blocked refusals
+(`is_admission_blocked()`) and records a Discord rejection as terminal. Unreadable
+success and mirror failure are **not** release signals: they keep the execution
+fence and require reconciliation, never a second event to recover a missing
+acknowledgement. Mirror failures map to
 `internal`; unreadable upstream rows map to `discord_unavailable`.
 
 ## Verification

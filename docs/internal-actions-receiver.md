@@ -5,8 +5,10 @@
 The container source integrates an opt-in private `POST /internal/actions`
 listener with the durable store, announcement executor, nonce-commit
 authentication capability and strict receiver configuration. It supports only
-`announcement.post`, `event.upsert` and `event.cancel`, regardless of the core
-action catalogue's broader defaults; every other verb is refused.
+`announcement.post`, `event.upsert`, and `event.cancel` (behind
+`TWO_INTERNAL_ALLOW_EVENT_CANCEL`), plus the keyless `event.read` (behind
+`TWO_INTERNAL_ALLOW_EVENT_READ`), regardless of the core action catalogue's
+broader defaults; every other verb is refused.
 The public health/readiness/metrics router has no action route. A merged,
 deployed receiver is dark until the Operator enables it, and it is reachable
 only through the staging-only Worker ingress described in
@@ -78,7 +80,7 @@ that is not yet deployed), deploy that one version, then run the takeover once.
 Migration `0423` adds the nullable `internal_idempotency.outcome` column that
 event receipts read back. Roll back in this order: disable the receiver (step 5)
 and deploy the previous binary, then drop the column. Dropping it while this
-binary runs fails every success finish and replay, not only event receipts.
+binary runs fails every finish and every success replay, not only event receipts.
 
 TOG-16851 proved a loopback-only receiver never becomes healthy: the Containers
 port check and `containerFetch` cannot reach it, so the container waited on 8091
@@ -192,12 +194,13 @@ returned only after the receipt/audit transaction commits. See
 
 A local admission refusal (the guard, or a token lane held by another send)
 proves nothing was sent, so the event claim is released and the same key may
-retry. Event creates add a guild-wide fence: a create runs only when no other
-create in its guild is in flight or unknown, because an unknown create may
-already exist in Discord before its key mapping is written. A fenced create is
-refused and released before any Discord call: `needs_reconciliation` when the
-blocking create is unknown, `in_progress` when it is in flight. Clearing an
-unknown create is an operator reconciliation; no production tool does that yet.
+retry. Event mutations run one at a time in the process, so two creates for one
+event key cannot both reach Discord. A create whose outcome is unknown, or whose
+request is dropped after its claim, can still leave a Discord event with no key
+mapping; a create under a new Idempotency-Key would then make a second event.
+Callers must not re-submit a `needs_reconciliation` operation under a new key:
+reconcile the Discord event by hand first. An abandoned in-flight intent answers
+`needs_reconciliation` to its own key. No production reconcile tool exists yet.
 
 The website-compatible envelopes contain `ok`, `request_id`, and either
 `result.message_id` (announcements), `result.{outcome,event_id}` (event
@@ -223,8 +226,8 @@ capacity, redacted authentication failures, nonce-before-parse ordering,
 concurrent/restarted/key-rotated replay, byte mismatch, unsupported actions,
 cancellation/stale ownership, unknown/no-effect outcomes, unavailable stores,
 failed receipt finalization, event verb flags, malformed event bodies (including a
-101-character location), the create fence, admission-refusal release and listener
-supervision. Nonces are generated
+101-character location), concurrent creates for one key, admission-refusal release
+for creates and cancels, and listener supervision. Nonces are generated
 fresh for each attempt; the nonce-replay test intentionally reuses one generated
 value. They do not send live Discord actions.
 

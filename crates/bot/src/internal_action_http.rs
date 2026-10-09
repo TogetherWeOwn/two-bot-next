@@ -196,6 +196,7 @@ struct ReceiverState {
     buckets: Mutex<TokenBuckets>,
     telemetry: Mutex<RejectionTelemetry>,
     capacity: Arc<Semaphore>,
+    event_gate: tokio::sync::Mutex<()>,
 }
 
 impl ReceiverState {
@@ -216,6 +217,7 @@ impl ReceiverState {
             buckets: Mutex::new(TokenBuckets::new()),
             telemetry: Mutex::new(RejectionTelemetry::default()),
             capacity: Arc::new(Semaphore::new(MAX_REQUESTS)),
+            event_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -626,6 +628,9 @@ async fn mutate_event(
     } else {
         None
     };
+    // One event mutation at a time in this process: a create's key mapping must be
+    // visible to the next mutation for that key before that mutation reads it.
+    let _gate = state.event_gate.lock().await;
     let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
     let mapped = match state.store.event_id_for_key(guild_id, &event_key).await {
         Ok(mapped) => mapped,
@@ -646,14 +651,14 @@ async fn mutate_event(
             Err(_) => return reject(Failure::code(ErrorCode::Internal)),
         },
     };
-    let creating = upsert && event_id.is_none();
     let (call, outcome) = if upsert {
+        let created = event_id.is_none();
         (
             EventCall::Upsert {
                 event_id,
                 input: input.expect("upsert validated its event input"),
             },
-            if creating {
+            if created {
                 EventOutcome::Created
             } else {
                 EventOutcome::Updated
@@ -689,21 +694,6 @@ async fn mutate_event(
         Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation()),
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
-    if creating {
-        let refusal = match state.store.unresolved_event_create(guild_id, &claim).await {
-            Ok(None) => None,
-            Ok(Some(blocker)) if blocker == "unknown" => Some(Failure::reconciliation()),
-            Ok(Some(_)) => Some(Failure::code(ErrorCode::InProgress)),
-            Err(_) => Some(Failure::code(ErrorCode::Internal)),
-        };
-        if let Some(failure) = refusal {
-            // No Discord call was made, so the refused create is released for a later retry.
-            if state.store.release_proven_not_sent(claim).await.is_err() {
-                return reject(Failure::code(ErrorCode::Internal));
-            }
-            return reject(failure);
-        }
-    }
     let observed_at = format_iso_millis(now_ms() as i64);
     match state
         .event_mutate

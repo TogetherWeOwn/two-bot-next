@@ -1336,40 +1336,55 @@ async fn event_upsert_discord_500_needs_reconciliation_without_receipt() {
 }
 
 #[tokio::test]
-async fn event_create_fenced_while_another_create_is_unresolved() {
+async fn concurrent_creates_for_one_key_serialize_into_a_create_then_an_update() {
     let Some(db) = database().await else { return };
     let _flag = INTERNAL_FLAG_LOCK.lock().await;
     set_event_cancel_flag(false);
-    let api = MockEventApi::start_scripted(vec![ScriptedEvent {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        body: Value::Null,
-    }])
+    let api = MockEventApi::start_scripted(vec![
+        ScriptedEvent {
+            status: StatusCode::CREATED,
+            body: discord_event_for(CREATE_EVENT_ID, 1),
+        },
+        ScriptedEvent {
+            status: StatusCode::OK,
+            body: discord_event_for(CREATE_EVENT_ID, 1),
+        },
+    ])
     .await;
     let app = mutate_app(db.pool().clone(), &api);
-    let (status, _, first) = answer(
-        app.clone(),
-        signed(&upsert_payload("first"), "old", "intent-first"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(first["error"]["code"], "needs_reconciliation");
-    // A new key would be a second live event in the guild: the unresolved
-    // create fences every create until it is reconciled.
-    let (status, _, second) = answer(
-        app,
-        signed(&upsert_payload("second"), "old", "intent-second"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(second["error"]["code"], "needs_reconciliation");
-    assert_eq!(api.count(), 1, "the fenced create never reaches Discord");
+    let raw = upsert_payload("race");
+    let (first, second) = tokio::join!(
+        answer(app.clone(), signed(&raw, "old", "intent-race-a")),
+        answer(app, signed(&raw, "old", "intent-race-b")),
+    );
+    let (first_status, _, first) = first;
+    let (second_status, _, second) = second;
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(second_status, StatusCode::OK);
+    let mut outcomes = [
+        first["result"]["outcome"].as_str().unwrap().to_owned(),
+        second["result"]["outcome"].as_str().unwrap().to_owned(),
+    ];
+    outcomes.sort();
+    assert_eq!(outcomes, ["created", "updated"]);
+    assert_eq!(
+        api.count(),
+        2,
+        "one create and one update, never two creates"
+    );
+    {
+        let seen = api.requests.lock().unwrap();
+        assert_eq!(seen[0]["method"], "POST");
+        assert_eq!(seen[1]["method"], "PATCH");
+    }
     let store = InternalActionStore::new(db.pool().clone());
     assert_eq!(
         store
-            .event_id_for_key(staging_guild(), "second")
+            .event_id_for_key(staging_guild(), "race")
             .await
-            .unwrap(),
-        None
+            .unwrap()
+            .as_deref(),
+        Some(CREATE_EVENT_ID)
     );
     db.close().await.unwrap();
 }
@@ -1432,6 +1447,45 @@ async fn event_create_admission_refusal_releases_claim_for_same_key_retry() {
             .unwrap()
             .as_deref(),
         Some(CREATE_EVENT_ID)
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_cancel_admission_refusal_releases_claim_for_same_key_retry() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_cancel_flag(true);
+    map_launch(db.pool()).await;
+    let blocked = two_bot_core::send_admission::AdmissionError::Blocked.to_string();
+    let mutates: Arc<dyn EventMutateEffect> = Arc::new(ScriptedEventMutate {
+        replies: Mutex::new(vec![
+            Err(EventActionError::Discord(DiscordError::Unavailable(
+                blocked,
+            ))),
+            Ok(json!({"event_id": READ_EVENT_ID})),
+        ]),
+    });
+    let reads: Arc<dyn EventReadEffect> = Arc::new(MockEventRead::default());
+    let effect: Arc<dyn ActionEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    let app = router(Arc::new(ReceiverState::new(
+        config(),
+        db.pool().clone(),
+        effect,
+        reads,
+        mutates,
+    )));
+    let raw = cancel_payload("launch");
+    let (status, _, refused) = answer(app.clone(), signed(&raw, "old", "intent-cancel")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(refused["error"]["code"], "discord_unavailable");
+    let (status, headers, cancelled) = answer(app, signed(&raw, "old", "intent-cancel")).await;
+    set_event_cancel_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("idempotent-replay"));
+    assert_eq!(
+        cancelled["result"],
+        json!({"outcome": "cancelled", "event_id": READ_EVENT_ID})
     );
     db.close().await.unwrap();
 }
