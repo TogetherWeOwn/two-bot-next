@@ -24,7 +24,7 @@ not a restore verification: `two-bot restore --dry-run` remains the full
 archive inspection (docs/backup.md).
 
 Usage:
-  python3 scripts/rollback_readiness_probe.py --backup-dir DIR \
+  python3 scripts/rollback_readiness_probe.py --backup-dir DIR \\
       --sequences live-sequences.json [--staging-url URL] [--config wrangler.toml]
 """
 
@@ -141,7 +141,7 @@ def validate_manifest(obj):
         raise ProbeError(f"manifest version {obj.get('version')!r} is not one of {DUMP_VERSIONS}")
     if not isinstance(obj.get("createdAt"), str):
         raise ProbeError("manifest has no createdAt timestamp")
-    if not isinstance(obj.get("eventsSequence")):
+    if not is_int(obj.get("eventsSequence")):
         raise ProbeError("manifest has an invalid eventsSequence")
     migrations = obj.get("schemaMigrations")
     if not isinstance(migrations, list) or not all(isinstance(m, str) for m in migrations):
