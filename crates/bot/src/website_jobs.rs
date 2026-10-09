@@ -4,13 +4,15 @@
 use std::{sync::Arc, time::Duration};
 
 use serde_json::Value;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use tokio::sync::{watch, Mutex, OnceCell};
 use two_bot_core::{
-    build_community_snapshot, build_counter_reading, match_rank_roles, normalize_events, now_iso,
-    read_raid_windows, replace_events, write_counter, write_rank_snapshot, Config,
-    RawScheduledEvent, RosterMember, WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS,
-    RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
+    build_community_snapshot, build_counter_reading,
+    database_tls::{self, TlsPolicy},
+    match_rank_roles, normalize_events, now_iso, read_raid_windows, replace_events, write_counter,
+    write_rank_snapshot, Config, RawScheduledEvent, RosterMember, WebsiteStoreError,
+    LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
 };
 use two_bot_discord::executor::ActionExecutor;
 
@@ -120,12 +122,58 @@ fn governed_executor(
     ActionExecutor::with_admission(token.to_owned(), proxy, Arc::new(admission))
 }
 
-fn admission_pool(url: &str) -> Result<PgPool, String> {
+/// Send-admission pool shape: max 2 + 15 s statement timeout (store parity)
+/// with a 10 s acquire timeout. One shared helper for the website jobs, the
+/// preflight `admission_transport` and the commands CLI `executor`
+/// (threat-model F6).
+pub(crate) const ADMISSION_POOL_MAX: u32 = 2;
+pub(crate) const ADMISSION_STATEMENT_TIMEOUT_MS: u64 = 15_000;
+pub(crate) const ADMISSION_ACQUIRE_TIMEOUT_SECS: u64 = 10;
+
+/// Read the one TLS policy setting; an unset value is `Required`.
+pub(crate) fn admission_tls_policy_from_env() -> Result<TlsPolicy, &'static str> {
+    let value = std::env::var_os(database_tls::POLICY_SETTING);
+    // A non-UTF-8 value parses as "" and is refused like any unknown value.
+    TlsPolicy::from_setting(value.as_ref().map(|v| v.to_str().unwrap_or("")))
+}
+
+/// Shared fenced options builder: validate before SQLx can WARN-log query
+/// values, enforce the TLS policy, then apply the effective mode. The
+/// statement timeout rides the connection options. URL/parse failures read as
+/// the generic authority code; TLS refusals keep their fixed strings. Nothing
+/// echoes the URL, host or password.
+pub(crate) fn admission_connect_options(
+    url: &str,
+    tls: TlsPolicy,
+) -> Result<PgConnectOptions, &'static str> {
+    two_bot_core::database_url::validate(url).map_err(|_| "invalid admission authority")?;
+    // Threat-model F6: refuse plaintext/unverified modes and the wrong host
+    // class before SQLx parses the URL (see `docs/database-tls.md`).
+    database_tls::enforce(url, tls)?;
     let options = two_bot_core::database_url::connect_options(url)
-        .map_err(|_| "invalid admission authority".to_owned())?;
-    Ok(sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
+        .map_err(|_| "invalid admission authority")?;
+    let options = database_tls::apply(options, tls);
+    Ok(options.options([(
+        "statement_timeout",
+        format!("{ADMISSION_STATEMENT_TIMEOUT_MS}ms"),
+    )]))
+}
+
+/// [`admission_pool`] with an explicit TLS policy (tests pass `LocalOnly`).
+/// Lazy, so refusal cases are hermetic (no socket) and the happy path asserts
+/// `pool.size() == 0`. The acquire timeout bounds the later wires.
+pub(crate) fn admission_pool_with_tls(url: &str, tls: TlsPolicy) -> Result<PgPool, &'static str> {
+    let options = admission_connect_options(url, tls)?;
+    Ok(PgPoolOptions::new()
+        .max_connections(ADMISSION_POOL_MAX)
+        .acquire_timeout(Duration::from_secs(ADMISSION_ACQUIRE_TIMEOUT_SECS))
         .connect_lazy_with(options))
+}
+
+fn admission_pool(url: &str) -> Result<PgPool, String> {
+    let tls =
+        admission_tls_policy_from_env().map_err(|_| "invalid admission authority".to_owned())?;
+    admission_pool_with_tls(url, tls).map_err(|_| "invalid admission authority".to_owned())
 }
 
 /// Boot-composed single call: the eight parameters are the full supervised
