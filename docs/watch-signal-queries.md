@@ -253,6 +253,31 @@ with no disconnect means the gap predates this instrumentation or the
 process restarted mid-window (counters reset to zero on restart, so a
 reset is not a quiet window — re-baseline both scrapes after it).
 
+Alert rule: the Worker `gateway_missed_events` rule implements the zero
+threshold above — it fires on any increase of
+`two_bot_gateway_missed_events_total` between two keepalive samples (the
+first sample and counter resets skip the window rather than firing).
+Runbook: [runbook](runbook.md#alert-gateway-missed-events).
+
+## 9. Ticker staleness
+
+Source: `two_bot_job_last_success_timestamp_seconds{job}` for the 15 s
+tickers `scheduled_messages` and `settings`. A wedged ticker never fails:
+skipped busy deadlines count neither as success nor failure, so the
+timestamp stops advancing while the failure streak stays flat. Series
+contract: [metrics](metrics.md).
+
+```promql
+time() - max by (job) (two_bot_job_last_success_timestamp_seconds{job=~"scheduled_messages|settings"})
+```
+
+A zero timestamp means the ticker never succeeded since start (boot) or
+was never registered (parked: `DATABASE_URL` unset, or the automations
+gate off) — not a wedge. Alert rule: the Worker `ticker_stale` rule pages
+when either ticker has no success for more than 10 minutes (40 missed
+ticks; boot and parked stay silent). Runbook:
+[runbook](runbook.md#alert-ticker-stale).
+
 ## What this pack does not do
 
 - No threshold is set or changed here.
