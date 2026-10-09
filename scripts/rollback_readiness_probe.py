@@ -24,7 +24,7 @@ not a restore verification: `two-bot restore --dry-run` remains the full
 archive inspection (docs/backup.md).
 
 Usage:
-  python3 scripts/rollback_readiness_probe.py --backup-dir DIR \\
+  python3 scripts/rollback_readiness_probe.py --backup-dir DIR \
       --sequences live-sequences.json [--staging-url URL] [--config wrangler.toml]
 """
 
@@ -65,13 +65,10 @@ READYZ_BODY_CAP = 64 << 10
 USER_AGENT = "two-bot-next-staging-rollout/1.0"
 # Component names from crates/bot/src/server.rs; the drift test pins them to the source.
 READYZ_STATES = ("ready", "starting", "down")
-READYZ_REQUIRED = ("process", "gateway")
-# 503 is parked, never acceptance: process ready and every not-ready component listed here in that state.
-READYZ_PARKED = {
-    "gateway": ("down", "starting"),
-    "database": ("down",),
-    "token_invalid": ("down",),
-}
+READYZ_REQUIRED = ("process", "gateway", "database", "token_invalid")
+# Only the gateway parks: a 503 is accepted only with it starting or down. A database ping failure or a
+# latched bot token is a fault for this process (docs/runbook.md, docs/rest-guard.md), never parked.
+READYZ_PARKED = {"gateway": ("down", "starting")}
 # Owned serial/identity sequences via pg_get_serial_sequence, plus the standalone
 # guild_settings_version_seq (guarded by to_regclass), mirroring the restore
 # (crates/core/src/backup/dump.rs). Also reports whether last_value is readable:
@@ -144,7 +141,7 @@ def validate_manifest(obj):
         raise ProbeError(f"manifest version {obj.get('version')!r} is not one of {DUMP_VERSIONS}")
     if not isinstance(obj.get("createdAt"), str):
         raise ProbeError("manifest has no createdAt timestamp")
-    if not is_int(obj.get("eventsSequence")):
+    if not isinstance(obj.get("eventsSequence")):
         raise ProbeError("manifest has an invalid eventsSequence")
     migrations = obj.get("schemaMigrations")
     if not isinstance(migrations, list) or not all(isinstance(m, str) for m in migrations):
@@ -329,7 +326,8 @@ def check_readyz(url, fetch_fn):
                                            for name, value in not_ready):
         summary = ", ".join(f"{name} {value}" for name, value in not_ready)
         return f"/readyz 503: process ready, {summary} (parked, not E2E approval)"
-    raise ProbeError(f"/readyz {status} with unexpected components {list(state.items())!r:.80}")
+    shown = ", ".join(f"{name} {value}" for name, value in not_ready or sorted(state.items()))
+    raise ProbeError(f"/readyz {status} with unexpected components: {shown:.200}")
 
 
 def check_deploy_config(config, envs, extra_keys):
