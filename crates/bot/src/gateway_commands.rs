@@ -82,7 +82,7 @@ fn acceptance_without_inspector(automod: Option<&str>) -> AutomationMessageAccep
 /// inspection; every other verdict fails closed. A missing verdict is never
 /// acceptance: the worker's bool precheck may let an unscreened create through,
 /// and this mapping is the second fence.
-pub fn acceptance_for_verdict(verdict: Option<FunnelDisposition>) -> AutomationMessageAcceptance {
+pub(crate) fn acceptance_for_verdict(verdict: Option<FunnelDisposition>) -> AutomationMessageAcceptance {
     match verdict {
         Some(FunnelDisposition::Accept) => AutomationMessageAcceptance::Unmatched,
         Some(FunnelDisposition::CaptureOnly) => AutomationMessageAcceptance::CaptureOnly,
