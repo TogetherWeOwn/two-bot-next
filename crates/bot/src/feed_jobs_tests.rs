@@ -284,7 +284,7 @@ fn live_poll_seconds_prefers_the_stored_value() {
     );
 
     let (mut writer, live) = live_channel();
-    for (value, expected) in [
+    for ((value, expected), revision) in [
         (json!(600), 600),
         (json!("120"), 120),
         // Out of range and unparsable values keep the boot interval.
@@ -292,9 +292,12 @@ fn live_poll_seconds_prefers_the_stored_value() {
         (json!(86401), 300),
         (json!("hourly"), 300),
         (json!(["600"]), 300),
-    ] {
+    ]
+    .into_iter()
+    .zip(1i64..)
+    {
         writer.publish(&SettingsSnapshot {
-            revision: 1,
+            revision,
             rows: vec![SettingRow {
                 guild_id: GUILD.to_owned(),
                 key: INTERVAL_KEY.to_owned(),
@@ -311,7 +314,7 @@ fn live_poll_seconds_prefers_the_stored_value() {
 
     // A deleted row hands the interval back to the boot value.
     writer.publish(&SettingsSnapshot {
-        revision: 2,
+        revision: 7,
         rows: vec![],
     });
     assert_eq!(live_poll_seconds_with(GUILD, 300, Some(&live)), 300);
