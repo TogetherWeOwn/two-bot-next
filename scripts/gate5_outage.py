@@ -7,7 +7,7 @@ outage must recover in **under 60 seconds**, measured from the actual outage
 start to verified recovery. This script never touches staging or production;
 it only reads a committed JSONL fixture and prints the summary.
 
-Log format (one JSON object per line, in time order):
+Log format (one JSON object per line, in time order, UTC timestamps with an offset):
 
     {"ts": "2026-10-01T00:00:01Z", "event": "readyz_ok"}
     {"ts": "2026-10-01T00:00:02Z", "event": "readyz_fail", "status": 503}
@@ -17,11 +17,12 @@ Log format (one JSON object per line, in time order):
 Outage start is the first ``readyz_fail`` or ``tick_missed`` while healthy;
 recovery is the first ``readyz_ok`` after that. A repeated failure inside an
 open window does not move the start: the window always spans first failure
-to first recovery. Each recovered window carries ``outage_seconds`` rounded
-to 0.1 s for display, reusing the ``outage_seconds`` convention of
-``scripts/staging_container_drill.py`` (fence-to-first-ready); verdicts use the
-unrounded duration. Any unrecognised ``event`` value or malformed line is
-preserved as an UNKNOWN interval, never silently dropped.
+to first recovery. Each recovered window carries ``outage_seconds`` floored to
+0.1 s for display, so a displayed value reaches the budget only when the outage
+does; verdicts use the unfloored duration, reusing the ``outage_seconds``
+convention of ``scripts/staging_container_drill.py`` (fence-to-first-ready).
+A line that is not valid UTF-8, not JSON, or lacks a UTC offset is preserved as
+an UNKNOWN interval, never silently dropped.
 
 A window still open when the log ends stays explicitly UNKNOWN
 (``status: "unknown"``, ``end: null``, ``outage_seconds: null``): like
@@ -30,13 +31,14 @@ never scored as zero.
 
 Verdict: NEEDS WORK when a recovered outage is at or over the budget. PASS needs
 the acceptance interval and a log that covers it: the first record within a
-budget of the interval start, the last within a budget of its end, and no
-silent gap longer than a budget. Missing evidence is NOT VERIFIED, never PASS:
+budget of the interval start, the last record at or after the interval end, and
+no silent gap longer than a budget. Missing evidence is NOT VERIFIED, never PASS:
 no interval, an empty log, a silent gap, an out-of-order or unknown record, a
-log that began mid-outage, an outage still open at the end, a start that cannot
-be pinned within the budget (the last healthy sample is more than a budget
-before recovery), a readyz_ok with a non-200 status, and an outage that recurs
-within a budget of its recovery.
+log that began mid-outage (NEEDS WORK instead when that outage already reaches
+the budget), an outage still open at the end, a start that cannot be pinned
+within the budget (the last healthy sample is more than a budget before
+recovery), a readyz_ok with a non-200 status or a readyz_fail with status 200,
+and an outage that recurs within a budget of its recovery.
 
 Usage:
 
@@ -47,6 +49,7 @@ START and END are the UTC acceptance-interval bounds from the approved soak reco
 
 import argparse
 import json
+import math
 import sys
 from datetime import datetime, timezone
 
@@ -63,13 +66,13 @@ OUTAGE_START_EVENTS = ("readyz_fail", "tick_missed")
 
 
 def parse_ts(value):
-    """Parse an ISO-8601 UTC timestamp; raise ValueError when absent/garbled."""
+    """Parse an ISO-8601 timestamp with a UTC offset; raise ValueError otherwise."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"missing ts: {value!r}")
     text = value.strip().replace("Z", "+00:00")
     moment = datetime.fromisoformat(text)
     if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
+        raise ValueError(f"ts lacks a UTC offset: {value!r}")
     return moment.astimezone(timezone.utc)
 
 
@@ -78,6 +81,10 @@ def _reject_duplicate_keys(pairs):
     if len(keys) != len(set(keys)):
         raise ValueError("duplicate key in record")
     return dict(pairs)
+
+
+def _display_seconds(seconds):
+    return math.floor(round(seconds, 6) * 10) / 10
 
 
 def summarize(lines, interval_start=None, interval_end=None):
@@ -110,15 +117,15 @@ def summarize(lines, interval_start=None, interval_end=None):
         try:
             record = json.loads(line, object_pairs_hook=_reject_duplicate_keys)
         except (ValueError, RecursionError):
-            note_unknown(None, None, f"malformed line {lineno}: not JSON")
+            note_unknown(None, None, f"malformed line {lineno}: not JSON or repeats a key")
             continue
         if not isinstance(record, dict):
             note_unknown(None, None, f"malformed line {lineno}: not an object")
             continue
         try:
             ts = parse_ts(record.get("ts"))
-        except (ValueError, OverflowError):
-            note_unknown(None, None, f"malformed line {lineno}: bad ts")
+        except (ValueError, OverflowError) as exc:
+            note_unknown(None, None, f"malformed line {lineno}: bad ts ({exc})")
             continue
         if last_ts is None:
             first_ts = ts
@@ -135,6 +142,9 @@ def summarize(lines, interval_start=None, interval_end=None):
         if event == RECOVERY_EVENT and record.get("status", 200) != 200:
             note_unknown(ts, ts, f"readyz_ok with status {record.get('status')!r}")
             continue
+        if event == "readyz_fail" and record.get("status") == 200:
+            note_unknown(ts, ts, "readyz_fail with status 200")
+            continue
         if event == RECOVERY_EVENT:
             readyz_ok += 1
             if outage_start is not None:
@@ -146,12 +156,12 @@ def summarize(lines, interval_start=None, interval_end=None):
                     outage_windows.append({
                         "start": outage_start.isoformat(),
                         "end": ts.isoformat(),
-                        "outage_seconds": round(measured, 1),
+                        "outage_seconds": _display_seconds(measured),
                         "status": "recovered",
                     })
                 elif last_healthy_ts is None:
                     note_unknown(outage_start, ts,
-                                 "log began mid-outage: actual start not observed")
+                                 "no healthy sample before the first failure: start not observed")
                 else:
                     note_unknown(last_healthy_ts, ts,
                                  "outage start not pinned: last healthy sample too far back")
@@ -187,9 +197,8 @@ def summarize(lines, interval_start=None, interval_end=None):
         if (first_ts - interval_start).total_seconds() > SILENT_GAP_LIMIT_S:
             note_unknown(interval_start, first_ts,
                          "log starts more than a budget after the interval start")
-        if (interval_end - last_ts).total_seconds() > SILENT_GAP_LIMIT_S:
-            note_unknown(last_ts, interval_end,
-                         "log ends more than a budget before the interval end")
+        if last_ts < interval_end:
+            note_unknown(last_ts, interval_end, "log ends before the interval end")
 
     recovered = [window["outage_seconds"] for window in outage_windows
                  if window["status"] == "recovered"]
@@ -222,6 +231,14 @@ def summarize(lines, interval_start=None, interval_end=None):
     }
 
 
+def _decoded_lines(binary_handle):
+    for raw in binary_handle:
+        try:
+            yield raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            yield "\x00"  # not JSON, so the line is kept as UNKNOWN
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", help="readiness tick log in JSONL format")
@@ -230,8 +247,8 @@ def main(argv=None):
     parser.add_argument("--interval-end", type=parse_ts,
                         help="acceptance interval end, UTC ISO-8601")
     args = parser.parse_args(argv)
-    with open(args.log, encoding="utf-8-sig", errors="replace") as handle:
-        summary = summarize(handle, args.interval_start, args.interval_end)
+    with open(args.log, "rb") as handle:
+        summary = summarize(_decoded_lines(handle), args.interval_start, args.interval_end)
     json.dump(summary, sys.stdout, indent=2)
     sys.stdout.write("\n")
     if summary["verdict"] != "PASS":

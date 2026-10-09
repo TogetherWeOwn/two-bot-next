@@ -9,8 +9,9 @@ from datetime import timedelta
 
 from gate5_outage import main, parse_ts, summarize
 
+# Fixtures below run past END; coverage of the interval is tested separately.
 START = "2026-10-01T00:00:00Z"
-END = "2026-10-01T00:01:00Z"
+END = "2026-10-01T00:00:01Z"
 INTERVAL = ("--interval-start", START, "--interval-end", END)
 
 
@@ -204,13 +205,13 @@ class Gate5OutageTests(unittest.TestCase):
         self.assertEqual([w["outage_seconds"] for w in summary["outage_windows"]], [10.0, 10.0])
         self.assertEqual(summary["verdict"], "PASS")
 
-    def test_sub_budget_outage_is_not_breached_by_rounding(self):
+    def test_sub_budget_outage_is_not_breached_by_display(self):
         summary = run(
             '{"ts": "2026-10-01T00:00:01.000Z", "event": "readyz_ok"}\n'
             '{"ts": "2026-10-01T00:00:01.000Z", "event": "readyz_fail", "status": 503}\n'
             '{"ts": "2026-10-01T00:01:00.960Z", "event": "readyz_ok"}\n'
         )
-        self.assertEqual(summary["max_outage_seconds"], 60.0)
+        self.assertEqual(summary["max_outage_seconds"], 59.9)
         self.assertEqual(summary["verdict"], "PASS")
 
     def test_hostile_lines_are_unknown_not_crashes(self):
@@ -242,6 +243,23 @@ class Gate5OutageTests(unittest.TestCase):
         self.assertIn("status", summary["unknown_intervals"][0]["reason"])
         self.assertEqual(summary["verdict"], "NOT VERIFIED")
 
+    def test_failure_reported_with_status_200_is_not_verified(self):
+        summary = run(
+            '{"ts": "2026-10-01T00:00:00Z", "event": "readyz_ok"}\n'
+            '{"ts": "2026-10-01T00:00:10Z", "event": "readyz_fail", "status": 200}\n'
+            '{"ts": "2026-10-01T00:00:20Z", "event": "readyz_ok"}\n'
+        )
+        self.assertEqual(summary["outage_windows"], [])
+        self.assertEqual(summary["verdict"], "NOT VERIFIED")
+
+    def test_naive_timestamp_is_not_treated_as_utc(self):
+        summary = run(
+            '{"ts": "2026-10-01T00:00:01", "event": "readyz_ok"}\n'
+            '{"ts": "2026-10-01T00:00:02Z", "event": "readyz_ok"}\n'
+        )
+        self.assertIn("UTC offset", summary["unknown_intervals"][0]["reason"])
+        self.assertEqual(summary["verdict"], "NOT VERIFIED")
+
     def test_offset_timestamps_are_normalised(self):
         summary = run(
             '{"ts": "2026-10-01T02:00:00+02:00", "event": "readyz_ok"}\n'
@@ -260,8 +278,16 @@ class Gate5OutageTests(unittest.TestCase):
         summary = run(cadence_log(START, 600, 30), end="2026-10-01T04:00:00Z")
         self.assertEqual(summary["verdict"], "NOT VERIFIED")
 
+    def test_minute_samples_stopping_before_interval_end_are_not_verified(self):
+        summary = run(cadence_log(START, 14340, 60), end="2026-10-01T04:00:00Z")
+        self.assertEqual(summary["verdict"], "NOT VERIFIED")
+
     def test_full_interval_at_30s_cadence_passes(self):
         summary = run(cadence_log(START, 4 * 3600, 30), end="2026-10-01T04:00:00Z")
+        self.assertEqual(summary["verdict"], "PASS")
+
+    def test_minute_samples_reaching_interval_end_pass(self):
+        summary = run(cadence_log(START, 4 * 3600, 60), end="2026-10-01T04:00:00Z")
         self.assertEqual(summary["verdict"], "PASS")
 
     def test_log_starting_after_interval_start_is_not_verified(self):
@@ -286,12 +312,15 @@ class Gate5OutageTests(unittest.TestCase):
                   b'{"ts": "2026-10-01T01:00:01Z", "event": "readyz_ok"}\n')
         breach = (b'{"ts": "2026-10-01T00:00:00Z", "event": "readyz_fail", "status": 503}\n'
                   b'{"ts": "2026-10-01T00:02:00Z", "event": "readyz_ok"}\n')
-        invalid_utf8 = b'{"ts": "2026-10-01T00:00:01\xff", "event": "readyz_ok"}\n'
+        invalid_ts = b'{"ts": "2026-10-01T00:00:01\xff", "event": "readyz_ok"}\n'
+        invalid_field = (b'{"ts": "2026-10-01T00:00:01Z", "event": "readyz_ok", "note": "\xff"}\n'
+                         b'{"ts": "2026-10-01T00:00:02Z", "event": "readyz_ok"}\n')
         cases = (
             ("no interval", clean, (), 1, "NOT VERIFIED"),
             ("gapped", gapped, INTERVAL, 1, "NOT VERIFIED"),
             ("breach", breach, INTERVAL, 1, "NEEDS WORK"),
-            ("invalid utf-8", invalid_utf8, INTERVAL, 1, "NOT VERIFIED"),
+            ("invalid utf-8 in timestamp", invalid_ts, INTERVAL, 1, "NOT VERIFIED"),
+            ("invalid utf-8 in unused field", invalid_field, INTERVAL, 1, "NOT VERIFIED"),
         )
         for name, content, args, expected_code, verdict in cases:
             with self.subTest(case=name):
