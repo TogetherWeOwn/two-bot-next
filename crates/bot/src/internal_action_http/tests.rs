@@ -125,7 +125,54 @@ fn state_with_reads(
     effect: Arc<MockEffect>,
     reads: Arc<MockEventRead>,
 ) -> Arc<ReceiverState> {
-    Arc::new(ReceiverState::new(config(), pool, effect, reads))
+    state_full(pool, effect, reads, Arc::new(MockModeration::default()))
+}
+
+fn state_full(
+    pool: sqlx::PgPool,
+    effect: Arc<MockEffect>,
+    reads: Arc<MockEventRead>,
+    moderation: Arc<MockModeration>,
+) -> Arc<ReceiverState> {
+    Arc::new(ReceiverState::new(
+        config(),
+        pool,
+        effect,
+        reads,
+        moderation,
+    ))
+}
+
+/// Offline moderation double: the auth/key/flag fences must refuse before
+/// this is ever called, so deny-path tests assert `calls() == 0`.
+#[derive(Default)]
+struct MockModeration {
+    calls: AtomicUsize,
+}
+
+impl MockModeration {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl ModerationEffect for MockModeration {
+    fn execute_moderation<'a>(
+        &'a self,
+        request: &'a InternalMemberRequest,
+        _: &'a str,
+        _: &'a str,
+        _: i64,
+    ) -> BoxFuture<'a, Result<TerminalResponse, ActionError>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let target = DiscordId::new(request.target_id()).expect("validated target");
+            Ok(TerminalResponse::Success {
+                resource_id: Some(target),
+                affected: 1,
+            })
+        })
+    }
 }
 
 /// Offline read double: the auth/key/flag fences must refuse before this is
@@ -165,6 +212,59 @@ fn set_event_read_flag(on: bool) {
         std::env::set_var("TWO_INTERNAL_ALLOW_EVENT_READ", "1");
     } else {
         std::env::remove_var("TWO_INTERNAL_ALLOW_EVENT_READ");
+    }
+}
+
+/// The moderation flag gate needs BOTH vars: the internal allowlist plus the
+/// moderation publish gate. Tests serialize on their own lock and always
+/// restore both vars.
+static MODERATION_FLAG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn set_moderation_flags(on: bool) {
+    if on {
+        std::env::set_var("TWO_INTERNAL_ALLOW_MODERATION", "1");
+        std::env::set_var("TWO_MODERATION", "1");
+    } else {
+        std::env::remove_var("TWO_INTERNAL_ALLOW_MODERATION");
+        std::env::remove_var("TWO_MODERATION");
+    }
+}
+
+fn moderation_payload(action: &str) -> String {
+    let mut body = serde_json::json!({
+        "action": action,
+        "actor_id": "111111111111111111",
+        "discord_id": "333333333333333333",
+        "reason": "spam",
+    });
+    if action == "moderation.tempban" {
+        body["duration_seconds"] = serde_json::json!(3600);
+    }
+    body.to_string()
+}
+
+fn moderation_payload_with(action: &str, extra: Value) -> String {
+    let mut body = serde_json::json!({
+        "action": action,
+        "actor_id": "111111111111111111",
+        "discord_id": "333333333333333333",
+        "reason": "spam",
+    });
+    if action == "moderation.tempban" && extra.get("duration_seconds").is_none() {
+        body["duration_seconds"] = serde_json::json!(3600);
+    }
+    for (key, value) in extra.as_object().unwrap() {
+        body[key] = value.clone();
+    }
+    body.to_string()
+}
+
+fn moderation_outcome_for(action: &str) -> &'static str {
+    match action {
+        "moderation.ban" => "banned",
+        "moderation.tempban" => "temporarily_banned",
+        "moderation.kick" => "kicked",
+        _ => "warned",
     }
 }
 
@@ -749,7 +849,13 @@ fn read_app(pool: sqlx::PgPool, api: &MockEventApi) -> Router {
             .unwrap();
     let reads: Arc<dyn EventReadEffect> = Arc::new(EventReadExecutor::new(executor, pool.clone()));
     let effect: Arc<dyn ActionEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
-    router(Arc::new(ReceiverState::new(config(), pool, effect, reads)))
+    router(Arc::new(ReceiverState::new(
+        config(),
+        pool,
+        effect,
+        reads,
+        Arc::new(MockModeration::default()),
+    )))
 }
 
 async fn map_launch(pool: &sqlx::PgPool) {
@@ -846,6 +952,281 @@ async fn event_read_unmapped_key_is_refused_before_any_discord_call() {
     assert_eq!(body["error"]["code"], "action_not_allowed");
     assert_eq!(body["error"]["retryable"], false);
     assert_eq!(api.count(), 0, "unmapped keys never reach Discord");
+    db.close().await.unwrap();
+}
+
+fn moderation_app(pool: sqlx::PgPool, moderation: Arc<MockModeration>) -> Router {
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    router(state_full(
+        pool,
+        effect,
+        Arc::new(MockEventRead::default()),
+        moderation,
+    ))
+}
+
+/// Moderation signing without an `Idempotency-Key` header, for the
+/// missing-key refusal path.
+fn signed_moderation_without_key(raw: &str, key: &str) -> Request {
+    let timestamp = (now_ms() / 1000).to_string();
+    let nonce_value = nonce();
+    let signature = sign(
+        secret(usize::from(key == "new")).as_bytes(),
+        &timestamp,
+        &nonce_value,
+        raw.as_bytes(),
+    );
+    Request::builder()
+        .method(Method::POST)
+        .uri(ACTIONS_PATH)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-two-key-id", key)
+        .header("x-two-timestamp", timestamp)
+        .header("x-two-nonce", nonce_value)
+        .header("x-two-signature", signature)
+        .body(Body::from(raw.to_owned()))
+        .unwrap()
+}
+
+#[test]
+fn moderation_gates_are_verb_specific() {
+    assert_eq!(
+        moderation_required_permission(ModerationAction::Ban),
+        PERM_BAN_MEMBERS
+    );
+    assert_eq!(
+        moderation_required_permission(ModerationAction::TempBan),
+        PERM_BAN_MEMBERS
+    );
+    assert_eq!(
+        moderation_required_permission(ModerationAction::Kick),
+        PERM_KICK_MEMBERS
+    );
+    assert_eq!(
+        moderation_required_permission(ModerationAction::Warn),
+        PERM_MODERATE_MEMBERS
+    );
+    assert!(moderation_tolerates_departed_target(ModerationAction::Ban));
+    assert!(moderation_tolerates_departed_target(
+        ModerationAction::TempBan
+    ));
+    assert!(!moderation_tolerates_departed_target(
+        ModerationAction::Kick
+    ));
+    assert!(!moderation_tolerates_departed_target(
+        ModerationAction::Warn
+    ));
+    for verb in [
+        ModerationAction::Ban,
+        ModerationAction::TempBan,
+        ModerationAction::Kick,
+        ModerationAction::Warn,
+    ] {
+        assert!(is_wired_moderation_verb(verb), "{verb:?}");
+    }
+    for verb in [
+        ModerationAction::Timeout,
+        ModerationAction::Purge,
+        ModerationAction::Slowmode,
+        ModerationAction::Lockdown,
+        ModerationAction::Unlock,
+    ] {
+        assert!(!is_wired_moderation_verb(verb), "{verb:?}");
+    }
+}
+
+#[tokio::test]
+async fn moderation_flag_off_is_refused_before_any_effect() {
+    let Some(db) = database().await else { return };
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(false);
+    let moderation = Arc::new(MockModeration::default());
+    let app = moderation_app(db.pool().clone(), moderation.clone());
+    for verb in [
+        "moderation.ban",
+        "moderation.tempban",
+        "moderation.kick",
+        "moderation.warn",
+    ] {
+        let (status, _, body) = answer(
+            app.clone(),
+            signed(
+                &moderation_payload(verb),
+                "old",
+                &format!("intent-{verb}-off"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{verb}");
+        assert_eq!(body["error"]["code"], "action_not_allowed", "{verb}");
+        assert_eq!(body["error"]["retryable"], false, "{verb}");
+    }
+    set_moderation_flags(true);
+    assert_eq!(
+        moderation.calls(),
+        0,
+        "disabled verbs never reach the effect"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn moderation_missing_idempotency_key_is_refused_before_any_effect() {
+    let Some(db) = database().await else { return };
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    let moderation = Arc::new(MockModeration::default());
+    let app = moderation_app(db.pool().clone(), moderation.clone());
+    let (status, _, body) = answer(
+        app,
+        signed_moderation_without_key(&moderation_payload("moderation.ban"), "old"),
+    )
+    .await;
+    set_moderation_flags(false);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "malformed");
+    assert_eq!(
+        moderation.calls(),
+        0,
+        "keyless calls never reach the effect"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn moderation_malformed_bodies_are_refused_before_any_effect() {
+    let Some(db) = database().await else { return };
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    let moderation = Arc::new(MockModeration::default());
+    let app = moderation_app(db.pool().clone(), moderation.clone());
+    for (verb, extra) in [
+        (
+            "moderation.ban",
+            serde_json::json!({"actor_id": "00000000000000000"}),
+        ),
+        (
+            "moderation.kick",
+            serde_json::json!({"discord_id": "99999999999999999999"}),
+        ),
+        (
+            "moderation.tempban",
+            serde_json::json!({"duration_seconds": 59}),
+        ),
+        (
+            "moderation.tempban",
+            serde_json::json!({"duration_seconds": "3600"}),
+        ),
+        ("moderation.warn", serde_json::json!({"reason": ""})),
+        (
+            "moderation.warn",
+            serde_json::json!({"reason": "x".repeat(513)}),
+        ),
+    ] {
+        let (status, _, body) = answer(
+            app.clone(),
+            signed(
+                &moderation_payload_with(verb, extra),
+                "old",
+                &format!("intent-malformed-{verb}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{verb}");
+        assert_eq!(body["error"]["code"], "malformed", "{verb}");
+    }
+    set_moderation_flags(false);
+    assert_eq!(
+        moderation.calls(),
+        0,
+        "malformed bodies never reach the effect"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn moderation_success_replays_without_second_effect_but_changed_bytes_conflict() {
+    let Some(db) = database().await else { return };
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    let moderation = Arc::new(MockModeration::default());
+    let app = moderation_app(db.pool().clone(), moderation.clone());
+    for verb in [
+        "moderation.ban",
+        "moderation.tempban",
+        "moderation.kick",
+        "moderation.warn",
+    ] {
+        let intent = format!("intent-moderation-{verb}");
+        let raw = moderation_payload(verb);
+        let (status, headers, first) = answer(app.clone(), signed(&raw, "old", &intent)).await;
+        assert_eq!(status, StatusCode::OK, "{verb}");
+        assert!(!headers.contains_key("idempotent-replay"), "{verb}");
+        assert_eq!(
+            first["result"]["outcome"],
+            moderation_outcome_for(verb),
+            "{verb}"
+        );
+        assert_eq!(first["request_id"].as_str().unwrap().len(), 26, "{verb}");
+        // Same intent, fresh nonce: the stored receipt replays, no second effect.
+        let (_, headers, replay) = answer(app.clone(), signed(&raw, "new", &intent)).await;
+        assert_eq!(headers["idempotent-replay"], "true", "{verb}");
+        assert_eq!(first["result"], replay["result"], "{verb}");
+        // Same intent with changed exact signed bytes is a caller bug.
+        let changed = format!("{raw} ");
+        let (status, _, refusal) = answer(app.clone(), signed(&changed, "new", &intent)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{verb}");
+        assert_eq!(refusal["error"]["code"], "version_conflict", "{verb}");
+        assert_eq!(refusal["error"]["retryable"], false, "{verb}");
+    }
+    set_moderation_flags(false);
+    assert_eq!(
+        moderation.calls(),
+        4,
+        "one effect per verb, replays effect-free"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn unwired_moderation_verbs_stay_refused_with_flags_on() {
+    let Some(db) = database().await else { return };
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    let moderation = Arc::new(MockModeration::default());
+    let app = moderation_app(db.pool().clone(), moderation.clone());
+    // `moderation.timeout` belongs to the timeout family slice and is still
+    // unwired on this branch; the channel verbs belong to the channel slice.
+    // This assertion drops its timeout line when the timeout slice merges.
+    for (verb, extra) in [
+        (
+            "moderation.timeout",
+            serde_json::json!({"duration_seconds": 60}),
+        ),
+        ("moderation.purge", serde_json::json!({"count": 10})),
+        ("moderation.slowmode", serde_json::json!({"seconds": 5})),
+        ("moderation.lockdown", serde_json::json!({})),
+        ("moderation.unlock", serde_json::json!({})),
+    ] {
+        let (status, _, body) = answer(
+            app.clone(),
+            signed(
+                &moderation_payload_with(verb, extra),
+                "old",
+                &format!("intent-unwired-{verb}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{verb}");
+        assert_eq!(body["error"]["code"], "action_not_allowed", "{verb}");
+        assert_eq!(body["error"]["retryable"], false, "{verb}");
+    }
+    set_moderation_flags(false);
+    assert_eq!(
+        moderation.calls(),
+        0,
+        "unwired verbs never reach the effect"
+    );
     db.close().await.unwrap();
 }
 
