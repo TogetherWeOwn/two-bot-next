@@ -151,6 +151,18 @@ function missCacheFor(env: Env): RedirectMissCache {
 // the Worker and is unaffected.
 const healthBuckets = new TokenBuckets();
 
+// Failed-bearer cap for the authenticated /ops/metrics scrape. Only failed
+// attempts consume budget, so a correct bearer is never throttled by someone
+// else's failures (buckets are per caller, as with the probe cap). A correct
+// bearer from the same caller succeeds without consulting the bucket.
+// CONTROL_PATH deliberately shares nothing here: it is a separate ownership
+// gate whose token already requires 32 characters (see ownership.ts
+// authenticated()), and its lockout semantics belong to that fence.
+const metricsAuthBuckets = new TokenBuckets({ capacity: 10, refillPerSecond: 1 });
+// A short scrape token is an operator misconfiguration, not per-request
+// information: say so once per isolate so scanners cannot flood the logs.
+let metricsShortTokenLogged = false;
+
 // Store instances are request-scoped, but the lookup cache must survive
 // across requests to blunt repeated lookups — so it lives here beside the
 // miss cache, keyed (and reset) on the same configuration identity. A changed
@@ -198,6 +210,16 @@ const DEFAULT_UNREADY_SECONDS = 600;
 const READINESS_KEY = "two-bot:readiness";
 const METRICS_ALERT_KEY = "two-bot:metrics-alerts";
 const OPS_METRICS_PATH = "/ops/metrics";
+// The scrape token follows the ownership control token's floor: anything
+// shorter is treated as not configured. A short staging token must be
+// reissued, never padded (none is provisioned today).
+const MIN_SCRAPE_TOKEN_LENGTH = 32;
+// The DO serves the scrape from inside blockConcurrencyWhile, so the
+// container fetch must be bounded well below the 30s DO gate.
+const METRICS_FETCH_TIMEOUT_MS = 6000;
+// Prometheus exposition is small; cap the proxied body so a compromised or
+// wedged container cannot exhaust the isolate reading it.
+const MAX_METRICS_BODY_BYTES = 64 * 1024;
 
 /** Compare via digests so length/prefix timing does not leak the token. */
 async function tokenMatches(provided: string, expected: string): Promise<boolean> {
@@ -236,6 +258,32 @@ function isBotProbeResponse(response: Response): boolean {
 // warn. Strict tokens only: nothing else from the probe body is ever logged.
 const FAILURE_TOKEN = /^[a-z0-9_]{1,32}$/;
 const MAX_PROBE_BODY_BYTES = 64 * 1024;
+
+/**
+ * Read at most `limit` bytes as text. Returns null when the body is larger
+ * (drained first so the SDK proxy pipe is not left hanging), so an oversized
+ * container response can be refused without buffering it.
+ */
+async function readBoundedText(response: Response, limit: number): Promise<string | null> {
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > limit) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder().decode(bytes);
+}
 
 function gatewayFailure(body: ArrayBuffer): { phase: string; class: string } | null {
   if (body.byteLength > MAX_PROBE_BODY_BYTES) return null;
@@ -386,8 +434,33 @@ export class TwoBotContainer extends Container<Env> {
         // Reached only through the Worker's bearer-token gate (see default export).
         if (url.pathname === OPS_METRICS_PATH) {
           await this.armKeepalive();
-          const upstream = await this.containerFetch("http://c/metrics");
-          return new Response(await upstream.text(), {
+          let upstream: Response;
+          try {
+            upstream = await this.containerFetch("http://c/metrics", {
+              signal: AbortSignal.timeout(METRICS_FETCH_TIMEOUT_MS),
+            });
+          } catch {
+            return new Response("metrics unavailable\n", {
+              status: 504,
+              headers: { "content-type": "text/plain", "cache-control": "no-store" },
+            });
+          }
+          let body: string | null;
+          try {
+            body = await readBoundedText(upstream, MAX_METRICS_BODY_BYTES);
+          } catch {
+            return new Response("metrics unavailable\n", {
+              status: 504,
+              headers: { "content-type": "text/plain", "cache-control": "no-store" },
+            });
+          }
+          if (body === null) {
+            return new Response("metrics unavailable\n", {
+              status: 502,
+              headers: { "content-type": "text/plain", "cache-control": "no-store" },
+            });
+          }
+          return new Response(body, {
             status: upstream.status,
             headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8", "cache-control": "no-store" },
           });
@@ -831,12 +904,41 @@ export default {
       return result;
     }
 
-    // Authenticated off-container scrape path. No configured token → 404 (the
-    // route does not exist); missing/wrong bearer → 401. Exact path only.
+    // Authenticated off-container scrape path. No configured token (or one
+    // shorter than the 32-character floor — same bar as the ownership
+    // control token) → 404 (the route does not exist); missing/wrong
+    // bearer → 401 with per-caller throttling of repeated failures (429 +
+    // retry-after). A correct bearer never consults the failure bucket, so
+    // someone else's guessing cannot throttle it. Exact path only.
+    // CONTROL_PATH keeps its own gate (ownership.ts authenticated()): it
+    // shares neither this bucket nor its budget.
     if (url.pathname === OPS_METRICS_PATH) {
-      if (!env.METRICS_SCRAPE_TOKEN || request.method !== "GET") return new Response("not found", { status: 404 });
+      if (!env.METRICS_SCRAPE_TOKEN || env.METRICS_SCRAPE_TOKEN.length < MIN_SCRAPE_TOKEN_LENGTH
+        || request.method !== "GET") {
+        if (env.METRICS_SCRAPE_TOKEN && env.METRICS_SCRAPE_TOKEN.length < MIN_SCRAPE_TOKEN_LENGTH
+          && !metricsShortTokenLogged) {
+          metricsShortTokenLogged = true;
+          console.error(JSON.stringify({
+            event: "metrics_scrape_token_misconfigured",
+            reason: "token_below_minimum_length",
+            minimum_length: MIN_SCRAPE_TOKEN_LENGTH,
+          }));
+        }
+        return new Response("not found", { status: 404 });
+      }
+      const caller = request.headers.get("cf-connecting-ip") ?? "unknown";
       const m = /^Bearer (.+)$/.exec(request.headers.get("authorization") ?? "");
-      if (!m || !(await tokenMatches(m[1]!, env.METRICS_SCRAPE_TOKEN))) {
+      if (!m || m[1]!.length > 4096 || !(await tokenMatches(m[1]!, env.METRICS_SCRAPE_TOKEN))) {
+        const verdict = metricsAuthBuckets.take(caller);
+        if (!verdict.allowed) {
+          return new Response("slow down\n", {
+            status: 429,
+            headers: {
+              "content-type": "text/plain",
+              "retry-after": String(verdict.retryAfter),
+            },
+          });
+        }
         return new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } });
       }
       try {

@@ -880,6 +880,42 @@ for (const path of ["/INTERNAL/OWNERSHIP", "/internal/%6fwnership", "//internal/
   });
 }
 
+test("DO /ops/metrics: hung container fetch aborts within the bound (504, generic body)", async (t) => {
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", (...args: Parameters<TwoBotContainer["containerFetch"]>) => {
+    const init = args[1] as RequestInit | undefined;
+    return new Promise<Response>((_resolve, reject) => {
+      if (init?.signal?.aborted) reject(new Error("fixture already aborted"));
+      else init?.signal?.addEventListener("abort", () => reject(new Error("fixture container hang aborted")));
+    });
+  });
+  const started = Date.now();
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/ops/metrics"));
+  const elapsed = Date.now() - started;
+  assert.equal(response.status, 504);
+  assert.equal(await response.text(), "metrics unavailable\n");
+  assert.ok(elapsed < 15000, `hung fetch must return within the bound, took ${elapsed}ms`);
+  assert.ok(elapsed >= 4000, `must actually await the abort, took ${elapsed}ms`);
+});
+
+test("DO /ops/metrics: oversized body returns 502 with a generic body", async (t) => {
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", async () => new Response("m 1\n".repeat(20000)));
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/ops/metrics"));
+  assert.equal(response.status, 502);
+  assert.equal(await response.text(), "metrics unavailable\n");
+});
+
+test("DO /ops/metrics: small body proxies status with the exposition content type", async (t) => {
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", async () => new Response("# HELP x\n", { status: 200 }));
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/ops/metrics"));
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "text/plain; version=0.0.4; charset=utf-8");
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.equal(await response.text(), "# HELP x\n");
+});
+
 // Readiness monitoring uses synthetic responses only. Global fetch is stubbed
 // in every alert test: no configured webhook, Worker or database is contacted.
 async function alertHarness(t: TestContext, env: Partial<Env> = {}, values?: Map<string, unknown>) {

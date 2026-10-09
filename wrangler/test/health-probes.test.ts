@@ -148,7 +148,8 @@ test("a burst over budget gets 429 with retry-after; other callers and 405s are 
 
 test("/ops/metrics gate behaves as before: 404 without token, 401 without/with wrong bearer", async () => {
   const h = harness();
-  const env = (token?: string) => ({ ...h.env, METRICS_SCRAPE_TOKEN: token }) as Env;
+  const token = "synthetic-metrics-scrape-token-0123456789";
+  const env = (t?: string) => ({ ...h.env, METRICS_SCRAPE_TOKEN: t }) as Env;
   const get = (e: Env, auth?: string) =>
     worker.fetch(
       new Request("https://probe.invalid/ops/metrics", { headers: auth ? { authorization: auth } : {} }),
@@ -156,10 +157,86 @@ test("/ops/metrics gate behaves as before: 404 without token, 401 without/with w
       h.ctx,
     );
   assert.equal((await get(env(), "Bearer anything")).status, 404);
-  assert.equal((await get(env("s3cret"))).status, 401);
-  assert.equal((await get(env("s3cret"), "Bearer nope")).status, 401);
+  assert.equal((await get(env(token))).status, 401);
+  assert.equal((await get(env(token), "Bearer nope")).status, 401);
   assert.equal(h.forwarded.length, 0, "unauthenticated scrapes never reach the container");
-  const ok = await get(env("s3cret"), "Bearer s3cret");
+  const ok = await get(env(token), `Bearer ${token}`);
   assert.equal(ok.status, 200);
   assert.equal(h.forwarded.length, 1);
+});
+
+test("/ops/metrics: short token 404s as not configured with one redacted log line", async () => {
+  const h = harness();
+  const short = "short-token";
+  const errors: string[] = [];
+  const orig = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+  try {
+    const res = await worker.fetch(
+      new Request("https://probe.invalid/ops/metrics", { headers: { authorization: `Bearer ${short}` } }),
+      { ...h.env, METRICS_SCRAPE_TOKEN: short } as Env,
+      h.ctx,
+    );
+    assert.equal(res.status, 404);
+    assert.equal(await res.text(), "not found");
+    assert.equal(h.forwarded.length, 0, "short-token scrapes never reach the container");
+  } finally {
+    console.error = orig;
+  }
+  assert.equal(errors.length, 1, "exactly one misconfiguration line");
+  assert.ok(errors[0]!.includes("metrics_scrape_token_misconfigured"), "line names the event");
+  assert.ok(errors[0]!.includes("32"), "line names the 32-character requirement");
+  assert.ok(!errors[0]!.includes(short), "line never carries the token value");
+});
+
+test("/ops/metrics: repeated wrong bearers throttle per caller; correct bearer unaffected", async () => {
+  const h = harness();
+  const token = "synthetic-metrics-throttle-token-0123456789";
+  const e = { ...h.env, METRICS_SCRAPE_TOKEN: token } as Env;
+  const get = (ip: string, auth?: string) =>
+    worker.fetch(
+      new Request("https://probe.invalid/ops/metrics", {
+        headers: { ...(auth ? { authorization: auth } : {}), "cf-connecting-ip": ip },
+      }),
+      e,
+      h.ctx,
+    );
+  // Bucket: 10 burst. Ten failures are plain 401s.
+  for (let i = 0; i < 10; i++) {
+    const res = await get("10.7.7.7", "Bearer wrong-bearer-value");
+    assert.equal(res.status, 401, `failure ${i} must stay 401`);
+    await res.text();
+  }
+  const throttled = await get("10.7.7.7", "Bearer wrong-bearer-value");
+  assert.equal(throttled.status, 429);
+  assert.ok(Number(throttled.headers.get("retry-after")) >= 1);
+  assert.equal(await throttled.text(), "slow down\n");
+  assert.equal(h.forwarded.length, 0, "failed scrapes never reach the container");
+  // Another caller's failures cannot throttle the correct bearer — and the
+  // correct bearer succeeds even from the throttled caller's address.
+  const other = await get("10.7.7.8", "Bearer wrong-bearer-value");
+  assert.equal(other.status, 401);
+  await other.text();
+  const ok = await get("10.7.7.7", `Bearer ${token}`);
+  assert.equal(ok.status, 200);
+  assert.equal(h.forwarded.length, 1);
+  // No token value in any response body seen above.
+});
+
+test("/ops/metrics: wrong bearer and throttle responses never carry the token", async () => {
+  const h = harness();
+  const token = "synthetic-metrics-secrecy-token-0123456789";
+  const e = { ...h.env, METRICS_SCRAPE_TOKEN: token } as Env;
+  for (let i = 0; i < 11; i++) {
+    const res = await worker.fetch(
+      new Request("https://probe.invalid/ops/metrics", {
+        headers: { authorization: "Bearer wrong", "cf-connecting-ip": "10.7.7.9" },
+      }),
+      e,
+      h.ctx,
+    );
+    const body = await res.text();
+    assert.ok(!body.includes(token), `response ${i} must not carry the token`);
+    assert.ok(!(res.headers.get("www-authenticate") ?? "").includes(token));
+  }
 });

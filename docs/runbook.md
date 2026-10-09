@@ -167,6 +167,11 @@ transition (fire, resolve). It posts to `OPS_ALERT_WEBHOOK_URL` only when
 retains the credential and monitoring. See
 [metrics](metrics.md#off-container-scrape-and-alert-rules). Fetch the live data
 with `curl -H "Authorization: Bearer $METRICS_SCRAPE_TOKEN" "$WORKER_URL/ops/metrics"`.
+`METRICS_SCRAPE_TOKEN` must be at least 32 characters; a shorter value leaves
+the route at `404` and a short staging token must be reissued (none is
+provisioned today). Repeated wrong bearers from one caller are throttled
+(`429` + `retry-after`); a correct bearer is never throttled by someone
+else's failures.
 
 #### Alert: job stale
 
