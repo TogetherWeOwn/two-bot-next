@@ -1025,6 +1025,11 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked --test restore_drill -- --ignored --nocapture
 
+      - name: Community scorecard captured-stream coverage (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot --locked --bin two-bot scorecard_marks_only_captured_streams -- --ignored
+
   moderation-db:
     name: moderation db
     permissions:
