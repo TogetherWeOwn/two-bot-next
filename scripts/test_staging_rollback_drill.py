@@ -124,10 +124,10 @@ class WorldOpener:
 
 
 def make_control(world):
-    def control(action, epoch=None, release_fence=False):
+    def control(action, epoch=None, release_fence=False, expected_deployment=None):
         world.tick(1)
         count = sum(1 for call in world.calls if call[0] == action) + 1
-        world.calls.append((action, epoch, release_fence))
+        world.calls.append((action, epoch, release_fence, expected_deployment))
         world.events.append(("control", action))
         failure = world.fail_control.get((action, count))
         if failure:
@@ -192,6 +192,9 @@ class HappyPathTests(unittest.TestCase):
         self.assertEqual(world.calls[2][1], 7)
         self.assertEqual(world.calls[5][1], 9)
         self.assertTrue(all(call[2] for call in world.calls if call[0] == "deployment-takeover"))
+        # Each takeover pins the version its leg just moved to: drill leg then restore leg.
+        self.assertEqual([call[3] for call in world.calls if call[0] == "deployment-takeover"],
+                         [TARGET, PRE])
         self.assertEqual([body["versions"][0]["version_id"] for _, body in world.posts], [TARGET, PRE])
         self.assertEqual(world.history[0], PRE)
         self.assertEqual((world.phase, world.running), ("active", True))
@@ -362,9 +365,9 @@ class EvidenceTests(unittest.TestCase):
         world = World()
         control = make_control(world)
 
-        def hostile(action, epoch=None, release_fence=False):
-            state = control(action, epoch, release_fence)
-            if action == "status" and world.calls.count(("status", None, False)) >= 2:
+        def hostile(action, epoch=None, release_fence=False, expected_deployment=None):
+            state = control(action, epoch, release_fence, expected_deployment)
+            if action == "status" and world.calls.count(("status", None, False, None)) >= 2:
                 state["owner"]["phase"] = f"weird {SENTINEL}"
             return state
 
@@ -541,6 +544,17 @@ class ClientAndControlTests(unittest.TestCase):
                     "OWNERSHIP_CONTROL_TOKEN": SENTINEL, "OWNERSHIP_ACTOR": actor,
                     "OWNERSHIP_RELEASE_FENCE": "false"})
                 self.assertNotIn(SENTINEL, " ".join(run.call_args.args[0]))
+
+    def test_takeover_pin_travels_only_with_the_takeover(self):
+        done = subprocess.CompletedProcess([], 0, stdout='{"configured": true}', stderr="")
+        control = drill.ownership_control(SENTINEL, URL, "github-actions:1:rollback-drill", root="/repo")
+        with patch.object(drill.subprocess, "run", return_value=done) as run:
+            control("deployment-takeover", release_fence=True, expected_deployment="deployed-version")
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["OWNERSHIP_EXPECTED_DEPLOYMENT"], "deployed-version")
+        with patch.object(drill.subprocess, "run", return_value=done) as run:
+            control("status")
+        self.assertNotIn("OWNERSHIP_EXPECTED_DEPLOYMENT", run.call_args.kwargs["env"])
 
     @unittest.skipUnless(shutil.which("node"), "Node runtime not installed")
     def test_minimal_child_environment_runs_node_preflight_without_network(self):

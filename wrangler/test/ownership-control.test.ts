@@ -40,16 +40,37 @@ test("routine deploy refuses to unpark a fenced/pristine singleton", async () =>
 
 test("routine deploy explicitly hands off the active epoch without redirects", async () => {
   const s = sender({ epoch: 3, deploymentId: "A", phase: "active" });
-  const result = await control({ ...args, action: "deployment-takeover" }, s.send);
+  const result = await control({ ...args, action: "deployment-takeover", expectedDeploymentId: "B" }, s.send);
   assert.equal(result.owner.epoch, 4);
   assert.equal(s.calls.length, 2);
   assert.equal(s.calls[0]!.redirect, "error");
   assert.deepEqual(JSON.parse(String(s.calls[1]!.body)), { action: "takeover", actor: args.actor, expectedEpoch: 3 });
 });
 
+test("deployment-takeover skips reads answered by the previous version, then posts to the deployed one", async () => {
+  const script = [
+    Response.json({ deploymentId: "A", owner: { epoch: 3, deploymentId: "A", phase: "active" }, running: false }),
+    Response.json({ deploymentId: "B", owner: { epoch: 3, deploymentId: "A", phase: "active" }, running: false }),
+    Response.json({ deploymentId: "B", running: false, owner: { deploymentId: "B", epoch: 4, phase: "active" } }),
+  ];
+  let waitCount = 0;
+  const s = sender({ epoch: 3, deploymentId: "A", phase: "active" });
+  const result = await control({ ...args, action: "deployment-takeover", expectedDeploymentId: "B", takeoverRetryDelayMs: 1 },
+    async (url, init) => { s.calls.push(init); return script[s.calls.length - 1]!; },
+    async () => { waitCount += 1; });
+  assert.equal(result.owner.epoch, 4);
+  assert.equal(waitCount, 1);
+});
+
+test("deployment-takeover needs the deployed version before posting", async () => {
+  const s = sender({ epoch: 3, deploymentId: "A", phase: "active" });
+  await assert.rejects(control({ ...args, action: "deployment-takeover" }, s.send), /needs the deployed version/);
+  assert.equal(s.calls.length, 1);
+});
+
 test("explicit release can initialize but requires an actor and confirmed stop", async () => {
   const s = sender(null);
-  assert.equal((await control({ ...args, action: "deployment-takeover", releaseFence: true }, s.send)).owner.epoch, 1);
+  assert.equal((await control({ ...args, action: "deployment-takeover", expectedDeploymentId: "B", releaseFence: true }, s.send)).owner.epoch, 1);
   await assert.rejects(control({ ...args, actor: "", action: "takeover" }, sender(null).send));
   await assert.rejects(control({ ...args, action: "takeover" }, async (_url, init) =>
     Response.json(init.method === "GET" ? { deploymentId: "B", owner: null, running: false }

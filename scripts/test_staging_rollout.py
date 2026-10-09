@@ -897,6 +897,12 @@ class DeploymentWiringTests(unittest.TestCase):
         self.assertNotIn("secrets.", receipt[0])
         self.assertNotIn("STAGING_URL", receipt[0])
         self.assertNotIn("|| true", receipt[0])
+        # The takeover posts only while reads answer from the deployed version:
+        # the step must pin it from the receipt's worker_version, never a literal.
+        self.assertIn("OWNERSHIP_EXPECTED_DEPLOYMENT", takeover[0])
+        self.assertIn("receipt.json", takeover[0])
+        self.assertIn("worker_version", takeover[0])
+        self.assertNotRegex(takeover[0], r"OWNERSHIP_EXPECTED_DEPLOYMENT=\"[^\$]")
         # GitHub rejects the whole workflow if job-level env uses the runner context.
         job_header = source.split("    steps:\n", 1)[0]
         self.assertNotIn("runner.", job_header)

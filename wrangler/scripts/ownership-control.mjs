@@ -11,7 +11,7 @@ class HttpFailure extends ControlError {
   }
 }
 
-// A retry read answered by a different Worker version than the first read.
+// A retry read answered by a Worker version other than the deployed one.
 // Propagation is still mixed, so this attempt must not post. Retryable inside
 // the takeover window like a 5xx; the window bound still applies.
 class DeploymentChanged extends ControlError {}
@@ -61,7 +61,7 @@ function withEarlierRefusal(error, earlier, summary) {
   return new ControlError(`Ownership control failed; ${detail}; stop, do not change credentials`);
 }
 
-export async function control({ action, url, token, actor, expectedEpoch, releaseFence = false, takeoverAttempts = 34, takeoverRetryDelayMs = 10000, takeoverWindowMs = 330000 }, send = fetch, wait = sleep) {
+export async function control({ action, url, token, actor, expectedEpoch, expectedDeploymentId, releaseFence = false, takeoverAttempts = 34, takeoverRetryDelayMs = 10000, takeoverWindowMs = 330000 }, send = fetch, wait = sleep) {
   const origin = new URL(url);
   if (origin.protocol !== "https:" || origin.port || origin.username || origin.password ||
       !/^two-bot-next-staging\.[a-z0-9-]+\.workers\.dev$/.test(origin.hostname) ||
@@ -90,7 +90,6 @@ export async function control({ action, url, token, actor, expectedEpoch, releas
     return state;
   };
   let postedEpoch;
-  let pinnedDeploymentId;
   const once = async () => {
     attempts += 1;
     const current = await read({ method: "GET" });
@@ -102,13 +101,16 @@ export async function control({ action, url, token, actor, expectedEpoch, releas
       if (current.owner?.phase !== "active" && !releaseFence) {
         throw new ControlError("Singleton is intentionally fenced or uninitialized; explicit staging release required");
       }
-      // Pin the deployment id that answered the first read. A later read answered
-      // by a different Worker version means propagation is still mixed: posting at
-      // the fresh epoch could hand a stale version a further commit, so skip this
-      // attempt and re-read inside the window instead of posting.
-      pinnedDeploymentId ??= current.deploymentId;
-      if (current.deploymentId !== pinnedDeploymentId) {
-        throw new DeploymentChanged(`Ownership transition not confirmed; answering deployment changed across takeover retries; refusing to post, preserve maintenance (attempts=${attempts} elapsed=${elapsedSeconds()}s)`);
+      // Pin to the version this deploy produced (the receipt's worker_version),
+      // never to whichever version answers first: right after deploy the old
+      // version can still answer reads while propagation is mixed, and posting
+      // there only earns a 503. A read answered by any other version skips the
+      // post and re-reads inside the window instead.
+      if (!expectedDeploymentId) {
+        throw new ControlError("Deployment-takeover needs the deployed version id; pass the receipt worker_version and do not post unpinned");
+      }
+      if (current.deploymentId !== expectedDeploymentId) {
+        throw new DeploymentChanged(`Ownership transition not confirmed; answering deployment is not the deployed version; refusing to post, preserve maintenance (attempts=${attempts} elapsed=${elapsedSeconds()}s)`);
       }
       // A 5xx after a committed takeover leaves the owner active at the posted epoch; confirm it without posting again.
       if (postedEpoch !== undefined && current.owner?.phase === "active" && current.owner.epoch === postedEpoch &&
@@ -116,11 +118,11 @@ export async function control({ action, url, token, actor, expectedEpoch, releas
         if (current.running) throw new ControlError("Ownership transition not confirmed; preserve maintenance");
         return current;
       }
-      // Our epoch committed but owned by another active deployment: the shared record
-      // cannot tell our commit reported by a stale version from a stale version's own
-      // further commit, so never re-post into it. Crash-recovery (fenced) still re-posts.
+      // Our epoch committed but owned by another active deployment: another actor
+      // committed at our epoch, so never re-post into it. Crash-recovery
+      // (fenced) still re-posts.
       if (postedEpoch !== undefined && current.owner?.phase === "active" && current.owner.epoch === postedEpoch &&
-          current.owner.deploymentId !== pinnedDeploymentId) {
+          current.owner.deploymentId !== expectedDeploymentId) {
         throw new ControlError("Ownership transition not confirmed; posted epoch is owned by another deployment; refusing to post, preserve maintenance");
       }
       expectedEpoch = current.owner?.epoch ?? 0;
@@ -129,6 +131,13 @@ export async function control({ action, url, token, actor, expectedEpoch, releas
     const targetAction = action === "deployment-takeover" ? "takeover" : action;
     postedEpoch = expectedEpoch + 1;
     const result = await read({ method: "POST", body: JSON.stringify({ action: targetAction, actor, expectedEpoch }) });
+    // Requests can still route to a draining version after the pre-post read:
+    // a 200 from the pinned version proves worker and singleton agree there,
+    // so an answer from any other version is propagation, not a commit.
+    // Retry it like a stale read instead of failing or misreading the epoch.
+    if (action === "deployment-takeover" && result.deploymentId !== expectedDeploymentId) {
+      throw new DeploymentChanged(`Ownership transition not confirmed; takeover answered by a different version than the deployed one; refusing to confirm, preserve maintenance (attempts=${attempts} elapsed=${elapsedSeconds()}s)`);
+    }
     if (result.running || result.owner?.epoch !== expectedEpoch + 1 ||
         (targetAction === "takeover" && (result.owner.phase !== "active" || result.owner.deploymentId !== result.deploymentId)) ||
         (targetAction === "fence" && (result.owner.phase !== "fenced" || result.owner.deploymentId !== null))) {
@@ -163,6 +172,7 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
       token: process.env.OWNERSHIP_CONTROL_TOKEN,
       actor: process.env.OWNERSHIP_ACTOR,
       expectedEpoch: epoch === undefined ? undefined : Number(epoch),
+      expectedDeploymentId: process.env.OWNERSHIP_EXPECTED_DEPLOYMENT,
       releaseFence: process.env.OWNERSHIP_RELEASE_FENCE === "true",
     });
     console.log(JSON.stringify(result));

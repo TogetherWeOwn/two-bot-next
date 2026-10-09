@@ -1,4 +1,5 @@
-// Takeover retry contract: retry only 5xx; 4xx, auth, validation and the fenced phase are never retried.
+// Takeover retry contract: retry only 5xx and reads answered by a version other
+// than the deployed one; 4xx, auth, validation and the fenced phase are never retried.
 import assert from 'node:assert/strict';
 import { readdir, readFile } from 'node:fs/promises';
 import test from 'node:test';
@@ -9,9 +10,14 @@ const TOKEN = 'x'.repeat(32);
 const ACTOR = 'github-actions:1:abc';
 const LEAK = `synthetic-leak-${'q'.repeat(40)}`;
 
+const DEPLOYED = 'new-deployment';
+
 function owner(epoch) {
-  return { deploymentId: 'new-deployment', epoch, phase: 'active' };
+  return { deploymentId: DEPLOYED, epoch, phase: 'active' };
 }
+
+// A read answered by the previous Worker version while propagation is mixed.
+const stale = (epoch) => ({ status: 200, body: { deploymentId: 'old-deployment', owner: { deploymentId: 'old-deployment', epoch, phase: 'active' }, running: false } });
 
 // Each scripted entry is one response; a string body is sent verbatim, anything else as JSON.
 function fixture(script) {
@@ -44,7 +50,7 @@ const http = (status, reason = 'deployment_mismatch') => ({ status, body: { erro
 
 test('deployment-takeover succeeds first try without waiting', async () => {
   const f = fixture([ok(80), ok(81)]);
-  const result = await f.invoke({ action: 'deployment-takeover' });
+  const result = await f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED });
   assert.equal(result.owner.epoch, 81);
   assert.deepEqual(f.calls, ['GET', 'POST']);
   assert.deepEqual(f.waits, []);
@@ -52,7 +58,7 @@ test('deployment-takeover succeeds first try without waiting', async () => {
 
 test('deployment-takeover retries GET 503s then succeeds', async () => {
   const f = fixture([http(503), http(503), ok(80), ok(81)]);
-  const result = await f.invoke({ action: 'deployment-takeover' });
+  const result = await f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED });
   assert.equal(result.owner.epoch, 81);
   assert.deepEqual(f.calls, ['GET', 'GET', 'GET', 'POST']);
   assert.deepEqual(f.waits, [10000, 10000]);
@@ -60,7 +66,7 @@ test('deployment-takeover retries GET 503s then succeeds', async () => {
 
 test('deployment-takeover retries POST 503 with a fresh state read', async () => {
   const f = fixture([ok(80), http(503), ok(80), ok(81)]);
-  const result = await f.invoke({ action: 'deployment-takeover' });
+  const result = await f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED });
   assert.equal(result.owner.epoch, 81);
   assert.deepEqual(f.calls, ['GET', 'POST', 'GET', 'POST']);
   assert.deepEqual(f.waits, [10000]);
@@ -68,7 +74,7 @@ test('deployment-takeover retries POST 503 with a fresh state read', async () =>
 
 test('deployment-takeover retry after a committed takeover does not take over again', async () => {
   const f = fixture([ok(80), http(503), ok(81)]);
-  const result = await f.invoke({ action: 'deployment-takeover' });
+  const result = await f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED });
   assert.equal(result.owner.epoch, 81);
   assert.deepEqual(f.calls, ['GET', 'POST', 'GET']);
   assert.deepEqual(f.waits, [10000]);
@@ -76,64 +82,69 @@ test('deployment-takeover retry after a committed takeover does not take over ag
 
 test('deployment-takeover retry that finds a committed takeover running is not confirmed and not posted again', async () => {
   const f = fixture([ok(80), http(503), { status: 200, body: { deploymentId: 'new-deployment', owner: owner(81), running: true } }]);
-  await assert.rejects(f.invoke({ action: 'deployment-takeover' }), /Ownership transition not confirmed/);
+  await assert.rejects(f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED }), /Ownership transition not confirmed/);
   assert.deepEqual(f.calls, ['GET', 'POST', 'GET']);
 });
 
 test('deployment-takeover refuses to re-post when the posted epoch is owned by another deployment', async () => {
   const other = { status: 200, body: { deploymentId: 'new-deployment', owner: { ...owner(81), deploymentId: 'other-deployment' }, running: false } };
   const f = fixture([ok(80), http(503), other]);
-  await assert.rejects(f.invoke({ action: 'deployment-takeover' }), /posted epoch is owned by another deployment/);
+  await assert.rejects(f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED }), /posted epoch is owned by another deployment/);
   assert.deepEqual(f.calls, ['GET', 'POST', 'GET']);
   assert.deepEqual(f.waits, [10000]);
 });
 
-test('deployment-takeover does not post while retry reads flap between versions', async () => {
-  const stale = { status: 200, body: { deploymentId: 'old-deployment', owner: owner(80), running: false } };
-  const f = fixture([ok(80), http(503), stale, ok(80), ok(81)]);
-  const result = await f.invoke({ action: 'deployment-takeover' });
+test('deployment-takeover skips stale-version reads, then commits once the deployed version answers', async () => {
+  const f = fixture([stale(80), ok(80), http(503), stale(80), ok(80), ok(81)]);
+  const result = await f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED });
   assert.equal(result.owner.epoch, 81);
-  assert.deepEqual(f.calls, ['GET', 'POST', 'GET', 'GET', 'POST']);
-  assert.deepEqual(f.waits, [10000, 10000]);
+  assert.deepEqual(f.calls, ['GET', 'GET', 'POST', 'GET', 'GET', 'POST']);
+  assert.deepEqual(f.waits, [10000, 10000, 10000]);
 });
 
-test('deployment-takeover keeps waiting across versions, then reports the version change', async () => {
-  const stale = { status: 200, body: { deploymentId: 'old-deployment', owner: owner(80), running: false } };
-  const f = fixture([ok(80), http(503), stale, stale]);
-  const message = await failure(f.invoke({ action: 'deployment-takeover', takeoverAttempts: 3 }));
-  assert.match(message, /answering deployment changed across takeover retries/);
+test('deployment-takeover reports when only stale versions answer inside the window', async () => {
+  const f = fixture([ok(80), http(503), stale(80), stale(80)]);
+  const message = await failure(f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED, takeoverAttempts: 3 }));
+  assert.match(message, /answering deployment is not the deployed version/);
   assert.match(message, /earlier takeover refusal HTTP 503 reason=deployment_mismatch attempts=3 /);
   assert.deepEqual(f.calls, ['GET', 'POST', 'GET', 'GET']);
   assert.deepEqual(f.waits, [10000, 10000]);
 });
 
-test('deployment-takeover accepts a commit answered by a different version than the first read', async () => {
-  const first = { status: 200, body: { deploymentId: 'old-deployment', owner: { ...owner(80), deploymentId: 'old-deployment' }, running: false } };
-  const f = fixture([first, ok(81)]);
-  const result = await f.invoke({ action: 'deployment-takeover' });
+test('deployment-takeover retries a commit answered by a different version than the deployed one', async () => {
+  const staleCommit = { status: 200, body: { deploymentId: 'old-deployment', owner: owner(81), running: false } };
+  const f = fixture([ok(80), staleCommit, ok(80), ok(81)]);
+  const result = await f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED });
   assert.equal(result.owner.epoch, 81);
-  assert.deepEqual(f.calls, ['GET', 'POST']);
+  assert.deepEqual(f.calls, ['GET', 'POST', 'GET', 'POST']);
+  assert.deepEqual(f.waits, [10000]);
+});
+
+test('deployment-takeover refuses to post without the deployed version', async () => {
+  const f = fixture([ok(80)]);
+  await assert.rejects(f.invoke({ action: 'deployment-takeover' }), /needs the deployed version/);
+  assert.deepEqual(f.calls, ['GET']);
   assert.deepEqual(f.waits, []);
 });
 
 test('deployment-takeover retry after a fenced pending takeover posts again', async () => {
   const pending = { status: 200, body: { deploymentId: 'new-deployment', owner: { ...owner(81), phase: 'fenced' }, running: false } };
   const f = fixture([ok(80), http(503), pending, ok(82)]);
-  const result = await f.invoke({ action: 'deployment-takeover', releaseFence: true });
+  const result = await f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED, releaseFence: true });
   assert.equal(result.owner.epoch, 82);
   assert.deepEqual(f.calls, ['GET', 'POST', 'GET', 'POST']);
 });
 
 test('deployment-takeover does not read an owner without an epoch as a committed takeover', async () => {
   const f = fixture([{ status: 200, body: { deploymentId: 'new-deployment', owner: { deploymentId: 'new-deployment', phase: 'active' }, running: false } }, ok(1)]);
-  const result = await f.invoke({ action: 'deployment-takeover' });
+  const result = await f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED });
   assert.equal(result.owner.epoch, 1);
   assert.deepEqual(f.calls, ['GET', 'POST']);
 });
 
 test('deployment-takeover gives up after thirty-four attempts inside the bounded window', async () => {
   const f = fixture(Array.from({ length: 34 }, () => http(503)));
-  assert.match(await failure(f.invoke({ action: 'deployment-takeover' })),
+  assert.match(await failure(f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED })),
     /^Ownership control failed \(HTTP 503\) reason=deployment_mismatch attempts=34 elapsed=\d+s; stop, do not change credentials$/);
   assert.equal(f.calls.length, 34);
   assert.deepEqual(f.waits, Array(33).fill(10000));
@@ -147,14 +158,14 @@ test('deployment-takeover default bound covers the deferred code update window',
     return new Response(JSON.stringify(http(503).body), { status: 503 });
   };
   const wait = async (ms) => { now += ms; };
-  const error = await control({ url: STAGING, token: TOKEN, actor: ACTOR, action: 'deployment-takeover' }, send, wait).then(() => null, (e) => e);
+  const error = await control({ url: STAGING, token: TOKEN, actor: ACTOR, action: 'deployment-takeover', expectedDeploymentId: DEPLOYED }, send, wait).then(() => null, (e) => e);
   assert.match(error.message, /^Ownership control failed \(HTTP 503\) reason=deployment_mismatch attempts=\d+ elapsed=\d+s/);
   assert.ok(now >= 300000 && now <= 360000, `last refusal ended at ${now} ms`);
 });
 
 test('deployment-takeover succeeds on the last attempt inside the window', async () => {
   const f = fixture([...Array.from({ length: 33 }, () => http(503)), ok(80), ok(81)]);
-  const result = await f.invoke({ action: 'deployment-takeover' });
+  const result = await f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED });
   assert.equal(result.owner.epoch, 81);
   assert.equal(f.calls.length, 35);
   assert.deepEqual(f.waits, Array(33).fill(10000));
@@ -165,14 +176,14 @@ test('deployment-takeover never retries the deliberate fence refusal', async () 
     status: 200,
     body: { deploymentId: 'new-deployment', owner: { ...owner(81), phase: 'fenced', deploymentId: null }, running: false },
   }]);
-  await assert.rejects(f.invoke({ action: 'deployment-takeover' }), /explicit staging release required/);
+  await assert.rejects(f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED }), /explicit staging release required/);
   assert.deepEqual(f.calls, ['GET']);
   assert.deepEqual(f.waits, []);
 });
 
 test('deployment-takeover never retries auth failures', async () => {
   const f = fixture([http(401)]);
-  await assert.rejects(f.invoke({ action: 'deployment-takeover' }), /HTTP 401/);
+  await assert.rejects(f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED }), /HTTP 401/);
   assert.deepEqual(f.calls, ['GET']);
   assert.deepEqual(f.waits, []);
 });
@@ -180,7 +191,7 @@ test('deployment-takeover never retries auth failures', async () => {
 test('deployment-takeover never retries any non-5xx failure', async () => {
   for (const [status, reason] of [[400, 'not_owner'], [403, 'not_owner'], [404, 'not_owner'], [409, 'epoch_conflict'], [429, 'not_owner']]) {
     const f = fixture([http(status, reason)]);
-    assert.match(await failure(f.invoke({ action: 'deployment-takeover' })),
+    assert.match(await failure(f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED })),
       new RegExp(`HTTP ${status}\\) reason=${reason} attempts=1 `));
     assert.deepEqual(f.calls, ['GET']);
     assert.deepEqual(f.waits, []);
@@ -256,7 +267,7 @@ const fenced = () => ({ status: 200, body: { deploymentId: 'new-deployment', own
 
 test('a fence left by a failed takeover keeps the earlier refusal reason', async () => {
   const f = fixture([ok(80), http(503, 'shutdown_unconfirmed'), fenced()]);
-  assert.match(await failure(f.invoke({ action: 'deployment-takeover' })),
+  assert.match(await failure(f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED })),
     /^Singleton is intentionally fenced or uninitialized; explicit staging release required; earlier takeover refusal HTTP 503 reason=shutdown_unconfirmed attempts=2 elapsed=\d+s$/);
   assert.deepEqual(f.calls, ['GET', 'POST', 'GET']);
   assert.deepEqual(f.waits, [10000]);
@@ -264,14 +275,14 @@ test('a fence left by a failed takeover keeps the earlier refusal reason', async
 
 test('a network error after an earlier refusal keeps the reason and drops the raw error text', async () => {
   const f = fixture([http(503), { throws: new TypeError('synthetic-network-text') }]);
-  const message = await failure(f.invoke({ action: 'deployment-takeover' }));
+  const message = await failure(f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED }));
   assert.match(message, /^Ownership control failed; earlier takeover refusal HTTP 503 reason=deployment_mismatch attempts=2 elapsed=\d+s; stop, do not change credentials$/);
   assert.equal(message.includes('synthetic-network-text'), false);
 });
 
 test('takeover stops before a wait that would end past the window', async () => {
   const f = fixture([http(503)]);
-  assert.match(await failure(f.invoke({ action: 'deployment-takeover', takeoverWindowMs: 0 })), /\(HTTP 503\) reason=deployment_mismatch attempts=1 /);
+  assert.match(await failure(f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED, takeoverWindowMs: 0 })), /\(HTTP 503\) reason=deployment_mismatch attempts=1 /);
   assert.deepEqual(f.calls, ['GET']);
   assert.deepEqual(f.waits, []);
 });

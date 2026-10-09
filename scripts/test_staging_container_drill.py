@@ -191,10 +191,10 @@ class FakeClient:
 
 
 def make_control(world):
-    def control(action, epoch=None, release_fence=False):
+    def control(action, epoch=None, release_fence=False, expected_deployment=None):
         world.tick(1)
         count = sum(1 for call in world.calls if call[0] == action) + 1
-        world.calls.append((action, epoch, release_fence))
+        world.calls.append((action, epoch, release_fence, expected_deployment))
         failure = world.fail_control.get((action, count))
         if failure:
             raise failure
@@ -247,6 +247,10 @@ def run_drill(world, raw_pin=None, attestation=COVERING_ATTESTATION, logs=None):
         if world.refuse_deploy:
             return 1
         world.serving_image = image
+        # An image deploy mints a fresh Worker version id. The fake reuses the
+        # image's known version so the deployments API models the post-deploy
+        # state the takeover pin reads.
+        world.history.insert(0, BACKOUT_WORKER if image == BACKOUT_IMAGE else PRE)
         world.rollouts.append(rollout_row(world, f"r-{len(world.rollouts)}", image))
         return 0
 
@@ -348,6 +352,10 @@ class HappyPathTests(unittest.TestCase):
                           "status", "fence", "deployment-takeover"])
         self.assertTrue(all(call[2] for call in world.calls
                             if call[0] == "deployment-takeover"))
+        # Each takeover pins the version its leg's deploy just put at 100%.
+        self.assertEqual([call[3] for call in world.calls
+                          if call[0] == "deployment-takeover"],
+                         [BACKOUT_WORKER, PRE])
 
     def test_deploy_config_overrides_only_the_image(self):
         world = World()
@@ -631,9 +639,9 @@ class EvidenceTests(unittest.TestCase):
         world = World()
         control = make_control(world)
 
-        def hostile(action, epoch=None, release_fence=False):
-            state = control(action, epoch, release_fence)
-            if action == "status" and world.calls.count(("status", None, False)) >= 2:
+        def hostile(action, epoch=None, release_fence=False, expected_deployment=None):
+            state = control(action, epoch, release_fence, expected_deployment)
+            if action == "status" and world.calls.count(("status", None, False, None)) >= 2:
                 state["owner"]["phase"] = f"weird {SENTINEL}"
             return state
 

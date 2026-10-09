@@ -130,7 +130,13 @@ jobs:
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
           OWNERSHIP_ACTOR: github-actions:${{ github.run_id }}:${{ github.sha }}
           OWNERSHIP_RELEASE_FENCE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_fence && 'true' || 'false' }}
-        run: node scripts/ownership-control.mjs deployment-takeover
+        # Pin the takeover to the version this deploy produced: the client posts
+        # only while reads answer from the receipt's worker_version, so mixed
+        # propagation hands over as soon as the new version serves.
+        run: |
+          set -euo pipefail
+          OWNERSHIP_EXPECTED_DEPLOYMENT="$(python3 -c 'import json, os; print(json.load(open(os.environ["ROLLOUT_DIR"] + "/receipt.json"))["worker_version"])')" \
+            node scripts/ownership-control.mjs deployment-takeover
       - name: Verify exact new rollout and serving Worker/container readiness
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
