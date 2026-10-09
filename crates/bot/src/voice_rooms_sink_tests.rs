@@ -607,10 +607,18 @@ async fn poisoned_live_lock_does_not_restart_the_gateway() {
 }
 
 #[tokio::test]
-async fn actor_load_failure_bumps_the_counter_but_warns_once_per_interval() {
+async fn actor_load_failure_bumps_counter_and_arms_warn_throttle() {
     let series = "two_bot_db_errors_total{op=\"other\"} ";
     let before = global_series(series);
     observe_voice_actor_load_failure(GUILD, &StoreError::Unavailable);
     observe_voice_actor_load_failure(GUILD, &StoreError::Unavailable);
     assert_eq!(global_series(series), before + 2);
+    // The first failure arms the throttle timestamp; the immediate second
+    // call stays silent. (Warn text itself is covered by the observability
+    // event catalog and its conformance allowlist entry.)
+    assert_ne!(
+        super::super::VOICE_ACTOR_LOAD_WARN_LAST_SECS.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "first failure arms the warn throttle"
+    );
 }
