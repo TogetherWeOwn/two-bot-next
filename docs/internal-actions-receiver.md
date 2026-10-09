@@ -194,17 +194,22 @@ returned only after the receipt/audit transaction commits. See
 
 A local admission refusal (the guard, or a token lane held by another send)
 proves nothing was sent, so the event claim is released and the same key may
-retry. Event reads and mutations share one process-wide gate, so a mutation that
-has registered its key is visible to the next read or mutation for that key. A
-request that cannot enter the gate within 8 seconds is refused `in_progress`
-before any claim. A create whose Discord call succeeded but whose key mapping or
-mirror write failed, or whose request is dropped after its claim, can leave a
-Discord event with no key mapping; a create under a new Idempotency-Key for that
-key would then make a second event. Callers must not re-submit a
+retry, unless another intent has mapped the key in the meantime; that retry is
+refused as a version conflict and needs a new key. Event reads and mutations share
+one process-wide gate, so a mutation that has registered its key is visible to the
+next read or mutation for that key. A request that cannot enter the gate within 8
+seconds is refused `in_progress` before any claim. A claimed mutation runs to its
+receipt in its own task, even if the client has timed out. A create whose Discord
+call times out, gets a 5xx or an unreadable reply, or whose key mapping or mirror
+write fails, can leave a Discord event with no key mapping; a create under a new
+Idempotency-Key for that key would then make a second event. The same can happen
+if the process stops mid-create. Callers must not re-submit a
 `needs_reconciliation` operation under a new key: reconcile the Discord event by
 hand first. An abandoned in-flight intent answers `in_progress` to its own key
-until its claim goes stale, then `needs_reconciliation`. No production reconcile
-tool exists yet.
+until its claim goes stale, then `needs_reconciliation`. The events poller writes
+the mirror outside the gate, so a snapshot taken before a mutation can overwrite
+that mutation's mirror row until the next poll; key mappings and receipts are
+unaffected. No production reconcile tool exists yet.
 
 The website-compatible envelopes contain `ok`, `request_id`, and either
 `result.message_id` (announcements), `result.{outcome,event_id}` (event
@@ -231,8 +236,9 @@ concurrent/restarted/key-rotated replay, byte mismatch, unsupported actions,
 cancellation/stale ownership, unknown/no-effect outcomes, unavailable stores,
 failed receipt finalization, event verb flags, malformed event bodies (including a
 101-character location), concurrent creates for one key, a gate-wait refusal before
-any claim, a mirror failure after a create, admission-refusal release for creates and
-cancels, and listener supervision. Nonces are generated
+any claim for a mutation and for a read, a mutation completing its receipt after its
+client is dropped, a mirror failure reported by the mutation path, admission-refusal
+release for creates and cancels, and listener supervision. Nonces are generated
 fresh for each attempt; the nonce-replay test intentionally reuses one generated
 value. They do not send live Discord actions.
 

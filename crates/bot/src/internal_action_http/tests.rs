@@ -1522,6 +1522,11 @@ async fn event_mutation_queued_behind_the_gate_is_refused_before_any_claim() {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"]["code"], "in_progress");
     assert_eq!(api.count(), 0, "a queued mutation never reaches Discord");
+    let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM internal_idempotency")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(claims, 0, "a queued mutation takes no claim");
     let store = InternalActionStore::new(db.pool().clone());
     assert_eq!(
         store
@@ -1566,6 +1571,117 @@ async fn event_create_mirror_failure_leaves_the_key_unmapped_and_unknown() {
             .unwrap(),
         None
     );
+    db.close().await.unwrap();
+}
+
+struct DelayedEventMutate {
+    delay: Duration,
+    event_id: &'static str,
+}
+
+impl EventMutateEffect for DelayedEventMutate {
+    fn execute_mutation<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a EventCall,
+        _: &'a str,
+    ) -> BoxFuture<'a, Result<Value, EventActionError>> {
+        Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
+            Ok(json!({"event_id": self.event_id}))
+        })
+    }
+}
+
+#[tokio::test]
+async fn event_mutation_completes_its_receipt_after_the_client_is_dropped() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_cancel_flag(false);
+    let mutates: Arc<dyn EventMutateEffect> = Arc::new(DelayedEventMutate {
+        delay: Duration::from_millis(300),
+        event_id: CREATE_EVENT_ID,
+    });
+    let reads: Arc<dyn EventReadEffect> = Arc::new(MockEventRead::default());
+    let effect: Arc<dyn ActionEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    let app = router(Arc::new(ReceiverState::new(
+        config(),
+        db.pool().clone(),
+        effect,
+        reads,
+        mutates,
+    )));
+    let raw = upsert_payload("dropped");
+    let client = tokio::time::timeout(
+        Duration::from_millis(50),
+        answer(app.clone(), signed(&raw, "old", "intent-dropped")),
+    )
+    .await;
+    assert!(
+        client.is_err(),
+        "the client gives up before the mutation answers"
+    );
+    let mut completed: i64 = 0;
+    for _ in 0..200 {
+        completed = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM internal_idempotency WHERE state = 'completed'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        if completed == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        completed, 1,
+        "the claimed create finishes without its client"
+    );
+    let store = InternalActionStore::new(db.pool().clone());
+    assert_eq!(
+        store
+            .event_id_for_key(staging_guild(), "dropped")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(CREATE_EVENT_ID)
+    );
+    let (status, headers, replay) = answer(app, signed(&raw, "old", "intent-dropped")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["idempotent-replay"], "true");
+    assert_eq!(
+        replay["result"],
+        json!({"outcome": "created", "event_id": CREATE_EVENT_ID})
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_read_queued_behind_the_gate_is_refused_before_any_discord_call() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_read_flag(true);
+    map_launch(db.pool()).await;
+    let api = MockEventApi::start_scripted(vec![]).await;
+    let executor =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(api.origin.clone()))
+            .unwrap();
+    let reads: Arc<dyn EventReadEffect> =
+        Arc::new(EventReadExecutor::new(executor, db.pool().clone()));
+    let effect: Arc<dyn ActionEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    let mutates: Arc<dyn EventMutateEffect> = Arc::new(MockEventMutate);
+    let mut receiver = ReceiverState::new(config(), db.pool().clone(), effect, reads, mutates);
+    receiver.event_gate_wait = Duration::from_millis(50);
+    let state = Arc::new(receiver);
+    let held = state.event_gate.lock().await;
+    let app = router(state.clone());
+    let (status, _, body) = answer(app, signed_read(&read_payload("launch"), "old")).await;
+    drop(held);
+    set_event_read_flag(false);
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "in_progress");
+    assert_eq!(api.count(), 0, "a queued read never reaches Discord");
     db.close().await.unwrap();
 }
 

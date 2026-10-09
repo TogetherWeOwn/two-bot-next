@@ -388,7 +388,7 @@ async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Re
     }
 }
 
-async fn receive(state: &ReceiverState, request: Request, id: &str) -> Response {
+async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Response {
     let reject_boundary =
         |failure| state.reject(failure, KeyLabel::Invalid, ActionLabel::Unknown, id);
     if request.uri().path_and_query().map(|path| path.as_str()) != Some(ACTIONS_PATH) {
@@ -493,7 +493,30 @@ async fn receive(state: &ReceiverState, request: Request, id: &str) -> Response 
     // Mutating event verbs take the same durable claim/audit path as
     // announcements below, with their own validation and key mapping.
     if supports_event_mutation(&decision.action) {
-        return mutate_event(state, &decision, &raw, headers.idempotency, id, key, action).await;
+        // Runs to its receipt even if the client has gone: a claimed create that
+        // was dropped mid-flight must still register its key mapping.
+        let task_state = Arc::clone(state);
+        let task_decision = decision.clone();
+        let task_raw = raw.to_vec();
+        let task_idempotency = headers.idempotency.map(str::to_owned);
+        let task_id = id.to_owned();
+        let task_key = key.clone();
+        let task = tokio::spawn(async move {
+            mutate_event(
+                &task_state,
+                &task_decision,
+                &task_raw,
+                task_idempotency.as_deref(),
+                &task_id,
+                task_key,
+                action,
+            )
+            .await
+        });
+        return match task.await {
+            Ok(response) => response,
+            Err(_) => state.reject(Failure::code(ErrorCode::Internal), key, action, id),
+        };
     }
     // This second fence is explicit: core phase-1 defaults are not capabilities.
     if !AnnouncementExecutor::supports(&decision.action) {
