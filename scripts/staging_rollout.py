@@ -48,7 +48,10 @@ APPLICATION_IMAGE_STALE_POLLS = 24
 IMAGE_DRIFT_DIAGNOSTIC_SECONDS = 15
 # Fence and unavailability reasons /readyz can actually return
 # (wrangler/src/ownership.ts OwnershipRefused reasons surfaced as the 503
-# `reason`, plus the container probe's 500 `error_class`). `epoch_conflict`
+# `reason`, plus the container probe's 500 `error_class`). `deployment_id_missing`
+# is the outer Worker version-identity fence (index.ts /readyz forward);
+# `operation_failed` is refused()'s fallback for non-OwnershipRefused errors.
+# `epoch_conflict`
 # is defensive only: the fence answers it with 409 on the control path, and
 # Client.request keeps JSON bodies for 500/503 alone, so a live 409 arrives
 # bodyless and records status plus identity with no token. The parser still
@@ -56,6 +59,7 @@ IMAGE_DRIFT_DIAGNOSTIC_SECONDS = 15
 READINESS_TOKENS = frozenset({
     "ownership_fenced", "not_owner", "container_unavailable", "epoch_conflict",
     "shutdown_unconfirmed", "storage_unavailable", "storage_invalid",
+    "deployment_id_missing", "operation_failed",
 })
 VERIFY_TIMEOUT_SECONDS = 300
 MAX_TIMEOUT_DIAGNOSTIC_SECONDS = 3600
