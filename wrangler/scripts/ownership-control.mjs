@@ -11,11 +11,6 @@ class HttpFailure extends ControlError {
   }
 }
 
-// A retry read answered by a different Worker version than the first read.
-// Propagation is still mixed, so this attempt must not post. Retryable inside
-// the takeover window like a 5xx; the window bound still applies.
-class DeploymentChanged extends ControlError {}
-
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Closed vocabulary of Worker refusal codes (wrangler/src); anything else prints as unrecognized.
@@ -90,7 +85,6 @@ export async function control({ action, url, token, actor, expectedEpoch, releas
     return state;
   };
   let postedEpoch;
-  let pinnedDeploymentId;
   const once = async () => {
     attempts += 1;
     const current = await read({ method: "GET" });
@@ -102,26 +96,11 @@ export async function control({ action, url, token, actor, expectedEpoch, releas
       if (current.owner?.phase !== "active" && !releaseFence) {
         throw new ControlError("Singleton is intentionally fenced or uninitialized; explicit staging release required");
       }
-      // Pin the deployment id that answered the first read. A later read answered
-      // by a different Worker version means propagation is still mixed: posting at
-      // the fresh epoch could hand a stale version a further commit, so skip this
-      // attempt and re-read inside the window instead of posting.
-      pinnedDeploymentId ??= current.deploymentId;
-      if (current.deploymentId !== pinnedDeploymentId) {
-        throw new DeploymentChanged(`Ownership transition not confirmed; answering deployment changed across takeover retries; refusing to post, preserve maintenance (attempts=${attempts} elapsed=${elapsedSeconds()}s)`);
-      }
       // A 5xx after a committed takeover leaves the owner active at the posted epoch; confirm it without posting again.
       if (postedEpoch !== undefined && current.owner?.phase === "active" && current.owner.epoch === postedEpoch &&
           current.owner.deploymentId === current.deploymentId) {
         if (current.running) throw new ControlError("Ownership transition not confirmed; preserve maintenance");
         return current;
-      }
-      // Our epoch committed but owned by another active deployment: the shared record
-      // cannot tell our commit reported by a stale version from a stale version's own
-      // further commit, so never re-post into it. Crash-recovery (fenced) still re-posts.
-      if (postedEpoch !== undefined && current.owner?.phase === "active" && current.owner.epoch === postedEpoch &&
-          current.owner.deploymentId !== pinnedDeploymentId) {
-        throw new ControlError("Ownership transition not confirmed; posted epoch is owned by another deployment; refusing to post, preserve maintenance");
       }
       expectedEpoch = current.owner?.epoch ?? 0;
     }
@@ -142,14 +121,11 @@ export async function control({ action, url, token, actor, expectedEpoch, releas
     try {
       return await once();
     } catch (error) {
-      // A mixed-version read skips the post and re-reads; only 5xx refusals are
-      // kept as the earlier refusal because DeploymentChanged carries no status.
-      const mixedVersionRetry = error instanceof DeploymentChanged;
-      if ((!retryableTakeoverFailure(error) && !mixedVersionRetry) || attempt >= takeoverAttempts ||
+      if (!retryableTakeoverFailure(error) || attempt >= takeoverAttempts ||
           Date.now() - started + takeoverRetryDelayMs > takeoverWindowMs) {
         throw withEarlierRefusal(error, earlier, `attempts=${attempts} elapsed=${elapsedSeconds()}s`);
       }
-      if (error instanceof HttpFailure) earlier = error;
+      earlier = error;
       await wait(takeoverRetryDelayMs);
     }
   }

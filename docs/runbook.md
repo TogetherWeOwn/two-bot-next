@@ -345,11 +345,6 @@ or unconfirmed shutdown leaves denial; do not assume a 503 stopped the old
 process. Preserve maintenance until teardown is confirmed. 401/auth failure is
 a stop, 409 requires state reconciliation, and 503 is never permission to clear
 storage/alarms. No operation clears SDK state or changes guild/database bindings.
-The deployment-takeover client pins the deployment id that answered its first
-read: a later read answered by a different version skips the post and re-reads
-inside the retry window instead of posting at the fresh epoch, and a posted
-epoch found owned by another active deployment stops without posting. A commit
-answered by another version than the first read is still accepted.
 
 The workflow preflight stops **before deploy** if control configuration is absent.
 After deployment it explicitly transfers only a previously active owner. First
