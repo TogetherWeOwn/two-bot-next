@@ -1,7 +1,8 @@
 """Pin deploy-production.yml's guards and run its inline steps offline.
 
-No GitHub or Cloudflare credentials: `gh` is faked through subprocess, and
-curl/sleep through PATH. Nothing here dispatches the workflow.
+No GitHub or Cloudflare credentials: `gh` is faked through subprocess and
+sleep through PATH. The readyz gate talks to a loopback HTTP server that
+scripts each answer. Nothing here dispatches the workflow.
 """
 
 import contextlib
@@ -11,20 +12,31 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
+import threading
+import tomllib
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/deploy-production.yml"
 STAGING = ROOT / ".github/workflows/deploy-staging.yml"
+SCRIPT = ROOT / "scripts/production_deploy.py"
+WRANGLER_DIR = ROOT / "wrangler"
+WRANGLER_TOML = WRANGLER_DIR / "wrangler.toml"
 LINES = WORKFLOW.read_text().splitlines()
 REPO = "TogetherWeOwn/two-bot-next"
 SHA = "0123456789abcdef0123456789abcdef01234567"
+BUILD_ID = "700-1"
+AGENT = "two-bot-next-production-rollout/1.0"
 VERSION = "0b6e5e3c-1f2a-4b3c-8d4e-5f6a7b8c9d0e"
 OLD_VERSION = "9f8e7d6c-5b4a-4c3d-9e2f-1a0b9c8d7e6f"
 GUARD_STEP = "Refuse unverified SHA or unprotected Environment"
+RENDER_STEP = "Render the production deploy config with build identity"
+GATE_STEP = "Gate on /health + /readyz revision"
 WRANGLER_ACTION = "cloudflare/wrangler-action@"
 
 
@@ -86,7 +98,8 @@ JOBS = children(TOP["jobs"][1:], 2)
 GUARD = inline_script(GUARD_STEP)
 RECORD = inline_script("Record the Worker version and SHA")
 URL_CHECK = inline_script("Require a production Worker URL distinct from staging")
-GATE = inline_script("Gate on /health + truthful /readyz")
+RENDER = inline_script(RENDER_STEP)
+GATE = inline_script(GATE_STEP)
 
 
 CI_RUN_ID = 101
@@ -235,7 +248,7 @@ class StaticGuardTests(unittest.TestCase):
         self.assertIn("ref: ${{ needs.guard.outputs.sha }}", production)
         self.assertIn("persist-credentials: false", production)
         self.assertIn('git merge-base --is-ancestor "$SHA" origin/main', production)
-        self.assertIn("command: deploy --message ${{ needs.guard.outputs.sha }}", production)
+        self.assertIn("command: deploy --config ${{ env.PRODUCTION_DEPLOY_CONFIG }} --env production --message ${{ needs.guard.outputs.sha }}", production)
         self.assertIn(
             "command: rollback ${{ needs.guard.outputs.version }} --message ${{ needs.guard.outputs.sha }} --yes",
             production,
@@ -261,6 +274,22 @@ class StaticGuardTests(unittest.TestCase):
         self.assertGreaterEqual(len(blocks), 6)
         for block in blocks:
             self.assertNotIn("${{", block)
+
+    def test_build_identity_comes_from_the_guarded_sha_and_run(self):
+        production = "\n".join(JOBS["production"])
+        self.assertNotIn("GITHUB_SHA", production)
+        self.assertNotIn("github.sha", production)
+        self.assertIn('--sha "$SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"', RENDER)
+        self.assertIn('echo "PRODUCTION_DEPLOY_CONFIG=$config" >> "$GITHUB_ENV"', RENDER)
+        names = [step[0].strip() for step in steps(JOBS["production"])]
+        self.assertLess(names.index(f"- name: {RENDER_STEP}"), names.index("- name: Deploy to production"))
+
+    def test_readyz_gate_judges_the_guarded_sha_and_mode_without_secrets(self):
+        self.assertIn('production_deploy.py readyz --status "$code" --body "$readyz" --sha "$SHA" --mode "$MODE" 2>&1',
+                      GATE)
+        for text in (RENDER, GATE):
+            self.assertNotIn("secrets.", text)
+            self.assertNotIn("token", text.lower())
 
 
 class GuardBehaviourTests(unittest.TestCase):
@@ -716,91 +745,281 @@ class RecordStepTests(unittest.TestCase):
         self.assertEqual(self.record("rollback", before, split, VERSION)[0], 1)
 
 
-FAKE_CURL = """#!/bin/sh
-out= url=
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -o) out=$2; shift 2 ;;
-    -w|--max-time) shift 2 ;;
-    -*) shift ;;
-    *) url=$1; shift ;;
-  esac
-done
-echo "$url" >> "$FAKE_LOG"
-case "$url" in
-  */health)
-    n=$(grep -c '/health$' "$FAKE_LOG")
-    code=$(echo $FAKE_HEALTH | awk -v n="$n" '{print (n <= NF) ? $n : $NF}') ;;
-  */readyz) code=$FAKE_READYZ ;;
-  *) code=000 ;;
-esac
-printf '{"components":"fake"}' > "$out"
-printf '%s' "$code"
-"""
+class ScriptedWorker:
+    """Loopback server answering each path with its scripted (status, body) pairs.
+
+    The last pair repeats. Status 0 closes the connection without an answer,
+    which curl reports as 000.
+    """
+
+    def __init__(self, routes):
+        self.routes, self.served, self.hits = routes, {}, []
+        worker = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                worker.hits.append((self.path, self.headers.get("User-Agent")))
+                answers = worker.routes.get(self.path, [(404, "")])
+                index = worker.served.get(self.path, 0)
+                worker.served[self.path] = index + 1
+                status, body = answers[min(index, len(answers) - 1)]
+                if status == 0:
+                    return
+                payload = body.encode()
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def count(self, path):
+        return self.served.get(path, 0)
+
+
+def report(revision=SHA, build_id=BUILD_ID):
+    components = [["process", "ready"], ["gateway", "ready"], ["database", "ready"], ["token_invalid", "ready"]]
+    return json.dumps({"components": components, "jobs": {}, "build_revision": revision, "build_id": build_id})
+
+
+def differences(before, after, path=""):
+    if isinstance(before, dict) and isinstance(after, dict):
+        for key in sorted(set(before) | set(after)):
+            if key not in before or key not in after:
+                yield f"{path}/{key}"
+            else:
+                yield from differences(before[key], after[key], f"{path}/{key}")
+    elif isinstance(before, list) and isinstance(after, list) and len(before) == len(after):
+        for index, (old, new) in enumerate(zip(before, after)):
+            yield from differences(old, new, f"{path}[{index}]")
+    elif before != after:
+        yield path
 
 
 class ShellStepTests(unittest.TestCase):
-    def bash(self, script, **env):
+    def bash(self, script, cwd=ROOT, **env):
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
             bin_dir = Path(tmp) / "bin"
             bin_dir.mkdir()
-            for name, body in (("curl", FAKE_CURL), ("sleep", "#!/bin/sh\nexit 0\n")):
-                (bin_dir / name).write_text(body)
-                (bin_dir / name).chmod(0o755)
-            step = Path(tmp) / "step.sh"
+            (bin_dir / "sleep").write_text("#!/bin/sh\nexit 0\n")
+            (bin_dir / "sleep").chmod(0o755)
+            step, summary = Path(tmp) / "step.sh", Path(tmp) / "summary"
             step.write_text(script)
-            log, summary = Path(tmp) / "curl.log", Path(tmp) / "summary"
-            log.touch()
             run_env = {
                 "PATH": f"{bin_dir}:{os.environ['PATH']}", "RUNNER_TEMP": tmp,
-                "GITHUB_STEP_SUMMARY": str(summary), "FAKE_LOG": str(log), **env,
+                "GITHUB_STEP_SUMMARY": str(summary), **env,
             }
             result = subprocess.run(
                 ["bash", "--noprofile", "--norc", "-eo", "pipefail", str(step)],
-                env=run_env, capture_output=True, text=True, timeout=60,
+                cwd=cwd, env=run_env, capture_output=True, text=True, timeout=120,
             )
-            return result.returncode, log.read_text().split(), summary.read_text() if summary.exists() else ""
+            return result.returncode, summary.read_text() if summary.exists() else ""
 
-    def gate(self, health="200", readyz="200"):
-        return self.bash(GATE, PRODUCTION_URL="https://prod.example.workers.dev/",
-                         FAKE_HEALTH=health, FAKE_READYZ=readyz)
+    def gate(self, routes, mode="deploy", sha=SHA):
+        with ScriptedWorker(routes) as worker:
+            code, summary = self.bash(GATE, cwd=WRANGLER_DIR, PRODUCTION_URL=worker.url,
+                                      MODE=mode, SHA=sha)
+        return code, summary, worker
 
-    def test_ready_or_truthfully_parked_gateway_passes(self):
-        for readyz, state in (("200", "gateway ready"), ("503", "gateway parked")):
-            with self.subTest(readyz=readyz):
-                code, urls, summary = self.gate(readyz=readyz)
-                self.assertEqual(code, 0)
-                self.assertEqual(urls, ["https://prod.example.workers.dev/health",
-                                        "https://prod.example.workers.dev/readyz"])
-                self.assertIn(f"/readyz {readyz} ({state}", summary)
+    def test_matching_revision_passes_ready_or_truthfully_parked(self):
+        for status, state in ((200, "gateway ready"), (503, "gateway parked")):
+            with self.subTest(status=status):
+                code, summary, worker = self.gate(
+                    {"/health": [(200, "{}")], "/readyz": [(status, report())]})
+                self.assertEqual(code, 0, summary)
+                self.assertIn(f"/readyz {status} ({state}", summary)
+                self.assertEqual(worker.count("/readyz"), 1)
+                self.assertEqual({agent for _, agent in worker.hits}, {AGENT})
 
     def test_health_is_polled_through_a_cold_start(self):
-        code, urls, _ = self.gate(health="000 502 503 200")
-        self.assertEqual(code, 0)
-        self.assertEqual(urls.count("https://prod.example.workers.dev/health"), 4)
+        code, summary, worker = self.gate(
+            {"/health": [(502, ""), (503, ""), (200, "{}")], "/readyz": [(200, report())]})
+        self.assertEqual(code, 0, summary)
+        self.assertEqual(worker.count("/health"), 3)
 
-    def test_broken_readyz_fails(self):
-        for readyz in ("500", "404", "000", "302"):
-            with self.subTest(readyz=readyz):
-                code, _, summary = self.gate(readyz=readyz)
+    def test_readyz_must_serve_this_revision(self):
+        cases = {
+            "other revision": report(revision="f" * 40),
+            "unstamped build": report(revision="unknown", build_id="unknown"),
+            "missing build_revision": json.dumps({"components": [], "build_id": BUILD_ID}),
+            "missing build_id": json.dumps({"build_revision": SHA, "components": []}),
+            "non-JSON body": "<html>502 Bad Gateway</html>",
+            "JSON that is not an object": "[]",
+        }
+        for name, body in cases.items():
+            for status in (200, 503):
+                with self.subTest(case=name, status=status):
+                    code, summary, worker = self.gate(
+                        {"/health": [(200, "{}")], "/readyz": [(status, body)]})
+                    self.assertEqual(code, 1)
+                    self.assertIn("roll back", summary)
+                    self.assertEqual(worker.count("/readyz"), 30)
+
+    def test_readyz_that_moves_to_this_revision_passes(self):
+        code, summary, worker = self.gate({
+            "/health": [(200, "{}")],
+            "/readyz": [(503, report(revision="a" * 40)), (200, report())],
+        })
+        self.assertEqual(code, 0, summary)
+        self.assertEqual(worker.count("/readyz"), 2)
+
+    def test_readyz_without_an_answer_fails(self):
+        for status in (0, 404, 500):
+            with self.subTest(status=status):
+                code, summary, _ = self.gate({"/health": [(200, "{}")], "/readyz": [(status, "")]})
                 self.assertEqual(code, 1)
                 self.assertIn("roll back", summary)
 
     def test_health_that_never_recovers_fails_without_probing_readyz(self):
-        code, urls, summary = self.gate(health="502")
+        code, summary, worker = self.gate({"/health": [(502, "")], "/readyz": [(200, report())]})
         self.assertEqual(code, 1)
-        self.assertEqual(len(urls), 30)
-        self.assertNotIn("https://prod.example.workers.dev/readyz", urls)
+        self.assertEqual(worker.count("/health"), 30)
+        self.assertEqual(worker.count("/readyz"), 0)
         self.assertIn("never 200", summary)
+
+    def test_rollback_passes_the_supplied_revision_or_a_pre_stamp_target_only(self):
+        cases = (
+            (report(), "gateway ready", 0),
+            (report(revision="unknown", build_id="unknown"), "pre-stamp version", 0),
+            (report(revision="a" * 40), "does not match", 1),
+            (report(revision="unknown", build_id=BUILD_ID), "not stamped", 1),
+        )
+        for body, expected, exit_code in cases:
+            with self.subTest(expected=expected):
+                code, summary, _ = self.gate({"/health": [(200, "{}")], "/readyz": [(200, body)]},
+                                             mode="rollback")
+                self.assertEqual(code, exit_code, summary)
+                self.assertIn(expected, summary)
 
     def test_production_url_must_be_https_and_not_staging(self):
         staging = "https://staging.example.workers.dev"
         for url, ok in (("", False), ("http://prod.example.workers.dev", False), (staging, False),
                         (staging + "/", False), ("https://prod.example.workers.dev", True)):
             with self.subTest(url=url):
-                code, urls, _ = self.bash(URL_CHECK, PRODUCTION_URL=url, STAGING_URL=staging)
+                code, _ = self.bash(URL_CHECK, PRODUCTION_URL=url, STAGING_URL=staging)
                 self.assertEqual(code == 0, ok)
-                self.assertEqual(urls, [])
+
+
+class RenderTests(unittest.TestCase):
+    def render(self, config=None, sha=SHA, run_id="700", attempt="1"):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            source = WRANGLER_TOML
+            if config is not None:
+                source = Path(tmp) / "wrangler.toml"
+                source.write_text(config)
+            out = Path(tmp) / "deploy.json"
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "render", "--config", str(source), "--out", str(out),
+                 "--sha", sha, "--run-id", run_id, "--attempt", attempt],
+                capture_output=True, text=True, timeout=60,
+            )
+            return result.returncode, json.loads(out.read_text()) if out.exists() else None
+
+    def test_production_container_gets_the_guarded_identity_only(self):
+        code, rendered = self.render(attempt="2")
+        self.assertEqual(code, 0)
+        self.assertEqual(rendered["env"]["production"]["containers"][0]["image_vars"],
+                         {"BOT_BUILD_REVISION": SHA, "BOT_BUILD_ID": "700-2"})
+        self.assertNotIn("image_vars", rendered["env"]["staging"]["containers"][0])
+        self.assertNotIn("image_vars", rendered["containers"][0])
+
+    def test_render_changes_only_paths_and_the_build_arguments(self):
+        code, rendered = self.render()
+        self.assertEqual(code, 0)
+        original = tomllib.loads(WRANGLER_TOML.read_text())
+        expected = {"/main", "/containers[0]/image", "/containers[0]/image_build_context",
+                    "/env/production/containers[0]/image_vars"}
+        for env in ("staging", "production"):
+            expected |= {f"/env/{env}/containers[0]/image", f"/env/{env}/containers[0]/image_build_context"}
+        self.assertEqual(set(differences(original, rendered)), expected)
+        self.assertEqual(rendered["main"], str(WRANGLER_DIR / "src/index.ts"))
+        self.assertEqual(rendered["env"]["production"]["containers"][0]["image"], str(ROOT / "Dockerfile"))
+
+    def test_identity_it_cannot_prove_is_refused_without_output(self):
+        for sha, run_id, attempt in ((SHA[:39], "700", "1"), (SHA.upper(), "700", "1"),
+                                     (SHA, "run", "1"), (SHA, "700", "")):
+            with self.subTest(sha=sha, run_id=run_id, attempt=attempt):
+                code, rendered = self.render(sha=sha, run_id=run_id, attempt=attempt)
+                self.assertEqual(code, 1)
+                self.assertIsNone(rendered)
+
+    def test_other_workers_and_container_shapes_are_refused(self):
+        base = WRANGLER_TOML.read_text()
+        cases = {
+            "other Worker": base.replace('name = "two-bot-next"', 'name = "other"', 1),
+            "two production containers": base + (
+                '\n[[env.production.containers]]\nclass_name = "TwoBotContainer"\n'
+                'image = "../Dockerfile"\nmax_instances = 1\n'),
+            "unbounded instances": base.replace(
+                "max_instances = 1\n\n[env.production.containers.constraints]",
+                "max_instances = 2\n\n[env.production.containers.constraints]", 1),
+        }
+        for name, config in cases.items():
+            with self.subTest(case=name):
+                code, rendered = self.render(config=config)
+                self.assertEqual(code, 1)
+                self.assertIsNone(rendered)
+
+
+class ReadyzVerdictTests(unittest.TestCase):
+    def judge(self, status="200", body=None, mode="deploy", sha=SHA):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            path = Path(tmp) / "readyz.json"
+            if body is not None:
+                path.write_text(body)
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "readyz", "--status", status, "--body", str(path),
+                 "--sha", sha, "--mode", mode],
+                capture_output=True, text=True, timeout=60,
+            )
+            return result.returncode, result.stdout.strip()
+
+    def test_matching_revision_passes_ready_and_truthfully_parked(self):
+        code, message = self.judge("200", report())
+        self.assertEqual((code, message.split(",")[0]), (0, "gateway ready"))
+        code, message = self.judge("503", report())
+        self.assertEqual((code, message.split(",")[0]), (0, "gateway parked; deploy is healthy"))
+
+    def test_every_other_observation_fails_with_its_reason(self):
+        cases = (
+            ("200", report(revision="f" * 40), "does not match"),
+            ("503", report(revision="f" * 40), "does not match"),
+            ("200", report(revision="unknown", build_id="unknown"), "not stamped"),
+            ("200", json.dumps({"components": [], "build_id": BUILD_ID}), "no build_revision"),
+            ("200", json.dumps({"build_revision": SHA, "build_id": None}), "no build_revision"),
+            ("200", "<html>502 Bad Gateway</html>", "did not return JSON"),
+            ("200", None, "did not return JSON"),
+            ("200", "[]", "not an object"),
+            ("500", report(), "answered 500"),
+            ("000", report(), "answered 000"),
+            ("302", report(), "answered 302"),
+        )
+        for status, body, reason in cases:
+            with self.subTest(status=status, reason=reason):
+                code, message = self.judge(status, body)
+                self.assertEqual(code, 1)
+                self.assertIn(reason, message)
+
+    def test_rollback_passes_the_supplied_revision_or_a_pre_stamp_target(self):
+        self.assertEqual(self.judge("200", report(), mode="rollback")[0], 0)
+        code, message = self.judge("503", report(revision="unknown", build_id="unknown"), mode="rollback")
+        self.assertEqual(code, 0)
+        self.assertIn("pre-stamp version", message)
+        self.assertEqual(self.judge("200", report(revision="f" * 40), mode="rollback")[0], 1)
+        self.assertEqual(self.judge("200", report(revision="unknown", build_id=BUILD_ID), mode="rollback")[0], 1)
 
 
 if __name__ == "__main__":
