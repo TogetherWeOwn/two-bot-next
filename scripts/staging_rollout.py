@@ -51,11 +51,10 @@ IMAGE_DRIFT_DIAGNOSTIC_SECONDS = 15
 # `reason`, plus the container probe's 500 `error_class`). `deployment_id_missing`
 # is the outer Worker version-identity fence (index.ts /readyz forward);
 # `operation_failed` is refused()'s fallback for non-OwnershipRefused errors.
-# `epoch_conflict`
-# is defensive only: the fence answers it with 409 on the control path, and
-# Client.request keeps JSON bodies for 500/503 alone, so a live 409 arrives
-# bodyless and records status plus identity with no token. The parser still
-# recognises it wherever a report reaches it, per this slice's fixed set.
+# `epoch_conflict` is defensive only: the fence answers it with 409 on the
+# control path, and Client.request keeps only /readyz JSON 500/503 bodies, so a
+# live 409 arrives bodyless and carries no token. The parser still recognises
+# it wherever a report reaches it, per this slice's fixed set.
 READINESS_TOKENS = frozenset({
     "ownership_fenced", "not_owner", "container_unavailable", "epoch_conflict",
     "shutdown_unconfirmed", "storage_unavailable", "storage_invalid",
