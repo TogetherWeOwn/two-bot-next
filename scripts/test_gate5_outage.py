@@ -64,12 +64,13 @@ class Gate5OutageTests(unittest.TestCase):
         self.assertIsNone(window["outage_seconds"])
         self.assertNotEqual(window["outage_seconds"], 0)
         self.assertIsNone(summary["max_outage_seconds"])
-        self.assertEqual(summary["verdict"], "NEEDS WORK")
+        self.assertEqual(summary["verdict"], "NOT VERIFIED")
 
     def test_over_budget_recovery_needs_work(self):
         summary = run(
-            '{"ts": "2026-10-01T00:00:00Z", "event": "readyz_fail", "status": 503}\n'
-            '{"ts": "2026-10-01T00:01:30Z", "event": "readyz_ok"}\n'
+            '{"ts": "2026-10-01T00:00:01Z", "event": "readyz_ok"}\n'
+            '{"ts": "2026-10-01T00:00:05Z", "event": "readyz_fail", "status": 503}\n'
+            '{"ts": "2026-10-01T00:01:35Z", "event": "readyz_ok"}\n'
         )
         window = summary["outage_windows"][0]
         self.assertEqual(window["outage_seconds"], 90.0)
@@ -83,7 +84,62 @@ class Gate5OutageTests(unittest.TestCase):
             "not json at all\n"
         )
         self.assertEqual(len(summary["unknown_intervals"]), 2)
-        self.assertEqual(summary["verdict"], "NEEDS WORK")
+        self.assertEqual(summary["verdict"], "NOT VERIFIED")
+
+    def test_empty_log_is_not_verified(self):
+        for text in ("", "\n\n"):
+            with self.subTest(text=text):
+                summary = run(text)
+                self.assertEqual(summary["verdict"], "NOT VERIFIED")
+                self.assertEqual(summary["unknown_intervals"][0]["reason"],
+                                 "no readiness events in log")
+
+    def test_silent_gap_of_budget_is_not_verified(self):
+        summary = run(
+            '{"ts": "2026-10-01T00:00:01Z", "event": "readyz_ok"}\n'
+            '{"ts": "2026-10-01T00:01:01Z", "event": "readyz_ok"}\n'
+        )
+        self.assertEqual(len(summary["unknown_intervals"]), 1)
+        self.assertEqual(summary["verdict"], "NOT VERIFIED")
+
+    def test_gap_under_budget_passes(self):
+        summary = run(
+            '{"ts": "2026-10-01T00:00:01Z", "event": "readyz_ok"}\n'
+            '{"ts": "2026-10-01T00:01:00Z", "event": "readyz_ok"}\n'
+        )
+        self.assertEqual(summary["unknown_intervals"], [])
+        self.assertEqual(summary["verdict"], "PASS")
+
+    def test_out_of_order_line_never_scores_negative(self):
+        summary = run(
+            '{"ts": "2026-10-01T00:00:00Z", "event": "readyz_ok"}\n'
+            '{"ts": "2026-10-01T00:00:10Z", "event": "readyz_fail", "status": 503}\n'
+            '{"ts": "2026-10-01T00:00:05Z", "event": "readyz_ok"}\n'
+            '{"ts": "2026-10-01T00:00:20Z", "event": "readyz_ok"}\n'
+        )
+        self.assertEqual([w["outage_seconds"] for w in summary["outage_windows"]], [10.0])
+        self.assertEqual(len(summary["unknown_intervals"]), 1)
+        self.assertEqual(summary["verdict"], "NOT VERIFIED")
+
+    def test_log_starting_mid_outage_is_not_scored(self):
+        summary = run(
+            '{"ts": "2026-10-01T00:00:00Z", "event": "readyz_fail", "status": 503}\n'
+            '{"ts": "2026-10-01T00:00:30Z", "event": "readyz_ok"}\n'
+        )
+        self.assertEqual(summary["outage_windows"], [])
+        self.assertIsNone(summary["max_outage_seconds"])
+        self.assertEqual(len(summary["unknown_intervals"]), 1)
+        self.assertEqual(summary["verdict"], "NOT VERIFIED")
+
+    def test_start_not_pinned_by_last_healthy_sample_is_not_verified(self):
+        summary = run(
+            '{"ts": "2026-10-01T00:00:00Z", "event": "readyz_ok"}\n'
+            '{"ts": "2026-10-01T00:00:40Z", "event": "readyz_fail", "status": 503}\n'
+            '{"ts": "2026-10-01T00:01:05Z", "event": "readyz_ok"}\n'
+        )
+        self.assertEqual(summary["outage_windows"], [])
+        self.assertEqual(len(summary["unknown_intervals"]), 1)
+        self.assertEqual(summary["verdict"], "NOT VERIFIED")
 
 
 if __name__ == "__main__":

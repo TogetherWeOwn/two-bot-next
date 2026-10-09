@@ -28,6 +28,14 @@ A window still open when the log ends stays explicitly UNKNOWN
 ``scripts/soak_evidence.py``, the outage length is unbounded there, so it is
 never scored as zero.
 
+Verdict: PASS needs complete, ordered evidence and every recovered outage under
+budget. A measured outage at or over budget is NEEDS WORK. Anything missing is
+NOT VERIFIED, never PASS: an empty log, a silent gap of the budget or more
+between records, an out-of-order record, an unknown or malformed record, a log
+that began mid-outage, an outage still open at the end, and a recovery a budget
+or more after the last healthy sample (the outage could have started anywhere
+after that sample).
+
 Usage:
 
     python3 scripts/gate5_outage.py path/to/tick-log.jsonl
@@ -42,6 +50,8 @@ SCHEMA_VERSION = 1
 
 # Gate 5 acceptance: recovery strictly under 60 s from outage start.
 OUTAGE_BUDGET_S = 60
+# A silence this long could hide an over-budget outage.
+SILENT_GAP_LIMIT_S = OUTAGE_BUDGET_S
 
 # Recovery signal; everything else that opens a window is a start signal.
 RECOVERY_EVENT = "readyz_ok"
@@ -66,6 +76,7 @@ def summarize(lines):
     outage_windows = []
     unknowns = []
     first_ts = last_ts = None
+    last_healthy_ts = None  # the outage cannot have started before this sample
     outage_start = None  # ts of the first failure of the currently open window
 
     def note_unknown(start, end, reason):
@@ -92,20 +103,37 @@ def summarize(lines):
         except ValueError:
             note_unknown(None, None, f"malformed line {lineno}: bad ts")
             continue
-        first_ts = ts if first_ts is None else min(first_ts, ts)
-        last_ts = ts if last_ts is None else max(last_ts, ts)
+        if last_ts is None:
+            first_ts = ts
+        else:
+            gap = (ts - last_ts).total_seconds()
+            if gap < 0:
+                note_unknown(ts, ts, f"out-of-order line {lineno}: before previous record")
+                continue
+            if gap >= SILENT_GAP_LIMIT_S:
+                note_unknown(last_ts, ts, f"silent gap of {gap:.1f} s before line {lineno}")
+        last_ts = ts
         event = record.get("event")
 
         if event == RECOVERY_EVENT:
             readyz_ok += 1
             if outage_start is not None:
-                outage_windows.append({
-                    "start": outage_start.isoformat(),
-                    "end": ts.isoformat(),
-                    "outage_seconds": round((ts - outage_start).total_seconds(), 1),
-                    "status": "recovered",
-                })
+                measured = (ts - outage_start).total_seconds()
+                if last_healthy_ts is None:
+                    note_unknown(outage_start, ts,
+                                 "log began mid-outage: actual start not observed")
+                elif measured < OUTAGE_BUDGET_S <= (ts - last_healthy_ts).total_seconds():
+                    note_unknown(last_healthy_ts, ts,
+                                 "outage start not pinned: last healthy sample too far back")
+                else:
+                    outage_windows.append({
+                        "start": outage_start.isoformat(),
+                        "end": ts.isoformat(),
+                        "outage_seconds": round(measured, 1),
+                        "status": "recovered",
+                    })
                 outage_start = None
+            last_healthy_ts = ts
         elif event in OUTAGE_START_EVENTS:
             if event == "readyz_fail":
                 readyz_fail += 1
@@ -125,14 +153,20 @@ def summarize(lines):
             "outage_seconds": None,
             "status": "unknown",
         })
+    if not (readyz_ok or readyz_fail or tick_missed):
+        note_unknown(None, None, "no readiness events in log")
 
     recovered = [window["outage_seconds"] for window in outage_windows
                  if window["status"] == "recovered"]
     max_outage = max(recovered) if recovered else None
     unknown_open = any(window["status"] == "unknown" for window in outage_windows)
     over_budget = any(seconds >= OUTAGE_BUDGET_S for seconds in recovered)
-    verdict = "PASS" if (not unknowns and not unknown_open
-                         and not over_budget) else "NEEDS WORK"
+    if over_budget:
+        verdict = "NEEDS WORK"
+    elif unknowns or unknown_open:
+        verdict = "NOT VERIFIED"
+    else:
+        verdict = "PASS"
     return {
         "schema_version": SCHEMA_VERSION,
         "window": {
