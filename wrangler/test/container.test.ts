@@ -882,6 +882,12 @@ for (const path of ["/INTERNAL/OWNERSHIP", "/internal/%6fwnership", "//internal/
 
 test("DO /ops/metrics: hung container fetch aborts within the bound (504, generic body)", async (t) => {
   const h = await harness(t);
+  // Prove the 6 s bound without sleeping through it: the runner cancels
+  // live waits near ~5 s, so shrink only the timer and assert the production
+  // code requested the full bound.
+  const realTimeout = AbortSignal.timeout;
+  const timeout = t.mock.method(AbortSignal, "timeout", (ms: number) =>
+    realTimeout(ms === 6000 ? 50 : ms));
   t.mock.method(h.bot, "containerFetch", (...args: Parameters<TwoBotContainer["containerFetch"]>) => {
     const init = args[1] as RequestInit | undefined;
     return new Promise<Response>((_resolve, reject) => {
@@ -894,8 +900,11 @@ test("DO /ops/metrics: hung container fetch aborts within the bound (504, generi
   const elapsed = Date.now() - started;
   assert.equal(response.status, 504);
   assert.equal(await response.text(), "metrics unavailable\n");
-  assert.ok(elapsed < 15000, `hung fetch must return within the bound, took ${elapsed}ms`);
-  assert.ok(elapsed >= 4000, `must actually await the abort, took ${elapsed}ms`);
+  assert.ok(
+    timeout.mock.calls.some((call) => call.arguments[0] === 6000),
+    "container fetch must request the 6 s abort bound",
+  );
+  assert.ok(elapsed < 5000, `hung fetch must return well within the bound, took ${elapsed}ms`);
 });
 
 test("DO /ops/metrics: oversized body returns 502 with a generic body", async (t) => {
