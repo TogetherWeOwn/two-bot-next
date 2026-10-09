@@ -5,7 +5,7 @@ Tooling for the B2 soak's Gate 5 rule
 (docs/soak-entry-gates.md "Gate 5 — qualifying-clock rules"): every actual
 outage must recover in **under 60 seconds**, measured from the actual outage
 start to verified recovery. This script never touches staging or production;
-it only reads a committed or piped JSONL fixture and prints the summary.
+it only reads a committed JSONL fixture and prints the summary.
 
 Log format (one JSON object per line, in time order):
 
@@ -28,13 +28,14 @@ A window still open when the log ends stays explicitly UNKNOWN
 ``scripts/soak_evidence.py``, the outage length is unbounded there, so it is
 never scored as zero.
 
-Verdict: PASS needs complete, ordered evidence and every recovered outage under
-budget. A measured outage at or over budget is NEEDS WORK. Anything missing is
-NOT VERIFIED, never PASS: an empty log, a silent gap of the budget or more
-between records, an out-of-order record, an unknown or malformed record, a log
-that began mid-outage, an outage still open at the end, and a recovery a budget
-or more after the last healthy sample (the outage could have started anywhere
-after that sample).
+Verdict: NEEDS WORK when a recovered outage is at or over the budget. PASS when
+no outage reaches the budget and the log holds no unknown evidence. Missing
+evidence is NOT VERIFIED, never PASS: an empty log, a silent gap longer than the
+budget, an out-of-order or unknown record, a log that began mid-outage, an
+outage still open at the end, a start that cannot be pinned within the budget
+(the last healthy sample is more than a budget before recovery), and an outage
+that recurs within a budget of its recovery. PASS covers the outage budget over
+the supplied log only; coverage of the acceptance interval is not checked here.
 
 Usage:
 
@@ -50,7 +51,7 @@ SCHEMA_VERSION = 1
 
 # Gate 5 acceptance: recovery strictly under 60 s from outage start.
 OUTAGE_BUDGET_S = 60
-# A silence this long could hide an over-budget outage.
+# Silences up to the budget cannot hide an over-budget outage.
 SILENT_GAP_LIMIT_S = OUTAGE_BUDGET_S
 
 # Recovery signal; everything else that opens a window is a start signal.
@@ -76,7 +77,9 @@ def summarize(lines):
     unknowns = []
     first_ts = last_ts = None
     last_healthy_ts = None  # the outage cannot have started before this sample
+    last_recovery_ts = None  # a recovery counts only after a budget of health
     outage_start = None  # ts of the first failure of the currently open window
+    breach = False
 
     def note_unknown(start, end, reason):
         unknowns.append({
@@ -91,7 +94,7 @@ def summarize(lines):
             continue
         try:
             record = json.loads(line)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             note_unknown(None, None, f"malformed line {lineno}: not JSON")
             continue
         if not isinstance(record, dict):
@@ -99,7 +102,7 @@ def summarize(lines):
             continue
         try:
             ts = parse_ts(record.get("ts"))
-        except ValueError:
+        except (ValueError, OverflowError):
             note_unknown(None, None, f"malformed line {lineno}: bad ts")
             continue
         if last_ts is None:
@@ -109,7 +112,7 @@ def summarize(lines):
             if gap < 0:
                 note_unknown(ts, ts, f"out-of-order line {lineno}: before previous record")
                 continue
-            if gap >= SILENT_GAP_LIMIT_S:
+            if gap > SILENT_GAP_LIMIT_S:
                 note_unknown(last_ts, ts, f"silent gap of {gap:.1f} s before line {lineno}")
         last_ts = ts
         event = record.get("event")
@@ -118,20 +121,24 @@ def summarize(lines):
             readyz_ok += 1
             if outage_start is not None:
                 measured = (ts - outage_start).total_seconds()
-                if last_healthy_ts is None:
-                    note_unknown(outage_start, ts,
-                                 "log began mid-outage: actual start not observed")
-                elif measured < OUTAGE_BUDGET_S <= (ts - last_healthy_ts).total_seconds():
-                    note_unknown(last_healthy_ts, ts,
-                                 "outage start not pinned: last healthy sample too far back")
-                else:
+                pinned = (last_healthy_ts is not None
+                          and (ts - last_healthy_ts).total_seconds() <= OUTAGE_BUDGET_S)
+                if measured >= OUTAGE_BUDGET_S or pinned:
+                    breach = breach or measured >= OUTAGE_BUDGET_S
                     outage_windows.append({
                         "start": outage_start.isoformat(),
                         "end": ts.isoformat(),
                         "outage_seconds": round(measured, 1),
                         "status": "recovered",
                     })
+                elif last_healthy_ts is None:
+                    note_unknown(outage_start, ts,
+                                 "log began mid-outage: actual start not observed")
+                else:
+                    note_unknown(last_healthy_ts, ts,
+                                 "outage start not pinned: last healthy sample too far back")
                 outage_start = None
+                last_recovery_ts = ts
             last_healthy_ts = ts
         elif event in OUTAGE_START_EVENTS:
             if event == "readyz_fail":
@@ -139,6 +146,10 @@ def summarize(lines):
             else:
                 tick_missed += 1
             if outage_start is None:
+                if (last_recovery_ts is not None
+                        and (ts - last_recovery_ts).total_seconds() < OUTAGE_BUDGET_S):
+                    note_unknown(last_recovery_ts, ts,
+                                 "outage recurred within a budget of its recovery")
                 outage_start = ts
         else:
             note_unknown(ts, ts, f"unrecognised event {event!r}")
@@ -159,8 +170,7 @@ def summarize(lines):
                  if window["status"] == "recovered"]
     max_outage = max(recovered) if recovered else None
     unknown_open = any(window["status"] == "unknown" for window in outage_windows)
-    over_budget = any(seconds >= OUTAGE_BUDGET_S for seconds in recovered)
-    if over_budget:
+    if breach:
         verdict = "NEEDS WORK"
     elif unknowns or unknown_open:
         verdict = "NOT VERIFIED"
@@ -187,7 +197,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", help="readiness tick log in JSONL format")
     args = parser.parse_args(argv)
-    with open(args.log, encoding="utf-8") as handle:
+    with open(args.log, encoding="utf-8-sig", errors="replace") as handle:
         summary = summarize(handle)
     json.dump(summary, sys.stdout, indent=2)
     sys.stdout.write("\n")
