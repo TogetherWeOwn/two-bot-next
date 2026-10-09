@@ -559,7 +559,10 @@ impl ReceiverState {
 /// (see [`InternalFlags`]): the website must never grant itself verbs through
 /// the settings store. Invalid enabled moderation configuration is fatal, like
 /// the receiver bind itself; a disabled executor still constructs and refuses
-/// every timeout with `action_not_allowed`.
+/// every timeout with `action_not_allowed`, tolerating invalid moderation
+/// gates so a bad `TWO_MODERATION_PROTECTED_ROLE_IDS` (or a stray
+/// `TWO_MODERATION=1` without `TWO_OWEN_USER_ID`) can never stop the receiver
+/// from binding while the timeout verb is off.
 fn moderation_executor_from_env(
     pool: sqlx::PgPool,
     discord: ActionExecutor,
@@ -570,14 +573,30 @@ fn moderation_executor_from_env(
     let vars: std::collections::HashMap<String, String> = std::env::vars().collect();
     let flags = InternalFlags::from_map(&vars);
     let enabled = flags.is_enabled("moderation.timeout");
-    let gates = ModerationGates::from_map(&vars).map_err(|e| e.to_string())?;
-    if enabled && !gates.enabled {
-        return Err("moderation timeout flag without TWO_MODERATION".to_owned());
-    }
-    let policy = ModerationPolicy {
-        owen_user_id: gates.owen_user_id,
-        protected_role_ids: gates.protected_role_ids,
-        bot_user_id: None,
+    let policy = if enabled {
+        let gates = ModerationGates::from_map(&vars).map_err(|e| e.to_string())?;
+        if !gates.enabled {
+            return Err("moderation timeout flag without TWO_MODERATION".to_owned());
+        }
+        ModerationPolicy {
+            owen_user_id: gates.owen_user_id,
+            protected_role_ids: gates.protected_role_ids,
+            bot_user_id: None,
+        }
+    } else {
+        // Disabled: refuse everything without trusting the gates. Invalid
+        // moderation settings must not fail the receiver bind while the verb
+        // is off; fall back to an empty policy the disabled executor never
+        // consults (see `InternalMemberExecutor::execute`).
+        let (owen_user_id, protected_role_ids) = match ModerationGates::from_map(&vars) {
+            Ok(gates) => (gates.owen_user_id, gates.protected_role_ids),
+            Err(_) => (String::new(), std::collections::HashSet::new()),
+        };
+        ModerationPolicy {
+            owen_user_id,
+            protected_role_ids,
+            bot_user_id: None,
+        }
     };
     let audit_secret = moderation_audit_secret(&vars, None)
         .map_err(|e| e.to_string())?

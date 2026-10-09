@@ -1187,6 +1187,253 @@ async fn moderation_timeout_success_replays_and_mismatches_like_announcements() 
     db.close().await.unwrap();
 }
 
+/// A disabled timeout executor must bind despite invalid moderation gates:
+/// a bad `TWO_MODERATION_PROTECTED_ROLE_IDS` (or a stray `TWO_MODERATION=1`
+/// without `TWO_OWEN_USER_ID`) must not stop the receiver from starting while
+/// the timeout verb is off. Enabled misconfiguration stays fatal (next test).
+#[tokio::test]
+async fn moderation_executor_disabled_tolerates_invalid_gates() {
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    let prev_allow = std::env::var("TWO_INTERNAL_ALLOW_MODERATION").ok();
+    let prev_mod = std::env::var("TWO_MODERATION").ok();
+    let prev_owen = std::env::var("TWO_OWEN_USER_ID").ok();
+    let prev_protected = std::env::var("TWO_MODERATION_PROTECTED_ROLE_IDS").ok();
+    // Stray moderation publish gate without the internal allowlist: the
+    // timeout verb is off, with both invalid-gate shapes present at once.
+    std::env::remove_var("TWO_INTERNAL_ALLOW_MODERATION");
+    std::env::set_var("TWO_MODERATION", "1");
+    std::env::remove_var("TWO_OWEN_USER_ID");
+    std::env::set_var("TWO_MODERATION_PROTECTED_ROLE_IDS", "not-a-snowflake");
+    let api = MockEventApi::start().await;
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(api.origin.clone()))
+            .unwrap();
+    let result = moderation_executor_from_env(lazy_pool(), discord);
+    if let Some(value) = prev_allow {
+        std::env::set_var("TWO_INTERNAL_ALLOW_MODERATION", value);
+    } else {
+        std::env::remove_var("TWO_INTERNAL_ALLOW_MODERATION");
+    }
+    if let Some(value) = prev_mod {
+        std::env::set_var("TWO_MODERATION", value);
+    } else {
+        std::env::remove_var("TWO_MODERATION");
+    }
+    if let Some(value) = prev_owen {
+        std::env::set_var("TWO_OWEN_USER_ID", value);
+    } else {
+        std::env::remove_var("TWO_OWEN_USER_ID");
+    }
+    if let Some(value) = prev_protected {
+        std::env::set_var("TWO_MODERATION_PROTECTED_ROLE_IDS", value);
+    } else {
+        std::env::remove_var("TWO_MODERATION_PROTECTED_ROLE_IDS");
+    }
+    assert!(
+        result.is_ok(),
+        "disabled executor must bind despite invalid gates"
+    );
+}
+
+/// Enabled misconfiguration stays fatal: `TWO_MODERATION=1` with the timeout
+/// verb on but no valid `TWO_OWEN_USER_ID` must refuse the receiver bind.
+#[tokio::test]
+async fn moderation_executor_enabled_rejects_invalid_gates() {
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    let prev_owen = std::env::var("TWO_OWEN_USER_ID").ok();
+    let prev_protected = std::env::var("TWO_MODERATION_PROTECTED_ROLE_IDS").ok();
+    set_moderation_flags(true);
+    std::env::remove_var("TWO_OWEN_USER_ID");
+    std::env::remove_var("TWO_MODERATION_PROTECTED_ROLE_IDS");
+    let api = MockEventApi::start().await;
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(api.origin.clone()))
+            .unwrap();
+    let result = moderation_executor_from_env(lazy_pool(), discord);
+    set_moderation_flags(false);
+    if let Some(value) = prev_owen {
+        std::env::set_var("TWO_OWEN_USER_ID", value);
+    } else {
+        std::env::remove_var("TWO_OWEN_USER_ID");
+    }
+    if let Some(value) = prev_protected {
+        std::env::set_var("TWO_MODERATION_PROTECTED_ROLE_IDS", value);
+    } else {
+        std::env::remove_var("TWO_MODERATION_PROTECTED_ROLE_IDS");
+    }
+    assert!(
+        result.is_err(),
+        "enabled executor must refuse invalid gates"
+    );
+}
+
+/// Loopback Discord double answering guild-member GETs for the timeout
+/// permission tests. Routes by the trailing `/members/{user_id}` segment so
+/// the live hierarchy/permission resolution runs against canned snapshots.
+struct MockMemberApi {
+    origin: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl MockMemberApi {
+    async fn start(actor_id: &str, actor_roles: Vec<String>, target_id: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let actor = actor_id.to_owned();
+        let roles = actor_roles.clone();
+        let target = target_id.to_owned();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(move |request: Request| {
+                    let actor = actor.clone();
+                    let roles = roles.clone();
+                    let target = target.clone();
+                    async move {
+                        let (parts, _) = request.into_parts();
+                        let path = parts.uri.path().to_owned();
+                        if path.ends_with(&format!("/members/{actor}")) {
+                            return (
+                                StatusCode::OK,
+                                Json(json!({"user": {"id": actor}, "roles": roles})),
+                            );
+                        }
+                        if path.ends_with(&format!("/members/{target}")) {
+                            return (
+                                StatusCode::OK,
+                                Json(json!({"user": {"id": target}, "roles": []})),
+                            );
+                        }
+                        (StatusCode::NOT_FOUND, Json(json!({})))
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        Self { origin, task }
+    }
+}
+
+impl Drop for MockMemberApi {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn timeout_facts() -> TimeoutGuildFacts {
+    let guild = staging_guild().to_owned();
+    TimeoutGuildFacts {
+        guild_id: guild.clone(),
+        owner_id: "999999999999999999".to_owned(),
+        positions: HashMap::from([
+            (guild.clone(), 0),
+            ("555555555555555555".to_owned(), 10),
+            ("666666666666666666".to_owned(), 20),
+        ]),
+        permissions: HashMap::from([
+            (guild.clone(), 0u64),
+            ("555555555555555555".to_owned(), 0u64),
+            ("666666666666666666".to_owned(), PERM_MODERATE_MEMBERS),
+        ]),
+    }
+}
+
+fn timeout_request() -> InternalMemberRequest {
+    let body = serde_json::from_str::<Value>(&timeout_payload())
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone();
+    InternalMemberRequest::from_body("moderation.timeout", &body).unwrap()
+}
+
+/// The guild permission union fails closed: owners and `ADMINISTRATOR`
+/// holders pass, unknown roles resolve to no snapshot, and a zero union stays
+/// zero for non-owners.
+#[test]
+fn timeout_permission_union_covers_owner_admin_and_fail_closed() {
+    let guild = staging_guild().to_owned();
+    let owner = "999999999999999999".to_owned();
+    let facts = TimeoutGuildFacts {
+        guild_id: guild.clone(),
+        owner_id: owner.clone(),
+        positions: HashMap::from([(guild.clone(), 0)]),
+        permissions: HashMap::from([
+            (guild.clone(), 0u64),
+            ("777777777777777777".to_owned(), ADMINISTRATOR_BIT),
+        ]),
+    };
+    assert_eq!(timeout_permissions(&[], &facts, &owner), Some(u64::MAX));
+    assert_eq!(
+        timeout_permissions(
+            &["777777777777777777".to_owned()],
+            &facts,
+            "111111111111111111"
+        ),
+        Some(u64::MAX)
+    );
+    assert_eq!(
+        timeout_permissions(
+            &["000000000000000001".to_owned()],
+            &facts,
+            "111111111111111111"
+        ),
+        None
+    );
+    assert_eq!(
+        timeout_permissions(&[], &facts, "111111111111111111"),
+        Some(0)
+    );
+}
+
+/// An actor whose live snapshot carries no timeout permission is refused
+/// before the target resolves: deleting the Moderate Members check turns this
+/// refusal into a resolution success, so the test pins the gate itself.
+#[tokio::test]
+async fn moderation_timeout_actor_without_permission_is_refused() {
+    let facts = timeout_facts();
+    let actor_id = "111111111111111111";
+    let target_id = "333333333333333333";
+    let api =
+        MockMemberApi::start(actor_id, vec!["555555555555555555".to_owned()], target_id).await;
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(api.origin.clone()))
+            .unwrap();
+    let request = timeout_request();
+    let error = timeout_resolve(&discord, &request, &facts, 100)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error.code, ErrorCode::ActionNotAllowed),
+        "unpermitted actor must be refused, got {:?}",
+        error.code
+    );
+    assert_eq!(error.log_reason, "moderation_actor_forbidden");
+}
+
+/// An actor whose live snapshot carries the timeout permission resolves to
+/// the shared moderation service inputs.
+#[tokio::test]
+async fn moderation_timeout_actor_with_permission_resolves() {
+    let facts = timeout_facts();
+    let actor_id = "111111111111111111";
+    let target_id = "333333333333333333";
+    let api =
+        MockMemberApi::start(actor_id, vec!["666666666666666666".to_owned()], target_id).await;
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(api.origin.clone()))
+            .unwrap();
+    let request = timeout_request();
+    let (actor, target, bot_position) = timeout_resolve(&discord, &request, &facts, 100)
+        .await
+        .unwrap();
+    assert_eq!(actor.user_id, actor_id);
+    assert_eq!(target.user_id, target_id);
+    assert_eq!(bot_position, 100);
+    assert_ne!(actor.permissions & PERM_MODERATE_MEMBERS, 0);
+}
+
 #[tokio::test]
 async fn listeners_fail_closed_and_drain_sibling_on_unexpected_exit() {
     let (shutdown, stopping) = tokio::sync::watch::channel(false);
