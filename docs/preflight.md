@@ -71,13 +71,22 @@ export is required. The report names this coverage gate explicitly.
    requested. Content is requested for `TWO_AUTOMOD=1` **or** all three nonempty
    ticket settings (category, staff role, panel channel). Missing a requested
    portal flag is FAIL; an unused enabled flag is WARN.
-3. The bot's guild member and all guild roles are fetched. Permissions are the
+3. `GET /gateway/bot` reads the Discord session-start budget through the same
+   governed GET path (lane held, no retry). The cutover's forced IDENTIFY
+   spends one start against this hard daily limit, plus more on reconnect
+   retries, so `remaining` below 10 is FAIL and below 100 is WARN; otherwise
+   PASS. The detail prints `remaining`, `total`, `reset_after_ms` and
+   `max_concurrency` only, never the token. A failed, timed-out or malformed
+   budget read fails closed and stops further checks. A 429 or 5xx follows the
+   same handling as every other check: recorded by the shared gate, lane held,
+   never retried by this command.
+4. The bot's guild member and all guild roles are fetched. Permissions are the
    union of `@everyone` and the bot's held roles. The legacy funnel/internal-action
    grant is checked: Manage Server, View Channels, Create Instant Invite, Manage
    Roles, Manage Events and Send Messages. Administrator satisfies these bits but
    is always WARN because it bypasses channel overwrites. Invite-list readability
    is also checked with a real GET.
-4. Every supplied level reward and every `TWO_SELF_ROLE_PANELS[].options[].roleId`
+5. Every supplied level reward and every `TWO_SELF_ROLE_PANELS[].options[].roleId`
    must exist, be unmanaged, not be `@everyone`, and be strictly below the bot's
    highest role. Equal-position roles use Twilight's Discord snowflake ordering.
    Administrator **does not bypass hierarchy**. The self-role catalogue is
@@ -85,11 +94,11 @@ export is required. The report names this coverage gate explicitly.
    (`parse_self_role_panels`), so Discord bounds (20 reactions, 100-unit
    button custom ids, 80-unit button labels) fail preflight before any REST.
    Live role/channel safety beyond the catalogue still validates at runtime.
-5. For production's built-in onboarding catalogue, game **and platform** role IDs
+6. For production's built-in onboarding catalogue, game **and platform** role IDs
    and primary/fallback channel IDs are checked when the game picker is enabled.
    Production catalogue IDs are never applied to another guild, and `session` or
    onboarding dry-run does not require these role-write targets.
-6. Each configured channel is fetched individually, must belong to the target
+7. Each configured channel is fetched individually, must belong to the target
    guild, and is resolved from its **own** overwrites. A category allow is not
    assumed to grant access to an unsynced child. Posting destinations must be text
    or announcement channels with View, Send and Embed. ManageMessages is required
@@ -176,8 +185,10 @@ cargo test -p two-bot --locked --test preflight
 
 Acceptance launches the **real binary** against the existing scripted mock REST
 double, with a cleared environment and fake token. It covers PASS/WARN/FAIL,
-intent gates, role hierarchy/managed/deleted roles, channel denials, JSON/table
-output, credential rejection, invalid config and zero API writes. The fake REST
+intent gates, the session-start budget gate (PASS/WARN/FAIL on `remaining`,
+malformed, missing field, 429 and 5xx), role hierarchy/managed/deleted roles,
+channel denials, JSON/table output, credential rejection, invalid config and
+zero API writes. The fake REST
 names and error bodies intentionally contain the fake token to detect accidental
 logging. With only the explicit loopback fixture and no `TWO_DATABASE_URL`, no
 admission database is needed. A present but failed authority is never replaced
