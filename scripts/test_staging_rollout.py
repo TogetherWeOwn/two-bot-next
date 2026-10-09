@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -904,10 +905,42 @@ class DeploymentWiringTests(unittest.TestCase):
         self.assertIn("--env staging", deploy[0])
         self.assertIn('${{ env.ROLLOUT_DIR }}/staging-deploy.json', deploy[0])
         self.assertIn('--evidence "$ROLLOUT_DIR/evidence.json"', verify[0])
+        # Takeover pin: the client must be pinned to the receipt-validated
+        # Worker version, so a retry answered by a stale version refuses while
+        # the old-to-new handover still re-posts. Deleting either side must
+        # redden this suite.
+        self.assertIn("set -euo pipefail", takeover[0])
+        self.assertNotRegex(takeover[0], r"(?m)^\s*(?:if|continue-on-error):")
+        self.assertIn("OWNERSHIP_EXPECTED_DEPLOYMENT", takeover[0])
+        self.assertIn("receipt.json", takeover[0])
+        self.assertIn("worker_version", takeover[0])
+        client = (root / "wrangler" / "scripts" / "ownership-control.mjs").read_text()
+        self.assertIn("process.env.OWNERSHIP_EXPECTED_DEPLOYMENT", client)
+        self.assertIn("expectedDeploymentId", client)
         executable_lines = "\n".join(line for line in source.splitlines()
                                       if line.strip() and not line.lstrip().startswith("#"))
         self.assertNotRegex(executable_lines, r"\b503\b")
         self.assertNotIn("curl", executable_lines)
+
+    @unittest.skipUnless(shutil.which("node"), "Node runtime not installed")
+    def test_takeover_pin_env_reaches_control_client_cli(self):
+        # CLI-level: the script runs with the pin env set and the mapping at
+        # ownership-control.mjs:163 passes it through. Preflight needs a valid
+        # URL/token but no network, so it proves the env is accepted end to end.
+        import json
+        import subprocess
+        root = Path(__file__).resolve().parent.parent
+        script = root / "wrangler" / "scripts" / "ownership-control.mjs"
+        env = dict(os.environ)
+        env.update({
+            "STAGING_WORKER_URL": "https://two-bot-next-staging.5150.workers.dev/",
+            "OWNERSHIP_CONTROL_TOKEN": "x" * 32,
+            "OWNERSHIP_EXPECTED_DEPLOYMENT": "123e4567-e89b-12d3-a456-426614174000",
+        })
+        completed = subprocess.run(["node", str(script), "preflight"],
+                                   env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout), {"configured": True})
 
     def test_required_worker_ci_runs_this_offline_suite(self):
         root = Path(__file__).resolve().parent.parent
