@@ -124,7 +124,8 @@ as dynamic labels.
   `DELETE /guilds/:guild/members/:member/roles/:role`,
   `POST /guilds/:guild/scheduled-events`,
   `PATCH /guilds/:guild/scheduled-events/:event`,
-  `DELETE /guilds/:guild/scheduled-events/:event`, `other`).
+  `DELETE /guilds/:guild/scheduled-events/:event`,
+  `POST /guilds/:guild/channels`, `DELETE /channels/:channel`, `other`).
 - `two_bot_job_runs_total{job,outcome}`,
   `two_bot_job_last_success_timestamp_seconds{job}` and
   `two_bot_job_consecutive_failures{job}` — `job` is one of
