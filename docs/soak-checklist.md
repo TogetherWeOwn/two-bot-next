@@ -821,7 +821,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s7-01: Config / env catalogue
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** With approved synthetic configs, attempt an attributed dashboard write to a wired hot key (TWO_RAID_JOIN_THRESHOLD), a cold key (TWO_FEED_POLL_SECONDS), an env_only key and an unknown key. Observe the hot change after the 15s poll; cold and hot-but-unwired changes wait for an approved restart. Never display secret values.
+- **Action:** With approved synthetic configs, attempt an attributed dashboard write to a wired hot key (TWO_RAID_JOIN_THRESHOLD or TWO_FEED_POLL_SECONDS), a cold key (TWO_TICKET_COOLDOWN_SECONDS), an env_only key and an unknown key. Observe the hot change after the 15s poll; cold and hot-but-unwired changes wait for an approved restart. Never display secret values.
 - **Expected:** Catalogued hot and cold keys are writable, versioned and audited; wired hot keys apply live, cold and hot-but-unwired keys are marked next-restart and do not apply live. Env_only and unknown writes are refused before persistence/audit; env-only values remain private.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 

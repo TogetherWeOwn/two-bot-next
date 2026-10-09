@@ -263,6 +263,88 @@ fn default_off_and_interval_validation() {
     }
 }
 
+/// TOG-19027: the stored feed interval reaches the consumer through the
+/// live snapshot, without a restart. Store-first: the live value wins, an
+/// absent/unparsable/out-of-range value falls back to the boot value.
+#[test]
+fn live_poll_seconds_prefers_the_stored_value() {
+    use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
+
+    assert_eq!(live_poll_seconds_with(GUILD, 300, None), 300);
+    let (_, live) = live_channel();
+    assert_eq!(
+        live_poll_seconds_with(GUILD, 300, Some(&live)),
+        300,
+        "empty snapshot falls back"
+    );
+    assert_eq!(
+        live_poll_seconds_with("other-guild", 300, Some(&live)),
+        300,
+        "other guilds fall back"
+    );
+
+    let (mut writer, live) = live_channel();
+    for (value, expected) in [
+        (json!(600), 600),
+        (json!("120"), 120),
+        // Out of range and unparsable values keep the boot interval.
+        (json!(59), 300),
+        (json!(86401), 300),
+        (json!("hourly"), 300),
+        (json!(["600"]), 300),
+    ] {
+        writer.publish(&SettingsSnapshot {
+            revision: 1,
+            rows: vec![SettingRow {
+                guild_id: GUILD.to_owned(),
+                key: INTERVAL_KEY.to_owned(),
+                value,
+                version: 1,
+            }],
+        });
+        assert_eq!(
+            live_poll_seconds_with(GUILD, 300, Some(&live)),
+            expected,
+            "stored value applies without restart"
+        );
+    }
+
+    // A deleted row hands the interval back to the boot value.
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![],
+    });
+    assert_eq!(live_poll_seconds_with(GUILD, 300, Some(&live)), 300);
+}
+
+/// The per-tick schedule gate observes a stored increase without a restart:
+/// after the interval moves 60 s to 3600 s, a tick one minute later skips.
+#[test]
+fn schedule_gate_observes_a_stored_increase_without_restart() {
+    use two_bot_core::feeds::FeedPollSchedule;
+
+    let mut schedule = FeedPollSchedule::new(60).expect("valid boot interval");
+    assert!(schedule.begin(0));
+    schedule.finish();
+
+    // The stored interval moves 60 s to 3600 s without re-registering.
+    assert!(schedule.set_interval_seconds(3600));
+    assert_eq!(schedule.interval_seconds(), 3600);
+    assert!(
+        !schedule.set_interval_seconds(3600),
+        "same interval is a no-op"
+    );
+    assert!(!schedule.set_interval_seconds(59), "out of range refused");
+    assert_eq!(schedule.interval_seconds(), 3600);
+
+    // The next run gates on the new interval, and the tick one boot interval
+    // after it skips: the stored increase applied without a restart.
+    assert!(schedule.begin(61_000));
+    schedule.finish();
+    assert!(!schedule.begin(122_000));
+    assert!(schedule.begin(3_661_000));
+}
+
 #[tokio::test(start_paused = true)]
 async fn registration_parks_off_values_without_constructing_work() {
     let calls = Arc::new(AtomicUsize::new(0));

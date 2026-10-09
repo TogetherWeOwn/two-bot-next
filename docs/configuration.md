@@ -115,16 +115,16 @@ Catalog entries: 122.
 | `TWO_ASSISTANT_MODEL` | env_only | Not specified in Next | environment only | Template-assistant model name; environment-only so a web form cannot redirect it. |
 | `TWO_AUTOMATIONS` | cold | `false` | env at boot; stored unwired | Enable automation administration and custom command publication/routing. |
 | `TWO_AUTOMOD` | cold | `false` | env at boot; stored unwired | Enable automod message inspection. |
-| `TWO_AUTOMOD_ALLOWED_DOMAINS` | hot | `[]` | stored unwired | Domains permitted by the external-link matcher. |
-| `TWO_AUTOMOD_BAD_WORDS` | hot | `[]` | stored unwired | Bad-word list normalized with NFKC and lowercase. |
-| `TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS` | hot | `["bat","cmd","com","exe","js","jse","msi","ps1","scr","vbs","wsf"]` | stored unwired | Blocked attachment extensions, lowercase without a leading dot. |
-| `TWO_AUTOMOD_BYPASS_ROLE_IDS` | hot | `[]` | stored unwired | Roles exempt from automod inspection. |
-| `TWO_AUTOMOD_ENFORCE` | hot | `false` | stored unwired | Enable automod enforcement; absent/disabled remains dry-run. |
-| `TWO_AUTOMOD_EXEMPT_CHANNEL_IDS` | hot | `[]` | stored unwired | Channels exempt from automod inspection. |
-| `TWO_AUTOMOD_MENTION_LIMIT` | hot | `5` | stored unwired | Mention threshold for automod (validated from 1 to 50). |
+| `TWO_AUTOMOD_ALLOWED_DOMAINS` | hot | `[]` | stored unwired (reload-report hot) | Domains permitted by the external-link matcher. |
+| `TWO_AUTOMOD_BAD_WORDS` | hot | `[]` | stored unwired (reload-report hot) | Bad-word list normalized with NFKC and lowercase. |
+| `TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS` | hot | `["bat","cmd","com","exe","js","jse","msi","ps1","scr","vbs","wsf"]` | stored unwired (reload-report hot) | Blocked attachment extensions, lowercase without a leading dot. |
+| `TWO_AUTOMOD_BYPASS_ROLE_IDS` | hot | `[]` | stored unwired (reload-report hot) | Roles exempt from automod inspection. |
+| `TWO_AUTOMOD_ENFORCE` | hot | `false` | stored unwired (reload-report hot) | Enable automod enforcement; absent/disabled remains dry-run. |
+| `TWO_AUTOMOD_EXEMPT_CHANNEL_IDS` | hot | `[]` | stored unwired (reload-report hot) | Channels exempt from automod inspection. |
+| `TWO_AUTOMOD_MENTION_LIMIT` | hot | `5` | stored unwired (reload-report hot) | Mention threshold for automod (validated from 1 to 50). |
 | `TWO_AUTOMOD_REPEAT_COUNT` | hot | `3` | stored unwired (reload-report hot) | Repeated-message threshold (validated from 2 to 20). |
-| `TWO_AUTOMOD_REPEAT_WINDOW_SECONDS` | hot | `30` | stored unwired | Repeated-message window (validated from 1 to 3600 seconds). |
-| `TWO_AUTOMOD_SANCTIONS` | hot | `[{"violations":1,"action":"delete","timeout_seconds":null},{"violations":2,"action":"warn","timeout_seconds":null},{"violations":3,"action":"timeout","timeout_seconds":600}]` | stored unwired | Ordered violation ladder, starting at one; delete, warn or timeout actions. |
+| `TWO_AUTOMOD_REPEAT_WINDOW_SECONDS` | hot | `30` | stored unwired (reload-report hot) | Repeated-message window (validated from 1 to 3600 seconds). |
+| `TWO_AUTOMOD_SANCTIONS` | hot | `[{"violations":1,"action":"delete","timeout_seconds":null},{"violations":2,"action":"warn","timeout_seconds":null},{"violations":3,"action":"timeout","timeout_seconds":600}]` | stored unwired (reload-report hot) | Ordered violation ladder, starting at one; delete, warn or timeout actions. |
 | `TWO_BACKUP_S3_ACCESS_KEY_ID` | env_only | Not rendered (secret) | environment only | Backup object-store access credential; never rendered. |
 | `TWO_BACKUP_S3_BUCKET` | env_only | Not specified in Next | environment only | Backup destination bucket; environment-only to prevent web-selected exfiltration. |
 | `TWO_BACKUP_S3_ENDPOINT` | env_only | Not specified in Next | environment only | Backup object-store endpoint; environment-only destination boundary. |
@@ -145,7 +145,7 @@ Catalog entries: 122.
 | `TWO_COMMUNITY_WELCOME_CHANNEL_IDS` | hot | Not specified in Next | stored unwired | Welcome-channel classification for community analytics. |
 | `TWO_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Administrative/shared admission database credential required for live preflight, cutover and guild-config; must reach the same database as Container DATABASE_URL for the same token. |
 | `TWO_DB_POOL_MAX` | env_only | Not specified in Next | environment only | Legacy database pool maximum read before the settings store exists. |
-| `TWO_FEED_POLL_SECONDS` | cold | `300` | env at boot; stored unwired | Feed polling interval (validated from 60 to 86400 seconds). |
+| `TWO_FEED_POLL_SECONDS` | hot | `300` | stored unwired (reload-report hot) | Feed polling interval (validated from 60 to 86400 seconds). |
 | `TWO_HEALTH_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy health listener interface; environment-only network bind. |
 | `TWO_HEALTH_PORT` | env_only | Not specified in Next | environment only | Legacy health listener port; Container uses LISTEN_ADDR instead. |
 | `TWO_INACTIVITY_DAYS` | cold | Not specified in Next | stored unwired | Inactivity horizon used for community nudges. |

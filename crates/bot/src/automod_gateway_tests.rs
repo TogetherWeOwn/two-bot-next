@@ -190,6 +190,130 @@ fn delivery(kind: MessageDeliveryKind) -> MessageDelivery {
     }
 }
 
+/// TOG-19027: stored automod lists/thresholds reach the consumer through
+/// the live snapshot, without a restart. The poller publishes; the same
+/// process re-resolves and observes the stored values.
+#[test]
+fn live_snapshot_moves_automod_lists_and_thresholds_without_restart() {
+    let deployment = vars(&[
+        ("TWO_AUTOMOD", "1"),
+        ("TWO_OWEN_USER_ID", OWEN),
+        ("TWO_MODERATION_PROTECTED_ROLE_IDS", ROLE),
+    ]);
+    let boot = resolve_with_live(&deployment, GUILD, None)
+        .expect("boot resolves")
+        .expect("automod on");
+    assert!(boot.config.policy.bad_words.is_empty());
+    assert_eq!(boot.config.policy.repeated_message_count, 3);
+    assert_eq!(boot.config.policy.mention_limit, 5);
+    assert!(boot.config.dry_run, "absent ENFORCE stays dry-run");
+
+    let guild = GUILD.to_string();
+    let (mut writer, live) = two_bot_core::settings::live_channel();
+    writer.publish(&two_bot_core::settings::SettingsSnapshot {
+        revision: 1,
+        rows: vec![
+            two_bot_core::settings::SettingRow {
+                guild_id: guild.clone(),
+                key: "TWO_AUTOMOD_BAD_WORDS".to_owned(),
+                value: json!(["spamword"]),
+                version: 1,
+            },
+            two_bot_core::settings::SettingRow {
+                guild_id: guild.clone(),
+                key: "TWO_AUTOMOD_REPEAT_COUNT".to_owned(),
+                value: json!(7),
+                version: 1,
+            },
+            two_bot_core::settings::SettingRow {
+                guild_id: guild.clone(),
+                key: "TWO_AUTOMOD_MENTION_LIMIT".to_owned(),
+                value: json!(2),
+                version: 1,
+            },
+            two_bot_core::settings::SettingRow {
+                guild_id: guild.clone(),
+                key: "TWO_AUTOMOD_ENFORCE".to_owned(),
+                value: json!(true),
+                version: 1,
+            },
+        ],
+    });
+
+    let reloaded = resolve_with_live(&deployment, GUILD, Some(&live))
+        .expect("live resolves")
+        .expect("automod on");
+    assert_eq!(reloaded.config.policy.bad_words, vec!["spamword"]);
+    assert_eq!(reloaded.config.policy.repeated_message_count, 7);
+    assert_eq!(reloaded.config.policy.mention_limit, 2);
+    assert!(
+        !reloaded.config.dry_run,
+        "stored ENFORCE=1 arms enforcement"
+    );
+
+    // A deleted row hands the key back to the deployment environment.
+    writer.publish(&two_bot_core::settings::SettingsSnapshot {
+        revision: 2,
+        rows: vec![],
+    });
+    let reverted = resolve_with_live(&deployment, GUILD, Some(&live))
+        .expect("revert resolves")
+        .expect("automod on");
+    assert!(reverted.config.policy.bad_words.is_empty());
+    assert_eq!(reverted.config.policy.repeated_message_count, 3);
+}
+
+/// The running activation applies the live policy in place: the first
+/// refresh after a stored write reports a change, a repeat reports none, and
+/// repeat history is never rebuilt (no restart, no new activation).
+#[test]
+fn running_activation_applies_live_policy_without_restart() {
+    crate::gateway::ensure_crypto_provider();
+    let deployment = vars(&[
+        ("TWO_AUTOMOD", "1"),
+        ("TWO_OWEN_USER_ID", OWEN),
+        ("TWO_MODERATION_PROTECTED_ROLE_IDS", ROLE),
+    ]);
+    let resolved = resolve(&deployment, GUILD)
+        .expect("boot resolves")
+        .expect("automod on");
+    let executor = ActionExecutor::with_proxy(
+        "test-token".to_owned(),
+        Some("http://127.0.0.1:9".to_owned()),
+    )
+    .expect("executor builds");
+    let activation = AutomodActivation::new(
+        AutomodRuntime::new(resolved.config, resolved.scope),
+        HangingLedger,
+        HangingFacts,
+        executor,
+    );
+
+    let guild = GUILD.to_string();
+    let (mut writer, live) = two_bot_core::settings::live_channel();
+    assert!(
+        !refresh_live(&activation, &deployment, &guild, &live),
+        "empty snapshot changes nothing"
+    );
+    writer.publish(&two_bot_core::settings::SettingsSnapshot {
+        revision: 1,
+        rows: vec![two_bot_core::settings::SettingRow {
+            guild_id: guild.clone(),
+            key: "TWO_AUTOMOD_BAD_WORDS".to_owned(),
+            value: json!(["spamword"]),
+            version: 1,
+        }],
+    });
+    assert!(
+        refresh_live(&activation, &deployment, &guild, &live),
+        "stored bad words move the running policy"
+    );
+    assert!(
+        !refresh_live(&activation, &deployment, &guild, &live),
+        "unchanged snapshot is a no-op"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_stalled_delivery_times_out_without_becoming_acceptance() {
     crate::gateway::ensure_crypto_provider();
