@@ -241,8 +241,10 @@ them), the run alias and its own alias, which must be the descriptor's
 `reader_alias`. It reads the descriptor, writer seal, writer manifest, 120
 record keys and 32 incident keys: one attempt per key, each at most 2 seconds,
 300 seconds overall. A denial or the time budget ends reading at once and
-leaves the rest `not_attempted` with `TRUNCATED`. After a permission denial
-the reader writes neither its manifest nor its seal.
+leaves the rest `not_attempted` with `TRUNCATED`. After a read denial the
+reader writes neither its manifest nor its seal. A write denied for the
+manifest leaves no seal; a write denied for the seal leaves a committed
+manifest without one.
 
 It recomputes each record hash and rechecks aliases, index, schedule, intrinsic
 flags and (where a persisted interval exists) the CPU arithmetic from the two
@@ -259,8 +261,11 @@ its predecessor (persisted arrival order shows that), because the writer then
 held no pair to judge. The reader never uses
 the writer's memory, hashes alone, a re-scrape or sorted estimates. With no
 readable descriptor there is nothing to bind a manifest to, so none is
-produced. The reader persists its manifest and seal at most once; a second
-reader finds the keys taken and is refused.
+produced. The reader writes its seal only after this call commits its manifest. A
+second reader's manifest write finds the key taken, so it writes no seal and
+leaves both stored outputs untouched. A manifest that fails, stays unknown
+after a timeout, or is denied also leaves no seal; an unknown manifest may
+still have landed.
 
 **Coverage.** `unknown` without authority (T unset or references missing), for a
 writer claim with every slot committed, or for a run that is merely open (no

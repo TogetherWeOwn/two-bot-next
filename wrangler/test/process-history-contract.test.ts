@@ -622,13 +622,38 @@ test("complete_structural_120: 120 canonical records, 119 adjacent deltas, struc
   assert.equal(rb.result.seal?.outcome, "finished");
   assert.equal(rb.result.seal?.last_i, 119);
 
-  // The reader's own outputs persist once; a second reader is refused and cannot overwrite them.
+  // The reader's outputs persist once; a second reader's manifest write finds the key taken, so it writes no seal.
   const target = map;
   assert.deepEqual(C.persistReaderOutputs(target, rb.result, DESC.run_alias), { manifest: "committed", seal: "committed" });
   const stored = (target.read(C.keyFor(DESC.run_alias, "manifest:reader")) as { value: string }).value;
   assert.deepEqual(C.decodeManifest(stored), { ok: true, value: m });
-  assert.deepEqual(C.persistReaderOutputs(target, rb.result, DESC.run_alias), { manifest: "exists", seal: "exists" });
+  assert.deepEqual(C.persistReaderOutputs(target, rb.result, DESC.run_alias), { manifest: "exists", seal: "skipped" });
   assert.equal((target.read(C.keyFor(DESC.run_alias, "manifest:reader")) as { value: string }).value, stored);
+});
+
+test("reader seal follows only a manifest this reader committed", () => {
+  const { map, writer } = newRun({ reconcile: true });
+  feed(writer, range(120));
+  finishRun(writer);
+  const { result } = readMap(map);
+  const manifestKey = C.keyFor(DESC.run_alias, "manifest:reader");
+  const sealKey = C.keyFor(DESC.run_alias, "reader-seal");
+
+  const foreign = new C.PersistedMap();
+  assert.equal(foreign.create(manifestKey, "foreign manifest bytes").kind, "created");
+  assert.deepEqual(C.persistReaderOutputs(foreign, result, DESC.run_alias), { manifest: "exists", seal: "skipped" });
+  assert.deepEqual(foreign.read(manifestKey), { kind: "value", value: "foreign manifest bytes", elapsed_ms: 0 }, "the foreign manifest is untouched");
+  assert.equal(foreign.read(sealKey).kind, "absent", "a seal never attests to a manifest this reader did not commit");
+
+  for (const [outcome, status] of [[TIMEOUT, "unknown"], [REJECTED, "failed"]] as const) {
+    const spy = new SpyStore(new C.PersistedMap(), (op, key) => (op === "create" && key === manifestKey ? { outcome } : undefined));
+    assert.deepEqual(C.persistReaderOutputs(spy, result, DESC.run_alias), { manifest: status, seal: "skipped" }, status);
+    assert.equal(spy.count("create", sealKey), 0, `${status} manifest: no seal write`);
+  }
+
+  const deniedSeal = new SpyStore(new C.PersistedMap(), (op, key) => (op === "create" && key === sealKey ? { outcome: DENIED } : undefined));
+  assert.deepEqual(C.persistReaderOutputs(deniedSeal, result, DESC.run_alias), { manifest: "committed", seal: "denied" });
+  assert.equal(deniedSeal.count("create", sealKey), 1, "a denied seal write is terminal");
 });
 
 test("independent_reader: a destroyed writer, fresh serialized bytes, and tampering is detected", () => {

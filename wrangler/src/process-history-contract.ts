@@ -1949,15 +1949,12 @@ export function readback(p: ReadbackParams): ReadbackResult {
   }, OK, last ? { i: last.i, sha: shas[last.i]! } : null);
 }
 
-/**
- * Persist the reader's own manifest and seal once. A second reader finds the
- * keys taken and is refused: no overwrite, no extra run budget.
- */
+/** Persists nothing after a denied read or without both texts; the seal follows only a manifest this call committed. */
 export function persistReaderOutputs(store: PersistedStore, result: ReadbackResult, alias: string):
   { manifest: PersistResult["status"] | "skipped"; seal: PersistResult["status"] | "skipped" } {
   if (result.stop === "denied" || result.manifest_text === null || result.seal_text === null) return { manifest: "skipped", seal: "skipped" };
   const manifest = persistBytes(store, keyFor(alias, "manifest:reader"), result.manifest_text, false);
-  if (manifest.status === "denied") return { manifest: "denied", seal: "skipped" };
+  if (manifest.status !== "committed") return { manifest: manifest.status, seal: "skipped" };
   const seal = persistBytes(store, keyFor(alias, "reader-seal"), result.seal_text, false);
   return { manifest: manifest.status, seal: seal.status };
 }
