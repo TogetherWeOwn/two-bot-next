@@ -56,7 +56,6 @@ SILENT_GAP_LIMIT_S = OUTAGE_BUDGET_S
 # Recovery signal; everything else that opens a window is a start signal.
 RECOVERY_EVENT = "readyz_ok"
 OUTAGE_START_EVENTS = ("readyz_fail", "tick_missed")
-KNOWN_EVENTS = (RECOVERY_EVENT, *OUTAGE_START_EVENTS)
 
 
 def parse_ts(value):
