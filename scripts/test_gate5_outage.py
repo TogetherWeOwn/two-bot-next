@@ -59,27 +59,44 @@ class Gate5OutageTests(unittest.TestCase):
         self.assertEqual(len(summary["unknown_intervals"]), 1)
         self.assertEqual(summary["verdict"], "NEEDS WORK")
 
+    def test_silence_before_first_record_beyond_gap_needs_work(self):
+        summary = run(ok(20), ok(25), ok(30), expect=(0, 30))
+        self.assertEqual(len(summary["unknown_intervals"]), 1)
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_failure_reporting_status_200_is_unknown(self):
+        summary = run(ok(0), line(5, "readyz_fail", status=200), ok(10), expect=(0, 10))
+        self.assertTrue(any("contradicts" in item["reason"]
+                            for item in summary["unknown_intervals"]))
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_log_that_stops_before_declared_end_needs_work(self):
+        summary = run(ok(0), ok(5), ok(10), ok(15), expect=(0, 20))
+        self.assertTrue(any("declared end" in item["reason"]
+                            for item in summary["unknown_intervals"]))
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
     def test_mid_log_outage_with_recovery(self):
         summary = run(
-            ok(1), fail(10), fail(20), fail(30), fail(40), fail(50),
-            ok(55), ok(60), ok(65), expect=(1, 65),
+            ok(1), fail(10), fail(20), fail(30),
+            ok(35), ok(40), ok(45), expect=(1, 45),
         )
         self.assertEqual(len(summary["outage_windows"]), 1)
         window = summary["outage_windows"][0]
-        # The window spans the FIRST failure to the first confirmed recovery.
+        # The window spans the FIRST failure to the record that verifies recovery.
         self.assertEqual(window["start"], "2026-10-01T00:00:10+00:00")
-        self.assertEqual(window["end"], "2026-10-01T00:00:55+00:00")
-        self.assertEqual(window["outage_seconds"], 45.0)
-        self.assertEqual(window["outage_seconds_max"], 54.0)
+        self.assertEqual(window["end"], "2026-10-01T00:00:45+00:00")
+        self.assertEqual(window["outage_seconds"], 35.0)
+        self.assertEqual(window["outage_seconds_max"], 44.0)
         self.assertEqual(window["status"], "recovered")
-        self.assertEqual(summary["max_outage_seconds"], 54.0)
+        self.assertEqual(summary["max_outage_seconds"], 44.0)
         self.assertEqual(summary["verdict"], "PASS")
 
     def test_missed_tick_opens_outage(self):
         summary = run(ok(1), line(2, "tick_missed"), ok(12), ok(13), ok(14), expect=(1, 14))
         self.assertEqual(len(summary["outage_windows"]), 1)
         window = summary["outage_windows"][0]
-        self.assertEqual(window["outage_seconds"], 10.0)
+        self.assertEqual(window["outage_seconds"], 12.0)
         self.assertEqual(window["status"], "recovered")
         self.assertEqual(summary["verdict"], "PASS")
 
@@ -92,8 +109,8 @@ class Gate5OutageTests(unittest.TestCase):
         self.assertEqual(len(summary["outage_windows"]), 1)
         window = summary["outage_windows"][0]
         self.assertEqual(window["start"], "2026-10-01T00:00:05+00:00")
-        self.assertEqual(window["outage_seconds"], 55.0)
-        self.assertEqual(window["outage_seconds_max"], 60.0)
+        self.assertEqual(window["outage_seconds"], 65.0)
+        self.assertEqual(window["outage_seconds_max"], 70.0)
         self.assertEqual(summary["verdict"], "NEEDS WORK")
 
     def test_start_between_samples_is_bounded_by_last_healthy_record(self):
@@ -102,14 +119,14 @@ class Gate5OutageTests(unittest.TestCase):
             ok(64), ok(69), ok(74), expect=(0, 74),
         )
         window = summary["outage_windows"][0]
-        self.assertEqual(window["outage_seconds"], 59.0)
-        self.assertEqual(window["outage_seconds_max"], 64.0)
+        self.assertEqual(window["outage_seconds"], 69.0)
+        self.assertEqual(window["outage_seconds_max"], 74.0)
         self.assertEqual(summary["verdict"], "NEEDS WORK")
 
     def test_upper_bound_exactly_at_budget_needs_work(self):
         summary = run(
             ok(0), *(fail(second) for second in range(5, 60, 5)),
-            ok(60), ok(65), ok(70), expect=(0, 70),
+            ok(58), ok(59), ok(60), expect=(0, 60),
         )
         window = summary["outage_windows"][0]
         self.assertEqual(window["outage_seconds"], 55.0)
@@ -122,11 +139,21 @@ class Gate5OutageTests(unittest.TestCase):
             ok(95), ok(100), ok(105), expect=(0, 105),
         )
         window = summary["outage_windows"][0]
-        self.assertEqual(window["outage_seconds"], 90.0)
-        self.assertEqual(summary["max_outage_seconds"], 95.0)
+        self.assertEqual(window["outage_seconds"], 100.0)
+        self.assertEqual(summary["max_outage_seconds"], 105.0)
         # The budget alone fails this log: no silent gaps, no unknowns.
         self.assertEqual(summary["unknown_intervals"], [])
         self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_healthy_marker_refreshes_after_a_confirmed_recovery(self):
+        summary = run(
+            ok(0), fail(5), ok(10), ok(15), ok(20),
+            *(fail(second) for second in range(25, 60, 5)),
+            ok(60), ok(65), ok(70), expect=(0, 70),
+        )
+        second_window = summary["outage_windows"][1]
+        self.assertEqual(second_window["last_healthy"], "2026-10-01T00:00:20+00:00")
+        self.assertEqual(second_window["outage_seconds_max"], 50.0)
 
     def test_two_confirmations_are_not_a_recovery(self):
         summary = run(ok(0), fail(5), ok(10), ok(15), expect=(0, 15))
@@ -135,6 +162,13 @@ class Gate5OutageTests(unittest.TestCase):
         self.assertEqual(window["status"], "unknown")
         self.assertIsNone(window["end"])
         self.assertIsNone(summary["max_outage_seconds"])
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_duplicate_instants_are_not_confirmations(self):
+        summary = run(ok(0), fail(5), fail(10), ok(15), ok(15), ok(15), expect=(0, 15))
+        self.assertTrue(any("duplicate" in item["reason"]
+                            for item in summary["unknown_intervals"]))
+        self.assertEqual(summary["outage_windows"][0]["status"], "unknown")
         self.assertEqual(summary["verdict"], "NEEDS WORK")
 
     def test_still_down_at_end_is_unknown_not_zero(self):
@@ -162,14 +196,14 @@ class Gate5OutageTests(unittest.TestCase):
 
     def test_silent_gap_inside_outage_needs_work(self):
         summary = run(ok(1), fail(10), fail(25), ok(30), ok(35), ok(40), expect=(1, 40))
-        self.assertEqual(summary["outage_windows"][0]["outage_seconds"], 20.0)
+        self.assertEqual(summary["outage_windows"][0]["outage_seconds"], 30.0)
         self.assertEqual(len(summary["unknown_intervals"]), 1)
         self.assertEqual(summary["verdict"], "NEEDS WORK")
 
     def test_out_of_order_record_needs_work_and_never_scores_negative(self):
         summary = run(ok(1), fail(10), ok(5), ok(15), ok(20), ok(25), expect=(1, 25))
         window = summary["outage_windows"][0]
-        self.assertEqual(window["outage_seconds"], 5.0)
+        self.assertEqual(window["outage_seconds"], 15.0)
         self.assertTrue(any("out-of-order" in item["reason"]
                             for item in summary["unknown_intervals"]))
         self.assertEqual(summary["verdict"], "NEEDS WORK")
@@ -196,6 +230,11 @@ class Gate5OutageTests(unittest.TestCase):
                + ok(5).encode("utf-8"))
         summary = summarize(io.BytesIO(raw), at(0), at(5))
         self.assertEqual(len(summary["unknown_intervals"]), 2)
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_deeply_nested_json_is_unknown_not_a_crash(self):
+        summary = run(ok(0), "[" * 100000 + "\n", ok(5), expect=(0, 5))
+        self.assertEqual(len(summary["unknown_intervals"]), 1)
         self.assertEqual(summary["verdict"], "NEEDS WORK")
 
     def test_unknown_events_are_preserved_not_dropped(self):
