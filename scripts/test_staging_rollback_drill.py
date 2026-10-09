@@ -664,6 +664,14 @@ class OwnershipControlTimeoutTests(unittest.TestCase):
         request_ms = int(re.search(r"AbortSignal\.timeout\((\d+)\)", client).group(1))
         self.assertGreater(drill.OWNERSHIP_CONTROL_TIMEOUT_SECONDS * 1000, window_ms + 2 * request_ms)
 
+    def test_control_subprocess_is_called_with_the_timeout(self):
+        done = subprocess.CompletedProcess([], 0, stdout=json.dumps({"owner": {"phase": "active", "epoch": 1}}),
+                                           stderr="")
+        control = drill.ownership_control(SENTINEL, URL, "github-actions:1:rollback-drill", root="/repo")
+        with patch.object(drill.subprocess, "run", return_value=done) as run:
+            control("status")
+        self.assertEqual(run.call_args.kwargs["timeout"], drill.OWNERSHIP_CONTROL_TIMEOUT_SECONDS)
+
 
 if __name__ == "__main__":
     unittest.main()
