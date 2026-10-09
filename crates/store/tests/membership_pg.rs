@@ -166,7 +166,7 @@ fn sqlx_membership_chronology_contract_non_utc_session() {
 /// writers race duplicate reconfirmations of the same once-per-member join
 /// row behind a barrier, so both transactions overlap on the event-row lock.
 /// The store serializes on `SELECT … FOR UPDATE` and converges on the newest
-/// hint; a stale compare-and-swap then matches zero rows and leaves the
+/// hint; a stale duplicate reconfirmation through the store then leaves the
 /// maximum intact, failing loudly (assert) instead of losing the update.
 #[test]
 #[ignore = "requires authorized TEST_DATABASE_URL"]
@@ -246,37 +246,15 @@ fn sqlx_membership_parallel_writer_cas() {
         "parallel writers converge on the newest hint"
     );
 
-    // Stale compare-and-swap matches zero rows: a writer holding a mismatched
-    // expected value cannot overwrite the converged maximum. The row count is
-    // the revision check, and the asserts fail loudly on a lost update.
-    let stale_rows = f.runtime.block_on(async {
-        let current: Option<String> = sqlx::query_scalar(
-            "SELECT metadata FROM events WHERE guild_id = $1 AND member_id = $2 AND event_type = $3",
-        )
-        .bind(GUILD.to_string())
-        .bind(MEMBER.to_string())
-        .bind(EventType::MemberJoin.as_str())
-        .fetch_one(&f.pool)
-        .await
-        .expect("read contested metadata");
-        let mut stale_expected =
-            current.expect("converged row carries metadata");
-        stale_expected.push(' ');
-        sqlx::query(
-            "UPDATE events SET metadata = $1 WHERE guild_id = $2 AND member_id = $3
-             AND event_type = $4 AND metadata IS NOT DISTINCT FROM $5",
-        )
-        .bind(format!("{{\"membershipObservedAt\":\"{STALE_HINT}\"}}"))
-        .bind(GUILD.to_string())
-        .bind(MEMBER.to_string())
-        .bind(EventType::MemberJoin.as_str())
-        .bind(&stale_expected)
-        .execute(&f.pool)
-        .await
-        .expect("stale CAS probe")
-        .rows_affected()
-    });
-    assert_eq!(stale_rows, 0, "stale compare-and-swap must match zero rows");
+    // A stale duplicate through the store cannot overwrite the converged
+    // maximum: the reconfirmation takes the same `advance_duplicate` path as
+    // the racing writers (row lock plus the `IS NOT DISTINCT FROM` revision
+    // check), the older hint loses the maximum comparison, and the asserts
+    // fail loudly on a lost update.
+    assert!(
+        !s.record_observed(duplicate(), Some(STALE_HINT)).inserted,
+        "stale reconfirmation is a duplicate, not an insert"
+    );
     let rows = s.membership_rows(GUILD, MEMBER);
     assert_eq!(
         observed(&rows[0].metadata).as_deref(),

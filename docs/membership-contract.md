@@ -113,7 +113,7 @@ The Rust harness groups parameterized scenarios rather than copying test names.
 | `test/unit.membership-replay.test.ts:81` | Reconfirmation vs genuine rejoin, original inviter/identity | `replay` |
 | `test/unit.membership-replay.test.ts:121` | Concurrent writes, new leave, stale duplicates | `concurrent` |
 | `test/unit.membership-replay.test.ts:160` | Delayed older duplicate cannot overwrite newer maximum | `concurrent` |
-| `test/unit.membership-replay.test.ts:217` | Five stale competing duplicates converge on newest stamp | `concurrent` plus `sqlx_membership_parallel_writer_cas` in `crates/store/tests/membership_pg.rs` (barrier-raced writers on one row; stale `IS NOT DISTINCT FROM` matches zero rows) |
+| `test/unit.membership-replay.test.ts:217` | Five stale competing duplicates converge on newest stamp | `concurrent` plus `sqlx_membership_parallel_writer_cas` in `crates/store/tests/membership_pg.rs` (barrier-raced writers on one row; stale duplicate through the store leaves the maximum intact) |
 | `test/unit.membership-replay.test.ts:282` | Delayed leave / delayed invite-add completion | `dispatch_and_rest` (captured dispatch stamps) |
 | `test/unit.membership-clock.test.ts:5` | Same tick, advancing wall time, backward wall correction | `clock` |
 | `test/unit.membership-rest-observation.test.ts:9` | Request start survives delayed headers/body | `discord/tests/membership_observation.rs` plus store boundary fixture |
