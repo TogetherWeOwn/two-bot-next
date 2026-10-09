@@ -214,9 +214,11 @@ async fn a_stalled_delivery_times_out_without_becoming_acceptance() {
             delivery(MessageDeliveryKind::Create),
             "2026-10-02T00:00:00.000Z"
         )
-        .await
-        .funnel,
-        FunnelDisposition::CaptureOnly
+        .await,
+        WorkerVerdict {
+            funnel: FunnelDisposition::CaptureOnly,
+            trigger: FunnelDisposition::CaptureOnly,
+        }
     );
     assert_eq!(
         process(
@@ -231,7 +233,7 @@ async fn a_stalled_delivery_times_out_without_becoming_acceptance() {
 }
 
 #[test]
-fn uninspected_create_keeps_funnel_accept_without_trigger_verdict() {
+fn uninspected_create_keeps_funnel_accept_with_capture_only_trigger() {
     let bypassed = Activation {
         disposition: FunnelDisposition::Accept,
         outcome: ActivationOutcome::Bypassed,
@@ -240,7 +242,7 @@ fn uninspected_create_keeps_funnel_accept_without_trigger_verdict() {
         verdict_of(&bypassed, MessageDeliveryKind::Create),
         WorkerVerdict {
             funnel: FunnelDisposition::Accept,
-            trigger: None,
+            trigger: FunnelDisposition::CaptureOnly,
         }
     );
 }
@@ -259,7 +261,7 @@ fn settled_clean_create_hands_its_accept_to_triggers() {
         verdict_of(&clean, MessageDeliveryKind::Create),
         WorkerVerdict {
             funnel: FunnelDisposition::Accept,
-            trigger: Some(FunnelDisposition::Accept),
+            trigger: FunnelDisposition::Accept,
         }
     );
 }

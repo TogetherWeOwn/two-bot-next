@@ -911,10 +911,11 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                     voice.disconnect();
                                 }
                             }
-                            let trigger = disposition.and_then(|verdict| verdict.trigger);
+                            let funnel = disposition.map(|verdict| verdict.funnel);
+                            let trigger = disposition.map(|verdict| verdict.trigger);
                             if automod_enabled
                                 && matches!(dispatch.event, Event::MessageCreate(_))
-                                && crate::automod_gateway::runs_text_automations(trigger)
+                                && crate::automod_gateway::runs_text_automations(funnel)
                             {
                                 if let Some(runtime) = command_runtime.as_ref() {
                                     // Detached spawn from the blocking worker needs the runtime.

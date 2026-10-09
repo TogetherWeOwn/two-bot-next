@@ -131,22 +131,26 @@ pub(crate) fn partial_edit(text: &str, receipt_ms: u64) -> Option<MessageDeliver
 }
 
 /// What one delivery decided: `funnel` is its single call into the funnel and
-/// `trigger` is what prefix triggers may act on. A delivery the activation never
-/// inspected keeps its funnel accept but gives triggers no verdict.
+/// `trigger` is the verdict prefix triggers act on. An uninspected delivery keeps
+/// its funnel accept, but its trigger verdict is capture-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkerVerdict {
     pub(crate) funnel: FunnelDisposition,
-    pub(crate) trigger: Option<FunnelDisposition>,
+    pub(crate) trigger: FunnelDisposition,
 }
 
 fn verdict_of(activation: &Activation, kind: MessageDeliveryKind) -> WorkerVerdict {
     let funnel = activation.uncommitted_disposition(kind);
-    let trigger = (!matches!(activation.outcome, ActivationOutcome::Bypassed)).then_some(funnel);
+    let trigger = if matches!(activation.outcome, ActivationOutcome::Bypassed) {
+        FunnelDisposition::CaptureOnly
+    } else {
+        funnel
+    };
     WorkerVerdict { funnel, trigger }
 }
 
 /// Run one delivery through the activation. A timeout never becomes acceptance:
-/// a create keeps raw capture only and gives triggers no verdict.
+/// a create keeps raw capture only.
 pub(crate) async fn process<L: AutomodClaimLedger, F: AutomodFacts>(
     activation: &AutomodActivation<L, F>,
     delivery: MessageDelivery,
@@ -157,9 +161,10 @@ pub(crate) async fn process<L: AutomodClaimLedger, F: AutomodFacts>(
         Ok(result) => verdict_of(&result, kind),
         Err(_) => {
             warn!("automod delivery timed out; claim left for reconciliation");
+            let capture = kind.funnel(true);
             WorkerVerdict {
-                funnel: kind.funnel(true),
-                trigger: None,
+                funnel: capture,
+                trigger: capture,
             }
         }
     }

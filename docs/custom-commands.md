@@ -59,9 +59,9 @@ Prefix execution also needs the automod verdict that the serial dispatch worker
 decides for each create, in addition to both custom-command gates. An explicit
 `TWO_AUTOMOD=0` keeps the disabled fast path and needs no verdict. With
 `TWO_AUTOMOD=1`, only an `Accept` verdict (`Unmatched`) permits prefix lookup and
-send; a matched create (`CaptureOnly`) or a create automod did not inspect (no
-verdict) yields a refusal with no prefix lookup/send. Missing or malformed
-`TWO_AUTOMOD` values yield `Unavailable`.
+send. A matched create, a timed-out create and a create outside automod's scope
+yield `CaptureOnly`; a missing verdict yields `Unavailable`. Each refuses with no
+prefix lookup/send. Missing or malformed `TWO_AUTOMOD` values yield `Unavailable`.
 Neither `MessageCreate` nor `capture_only: false` proves acceptance; only the
 worker's verdict does. This adapter runs no second matcher.
 
@@ -115,7 +115,7 @@ inspection, and capture-only operation. Only the first three permit automations.
 A match rejects prefix execution even in dry-run mode or when sanctions/deletion
 were refused. Missing services and unknown errors fail closed. The caller must
 reuse the existing inspection result; this slice does not run a second matcher or
-implement automod itself. The ordinary message path must
+implement automod itself. The automod inspection must
 complete before invoking the callback.
 
 This is based on legacy `two-bot` revision
