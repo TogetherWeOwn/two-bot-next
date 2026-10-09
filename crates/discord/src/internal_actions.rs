@@ -2,9 +2,10 @@
 //!
 //! The caller must authorize and commit its durable execution claim first.
 //! `announcement.post` is implemented here; `event.upsert` and `event.cancel`
-//! run through [`ActionExecutor::execute_event`] (see [`crate::internal_events`])
-//! with the receiver-owned claim and key mapping. Core feature flags are not
-//! executor capabilities. No runtime flags, stores or listeners are installed.
+//! run through [`ActionExecutor::execute_event`](crate::ActionExecutor::execute_event)
+//! (see [`crate::internal_events`]) with the receiver-owned claim and key
+//! mapping. Core feature flags are not executor capabilities. No runtime flags,
+//! stores or listeners are installed.
 //! Every 429 feeds the caller-supplied per-token [`CooldownGovernor`].
 
 use bytes::Bytes;
@@ -31,12 +32,12 @@ pub use governor::{Clock, CooldownGovernor, MAX_CHANNEL_HOLDS};
 
 /// Every verb with a wired effect adapter. The announcement adapter below owns
 /// only `announcement.post`; the two event verbs run through
-/// [`ActionExecutor::execute_event`](crate::internal_events) behind the
+/// [`ActionExecutor::execute_event`](crate::ActionExecutor::execute_event) behind the
 /// receiver's claim and key mapping. All other implemented verbs stay refused.
 pub const SUPPORTED_ACTIONS: &[&str] = &["announcement.post", "event.upsert", "event.cancel"];
 
 /// True for the two event verbs the receiver executes through
-/// [`ActionExecutor::execute_event`](crate::internal_events). The env-only
+/// [`ActionExecutor::execute_event`](crate::ActionExecutor::execute_event). The env-only
 /// flag gate itself stays with the receiver's `authorize` check: this only
 /// names which verbs have a wired mutation path.
 #[must_use]
@@ -202,7 +203,7 @@ impl AnnouncementExecutor {
 
     /// This adapter owns only the announcement verb. Event verbs are listed in
     /// [`SUPPORTED_ACTIONS`] but execute through
-    /// [`ActionExecutor::execute_event`](crate::internal_events); routing them
+    /// [`ActionExecutor::execute_event`](crate::ActionExecutor::execute_event); routing them
     /// here would validate an event body as an announcement.
     #[must_use]
     pub fn supports(action: &str) -> bool {
