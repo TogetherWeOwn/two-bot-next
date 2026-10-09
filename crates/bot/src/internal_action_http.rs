@@ -646,14 +646,14 @@ async fn mutate_event(
             Err(_) => return reject(Failure::code(ErrorCode::Internal)),
         },
     };
+    let creating = upsert && event_id.is_none();
     let (call, outcome) = if upsert {
-        let created = event_id.is_none();
         (
             EventCall::Upsert {
                 event_id,
                 input: input.expect("upsert validated its event input"),
             },
-            if created {
+            if creating {
                 EventOutcome::Created
             } else {
                 EventOutcome::Updated
@@ -689,6 +689,21 @@ async fn mutate_event(
         Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation()),
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
+    if creating {
+        let refusal = match state.store.unresolved_event_create(guild_id, &claim).await {
+            Ok(None) => None,
+            Ok(Some(blocker)) if blocker == "unknown" => Some(Failure::reconciliation()),
+            Ok(Some(_)) => Some(Failure::code(ErrorCode::InProgress)),
+            Err(_) => Some(Failure::code(ErrorCode::Internal)),
+        };
+        if let Some(failure) = refusal {
+            // No Discord call was made, so the refused create is released for a later retry.
+            if state.store.release_proven_not_sent(claim).await.is_err() {
+                return reject(Failure::code(ErrorCode::Internal));
+            }
+            return reject(failure);
+        }
+    }
     let observed_at = format_iso_millis(now_ms() as i64);
     match state
         .event_mutate
@@ -740,14 +755,16 @@ async fn mutate_event(
             // is released and the same key may retry. A 429 proves no effect
             // and, like announcements, is recorded as a refusal, never resent.
             // Anything uncertain retains the fence for reconciliation.
-            match error {
-                EventActionError::Discord(DiscordError::Guard(_)) => {
-                    let wire = error.action_error();
-                    if state.store.release_proven_not_sent(claim).await.is_err() {
-                        return reject(Failure::code(ErrorCode::Internal));
-                    }
-                    reject(Failure::from_action(wire))
+            if matches!(error, EventActionError::Discord(DiscordError::Guard(_)))
+                || error.is_admission_blocked()
+            {
+                let wire = error.action_error();
+                if state.store.release_proven_not_sent(claim).await.is_err() {
+                    return reject(Failure::code(ErrorCode::Internal));
                 }
+                return reject(Failure::from_action(wire));
+            }
+            match error {
                 EventActionError::Discord(
                     DiscordError::RateLimited | DiscordError::Rejected(_),
                 ) => {

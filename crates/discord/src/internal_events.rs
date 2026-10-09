@@ -50,6 +50,12 @@ impl EventActionError {
         matches!(self, Self::Discord(error) if error.is_safe_pre_mutation())
     }
 
+    /// The send-admission lane refused before any request reached the wire.
+    #[must_use]
+    pub fn is_admission_blocked(&self) -> bool {
+        matches!(self, Self::Discord(error) if error.is_admission_blocked())
+    }
+
     /// Wire error for the receiver. Details never include upstream event text
     /// or database errors; those are not safe response payloads.
     #[must_use]

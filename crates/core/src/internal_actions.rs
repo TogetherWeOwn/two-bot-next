@@ -82,6 +82,7 @@ pub const MAX_MESSAGE_CHARS: usize = 2000;
 pub const MAX_EVENT_NAME_CHARS: usize = 100;
 /// Discord's own event-description ceiling.
 pub const MAX_EVENT_DESCRIPTION_CHARS: usize = 1000;
+pub const MAX_EVENT_LOCATION_CHARS: usize = 100;
 /// Ceiling on one stored setting: a dashboard field needing more is not a
 /// setting, and the cap keeps one signed request from filling the table.
 pub const MAX_SETTING_VALUE_BYTES: usize = 8192;
@@ -1233,7 +1234,15 @@ pub fn validate_event_input(
             }
         }
     } else {
-        EventPlace::Location(require_field_str(body, "location")?.to_owned())
+        let location = require_field_str(body, "location")?;
+        if utf16_len(location) > MAX_EVENT_LOCATION_CHARS {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                format!(r#""location" is longer than {MAX_EVENT_LOCATION_CHARS} characters"#),
+                "location_too_long",
+            ));
+        }
+        EventPlace::Location(location.to_owned())
     };
     Ok(EventInput {
         name: name.to_owned(),

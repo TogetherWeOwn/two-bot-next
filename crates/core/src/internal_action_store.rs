@@ -782,6 +782,26 @@ impl InternalActionStore {
         .fetch_optional(&self.pool)
         .await?)
     }
+
+    /// State of another in-flight or unknown create in this guild. Such a create
+    /// may already exist in Discord with no key mapping yet, so no second create
+    /// runs until it is reconciled or released.
+    pub async fn unresolved_event_create(
+        &self,
+        guild_id: &str,
+        claim: &ExecutionClaim,
+    ) -> Result<Option<String>, InternalStoreError> {
+        Ok(sqlx::query_scalar(
+            "SELECT state FROM internal_idempotency \
+             WHERE action = 'event.upsert' AND guild_id = $1 AND target_id IS NULL \
+               AND state IN ('in_flight', 'unknown') AND intent_id <> $2 \
+             ORDER BY (state = 'unknown') DESC, intent_id LIMIT 1",
+        )
+        .bind(guild_id)
+        .bind(claim.intent_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
 }
 
 #[cfg(test)]

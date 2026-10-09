@@ -51,6 +51,11 @@ rejection (typically 400). A 404 is also `discord_rejected`, not a fabricated
 successful cancellation. Same-key idempotency is durable replay of the first
 result. No 429, 5xx or uncertain mutation is automatically retried here.
 
+An upsert whose mapped event was deleted in Discord fails the same way: its PATCH
+404 is `discord_rejected`, and the mapping is kept. That key needs an operator to
+clear the mapping before a new create. Classifying that 404 as absence is a
+follow-up.
+
 Synchronous persistence adds stricter response checks than legacy mutations,
 which ignored PATCH bodies: require a complete normalizable row, known status,
 parseable start time, valid event ID, matching requested ID and matching guild

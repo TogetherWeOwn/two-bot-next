@@ -5,7 +5,8 @@
 The container source integrates an opt-in private `POST /internal/actions`
 listener with the durable store, announcement executor, nonce-commit
 authentication capability and strict receiver configuration. It supports only
-`announcement.post`, regardless of the core action catalogue's broader defaults.
+`announcement.post`, `event.upsert` and `event.cancel`, regardless of the core
+action catalogue's broader defaults; every other verb is refused.
 The public health/readiness/metrics router has no action route. A merged,
 deployed receiver is dark until the Operator enables it, and it is reachable
 only through the staging-only Worker ingress described in
@@ -73,6 +74,11 @@ that is not yet deployed), deploy that one version, then run the takeover once.
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
 4. Operator stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
 5. Rollback: stage deletion of `TWO_INTERNAL_ACTIONS` (`wrangler versions secret delete`), deploy and transfer ownership; or use the existing Worker-version rollback. The route is absent again and the next container start carries no receiver setting.
+
+Migration `0423` adds the nullable `internal_idempotency.outcome` column that
+event receipts read back. Roll back in this order: disable the receiver (step 5)
+and deploy the previous binary, then drop the column. Dropping it while this
+binary runs fails every success finish and replay, not only event receipts.
 
 TOG-16851 proved a loopback-only receiver never becomes healthy: the Containers
 port check and `containerFetch` cannot reach it, so the container waited on 8091
@@ -184,6 +190,15 @@ finalization retain durable ownership and require reconciliation. Success is
 returned only after the receipt/audit transaction commits. See
 [the executor contract](internal-action-executor.md#single-attempt-and-safe-results).
 
+A local admission refusal (the guard, or a token lane held by another send)
+proves nothing was sent, so the event claim is released and the same key may
+retry. Event creates add a guild-wide fence: a create runs only when no other
+create in its guild is in flight or unknown, because an unknown create may
+already exist in Discord before its key mapping is written. A fenced create is
+refused and released before any Discord call: `needs_reconciliation` when the
+blocking create is unknown, `in_progress` when it is in flight. Clearing an
+unknown create is an operator reconciliation; no production tool does that yet.
+
 The website-compatible envelopes contain `ok`, `request_id`, and either
 `result.message_id` (announcements), `result.{outcome,event_id}` (event
 upsert/cancel, with `outcome` replayed from the stored receipt, never
@@ -207,7 +222,9 @@ Receiver tests use a module-private injected effect and guarded, migrated
 capacity, redacted authentication failures, nonce-before-parse ordering,
 concurrent/restarted/key-rotated replay, byte mismatch, unsupported actions,
 cancellation/stale ownership, unknown/no-effect outcomes, unavailable stores,
-failed receipt finalization and listener supervision. Nonces are generated
+failed receipt finalization, event verb flags, malformed event bodies (including a
+101-character location), the create fence, admission-refusal release and listener
+supervision. Nonces are generated
 fresh for each attempt; the nonce-replay test intentionally reuses one generated
 value. They do not send live Discord actions.
 

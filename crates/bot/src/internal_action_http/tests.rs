@@ -1233,6 +1233,13 @@ async fn event_mutation_malformed_bodies_refused_before_any_discord_call() {
     ] {
         cases.push(serde_json::from_str(&raw).unwrap());
     }
+    // Location is 1-100 characters on Discord; one more is refused locally.
+    cases.push(
+        serde_json::from_str(
+            &upsert_payload("launch").replace("\"The Hall\"", &format!("\"{}\"", "x".repeat(101))),
+        )
+        .unwrap(),
+    );
     // Empty description is a missing field, not an omitted one.
     base_value["description"] = json!("");
     cases.push(base_value);
@@ -1325,6 +1332,107 @@ async fn event_upsert_discord_500_needs_reconciliation_without_receipt() {
     let (_, _, second) = answer(app, signed(&raw, "old", "intent-upsert")).await;
     assert_eq!(second["error"]["code"], "needs_reconciliation");
     assert_eq!(api.count(), 1, "uncertainty never resends the intent");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_create_fenced_while_another_create_is_unresolved() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_cancel_flag(false);
+    let api = MockEventApi::start_scripted(vec![ScriptedEvent {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        body: Value::Null,
+    }])
+    .await;
+    let app = mutate_app(db.pool().clone(), &api);
+    let (status, _, first) = answer(
+        app.clone(),
+        signed(&upsert_payload("first"), "old", "intent-first"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(first["error"]["code"], "needs_reconciliation");
+    // A new key would be a second live event in the guild: the unresolved
+    // create fences every create until it is reconciled.
+    let (status, _, second) = answer(
+        app,
+        signed(&upsert_payload("second"), "old", "intent-second"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(second["error"]["code"], "needs_reconciliation");
+    assert_eq!(api.count(), 1, "the fenced create never reaches Discord");
+    let store = InternalActionStore::new(db.pool().clone());
+    assert_eq!(
+        store
+            .event_id_for_key(staging_guild(), "second")
+            .await
+            .unwrap(),
+        None
+    );
+    db.close().await.unwrap();
+}
+
+struct ScriptedEventMutate {
+    replies: Mutex<Vec<Result<Value, EventActionError>>>,
+}
+
+impl EventMutateEffect for ScriptedEventMutate {
+    fn execute_mutation<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a EventCall,
+        _: &'a str,
+    ) -> BoxFuture<'a, Result<Value, EventActionError>> {
+        Box::pin(async move { self.replies.lock().unwrap().remove(0) })
+    }
+}
+
+#[tokio::test]
+async fn event_create_admission_refusal_releases_claim_for_same_key_retry() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_cancel_flag(false);
+    let blocked = two_bot_core::send_admission::AdmissionError::Blocked.to_string();
+    let mutates: Arc<dyn EventMutateEffect> = Arc::new(ScriptedEventMutate {
+        replies: Mutex::new(vec![
+            Err(EventActionError::Discord(DiscordError::Unavailable(
+                blocked,
+            ))),
+            Ok(json!({"event_id": CREATE_EVENT_ID})),
+        ]),
+    });
+    let reads: Arc<dyn EventReadEffect> = Arc::new(MockEventRead::default());
+    let effect: Arc<dyn ActionEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    let app = router(Arc::new(ReceiverState::new(
+        config(),
+        db.pool().clone(),
+        effect,
+        reads,
+        mutates,
+    )));
+    let raw = upsert_payload("lane");
+    let (status, _, refused) = answer(app.clone(), signed(&raw, "old", "intent-lane")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(refused["error"]["code"], "discord_unavailable");
+    // The lane refusal proved nothing was sent, so the same key may retry.
+    let (status, headers, created) = answer(app, signed(&raw, "old", "intent-lane")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("idempotent-replay"));
+    assert_eq!(
+        created["result"],
+        json!({"outcome": "created", "event_id": CREATE_EVENT_ID})
+    );
+    let store = InternalActionStore::new(db.pool().clone());
+    assert_eq!(
+        store
+            .event_id_for_key(staging_guild(), "lane")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(CREATE_EVENT_ID)
+    );
     db.close().await.unwrap();
 }
 
