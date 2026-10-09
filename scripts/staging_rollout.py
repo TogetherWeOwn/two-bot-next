@@ -49,8 +49,10 @@ IMAGE_DRIFT_DIAGNOSTIC_SECONDS = 15
 # Fence and unavailability reasons /readyz can actually return
 # (wrangler/src/ownership.ts OwnershipRefused reasons surfaced as the 503
 # `reason`, plus the container probe's 500 `error_class`). `epoch_conflict`
-# is kept: the fence endpoint answers it with 409 and the gate records any
-# /readyz status, so the classifier must recognise it wherever it appears.
+# is defensive only: the fence answers it with 409 on the control path, and
+# Client.request keeps JSON bodies for 500/503 alone, so a live 409 arrives
+# bodyless and records status plus identity with no token. The parser still
+# recognises it wherever a report reaches it, per this slice's fixed set.
 READINESS_TOKENS = frozenset({
     "ownership_fenced", "not_owner", "container_unavailable", "epoch_conflict",
     "shutdown_unconfirmed", "storage_unavailable", "storage_invalid",

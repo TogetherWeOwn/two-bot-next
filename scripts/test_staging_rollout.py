@@ -798,7 +798,8 @@ class ClientSanitizationTests(OfflineTestCase):
                 self.assertEqual(client.request(URL + "/readyz"), (503, headers, body))
         for code, headers in [(503, {"content-type": "text/plain"}), (503, {}),
                               (500, {"content-type": "text/plain"}),
-                              (429, {"content-type": "application/json"})]:
+                              (429, {"content-type": "application/json"}),
+                              (409, {"content-type": "application/json"})]:
             with self.subTest(code=code, headers=headers):
                 client = rollout.Client(ACCOUNT, SENTINEL)
                 client.opener.open.side_effect = HTTPError(
@@ -1403,9 +1404,6 @@ class OrchestrationTests(OfflineTestCase):
             ((500, {"content-type": "application/json"},
               b'{"ready":false,"error_class":"container_unavailable"}'),
              "readyz=500 identity=absent token=container_unavailable"),
-            ((409, {"content-type": "application/json"},
-              b'{"error":"ownership_fenced","reason":"epoch_conflict"}'),
-             "readyz=409 identity=absent token=epoch_conflict"),
             ((503, {"content-type": "application/json"},
               b'{"error":"ownership_fenced","reason":"shutdown_unconfirmed"}'),
              "readyz=503 identity=absent token=shutdown_unconfirmed"),
@@ -1429,6 +1427,16 @@ class OrchestrationTests(OfflineTestCase):
                 self.assertNotIn("gateway_failure=", client.observation)
                 self.assertNotIn(SENTINEL, client.observation)
                 self.assert_no_evidence()
+
+    def test_readiness_token_still_recognises_defensive_epoch_conflict(self):
+        # Parser-level only: the live client drops 409 bodies (pinned above),
+        # so this token never prints end to end; it stays recognised here.
+        self.assertEqual(
+            rollout.readiness_token(
+                {"error": "ownership_fenced", "reason": "epoch_conflict"}),
+            "epoch_conflict")
+        self.assertIsNone(rollout.readiness_token(
+            {"error": SENTINEL, "reason": SENTINEL}))
 
     def test_diagnostic_only_change_preserves_the_three_recorded_run_verdict_shapes(self):
         self.prepare_baseline()
