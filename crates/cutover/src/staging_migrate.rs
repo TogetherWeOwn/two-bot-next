@@ -89,6 +89,12 @@ pub struct Request {
     pub source_sha: String,
     pub expected_host: String,
     pub expected_database: String,
+    /// Pinned PlanetScale branch id (non-secret workflow input). Empty means
+    /// no pin (Neon and test hosts). Required when the pinned host is a
+    /// `*.psdb.cloud` endpoint: PlanetScale routes by the username's
+    /// `{role}.{branch_id}` suffix while every branch shares `postgres` as
+    /// the database name, so host+database alone cannot fix the branch.
+    pub expected_branch_id: String,
     pub recovery_evidence_ref: String,
     pub acl_plan_ref: String,
     pub apply: bool,
@@ -124,6 +130,57 @@ fn is_ref(value: &str) -> bool {
         && !value.contains("://")
         && !value.contains('@')
         && !value.chars().any(char::is_whitespace)
+}
+
+/// True for PlanetScale Postgres endpoints (`*.pg.psdb.cloud`,
+/// `*.horizon.psdb.cloud`). Both serve direct Postgres on 5432 and
+/// transaction-mode PgBouncer on 6432 of the same host.
+fn is_planetscale_host(host: &str) -> bool {
+    host.to_ascii_lowercase().ends_with(".psdb.cloud")
+}
+
+/// Bare branch-id shape: PlanetScale branch ids are short alphanumeric
+/// strings (e.g. `cnlmx96ec5kw`). Allow alphanumerics, dash and underscore
+/// up to 63 chars; anything else is not a bare pin.
+fn branch_id_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 63
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Binding-shape refusal shared by `validate_request` (pre-connect) and
+/// `verify_target` (binding match): pooled ports, pooler-style usernames and
+/// branch mismatches all refuse before any DDL.
+fn check_binding_shape(
+    req: &Request,
+    options: &sqlx::postgres::PgConnectOptions,
+) -> Result<(), RunError> {
+    // Transaction pooling (PgBouncer, transaction mode) is unsound for the
+    // per-connection SET ROLE and the SQLx advisory lock: only direct 5432.
+    if options.get_port() != 5432 {
+        return refuse("pooled ports are refused; use the direct 5432 endpoint");
+    }
+    let username = options.get_username();
+    // Dedicated and replica bouncers append `|name` to the username and
+    // share the pinned host: the host pin alone cannot exclude them.
+    if username.contains('|') {
+        return refuse("pooler-style usernames are refused; use the direct role login");
+    }
+    let want = req.expected_branch_id.trim();
+    if !want.is_empty() {
+        // PlanetScale routes by `{role}.{branch_id}`: the username's final
+        // dot-suffix must equal the pinned branch id.
+        let matches = username
+            .rsplit('.')
+            .next()
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(want));
+        if !matches {
+            return refuse("binding branch does not match the pinned staging branch");
+        }
+    }
+    Ok(())
 }
 
 /// Parse the `expected_pending` workflow input: ascending, comma-separated
@@ -293,8 +350,22 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
     }
     // Session SET ROLE and the SQLx advisory lock are unsound behind
     // transaction pooling: only the direct endpoint may be targeted.
+    // PlanetScale serves PgBouncer on port 6432 of the same host (never a
+    // `-pooler` hostname), so the hostname check alone cannot exclude it:
+    // the port and username checks in `check_binding_shape` own the rest.
     if req.expected_host.to_ascii_lowercase().contains("-pooler") {
         return refuse("pooler endpoints are refused; use the direct endpoint");
+    }
+    // PlanetScale branch pin: every branch shares `postgres` as the database
+    // name and routes by the username's `{role}.{branch_id}` suffix, so the
+    // host+database pin alone cannot fix the branch. A `*.psdb.cloud` pin
+    // requires the non-secret branch id; other hosts accept an empty pin.
+    let branch = req.expected_branch_id.trim();
+    if !branch.is_empty() && !branch_id_valid(branch) {
+        return refuse("staging branch id is not a bare branch pin");
+    }
+    if branch.is_empty() && is_planetscale_host(&req.expected_host) {
+        return refuse("PlanetScale hosts require --staging-branch-id");
     }
     match &req.expected_pending {
         Some(raw) => {
@@ -359,6 +430,15 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
             binding_env(req),
         ));
     }
+    // Pre-connect pooled/branch refusal: the same shape check `verify_target`
+    // runs is parsed here so a pooled `:6432`, `|bouncer` or wrong-branch
+    // binding refuses in `validate_request` too. An unparseable URL is left
+    // for `verify_target`, which owns the invalid-URL refusal.
+    if let Some(url) = req.url.as_deref().filter(|u| !u.is_empty()) {
+        if let Ok(options) = two_bot_core::database_url::connect_options(url) {
+            check_binding_shape(req, &options)?;
+        }
+    }
     Ok(())
 }
 
@@ -404,6 +484,13 @@ fn verify_target(req: &Request) -> Result<sqlx::postgres::PgConnectOptions, RunE
             "{binding} target does not match the verified staging identity"
         ));
     }
+    // Fail-closed PlanetScale pin: a `*.psdb.cloud` binding without a pinned
+    // branch id refuses even when host+database match, so a dispatch that
+    // forgets `--staging-branch-id` cannot reach an unpinned branch.
+    if req.expected_branch_id.trim().is_empty() && is_planetscale_host(&host) {
+        return refuse("PlanetScale hosts require --staging-branch-id");
+    }
+    check_binding_shape(req, &options)?;
     Ok(options)
 }
 
@@ -743,7 +830,8 @@ async fn run_on_pool(
                  "sqlx": SQLX_VERSION, "invocation": "staging-migrate --plan|--apply"},
         "mode": if req.apply { "apply" } else { "plan" },
         "source_sha": req.source_sha,
-        "target": {"host": req.expected_host, "database": req.expected_database},
+        "target": {"host": req.expected_host, "database": req.expected_database,
+                   "branch_id": req.expected_branch_id.trim()},
         "recovery_evidence_ref": req.recovery_evidence_ref,
         "acl_plan_ref": req.acl_plan_ref,
         "role": expected_role(req),
@@ -977,6 +1065,7 @@ mod tests {
             source_sha: source_sha.to_owned(),
             expected_host: "agent-testdb".to_owned(),
             expected_database: "two_staging".to_owned(),
+            expected_branch_id: String::new(),
             recovery_evidence_ref: "TOG-1#doc".to_owned(),
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: true,
@@ -1204,6 +1293,7 @@ mod tests {
             source_sha: "a".repeat(40),
             expected_host: "agent-testdb".to_owned(),
             expected_database: "two_staging".to_owned(),
+            expected_branch_id: String::new(),
             recovery_evidence_ref: "TOG-1#doc".to_owned(),
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
@@ -1226,6 +1316,79 @@ mod tests {
             ..ok.clone()
         };
         assert!(validate_request(&neon_pin).is_ok());
+        // PlanetScale staging uses the same pinned-host model plus a branch
+        // pin: a direct `*.pg.psdb.cloud:5432` host with the matching
+        // `{role}.{branch_id}` username validates, while a `-pooler` host,
+        // a pooled `:6432` port, a `|bouncer` username, a wrong branch or a
+        // missing branch pin refuses. PgBouncer serves pooling on 6432 of
+        // the same host in transaction mode, never a `-pooler` hostname.
+        let planetscale_pin = Request {
+            url: Some(
+                "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres?sslmode=require"
+                    .to_owned(),
+            ),
+            expected_host: "psdb-fixture-1.pg.psdb.cloud".to_owned(),
+            expected_database: "postgres".to_owned(),
+            expected_branch_id: "cnfixture01".to_owned(),
+            ..ok.clone()
+        };
+        assert!(validate_request(&planetscale_pin).is_ok());
+        assert!(verify_target(&planetscale_pin).is_ok());
+        // A PlanetScale pin without the branch id refuses: every branch
+        // shares `postgres` as the database name, so host+database alone
+        // cannot fix the branch.
+        let ps_missing_branch = Request {
+            url: Some(
+                "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres?sslmode=require"
+                    .to_owned(),
+            ),
+            expected_host: "psdb-fixture-1.pg.psdb.cloud".to_owned(),
+            expected_database: "postgres".to_owned(),
+            expected_branch_id: String::new(),
+            ..ok.clone()
+        };
+        assert!(matches!(
+            validate_request(&ps_missing_branch),
+            Err(RunError::Refused(_))
+        ));
+        assert!(matches!(
+            verify_target(&ps_missing_branch),
+            Err(RunError::Refused(_))
+        ));
+        // Pooled shapes refuse in both gates even when the pins match them.
+        for pooled in [
+            // Default PgBouncer on the same host.
+            "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:6432/postgres?sslmode=require",
+            // Dedicated/replica bouncer usernames share the pinned host.
+            "postgresql://migrator.cnfixture01%7Cread-bouncer@psdb-fixture-1.pg.psdb.cloud:6432/postgres?sslmode=require",
+            // Wrong branch credential on the pinned host.
+            "postgresql://migrator.otherbranch@psdb-fixture-1.pg.psdb.cloud:5432/postgres?sslmode=require",
+        ] {
+            let req = Request {
+                url: Some(pooled.to_owned()),
+                expected_host: "psdb-fixture-1.pg.psdb.cloud".to_owned(),
+                expected_database: "postgres".to_owned(),
+                expected_branch_id: "cnfixture01".to_owned(),
+                ..ok.clone()
+            };
+            assert!(
+                matches!(validate_request(&req), Err(RunError::Refused(_))),
+                "validate must refuse pooled/branch-mismatched binding {pooled}"
+            );
+            assert!(
+                matches!(verify_target(&req), Err(RunError::Refused(_))),
+                "verify must refuse pooled/branch-mismatched binding {pooled}"
+            );
+        }
+        // A malformed branch pin refuses before any DDL.
+        let bad_branch = Request {
+            expected_branch_id: "not a branch!".to_owned(),
+            ..planetscale_pin.clone()
+        };
+        assert!(matches!(
+            validate_request(&bad_branch),
+            Err(RunError::Refused(_))
+        ));
         let bad = [
             Request {
                 url: None,
@@ -1261,6 +1424,10 @@ mod tests {
             },
             Request {
                 expected_host: "ep-test-pooler.us-east-2.aws.neon.tech".to_owned(),
+                ..ok.clone()
+            },
+            Request {
+                expected_host: "psdb-fixture-1-pooler.pg.psdb.cloud".to_owned(),
                 ..ok.clone()
             },
             Request {
@@ -1324,6 +1491,7 @@ mod tests {
             source_sha: sha.clone(),
             expected_host: "agent-testdb".to_owned(),
             expected_database: "two_staging".to_owned(),
+            expected_branch_id: String::new(),
             recovery_evidence_ref: "TOG-1#doc".to_owned(),
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
@@ -1349,6 +1517,7 @@ mod tests {
             source_sha: "a".repeat(40),
             expected_host: "agent-testdb".to_owned(),
             expected_database: "two_staging".to_owned(),
+            expected_branch_id: String::new(),
             recovery_evidence_ref: "TOG-1#doc".to_owned(),
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
@@ -1395,6 +1564,7 @@ mod tests {
             source_sha: "a".repeat(40),
             expected_host: "agent-testdb".to_owned(),
             expected_database: "two_bot".to_owned(),
+            expected_branch_id: String::new(),
             recovery_evidence_ref: "TOG-1#doc".to_owned(),
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
@@ -1431,6 +1601,70 @@ mod tests {
             Err(RunError::Refused(_))
         ));
         assert!(matches!(verify_target(&pooler), Err(RunError::Refused(_))));
+        // A PlanetScale pooler binding is refused even when the pins match it.
+        let ps_pooler = Request {
+            url: Some(
+                "postgresql://migrator.cnfixture01@psdb-fixture-1-pooler.pg.psdb.cloud:5432/postgres?sslmode=require"
+                    .to_owned(),
+            ),
+            expected_host: "psdb-fixture-1-pooler.pg.psdb.cloud".to_owned(),
+            expected_database: "postgres".to_owned(),
+            expected_branch_id: "cnfixture01".to_owned(),
+            ..base.clone()
+        };
+        assert!(matches!(
+            validate_request(&ps_pooler),
+            Err(RunError::Refused(_))
+        ));
+        assert!(matches!(
+            verify_target(&ps_pooler),
+            Err(RunError::Refused(_))
+        ));
+        // A direct PlanetScale binding with the matching branch pin passes
+        // both gates.
+        let ps_direct = Request {
+            url: Some(
+                "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres?sslmode=require"
+                    .to_owned(),
+            ),
+            expected_host: "psdb-fixture-1.pg.psdb.cloud".to_owned(),
+            expected_database: "postgres".to_owned(),
+            expected_branch_id: "cnfixture01".to_owned(),
+            ..base.clone()
+        };
+        assert!(validate_request(&ps_direct).is_ok());
+        assert!(verify_target(&ps_direct).is_ok());
+        // Pooled and wrong-branch shapes refuse in both gates.
+        for (url, branch) in [
+            (
+                "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:6432/postgres?sslmode=require",
+                "cnfixture01",
+            ),
+            (
+                "postgresql://migrator.cnfixture01%7Cread-bouncer@psdb-fixture-1.pg.psdb.cloud:6432/postgres?sslmode=require",
+                "cnfixture01",
+            ),
+            (
+                "postgresql://migrator.otherbranch@psdb-fixture-1.pg.psdb.cloud:5432/postgres?sslmode=require",
+                "cnfixture01",
+            ),
+        ] {
+            let req = Request {
+                url: Some(url.to_owned()),
+                expected_host: "psdb-fixture-1.pg.psdb.cloud".to_owned(),
+                expected_database: "postgres".to_owned(),
+                expected_branch_id: branch.to_owned(),
+                ..base.clone()
+            };
+            assert!(
+                matches!(validate_request(&req), Err(RunError::Refused(_))),
+                "validate must refuse {url}"
+            );
+            assert!(
+                matches!(verify_target(&req), Err(RunError::Refused(_))),
+                "verify must refuse {url}"
+            );
+        }
     }
 
     #[test]
