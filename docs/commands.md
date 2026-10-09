@@ -88,10 +88,10 @@ Define or replace a custom command
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `name` | string | true | — | — | — | — | Command name, a-z 0-9 _ - |
-| `template` | string | true | — | — | — | — | What the bot replies; {user} {username} {server} {channel} |
-| `description` | string | false | — | — | — | — | Shown in the command picker |
-| `text-trigger` | string | false | — | — | — | — | Optional !trigger form, e.g. !faq |
+| `name` | string | true | — | — | 32 | — | Command name, a-z 0-9 _ - |
+| `template` | string | true | — | — | 2000 | — | What the bot replies; {user} {username} {server} {channel} |
+| `description` | string | false | — | — | 100 | — | Shown in the command picker |
+| `text-trigger` | string | false | — | — | 33 | — | Optional !trigger form, e.g. !faq |
 
 ## `/command-list`
 
@@ -111,7 +111,7 @@ Delete a custom command
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `name` | string | true | — | — | — | — | Command to delete |
+| `name` | string | true | — | — | 32 | — | Command to delete |
 
 ## `/create`
 

@@ -638,7 +638,6 @@ async fn audit_failure_after_kick_stops_before_next_member_read() {
 #[cfg(unix)]
 #[test]
 fn special_audit_files_refuse_before_token_access_and_relative_regular_files_work() {
-    use std::os::unix::ffi::OsStrExt;
     let root = std::env::var_os("PAPERCLIP_RUN_SCRATCH_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
@@ -653,9 +652,13 @@ fn special_audit_files_refuse_before_token_access_and_relative_regular_files_wor
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("ids"), A).unwrap();
     let fifo = root.join("fifo");
-    let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-    // SAFETY: c_path is NUL-terminated and lives through this local fixture call.
-    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    // FIFO fixture without unsafe: the `mkfifo` utility creates the same named
+    // pipe the audit guard must refuse as a non-regular file.
+    let mkfifo = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo fixture");
+    assert!(mkfifo.success());
     for path in [fifo.as_path(), std::path::Path::new("/dev/null")] {
         assert!(FileAudit::open(path, G)
             .err()

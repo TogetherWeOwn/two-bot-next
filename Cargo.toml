@@ -23,6 +23,9 @@ workspace = true
 print_stdout = "deny"
 dbg_macro = "deny"
 
+[workspace.lints.rust]
+unsafe_code = "deny"
+
 [workspace.package]
 edition = "2021"
 rust-version = "1.94"
