@@ -3,21 +3,51 @@
 // Production handoff remains B4's separately authorized execution sheet.
 class ControlError extends Error {}
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// A takeover POST fired within a second of `wrangler deploy` can land on a
-// still-propagating older Worker version, whose deployment id no longer
-// matches the stamped header; the singleton answers 503 (deployment_mismatch
-// and friends all map to 503 server-side). Retry only that transient 5xx for
-// the push-path deployment-takeover. Never retry the deliberate fence refusal,
-// auth/validation failures, or explicit operator actions; the verify gate
-// still adjudicates exactness of whatever owner wins.
-function retryableTakeoverFailure(error) {
-  return error instanceof ControlError &&
-    /^Ownership control failed \(HTTP 5\d\d\)/.test(error.message);
+class HttpFailure extends ControlError {
+  constructor(message, status) {
+    super(message);
+    this.status = status;
+  }
 }
 
-export async function control({ action, url, token, actor, expectedEpoch, releaseFence = false, takeoverAttempts = 5, takeoverRetryDelayMs = 10000 }, send = fetch, wait = sleep) {
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Closed vocabulary of Worker refusal codes (wrangler/src); anything else prints as unrecognized.
+export const REFUSAL_REASONS = new Set([
+  "deployment_id_missing", "storage_unavailable", "storage_invalid", "not_owner", "epoch_conflict",
+  "epoch_exhausted", "shutdown_unconfirmed", "deployment_mismatch", "stale_keepalive", "operation_failed",
+]);
+const MAX_REFUSAL_BODY_BYTES = 1024;
+
+async function refusalReason(response) {
+  try {
+    const reader = response.body.getReader();
+    const chunks = [];
+    let size = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > MAX_REFUSAL_BODY_BYTES) return "unrecognized";
+        chunks.push(value);
+      }
+    } finally {
+      await reader.cancel();
+    }
+    const reason = JSON.parse(Buffer.concat(chunks).toString("utf8"))?.reason;
+    return REFUSAL_REASONS.has(reason) ? reason : "unrecognized";
+  } catch {
+    return "unrecognized";
+  }
+}
+
+// Right after `wrangler deploy` an older Worker version can still answer 5xx; retry 5xx only.
+function retryableTakeoverFailure(error) {
+  return error instanceof HttpFailure && error.status >= 500 && error.status <= 599;
+}
+
+export async function control({ action, url, token, actor, expectedEpoch, releaseFence = false, takeoverAttempts = 12, takeoverRetryDelayMs = 10000 }, send = fetch, wait = sleep) {
   const origin = new URL(url);
   if (origin.protocol !== "https:" || origin.port || origin.username || origin.password ||
       !/^two-bot-next-staging\.[a-z0-9-]+\.workers\.dev$/.test(origin.hostname) ||
@@ -29,10 +59,16 @@ export async function control({ action, url, token, actor, expectedEpoch, releas
   if (action === "preflight") return { configured: true };
   const endpoint = new URL("/internal/ownership", origin);
   const headers = { authorization: `Bearer ${token}` };
+  const started = Date.now();
+  let attempts = 0;
   const read = async (init) => {
     // Never follow redirects carrying the control secret to another origin.
     const response = await send(endpoint, { ...init, headers, redirect: "error", signal: AbortSignal.timeout(15000) });
-    if (!response.ok) throw new ControlError(`Ownership control failed (HTTP ${response.status}); stop, do not change credentials`);
+    if (!response.ok) {
+      const reason = await refusalReason(response);
+      const elapsed = Math.round((Date.now() - started) / 1000);
+      throw new HttpFailure(`Ownership control failed (HTTP ${response.status}) reason=${reason} attempts=${attempts} elapsed=${elapsed}s; stop, do not change credentials`, response.status);
+    }
     const state = await response.json();
     if (!state.deploymentId || !("owner" in state) || typeof state.running !== "boolean") {
       throw new ControlError("Invalid ownership control response");
@@ -40,6 +76,7 @@ export async function control({ action, url, token, actor, expectedEpoch, releas
     return state;
   };
   const once = async () => {
+    attempts += 1;
     const current = await read({ method: "GET" });
     if (action === "status") return current;
     if (!actor || !/^[a-zA-Z0-9_.:@/-]{1,128}$/.test(actor)) throw new ControlError("Explicit audit actor is required");
