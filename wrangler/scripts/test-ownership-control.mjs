@@ -111,9 +111,27 @@ test('deployment-takeover reports when only stale versions answer inside the win
   assert.deepEqual(f.waits, [10000, 10000]);
 });
 
-test('deployment-takeover retries a commit answered by a different version than the deployed one', async () => {
-  const staleCommit = { status: 200, body: { deploymentId: 'old-deployment', owner: owner(81), running: false } };
-  const f = fixture([ok(80), staleCommit, ok(80), ok(81)]);
+test('deployment-takeover re-posts a stale-version commit instead of stopping', async () => {
+  // A draining version commits for itself at the posted epoch when the owner
+  // is fenced (the same-owner no-op only applies to the active path), so its
+  // answer records its own deployment as owner. The next pinned read shows
+  // that commit and the client re-posts at the posted epoch.
+  const staleCommit = { status: 200, body: { deploymentId: 'old-deployment', owner: { deploymentId: 'old-deployment', epoch: 81, phase: 'active' }, running: false } };
+  const reread = { status: 200, body: { deploymentId: 'new-deployment', owner: { deploymentId: 'old-deployment', epoch: 81, phase: 'active' }, running: false } };
+  const f = fixture([ok(80), staleCommit, reread, ok(82)]);
+  const result = await f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED });
+  assert.equal(result.owner.epoch, 82);
+  assert.deepEqual(f.calls, ['GET', 'POST', 'GET', 'POST']);
+  assert.deepEqual(f.waits, [10000]);
+});
+
+test('deployment-takeover retries a stale-version no-op without recording a commit', async () => {
+  // On the active path the draining version no-ops, so its answer keeps the
+  // old epoch. That is propagation, not a commit: the client must not record
+  // it, and the retry posts at the unchanged epoch.
+  const staleNoop = { status: 200, body: { deploymentId: 'old-deployment', owner: { deploymentId: 'old-deployment', epoch: 80, phase: 'active' }, running: false } };
+  const reread = { status: 200, body: { deploymentId: 'new-deployment', owner: { deploymentId: 'old-deployment', epoch: 80, phase: 'active' }, running: false } };
+  const f = fixture([ok(80), staleNoop, reread, ok(81)]);
   const result = await f.invoke({ action: 'deployment-takeover', expectedDeploymentId: DEPLOYED });
   assert.equal(result.owner.epoch, 81);
   assert.deepEqual(f.calls, ['GET', 'POST', 'GET', 'POST']);

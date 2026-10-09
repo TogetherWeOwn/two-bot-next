@@ -90,6 +90,12 @@ export async function control({ action, url, token, actor, expectedEpoch, expect
     return state;
   };
   let postedEpoch;
+  // A takeover our POST committed through a draining Worker version: on a
+  // fenced owner the answering version commits for itself (the same-owner
+  // no-op only applies to the active path), so the next pinned read shows
+  // that version owning our posted epoch. Remember it to re-post there
+  // instead of stopping for "another deployment".
+  let ownStaleCommit;
   const once = async () => {
     attempts += 1;
     const current = await read({ method: "GET" });
@@ -120,9 +126,14 @@ export async function control({ action, url, token, actor, expectedEpoch, expect
       }
       // Our epoch committed but owned by another active deployment: another actor
       // committed at our epoch, so never re-post into it. Crash-recovery
-      // (fenced) still re-posts.
+      // (fenced) still re-posts. The one exception is a commit our own POST
+      // made through a draining version (see below): that owner is us, so
+      // fall through and re-post at the posted epoch instead of stopping.
+      const ownStaleOwner = ownStaleCommit !== undefined && current.owner?.phase === "active" &&
+          current.owner.epoch === postedEpoch && current.owner.deploymentId === ownStaleCommit.deploymentId &&
+          current.owner.epoch === ownStaleCommit.epoch;
       if (postedEpoch !== undefined && current.owner?.phase === "active" && current.owner.epoch === postedEpoch &&
-          current.owner.deploymentId !== expectedDeploymentId) {
+          current.owner.deploymentId !== expectedDeploymentId && !ownStaleOwner) {
         throw new ControlError("Ownership transition not confirmed; posted epoch is owned by another deployment; refusing to post, preserve maintenance");
       }
       expectedEpoch = current.owner?.epoch ?? 0;
@@ -131,11 +142,17 @@ export async function control({ action, url, token, actor, expectedEpoch, expect
     const targetAction = action === "deployment-takeover" ? "takeover" : action;
     postedEpoch = expectedEpoch + 1;
     const result = await read({ method: "POST", body: JSON.stringify({ action: targetAction, actor, expectedEpoch }) });
-    // Requests can still route to a draining version after the pre-post read:
-    // a 200 from the pinned version proves worker and singleton agree there,
-    // so an answer from any other version is propagation, not a commit.
-    // Retry it like a stale read instead of failing or misreading the epoch.
+    // Requests can still route to a draining version after the pre-post read.
+    // On the active path that answer is the same-owner no-op (propagation,
+    // not a commit), but on a fenced owner the answering version commits for
+    // itself at the posted epoch. Either way retry like a stale read instead
+    // of failing or misreading the epoch; a real stale-version commit is
+    // remembered above so the next pinned read re-posts instead of stopping.
     if (action === "deployment-takeover" && result.deploymentId !== expectedDeploymentId) {
+      if (result.owner?.phase === "active" && result.owner.epoch === postedEpoch &&
+          result.owner.deploymentId === result.deploymentId) {
+        ownStaleCommit = { deploymentId: result.deploymentId, epoch: postedEpoch };
+      }
       throw new DeploymentChanged(`Ownership transition not confirmed; takeover answered by a different version than the deployed one; refusing to confirm, preserve maintenance (attempts=${attempts} elapsed=${elapsedSeconds()}s)`);
     }
     if (result.running || result.owner?.epoch !== expectedEpoch + 1 ||
