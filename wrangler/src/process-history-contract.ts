@@ -1955,7 +1955,7 @@ export function readback(p: ReadbackParams): ReadbackResult {
  */
 export function persistReaderOutputs(store: PersistedStore, result: ReadbackResult, alias: string):
   { manifest: PersistResult["status"] | "skipped"; seal: PersistResult["status"] | "skipped" } {
-  if (result.manifest_text === null || result.seal_text === null) return { manifest: "skipped", seal: "skipped" };
+  if (result.stop === "denied" || result.manifest_text === null || result.seal_text === null) return { manifest: "skipped", seal: "skipped" };
   const manifest = persistBytes(store, keyFor(alias, "manifest:reader"), result.manifest_text, false);
   if (manifest.status === "denied") return { manifest: "denied", seal: "skipped" };
   const seal = persistBytes(store, keyFor(alias, "reader-seal"), result.seal_text, false);

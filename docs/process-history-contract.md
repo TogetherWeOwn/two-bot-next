@@ -241,7 +241,8 @@ them), the run alias and its own alias, which must be the descriptor's
 `reader_alias`. It reads the descriptor, writer seal, writer manifest, 120
 record keys and 32 incident keys: one attempt per key, each at most 2 seconds,
 300 seconds overall. A denial or the time budget ends reading at once and
-leaves the rest `not_attempted` with `TRUNCATED`.
+leaves the rest `not_attempted` with `TRUNCATED`. After a permission denial
+the reader writes neither its manifest nor its seal.
 
 It recomputes each record hash and rechecks aliases, index, schedule, intrinsic
 flags and (where a persisted interval exists) the CPU arithmetic from the two

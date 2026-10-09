@@ -842,6 +842,20 @@ test("skipped_slot_each_index: a gap is never bridged with the slot before it", 
   }
 });
 
+test("zero_anchor_each_index: an anchor of \"0\" on slot i-1 is not a usable clock, so slot i is NONADJACENT_CPU with no interval", () => {
+  for (let e = 1; e < 120; e++) {
+    const prev = clone(baseSlot(e - 1));
+    obsOf(prev).cpu_anchor_mono_ns = "0";
+    obsOf(prev).mono_start_ns = "0";
+    obsOf(prev).mono_end_ns = "9000000";
+    const pair = C.computeCpuInterval(e, baseSlot(e), baseSlot(e - 1));
+    assert.equal(pair.flags, 0, `control e=${e}: the untouched predecessor pairs`);
+    const zero = C.computeCpuInterval(e, baseSlot(e), prev);
+    assert.equal(zero.flags, F.NONADJACENT_CPU, `e=${e}`);
+    assert.ok(Object.values(zero.interval).every((v) => v === null), `e=${e}: no span measured from the epoch`);
+  }
+});
+
 test("counter reset and wrap at every slot 1..119; slot 0 is only a baseline", () => {
   for (const v of ["0", U64_MAX.toString()]) {
     const { map, writer } = newRun();
@@ -1162,6 +1176,10 @@ test("failed_read_each_index and read_mismatch_each_index: 120 each; a read fail
       });
       assert.ok(has(rb.manifest.flags_mask, "TRUNCATED", "FAILED_READ"));
       assert.equal(rb.manifest.coverage, "incomplete");
+      const calls = rb.store.log.length;
+      assert.deepEqual(C.persistReaderOutputs(rb.store, rb.result, DESC.run_alias), { manifest: "skipped", seal: "skipped" }, `k=${k}`);
+      assert.equal(rb.store.count("create"), 0, "a denied reader writes neither its manifest nor its seal");
+      assert.equal(rb.store.log.length, calls, "persisting after the denial initiates no I/O");
       note(rb.manifest.flags_mask);
     }
     // Mismatches: a tampered value, a stale record under the wrong key, a record of another run, non-canonical bytes.
