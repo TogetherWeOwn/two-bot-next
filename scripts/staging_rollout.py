@@ -46,7 +46,15 @@ APPLICATION_IMAGE_STALE_POLLS = 24
 # drift diagnostic, including when an in-flight poll read reaches the deadline.
 # It cannot accept a rollout; it only labels the failure.
 IMAGE_DRIFT_DIAGNOSTIC_SECONDS = 15
-READINESS_TOKENS = frozenset({"ownership_fenced", "not_owner", "container_unavailable", "epoch_conflict"})
+# Fence and unavailability reasons /readyz can actually return
+# (wrangler/src/ownership.ts OwnershipRefused reasons surfaced as the 503
+# `reason`, plus the container probe's 500 `error_class`). `epoch_conflict`
+# is kept: the fence endpoint answers it with 409 and the gate records any
+# /readyz status, so the classifier must recognise it wherever it appears.
+READINESS_TOKENS = frozenset({
+    "ownership_fenced", "not_owner", "container_unavailable", "epoch_conflict",
+    "shutdown_unconfirmed", "storage_unavailable", "storage_invalid",
+})
 VERIFY_TIMEOUT_SECONDS = 300
 MAX_TIMEOUT_DIAGNOSTIC_SECONDS = 3600
 TOKEN = re.compile(r"[a-z0-9_]{1,32}")
