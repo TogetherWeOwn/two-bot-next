@@ -31,6 +31,8 @@ Shared sticky/feed interactions start their existing detached dispatch at receip
 
 On a checkpoint error or timeout, readiness stays Starting and no new packets are admitted. Before returning the original error, the runner consumes the current and queued RSVP preparations in receipt order, completing only successfully acknowledged commands. It does not run buffered funnel events or advance any checkpoint past the failed transaction. This deliberately separates draining accepted external work from recovering the transactional funnel; retrying an uncertain checkpoint in-process would be unsafe.
 
+Dispatch-worker failures use the same path: a failed leveling drain, a dropped interaction completion, or an invalid onboarding job is recorded as a typed `InvalidArgument` error naming its stage (`; checkpoint unchanged`), the worker stops, accepted RSVP drains in receipt order, and the cursor stays unchanged. The runner surfaces that typed error rather than a bare "dispatch worker failed". Detached onboarding acknowledgements hold a drop-guard permit, so a panicking acknowledgement releases its ingress slot instead of leaking it toward capacity exhaustion.
+
 These changes prevent scheduler-induced loss at backlog/deadline and recoverable checkpoint-error boundaries, not process-crash exactly-once delivery. RSVP store effects and Discord acknowledgements are not atomic with the gateway checkpoint, and no durable interaction inbox is introduced. A failed final edit never retries the already-executed command.
 
 ## Force-fresh IDENTIFY (first production boot)
