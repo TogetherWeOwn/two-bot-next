@@ -1,6 +1,6 @@
 //! Gateway composition of the shared custom-command router/runtime.
 //! Bootstrap reads finish before constructing the shard, including cold RESUME.
-//! Event work is detached at reception by [`crate::command_runtime::CommandRuntime::dispatch`].
+//! Event work is detached by [`crate::command_runtime::CommandRuntime::dispatch`] or its verdict-carrying form.
 
 use std::{
     collections::HashMap,
@@ -65,9 +65,7 @@ fn config_error() -> sqlx::Error {
     sqlx::Error::InvalidArgument("gateway command configuration invalid".into())
 }
 
-/// The ordinary message pipeline currently captures facts but has no automod
-/// inspector. Only an explicit disabled configuration is known acceptance.
-/// Missing, enabled, and malformed values must not turn capture into permission.
+/// Only an explicit disabled configuration is acceptance without an automod verdict.
 fn acceptance_without_inspector(automod: Option<&str>) -> AutomationMessageAcceptance {
     if automod == Some("0") {
         AutomationMessageAcceptance::AutomodDisabled

@@ -55,14 +55,13 @@ publisher runs on READY/RESUMED; no builtin-only publication can erase custom ro
 The combined mock gateway fixture checks registry coexistence and single replies
 for custom, management, feed and sticky commands. It is added, not locally run.
 
-The ordinary message pipeline still has **no automod inspection service**. Prefix
-execution therefore requires an explicit `TWO_AUTOMOD=0`, in addition to both
-custom-command gates. Missing, malformed, or enabled automod configuration yields
-`Unavailable` and no prefix lookup/send. This deliberately stricter interim rule
-must not be presented as automod enforcement or unmatched/exempt integration.
-Neither `MessageCreate` nor `capture_only: false` proves acceptance. Completing
-normal automod-enabled prefix operation still requires the ordinary path's actual
-inspection result, not a second matcher in this custom-command adapter.
+With automod enabled (`TWO_AUTOMOD=1`), the gateway worker inspects each create and
+passes its verdict to the prefix trigger handler, which applies the mapping in the
+next section. An absent verdict yields `Unavailable` and no prefix lookup or send.
+An explicit `TWO_AUTOMOD=0` keeps `AutomodDisabled` without waiting for a verdict,
+and missing or malformed configuration yields `Unavailable`. Neither `MessageCreate`
+nor `capture_only: false` proves acceptance; only the worker's verdict does, and this
+adapter runs no second matcher.
 
 Runtime dispatch and checkpoint persistence share one total deadline: the lesser
 of five seconds and one quarter of HELLO's heartbeat interval. Readiness stays
