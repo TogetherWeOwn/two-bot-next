@@ -388,11 +388,16 @@ jobs:
               sys.exit(1)
       # Same contract as staging, plus the build identity: /health
       # must be 200, which proves the Container/DO bindings are wired. /readyz
-      # must answer with its component breakdown and this run's revision: 200
-      # once the gateway is ready, or a truthful 503 while it is parked (for
-      # example behind the B4 ownership fence). Any other status, body or
-      # revision fails. Rollback accepts an unstamped pre-stamp target as a
-      # recorded outcome, never a different revision as a pass.
+      # must answer with its component breakdown and this run's build identity:
+      # the guarded SHA and this run's `<run id>-<attempt>`. 200 once the
+      # gateway is ready, or a truthful 503 while it is parked with the
+      # revision still matching. The build ID matters because a replaced
+      # container can keep serving the previous build of the same SHA; without
+      # it a same-SHA redeploy would pass on the old container's answer. Any
+      # other status, body, revision or build ID fails. Rollback checks the
+      # revision only (the serving version was built by an older run) and
+      # accepts an unstamped pre-stamp target as a recorded outcome, never a
+      # different revision as a pass.
       - name: Gate on /health + /readyz revision
         env:
           PRODUCTION_URL: ${{ vars.PRODUCTION_WORKER_URL }}
@@ -424,7 +429,7 @@ jobs:
           # a while, so /readyz is polled like /health and every answer is judged.
           for i in $(seq 1 30); do
             code=$(curl -s --max-time 10 -H "User-Agent: $agent" -o "$readyz" -w '%{http_code}' "$url/readyz" || true)
-            if state=$(python3 ../scripts/production_deploy.py readyz --status "$code" --body "$readyz" --sha "$SHA" --mode "$MODE" 2>&1); then
+            if state=$(python3 ../scripts/production_deploy.py readyz --status "$code" --body "$readyz" --sha "$SHA" --mode "$MODE" --build-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 2>&1); then
               break
             fi
             echo "attempt $i: /readyz -> $code; $state; waiting 10s"

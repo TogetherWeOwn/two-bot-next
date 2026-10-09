@@ -59,6 +59,11 @@ def readyz(args):
     if not isinstance(revision, str) or not isinstance(build_id, str):
         return reject("/readyz has no build_revision and build_id")
     if revision == args.sha:
+        if args.mode == "deploy" and build_id != args.build_id:
+            return reject(
+                f"build_id {build_id} is not this run's build ({args.build_id}): "
+                "a previous container still serves this SHA"
+            )
         state = "gateway ready" if args.status == "200" else "gateway parked; deploy is healthy"
         print(f"{state}, revision matches the SHA, build {build_id}")
         return 0
@@ -86,6 +91,10 @@ def main(argv=None):
     readyz_cmd.add_argument("--body", required=True)
     readyz_cmd.add_argument("--sha", required=True)
     readyz_cmd.add_argument("--mode", choices=("deploy", "rollback"), required=True)
+    # This run's `<run id>-<attempt>` (ignored in rollback mode, where the
+    # serving version was built by an older run). Deploy mode requires it so a
+    # same-SHA redeploy cannot pass on the previous container's answer.
+    readyz_cmd.add_argument("--build-id", required=True)
 
     args = parser.parse_args(argv)
     if args.command == "render":

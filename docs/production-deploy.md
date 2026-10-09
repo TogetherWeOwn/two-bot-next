@@ -22,9 +22,12 @@ since Environment settings can drift.
    `CLOUDFLARE_ACCOUNT_ID` secrets. Environment secrets override the
    repository secrets that staging uses.
 
-Until the Environment has reviewers and a main-only branch policy, the
-`sha guard` job refuses every dispatch, unless `PRODUCTION_AUTO_APPROVE` is
-`true` (see [PRODUCTION_AUTO_APPROVE](#production_auto_approve)). A job that
+The `sha guard` job refuses every dispatch until the Environment has
+reviewers and a main-only branch policy. `PRODUCTION_AUTO_APPROVE=true`
+excuses only the missing-reviewers refusal, and only when the latest
+`deploy-staging` run on the SHA is a completed success; the main-only branch
+policy stays mandatory with or without it
+(see [PRODUCTION_AUTO_APPROVE](#production_auto_approve)). A job that
 names a missing Environment makes GitHub create it with no protection, so the
 guard checks before the deploy job can run. This repository is public, so
 required reviewers work on every plan; no Enterprise plan is needed.
@@ -88,13 +91,19 @@ single production container. Nothing else changes, and
 (4.147.0) runs the deploy: `wrangler-action` uses the installed version when
 `wranglerVersion` is omitted, and the job runs `npm ci` first.
 
-The gate polls `/readyz` every 10 seconds for up to 30 attempts and passes an
-answer only when its JSON `build_revision` equals the guarded SHA:
+The gate polls `/readyz` every 10 seconds for up to 30 attempts. In deploy
+mode it passes an answer only when its JSON `build_revision` equals the
+guarded SHA **and** its `build_id` equals this run's `<run id>-<run
+attempt>`: the build ID proves the new container serves, not a previous
+build of the same SHA still draining. Rollback mode checks the revision
+only, because the serving version was built by an older run.
 
 | `/readyz` answer | Result |
 |---|---|
-| 200 and `build_revision` is the SHA | Pass: gateway ready |
-| 503 and `build_revision` is the SHA | Pass: gateway parked behind the fence (truthful) |
+| 200, revision is the SHA, `build_id` is this run's (deploy) or any stamped id (rollback) | Pass: gateway ready |
+| 503 with the SHA and a passing build id (same rule) | Pass: gateway parked (truthful 503 as a state, identity still matches) |
+| 503 `{"error":"ownership_fenced"}` with no build fields | Keep polling; fail at the end. The fence releases at cutover step 3.5, so the identity match is established only after the takeover |
+| Revision is the SHA but `build_id` is another run's (deploy mode) | Keep polling; fail at the end: the previous container still serves this SHA |
 | `build_revision` is another SHA | Keep polling; fail at the end |
 | `build_revision` and `build_id` are both `unknown` (not stamped) | Deploy: keep polling; fail at the end. Rollback: recorded as a pre-stamp version, not a failure |
 | `build_revision` is `unknown` and `build_id` is not | Keep polling; fail at the end |
@@ -102,7 +111,8 @@ answer only when its JSON `build_revision` equals the guarded SHA:
 | Any other status, including `000` (no answer) | Keep polling; fail at the end |
 
 Polling matters because a replaced container can keep answering with the
-previous revision for a while. The gate sends an explicit agent,
+previous revision — or, on a same-SHA redeploy, the previous build — for a
+while. The gate sends an explicit agent,
 `two-bot-next-production-rollout/1.0`, the production twin of the staging
 gate's agent. The staging gate sets one because the edge rejects Python's
 default agent. The run summary records the status, the state and the

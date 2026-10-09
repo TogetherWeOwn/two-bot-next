@@ -285,7 +285,8 @@ class StaticGuardTests(unittest.TestCase):
         self.assertLess(names.index(f"- name: {RENDER_STEP}"), names.index("- name: Deploy to production"))
 
     def test_readyz_gate_judges_the_guarded_sha_and_mode_without_secrets(self):
-        self.assertIn('production_deploy.py readyz --status "$code" --body "$readyz" --sha "$SHA" --mode "$MODE" 2>&1',
+        self.assertIn('production_deploy.py readyz --status "$code" --body "$readyz" --sha "$SHA" '
+                      '--mode "$MODE" --build-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 2>&1',
                       GATE)
         for text in (RENDER, GATE):
             self.assertNotIn("secrets.", text)
@@ -828,10 +829,11 @@ class ShellStepTests(unittest.TestCase):
             )
             return result.returncode, summary.read_text() if summary.exists() else ""
 
-    def gate(self, routes, mode="deploy", sha=SHA):
+    def gate(self, routes, mode="deploy", sha=SHA, run_id="700", attempt="1"):
         with ScriptedWorker(routes) as worker:
             code, summary = self.bash(GATE, cwd=WRANGLER_DIR, PRODUCTION_URL=worker.url,
-                                      MODE=mode, SHA=sha)
+                                      MODE=mode, SHA=sha,
+                                      GITHUB_RUN_ID=run_id, GITHUB_RUN_ATTEMPT=attempt)
         return code, summary, worker
 
     def test_matching_revision_passes_ready_or_truthfully_parked(self):
@@ -854,6 +856,8 @@ class ShellStepTests(unittest.TestCase):
         cases = {
             "other revision": report(revision="f" * 40),
             "unstamped build": report(revision="unknown", build_id="unknown"),
+            "stale build of this revision": report(build_id="999-1"),
+            "unstamped build id on this revision": report(build_id="unknown"),
             "missing build_revision": json.dumps({"components": [], "build_id": BUILD_ID}),
             "missing build_id": json.dumps({"build_revision": SHA, "components": []}),
             "non-JSON body": "<html>502 Bad Gateway</html>",
@@ -867,6 +871,23 @@ class ShellStepTests(unittest.TestCase):
                     self.assertEqual(code, 1)
                     self.assertIn("roll back", summary)
                     self.assertEqual(worker.count("/readyz"), 30)
+
+    def test_readyz_from_the_previous_build_of_this_sha_keeps_polling(self):
+        # A same-SHA redeploy: the old container still serves the SHA with its
+        # own build id, so the gate must not pass on the stale answer. The
+        # scripted stale answer repeats, like a container that never swaps.
+        code, summary, worker = self.gate(
+            {"/health": [(200, "{}")], "/readyz": [(200, report(build_id="999-1"))]})
+        self.assertEqual(code, 1, summary)
+        self.assertIn("not this run's build", summary)
+        self.assertEqual(worker.count("/readyz"), 30)
+
+    def test_rollback_ignores_the_build_id_of_the_older_build(self):
+        code, summary, _ = self.gate(
+            {"/health": [(200, "{}")], "/readyz": [(200, report(build_id="999-1"))]},
+            mode="rollback")
+        self.assertEqual(code, 0, summary)
+        self.assertIn("gateway ready", summary)
 
     def test_readyz_that_moves_to_this_revision_passes(self):
         code, summary, worker = self.gate({
@@ -975,14 +996,14 @@ class RenderTests(unittest.TestCase):
 
 
 class ReadyzVerdictTests(unittest.TestCase):
-    def judge(self, status="200", body=None, mode="deploy", sha=SHA):
+    def judge(self, status="200", body=None, mode="deploy", sha=SHA, build_id=BUILD_ID):
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
             path = Path(tmp) / "readyz.json"
             if body is not None:
                 path.write_text(body)
             result = subprocess.run(
                 [sys.executable, str(SCRIPT), "readyz", "--status", status, "--body", str(path),
-                 "--sha", sha, "--mode", mode],
+                 "--sha", sha, "--mode", mode, "--build-id", build_id],
                 capture_output=True, text=True, timeout=60,
             )
             return result.returncode, result.stdout.strip()
@@ -992,6 +1013,16 @@ class ReadyzVerdictTests(unittest.TestCase):
         self.assertEqual((code, message.split(",")[0]), (0, "gateway ready"))
         code, message = self.judge("503", report())
         self.assertEqual((code, message.split(",")[0]), (0, "gateway parked; deploy is healthy"))
+
+    def test_deploy_rejects_a_stale_build_of_the_same_sha(self):
+        # The previous container still serves the SHA after a same-SHA
+        # redeploy or a "Re-run failed jobs": its build id is not this run's.
+        for status in ("200", "503"):
+            for body in (report(build_id="999-1"), report(build_id="unknown")):
+                with self.subTest(status=status, body=body):
+                    code, message = self.judge(status, body)
+                    self.assertEqual(code, 1)
+                    self.assertIn("not this run's build", message)
 
     def test_every_other_observation_fails_with_its_reason(self):
         cases = (
@@ -1020,6 +1051,9 @@ class ReadyzVerdictTests(unittest.TestCase):
         self.assertIn("pre-stamp version", message)
         self.assertEqual(self.judge("200", report(revision="f" * 40), mode="rollback")[0], 1)
         self.assertEqual(self.judge("200", report(revision="unknown", build_id=BUILD_ID), mode="rollback")[0], 1)
+        # The rolled-back version was built by an older run: its build id is
+        # not this run's, and the gate must still pass on the revision.
+        self.assertEqual(self.judge("200", report(build_id="999-1"), mode="rollback")[0], 0)
 
 
 if __name__ == "__main__":
