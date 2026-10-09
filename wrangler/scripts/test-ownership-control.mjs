@@ -66,6 +66,14 @@ test('deployment-takeover retries POST 503 with a fresh state read', async () =>
   assert.deepEqual(f.waits, [10000]);
 });
 
+test('deployment-takeover retry after a committed takeover does not take over again', async () => {
+  const f = fixture([ok(80), http(503), ok(81)]);
+  const result = await f.invoke({ action: 'deployment-takeover' });
+  assert.equal(result.owner.epoch, 81);
+  assert.deepEqual(f.calls, ['GET', 'POST', 'GET']);
+  assert.deepEqual(f.waits, [10000]);
+});
+
 test('deployment-takeover gives up after thirty-four attempts inside the bounded window', async () => {
   const f = fixture(Array.from({ length: 34 }, () => http(503)));
   assert.match(await failure(f.invoke({ action: 'deployment-takeover' })),

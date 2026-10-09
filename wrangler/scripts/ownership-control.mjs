@@ -84,6 +84,7 @@ export async function control({ action, url, token, actor, expectedEpoch, releas
     }
     return state;
   };
+  let postedEpoch;
   const once = async () => {
     attempts += 1;
     const current = await read({ method: "GET" });
@@ -95,10 +96,14 @@ export async function control({ action, url, token, actor, expectedEpoch, releas
       if (current.owner?.phase !== "active" && !releaseFence) {
         throw new ControlError("Singleton is intentionally fenced or uninitialized; explicit staging release required");
       }
+      // A 5xx after a committed takeover leaves the owner active at the posted epoch; do not take over again.
+      if (postedEpoch !== undefined && current.owner?.phase === "active" && current.owner.epoch === postedEpoch &&
+          current.owner.deploymentId === current.deploymentId) return current;
       expectedEpoch = current.owner?.epoch ?? 0;
     }
     if (!Number.isSafeInteger(expectedEpoch) || expectedEpoch < 0) throw new ControlError("Explicit expected epoch is required");
     const targetAction = action === "deployment-takeover" ? "takeover" : action;
+    postedEpoch = expectedEpoch + 1;
     const result = await read({ method: "POST", body: JSON.stringify({ action: targetAction, actor, expectedEpoch }) });
     if (result.running || result.owner?.epoch !== expectedEpoch + 1 ||
         (targetAction === "takeover" && (result.owner.phase !== "active" || result.owner.deploymentId !== result.deploymentId)) ||
