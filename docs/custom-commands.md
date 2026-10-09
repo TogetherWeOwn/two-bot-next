@@ -55,12 +55,14 @@ publisher runs on READY/RESUMED; no builtin-only publication can erase custom ro
 The combined mock gateway fixture checks registry coexistence and single replies
 for custom, management, feed and sticky commands. It is added, not locally run.
 
-With automod enabled (`TWO_AUTOMOD=1`), the gateway worker inspects each create and
+When `TWO_AUTOMOD=1` builds the automod gateway, the worker inspects each create and
 passes its verdict to the prefix trigger handler, which applies the mapping in the
-next section. An absent verdict yields `Unavailable` and no prefix lookup or send.
-An explicit `TWO_AUTOMOD=0` keeps `AutomodDisabled` without waiting for a verdict,
-and missing or malformed configuration yields `Unavailable`. Neither `MessageCreate`
-nor `capture_only: false` proves acceptance; only the worker's verdict does, and this
+next section. Activation builds it only where it is permitted, which is the staging
+guild today (see `docs/automod-runtime.md`). Elsewhere, `TWO_AUTOMOD=1` leaves prefix
+execution closed, with no lookup or send. An absent verdict yields `Unavailable`. An
+explicit `TWO_AUTOMOD=0` keeps `AutomodDisabled` without waiting for a verdict, and
+missing or malformed configuration yields `Unavailable`. Neither `MessageCreate` nor
+`capture_only: false` proves acceptance; only the worker's verdict does, and this
 adapter runs no second matcher.
 
 Runtime dispatch and checkpoint persistence share one total deadline: the lesser
@@ -113,10 +115,10 @@ inspection, and capture-only operation. Only the first three permit automations.
 A match rejects prefix execution even in dry-run mode or when sanctions/deletion
 were refused. Missing services and unknown errors fail closed. The caller must
 reuse the existing inspection result; this slice does not run a second matcher.
-The gateway worker passes its per-create automod disposition: `Accept` maps to
-`Unmatched`, `CaptureOnly` and `None` refuse, and an absent disposition fails
-closed as `Unavailable`. `TWO_AUTOMOD=0` keeps `AutomodDisabled` without waiting
-for a verdict. The ordinary message path must complete before invoking the
+The gateway worker hands the handler only an accepted create (`Accept`, which maps
+to `Unmatched`) or an absent verdict (`Unavailable`). The mapping also refuses
+`CaptureOnly` and the edit-only `FunnelDisposition::None` if they arrive.
+`TWO_AUTOMOD=0` keeps `AutomodDisabled` without waiting for a verdict. The ordinary message path must complete before invoking the
 callback.
 
 This is based on legacy `two-bot` revision

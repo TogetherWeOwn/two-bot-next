@@ -145,8 +145,9 @@ pub(crate) async fn process<L: AutomodClaimLedger, F: AutomodFacts>(
     }
 }
 
-/// Text automations (sticky and friends) run only for an accepted create: a
-/// matched, unavailable or timed-out create is rejected for them too.
+/// Text automations (sticky and friends) run for an accepted create or a direct
+/// message with no disposition; a matched, unavailable or timed-out create is
+/// rejected for them too.
 pub(crate) fn runs_text_automations(disposition: Option<FunnelDisposition>) -> bool {
     disposition.is_none_or(|disposition| disposition == FunnelDisposition::Accept)
 }
