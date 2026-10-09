@@ -143,7 +143,7 @@ as dynamic labels.
   `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other`.
 - `two_bot_db_errors_total{op}` — `op` is `admission` or `other`. Recorded
   by `Metrics::db_error`; send-admission SQL (admit/extend/complete storage
-  failures) reports as `admission`, and failed voice guild-actor store loads
+  failures) reports as `admission`, and failed voice actor store loads
   report as `other`.
 - `two_bot_send_admissions_total{outcome}` — `outcome` is `admitted`,
   `blocked`, `storage_error` or `other`. Recorded once per `admit()`

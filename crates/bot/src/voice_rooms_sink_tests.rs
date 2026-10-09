@@ -612,9 +612,11 @@ async fn actor_load_failure_bumps_counter_and_arms_warn_throttle() {
     let before = global_series(series);
     observe_voice_actor_load_failure(GUILD, &StoreError::Unavailable);
     observe_voice_actor_load_failure(GUILD, &StoreError::Unavailable);
+    // Global counters are monotonic and shared with parallel tests, so assert
+    // a lower bound, not an exact value (see `global_series` convention).
     assert!(
         global_series(series) >= before + 2,
-        "load failures bump the process-wide counter (parallel tests may add more)"
+        "two load failures bump the `other` counter"
     );
     // The first failure arms the throttle timestamp; the immediate second
     // call stays silent. (Warn text itself is covered by the observability
