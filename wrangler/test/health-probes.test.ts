@@ -229,6 +229,41 @@ test("/ops/metrics: repeated wrong bearers throttle per caller before comparison
   // No token value in any response body seen above.
 });
 
+test("/ops/metrics: concurrent burst cannot share one token across comparisons", async () => {
+  const h = harness();
+  const token = "synthetic-metrics-concurrency-token-0123456789";
+  const e = { ...h.env, METRICS_SCRAPE_TOKEN: token } as Env;
+  const get = (ip: string, auth?: string) =>
+    worker.fetch(
+      new Request("https://probe.invalid/ops/metrics", {
+        headers: { ...(auth ? { authorization: auth } : {}), "cf-connecting-ip": ip },
+      }),
+      e,
+      h.ctx,
+    );
+  // Budget is taken synchronously before the awaited digest comparison, so 30
+  // concurrent wrong guesses plus the correct bearer last fit only the
+  // 10-burst: everything else — including the correct bearer — is refused
+  // without a comparison.
+  const attempts = Array.from({ length: 30 }, () => get("10.8.8.8", "Bearer wrong-bearer-value"));
+  attempts.push(get("10.8.8.8", `Bearer ${token}`));
+  const results = await Promise.all(attempts);
+  let compared = 0;
+  let refused = 0;
+  for (const r of results) {
+    if (r.status === 401) compared += 1;
+    else if (r.status === 429) {
+      refused += 1;
+      assert.ok(Number(r.headers.get("retry-after")) >= 1);
+    } else assert.fail(`unexpected concurrent status ${r.status}`);
+    await r.text();
+  }
+  assert.equal(compared, 10, "only the 10-burst is compared");
+  assert.equal(refused, 21, "the rest is refused");
+  assert.equal(results[30]!.status, 429, "the concurrent correct bearer is refused without a comparison");
+  assert.equal(h.forwarded.length, 0, "no concurrent attempt reaches the container");
+});
+
 test("/ops/metrics: wrong bearer and throttle responses never carry the token", async () => {
   const h = harness();
   const token = "synthetic-metrics-secrecy-token-0123456789";

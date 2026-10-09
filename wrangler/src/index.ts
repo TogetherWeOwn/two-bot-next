@@ -151,17 +151,20 @@ function missCacheFor(env: Env): RedirectMissCache {
 // the Worker and is unaffected.
 const healthBuckets = new TokenBuckets();
 
-// Failed-bearer cap for the authenticated /ops/metrics scrape. Only failed
-// attempts consume budget via take(), and a read-only peek() refuses
-// throttled callers before the secret comparison, so guessing cannot confirm
-// a bearer while the bucket is exhausted. Buckets are per caller (as with
-// the probe cap), so another caller's guessing cannot throttle a correct
-// bearer; a correct bearer from the same exhausted caller waits out the
-// retry-after like any other request. Successful bearers never consume
-// failure budget. CONTROL_PATH deliberately shares nothing here: it is a
-// separate ownership gate whose token already requires 32 characters (see
-// ownership.ts authenticated()), and its lockout semantics belong to that
-// fence.
+// Attempt cap for the authenticated /ops/metrics scrape. Every attempt takes
+// one token synchronously before the secret comparison, so a burst of
+// concurrent guesses cannot share a single token across many comparisons
+// (the comparison awaits digests, during which other in-flight requests would
+// otherwise all pass a read-only precheck). An exhausted caller is refused
+// without any comparison, so guessing cannot confirm a bearer while
+// throttled. Buckets are per caller (as with the probe cap), so another
+// caller's guessing cannot throttle a correct bearer; a correct bearer from
+// the same exhausted caller waits out the retry-after like any other request.
+// A correct bearer consumes one token per scrape, which the production
+// scraper (~1/15 s against a 10-burst/1-per-second bucket) never nears.
+// CONTROL_PATH deliberately shares nothing here: it is a separate ownership
+// gate whose token already requires 32 characters (see ownership.ts
+// authenticated()), and its lockout semantics belong to that fence.
 const metricsAuthBuckets = new TokenBuckets({ capacity: 10, refillPerSecond: 1 });
 // A short scrape token is an operator misconfiguration, not per-request
 // information: say so once per isolate so scanners cannot flood the logs.
@@ -457,7 +460,9 @@ export class TwoBotContainer extends Container<Env> {
             return metricsUnavailable(504);
           }
           if (fetchSignal.aborted || !upstream.ok) {
-            await upstream.arrayBuffer().catch(() => {});
+            // Cancel without reading: a huge non-2xx body must not bypass
+            // the 64 KiB cap by being drained here.
+            await upstream.body?.cancel().catch(() => {});
             return metricsUnavailable(504);
           }
           let body: string | null;
@@ -922,13 +927,14 @@ export default {
     // Authenticated off-container scrape path. No configured token (or one
     // shorter than the 32-character floor — same bar as the ownership
     // control token) → 404 (the route does not exist); missing/wrong
-    // bearer → 401 with per-caller throttling of repeated failures (429 +
-    // retry-after). A throttled caller is refused before the secret
-    // comparison, so guessing cannot confirm a bearer while exhausted;
-    // buckets are per caller, so someone else's guessing cannot throttle a
-    // correct bearer. Exact path only. CONTROL_PATH keeps its own gate
-    // (ownership.ts authenticated()): it shares neither this bucket nor its
-    // budget.
+    // bearer → 401, with per-caller throttling of attempts (429 +
+    // retry-after). Every attempt takes a token synchronously before the
+    // secret comparison, so concurrent guesses cannot share one token; a
+    // throttled caller is refused without any comparison, so guessing cannot
+    // confirm a bearer while exhausted. Buckets are per caller, so someone
+    // else's guessing cannot throttle a correct bearer. Exact path only.
+    // CONTROL_PATH keeps its own gate (ownership.ts authenticated()): it
+    // shares neither this bucket nor its budget.
     if (url.pathname === OPS_METRICS_PATH) {
       if (!env.METRICS_SCRAPE_TOKEN || env.METRICS_SCRAPE_TOKEN.length < MIN_SCRAPE_TOKEN_LENGTH
         || request.method !== "GET") {
@@ -944,31 +950,23 @@ export default {
         return new Response("not found", { status: 404 });
       }
       const caller = request.headers.get("cf-connecting-ip") ?? "unknown";
-      // Refuse an exhausted caller before the secret comparison: no guess —
-      // right or wrong — is evaluated while throttled. Peek consumes nothing,
-      // so a correct bearer on a fresh budget is unaffected.
-      const precheck = metricsAuthBuckets.peek(caller);
-      if (!precheck.allowed) {
+      // Take budget synchronously before the secret comparison: no guess —
+      // right or wrong — is evaluated while throttled, and concurrent
+      // guesses each consume their own token instead of sharing one across
+      // the awaited digest comparison below. A correct bearer on a fresh
+      // budget is unaffected (one token of a 10-burst).
+      const verdict = metricsAuthBuckets.take(caller);
+      if (!verdict.allowed) {
         return new Response("slow down\n", {
           status: 429,
           headers: {
             "content-type": "text/plain",
-            "retry-after": String(precheck.retryAfter),
+            "retry-after": String(verdict.retryAfter),
           },
         });
       }
       const m = /^Bearer (.+)$/.exec(request.headers.get("authorization") ?? "");
       if (!m || m[1]!.length > 4096 || !(await tokenMatches(m[1]!, env.METRICS_SCRAPE_TOKEN))) {
-        const verdict = metricsAuthBuckets.take(caller);
-        if (!verdict.allowed) {
-          return new Response("slow down\n", {
-            status: 429,
-            headers: {
-              "content-type": "text/plain",
-              "retry-after": String(verdict.retryAfter),
-            },
-          });
-        }
         return new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } });
       }
       try {

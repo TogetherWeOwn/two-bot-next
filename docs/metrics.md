@@ -246,11 +246,13 @@ No Prometheus server, no new infrastructure.
   (plus one redacted log line naming the requirement); a short staging
   token must be reissued, never padded (none is provisioned today).
   Missing or wrong bearer → `401` (compared via SHA-256 digests);
-  repeated failures from one caller → `429` + `retry-after` via the
-  existing per-caller bucket (10 burst, 1/sec); a throttled caller is
-  refused before the secret comparison, so guessing cannot confirm a
-  bearer while exhausted — buckets are per caller, so another caller's
-  guessing cannot throttle a correct bearer elsewhere. Non-GET →
+  every attempt takes one token synchronously before the comparison, so
+  concurrent guesses cannot share a token and a throttled caller is
+  refused without any comparison — guessing cannot confirm a bearer
+  while exhausted (`429` + `retry-after` via the existing per-caller
+  bucket, 10 burst, 1/sec). Buckets are per caller, so another caller's
+  guessing cannot throttle a correct bearer elsewhere; the scraper
+  (~1/15 s) never nears the budget. Non-GET →
   `404`. Unauthenticated requests never reach the container. `/metrics`
   itself stays `404`. The ownership control path (`/internal/ownership`)
   keeps its own gate and shares neither this bucket nor its budget.
