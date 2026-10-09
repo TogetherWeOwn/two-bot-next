@@ -21,7 +21,11 @@ to first recovery. Each recovered window carries ``outage_seconds`` rounded
 to 0.1 s, reusing the ``outage_seconds`` convention of
 ``scripts/staging_container_drill.py`` (fence-to-first-ready). Any
 unrecognised ``event`` value or malformed line is preserved as an UNKNOWN
-interval, never silently dropped.
+interval, never silently dropped. Silence longer than ``MAX_GAP_S`` between
+records, a record timestamped before its predecessor (skipped), and a failure
+seen before the first ``readyz_ok`` (unbounded start, so UNKNOWN rather than
+recovered) are UNKNOWN too. The verdict is PASS only with evidence, no UNKNOWN
+intervals or windows, and no outage at or over budget.
 
 A window still open when the log ends stays explicitly UNKNOWN
 (``status: "unknown"``, ``end: null``, ``outage_seconds: null``): like
@@ -42,6 +46,12 @@ SCHEMA_VERSION = 1
 
 # Gate 5 acceptance: recovery strictly under 60 s from outage start.
 OUTAGE_BUDGET_S = 60
+
+# No tick producer exists yet; this cadence matches the staging /readyz poll
+# (POLL_SECONDS in scripts/staging_container_drill.py). Silence longer than two
+# cadences is unobserved time, never healthy time.
+TICK_CADENCE_S = 5
+MAX_GAP_S = 2 * TICK_CADENCE_S
 
 # Recovery signal; everything else that opens a window is a start signal.
 RECOVERY_EVENT = "readyz_ok"
@@ -66,7 +76,9 @@ def summarize(lines):
     outage_windows = []
     unknowns = []
     first_ts = last_ts = None
-    outage_start = None  # ts of the first failure of the currently open window
+    healthy_seen = False
+    outage_open = False
+    outage_start = None  # first failure of the open window; None when unbounded
 
     def note_unknown(start, end, reason):
         unknowns.append({
@@ -92,35 +104,54 @@ def summarize(lines):
         except ValueError:
             note_unknown(None, None, f"malformed line {lineno}: bad ts")
             continue
-        first_ts = ts if first_ts is None else min(first_ts, ts)
-        last_ts = ts if last_ts is None else max(last_ts, ts)
+        if last_ts is None:
+            first_ts = ts
+        elif ts < last_ts:
+            note_unknown(last_ts, ts, f"out-of-order ts at line {lineno}")
+            continue
+        else:
+            gap = (ts - last_ts).total_seconds()
+            if gap > MAX_GAP_S:
+                note_unknown(last_ts, ts,
+                             f"{gap:.1f} s without records exceeds {MAX_GAP_S} s")
+        last_ts = ts
         event = record.get("event")
 
         if event == RECOVERY_EVENT:
             readyz_ok += 1
-            if outage_start is not None:
-                outage_windows.append({
-                    "start": outage_start.isoformat(),
-                    "end": ts.isoformat(),
-                    "outage_seconds": round((ts - outage_start).total_seconds(), 1),
-                    "status": "recovered",
-                })
-                outage_start = None
+            healthy_seen = True
+            if outage_open:
+                outage_open = False
+                if outage_start is None:
+                    outage_windows.append({
+                        "start": None,
+                        "end": ts.isoformat(),
+                        "outage_seconds": None,
+                        "status": "unknown",
+                    })
+                else:
+                    outage_windows.append({
+                        "start": outage_start.isoformat(),
+                        "end": ts.isoformat(),
+                        "outage_seconds": round((ts - outage_start).total_seconds(), 1),
+                        "status": "recovered",
+                    })
         elif event in OUTAGE_START_EVENTS:
             if event == "readyz_fail":
                 readyz_fail += 1
             else:
                 tick_missed += 1
-            if outage_start is None:
-                outage_start = ts
+            if not outage_open:
+                outage_open = True
+                outage_start = ts if healthy_seen else None
         else:
             note_unknown(ts, ts, f"unrecognised event {event!r}")
 
-    if outage_start is not None:
+    if outage_open:
         # Log ends while still down: the outage length is unbounded, so the
         # window stays explicitly UNKNOWN instead of being scored as zero.
         outage_windows.append({
-            "start": outage_start.isoformat(),
+            "start": outage_start.isoformat() if outage_start is not None else None,
             "end": None,
             "outage_seconds": None,
             "status": "unknown",
@@ -129,10 +160,11 @@ def summarize(lines):
     recovered = [window["outage_seconds"] for window in outage_windows
                  if window["status"] == "recovered"]
     max_outage = max(recovered) if recovered else None
-    unknown_open = any(window["status"] == "unknown" for window in outage_windows)
+    unknown_windows = any(window["status"] == "unknown" for window in outage_windows)
     over_budget = any(seconds >= OUTAGE_BUDGET_S for seconds in recovered)
-    verdict = "PASS" if (not unknowns and not unknown_open
-                         and not over_budget) else "NEEDS WORK"
+    passed = (first_ts is not None and not unknowns and not unknown_windows
+              and not over_budget)
+    verdict = "PASS" if passed else "NEEDS WORK"
     return {
         "schema_version": SCHEMA_VERSION,
         "window": {
