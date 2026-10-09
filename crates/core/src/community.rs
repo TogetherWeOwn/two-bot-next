@@ -39,6 +39,29 @@ pub const COMMUNITY_FACT_TYPES: [&str; 6] = [
     "rules_accepted",
 ];
 
+/// Streams with a live production writer: the only streams `scorecard_once`
+/// may mark covered. Today that is just `event_attended` (host check-in via
+/// `rsvp_store::record_checkin`); message, voice, join and rules capture land
+/// in later slices, one per stream. This must always equal the `Some` rows of
+/// [`STREAM_WRITERS`]; the `captured_streams_match_live_writers` guard fails
+/// otherwise.
+pub const CAPTURED_STREAMS: [&str; 1] = ["event_attended"];
+
+/// Capture registry: every fact stream with the production writer that appends
+/// it, or `None` while no live path writes it. Single source of truth for both
+/// directions of the guard: a stream in [`CAPTURED_STREAMS`] whose row is
+/// `None` has no writer, and a `Some` row missing from [`CAPTURED_STREAMS`]
+/// is a writer the scorecard does not claim. Landing a writer flips its row
+/// and grows [`CAPTURED_STREAMS`] in the same PR.
+pub const STREAM_WRITERS: [(&str, Option<&str>); 6] = [
+    ("message_created", None),
+    ("voice_session_started", None),
+    ("voice_session_ended", None),
+    ("member_joined", None),
+    ("event_attended", Some("rsvp_store::record_checkin")),
+    ("rules_accepted", None),
+];
+
 /// Exclusion buckets (legacy `COMMUNITY_CLASSIFICATIONS`). Contract
 /// precedence is deliberate: a Discord bot posting through a webhook is a bot
 /// bucket, not two exclusions, so reconciliation remains exact.
@@ -1116,6 +1139,32 @@ mod tests {
         assert!(!is_scorecard_run_time(ms("2026-09-07T07:00:00.000Z")));
         assert!(!is_scorecard_run_time(ms("2026-09-08T06:15:00.000Z")));
         assert!(!is_scorecard_run_time(ms("2026-09-06T06:15:00.000Z")));
+    }
+
+    #[test]
+    fn captured_streams_match_live_writers() {
+        // The scorecard claims exactly the streams the runtime captures: a
+        // stream in `CAPTURED_STREAMS` with no writer would invent coverage,
+        // and a writer missing from the list would leave its stream unmarked.
+        use std::collections::HashSet;
+        let registry: Vec<&str> = STREAM_WRITERS.iter().map(|(s, _)| *s).collect();
+        assert_eq!(registry.len(), COMMUNITY_FACT_TYPES.len());
+        for stream in COMMUNITY_FACT_TYPES {
+            assert!(registry.contains(&stream), "{stream} has no registry row");
+        }
+        let claimed: HashSet<&str> = CAPTURED_STREAMS.iter().copied().collect();
+        assert_eq!(
+            claimed.len(),
+            CAPTURED_STREAMS.len(),
+            "CAPTURED_STREAMS lists a stream twice"
+        );
+        for (stream, writer) in STREAM_WRITERS {
+            assert_eq!(
+                claimed.contains(stream),
+                writer.is_some(),
+                "stream {stream}: claimed without a writer, or written without a claim"
+            );
+        }
     }
 
     #[test]

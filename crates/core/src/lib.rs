@@ -190,8 +190,8 @@ pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryErr
 pub use community::{
     build_scorecard, classify, is_scorecard_run_time, previous_closed_week, scorecard_tick,
     week_start_ms, Classification, ClassifierConfig, ClassifyInput, FactRow, ScorecardGates,
-    ScorecardInputs, ScorecardOutcome, StreamCoverage, COMMUNITY_CLASSIFICATIONS,
-    COMMUNITY_FACT_TYPES, SCORECARD_TICK_INTERVAL_MS,
+    ScorecardInputs, ScorecardOutcome, StreamCoverage, CAPTURED_STREAMS, COMMUNITY_CLASSIFICATIONS,
+    COMMUNITY_FACT_TYPES, SCORECARD_TICK_INTERVAL_MS, STREAM_WRITERS,
 };
 pub use community_snapshots::{
     build_community_snapshot, build_counter_reading, match_rank_roles, window_bounds,
