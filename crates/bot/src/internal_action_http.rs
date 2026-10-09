@@ -589,11 +589,11 @@ async fn write_setting(
     let reject = |failure| state.reject(failure, key.clone(), action, id);
     let idempotency = match validate_idempotency_key(idempotency_header, &decision.action) {
         Ok(key) => key,
-        Err(error) => return reject(Failure::from_action(error), action),
+        Err(error) => return reject(Failure::from_action(error)),
     };
     let command = match SettingsCommand::parse("settings.set", &decision.body) {
         Ok(command) => command,
-        Err(error) => return reject(Failure::from_action(error), action),
+        Err(error) => return reject(Failure::from_action(error)),
     };
     let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
     let (_, actor, _) = command.write().expect("set parses as a write");
@@ -603,23 +603,21 @@ async fn write_setting(
         ..AuditSubject::default()
     };
     let Some(caller) = state.config.caller_for(&decision.key_id) else {
-        return reject(Failure::code(ErrorCode::Internal), action);
+        return reject(Failure::code(ErrorCode::Internal));
     };
     let identity = match RequestIdentity::new(caller, idempotency, &decision.action, raw) {
         Ok(identity) => identity,
-        Err(_) => return reject(Failure::code(ErrorCode::Internal), action),
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
     let claim = match state.store.claim(&identity, &subject).await {
         Ok(InternalClaim::Claimed(claim)) => claim,
         Ok(InternalClaim::Replay(response)) => {
             return replay_setting(state, &decision.body, response, id, key, action);
         }
-        Ok(InternalClaim::Mismatch) => {
-            return reject(Failure::code(ErrorCode::VersionConflict), action)
-        }
-        Ok(InternalClaim::InFlight) => return reject(Failure::code(ErrorCode::InProgress), action),
-        Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation(), action),
-        Err(_) => return reject(Failure::code(ErrorCode::Internal), action),
+        Ok(InternalClaim::Mismatch) => return reject(Failure::code(ErrorCode::VersionConflict)),
+        Ok(InternalClaim::InFlight) => return reject(Failure::code(ErrorCode::InProgress)),
+        Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation()),
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
     let store = SettingsStore::new(state.store.pool());
     match execute_settings(&store, guild_id, &command).await {
@@ -631,7 +629,7 @@ async fn write_setting(
             };
             if state.store.finish(&claim, &terminal).await.is_err() {
                 let _ = state.store.mark_unknown(&claim).await;
-                return reject(Failure::reconciliation(), action);
+                return reject(Failure::reconciliation());
             }
             settings_write_response(outcome.result, id, false)
         }
@@ -649,12 +647,12 @@ async fn write_setting(
             if let Some(terminal) = terminal {
                 if state.store.finish(&claim, &terminal).await.is_err() {
                     let _ = state.store.mark_unknown(&claim).await;
-                    return reject(Failure::reconciliation(), action);
+                    return reject(Failure::reconciliation());
                 }
-                return reject(Failure::from_action(error), action);
+                return reject(Failure::from_action(error));
             }
             let _ = state.store.mark_unknown(&claim).await;
-            reject(Failure::reconciliation(), action)
+            reject(Failure::reconciliation())
         }
     }
 }
