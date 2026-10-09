@@ -4740,3 +4740,118 @@ async fn declined_kick_gets_the_router_refusal_exactly_once() {
         }
     }
 }
+
+#[tokio::test]
+async fn self_role_reactions_share_the_bounded_message_lane() {
+    use std::collections::HashSet;
+    use twilight_model::gateway::payload::incoming::ReactionAdd;
+    use two_bot_core::self_roles::{PanelMode, SelfRoleGates, SelfRoleOption, SelfRolePanel};
+    use two_bot_core::InteractionRouter;
+    use two_bot_cutover::self_role_store::SelfRoleStore;
+
+    use crate::command_runtime::{DISPATCH_LIMITS, LANE_MESSAGES};
+    use crate::self_role_handlers::SelfRoleService;
+    use crate::self_role_runtime::SelfRoleRuntime;
+
+    const SR_GUILD: u64 = 100_000_000_000_000_001;
+    const SR_CHANNEL: &str = "100000000000000007";
+    const SR_MESSAGE: &str = "100000000000000008";
+    const SR_BOT: &str = "100000000000000003";
+
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    let executor =
+        ActionExecutor::with_proxy("test-token".to_owned(), Some(origin)).expect("mock executor");
+    let service_runtime = SelfRoleRuntime {
+        store: SelfRoleStore::new(pool.clone()),
+        executor: executor.clone(),
+        guild_id: SR_GUILD.to_string(),
+        bot_id: SR_BOT.to_owned(),
+    };
+    let panel = SelfRolePanel {
+        id: "games".into(),
+        channel_id: SR_CHANNEL.into(),
+        message_id: SR_MESSAGE.into(),
+        mode: PanelMode::Reaction,
+        exclusive: true,
+        color: false,
+        options: vec![SelfRoleOption {
+            key: "new".into(),
+            label: "New".into(),
+            role_id: "100000000000000004".into(),
+            permissions: "0".into(),
+            emoji: Some("b".into()),
+            description: None,
+        }],
+    };
+    let service = Arc::new(
+        SelfRoleService::new(
+            service_runtime,
+            SelfRoleGates {
+                panels: vec![panel],
+                dry_run: false,
+            },
+            &[SR_GUILD.to_string()].into_iter().collect::<HashSet<_>>(),
+        )
+        .expect("approved staging catalogue"),
+    );
+    let router = InteractionRouter::new(RouterGates {
+        configured_guild: Some(SR_GUILD),
+        scorecard: false,
+        automations: false,
+        announcements: false,
+        moderation: false,
+        voice: false,
+        voice_assistant: false,
+        tickets: false,
+        self_roles: true,
+        onboarding_picker: false,
+        session_picker: false,
+    });
+    let runtime =
+        CommandRuntime::new_with_self_roles(pool, executor, router, SR_GUILD, false, service);
+    let _guard = runtime.dispatch_guard();
+    let cap = DISPATCH_LIMITS[LANE_MESSAGES];
+
+    // One reaction is admitted while the lane has room; the detached task
+    // settles (fast store refusal) and the lane drains.
+    let first = Event::ReactionAdd(Box::new(ReactionAdd(
+        crate::self_role_handlers::tests::reaction(),
+    )));
+    assert!(runtime.dispatch(&first), "room in the lane admits");
+    wait_for(
+        || runtime.lane_in_flight(LANE_MESSAGES) == 0,
+        "admitted reaction settles",
+    )
+    .await;
+
+    // Saturate the shared message lane without database or REST work.
+    for _ in 0..cap {
+        assert!(runtime.hold_lane_for_test(LANE_MESSAGES, Duration::from_secs(30)));
+    }
+    assert_eq!(runtime.lane_in_flight(LANE_MESSAGES), cap);
+
+    // A 1,000-event burst is dropped at the lane, never unbounded: every
+    // dispatch reports refusal and in-flight never exceeds the cap.
+    let mut admitted = 0usize;
+    let mut max_observed = 0usize;
+    for _ in 0..1000 {
+        let event = Event::ReactionAdd(Box::new(ReactionAdd(
+            crate::self_role_handlers::tests::reaction(),
+        )));
+        if runtime.dispatch(&event) {
+            admitted += 1;
+        }
+        max_observed = max_observed.max(runtime.lane_in_flight(LANE_MESSAGES));
+    }
+    assert_eq!(admitted, 0, "saturated lane drops reaction bursts");
+    assert!(
+        max_observed <= cap,
+        "in-flight {max_observed} exceeds lane cap {cap}"
+    );
+    assert_eq!(runtime.lane_in_flight(LANE_MESSAGES), cap);
+    assert!(mock.requests().is_empty(), "dropped reactions send no REST");
+    mock.shutdown().await;
+}
