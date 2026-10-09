@@ -320,6 +320,10 @@
     "crates/cutover/migrations/0422_voice_create_reservations.sql": {
       "sha256": "8c0d98f0b5dd3e45770a05b5fe211fcd29b67352a23b802658b5cf81b7e47883",
       "justification": "Durable voice room-create admission: one reservation row per accepted create, so burst and cooldown history survives room deletion and restarts."
+    },
+    "crates/cutover/migrations/0423_internal_action_outcome.sql": {
+      "sha256": "4f1c1752195f4989bce6a555da6c35071f3a3043fd35a0b71371a105c0c45df7",
+      "justification": "Durable website-event outcome for idempotent receipts: nullable created/updated/cancelled on internal_idempotency so a create replayed after key registration still reads created; additive, backout drops the column."
     }
   }
 }
