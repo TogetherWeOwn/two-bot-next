@@ -1495,14 +1495,57 @@ class OrchestrationTests(OfflineTestCase):
             "components=process:ready,gateway:starting "
             "gateway_failure=durable_gateway:checkpoint_load_failed "
             "phase=rollout reason=zero_instances elapsed_s=10 polls=2 "
-            "first=readyz=503,identity=match,components=process:ready,gateway:starting,"
-            "gateway_failure=durable_gateway:checkpoint_load_failed "
-            "last=readyz=503,identity=match,components=process:ready,gateway:starting,"
-            "gateway_failure=durable_gateway:checkpoint_load_failed",
+            "first=readyz=503,identity=match,components=process:ready,gateway:starting "
+            "last=readyz=503,identity=match,components=process:ready,gateway:starting",
         ])
         self.assertEqual(client.calls.count(("request", URL + "/readyz")), 2)
         self.assertEqual(client.calls.count(("request", URL + "/health")), 2)
         self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_zero_instance_first_last_summary_drops_a_stale_gateway_failure(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        zero = completed_row()
+        zero["health"]["instances"].update(active=0, healthy=0)
+        _, headers, _ = ready_response()
+        first = (503, headers, self.readyz_body(
+            {"phase": "durable_gateway", "class": "checkpoint_load_failed"},
+            components=[["process", "ready"], ["gateway", "starting"]]))
+        last = (503, headers, self.readyz_body(
+            None, components=[["process", "ready"], ["gateway", "ready"]]))
+        client = verify_client()
+        client.api_routes[DETAIL_PATH] = [zero]
+        client.request_routes[URL + "/readyz"] = [first, last]
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertIn(
+            "polls=2 first=readyz=503,identity=match,components=process:ready,gateway:starting "
+            "last=readyz=503,identity=match,components=process:ready,gateway:ready",
+            client.observation)
+        self.assertNotIn("gateway_failure=", client.observation)
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_converged_rollout_fence_and_unavailable_polls_keep_identity_and_token(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        cases = [
+            ((503, {"content-type": "application/json"},
+              b'{"error":"ownership_fenced","reason":"not_owner"}'),
+             "rollout=converged readyz=503 identity=absent token=not_owner"),
+            ((500, {"content-type": "application/json"},
+              b'{"ready":false,"error_class":"container_unavailable"}'),
+             "rollout=converged readyz=500 identity=absent token=container_unavailable"),
+        ]
+        for response, expected in cases:
+            with self.subTest(expected=expected):
+                self.clock.now = 100
+                client = verify_client()
+                client.request_routes[URL + "/readyz"] = [response]
+                self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+                self.assertEqual(client.observation, expected)
+                self.assertNotIn("body=unreadable", client.observation)
+                self.assert_no_evidence()
         self.assert_no_secret_saved_or_printed()
 
     def test_zero_instance_timeout_diagnostic_survives_an_in_flight_probe_timeout(self):

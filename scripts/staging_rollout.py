@@ -465,18 +465,24 @@ def runtime_observation(status, headers, body, version, revision, build_id):
     parts = [f"readyz={status}"]
     try:
         report = mapping(decode(body))
-        components = [f"{part[0]}:{part[1]}" for part in sequence(report.get("components"))
+    except GateError:
+        parts.append("body=unreadable")
+        return " ".join(parts)
+    try:
+        raw = sequence(report.get("components"))
+        components = [f"{part[0]}:{part[1]}" for part in raw
                       if isinstance(part, list) and len(part) == 2
                       and all(isinstance(item, str) and TOKEN.fullmatch(item) for item in part)]
         parts.append("components=" + ",".join(components))
-        parts.append("identity=" + ("match" if headers.get("x-two-worker-version") == version
-                                    and report.get("build_revision") == revision
-                                    and report.get("build_id") == build_id else "mismatch"))
-        failure = gateway_failure(report)
-        if failure:
-            parts.append("gateway_failure=" + failure)
     except GateError:
-        parts.append("body=unreadable")
+        pass
+    parts.append("identity=" + readiness_identity(headers, report, version, revision, build_id))
+    token = readiness_token(report)
+    if token:
+        parts.append(f"token={token}")
+    failure = gateway_failure(report)
+    if failure:
+        parts.append("gateway_failure=" + failure)
     return " ".join(parts)
 
 
@@ -533,6 +539,14 @@ def zero_instance_readiness_observation(status, headers, report, version, revisi
     return " ".join(parts)
 
 
+def summary_observation(diagnostic):
+    # The first/last summary keeps status, identity, components and token; the
+    # per-poll gateway_failure stays on the live observation only, so a failure
+    # seen on an early poll cannot look current after a later poll cleared it.
+    return " ".join(part for part in (diagnostic or "").split(" ")
+                    if not part.startswith("gateway_failure="))
+
+
 def record_zero_instance_timeout(client, row, verification_started):
     if (not completed_zero_instance_rollout(row) or not client.observation
             or " reason=zero_instances" in client.observation):
@@ -541,8 +555,8 @@ def record_zero_instance_timeout(client, row, verification_started):
                   max(0, int(time.monotonic() - verification_started)))
     details = ""
     if client.zero_instance_polls:
-        first = (client.zero_instance_first or "").replace(" ", ",")
-        last = (client.zero_instance_last or "").replace(" ", ",")
+        first = summary_observation(client.zero_instance_first).replace(" ", ",")
+        last = summary_observation(client.zero_instance_last).replace(" ", ",")
         details = (f" polls={client.zero_instance_polls} first={first} last={last}")
     client.observation += f" phase=rollout reason=zero_instances elapsed_s={elapsed}{details}"
 
