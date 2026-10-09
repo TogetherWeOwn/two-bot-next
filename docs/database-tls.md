@@ -93,9 +93,18 @@ Fenced: every caller of `two_bot_cutover::connect`, the gateway store pool
 (`two_bot_store::connect_pool`, via `connect_pool_with_tls`), both
 `two-bot backup` URL parses (`backup_cli::open_pool`, via
 `open_pool_with_tls`, and `governed_guild_config_api`),
-`channel_moderation_store::connect` (via `connect_with_tls`), and the three
+`channel_moderation_store::connect` (via `connect_with_tls`), and three of the
 send-admission pools (`website_jobs::admission_pool_with_tls` for the website
 jobs, the preflight `admission_transport` and the commands CLI `executor`).
+
+Known gaps (not yet fenced): `two_bot_cutover::rest::RestClient::from_env`
+(`crates/cutover/src/rest.rs`) builds a send-admission pool from
+`TWO_DATABASE_URL` with raw `connect_options` for the `report`,
+`ghost_cleanup` and `backfill_messages` operator tools, so the TLS policy is
+not enforced there; and `staging_migrate::verify_target` plus `connect`
+(`crates/cutover/src/staging_migrate.rs`) pins the expected host and database
+but never calls `database_tls::enforce`/`apply` and sets no timeouts. Their
+refusals already use fixed strings with no URL, host or credential.
 
 F6 stays open until the deployment card records a non-secret TLS receipt.
 
