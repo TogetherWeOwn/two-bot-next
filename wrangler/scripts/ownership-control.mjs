@@ -3,21 +3,60 @@
 // Production handoff remains B4's separately authorized execution sheet.
 class ControlError extends Error {}
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// A takeover POST fired within a second of `wrangler deploy` can land on a
-// still-propagating older Worker version, whose deployment id no longer
-// matches the stamped header; the singleton answers 503 (deployment_mismatch
-// and friends all map to 503 server-side). Retry only that transient 5xx for
-// the push-path deployment-takeover. Never retry the deliberate fence refusal,
-// auth/validation failures, or explicit operator actions; the verify gate
-// still adjudicates exactness of whatever owner wins.
-function retryableTakeoverFailure(error) {
-  return error instanceof ControlError &&
-    /^Ownership control failed \(HTTP 5\d\d\)/.test(error.message);
+class HttpFailure extends ControlError {
+  constructor(message, status, reason) {
+    super(message);
+    this.status = status;
+    this.reason = reason;
+  }
 }
 
-export async function control({ action, url, token, actor, expectedEpoch, releaseFence = false, takeoverAttempts = 5, takeoverRetryDelayMs = 10000 }, send = fetch, wait = sleep) {
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Closed vocabulary of Worker refusal codes (wrangler/src); anything else prints as unrecognized.
+export const REFUSAL_REASONS = new Set([
+  "deployment_id_missing", "storage_unavailable", "storage_invalid", "not_owner", "epoch_conflict",
+  "epoch_exhausted", "shutdown_unconfirmed", "deployment_mismatch", "stale_keepalive", "operation_failed",
+]);
+const MAX_REFUSAL_BODY_BYTES = 1024;
+
+async function refusalReason(response) {
+  try {
+    const reader = response.body.getReader();
+    const chunks = [];
+    let size = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > MAX_REFUSAL_BODY_BYTES) return "unrecognized";
+        chunks.push(value);
+      }
+    } finally {
+      await reader.cancel();
+    }
+    const reason = JSON.parse(Buffer.concat(chunks).toString("utf8"))?.reason;
+    return REFUSAL_REASONS.has(reason) ? reason : "unrecognized";
+  } catch {
+    return "unrecognized";
+  }
+}
+
+// Wrangler's default deferred code update is expected to keep old code answering 5xx for up to 300 s (docs/runbook.md); retry 5xx only.
+function retryableTakeoverFailure(error) {
+  return error instanceof HttpFailure && error.status >= 500 && error.status <= 599;
+}
+
+// A non-HTTP refusal after an earlier 5xx (for example a fence left by a failed takeover POST) keeps that 5xx reason.
+function withEarlierRefusal(error, earlier, summary) {
+  if (!earlier || error instanceof HttpFailure) return error;
+  const detail = `earlier takeover refusal HTTP ${earlier.status} reason=${earlier.reason} ${summary}`;
+  if (error instanceof ControlError) return new ControlError(`${error.message}; ${detail}`);
+  return new ControlError(`Ownership control failed; ${detail}; stop, do not change credentials`);
+}
+
+export async function control({ action, url, token, actor, expectedEpoch, releaseFence = false, takeoverAttempts = 34, takeoverRetryDelayMs = 10000, takeoverWindowMs = 330000 }, send = fetch, wait = sleep) {
   const origin = new URL(url);
   if (origin.protocol !== "https:" || origin.port || origin.username || origin.password ||
       !/^two-bot-next-staging\.[a-z0-9-]+\.workers\.dev$/.test(origin.hostname) ||
@@ -29,17 +68,25 @@ export async function control({ action, url, token, actor, expectedEpoch, releas
   if (action === "preflight") return { configured: true };
   const endpoint = new URL("/internal/ownership", origin);
   const headers = { authorization: `Bearer ${token}` };
+  const started = Date.now();
+  const elapsedSeconds = () => Math.round((Date.now() - started) / 1000);
+  let attempts = 0;
   const read = async (init) => {
     // Never follow redirects carrying the control secret to another origin.
     const response = await send(endpoint, { ...init, headers, redirect: "error", signal: AbortSignal.timeout(15000) });
-    if (!response.ok) throw new ControlError(`Ownership control failed (HTTP ${response.status}); stop, do not change credentials`);
+    if (!response.ok) {
+      const reason = await refusalReason(response);
+      throw new HttpFailure(`Ownership control failed (HTTP ${response.status}) reason=${reason} attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`, response.status, reason);
+    }
     const state = await response.json();
     if (!state.deploymentId || !("owner" in state) || typeof state.running !== "boolean") {
       throw new ControlError("Invalid ownership control response");
     }
     return state;
   };
+  let postedEpoch;
   const once = async () => {
+    attempts += 1;
     const current = await read({ method: "GET" });
     if (action === "status") return current;
     if (!actor || !/^[a-zA-Z0-9_.:@/-]{1,128}$/.test(actor)) throw new ControlError("Explicit audit actor is required");
@@ -49,10 +96,17 @@ export async function control({ action, url, token, actor, expectedEpoch, releas
       if (current.owner?.phase !== "active" && !releaseFence) {
         throw new ControlError("Singleton is intentionally fenced or uninitialized; explicit staging release required");
       }
+      // A 5xx after a committed takeover leaves the owner active at the posted epoch; confirm it without posting again.
+      if (postedEpoch !== undefined && current.owner?.phase === "active" && current.owner.epoch === postedEpoch &&
+          current.owner.deploymentId === current.deploymentId) {
+        if (current.running) throw new ControlError("Ownership transition not confirmed; preserve maintenance");
+        return current;
+      }
       expectedEpoch = current.owner?.epoch ?? 0;
     }
     if (!Number.isSafeInteger(expectedEpoch) || expectedEpoch < 0) throw new ControlError("Explicit expected epoch is required");
     const targetAction = action === "deployment-takeover" ? "takeover" : action;
+    postedEpoch = expectedEpoch + 1;
     const result = await read({ method: "POST", body: JSON.stringify({ action: targetAction, actor, expectedEpoch }) });
     if (result.running || result.owner?.epoch !== expectedEpoch + 1 ||
         (targetAction === "takeover" && (result.owner.phase !== "active" || result.owner.deploymentId !== result.deploymentId)) ||
@@ -62,17 +116,19 @@ export async function control({ action, url, token, actor, expectedEpoch, releas
     return result;
   };
   if (action !== "deployment-takeover") return once();
-  let failure;
-  for (let attempt = 1; attempt <= takeoverAttempts; attempt++) {
+  let earlier;
+  for (let attempt = 1; ; attempt++) {
     try {
       return await once();
     } catch (error) {
-      failure = error;
-      if (!retryableTakeoverFailure(error) || attempt >= takeoverAttempts) throw error;
+      if (!retryableTakeoverFailure(error) || attempt >= takeoverAttempts ||
+          Date.now() - started + takeoverRetryDelayMs > takeoverWindowMs) {
+        throw withEarlierRefusal(error, earlier, `attempts=${attempts} elapsed=${elapsedSeconds()}s`);
+      }
+      earlier = error;
       await wait(takeoverRetryDelayMs);
     }
   }
-  throw failure;
 }
 
 if (process.argv[1] === new URL(import.meta.url).pathname) {
