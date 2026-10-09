@@ -46,6 +46,7 @@ APPLICATION_IMAGE_STALE_POLLS = 24
 # drift diagnostic, including when an in-flight poll read reaches the deadline.
 # It cannot accept a rollout; it only labels the failure.
 IMAGE_DRIFT_DIAGNOSTIC_SECONDS = 15
+READINESS_TOKENS = frozenset({"ownership_fenced", "not_owner", "container_unavailable", "epoch_conflict"})
 VERIFY_TIMEOUT_SECONDS = 300
 MAX_TIMEOUT_DIAGNOSTIC_SECONDS = 3600
 TOKEN = re.compile(r"[a-z0-9_]{1,32}")
@@ -115,6 +116,9 @@ class Client:
         self.deadline = deadline
         # Last allowlisted state seen by verify; printed only on rollout_timeout.
         self.observation = None
+        self.zero_instance_polls = 0
+        self.zero_instance_first = None
+        self.zero_instance_last = None
         self.opener = build_opener(NoRedirect())
 
     def request(self, url, authenticated=False):
@@ -132,12 +136,11 @@ class Client:
             # Even Cloudflare's error envelope may include configuration values.
             if authenticated:
                 raise GateError("api_http_failure") from None
-            # Only the bot's own parked-readiness answer (JSON 503, the Worker's
-            # probe allowlist) keeps its body: the gate echoes strict tokens from
-            # it. Every other error body is discarded (TOG-13044).
+            # Readiness diagnostics may inspect only JSON 500/503 bodies; the
+            # allowlisted token parser below prevents upstream text from logging.
             headers = error.headers if error.headers is not None else {}
             media = (headers.get("content-type") or "").split(";")[0].strip().lower()
-            if error.code == 503 and media == "application/json":
+            if url.endswith("/readyz") and error.code in (500, 503) and media == "application/json":
                 try:
                     body = error.read(MAX_BODY + 1)
                 except (OSError, ValueError):
@@ -477,9 +480,34 @@ def runtime_observation(status, headers, body, version, revision, build_id):
     return " ".join(parts)
 
 
+def readiness_identity(headers, report, version, revision, build_id):
+    worker = headers.get("x-two-worker-version")
+    if not isinstance(report, dict):
+        return "mismatch" if worker is not None and worker != version else "absent"
+    observed = (worker, report.get("build_revision"), report.get("build_id"))
+    expected = (version, revision, build_id)
+    if any(value is not None and value != target for value, target in zip(observed, expected)):
+        return "mismatch"
+    if any(value is None for value in observed):
+        return "absent"
+    return "match"
+
+
+def readiness_token(report):
+    if not isinstance(report, dict):
+        return None
+    candidates = [report.get("reason"), report.get("error_class"), report.get("error")]
+    fenced = report.get("ownership_fenced")
+    if isinstance(fenced, dict):
+        candidates.extend((fenced.get("reason"), fenced.get("error")))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate in READINESS_TOKENS:
+            return candidate
+    return None
+
+
 def zero_instance_readiness_observation(status, headers, report, version, revision, build_id):
-    if (headers.get("x-two-worker-version") != version or report.get("build_revision") != revision
-            or report.get("build_id") != build_id):
+    if readiness_identity(headers, report, version, revision, build_id) != "match":
         return None
     components = report.get("components")
     if not isinstance(components, list):
@@ -511,24 +539,34 @@ def record_zero_instance_timeout(client, row, verification_started):
         return
     elapsed = min(MAX_TIMEOUT_DIAGNOSTIC_SECONDS,
                   max(0, int(time.monotonic() - verification_started)))
-    client.observation += f" phase=rollout reason=zero_instances elapsed_s={elapsed}"
+    details = ""
+    if client.zero_instance_polls:
+        first = (client.zero_instance_first or "").replace(" ", ",")
+        last = (client.zero_instance_last or "").replace(" ", ",")
+        details = (f" polls={client.zero_instance_polls} first={first} last={last}")
+    client.observation += f" phase=rollout reason=zero_instances elapsed_s={elapsed}{details}"
 
 
 def unconverged_readiness(client, url, version, revision, build_id, zero_instances):
-    # Best effort from the existing readiness probe; only this exact build may
-    # contribute a failure or the bounded zero-instance component summary.
+    # Best effort from the existing readiness probe; logs contain only status,
+    # identity class and fixed tokens, never upstream text or identifiers.
     status, headers, body = client.request(url + "/readyz")
+    status_code = status if type(status) is int and 0 <= status <= 599 else "unknown"
     try:
         report = mapping(decode(body))
     except GateError:
-        return None
-    if (headers.get("x-two-worker-version") != version or report.get("build_revision") != revision
-            or report.get("build_id") != build_id):
-        return None
+        report = None
+    identity = readiness_identity(headers, report, version, revision, build_id)
+    parts = [f"readyz={status_code}", f"identity={identity}"]
+    token = readiness_token(report)
+    if token:
+        parts.append(f"token={token}")
+    if identity != "match":
+        return None, " ".join(parts)
     failure = gateway_failure(report)
     diagnostic = (zero_instance_readiness_observation(
         status, headers, report, version, revision, build_id) if zero_instances else None)
-    return failure, diagnostic
+    return failure, diagnostic or " ".join(parts)
 
 
 def staging_url():
@@ -754,7 +792,12 @@ def verify(args, client):
                 failure, diagnostic = readiness
                 if diagnostic:
                     client.observation += " " + diagnostic
-                elif failure:
+                    if completed_zero_instance_rollout(row):
+                        client.zero_instance_polls += 1
+                        if client.zero_instance_first is None:
+                            client.zero_instance_first = diagnostic
+                        client.zero_instance_last = diagnostic
+                if failure and "gateway_failure=" not in client.observation:
                     client.observation += " gateway_failure=" + failure
         if not passed:
             lag_streak = 0
