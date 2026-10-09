@@ -1,7 +1,7 @@
-//! Gateway wiring for the shared automod activation (TOG-12354).
+//! Gateway wiring for the shared automod activation.
 //!
 //! The serial dispatch worker calls [`process`] once per translated delivery,
-//! in gateway order and before the funnel, then hands the returned disposition
+//! in gateway order and before the funnel, then hands the funnel disposition
 //! to `OrderedLevelingPipeline::collect_at_with_message_disposition` exactly once. There is no
 //! private client, router or timer: Discord reads and mutations go through the
 //! command runtime's [`ActionExecutor`], and repeat history expires on the
@@ -131,8 +131,9 @@ pub(crate) fn partial_edit(text: &str, receipt_ms: u64) -> Option<MessageDeliver
 }
 
 /// What one delivery decided: `funnel` is its single call into the funnel and
-/// `trigger` is the verdict prefix triggers act on. An uninspected delivery keeps
-/// its funnel accept, but its trigger verdict is capture-only.
+/// `trigger` is the verdict prefix triggers act on. A delivery automod did not
+/// inspect, or whose completion was not recorded, keeps its funnel disposition
+/// but its trigger verdict is capture-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkerVerdict {
     pub(crate) funnel: FunnelDisposition,
@@ -141,10 +142,11 @@ pub(crate) struct WorkerVerdict {
 
 fn verdict_of(activation: &Activation, kind: MessageDeliveryKind) -> WorkerVerdict {
     let funnel = activation.uncommitted_disposition(kind);
-    let trigger = if matches!(activation.outcome, ActivationOutcome::Bypassed) {
-        FunnelDisposition::CaptureOnly
-    } else {
-        funnel
+    let trigger = match activation.outcome {
+        ActivationOutcome::Bypassed | ActivationOutcome::Retained(_) => {
+            FunnelDisposition::CaptureOnly
+        }
+        _ => funnel,
     };
     WorkerVerdict { funnel, trigger }
 }

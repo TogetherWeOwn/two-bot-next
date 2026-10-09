@@ -10,7 +10,7 @@ use two_bot_core::automod_runtime::{
     TargetFacts, ViolationRecord, STAGING_GUILD_ID,
 };
 use two_bot_core::AutomodFilter;
-use two_bot_discord::automod_activation::FetchedMessage;
+use two_bot_discord::automod_activation::{FetchedMessage, RetainReason};
 
 const OWEN: &str = "123456789012345678";
 const ROLE: &str = "234567890123456789";
@@ -262,6 +262,21 @@ fn settled_clean_create_hands_its_accept_to_triggers() {
         WorkerVerdict {
             funnel: FunnelDisposition::Accept,
             trigger: FunnelDisposition::Accept,
+        }
+    );
+}
+
+#[test]
+fn retained_completion_hands_triggers_a_capture_only_verdict() {
+    let retained = Activation {
+        disposition: FunnelDisposition::Accept,
+        outcome: ActivationOutcome::Retained(RetainReason::CompletionRefused),
+    };
+    assert_eq!(
+        verdict_of(&retained, MessageDeliveryKind::Create),
+        WorkerVerdict {
+            funnel: FunnelDisposition::Accept,
+            trigger: FunnelDisposition::CaptureOnly,
         }
     );
 }
