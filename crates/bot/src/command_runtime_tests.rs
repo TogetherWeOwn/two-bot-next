@@ -4742,14 +4742,14 @@ async fn declined_kick_gets_the_router_refusal_exactly_once() {
 }
 
 #[tokio::test]
-async fn self_role_reactions_share_the_bounded_message_lane() {
+async fn self_role_reactions_have_their_own_bounded_lane() {
     use std::collections::HashSet;
-    use twilight_model::gateway::payload::incoming::ReactionAdd;
+    use twilight_model::gateway::payload::incoming::{MessageCreate, ReactionAdd};
     use two_bot_core::self_roles::{PanelMode, SelfRoleGates, SelfRoleOption, SelfRolePanel};
     use two_bot_core::InteractionRouter;
     use two_bot_cutover::self_role_store::SelfRoleStore;
 
-    use crate::command_runtime::{DISPATCH_LIMITS, LANE_MESSAGES};
+    use crate::command_runtime::{DISPATCH_LIMITS, LANE_MESSAGES, LANE_REACTIONS};
     use crate::self_role_handlers::SelfRoleService;
     use crate::self_role_runtime::SelfRoleRuntime;
 
@@ -4811,9 +4811,9 @@ async fn self_role_reactions_share_the_bounded_message_lane() {
         session_picker: false,
     });
     let runtime =
-        CommandRuntime::new_with_self_roles(pool, executor, router, SR_GUILD, false, service);
+        CommandRuntime::new_with_self_roles(pool, executor, router, SR_GUILD, true, service);
     let _guard = runtime.dispatch_guard();
-    let cap = DISPATCH_LIMITS[LANE_MESSAGES];
+    let cap = DISPATCH_LIMITS[LANE_REACTIONS];
 
     // One reaction is admitted while the lane has room; the detached task
     // settles (fast store refusal) and the lane drains.
@@ -4822,16 +4822,40 @@ async fn self_role_reactions_share_the_bounded_message_lane() {
     )));
     assert!(runtime.dispatch(&first), "room in the lane admits");
     wait_for(
-        || runtime.lane_in_flight(LANE_MESSAGES) == 0,
+        || runtime.lane_in_flight(LANE_REACTIONS) == 0,
         "admitted reaction settles",
     )
     .await;
 
-    // Saturate the shared message lane without database or REST work.
+    // Saturate the dedicated reaction lane without database or REST work.
     for _ in 0..cap {
-        assert!(runtime.hold_lane_for_test(LANE_MESSAGES, Duration::from_secs(30)));
+        assert!(runtime.hold_lane_for_test(LANE_REACTIONS, Duration::from_secs(30)));
     }
-    assert_eq!(runtime.lane_in_flight(LANE_MESSAGES), cap);
+    assert_eq!(runtime.lane_in_flight(LANE_REACTIONS), cap);
+
+    // A reaction burst must not discard message automations: with the
+    // reaction lane full, a message still admits on its own lane and settles
+    // (fast sticky refusal) without touching the reaction depth.
+    let message = Event::MessageCreate(Box::new(MessageCreate(message(
+        9,
+        100_000_000_000_000_007,
+        false,
+        Some(SR_GUILD),
+    ))));
+    assert!(
+        runtime.dispatch(&message),
+        "full reaction lane still admits messages"
+    );
+    wait_for(
+        || runtime.lane_in_flight(LANE_MESSAGES) == 0,
+        "admitted message settles",
+    )
+    .await;
+    assert_eq!(
+        runtime.lane_in_flight(LANE_REACTIONS),
+        cap,
+        "message work stays off the reaction lane"
+    );
 
     // A 1,000-event burst is dropped at the lane, never unbounded: every
     // dispatch reports refusal and in-flight never exceeds the cap.
@@ -4844,14 +4868,14 @@ async fn self_role_reactions_share_the_bounded_message_lane() {
         if runtime.dispatch(&event) {
             admitted += 1;
         }
-        max_observed = max_observed.max(runtime.lane_in_flight(LANE_MESSAGES));
+        max_observed = max_observed.max(runtime.lane_in_flight(LANE_REACTIONS));
     }
     assert_eq!(admitted, 0, "saturated lane drops reaction bursts");
     assert!(
         max_observed <= cap,
         "in-flight {max_observed} exceeds lane cap {cap}"
     );
-    assert_eq!(runtime.lane_in_flight(LANE_MESSAGES), cap);
+    assert_eq!(runtime.lane_in_flight(LANE_REACTIONS), cap);
     assert!(mock.requests().is_empty(), "dropped reactions send no REST");
     mock.shutdown().await;
 }
