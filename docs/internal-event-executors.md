@@ -68,8 +68,8 @@ The receiver releases a claim only for the send guard and admission-blocked refu
 (`is_admission_blocked()`) and records a Discord rejection as terminal. Unreadable
 success and mirror failure are **not** release signals: they keep the execution
 fence and require reconciliation, never a second event to recover a missing
-acknowledgement. Mirror failures map to
-`internal`; unreadable upstream rows map to `discord_unavailable`.
+acknowledgement. On the read path, mirror failures map to `internal` and unreadable
+rows to `discord_unavailable`; on the mutation path both become `needs_reconciliation`.
 
 ## Verification
 

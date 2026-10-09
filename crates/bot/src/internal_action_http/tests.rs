@@ -1066,7 +1066,7 @@ async fn event_upsert_create_registers_key_and_replays_created() {
 }
 
 #[tokio::test]
-async fn event_upsert_update_repoints_and_replays_updated() {
+async fn event_upsert_update_patches_the_mapped_event_and_replays_updated() {
     let Some(db) = database().await else { return };
     let _flag = INTERNAL_FLAG_LOCK.lock().await;
     set_event_cancel_flag(false);
@@ -1257,9 +1257,14 @@ async fn event_mutation_malformed_bodies_refused_before_any_discord_call() {
         )
         .await;
         assert_eq!(status, expected, "{raw}");
-        assert!(body["error"]["code"].is_string(), "{raw}");
+        let code = if index == 4 {
+            "action_not_allowed"
+        } else {
+            "malformed"
+        };
+        assert_eq!(body["error"]["code"], code, "{raw}");
     }
-    // Mutations require an Idempotency-Key header; reads stay keyless.
+    // Mutations require an Idempotency-Key header; a keyless signed request is malformed.
     let (status, _, body) =
         answer(app.clone(), signed_read(&upsert_payload("launch"), "old")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1486,6 +1491,80 @@ async fn event_cancel_admission_refusal_releases_claim_for_same_key_retry() {
     assert_eq!(
         cancelled["result"],
         json!({"outcome": "cancelled", "event_id": READ_EVENT_ID})
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_mutation_queued_behind_the_gate_is_refused_before_any_claim() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_cancel_flag(false);
+    let api = MockEventApi::start_scripted(vec![]).await;
+    let executor =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(api.origin.clone()))
+            .unwrap();
+    let reads: Arc<dyn EventReadEffect> = Arc::new(MockEventRead::default());
+    let effect: Arc<dyn ActionEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    let mutates: Arc<dyn EventMutateEffect> =
+        Arc::new(EventMutationExecutor::new(executor, db.pool().clone()));
+    let mut receiver = ReceiverState::new(config(), db.pool().clone(), effect, reads, mutates);
+    receiver.event_gate_wait = Duration::from_millis(50);
+    let state = Arc::new(receiver);
+    let held = state.event_gate.lock().await;
+    let app = router(state.clone());
+    let (status, _, body) = answer(
+        app,
+        signed(&upsert_payload("queued"), "old", "intent-queued"),
+    )
+    .await;
+    drop(held);
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "in_progress");
+    assert_eq!(api.count(), 0, "a queued mutation never reaches Discord");
+    let store = InternalActionStore::new(db.pool().clone());
+    assert_eq!(
+        store
+            .event_id_for_key(staging_guild(), "queued")
+            .await
+            .unwrap(),
+        None
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_create_mirror_failure_leaves_the_key_unmapped_and_unknown() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_cancel_flag(false);
+    let mutates: Arc<dyn EventMutateEffect> = Arc::new(ScriptedEventMutate {
+        replies: Mutex::new(vec![Err(EventActionError::Mirror)]),
+    });
+    let reads: Arc<dyn EventReadEffect> = Arc::new(MockEventRead::default());
+    let effect: Arc<dyn ActionEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    let app = router(Arc::new(ReceiverState::new(
+        config(),
+        db.pool().clone(),
+        effect,
+        reads,
+        mutates,
+    )));
+    let raw = upsert_payload("mirror");
+    let (status, _, first) = answer(app.clone(), signed(&raw, "old", "intent-mirror")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(first["error"]["code"], "needs_reconciliation");
+    // The retry finds the unknown intent, so the one-reply mutator is never called again.
+    let (status, _, second) = answer(app, signed(&raw, "old", "intent-mirror")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(second["error"]["code"], "needs_reconciliation");
+    let store = InternalActionStore::new(db.pool().clone());
+    assert_eq!(
+        store
+            .event_id_for_key(staging_guild(), "mirror")
+            .await
+            .unwrap(),
+        None
     );
     db.close().await.unwrap();
 }

@@ -1021,7 +1021,7 @@ async fn stale_and_unknown_claims_never_reexecute_and_reconciliation_is_terminal
 }
 
 #[tokio::test]
-async fn event_outcome_persists_and_replays_byte_identically() {
+async fn event_outcome_persists_and_replays_the_recorded_response() {
     let db = TestDb::new().await;
     let store = db.store();
     for (key, outcome) in [

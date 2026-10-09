@@ -30,10 +30,10 @@ use two_bot_core::send_admission::{
 mod governor;
 pub use governor::{Clock, CooldownGovernor, MAX_CHANNEL_HOLDS};
 
-/// Every verb with a wired effect adapter. The announcement adapter below owns
+/// Mutating verbs with a wired effect. The announcement adapter below owns
 /// only `announcement.post`; the two event verbs run through
 /// [`ActionExecutor::execute_event`](crate::ActionExecutor::execute_event) behind the
-/// receiver's claim and key mapping. All other implemented verbs stay refused.
+/// receiver's claim and key mapping. `event.read` is a keyless read path, not listed.
 pub const SUPPORTED_ACTIONS: &[&str] = &["announcement.post", "event.upsert", "event.cancel"];
 
 /// True for the two event verbs the receiver executes through

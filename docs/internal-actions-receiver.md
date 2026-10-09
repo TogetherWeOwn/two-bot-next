@@ -74,7 +74,7 @@ that is not yet deployed), deploy that one version, then run the takeover once.
 1. Merge this change. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
 2. Operator stages `TWO_INTERNAL_CALLERS` and `TWO_INTERNAL_CHANNEL_KEYS` (plain values).
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
-4. Operator stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
+4. Operator applies migration `0423` first (the bot does not apply migrations; an enabled receiver's finish fails without the column), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
 5. Rollback: stage deletion of `TWO_INTERNAL_ACTIONS` (`wrangler versions secret delete`), deploy and transfer ownership; or use the existing Worker-version rollback. The route is absent again and the next container start carries no receiver setting.
 
 Migration `0423` adds the nullable `internal_idempotency.outcome` column that
@@ -194,13 +194,17 @@ returned only after the receipt/audit transaction commits. See
 
 A local admission refusal (the guard, or a token lane held by another send)
 proves nothing was sent, so the event claim is released and the same key may
-retry. Event mutations run one at a time in the process, so two creates for one
-event key cannot both reach Discord. A create whose outcome is unknown, or whose
-request is dropped after its claim, can still leave a Discord event with no key
-mapping; a create under a new Idempotency-Key would then make a second event.
-Callers must not re-submit a `needs_reconciliation` operation under a new key:
-reconcile the Discord event by hand first. An abandoned in-flight intent answers
-`needs_reconciliation` to its own key. No production reconcile tool exists yet.
+retry. Event reads and mutations share one process-wide gate, so a mutation that
+has registered its key is visible to the next read or mutation for that key. A
+request that cannot enter the gate within 8 seconds is refused `in_progress`
+before any claim. A create whose Discord call succeeded but whose key mapping or
+mirror write failed, or whose request is dropped after its claim, can leave a
+Discord event with no key mapping; a create under a new Idempotency-Key for that
+key would then make a second event. Callers must not re-submit a
+`needs_reconciliation` operation under a new key: reconcile the Discord event by
+hand first. An abandoned in-flight intent answers `in_progress` to its own key
+until its claim goes stale, then `needs_reconciliation`. No production reconcile
+tool exists yet.
 
 The website-compatible envelopes contain `ok`, `request_id`, and either
 `result.message_id` (announcements), `result.{outcome,event_id}` (event
@@ -226,8 +230,9 @@ capacity, redacted authentication failures, nonce-before-parse ordering,
 concurrent/restarted/key-rotated replay, byte mismatch, unsupported actions,
 cancellation/stale ownership, unknown/no-effect outcomes, unavailable stores,
 failed receipt finalization, event verb flags, malformed event bodies (including a
-101-character location), concurrent creates for one key, admission-refusal release
-for creates and cancels, and listener supervision. Nonces are generated
+101-character location), concurrent creates for one key, a gate-wait refusal before
+any claim, a mirror failure after a create, admission-refusal release for creates and
+cancels, and listener supervision. Nonces are generated
 fresh for each attempt; the nonce-replay test intentionally reuses one generated
 value. They do not send live Discord actions.
 

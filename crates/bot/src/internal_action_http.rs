@@ -45,6 +45,9 @@ const MAX_HEADERS: usize = 64;
 const MAX_REQUESTS: usize = 32;
 const BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Queued event work waits at most this long, so a claimed mutation keeps its
+/// Discord budget inside `REQUEST_TIMEOUT`.
+const EVENT_GATE_WAIT: Duration = Duration::from_secs(8);
 
 /// The test seam is module-private: runtime effects can only use the admitted
 /// announcement adapter. It does not expose an origin override or a resend API.
@@ -197,6 +200,7 @@ struct ReceiverState {
     telemetry: Mutex<RejectionTelemetry>,
     capacity: Arc<Semaphore>,
     event_gate: tokio::sync::Mutex<()>,
+    event_gate_wait: Duration,
 }
 
 impl ReceiverState {
@@ -218,6 +222,7 @@ impl ReceiverState {
             telemetry: Mutex::new(RejectionTelemetry::default()),
             capacity: Arc::new(Semaphore::new(MAX_REQUESTS)),
             event_gate: tokio::sync::Mutex::new(()),
+            event_gate_wait: EVENT_GATE_WAIT,
         }
     }
 
@@ -563,6 +568,11 @@ async fn read_event(
         Ok(key) => key.to_owned(),
         Err(error) => return reject(Failure::from_action(error)),
     };
+    // Shares the mutation gate so a read's mirror write cannot overtake a cancel's.
+    let Ok(_gate) = tokio::time::timeout(state.event_gate_wait, state.event_gate.lock()).await
+    else {
+        return reject(Failure::code(ErrorCode::InProgress));
+    };
     let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
     let event_id = match state.store.event_id_for_key(guild_id, &event_key).await {
         Ok(Some(event_id)) => event_id,
@@ -628,9 +638,10 @@ async fn mutate_event(
     } else {
         None
     };
-    // One event mutation at a time in this process: a create's key mapping must be
-    // visible to the next mutation for that key before that mutation reads it.
-    let _gate = state.event_gate.lock().await;
+    let Ok(_gate) = tokio::time::timeout(state.event_gate_wait, state.event_gate.lock()).await
+    else {
+        return reject(Failure::code(ErrorCode::InProgress));
+    };
     let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
     let mapped = match state.store.event_id_for_key(guild_id, &event_key).await {
         Ok(mapped) => mapped,
