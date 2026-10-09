@@ -307,14 +307,11 @@ pub fn parse_xml_feed_for_kind(xml: &str, kind: FeedKind) -> Result<Vec<FeedItem
     parse_xml_feed_report(xml, kind).map(|parsed| parsed.items)
 }
 
-/// Parsed items plus how many entries the parser dropped only because their
-/// URL carries `@everyone`/`@here` text, which the shared REST sanitizer would
-/// rewrite. Handles that merely start with `here` or `everyone` match too, so
-/// the managed poller logs the count to make a silent relay diagnosable.
+/// Parsed items and how many entries were dropped for an unsafe item URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedFeed {
     pub items: Vec<FeedItem>,
-    pub mention_urls_filtered: usize,
+    pub unsafe_urls_filtered: usize,
 }
 
 pub fn parse_xml_feed_report(xml: &str, kind: FeedKind) -> Result<ParsedFeed, FeedError> {
@@ -322,14 +319,14 @@ pub fn parse_xml_feed_report(xml: &str, kind: FeedKind) -> Result<ParsedFeed, Fe
     let items = parse_xml_feed_with_url_limit(xml, max_feed_item_url_utf16_units(kind), &filtered)?;
     Ok(ParsedFeed {
         items,
-        mention_urls_filtered: filtered.get(),
+        unsafe_urls_filtered: filtered.get(),
     })
 }
 
 fn parse_xml_feed_with_url_limit(
     xml: &str,
     max_url_utf16_units: usize,
-    mention_urls_filtered: &Cell<usize>,
+    unsafe_urls_filtered: &Cell<usize>,
 ) -> Result<Vec<FeedItem>, FeedError> {
     if xml.len() > MAX_FEED_BYTES {
         return Err(FetchError::TooLarge.into());
@@ -435,8 +432,8 @@ fn parse_xml_feed_with_url_limit(
             let key = decode_xml_entities(&raw_key);
             let url = decode_xml_entities(&raw_url);
             if key.is_empty() || !is_item_url(&url, max_url_utf16_units) {
-                if has_mass_mention_url(&url) {
-                    mention_urls_filtered.set(mention_urls_filtered.get() + 1);
+                if has_unsafe_message_url(&url) {
+                    unsafe_urls_filtered.set(unsafe_urls_filtered.get() + 1);
                 }
                 return None;
             }
@@ -975,14 +972,15 @@ fn is_item_url(value: &str, max_url_utf16_units: usize) -> bool {
     })
 }
 
-/// Filter URLs that the shared REST sanitizer would rewrite; encoding `@` can
-/// change the destination of a path or query.
+/// Drops URLs the REST sanitizer rewrites and `](`, which Discord renders as a masked link.
 fn item_url_for_message(url: &url::Url) -> Option<&str> {
     let url = url.as_str();
-    (!crate::message_safety::contains_mass_mention(url)).then_some(url)
+    let unsafe_for_message =
+        crate::message_safety::contains_mass_mention(url) || url.contains("](");
+    (!unsafe_for_message).then_some(url)
 }
 
-fn has_mass_mention_url(value: &str) -> bool {
+fn has_unsafe_message_url(value: &str) -> bool {
     parse_item_url(value).is_some_and(|url| item_url_for_message(&url).is_none())
 }
 
