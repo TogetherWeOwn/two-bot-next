@@ -841,8 +841,8 @@ async fn community_ticks_write_rows_and_stay_gated() {
 /// Only streams with a live writer are marked: one Monday tick with just
 /// `event_attended` captured leaves a single heartbeat, and the run fails
 /// closed — `incomplete`, never `complete` — naming the five uncaptured
-/// streams. The successful (degraded) run still completes the week, so the
-/// job neither crash-loops nor re-alerts on retry.
+/// streams. Under production defaults the degraded run records one
+/// `INGESTION_INCOMPLETE` alert, and the retry tick does not duplicate it.
 #[tokio::test]
 #[ignore = "needs a disposable test database; routed to a check.yml step"]
 async fn scorecard_marks_only_captured_streams() {
@@ -862,7 +862,11 @@ async fn scorecard_marks_only_captured_streams() {
     // The scorecard path makes no Discord calls; the double stays silent.
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
     let rest = executor(&mock);
-    let state = fresh_state(enabled_gates(), 14);
+    let gates = ScorecardGates {
+        recommendations_enabled: true,
+        ..enabled_gates()
+    };
+    let state = fresh_state(gates, 14);
 
     let monday = parse_iso_millis("2026-09-28T06:15:00.000Z").unwrap();
     run_once(Kind::Scorecard, &pool, &rest, guild, &state, monday)
@@ -931,13 +935,18 @@ async fn scorecard_marks_only_captured_streams() {
         "the captured stream is not flagged"
     );
     assert_eq!(scorecard["intervention"]["code"], "INGESTION_INCOMPLETE");
-    let alerts: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM community_scorecard_alerts WHERE guild_id=$1")
+    let alert_keys: Vec<String> =
+        sqlx::query_scalar("SELECT alert_key FROM community_scorecard_alerts WHERE guild_id=$1")
             .bind(guild)
-            .fetch_one(&pool)
+            .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(alerts, 0, "no threshold alert on the degraded run");
+    let week = &scorecard["weekStart"].as_str().expect("week start")[..10];
+    assert_eq!(
+        alert_keys,
+        [format!("INGESTION_INCOMPLETE:{week}:contract")],
+        "one deduplicated alert across the retry tick"
+    );
 
     mock.shutdown().await;
     fixture
