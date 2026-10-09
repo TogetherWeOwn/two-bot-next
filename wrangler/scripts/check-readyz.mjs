@@ -4,13 +4,10 @@ import { readFileSync } from "node:fs";
 // Mirrors READYZ_* in scripts/rollback_readiness_probe.py; the drift test in
 // test/readiness-gate.test.ts pins these names to crates/bot/src/server.rs.
 const STATES = new Set(["ready", "starting", "down"]);
-export const READYZ_REQUIRED = ["process", "gateway"];
-// 503 is parked, never acceptance: process ready and every not-ready component listed here in that state.
-export const READYZ_PARKED = new Map([
-  ["gateway", new Set(["down", "starting"])],
-  ["database", new Set(["down"])],
-  ["token_invalid", new Set(["down"])],
-]);
+export const READYZ_REQUIRED = ["process", "gateway", "database", "token_invalid"];
+// Only the gateway parks: a 503 is accepted only with it starting or down. A database ping failure or a
+// latched bot token is a fault for this process (docs/runbook.md, docs/rest-guard.md), never parked.
+export const READYZ_PARKED = new Map([["gateway", new Set(["down", "starting"])]]);
 
 const isComponentRow = (row) =>
   Array.isArray(row) && row.length === 2 && typeof row[0] === "string" && STATES.has(row[1]);
