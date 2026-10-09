@@ -113,9 +113,12 @@ completed unmatched inspection, policy exemption, matched inspection, unavailabl
 inspection, and capture-only operation. Only the first three permit automations.
 A match rejects prefix execution even in dry-run mode or when sanctions/deletion
 were refused. Missing services and unknown errors fail closed. The caller must
-reuse the existing inspection result; this slice does not run a second matcher or
-claim to implement the missing automod service. The ordinary message path must
-complete before invoking the callback.
+reuse the existing inspection result; this slice does not run a second matcher.
+The gateway worker passes its per-create automod disposition: `Accept` maps to
+`Unmatched`, `CaptureOnly` and `None` refuse, and an absent disposition fails
+closed as `Unavailable`. `TWO_AUTOMOD=0` keeps `AutomodDisabled` without waiting
+for a verdict. The ordinary message path must complete before invoking the
+callback.
 
 This is based on legacy `two-bot` revision
 [`9677746`](https://github.com/TogetherWeOwn/two-bot/blob/96777468472f23a02a1e97a43ffab3912fe5df2a/src/discord/client.ts#L426-L535)
