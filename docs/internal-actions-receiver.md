@@ -205,9 +205,13 @@ write fails, can leave a Discord event with no key mapping; a create under a new
 Idempotency-Key for that key would then make a second event. The same can happen
 if the process stops mid-create. Callers must not re-submit a
 `needs_reconciliation` operation under a new key: reconcile the Discord event by
-hand first. An abandoned in-flight intent answers `in_progress` to its own key
-until its claim goes stale, then `needs_reconciliation`. The events poller writes
-the mirror outside the gate, so a snapshot taken before a mutation can overwrite
+hand first. An in-flight intent whose owner has stopped answers `in_progress` to its own key
+until its claim goes stale, then `needs_reconciliation`; a live owner can still
+finish after that. A panic after a claim answers `needs_reconciliation`. A 504 on a
+mutation is an unknown outcome that may still complete: retry the same key only.
+A claimed mutation holds the gate until it finishes, so a slow database can keep
+queued requests waiting for their 8 seconds. The events poller writes the mirror
+outside the gate, so a snapshot taken before a mutation can delete or overwrite
 that mutation's mirror row until the next poll; key mappings and receipts are
 unaffected. No production reconcile tool exists yet.
 

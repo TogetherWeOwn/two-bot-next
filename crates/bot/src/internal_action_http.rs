@@ -45,8 +45,8 @@ const MAX_HEADERS: usize = 64;
 const MAX_REQUESTS: usize = 32;
 const BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-/// Queued event work waits at most this long, so a claimed mutation keeps its
-/// Discord budget inside `REQUEST_TIMEOUT`.
+/// Queued event work waits at most this long, then is refused `in_progress`
+/// before any claim.
 const EVENT_GATE_WAIT: Duration = Duration::from_secs(8);
 
 /// The test seam is module-private: runtime effects can only use the admitted
@@ -377,8 +377,8 @@ async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Re
     };
     match tokio::time::timeout(REQUEST_TIMEOUT, receive(&state, request, &id)).await {
         Ok(response) => response,
-        // If a claim was committed, dropping the future retains it. A fresh
-        // nonce with that intent can only see InFlight/NeedsReconciliation.
+        // Dropping the future retains an announcement claim (a fresh nonce sees
+        // InFlight or NeedsReconciliation); event mutations finish in their own task.
         Err(_) => state.reject(
             Failure::code(ErrorCode::UpstreamTimeout),
             KeyLabel::Invalid,
@@ -515,7 +515,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
         });
         return match task.await {
             Ok(response) => response,
-            Err(_) => state.reject(Failure::code(ErrorCode::Internal), key, action, id),
+            Err(_) => state.reject(Failure::reconciliation(), key, action, id),
         };
     }
     // This second fence is explicit: core phase-1 defaults are not capabilities.

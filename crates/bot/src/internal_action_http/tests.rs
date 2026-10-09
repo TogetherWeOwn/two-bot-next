@@ -1577,6 +1577,7 @@ async fn event_create_mirror_failure_leaves_the_key_unmapped_and_unknown() {
 struct DelayedEventMutate {
     delay: Duration,
     event_id: &'static str,
+    entered: Arc<tokio::sync::Notify>,
 }
 
 impl EventMutateEffect for DelayedEventMutate {
@@ -1587,6 +1588,7 @@ impl EventMutateEffect for DelayedEventMutate {
         _: &'a str,
     ) -> BoxFuture<'a, Result<Value, EventActionError>> {
         Box::pin(async move {
+            self.entered.notify_one();
             tokio::time::sleep(self.delay).await;
             Ok(json!({"event_id": self.event_id}))
         })
@@ -1598,9 +1600,11 @@ async fn event_mutation_completes_its_receipt_after_the_client_is_dropped() {
     let Some(db) = database().await else { return };
     let _flag = INTERNAL_FLAG_LOCK.lock().await;
     set_event_cancel_flag(false);
+    let entered = Arc::new(tokio::sync::Notify::new());
     let mutates: Arc<dyn EventMutateEffect> = Arc::new(DelayedEventMutate {
         delay: Duration::from_millis(300),
         event_id: CREATE_EVENT_ID,
+        entered: Arc::clone(&entered),
     });
     let reads: Arc<dyn EventReadEffect> = Arc::new(MockEventRead::default());
     let effect: Arc<dyn ActionEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
@@ -1612,15 +1616,9 @@ async fn event_mutation_completes_its_receipt_after_the_client_is_dropped() {
         mutates,
     )));
     let raw = upsert_payload("dropped");
-    let client = tokio::time::timeout(
-        Duration::from_millis(50),
-        answer(app.clone(), signed(&raw, "old", "intent-dropped")),
-    )
-    .await;
-    assert!(
-        client.is_err(),
-        "the client gives up before the mutation answers"
-    );
+    let client = tokio::spawn(answer(app.clone(), signed(&raw, "old", "intent-dropped")));
+    entered.notified().await;
+    client.abort();
     let mut completed: i64 = 0;
     for _ in 0..200 {
         completed = sqlx::query_scalar(
