@@ -16,6 +16,7 @@ use twilight_model::{
     id::{marker::GuildMarker, Id},
 };
 use two_bot_core::{
+    automod_runtime::FunnelDisposition,
     custom_commands::AutomationMessageAcceptance,
     feature_commands::FeatureGates,
     moderation::ModerationGates,
@@ -72,6 +73,35 @@ fn acceptance_without_inspector(automod: Option<&str>) -> AutomationMessageAccep
         AutomationMessageAcceptance::AutomodDisabled
     } else {
         AutomationMessageAcceptance::Unavailable
+    }
+}
+
+/// Automod verdict for one MessageCreate, as decided in gateway order by the
+/// serial dispatch worker. An accepted create behaves like an unmatched
+/// inspection; every other verdict fails closed. A missing verdict is never
+/// acceptance: the worker's bool precheck may let an unscreened create through,
+/// and this mapping is the second fence.
+pub fn acceptance_for_verdict(verdict: Option<FunnelDisposition>) -> AutomationMessageAcceptance {
+    match verdict {
+        Some(FunnelDisposition::Accept) => AutomationMessageAcceptance::Unmatched,
+        Some(FunnelDisposition::CaptureOnly) => AutomationMessageAcceptance::CaptureOnly,
+        // `None` dispositions belong to edits, never creates: a create carrying
+        // one is unexpected, so refuse it like a match.
+        Some(FunnelDisposition::None) => AutomationMessageAcceptance::Matched,
+        None => AutomationMessageAcceptance::Unavailable,
+    }
+}
+
+fn effective_acceptance(
+    configured: AutomationMessageAcceptance,
+    verdict: Option<FunnelDisposition>,
+) -> AutomationMessageAcceptance {
+    // `TWO_AUTOMOD=0` never waits for a verdict: the disabled fast path stays
+    // exactly as configured. Every other configuration needs the verdict.
+    if configured == AutomationMessageAcceptance::AutomodDisabled {
+        configured
+    } else {
+        acceptance_for_verdict(verdict)
     }
 }
 
@@ -202,19 +232,16 @@ impl GatewayCommands {
         }
     }
 
-    /// Detached prefix-trigger dispatch with the configured acceptance, which
-    /// stays fail-closed until an automod verdict producer exists. The
-    /// immutable pre-send attempt claim fences reordered or replayed events.
-    pub async fn handle_message(&self, message: &Message) {
+    /// Detached prefix-trigger dispatch with the automod verdict for this
+    /// create. A disabled configuration keeps its fast-path acceptance;
+    /// every other configuration resolves the verdict (absent fails closed).
+    /// The immutable pre-send attempt claim fences reordered or replayed events.
+    pub async fn handle_message(&self, message: &Message, verdict: Option<FunnelDisposition>) {
+        let acceptance = effective_acceptance(self.acceptance, verdict);
         let guild_name = self.guild_name();
         if let Err(error) = self
             .runtime
-            .handle_message(
-                message,
-                self.acceptance,
-                self.text_commands,
-                Some(&guild_name),
-            )
+            .handle_message(message, acceptance, self.text_commands, Some(&guild_name))
             .await
         {
             tracing::warn!(error = %error, "custom-command trigger finished without confirmed success");
@@ -245,6 +272,72 @@ mod tests {
                 AutomationMessageAcceptance::Unavailable
             );
         }
+    }
+
+    #[test]
+    fn automod_verdict_maps_to_trigger_acceptance() {
+        // Allow: an accepted create behaves like an unmatched inspection.
+        assert_eq!(
+            acceptance_for_verdict(Some(FunnelDisposition::Accept)),
+            AutomationMessageAcceptance::Unmatched
+        );
+        assert!(acceptance_for_verdict(Some(FunnelDisposition::Accept)).permits_automations());
+        // Deny: containment and unexpected edit-like verdicts never run triggers.
+        assert_eq!(
+            acceptance_for_verdict(Some(FunnelDisposition::CaptureOnly)),
+            AutomationMessageAcceptance::CaptureOnly
+        );
+        assert_eq!(
+            acceptance_for_verdict(Some(FunnelDisposition::None)),
+            AutomationMessageAcceptance::Matched
+        );
+        for verdict in [
+            Some(FunnelDisposition::CaptureOnly),
+            Some(FunnelDisposition::None),
+        ] {
+            assert!(!acceptance_for_verdict(verdict).permits_automations());
+        }
+        // Absent: a missing verdict fails closed.
+        assert_eq!(
+            acceptance_for_verdict(None),
+            AutomationMessageAcceptance::Unavailable
+        );
+        assert!(!acceptance_for_verdict(None).permits_automations());
+    }
+
+    #[test]
+    fn disabled_automod_keeps_fast_path_without_a_verdict() {
+        assert_eq!(
+            effective_acceptance(
+                AutomationMessageAcceptance::AutomodDisabled,
+                Some(FunnelDisposition::Accept)
+            ),
+            AutomationMessageAcceptance::AutomodDisabled
+        );
+        assert_eq!(
+            effective_acceptance(AutomationMessageAcceptance::AutomodDisabled, None),
+            AutomationMessageAcceptance::AutomodDisabled
+        );
+        assert!(
+            effective_acceptance(AutomationMessageAcceptance::AutomodDisabled, None)
+                .permits_automations()
+        );
+        // Any other configuration resolves the verdict, and absent stays closed.
+        assert_eq!(
+            effective_acceptance(
+                AutomationMessageAcceptance::Unavailable,
+                Some(FunnelDisposition::Accept)
+            ),
+            AutomationMessageAcceptance::Unmatched
+        );
+        assert_eq!(
+            effective_acceptance(AutomationMessageAcceptance::Unavailable, None),
+            AutomationMessageAcceptance::Unavailable
+        );
+        assert!(
+            !effective_acceptance(AutomationMessageAcceptance::Unavailable, None)
+                .permits_automations()
+        );
     }
 
     #[test]

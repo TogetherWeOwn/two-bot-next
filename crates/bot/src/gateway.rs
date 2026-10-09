@@ -917,8 +917,10 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             {
                                 if let Some(runtime) = command_runtime.as_ref() {
                                     // Detached spawn from the blocking worker needs the runtime.
+                                    // The verdict travels with the event; a missing
+                                    // verdict fails closed inside the trigger handler.
                                     let _guard = handle.enter();
-                                    runtime.dispatch(&dispatch.event);
+                                    runtime.dispatch_with_verdict(&dispatch.event, disposition);
                                 }
                             }
                             if !requests.is_empty() {
