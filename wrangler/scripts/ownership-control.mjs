@@ -56,7 +56,7 @@ function withEarlierRefusal(error, earlier, summary) {
   return new ControlError(`Ownership control failed; ${detail}; stop, do not change credentials`);
 }
 
-export async function control({ action, url, token, actor, expectedEpoch, releaseFence = false, takeoverAttempts = 34, takeoverRetryDelayMs = 10000, takeoverWindowMs = 330000 }, send = fetch, wait = sleep) {
+export async function control({ action, url, token, actor, expectedEpoch, expectedDeploymentId, releaseFence = false, takeoverAttempts = 34, takeoverRetryDelayMs = 10000, takeoverWindowMs = 330000 }, send = fetch, wait = sleep) {
   const origin = new URL(url);
   if (origin.protocol !== "https:" || origin.port || origin.username || origin.password ||
       !/^two-bot-next-staging\.[a-z0-9-]+\.workers\.dev$/.test(origin.hostname) ||
@@ -103,14 +103,25 @@ export async function control({ action, url, token, actor, expectedEpoch, releas
         return current;
       }
       // Our epoch committed but this read is answered by a different deployment than
-      // the one that owns it: the answering version is stale, and posting at the
-      // fresh epoch would hand that stale version a further commit, so never re-post
-      // into it. Reads from converging versions are otherwise ordinary: the fresh
-      // epoch is always re-read, so old-to-new propagation recovers on the next post.
+      // the one that owns it. Either side can be the stale one: the answering
+      // version may lag behind our commit (refuse: posting at the fresh epoch
+      // would hand that stale version a further commit), or the owner may still
+      // sit on the old version while the new one has started answering (forward
+      // handover: re-post at the fresh epoch so the deployed version commits).
+      // The deploy step validates the Wrangler receipt before the transfer, so
+      // when the expected deployment is known, refuse only answers that are not
+      // the deployed version. Without it, fail closed and refuse. Reads from
+      // converging versions are otherwise ordinary: the fresh epoch is always
+      // re-read, so old-to-new propagation recovers on the next post.
       // Crash-recovery (fenced) still re-posts.
       if (postedEpoch !== undefined && current.owner?.phase === "active" && current.owner.epoch === postedEpoch &&
           current.owner.deploymentId !== current.deploymentId) {
-        throw new ControlError("Ownership transition not confirmed; posted epoch is owned by another deployment; refusing to post, preserve maintenance");
+        if (expectedDeploymentId !== undefined && !/^[a-zA-Z0-9_-]{1,128}$/.test(expectedDeploymentId)) {
+          throw new ControlError("Expected deployment id is invalid; stop before posting");
+        }
+        if (expectedDeploymentId === undefined || current.deploymentId !== expectedDeploymentId) {
+          throw new ControlError("Ownership transition not confirmed; posted epoch is owned by another deployment; refusing to post, preserve maintenance");
+        }
       }
       expectedEpoch = current.owner?.epoch ?? 0;
     }
@@ -149,6 +160,7 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
       token: process.env.OWNERSHIP_CONTROL_TOKEN,
       actor: process.env.OWNERSHIP_ACTOR,
       expectedEpoch: epoch === undefined ? undefined : Number(epoch),
+      expectedDeploymentId: process.env.OWNERSHIP_EXPECTED_DEPLOYMENT || undefined,
       releaseFence: process.env.OWNERSHIP_RELEASE_FENCE === "true",
     });
     console.log(JSON.stringify(result));

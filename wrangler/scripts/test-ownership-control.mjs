@@ -99,6 +99,42 @@ test('deployment-takeover refuses to re-post into a stale version after our epoc
   assert.deepEqual(f.waits, [10000]);
 });
 
+test('deployment-takeover re-posts the forward handover to the expected deployment', async () => {
+  // Old version answers the first read and the POST commits epoch 81 to it, a
+  // 5xx follows (the outer Worker maps a DO stub exception to 503 when the
+  // object restarts for the code update), then the new version answers with the
+  // owner still on the old deployment. The answering version is the deployed
+  // one, so re-post at the fresh epoch and hand ownership over.
+  const oldRead = { status: 200, body: { deploymentId: 'old-deployment', owner: { ...owner(80), deploymentId: 'old-deployment' }, running: false } };
+  const newRead = { status: 200, body: { deploymentId: 'new-deployment', owner: { ...owner(81), deploymentId: 'old-deployment' }, running: false } };
+  const handedOver = { status: 200, body: { deploymentId: 'new-deployment', owner: owner(82), running: false } };
+  const f = fixture([oldRead, http(502), newRead, handedOver]);
+  const result = await f.invoke({ action: 'deployment-takeover', expectedDeploymentId: 'new-deployment' });
+  assert.equal(result.owner.epoch, 82);
+  assert.equal(result.owner.deploymentId, 'new-deployment');
+  assert.deepEqual(f.calls, ['GET', 'POST', 'GET', 'POST']);
+  assert.deepEqual(f.waits, [10000]);
+});
+
+test('deployment-takeover refuses a stale answer when the expected deployment is pinned', async () => {
+  // Our POST committed epoch 81 to the deployed version, but this retry read is
+  // answered by the old version. The answering version is not the deployed one,
+  // so stop without posting instead of handing the stale version a commit.
+  const staleAnswer = { status: 200, body: { deploymentId: 'old-deployment', owner: owner(81), running: false } };
+  const f = fixture([ok(80), http(503), staleAnswer]);
+  await assert.rejects(f.invoke({ action: 'deployment-takeover', expectedDeploymentId: 'new-deployment' }), /posted epoch is owned by another deployment/);
+  assert.deepEqual(f.calls, ['GET', 'POST', 'GET']);
+  assert.deepEqual(f.waits, [10000]);
+});
+
+test('deployment-takeover rejects an invalid expected deployment id before posting', async () => {
+  const other = { status: 200, body: { deploymentId: 'new-deployment', owner: { ...owner(81), deploymentId: 'other-deployment' }, running: false } };
+  const f = fixture([ok(80), http(503), other]);
+  await assert.rejects(f.invoke({ action: 'deployment-takeover', expectedDeploymentId: 'not a deployment id!' }), /Expected deployment id is invalid/);
+  assert.deepEqual(f.calls, ['GET', 'POST', 'GET']);
+  assert.deepEqual(f.waits, [10000]);
+});
+
 test('deployment-takeover tolerates retry reads answered by converging versions', async () => {
   // Reads from old and new versions are ordinary before anything committed: the
   // fresh epoch is re-read every attempt, so version flaps never block the post.
