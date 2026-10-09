@@ -13,10 +13,14 @@ a required value or an implemented consumer. Secret defaults are never rendered.
 
 - `env_only`: never dashboard-stored. Unknown names and `TWO_INTERNAL_*` fail closed.
 - `cold` / `hot`: legacy-catalog storage classes, not application promises.
-The Container startup (`crates/bot/src/main.rs`) constructs no settings
-cache/store, poller or reload consumer, so no stored (`guild_settings`)
-value is read at boot or on reload — including after a restart. A
-database-only value such as `TWO_AUTOMATIONS=1` stays disabled. Keys in
+The Container registers a `guild_settings` poll job
+(`crates/bot/src/website_jobs.rs:152`) publishing through
+`settings_jobs::live` (`crates/bot/src/settings_jobs.rs:53`), but no feature
+runtime reads that snapshot yet; stored reads happen only through per-runtime
+store refreshes (`raid_runtime.rs:136`, `containment_runtime.rs:186`). Gateway
+feature gates still come from process environment only, so a database-only
+value such as `TWO_AUTOMATIONS=1` stays disabled (re-checked at `bce86a791`).
+Keys in
 legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`
 partition in `settings.rs`); every other storable key reports cold.
 

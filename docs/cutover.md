@@ -156,7 +156,7 @@ has RESUME disabled (see below).
 
 ## Tool availability and command sheet
 
-Baseline checked: `44338b2` on 2026-09-30. Recheck candidate **source parsing**
+Baseline checked: `bce86a791` on 2026-10-09. Recheck candidate **source parsing**
 before invoking tools. `two-bot` with no subcommand starts the server;
 `two-bot serve` is **not** supported. For baseline help-only inspection, use
 **only `two-bot --help`** (top-level).
@@ -211,20 +211,22 @@ Do not use `dedupe-events` during cutover: it defaults to deletion and has no
 guild fence. Their exact behavior is in the
 [cutover CLI sources](../crates/cutover/src/bin) and is outside this procedure.
 
-### Planned copy, registry and preflight tools
+### Merged copy, registry and preflight tools
 
-The following are **planned, not merged into this baseline**; do not paste them
-into a production shell or invent flags to make them work:
+The following are merged in this baseline (re-checked at `bce86a791`); do not
+paste them into a production shell without the cutover executor's approval:
 
-| Planned invocation | Owner / use / missing evidence |
+| Merged invocation | Source / use / limit |
 |---|---|
-| `legacy_copy` (separate cutover binary), default dry-run; `--apply`, `--allow-live-target` planned | [TOG-10868](/TOG/issues/TOG-10868): per-group legacy→Next mapping and row-count plan. Pending schema groups must fail, not be omitted. Exact source/target binding flags and verification invocation require merged tool documentation. A forward upsert is **not** a rollback delta exporter |
-| `two-bot commands diff` | [TOG-10860](/TOG/issues/TOG-10860): read current guild registry and compare to compiled desired registry; no PUT/no gateway |
-| `two-bot commands publish --apply` | Same card: explicit overwrite; default dry-run and live-guild opt-in required. Verify final flag spelling after merge; global snapshot/restore is not implied by a guild tool |
-| `two-bot preflight --json` | [TOG-10858](/TOG/issues/TOG-10858): read-only REST identity/intents/role/channel checks, FAIL vs WARN. Verify target selection and live-target guards after merge |
+| `legacy_copy` (separate cutover binary), default dry-run; `--apply`, `--allow-live-target` | `crates/cutover/src/bin/legacy_copy.rs:9-18`: per-group legacy→Next mapping and row-count plan. Pending schema groups fail, not omitted. A forward upsert is **not** a rollback delta exporter |
+| `two-bot commands diff` | `crates/bot/src/commands_cli.rs:19-28`: read current guild registry and compare to compiled desired registry; no PUT/no gateway |
+| `two-bot commands publish --apply` | Same source: explicit overwrite; default dry-run and `--allow-live-guild` opt-in required. Global snapshot/restore is not implied by a guild tool |
+| `two-bot preflight --json` | `crates/bot/src/preflight.rs:31-40`: read-only REST identity/intents/role/channel checks, FAIL vs WARN |
 
-No `commands restore`, complete database delta export/reverse-import, or
-`--disable-resume` command is established by this baseline. Gateway RESUME is
+No `commands restore` (registry), complete database delta export/reverse-import, or
+`--disable-resume` command is established by this baseline (re-checked at
+`bce86a791`: `commands_cli.rs` offers only `diff`/`publish`, no `restore`;
+no `disable-resume`/`RESUME=0` in `crates/bot/src`). Gateway RESUME is
 automatic; there is no verified disable environment flag either. Do not invent
 `RESUME=0`, delete session rows or omit the database to force a fresh session.
 These are required **capabilities**, not claimed existing subcommands. B4 must
