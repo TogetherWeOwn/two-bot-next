@@ -74,6 +74,35 @@ test('deployment-takeover retry after a committed takeover does not take over ag
   assert.deepEqual(f.waits, [10000]);
 });
 
+test('deployment-takeover retry that finds a committed takeover running is not confirmed and not posted again', async () => {
+  const f = fixture([ok(80), http(503), { status: 200, body: { deploymentId: 'new-deployment', owner: owner(81), running: true } }]);
+  await assert.rejects(f.invoke({ action: 'deployment-takeover' }), /Ownership transition not confirmed/);
+  assert.deepEqual(f.calls, ['GET', 'POST', 'GET']);
+});
+
+test('deployment-takeover retry does not read another owner at the posted epoch as its own takeover', async () => {
+  const other = { status: 200, body: { deploymentId: 'new-deployment', owner: { ...owner(81), deploymentId: 'other-deployment' }, running: false } };
+  const f = fixture([ok(80), http(503), other, ok(82)]);
+  const result = await f.invoke({ action: 'deployment-takeover' });
+  assert.equal(result.owner.epoch, 82);
+  assert.deepEqual(f.calls, ['GET', 'POST', 'GET', 'POST']);
+});
+
+test('deployment-takeover retry after a fenced pending takeover posts again', async () => {
+  const pending = { status: 200, body: { deploymentId: 'new-deployment', owner: { ...owner(81), phase: 'fenced' }, running: false } };
+  const f = fixture([ok(80), http(503), pending, ok(82)]);
+  const result = await f.invoke({ action: 'deployment-takeover', releaseFence: true });
+  assert.equal(result.owner.epoch, 82);
+  assert.deepEqual(f.calls, ['GET', 'POST', 'GET', 'POST']);
+});
+
+test('deployment-takeover does not read an owner without an epoch as a committed takeover', async () => {
+  const f = fixture([{ status: 200, body: { deploymentId: 'new-deployment', owner: { deploymentId: 'new-deployment', phase: 'active' }, running: false } }, ok(1)]);
+  const result = await f.invoke({ action: 'deployment-takeover' });
+  assert.equal(result.owner.epoch, 1);
+  assert.deepEqual(f.calls, ['GET', 'POST']);
+});
+
 test('deployment-takeover gives up after thirty-four attempts inside the bounded window', async () => {
   const f = fixture(Array.from({ length: 34 }, () => http(503)));
   assert.match(await failure(f.invoke({ action: 'deployment-takeover' })),

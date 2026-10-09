@@ -96,9 +96,12 @@ export async function control({ action, url, token, actor, expectedEpoch, releas
       if (current.owner?.phase !== "active" && !releaseFence) {
         throw new ControlError("Singleton is intentionally fenced or uninitialized; explicit staging release required");
       }
-      // A 5xx after a committed takeover leaves the owner active at the posted epoch; do not take over again.
+      // A 5xx after a committed takeover leaves the owner active at the posted epoch; confirm it without posting again.
       if (postedEpoch !== undefined && current.owner?.phase === "active" && current.owner.epoch === postedEpoch &&
-          current.owner.deploymentId === current.deploymentId) return current;
+          current.owner.deploymentId === current.deploymentId) {
+        if (current.running) throw new ControlError("Ownership transition not confirmed; preserve maintenance");
+        return current;
+      }
       expectedEpoch = current.owner?.epoch ?? 0;
     }
     if (!Number.isSafeInteger(expectedEpoch) || expectedEpoch < 0) throw new ControlError("Explicit expected epoch is required");
