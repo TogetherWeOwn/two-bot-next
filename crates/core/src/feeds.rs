@@ -1,10 +1,11 @@
 //! Framework-free feed commands, parsing and polling decisions.
 //! Side effects belong to the shared router/REST executor, not this module.
 
-use crate::feeds_http::{validate_source, FetchError, MAX_FEED_BYTES};
+use crate::feeds_http::{validate_source, FetchError, MAX_FEED_BYTES, MAX_FEED_SOURCE_BYTES};
 use roxmltree::{Document, Node, ParsingOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::HashSet;
 use thiserror::Error;
 
@@ -57,6 +58,8 @@ pub enum FeedError {
     TooManyItems,
     #[error("Feed item has no stable key.")]
     MissingKey,
+    #[error("Feed item URL is invalid or too long to post.")]
+    InvalidItemUrl,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +166,9 @@ fn validate_id(id: &str) -> Result<(), FeedError> {
 }
 
 pub fn normalize_source(kind: FeedKind, source: &str) -> Result<String, FeedError> {
+    if source.len() > MAX_FEED_SOURCE_BYTES {
+        return Err(FetchError::InvalidSource.into());
+    }
     let source = source.trim();
     if kind == FeedKind::Youtube
         && (20..=32).contains(&source.len())
@@ -177,6 +183,20 @@ pub fn normalize_source(kind: FeedKind, source: &str) -> Result<String, FeedErro
     Ok(validate_source(source)?.to_string())
 }
 
+const MAX_FEED_LIST_SOURCE_UNITS: usize = 128;
+
+fn truncate_feed_list_source(source: &str) -> String {
+    let truncated = truncate_utf16(source, MAX_FEED_LIST_SOURCE_UNITS);
+    if truncated == source {
+        truncated
+    } else {
+        format!(
+            "{}…",
+            truncate_utf16(&truncated, MAX_FEED_LIST_SOURCE_UNITS - 1)
+        )
+    }
+}
+
 pub fn feed_list_text(feeds: &[FeedRelay]) -> String {
     if feeds.is_empty() {
         return "No feed relays configured.".into();
@@ -185,12 +205,12 @@ pub fn feed_list_text(feeds: &[FeedRelay]) -> String {
         &feeds
             .iter()
             .map(|feed| {
+                let source = truncate_feed_list_source(&feed.source);
                 format!(
-                    "`{}` {} → <#{}> {}",
+                    "`{}` {} → <#{}> {source}",
                     feed.id,
                     feed.kind.as_str(),
-                    feed.channel_id,
-                    feed.source
+                    feed.channel_id
                 )
             })
             .collect::<Vec<_>>()
@@ -279,6 +299,38 @@ fn bound_xml_resources(xml: &str) -> Result<(), FeedError> {
 }
 
 pub fn parse_xml_feed(xml: &str) -> Result<Vec<FeedItem>, FeedError> {
+    // Without the relay kind, use the widest budget accepted by any feed kind.
+    parse_xml_feed_with_url_limit(xml, MAX_RSS_TWITCH_ITEM_URL_UTF16_UNITS, &Cell::new(0))
+}
+
+pub fn parse_xml_feed_for_kind(xml: &str, kind: FeedKind) -> Result<Vec<FeedItem>, FeedError> {
+    parse_xml_feed_report(xml, kind).map(|parsed| parsed.items)
+}
+
+/// Parsed items plus how many entries the parser dropped only because their
+/// URL carries `@everyone`/`@here` text, which the shared REST sanitizer would
+/// rewrite. Handles that merely start with `here` or `everyone` match too, so
+/// the managed poller logs the count to make a silent relay diagnosable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedFeed {
+    pub items: Vec<FeedItem>,
+    pub mention_urls_filtered: usize,
+}
+
+pub fn parse_xml_feed_report(xml: &str, kind: FeedKind) -> Result<ParsedFeed, FeedError> {
+    let filtered = Cell::new(0);
+    let items = parse_xml_feed_with_url_limit(xml, max_feed_item_url_utf16_units(kind), &filtered)?;
+    Ok(ParsedFeed {
+        items,
+        mention_urls_filtered: filtered.get(),
+    })
+}
+
+fn parse_xml_feed_with_url_limit(
+    xml: &str,
+    max_url_utf16_units: usize,
+    mention_urls_filtered: &Cell<usize>,
+) -> Result<Vec<FeedItem>, FeedError> {
     if xml.len() > MAX_FEED_BYTES {
         return Err(FetchError::TooLarge.into());
     }
@@ -382,7 +434,10 @@ pub fn parse_xml_feed(xml: &str) -> Result<Vec<FeedItem>, FeedError> {
             .unwrap_or(raw_url.clone());
             let key = decode_xml_entities(&raw_key);
             let url = decode_xml_entities(&raw_url);
-            if key.is_empty() || !is_item_url(&url) {
+            if key.is_empty() || !is_item_url(&url, max_url_utf16_units) {
+                if has_mass_mention_url(&url) {
+                    mention_urls_filtered.set(mention_urls_filtered.get() + 1);
+                }
                 return None;
             }
             let raw_title = raw_scalar_field(xml, entry, "title");
@@ -891,13 +946,44 @@ fn scan_attributes(tag: &str, visit: &mut dyn FnMut(&str, Option<&str>) -> bool)
     true
 }
 
-fn is_item_url(value: &str) -> bool {
-    url::Url::parse(value).is_ok_and(|url| {
+const DISCORD_MESSAGE_CONTENT_LIMIT: usize = 2000;
+const MAX_YOUTUBE_ITEM_URL_UTF16_UNITS: usize =
+    DISCORD_MESSAGE_CONTENT_LIMIT - "New YouTube upload: ****\n".len() - 1;
+const MAX_RSS_TWITCH_ITEM_URL_UTF16_UNITS: usize =
+    DISCORD_MESSAGE_CONTENT_LIMIT - "Twitch update: ****\n".len() - 1;
+
+fn max_feed_item_url_utf16_units(kind: FeedKind) -> usize {
+    match kind {
+        FeedKind::Youtube => MAX_YOUTUBE_ITEM_URL_UTF16_UNITS,
+        FeedKind::Rss | FeedKind::Twitch => MAX_RSS_TWITCH_ITEM_URL_UTF16_UNITS,
+    }
+}
+
+fn parse_item_url(value: &str) -> Option<url::Url> {
+    url::Url::parse(value).ok().filter(|url| {
         matches!(url.scheme(), "http" | "https")
             && url.host().is_some()
             && url.username().is_empty()
             && url.password().is_none()
     })
+}
+
+fn is_item_url(value: &str, max_url_utf16_units: usize) -> bool {
+    parse_item_url(value).is_some_and(|url| {
+        item_url_for_message(&url)
+            .is_some_and(|message_url| message_url.encode_utf16().count() <= max_url_utf16_units)
+    })
+}
+
+/// Filter URLs that the shared REST sanitizer would rewrite; encoding `@` can
+/// change the destination of a path or query.
+fn item_url_for_message(url: &url::Url) -> Option<&str> {
+    let url = url.as_str();
+    (!crate::message_safety::contains_mass_mention(url)).then_some(url)
+}
+
+fn has_mass_mention_url(value: &str) -> bool {
+    parse_item_url(value).is_some_and(|url| item_url_for_message(&url).is_none())
 }
 
 pub fn item_key(item: &FeedItem) -> Result<String, FeedError> {
@@ -929,25 +1015,75 @@ pub struct FeedPost {
 
 pub fn plan_post(feed: &FeedRelay, item: &FeedItem) -> Result<FeedPost, FeedError> {
     let key = item_key(item)?;
+    let parsed_url = parse_item_url(&item.url).ok_or(FeedError::InvalidItemUrl)?;
+    let item_url = item_url_for_message(&parsed_url).ok_or(FeedError::InvalidItemUrl)?;
+    if item_url.encode_utf16().count() > max_feed_item_url_utf16_units(feed.kind) {
+        return Err(FeedError::InvalidItemUrl);
+    }
     let prefix = match feed.kind {
         FeedKind::Youtube => "New YouTube upload",
         FeedKind::Twitch => "Twitch update",
         FeedKind::Rss => "New feed item",
     };
-    let title = if item.title.trim().is_empty() {
+    let raw_title = item.title.trim();
+    let raw_title = if raw_title.is_empty() {
         "Untitled"
     } else {
-        item.title.trim()
+        raw_title
     };
+    let fixed_units = format!("{prefix}: ****\n{item_url}").encode_utf16().count();
+    if fixed_units >= DISCORD_MESSAGE_CONTENT_LIMIT {
+        return Err(FeedError::InvalidItemUrl);
+    }
+    let title = crate::message_safety::neutralize_mentions(raw_title);
+    let title = truncate_escaped_markdown(&title, DISCORD_MESSAGE_CONTENT_LIMIT - fixed_units);
     Ok(FeedPost {
         feed_id: feed.id.clone(),
         channel_id: feed.channel_id.clone(),
         nonce: delivery_nonce(&feed.id, &key),
         item_key: key,
-        content: truncate_utf16(&format!("{prefix}: **{title}**\n{}", item.url), 2000),
+        content: truncate_utf16(
+            &format!("{prefix}: **{title}**\n{item_url}"),
+            DISCORD_MESSAGE_CONTENT_LIMIT,
+        ),
         suppress_mentions: true,
         enforce_nonce: true,
     })
+}
+
+/// Escape punctuation and flatten line breaks in feed-controlled text before
+/// inserting it into Discord's Markdown message content.
+fn escape_markdown(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\r' | '\n') {
+            escaped.push(' ');
+        } else {
+            if ch.is_ascii_punctuation() {
+                escaped.push('\\');
+            }
+            escaped.push(ch);
+        }
+    }
+    escaped
+}
+
+fn truncate_escaped_markdown(value: &str, limit: usize) -> String {
+    let escaped = escape_markdown(value);
+    if escaped.encode_utf16().count() <= limit {
+        return escaped;
+    }
+    if limit == 0 {
+        return String::new();
+    }
+
+    let mut truncated = truncate_utf16(&escaped, limit - 1);
+    let trailing_backslashes = truncated.chars().rev().take_while(|ch| *ch == '\\').count();
+    if trailing_backslashes % 2 == 1 {
+        truncated.pop();
+    }
+    truncated.push('…');
+    truncated
 }
 
 fn truncate_utf16(value: &str, limit: usize) -> String {

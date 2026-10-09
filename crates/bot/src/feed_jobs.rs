@@ -12,8 +12,8 @@ use sqlx::PgPool;
 use two_bot_core::{
     activation::LiveCapability,
     feeds::{
-        delivery_action, parse_xml_feed, poll_candidates, DeliveryAction, DeliveryClaim, FeedItem,
-        FeedPollSchedule, FeedPost, FeedRelay, MAX_FEED_POSTS_PER_POLL,
+        delivery_action, parse_xml_feed_report, poll_candidates, DeliveryAction, DeliveryClaim,
+        FeedItem, FeedPollSchedule, FeedPost, FeedRelay, MAX_FEED_POSTS_PER_POLL,
     },
     feeds_connector::fetch_feed,
     feeds_store::{self as store, FeedAudit},
@@ -130,18 +130,26 @@ impl FeedFetch for PublicFeedFetch {
             let fetched = fetch_feed(&feed.source)
                 .await
                 .map_err(|_| ErrorClass::Feed)?;
-            parse_fetched(fetched)
+            parse_fetched(fetched, &feed)
         })
     }
 }
 
 fn parse_fetched(
     fetched: two_bot_core::feeds_connector::FetchedFeed,
+    feed: &FeedRelay,
 ) -> Result<Vec<FeedItem>, ErrorClass> {
     if !fetched.status.is_success() {
         return Err(ErrorClass::Feed);
     }
-    parse_xml_feed(&fetched.body).map_err(|_| ErrorClass::Feed)
+    let parsed = parse_xml_feed_report(&fetched.body, feed.kind).map_err(|_| ErrorClass::Feed)?;
+    if parsed.mention_urls_filtered > 0 {
+        // Not an audit row: the entries stay in the feed, so a row per pass
+        // would repeat. One line per pass lets an operator find a silent relay.
+        tracing::warn!(job = NAME, feed_id = %feed.id, filtered = parsed.mention_urls_filtered,
+            "feed items skipped: item URL contains @everyone or @here text");
+    }
+    Ok(parsed.items)
 }
 
 /// The existing supervisor owns spawning, timeout, cancellation and join. A
