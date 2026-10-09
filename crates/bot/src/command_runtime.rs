@@ -143,12 +143,15 @@ pub type VoiceKickVote =
 /// `PRIVILEGED` is reserved for permission-gated slash commands from members who
 /// hold the permission; open interactions never enter it, so a burst of them
 /// cannot starve moderation. `BUSY` carries the one-call "busy" replies.
-pub(crate) const DISPATCH_LIMITS: [usize; 5] = [16, 16, 1, 8, 8];
+/// `REACTIONS` carries self-role reaction adds/removes so a panel burst cannot
+/// starve message automations (and a message burst cannot starve reactions).
+pub(crate) const DISPATCH_LIMITS: [usize; 6] = [16, 16, 1, 8, 8, 8];
 pub(crate) const LANE_MESSAGES: usize = 0;
 const LANE_INTERACTIONS: usize = 1;
 const LANE_REGISTRY: usize = 2;
 const LANE_PRIVILEGED: usize = 3;
 const LANE_BUSY: usize = 4;
+pub(crate) const LANE_REACTIONS: usize = 5;
 
 #[derive(Default)]
 struct DispatchTasks {
@@ -758,8 +761,8 @@ impl CommandRuntime {
     }
 
     /// Test-only lane depth: prunes finished tasks, then reports the live
-    /// count for `lane`. Reactions share `LANE_MESSAGES`; the bound test
-    /// asserts this never exceeds `DISPATCH_LIMITS[LANE_MESSAGES]`.
+    /// count for `lane`. Reactions use `LANE_REACTIONS`; the bound test
+    /// asserts this never exceeds `DISPATCH_LIMITS[LANE_REACTIONS]`.
     #[cfg(test)]
     pub(crate) fn lane_in_flight(&self, lane: usize) -> usize {
         let mut tasks = self.tasks.lock().expect("command task scope");
@@ -941,9 +944,9 @@ impl CommandRuntime {
         }
     }
 
-    /// Reactions share the message lane: a reaction burst must not consume
-    /// interaction acknowledgement capacity, and saturation drops with only
-    /// a log line, exactly like message bursts.
+    /// Reactions use the dedicated reaction lane: a reaction burst must not
+    /// consume interaction acknowledgement or message automation capacity,
+    /// and saturation drops with only a log line, exactly like message bursts.
     fn dispatch_self_role_reaction(&self, reaction: &GatewayReaction, remove: bool) -> bool {
         if !self.interactions.router.gates().self_roles {
             return true;
@@ -954,7 +957,7 @@ impl CommandRuntime {
         let Some(input) = service.reaction_input(reaction, remove) else {
             return true;
         };
-        self.spawn(LANE_MESSAGES, async move {
+        self.spawn(LANE_REACTIONS, async move {
             let _ = service.handle(&input).await;
         })
     }
