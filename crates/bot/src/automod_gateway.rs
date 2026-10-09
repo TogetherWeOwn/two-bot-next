@@ -22,12 +22,15 @@ use sqlx::PgPool;
 use tracing::warn;
 use two_bot_core::automod_runtime::{
     AutomodClaimLedger, AutomodRuntime, AutomodScope, FunnelDisposition, MessageDelivery,
+    MessageDeliveryKind,
 };
 use two_bot_core::automod_store::AutomodStore;
 use two_bot_core::moderation::ModerationGates;
 use two_bot_core::AutomodConfig;
 use two_bot_discord::automod::{partial_edit_delivery, PartialEdit};
-use two_bot_discord::automod_activation::{AutomodActivation, AutomodFacts, RestAutomodFacts};
+use two_bot_discord::automod_activation::{
+    Activation, ActivationOutcome, AutomodActivation, AutomodFacts, RestAutomodFacts,
+};
 use two_bot_discord::ActionExecutor;
 
 use crate::jobs::{self, Job};
@@ -127,20 +130,37 @@ pub(crate) fn partial_edit(text: &str, receipt_ms: u64) -> Option<MessageDeliver
     Some(partial_edit_delivery(&edit, receipt_ms))
 }
 
-/// Run one delivery through the activation and return the disposition for the
-/// funnel's single call. A timeout never becomes acceptance: a create keeps raw
-/// capture only.
+/// What one delivery decided: `funnel` is its single call into the funnel and
+/// `trigger` is what prefix triggers may act on. A delivery the activation never
+/// inspected keeps its funnel accept but gives triggers no verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkerVerdict {
+    pub(crate) funnel: FunnelDisposition,
+    pub(crate) trigger: Option<FunnelDisposition>,
+}
+
+fn verdict_of(activation: &Activation, kind: MessageDeliveryKind) -> WorkerVerdict {
+    let funnel = activation.uncommitted_disposition(kind);
+    let trigger = (!matches!(activation.outcome, ActivationOutcome::Bypassed)).then_some(funnel);
+    WorkerVerdict { funnel, trigger }
+}
+
+/// Run one delivery through the activation. A timeout never becomes acceptance:
+/// a create keeps raw capture only and gives triggers no verdict.
 pub(crate) async fn process<L: AutomodClaimLedger, F: AutomodFacts>(
     activation: &AutomodActivation<L, F>,
     delivery: MessageDelivery,
     at_iso: &str,
-) -> FunnelDisposition {
+) -> WorkerVerdict {
     let kind = delivery.kind;
     match tokio::time::timeout(PROCESS_MAX, activation.process(delivery, at_iso)).await {
-        Ok(result) => result.uncommitted_disposition(kind),
+        Ok(result) => verdict_of(&result, kind),
         Err(_) => {
             warn!("automod delivery timed out; claim left for reconciliation");
-            kind.funnel(true)
+            WorkerVerdict {
+                funnel: kind.funnel(true),
+                trigger: None,
+            }
         }
     }
 }

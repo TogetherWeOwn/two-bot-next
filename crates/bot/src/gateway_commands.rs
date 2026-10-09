@@ -65,9 +65,10 @@ fn config_error() -> sqlx::Error {
     sqlx::Error::InvalidArgument("gateway command configuration invalid".into())
 }
 
-/// The ordinary message pipeline currently captures facts but has no automod
-/// inspector. Only an explicit disabled configuration is known acceptance.
-/// Missing, enabled, and malformed values must not turn capture into permission.
+/// Bootstrap acceptance for a create with no per-create verdict. Only an
+/// explicit disabled configuration is known acceptance. Every other value stays
+/// `Unavailable` here; an enabled automod takes its acceptance from the worker's
+/// verdict in `acceptance_for_verdict`.
 fn acceptance_without_inspector(automod: Option<&str>) -> AutomationMessageAcceptance {
     if automod == Some("0") {
         AutomationMessageAcceptance::AutomodDisabled

@@ -55,14 +55,15 @@ publisher runs on READY/RESUMED; no builtin-only publication can erase custom ro
 The combined mock gateway fixture checks registry coexistence and single replies
 for custom, management, feed and sticky commands. It is added, not locally run.
 
-The ordinary message pipeline still has **no automod inspection service**. Prefix
-execution therefore requires an explicit `TWO_AUTOMOD=0`, in addition to both
-custom-command gates. Missing, malformed, or enabled automod configuration yields
-`Unavailable` and no prefix lookup/send. This deliberately stricter interim rule
-must not be presented as automod enforcement or unmatched/exempt integration.
-Neither `MessageCreate` nor `capture_only: false` proves acceptance. Completing
-normal automod-enabled prefix operation still requires the ordinary path's actual
-inspection result, not a second matcher in this custom-command adapter.
+Prefix execution also needs the automod verdict that the serial dispatch worker
+decides for each create, in addition to both custom-command gates. An explicit
+`TWO_AUTOMOD=0` keeps the disabled fast path and needs no verdict. With
+`TWO_AUTOMOD=1`, only an `Accept` verdict (`Unmatched`) permits prefix lookup and
+send; a matched create (`CaptureOnly`) or a create automod did not inspect (no
+verdict) yields a refusal with no prefix lookup/send. Missing or malformed
+`TWO_AUTOMOD` values yield `Unavailable`.
+Neither `MessageCreate` nor `capture_only: false` proves acceptance; only the
+worker's verdict does. This adapter runs no second matcher.
 
 Runtime dispatch and checkpoint persistence share one total deadline: the lesser
 of five seconds and one quarter of HELLO's heartbeat interval. Readiness stays
@@ -114,7 +115,7 @@ inspection, and capture-only operation. Only the first three permit automations.
 A match rejects prefix execution even in dry-run mode or when sanctions/deletion
 were refused. Missing services and unknown errors fail closed. The caller must
 reuse the existing inspection result; this slice does not run a second matcher or
-claim to implement the missing automod service. The ordinary message path must
+implement automod itself. The ordinary message path must
 complete before invoking the callback.
 
 This is based on legacy `two-bot` revision

@@ -214,7 +214,8 @@ async fn a_stalled_delivery_times_out_without_becoming_acceptance() {
             delivery(MessageDeliveryKind::Create),
             "2026-10-02T00:00:00.000Z"
         )
-        .await,
+        .await
+        .funnel,
         FunnelDisposition::CaptureOnly
     );
     assert_eq!(
@@ -223,7 +224,42 @@ async fn a_stalled_delivery_times_out_without_becoming_acceptance() {
             delivery(MessageDeliveryKind::Update),
             "2026-10-02T00:00:00.000Z"
         )
-        .await,
+        .await
+        .funnel,
         FunnelDisposition::None
+    );
+}
+
+#[test]
+fn uninspected_create_keeps_funnel_accept_without_trigger_verdict() {
+    let bypassed = Activation {
+        disposition: FunnelDisposition::Accept,
+        outcome: ActivationOutcome::Bypassed,
+    };
+    assert_eq!(
+        verdict_of(&bypassed, MessageDeliveryKind::Create),
+        WorkerVerdict {
+            funnel: FunnelDisposition::Accept,
+            trigger: None,
+        }
+    );
+}
+
+#[test]
+fn settled_clean_create_hands_its_accept_to_triggers() {
+    let clean = Activation {
+        disposition: FunnelDisposition::CaptureOnly,
+        outcome: ActivationOutcome::Duplicate(Some(StoredOutcome {
+            matched: false,
+            deleted: false,
+            outcome: two_bot_core::automod_runtime::CompletionKind::Accepted,
+        })),
+    };
+    assert_eq!(
+        verdict_of(&clean, MessageDeliveryKind::Create),
+        WorkerVerdict {
+            funnel: FunnelDisposition::Accept,
+            trigger: Some(FunnelDisposition::Accept),
+        }
     );
 }
