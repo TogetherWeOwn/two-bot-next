@@ -4,7 +4,11 @@ Threat-model [F6](threat-model.md) requires authenticated TLS for Neon. The
 `two_bot_core::database_tls` module fences the database URL before SQLx parses
 it. `two_bot_cutover::connect` (cutover CLIs, `two-bot db roles verify` and the
 bot's website/community job pool) calls it after the `database_url` key
-allowlist and before `connect_options`.
+allowlist and before `connect_options`. The three send-admission pools share
+one helper (`website_jobs::admission_pool_with_tls`, used by the website jobs,
+the preflight `admission_transport` and the commands CLI `executor`) that does
+the same: `database_url::validate`, `database_tls::enforce`, `connect_options`,
+`database_tls::apply`, plus the statement timeout and the acquire timeout.
 
 ## Setting
 
@@ -16,8 +20,13 @@ allowlist and before `connect_options`.
 | `local-only` | `LocalOnly` | Tests and CI only, explicitly. |
 
 Any other value, including an empty or non-UTF-8 one, refuses the connection.
-The Worker forwards only `DISCORD_TOKEN`, `DATABASE_URL` and `GUILD_ID` to the
-container (`wrangler/src/index.ts`), so the deployed bot always runs `Required`.
+The Worker forwards `DISCORD_TOKEN`, `DATABASE_URL` and `GUILD_ID` plus the
+reviewed `TWO_*` flag allowlist (`forwardedFlagVars`), `DISCORD_APPLICATION_ID`,
+the lobby channel, `LISTEN_ADDR` and the private-receiver lines into the
+container (`containerEnvVars` in `wrangler/src/index.ts:271-310`, allowlist in
+`wrangler/src/container-env.ts`). `TWO_DATABASE_TLS` is explicitly not
+forwarded (it stays in `NOT_FORWARDED`), so the deployed bot never sees it and
+always runs `Required`.
 The setting is not a dashboard setting: `settings::classify_key` refuses
 unknown names.
 
@@ -83,8 +92,10 @@ that nothing reaches logs.
 Fenced: every caller of `two_bot_cutover::connect`, the gateway store pool
 (`two_bot_store::connect_pool`, via `connect_pool_with_tls`), both
 `two-bot backup` URL parses (`backup_cli::open_pool`, via
-`open_pool_with_tls`, and `governed_guild_config_api`), and
-`channel_moderation_store::connect` (via `connect_with_tls`).
+`open_pool_with_tls`, and `governed_guild_config_api`),
+`channel_moderation_store::connect` (via `connect_with_tls`), and the three
+send-admission pools (`website_jobs::admission_pool_with_tls` for the website
+jobs, the preflight `admission_transport` and the commands CLI `executor`).
 
 F6 stays open until the deployment card records a non-secret TLS receipt.
 
