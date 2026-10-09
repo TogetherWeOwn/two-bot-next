@@ -697,15 +697,17 @@ fn observe_voice_operation(op: &'static str, outcome: &'static str) {
     }
 }
 
-/// Minimum seconds between `voice actor load failed` warns; every failure
+/// Minimum seconds between `voice actor load failed` warns (process-wide: a
+/// burst of failures across guilds names only the first); every failure
 /// still bumps `two_bot_db_errors_total{op="other"}`.
 const VOICE_ACTOR_LOAD_WARN_INTERVAL_SECS: u64 = 300;
 /// Last wall-clock second a load-failure warn was emitted.
 static VOICE_ACTOR_LOAD_WARN_LAST_SECS: AtomicU64 = AtomicU64::new(0);
 
 /// A failed `GuildRoomWorker::load` must not silently drop the guild actor:
-/// count it and warn (throttled). The actor respawns on the next gateway
-/// event via `UnboundedSender::is_closed`.
+/// count it and warn (throttled). The actor respawns on the next guild
+/// snapshot (`publish_snapshot` on `GuildCreate`/resumed replay); meanwhile
+/// voice, channel and role events for the guild are dropped by `live_actor`.
 fn observe_voice_actor_load_failure(guild: Snowflake, error: &StoreError) {
     metrics::global().db_error("other");
     let now_secs = SystemTime::now()
@@ -721,7 +723,7 @@ fn observe_voice_actor_load_failure(guild: Snowflake, error: &StoreError) {
         warn!(
             guild_id = guild.to_string(),
             error = %error,
-            "voice actor load failed; actor respawns on the next event"
+            "voice actor load failed; actor respawns on the next guild snapshot"
         );
     }
 }
