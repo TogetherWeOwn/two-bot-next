@@ -267,8 +267,9 @@ leaves both stored outputs untouched. A manifest that fails, stays unknown
 after a timeout, or is denied also leaves no seal; an unknown manifest may
 still have landed.
 
-**Coverage.** `unknown` without authority (T unset or references missing), for a
-writer claim with every slot committed, or for a run that is merely open (no
+**Coverage.** `unknown` without authority (T or its evidence unset, or, in
+`staging` mode, a missing reference), for a writer claim with every slot
+committed, or for a run that is merely open (no
 seal and no claim, or no claim) with nothing else wrong. A seal removed while
 the claim still names it is a `READ_MISMATCH`, so that is `incomplete`.
 `incomplete` for any loss, mismatch, unverified entry or blocking flag.
