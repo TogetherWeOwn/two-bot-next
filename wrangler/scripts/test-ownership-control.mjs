@@ -84,7 +84,7 @@ test('deployment-takeover default bound covers the deferred code update window',
   const wait = async (ms) => { now += ms; };
   const error = await control({ url: STAGING, token: TOKEN, actor: ACTOR, action: 'deployment-takeover' }, send, wait).then(() => null, (e) => e);
   assert.match(error.message, /^Ownership control failed \(HTTP 503\) reason=deployment_mismatch attempts=\d+ elapsed=\d+s/);
-  assert.ok(now <= 360000, `last refusal ended at ${now} ms`);
+  assert.ok(now >= 300000 && now <= 360000, `last refusal ended at ${now} ms`);
 });
 
 test('deployment-takeover succeeds on the last attempt inside the window', async () => {
