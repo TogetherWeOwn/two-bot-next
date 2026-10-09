@@ -802,9 +802,17 @@ function controlRequest(body?: object, token = CONTROL_TOKEN): Request {
 }
 
 test("authenticated takeover is CAS audited, tears down first and never auto-starts", async (t) => {
-  const h = await harness(t);
-  await h.bot.fetch(probeRequest("https://worker.invalid/health"));
-  const result = await h.bot.fetch(controlRequest({ action: "takeover", expectedEpoch: 1, actor: "fixture-operator" }));
+  // A same-owner exact-epoch repeat is a no-op, so the commit path is
+  // exercised by a fresh deployment at the fresh epoch.
+  const h = await harness(t, { ...WORKER_ENV, CF_VERSION_METADATA: { id: "deployment-B" } }, { running: true });
+  // Reconstruction already tore down the previous owner's live process
+  // (destroys is 1); the takeover below must not start a replacement.
+  const asB = (body?: object) => {
+    const request = controlRequest(body);
+    request.headers.set(DEPLOYMENT_HEADER, "deployment-B");
+    return request;
+  };
+  const result = await h.bot.fetch(asB({ action: "takeover", expectedEpoch: 1, actor: "fixture-operator" }));
   assert.equal(result.status, 200);
   const state = await result.json();
   assert.equal(state.owner.epoch, 2);
@@ -813,13 +821,75 @@ test("authenticated takeover is CAS audited, tears down first and never auto-sta
   assert.ok(Number.isFinite(Date.parse(state.owner.timestamp)));
   assert.equal(state.running, false);
   assert.equal(h.runtime.destroys, 1);
-  assert.equal(h.starts.length, 1, "control must not start replacement");
+  assert.equal(h.starts.length, 0, "control must not start replacement");
   assert.deepEqual(h.values.get(`${AUDIT_PREFIX}2:active`), state.owner);
-  assert.equal((await h.bot.fetch(controlRequest({ action: "takeover", expectedEpoch: 1, actor: "fixture-operator" }))).status, 409);
+  assert.equal((await h.bot.fetch(asB({ action: "takeover", expectedEpoch: 1, actor: "fixture-operator" }))).status, 409);
   await h.bot.keepalive(KEEPALIVE, { taskId: "stale-task" });
-  assert.equal(h.starts.length, 1, "old epoch is harmless even on the same deployment");
+  assert.equal(h.starts.length, 0, "old epoch is harmless even on the same deployment");
+  const probe = probeRequest("https://worker.invalid/health");
+  probe.headers.set(DEPLOYMENT_HEADER, "deployment-B");
+  await h.bot.fetch(probe);
+  assert.equal(h.starts.length, 1);
+});
+
+test("same-owner exact-epoch takeover repeat is a read-only no-op", async (t) => {
+  const h = await harness(t);
   await h.bot.fetch(probeRequest("https://worker.invalid/health"));
-  assert.equal(h.starts.length, 2);
+  const destroys = h.runtime.destroys;
+  const logMark = h.logs.length;
+  // The harness presets deployment-A active at epoch 1, so this is a repeat.
+  const repeat = await h.bot.fetch(controlRequest({ action: "takeover", expectedEpoch: 1, actor: "fixture-operator" }));
+  assert.equal(repeat.status, 200);
+  const state = await repeat.json();
+  assert.equal(state.owner.epoch, 1);
+  assert.equal(state.owner.deploymentId, "deployment-A");
+  assert.equal(state.owner.phase, "active");
+  assert.equal(h.runtime.destroys, destroys, "no-op must not tear down");
+  assert.ok([...h.values.keys()].every((key) => !String(key).startsWith(AUDIT_PREFIX)), "no-op writes no audit row");
+  const fresh = h.logs.slice(logMark).join("\n");
+  assert.ok(fresh.includes("two-bot ownership takeover already applied at epoch 1"));
+  assert.ok(!fresh.includes("two-bot ownership change:"), "no-op must not log a change that never happened");
+  assert.equal((await h.bot.fetch(probeRequest("https://worker.invalid/health"))).status, 200);
+});
+
+test("same-owner exact-epoch takeover while recoveryFailed still destroys and clears", async (t) => {
+  const epoch2 = { ...ACTIVE_OWNER, epoch: 2, oldEpoch: 1 };
+  const h = await harness(t, WORKER_ENV, { owner: epoch2 });
+  await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+  // Simulate an unconfirmed teardown: the repeat must re-run the full
+  // sequence, never silently clear the flag without tearing down.
+  (h.bot as unknown as { recoveryFailed: boolean }).recoveryFailed = true;
+  const destroys = h.runtime.destroys;
+  const logMark = h.logs.length;
+  const repeat = await h.bot.fetch(controlRequest({ action: "takeover", expectedEpoch: 2, actor: "fixture-operator" }));
+  assert.equal(repeat.status, 200);
+  const state = await repeat.json();
+  assert.equal(state.owner.epoch, 3);
+  assert.equal(h.runtime.destroys, destroys + 1, "recovery must actually tear down");
+  assert.deepEqual(h.values.get(`${AUDIT_PREFIX}3:active`), state.owner);
+  assert.equal((h.bot as unknown as { recoveryFailed: boolean }).recoveryFailed, false);
+  assert.ok(h.logs.slice(logMark).join("\n").includes("two-bot ownership change:"));
+  const again = await h.bot.fetch(controlRequest({ action: "takeover", expectedEpoch: 3, actor: "fixture-operator" }));
+  assert.equal(again.status, 200);
+  assert.equal((await again.json()).owner.epoch, 3, "flag clear restores the no-op");
+  assert.equal(h.runtime.destroys, destroys + 1);
+});
+
+test("different-deployment takeover at the fresh epoch still commits", async (t) => {
+  const h = await harness(t, { ...WORKER_ENV, CF_VERSION_METADATA: { id: "deployment-B" } });
+  const asB = (body?: object) => {
+    const request = controlRequest(body);
+    request.headers.set(DEPLOYMENT_HEADER, "deployment-B");
+    return request;
+  };
+  assert.equal((await h.bot.fetch(asB())).status, 200);
+  const result = await h.bot.fetch(asB({ action: "takeover", expectedEpoch: 1, actor: "fixture-operator" }));
+  assert.equal(result.status, 200);
+  const state = await result.json();
+  assert.equal(state.owner.epoch, 2);
+  assert.equal(state.owner.deploymentId, "deployment-B");
+  assert.equal(state.owner.phase, "active");
+  assert.equal(h.runtime.destroys, 0);
 });
 
 test("shutdown failure retains durable revocation and refuses warm proxying", async (t) => {

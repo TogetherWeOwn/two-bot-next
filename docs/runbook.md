@@ -334,7 +334,12 @@ node wrangler/scripts/ownership-control.mjs status
 Refresh the epoch before **each** change. `fence` is a persisted parking owner
 (`deploymentId=null`, `phase=fenced`); health/readyz and stale schedules refuse.
 Takeover/fence increment the epoch and record actor, timestamp, old/new epoch and
-owner. Durable revocation is written before awaited native destruction;
+owner, except a same-version repeat takeover by the deployment that already owns
+the active singleton: the Worker returns the stored record unchanged (no write,
+no audit row, no teardown) and the client stops with "Ownership transition not
+confirmed; preserve maintenance". That is the safe direction; the normal staging
+deploy path mints a new version id, so the verify gate is unaffected.
+Durable revocation is written before awaited native destruction;
 `running=false` is required before active release. A crash, storage-write failure
 or unconfirmed shutdown leaves denial; do not assume a 503 stopped the old
 process. Preserve maintenance until teardown is confirmed. 401/auth failure is
