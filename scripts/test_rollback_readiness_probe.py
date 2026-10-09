@@ -160,9 +160,18 @@ class RollbackReadinessProbeTests(unittest.TestCase):
         return next(line for key, line in results.items() if key.endswith(" readyz"))
 
     def test_every_real_server_state_is_accepted(self):
-        for label, response in READYZ.items():
+        for label in ("ready", "parked"):
             with self.subTest(label):
-                self.assertTrue(self.readyz(*response).startswith("PASS readyz"))
+                self.assertTrue(self.readyz(*READYZ[label]).startswith("PASS readyz"))
+
+    def test_database_and_token_faults_are_never_parked(self):
+        for label, component in (("database down", "database down"),
+                                 ("token invalid", "token_invalid down"),
+                                 ("gateway and database down", "database down")):
+            with self.subTest(label):
+                line = self.readyz(*READYZ[label])
+                self.assertTrue(line.startswith("FAIL readyz"), line)
+                self.assertIn(component, line)
 
     def test_parked_staging_gateway_is_a_truthful_response(self):
         self.assertIn("gateway starting (parked, not E2E approval)", self.readyz(*READYZ["parked"]))
@@ -171,36 +180,43 @@ class RollbackReadinessProbeTests(unittest.TestCase):
         process, gateway = ("process", "ready"), ("gateway", "ready")
         database, token = ("database", "ready"), ("token_invalid", "ready")
         accepted = {
-            "200 without the optional components": (200, readyz_body(process, gateway)),
             "200 with an unknown ready component": (200, readyz_body(process, gateway, database, token,
                                                                      ("voice", "ready"))),
-            "503 with gateway starting and token invalid": (503, readyz_body(
-                process, ("gateway", "starting"), ("token_invalid", "down"))),
-            "503 with gateway and database down": (503, readyz_body(
-                process, ("gateway", "down"), ("database", "down"), token)),
-            "503 with database and token invalid down": (503, readyz_body(
-                process, gateway, ("database", "down"), ("token_invalid", "down"))),
+            "503 with gateway starting": (503, readyz_body(process, ("gateway", "starting"), database, token)),
+            "503 with gateway down": (503, readyz_body(process, ("gateway", "down"), database, token)),
         }
         rejected = {
+            "200 without database or token_invalid": (200, readyz_body(process, gateway),
+                                                      "lacks database, token_invalid"),
             "200 with gateway starting": (200, readyz_body(process, ("gateway", "starting"), database, token),
                                           "unexpected components"),
             "200 with database down": (200, readyz_body(process, gateway, ("database", "down"), token),
                                        "unexpected components"),
             "200 with token invalid down": (200, readyz_body(process, gateway, database, ("token_invalid", "down")),
                                             "unexpected components"),
-            "200 with an unknown component down": (200, readyz_body(process, gateway, ("voice", "down")),
+            "200 with an unknown component down": (200, readyz_body(process, gateway, database, token,
+                                                                    ("voice", "down")),
                                                    "unexpected components"),
             "500 with a complete body": (500, readyz_body(process, gateway, database, token),
                                          "/readyz 500 with unexpected"),
             "503 with every component ready": (503, readyz_body(process, gateway, database, token),
                                                "unexpected components"),
-            "503 with process down": (503, readyz_body(("process", "down"), ("gateway", "down")),
+            "503 with process down": (503, readyz_body(("process", "down"), ("gateway", "down"), database, token),
                                       "unexpected components"),
-            "503 with an unknown component down": (503, readyz_body(process, gateway, ("voice", "down")),
+            "503 with an unknown component down": (503, readyz_body(process, ("gateway", "starting"), database,
+                                                                    token, ("voice", "down")),
                                                    "unexpected components"),
-            "missing process": (200, readyz_body(gateway, database), "lacks process"),
-            "missing gateway": (200, readyz_body(process, database), "lacks gateway"),
-            "empty breakdown": (200, readyz_body(), "lacks process, gateway"),
+            "503 with gateway starting and token invalid down": (503, readyz_body(
+                process, ("gateway", "starting"), database, ("token_invalid", "down")), "unexpected components"),
+            "503 with gateway and database down": (503, readyz_body(
+                process, ("gateway", "down"), ("database", "down"), token), "unexpected components"),
+            "503 with database and token invalid down": (503, readyz_body(
+                process, gateway, ("database", "down"), ("token_invalid", "down")), "unexpected components"),
+            "503 without database or token_invalid": (503, readyz_body(process, ("gateway", "starting")),
+                                                      "lacks database, token_invalid"),
+            "missing process": (200, readyz_body(gateway, database, token), "lacks process"),
+            "missing gateway": (200, readyz_body(process, database, token), "lacks gateway"),
+            "empty breakdown": (200, readyz_body(), "lacks process, gateway, database, token_invalid"),
             "duplicate component": (200, readyz_body(process, gateway, gateway), "repeats a component name"),
             "status outside ready, starting, down": (200, readyz_body(process, ("gateway", "ok")),
                                                      "without the bot's component breakdown"),
@@ -272,7 +288,8 @@ class RollbackReadinessProbeTests(unittest.TestCase):
                 "readyz", "did not respond (TimeoutError)"),
             "readyz gateway down at 200": (
                 lambda: None,
-                {"fetch": (200, b'{"components":[["process","ready"],["gateway","down"]]}')},
+                {"fetch": (200, readyz_body(("process", "ready"), ("gateway", "down"),
+                                            ("database", "ready"), ("token_invalid", "ready")))},
                 "readyz", "unexpected components"),
             "production env lacks TWO_GUILD_NAME": (
                 lambda: self.fx.config.write_text(missing_guild),
@@ -339,7 +356,7 @@ class RollbackReadinessProbeTests(unittest.TestCase):
             "negative sequence mark": (lines(sequences={"rsvp_events": -1}), None,
                                        "rsvp_events has an invalid high-water mark"),
             "no tables": (lines(tables=[]), None, "no table list"),
-            "duplicate table": (lines(tables=[manifest()["tables"][0]] * 2), None, "events is duplicated"),
+            "duplicate table": (lines(tables=[manifest()["tables"][0]]) * 2, None, "events is duplicated"),
             "bad row count": (lines(tables=[{**manifest()["tables"][0], "count": "2"}]), None,
                               "events has an invalid row count"),
             "no end marker": (good[:-1], None, "has no end marker: truncated"),
@@ -434,7 +451,7 @@ class ServerComponentDriftTests(unittest.TestCase):
             served.update(re.findall(r'"([a-z_]+)"\.to_owned\(\)', match.group(0)))
         fixtures = {name for _, body in READYZ.values() for name, _ in json.loads(body)["components"]}
         self.assertEqual(fixtures, served)
-        self.assertEqual({*probe.READYZ_REQUIRED, *probe.READYZ_PARKED}, served)
+        self.assertEqual(set(probe.READYZ_REQUIRED), served)
 
 
 class UserAgentTests(unittest.TestCase):
