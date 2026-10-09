@@ -200,10 +200,55 @@ test("invalid, empty and non-string Discord IDs are dropped, never forwarded", (
     DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID: "18446744073709551616",
     DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID: "-5",
   };
-  assert.deepEqual(forwardedDiscordIdVars(env), {});
-  const forwarded = containerEnv(env);
+  // Drops are loud (see next test); keep this test's output clean.
+  const warnings = captureWarnings(() => {
+    assert.deepEqual(forwardedDiscordIdVars(env), {});
+  });
+  assert.ok(warnings.length > 0, "expected drop warnings");
+  let forwarded: Record<string, string> = {};
+  captureWarnings(() => {
+    forwarded = containerEnv(env);
+  });
   for (const name of FORWARDED_DISCORD_IDS) {
     assert.equal(forwarded[name], undefined, name);
+  }
+});
+
+/** Run `fn` with console.warn captured; returns the joined messages. */
+function captureWarnings(fn: () => void): string[] {
+  const messages: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => {
+    messages.push(args.map(String).join(" "));
+  };
+  try {
+    fn();
+  } finally {
+    console.warn = original;
+  }
+  return messages;
+}
+
+test("dropped Discord IDs warn with the variable name, never the value", () => {
+  const warnings = captureWarnings(() => {
+    assert.deepEqual(
+      forwardedDiscordIdVars({
+        DISCORD_AUDIT_LOG_CHANNEL_ID: "not-a-snowflake",
+        DISCORD_LANDING_CHANNEL_IDS: "111, abc",
+        DISCORD_VOICE_LOG_CHANNEL_ID: "   ",
+        DISCORD_GOODBYE_CHANNEL_IDS: ", ,",
+        DISCORD_MODERATION_LOG_CHANNEL_ID: "",
+      }),
+      {},
+    );
+  });
+  // Loud drops: the two invalid values. Silent drops: unset-equivalents
+  // (empty, whitespace-only, all-empty list) and absent names.
+  assert.equal(warnings.length, 2, warnings.join("\n"));
+  assert.ok(warnings[0]!.includes("DISCORD_AUDIT_LOG_CHANNEL_ID"), warnings[0]);
+  assert.ok(warnings[1]!.includes("DISCORD_LANDING_CHANNEL_IDS"), warnings[1]);
+  for (const message of warnings) {
+    assert.doesNotMatch(message, /not-a-snowflake|111, abc/, `value leaked: ${message}`);
   }
 });
 

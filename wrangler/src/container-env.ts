@@ -199,14 +199,29 @@ function isForwardableDiscordId(name: string, value: string): boolean {
  * snowflakes, verbatim (an invalid, empty or whitespace-only value is
  * dropped: the Rust readers treat it as unset/disabled, never as a secret).
  * Unlisted names and non-string bindings are dropped.
+ *
+ * A present-but-invalid value is dropped loudly: the Worker logs the variable
+ * name (never the value) so a typo surfaces in Worker logs instead of
+ * silently disabling the destination while Rust reports it as unset.
  */
 export function forwardedDiscordIdVars(env: object): Record<string, string> {
   const source = env as Readonly<Record<string, unknown>>;
   const vars: Record<string, string> = {};
   for (const name of FORWARDED_DISCORD_IDS) {
     const value = source[name];
-    if (typeof value === "string" && isForwardableDiscordId(name, value)) {
+    if (typeof value !== "string" || value.trim() === "") continue;
+    // An all-empty list carries no IDs; keep dropping it silently so Rust
+    // sees "unset", as before.
+    if (
+      DISCORD_ID_LISTS.has(name) &&
+      value.split(",").every((part) => part.trim() === "")
+    ) {
+      continue;
+    }
+    if (isForwardableDiscordId(name, value)) {
       vars[name] = value;
+    } else {
+      console.warn(`[container-env] ignoring ${name}: not a Discord snowflake ID`);
     }
   }
   return vars;
