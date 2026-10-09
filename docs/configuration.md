@@ -26,6 +26,19 @@ Keys in
 legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`
 partition in `settings.rs`); every other storable key reports cold.
 
+The “stored unwired” labels in the table below come from the legacy
+`HOT_WIRED` list and boot-env list (`crates/core/src/settings.rs:232-238`).
+They do not show the per-runtime refresh reads above, which also apply stored
+values: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,
+`TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS` and `TWO_ANTI_NUKE_HEAT_THRESHOLD`
+(`crates/bot/src/containment_runtime.rs:61-67`, `:226`); join-risk applies
+`TWO_JOIN_RISK_THRESHOLD`, `TWO_JOIN_RISK_WINDOW_SECONDS` and
+`TWO_BULK_JOIN_WINDOW_UNTIL` (`crates/bot/src/join_risk_runtime.rs:66-70`,
+`:238`); raid applies `TWO_RAID_JOIN_THRESHOLD` and `TWO_RAID_WINDOW_SECONDS`
+(`crates/bot/src/raid_runtime.rs:45-46`, `:170`); onboarding merges its
+`CONFIG_KEYS` from the snapshot on each relevant
+event (`crates/bot/src/onboarding.rs:21-30`, `:175-182`).
+
 Gateway boot reads process environment only, through a fixed set of loaders:
 `Config::from_env` (`DISCORD_TOKEN`, `DATABASE_URL`, `LISTEN_ADDR`, `GUILD_ID`),
 `StickyRuntime::from_env` (`FeatureGates`: `TWO_AUTOMATIONS`, `TWO_ANNOUNCEMENTS`,
