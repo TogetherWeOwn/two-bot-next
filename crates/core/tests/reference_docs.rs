@@ -46,10 +46,12 @@ a required value or an implemented consumer. Secret defaults are never rendered.
   The Container registers a `guild_settings` poll job\n\
   (`crates/bot/src/website_jobs.rs:152`) publishing through\n\
   `settings_jobs::live` (`crates/bot/src/settings_jobs.rs:53`), but no feature\n\
-  runtime reads that snapshot yet; stored reads happen only through per-runtime\n\
-  store refreshes (`raid_runtime.rs:136`, `containment_runtime.rs:186`). Gateway\n\
-  feature gates still come from process environment only, so a database-only\n\
-  value such as `TWO_AUTOMATIONS=1` stays disabled (re-checked at `bce86a791`).\n\
+  runtime reads that snapshot yet; direct stored reads happen only through\n\
+  per-runtime store refreshes (`raid_runtime.rs:136`,\n\
+  `containment_runtime.rs:186`, `join_risk_runtime.rs:198`) and onboarding's\n\
+  per-event refresh (`onboarding.rs:167`). Gateway feature gates still come\n\
+  from process environment only, so a database-only value such as\n\
+  `TWO_AUTOMATIONS=1` stays disabled (re-checked at `bce86a791`).\n\
   Keys in\n\
   legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`\n\
   partition in `settings.rs`); every other storable key reports cold.\n\n\

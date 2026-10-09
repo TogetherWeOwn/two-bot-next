@@ -359,7 +359,7 @@ alongside an unconfirmed Next gateway.
 - The baseline has no wired scheduled-unban handoff/sweeper. Moderator sign-off
   must identify a verified executor for every pending deadline before GO:
   [moderation port boundary](../crates/core/src/moderation.rs#L7).
-- `/health` reports process liveness; `/readyz` covers process + gateway only.
+- `/health` reports process liveness; `/readyz` covers the three wired components (`process`, `gateway`, `database`, plus conditional `token_invalid`) (`crates/bot/src/server.rs:228-237`, `:196-198`; re-checked at `bce86a791`).
   The baseline server does not expose `/internal/actions` or `/metrics`:
   [HTTP routes and readiness](../crates/bot/src/server.rs#L21). Feature and
   internal-action acceptance therefore require separate merged runtime evidence.

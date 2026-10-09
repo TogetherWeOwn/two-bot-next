@@ -55,7 +55,9 @@ claim. Staging deploys from `main`; production is a separate manual gate.
   `guild_settings` poll (`crates/bot/src/website_jobs.rs:152`) publishes through
   `settings_jobs::live` (`crates/bot/src/settings_jobs.rs:53`) with no feature
   runtime reading that snapshot yet, so stored values reach the runtime only
-  through per-runtime store refreshes, if at all (see the reference;
+  through per-runtime store refreshes (`raid_runtime.rs:136`,
+  `containment_runtime.rs:186`, `join_risk_runtime.rs:198`) and onboarding's
+  per-event refresh (`onboarding.rs:167`), if at all (see the reference;
   re-checked at `bce86a791`).
 - [Gateway recovery runbook](docs/gateway-recovery.md): readiness, durable RESUME,
   failure handling and rollback.
