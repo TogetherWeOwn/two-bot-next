@@ -5,12 +5,34 @@ import io
 import os
 import tempfile
 import unittest
+from datetime import timedelta
 
-from gate5_outage import main, summarize
+from gate5_outage import main, parse_ts, summarize
+
+START = "2026-10-01T00:00:00Z"
+END = "2026-10-01T00:01:00Z"
+INTERVAL = ("--interval-start", START, "--interval-end", END)
 
 
-def run(text):
-    return summarize(io.StringIO(text))
+def run(text, start=START, end=END):
+    return summarize(io.StringIO(text), parse_ts(start), parse_ts(end))
+
+
+def cadence_log(first, seconds, step):
+    base = parse_ts(first)
+    return "".join(
+        '{"ts": "%s", "event": "readyz_ok"}\n' % (base + timedelta(seconds=offset)).isoformat()
+        for offset in range(0, seconds + 1, step))
+
+
+def cli(content, *args):
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "tick-log.jsonl")
+        with open(path, "wb") as handle:
+            handle.write(content)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = main([path, *args])
+    return code, out.getvalue()
 
 
 class Gate5OutageTests(unittest.TestCase):
@@ -201,20 +223,81 @@ class Gate5OutageTests(unittest.TestCase):
             with self.subTest(prefix=text[:24]):
                 self.assertEqual(run(text)["verdict"], "NOT VERIFIED")
 
-    def test_cli_exit_codes(self):
-        cases = (
-            ("clean", '{"ts": "2026-10-01T00:00:01Z", "event": "readyz_ok"}\n'
-                      '{"ts": "2026-10-01T00:00:02Z", "event": "readyz_ok"}\n', 0),
-            ("gapped", '{"ts": "2026-10-01T00:00:01Z", "event": "readyz_ok"}\n'
-                       '{"ts": "2026-10-01T01:00:01Z", "event": "readyz_ok"}\n', 1),
+    def test_duplicate_keys_are_not_verified(self):
+        summary = run(
+            '{"ts": "2026-10-01T00:00:00Z", "event": "readyz_ok"}\n'
+            '{"ts": "2026-10-01T00:00:10Z", "event": "readyz_fail", "event": "readyz_ok"}\n'
+            '{"ts": "2026-10-01T00:01:00Z", "event": "readyz_ok"}\n'
         )
-        with tempfile.TemporaryDirectory() as tmp:
-            for name, text, expected in cases:
-                path = os.path.join(tmp, f"{name}.jsonl")
-                with open(path, "w", encoding="utf-8") as handle:
-                    handle.write(text)
-                with self.subTest(case=name), contextlib.redirect_stdout(io.StringIO()):
-                    self.assertEqual(main([path]), expected)
+        self.assertIn("malformed line 2", summary["unknown_intervals"][0]["reason"])
+        self.assertEqual(summary["verdict"], "NOT VERIFIED")
+
+    def test_ready_status_conflict_is_not_verified(self):
+        summary = run(
+            '{"ts": "2026-10-01T00:00:00Z", "event": "readyz_ok"}\n'
+            '{"ts": "2026-10-01T00:00:10Z", "event": "readyz_fail", "status": 503}\n'
+            '{"ts": "2026-10-01T00:00:20Z", "event": "readyz_ok", "status": 503}\n'
+            '{"ts": "2026-10-01T00:00:30Z", "event": "readyz_ok"}\n'
+        )
+        self.assertIn("status", summary["unknown_intervals"][0]["reason"])
+        self.assertEqual(summary["verdict"], "NOT VERIFIED")
+
+    def test_offset_timestamps_are_normalised(self):
+        summary = run(
+            '{"ts": "2026-10-01T02:00:00+02:00", "event": "readyz_ok"}\n'
+            '{"ts": "2026-10-01T00:00:05Z", "event": "readyz_ok"}\n'
+        )
+        self.assertEqual(summary["window"]["start"], "2026-10-01T00:00:00+00:00")
+        self.assertEqual(summary["verdict"], "PASS")
+
+    def test_missing_or_reversed_interval_is_not_verified(self):
+        clean = ('{"ts": "2026-10-01T00:00:01Z", "event": "readyz_ok"}\n'
+                 '{"ts": "2026-10-01T00:00:02Z", "event": "readyz_ok"}\n')
+        self.assertEqual(summarize(io.StringIO(clean))["verdict"], "NOT VERIFIED")
+        self.assertEqual(run(clean, start=END, end=START)["verdict"], "NOT VERIFIED")
+
+    def test_short_capture_of_longer_interval_is_not_verified(self):
+        summary = run(cadence_log(START, 600, 30), end="2026-10-01T04:00:00Z")
+        self.assertEqual(summary["verdict"], "NOT VERIFIED")
+
+    def test_full_interval_at_30s_cadence_passes(self):
+        summary = run(cadence_log(START, 4 * 3600, 30), end="2026-10-01T04:00:00Z")
+        self.assertEqual(summary["verdict"], "PASS")
+
+    def test_log_starting_after_interval_start_is_not_verified(self):
+        summary = run(
+            '{"ts": "2026-10-01T00:02:00Z", "event": "readyz_ok"}\n'
+            '{"ts": "2026-10-01T00:02:30Z", "event": "readyz_ok"}\n'
+        )
+        self.assertEqual(summary["verdict"], "NOT VERIFIED")
+
+    def test_cli_passes_clean_log_with_bom(self):
+        content = (b"\xef\xbb\xbf"
+                   b'{"ts": "2026-10-01T00:00:01Z", "event": "readyz_ok"}\n'
+                   b'{"ts": "2026-10-01T00:00:02Z", "event": "readyz_ok"}\n')
+        code, out = cli(content, *INTERVAL)
+        self.assertEqual(code, 0)
+        self.assertIn('"verdict": "PASS"', out)
+
+    def test_cli_exit_codes(self):
+        clean = (b'{"ts": "2026-10-01T00:00:01Z", "event": "readyz_ok"}\n'
+                 b'{"ts": "2026-10-01T00:00:02Z", "event": "readyz_ok"}\n')
+        gapped = (b'{"ts": "2026-10-01T00:00:01Z", "event": "readyz_ok"}\n'
+                  b'{"ts": "2026-10-01T01:00:01Z", "event": "readyz_ok"}\n')
+        breach = (b'{"ts": "2026-10-01T00:00:00Z", "event": "readyz_fail", "status": 503}\n'
+                  b'{"ts": "2026-10-01T00:02:00Z", "event": "readyz_ok"}\n')
+        invalid_utf8 = b'{"ts": "2026-10-01T00:00:01\xff", "event": "readyz_ok"}\n'
+        cases = (
+            ("no interval", clean, (), 1, "NOT VERIFIED"),
+            ("gapped", gapped, INTERVAL, 1, "NOT VERIFIED"),
+            ("breach", breach, INTERVAL, 1, "NEEDS WORK"),
+            ("invalid utf-8", invalid_utf8, INTERVAL, 1, "NOT VERIFIED"),
+        )
+        for name, content, args, expected_code, verdict in cases:
+            with self.subTest(case=name):
+                code, out = cli(content, *args)
+                self.assertEqual(code, expected_code)
+                self.assertIn(verdict, out)
 
 
 if __name__ == "__main__":

@@ -18,28 +18,31 @@ Outage start is the first ``readyz_fail`` or ``tick_missed`` while healthy;
 recovery is the first ``readyz_ok`` after that. A repeated failure inside an
 open window does not move the start: the window always spans first failure
 to first recovery. Each recovered window carries ``outage_seconds`` rounded
-to 0.1 s, reusing the ``outage_seconds`` convention of
-``scripts/staging_container_drill.py`` (fence-to-first-ready). Any
-unrecognised ``event`` value or malformed line is preserved as an UNKNOWN
-interval, never silently dropped.
+to 0.1 s for display, reusing the ``outage_seconds`` convention of
+``scripts/staging_container_drill.py`` (fence-to-first-ready); verdicts use the
+unrounded duration. Any unrecognised ``event`` value or malformed line is
+preserved as an UNKNOWN interval, never silently dropped.
 
 A window still open when the log ends stays explicitly UNKNOWN
 (``status: "unknown"``, ``end: null``, ``outage_seconds: null``): like
 ``scripts/soak_evidence.py``, the outage length is unbounded there, so it is
 never scored as zero.
 
-Verdict: NEEDS WORK when a recovered outage is at or over the budget. PASS when
-no outage reaches the budget and the log holds no unknown evidence. Missing
-evidence is NOT VERIFIED, never PASS: an empty log, a silent gap longer than the
-budget, an out-of-order or unknown record, a log that began mid-outage, an
-outage still open at the end, a start that cannot be pinned within the budget
-(the last healthy sample is more than a budget before recovery), and an outage
-that recurs within a budget of its recovery. PASS covers the outage budget over
-the supplied log only; coverage of the acceptance interval is not checked here.
+Verdict: NEEDS WORK when a recovered outage is at or over the budget. PASS needs
+the acceptance interval and a log that covers it: the first record within a
+budget of the interval start, the last within a budget of its end, and no
+silent gap longer than a budget. Missing evidence is NOT VERIFIED, never PASS:
+no interval, an empty log, a silent gap, an out-of-order or unknown record, a
+log that began mid-outage, an outage still open at the end, a start that cannot
+be pinned within the budget (the last healthy sample is more than a budget
+before recovery), a readyz_ok with a non-200 status, and an outage that recurs
+within a budget of its recovery.
 
 Usage:
 
-    python3 scripts/gate5_outage.py path/to/tick-log.jsonl
+    python3 scripts/gate5_outage.py tick-log.jsonl --interval-start START --interval-end END
+
+START and END are the UTC acceptance-interval bounds from the approved soak record.
 """
 
 import argparse
@@ -70,16 +73,25 @@ def parse_ts(value):
     return moment.astimezone(timezone.utc)
 
 
-def summarize(lines):
+def _reject_duplicate_keys(pairs):
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("duplicate key in record")
+    return dict(pairs)
+
+
+def summarize(lines, interval_start=None, interval_end=None):
     """Fold JSONL tick-log lines into the Gate 5 outage summary dict."""
     readyz_ok = readyz_fail = tick_missed = 0
     outage_windows = []
     unknowns = []
     first_ts = last_ts = None
     last_healthy_ts = None  # the outage cannot have started before this sample
-    last_recovery_ts = None  # a recovery counts only after a budget of health
+    last_recovery_ts = None  # an outage recurring within a budget of this recovery
     outage_start = None  # ts of the first failure of the currently open window
     breach = False
+    interval_ok = (interval_start is not None and interval_end is not None
+                   and interval_end > interval_start)
 
     def note_unknown(start, end, reason):
         unknowns.append({
@@ -88,12 +100,15 @@ def summarize(lines):
             "reason": reason,
         })
 
+    if not interval_ok:
+        note_unknown(None, None, "acceptance interval missing or not after its start")
+
     for lineno, raw in enumerate(lines, 1):
         line = raw.strip()
         if not line:
             continue
         try:
-            record = json.loads(line)
+            record = json.loads(line, object_pairs_hook=_reject_duplicate_keys)
         except (ValueError, RecursionError):
             note_unknown(None, None, f"malformed line {lineno}: not JSON")
             continue
@@ -117,6 +132,9 @@ def summarize(lines):
         last_ts = ts
         event = record.get("event")
 
+        if event == RECOVERY_EVENT and record.get("status", 200) != 200:
+            note_unknown(ts, ts, f"readyz_ok with status {record.get('status')!r}")
+            continue
         if event == RECOVERY_EVENT:
             readyz_ok += 1
             if outage_start is not None:
@@ -165,6 +183,13 @@ def summarize(lines):
         })
     if not (readyz_ok or readyz_fail or tick_missed):
         note_unknown(None, None, "no readiness events in log")
+    if interval_ok and first_ts is not None:
+        if (first_ts - interval_start).total_seconds() > SILENT_GAP_LIMIT_S:
+            note_unknown(interval_start, first_ts,
+                         "log starts more than a budget after the interval start")
+        if (interval_end - last_ts).total_seconds() > SILENT_GAP_LIMIT_S:
+            note_unknown(last_ts, interval_end,
+                         "log ends more than a budget before the interval end")
 
     recovered = [window["outage_seconds"] for window in outage_windows
                  if window["status"] == "recovered"]
@@ -178,6 +203,10 @@ def summarize(lines):
         verdict = "PASS"
     return {
         "schema_version": SCHEMA_VERSION,
+        "acceptance_interval": {
+            "start": interval_start.isoformat() if interval_start else None,
+            "end": interval_end.isoformat() if interval_end else None,
+        },
         "window": {
             "start": first_ts.isoformat() if first_ts else None,
             "end": last_ts.isoformat() if last_ts else None,
@@ -196,9 +225,13 @@ def summarize(lines):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", help="readiness tick log in JSONL format")
+    parser.add_argument("--interval-start", type=parse_ts,
+                        help="acceptance interval start, UTC ISO-8601")
+    parser.add_argument("--interval-end", type=parse_ts,
+                        help="acceptance interval end, UTC ISO-8601")
     args = parser.parse_args(argv)
     with open(args.log, encoding="utf-8-sig", errors="replace") as handle:
-        summary = summarize(handle)
+        summary = summarize(handle, args.interval_start, args.interval_end)
     json.dump(summary, sys.stdout, indent=2)
     sys.stdout.write("\n")
     if summary["verdict"] != "PASS":
