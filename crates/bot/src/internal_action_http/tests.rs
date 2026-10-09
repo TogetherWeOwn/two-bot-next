@@ -1027,18 +1027,19 @@ async fn event_read_replayed_nonce_is_refused_without_a_second_discord_call() {
 
 #[tokio::test]
 async fn moderation_timeout_flag_off_is_refused_before_any_effect() {
+    let Some(db) = database().await else { return };
     let effect = Arc::new(MockEffect::new(MockOutcome::Success));
     let moderation = Arc::new(MockModeration::default());
-    let state = state_full(
-        lazy_pool(),
+    let app = router(state_full(
+        db.pool().clone(),
         effect.clone(),
         Arc::new(MockEventRead::default()),
         moderation.clone(),
-    );
+    ));
     let _flag = MODERATION_FLAG_LOCK.lock().await;
     set_moderation_flags(false);
     let (status, _, body) = answer(
-        router(state.clone()),
+        app.clone(),
         signed(&timeout_payload(), "old", "intent-timeout-flag-off"),
     )
     .await;
@@ -1047,6 +1048,7 @@ async fn moderation_timeout_flag_off_is_refused_before_any_effect() {
     assert_eq!(body["error"]["retryable"], false);
     assert_eq!(effect.calls(), 0);
     assert_eq!(moderation.calls(), 0);
+    db.close().await.unwrap();
 }
 
 #[tokio::test]
