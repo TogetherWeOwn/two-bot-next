@@ -9,9 +9,9 @@ Method: offline code search over `crates/bot/src/gateway.rs`,
 `crates/bot/src/main.rs`, `crates/bot/src/server.rs`,
 `crates/bot/src/shutdown.rs`, `crates/bot/src/gateway_metrics.rs`,
 `crates/bot/src/gateway_failure.rs`, `crates/core/src/metrics.rs` and
-`crates/bot/src/voice_rooms.rs`. File and line numbers were read on
-2026-10-03; they drift as the code moves, so re-run the search before
-quoting a line in an incident.
+`crates/bot/src/voice_rooms.rs`. Callsites name the file and the enclosing
+item (function or method), never a line number: line numbers drift as the
+code moves, so re-run the search before quoting a line in an incident.
 
 ## Gateway lifecycle log lines
 
@@ -19,49 +19,49 @@ The message string (last argument to the `tracing` macro) is the event
 name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 `guild_id` are context, not the name.
 
-| Event name | Callsite | Meaning |
+| Event name | Callsite (stable anchor) | Meaning |
 | --- | --- | --- |
-| `durable gateway initialized; shard connecting` | `crates/bot/src/main.rs:516` | Supervisor built the shard; `resume=true` means a saved checkpoint was offered, `false` means fresh IDENTIFY |
-| `gateway shard loop started` | `crates/bot/src/gateway.rs:495` | Reception task entered the Twilight stream loop |
-| `gateway reconnect failed; Twilight will retry` | `crates/bot/src/gateway.rs:371` | Transport reconnect attempt failed; Twilight owns the retry |
-| `cold resume committed; requesting voice snapshot via identify` | `crates/bot/src/gateway.rs:362` | Cold voice RESUME committed; reception IDENTIFies for a fresh voice snapshot |
-| `gateway ready; checkpoint committed` | `crates/bot/src/gateway.rs:671` | Dispatch committed and shard marked Connected |
-| `gateway leveling dispatch failed` | `crates/bot/src/gateway.rs:609` | Leveling funnel drain failed inside the checkpoint deadline |
-| `gateway community facts dispatch failed` | `crates/bot/src/gateway.rs:957` | Community facts drain failed; worker continues and the scorecard fails closed on missing coverage |
-| `gateway community facts dispatch timed out` | `crates/bot/src/gateway.rs:960` | Community facts drain missed the checkpoint deadline; worker continues and the scorecard fails closed on missing coverage |
-| `gateway onboarding job invalid` | `crates/bot/src/gateway.rs:1066` | Dispatch-worker durable onboarding payload failed to serialize; recorded as a typed error, checkpoint unchanged |
-| `onboarding interaction interrupted; member must reselect` | `crates/bot/src/gateway.rs:791` | Durable onboarding job recovered without callback credentials; kept as interruption receipt |
-| `invite counter read unavailable; retaining snapshot` | `crates/bot/src/gateway.rs:899` | REST invite read failed; persisted baseline kept instead of an empty listing |
-| `interaction acknowledgement blocked; advancing past lost callback` | `crates/bot/src/gateway.rs:287` | Ordered RSVP acknowledgement hit send-admission Blocked; checkpoint advances past the lost callback without replaying uncertain effects |
-| `interaction response failed; not replaying command` | `crates/bot/src/gateway.rs:290`, `:294`, `:300` | Ordered RSVP preparation or completion failed without admission blockage; command advances without replaying uncertain effects |
-| `READY identity differs from boot token; ordered identity not armed` | `crates/bot/src/gateway.rs:682` | READY application id differs from the boot/REST pin; ordered identity stays disarmed and its fence keeps refusing |
-| `gateway prerequisites missing; gateway parked, /readyz reports down` | `crates/bot/src/main.rs:564` | Token, database URL or guild ID missing; shard never starts |
-| `feature gates invalid; ordered interaction surface parked` | `crates/bot/src/main.rs:639` | Feature-gate parsing failed; gateway still boots, only the ordered interaction surface stays off |
-| `moderation gates invalid; ordered interaction surface parked` | `crates/bot/src/main.rs:646` | Moderation-gate parsing failed; gateway still boots, only the ordered interaction surface stays off |
-| `durable gateway failed; checkpoint unchanged, readiness unavailable` | `crates/bot/src/main.rs:617` | Gateway task failed with the fixed class in `error_class`; checkpoint not advanced |
-| `gateway task stopped; container restart required` | `crates/bot/src/main.rs:709` | Supervisor saw the essential task end; process must restart from checkpoint |
-| `gateway drain failed; restart required` | `crates/bot/src/main.rs:716` | Drain path failed; restart required |
-| `container service failed` | `crates/bot/src/main.rs:586` | Service supervisor failed (`startup_phase=service_supervisor`) |
-| `shutdown_deadline_exceeded: abandoning in-flight work` | `crates/bot/src/main.rs:724` | Drain deadline elapsed; in-flight work abandoned |
-| `listening` | `crates/bot/src/server.rs:176` | HTTP listener bound; one line per process start |
-| `SIGTERM received; draining` | `crates/bot/src/server.rs:221` | SIGTERM observed; effects drain before exit |
-| `SIGINT received; draining` | `crates/bot/src/server.rs:222` | SIGINT observed; effects drain before exit |
-| `shutdown_completed` | `crates/bot/src/server.rs:254` | HTTP graceful drain completed; stable `msg` name with no human message |
-| `response failed` | `crates/bot/src/server.rs:85,93` | HTTP 5xx response from the trace layer; DEBUG for the routine `/readyz` 503, ERROR otherwise |
-| `second shutdown signal received; exiting immediately` | `crates/bot/src/shutdown.rs:62` | Second signal during drain; process exits at once |
-| `invalid shutdown timeout; using default` | `crates/bot/src/shutdown.rs:36` | `SHUTDOWN_TIMEOUT_SECONDS` unparsable; default deadline kept |
-| `periodic job failed` | `crates/bot/src/jobs.rs:127` | Completed scheduled-job attempt failed; `job` and `error_class` name the job |
-| `TWO_VOICE=1 but no discord token; voice rooms disabled` | `crates/bot/src/gateway.rs:968` | Voice gate on but no token; gateway continues voice-off |
-| `TWO_VOICE=1 but no database URL; voice rooms disabled` | `crates/bot/src/gateway.rs:980` | Voice gate on but no database; gateway continues voice-off |
-| `voice database unavailable; voice rooms disabled` | `crates/bot/src/gateway.rs:989` | Voice store connect failed; gateway continues voice-off |
-| `voice rooms enabled; gateway sink attached` | `crates/bot/src/gateway.rs:995` | Voice runtime built; sink attached to the gateway writer |
-| `voice HTTP setup failed; voice rooms disabled` | `crates/bot/src/gateway.rs:999` | Voice HTTP setup failed; gateway continues voice-off |
+| `durable gateway initialized; shard connecting` | `crates/bot/src/main.rs` (`run`) | Supervisor built the shard; `resume=true` means a saved checkpoint was offered, `false` means fresh IDENTIFY |
+| `gateway shard loop started` | `crates/bot/src/gateway.rs` (`run_shard`) | Reception task entered the Twilight stream loop |
+| `gateway reconnect failed; Twilight will retry` | `crates/bot/src/gateway.rs` (`run_shard`) | Transport reconnect attempt failed; Twilight owns the retry |
+| `cold resume committed; requesting voice snapshot via identify` | `crates/bot/src/gateway.rs` (`run_shard`) | Cold voice RESUME committed; reception IDENTIFies for a fresh voice snapshot |
+| `gateway ready; checkpoint committed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Dispatch committed and shard marked Connected |
+| `gateway leveling dispatch failed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Leveling funnel drain failed inside the checkpoint deadline |
+| `gateway community facts dispatch failed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Community facts drain failed; worker continues and the scorecard fails closed on missing coverage |
+| `gateway community facts dispatch timed out` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Community facts drain missed the checkpoint deadline; worker continues and the scorecard fails closed on missing coverage |
+| `gateway onboarding job invalid` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Dispatch-worker durable onboarding payload failed to serialize; recorded as a typed error, checkpoint unchanged |
+| `onboarding interaction interrupted; member must reselect` | `crates/bot/src/gateway.rs` (`onboarding_queue`) | Durable onboarding job recovered without callback credentials; kept as interruption receipt |
+| `invite counter read unavailable; retaining snapshot` | `crates/bot/src/gateway.rs` (`HttpInvites::current`) | REST invite read failed; persisted baseline kept instead of an empty listing |
+| `interaction acknowledgement blocked; advancing past lost callback` | `crates/bot/src/gateway.rs` (`complete_acknowledgement`) | Ordered RSVP acknowledgement hit send-admission Blocked; checkpoint advances past the lost callback without replaying uncertain effects |
+| `interaction response failed; not replaying command` | `crates/bot/src/gateway.rs` (`complete_acknowledgement`, three sites) | Ordered RSVP preparation or completion failed without admission blockage; command advances without replaying uncertain effects |
+| `READY identity differs from boot token; ordered identity not armed` | `crates/bot/src/gateway.rs` (`run_shard`) | READY application id differs from the boot/REST pin; ordered identity stays disarmed and its fence keeps refusing |
+| `gateway prerequisites missing; gateway parked, /readyz reports down` | `crates/bot/src/main.rs` (`run`) | Token, database URL or guild ID missing; shard never starts |
+| `feature gates invalid; ordered interaction surface parked` | `crates/bot/src/main.rs` (`build_interaction_runtime`) | Feature-gate parsing failed; gateway still boots, only the ordered interaction surface stays off |
+| `moderation gates invalid; ordered interaction surface parked` | `crates/bot/src/main.rs` (`build_interaction_runtime`) | Moderation-gate parsing failed; gateway still boots, only the ordered interaction surface stays off |
+| `durable gateway failed; checkpoint unchanged, readiness unavailable` | `crates/bot/src/main.rs` (`publish_gateway_failure`) | Gateway task failed with the fixed class in `error_class`; checkpoint not advanced |
+| `gateway task stopped; container restart required` | `crates/bot/src/main.rs` (`supervise_gateway_bounded`) | Supervisor saw the essential task end; process must restart from checkpoint |
+| `gateway drain failed; restart required` | `crates/bot/src/main.rs` (`supervise_gateway_bounded`) | Drain path failed; restart required |
+| `container service failed` | `crates/bot/src/main.rs` (`run`) | Service supervisor failed (`startup_phase=service_supervisor`) |
+| `shutdown_deadline_exceeded: abandoning in-flight work` | `crates/bot/src/main.rs` (`supervise_gateway_bounded`) | Drain deadline elapsed; in-flight work abandoned |
+| `listening` | `crates/bot/src/server.rs` (`bind`) | HTTP listener bound; one line per process start |
+| `SIGTERM received; draining` | `crates/bot/src/server.rs` (`shutdown_signal`) | SIGTERM observed; effects drain before exit |
+| `SIGINT received; draining` | `crates/bot/src/server.rs` (`shutdown_signal`) | SIGINT observed; effects drain before exit |
+| `shutdown_completed` | `crates/bot/src/server.rs` (`serve_with_shutdown`) | HTTP graceful drain completed; stable `msg` name with no human message |
+| `response failed` | `crates/bot/src/server.rs` (`router_with_guard` trace layer, two sites) | HTTP 5xx response from the trace layer; DEBUG for the routine `/readyz` 503, ERROR otherwise |
+| `second shutdown signal received; exiting immediately` | `crates/bot/src/shutdown.rs` (`exit_on_second_signal`) | Second signal during drain; process exits at once |
+| `invalid shutdown timeout; using default` | `crates/bot/src/shutdown.rs` (`deadline_from`) | `SHUTDOWN_TIMEOUT_SECONDS` unparsable; default deadline kept |
+| `periodic job failed` | `crates/bot/src/jobs.rs` (`record_completion`) | Completed scheduled-job attempt failed; `job` and `error_class` name the job |
+| `TWO_VOICE=1 but no discord token; voice rooms disabled` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice gate on but no token; gateway continues voice-off |
+| `TWO_VOICE=1 but no database URL; voice rooms disabled` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice gate on but no database; gateway continues voice-off |
+| `voice database unavailable; voice rooms disabled` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice store connect failed; gateway continues voice-off |
+| `voice rooms enabled; gateway sink attached` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice runtime built; sink attached to the gateway writer |
+| `voice HTTP setup failed; voice rooms disabled` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice HTTP setup failed; gateway continues voice-off |
 
 ## Gateway metric event labels
 
-Fixed allowlist in `crates/core/src/metrics.rs:11-32`, observed in
-`crates/bot/src/gateway_metrics.rs:27-42`. Unknown dispatch types
-collapse to `other`; scrapers must match these exact spellings.
+Fixed allowlist `metrics::EVENTS` in `crates/core/src/metrics.rs`, observed in
+`Observer::observe_text` in `crates/bot/src/gateway_metrics.rs`. Unknown
+dispatch types collapse to `other`; scrapers must match these exact spellings.
 
 | Event label | Series | Meaning |
 | --- | --- | --- |
@@ -98,7 +98,8 @@ Scalar gateway series pair with the labels above:
 
 ## Gateway failure classes (`/readyz` `gateway_failure`)
 
-Enum in `crates/bot/src/gateway_failure.rs:80-95`, served as
+`FailureClass` enum in `crates/bot/src/gateway_failure.rs`
+(`FailureClass::ALL` / `as_str`), served as
 `{"phase":"durable_gateway","class":"…"}`. One class is logged once by
 `publish_gateway_failure`; SQL errors never reach the field.
 
@@ -130,12 +131,12 @@ Startup `error_class` values logged before fatal exits (see
 member, token, body or ID leaves the process. Included because the voice
 sink attaches to the gateway writer on the cutover path.
 
-| Field value | Callsite | Meaning |
+| Field value | Callsite (stable anchor) | Meaning |
 | --- | --- | --- |
-| `voice_event="voice_operation"` | `crates/bot/src/voice_rooms.rs:375` (`voice_operation succeeded`), `:382` (`voice_operation failed`) | One finished room create/move/delete outcome with bounded `op`/`outcome` |
-| `voice_event="voice_reconcile"` | `crates/bot/src/voice_rooms.rs:1470` (`voice_reconcile planned`) | One reconcile pass plan size with per-action counts |
-| `voice_event="voice_dead_letter"` | `crates/bot/src/voice_rooms.rs:2002` (`voice action dead-lettered`) | Queue write exhausted retries with bounded `action` and attempts |
-| `voice_event="voice_creator_orphan"` | `crates/bot/src/voice_rooms.rs:4904` (`voice creator orphan needs manual deletion`) | Untracked creator-channel orphan needing manual deletion |
+| `voice_event="voice_operation"` | `crates/bot/src/voice_rooms.rs` (`observe_voice_operation`: `voice_operation succeeded` / `voice_operation failed`) | One finished room create/move/delete outcome with bounded `op`/`outcome` |
+| `voice_event="voice_reconcile"` | `crates/bot/src/voice_rooms.rs` (`reconcile`: `voice_reconcile planned`) | One reconcile pass plan size with per-action counts |
+| `voice_event="voice_dead_letter"` | `crates/bot/src/voice_rooms.rs` (`mark_failed_observed`: `voice action dead-lettered`) | Queue write exhausted retries with bounded `action` and attempts |
+| `voice_event="voice_creator_orphan"` | `crates/bot/src/voice_rooms.rs` (`execute_create`: `voice creator orphan needs manual deletion`) | Untracked creator-channel orphan needing manual deletion |
 
 Adjacent actor message without a `voice_event` field:
 `voice actor load failed; actor respawns on the next guild snapshot`
