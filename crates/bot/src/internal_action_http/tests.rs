@@ -11,6 +11,7 @@ use two_bot_core::internal_actions::sign;
 use two_bot_testsupport::TestDatabase;
 
 mod adapter;
+mod settings;
 
 fn secret(index: usize) -> String {
     let fixture: Value = serde_json::from_str(include_str!(

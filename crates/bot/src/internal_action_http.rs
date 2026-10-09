@@ -1,6 +1,8 @@
-//! Private announcement receiver. Never merge this router into the health socket.
-//! Authentication and a committed nonce precede JSON; a committed intent precedes
-//! the effect. Cancellation leaves durable ownership, never a new execution lease.
+//! Private internal-action receiver (announcement, event read, settings).
+//! Never merge this router into the health socket. Authentication and a
+//! committed nonce precede JSON; a committed intent precedes the effect (except
+//! keyless reads). Cancellation leaves durable ownership, never a new execution
+//! lease.
 
 use std::{
     future::IntoFuture,
@@ -32,8 +34,10 @@ use two_bot_core::{
         validate_idempotency_key, ActionError, AuthDecision, AuthHeaders, AuthenticatedRequest,
         ErrorCode, InternalFlags, TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES, SKEW_SECONDS,
     },
+    internal_settings::SettingsCommand,
     rejection_telemetry::{ActionLabel, KeyLabel, Rejection, RejectionRecord, RejectionTelemetry},
 };
+use two_bot_cutover::{internal_settings::execute_settings, settings::SettingsStore};
 use two_bot_discord::internal_actions::{AnnouncementExecutor, ExecutionOutcome, Refusal};
 use two_bot_discord::{ActionExecutor, EventActionError, EventCall};
 
@@ -192,6 +196,7 @@ impl ReceiverState {
                 TerminalFailure::ActionNotAllowed => ErrorCode::ActionNotAllowed,
                 TerminalFailure::DiscordRejected => ErrorCode::DiscordRejected,
                 TerminalFailure::NoEffect => ErrorCode::DiscordUnavailable,
+                TerminalFailure::VersionConflict => ErrorCode::VersionConflict,
             };
             log_records(
                 self.telemetry
@@ -412,7 +417,7 @@ async fn receive(state: &ReceiverState, request: Request, id: &str) -> Response 
     let flags = InternalFlags::from_env();
     let decision = {
         let mut buckets = state.buckets.lock().expect("buckets lock");
-        burned.authorize(&flags, true, false, &mut buckets)
+        burned.authorize(&flags, true, true, &mut buckets)
     };
     let decision = match decision {
         Ok(decision) => decision,
@@ -430,6 +435,12 @@ async fn receive(state: &ReceiverState, request: Request, id: &str) -> Response 
     // idempotency claim. The committed nonce above is their replay guard.
     if decision.action == "event.read" {
         return read_event(state, &decision, id, key, action).await;
+    }
+    if decision.action == "settings.get" {
+        return read_setting(state, &decision, id, key, action).await;
+    }
+    if decision.action == "settings.set" {
+        return write_setting(state, &decision, headers.idempotency, &raw, id, key, action).await;
     }
     // This second fence is explicit: core phase-1 defaults are not capabilities.
     if !AnnouncementExecutor::supports(&decision.action) {
@@ -531,6 +542,174 @@ fn event_read_response(result: Value, id: &str) -> Response {
         Json(json!({"ok": true, "result": result, "request_id": id})),
     )
         .into_response();
+    wire.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    wire
+}
+
+/// Keyless `settings.get`: read the guild's stored override only, never the
+/// process environment. The flag gate already ran in `authorize`; the committed
+/// nonce above is the replay guard, so no idempotency claim is taken.
+async fn read_setting(
+    state: &ReceiverState,
+    decision: &AuthDecision,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let command = match SettingsCommand::parse("settings.get", &decision.body) {
+        Ok(command) => command,
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let store = SettingsStore::new(state.store.pool());
+    match execute_settings(&store, guild_id, &command).await {
+        Ok(outcome) => settings_read_response(outcome.result, outcome.observed_version, id),
+        Err(error) => reject(Failure::from_action(error)),
+    }
+}
+
+/// `settings.set`: validated writes claim the outer durable idempotency key
+/// before executing. Replaying the stored terminal returns the first
+/// value-free `{key,outcome}` result without a second write, audit row or
+/// version bump. A stale `expected_version` is a non-retryable 409
+/// `version_conflict`: the save that landed in between is never silently
+/// reverted.
+#[allow(clippy::too_many_arguments)]
+async fn write_setting(
+    state: &ReceiverState,
+    decision: &AuthDecision,
+    idempotency_header: Option<&str>,
+    raw: &[u8],
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let idempotency = match validate_idempotency_key(idempotency_header, &decision.action) {
+        Ok(key) => key,
+        Err(error) => return reject(Failure::from_action(error), action),
+    };
+    let command = match SettingsCommand::parse("settings.set", &decision.body) {
+        Ok(command) => command,
+        Err(error) => return reject(Failure::from_action(error), action),
+    };
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let (_, actor, _) = command.write().expect("set parses as a write");
+    let subject = AuditSubject {
+        guild_id: Some(DiscordId::new(guild_id).expect("staging guild ID")),
+        actor_id: Some(DiscordId::new(actor).expect("validated actor ID")),
+        ..AuditSubject::default()
+    };
+    let Some(caller) = state.config.caller_for(&decision.key_id) else {
+        return reject(Failure::code(ErrorCode::Internal), action);
+    };
+    let identity = match RequestIdentity::new(caller, idempotency, &decision.action, raw) {
+        Ok(identity) => identity,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal), action),
+    };
+    let claim = match state.store.claim(&identity, &subject).await {
+        Ok(InternalClaim::Claimed(claim)) => claim,
+        Ok(InternalClaim::Replay(response)) => {
+            return replay_setting(state, &decision.body, response, id, key, action);
+        }
+        Ok(InternalClaim::Mismatch) => {
+            return reject(Failure::code(ErrorCode::VersionConflict), action)
+        }
+        Ok(InternalClaim::InFlight) => return reject(Failure::code(ErrorCode::InProgress), action),
+        Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation(), action),
+        Err(_) => return reject(Failure::code(ErrorCode::Internal), action),
+    };
+    let store = SettingsStore::new(state.store.pool());
+    match execute_settings(&store, guild_id, &command).await {
+        Ok(outcome) => {
+            let deleted = command.write().expect("set parses as a write").0.is_none();
+            let terminal = TerminalResponse::Success {
+                resource_id: None,
+                affected: u32::from(!deleted),
+            };
+            if state.store.finish(&claim, &terminal).await.is_err() {
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation(), action);
+            }
+            settings_write_response(outcome.result, id, false)
+        }
+        Err(error) => {
+            let terminal = match error.code {
+                ErrorCode::VersionConflict => {
+                    Some(TerminalResponse::Failure(TerminalFailure::VersionConflict))
+                }
+                ErrorCode::ActionNotAllowed => {
+                    Some(TerminalResponse::Failure(TerminalFailure::ActionNotAllowed))
+                }
+                ErrorCode::Malformed => Some(TerminalResponse::Failure(TerminalFailure::Malformed)),
+                _ => None,
+            };
+            if let Some(terminal) = terminal {
+                if state.store.finish(&claim, &terminal).await.is_err() {
+                    let _ = state.store.mark_unknown(&claim).await;
+                    return reject(Failure::reconciliation(), action);
+                }
+                return reject(Failure::from_action(error), action);
+            }
+            let _ = state.store.mark_unknown(&claim).await;
+            reject(Failure::reconciliation(), action)
+        }
+    }
+}
+
+/// Replay a stored `settings.set` terminal without re-executing the write.
+/// Success rebuilds the value-free `{key,outcome}` result from the claimed
+/// body (the payload hash guarantees it matches the first execution); failures
+/// reuse the generic terminal envelope with the replay marker.
+fn replay_setting(
+    state: &ReceiverState,
+    body: &Map<String, Value>,
+    response: TerminalResponse,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    match response {
+        TerminalResponse::Success { .. } => {
+            let rebuilt = SettingsCommand::parse("settings.set", body)
+                .map(|command| {
+                    let deleted = command.write().expect("claimed set is a write").0.is_none();
+                    let outcome = if deleted { "unset" } else { "saved" };
+                    json!({"key": command.key(), "outcome": outcome})
+                })
+                .unwrap_or_else(|_| json!({"key": "", "outcome": "saved"}));
+            settings_write_response(rebuilt, id, true)
+        }
+        TerminalResponse::Failure(_) => state.terminal(response, true, id, key, action),
+    }
+}
+
+/// Legacy `result` (`key`/`value`/`source`) plus the CAS `version` as envelope
+/// metadata, never an extra field inside `result`. Zero means absent; otherwise
+/// feed it back as `expected_version` for the next save.
+fn settings_read_response(result: Value, version: i64, id: &str) -> Response {
+    let mut wire = (
+        StatusCode::OK,
+        Json(json!({"ok": true, "result": result, "version": version, "request_id": id})),
+    )
+        .into_response();
+    wire.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    wire
+}
+
+fn settings_write_response(result: Value, id: &str, replayed: bool) -> Response {
+    let mut wire = (
+        StatusCode::OK,
+        Json(json!({"ok": true, "result": result, "request_id": id})),
+    )
+        .into_response();
+    if replayed {
+        wire.headers_mut()
+            .insert("idempotent-replay", HeaderValue::from_static("true"));
+    }
     wire.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     wire
@@ -705,6 +884,7 @@ fn terminal_response(response: TerminalResponse, replayed: bool, id: &str) -> Re
             TerminalFailure::Malformed => Failure::code(ErrorCode::Malformed),
             TerminalFailure::ActionNotAllowed => Failure::code(ErrorCode::ActionNotAllowed),
             TerminalFailure::DiscordRejected => Failure::code(ErrorCode::DiscordRejected),
+            TerminalFailure::VersionConflict => Failure::code(ErrorCode::VersionConflict),
             TerminalFailure::NoEffect => Failure::http(
                 StatusCode::BAD_GATEWAY,
                 "no_effect",
