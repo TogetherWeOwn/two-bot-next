@@ -975,7 +975,7 @@ struct QueueInner {
     suspended: HashSet<(Snowflake, Snowflake)>,
     failed: Vec<FailedAction>,
     /// Dead letters evicted by the [`MAX_FAILED_ACTIONS`] cap (oldest first).
-    /// Monotonic; `clear_failed` leaves it so `/setup` can report loss.
+    /// Monotonic; `clear_failed` leaves it set.
     failed_dropped: u64,
 }
 
@@ -1266,8 +1266,7 @@ impl ActionQueue {
         self.inner.lock().expect("queue lock").failed.clone()
     }
 
-    /// Dead letters evicted by the cap so far. `/setup` adds this to the
-    /// recent-failures count instead of silently under-reporting.
+    /// Dead letters evicted by the cap so far; `clear_failed` does not reset it.
     #[must_use]
     pub fn failed_dropped(&self) -> u64 {
         self.inner.lock().expect("queue lock").failed_dropped
@@ -2109,7 +2108,7 @@ mod tests {
                     action = q.pop_due(GUILD, due).expect("retry exactly when due");
                     assert_eq!(action.attempts, step);
                 } else {
-                    assert!(q.mark_failed(action, format!("boom-{i}"), i));
+                    assert!(q.mark_failed(action.clone(), format!("boom-{i}"), i));
                 }
             }
         }

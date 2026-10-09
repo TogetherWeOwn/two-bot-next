@@ -210,9 +210,9 @@ impl ChannelClassifier for NoClassification {
 /// this covers missed leaves (gateway gaps, restarts). Thirty minutes keeps a
 /// normal session's chain alive between frames without pinning members who
 /// never return.
-pub const VOICE_CHAIN_IDLE_MS: u64 = 30 * 60_000;
-/// Above this many chains, each voice frame prunes idle entries so a burst of
-/// missed leaves cannot grow the map without bound.
+const VOICE_CHAIN_IDLE_MS: u64 = 30 * 60_000;
+/// Above this many chains, join and move frames prune idle entries so a burst
+/// of missed leaves cannot grow the map without bound.
 const VOICE_CHAIN_PRUNE_AT: usize = 2_048;
 
 /// Per-member serial chains for voice frames (TOG-5981): the shard loop is
@@ -249,9 +249,9 @@ impl VoiceChains {
         entry.mutex.clone()
     }
 
-    /// Drop the member's chain after a full voice leave, keeping it only when
-    /// another frame holds or waits on the same mutex. Pointer-checked so a
-    /// concurrent frame that recreated the entry keeps its own chain.
+    /// Drop the member's chain after a full voice leave. Kept while another
+    /// frame holds a handle (inside the critical section or queued on it), so
+    /// end/start stays serial. Pointer-checked so a recreated entry survives.
     fn remove_after_leave(
         &self,
         guild_id: Snowflake,
@@ -260,8 +260,9 @@ impl VoiceChains {
     ) {
         let mut chains = self.inner.lock().expect("chains lock");
         let key = (guild_id, member_id);
+        // The map and this frame each hold one handle; more belong to another frame.
         let keep = chains.get(&key).is_some_and(|entry| {
-            !Arc::ptr_eq(&entry.mutex, chain) || entry.mutex.try_lock().is_err()
+            !Arc::ptr_eq(&entry.mutex, chain) || Arc::strong_count(&entry.mutex) > 2
         });
         if !keep {
             chains.remove(&key);
@@ -279,10 +280,6 @@ impl VoiceChains {
 
     fn len(&self) -> usize {
         self.inner.lock().expect("chains lock").len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.inner.lock().expect("chains lock").is_empty()
     }
 }
 
@@ -837,7 +834,7 @@ mod tests {
     fn idle_chains_prune_at_10k_hot_untouched() {
         const TOTAL: u64 = 10_000;
         const HOT: u64 = 100;
-        const NOW: i64 = 1_000_000;
+        const NOW: i64 = 2 * VOICE_CHAIN_IDLE_MS as i64;
         let chains = VoiceChains::default();
         let mut hot: Vec<(Snowflake, Arc<Mutex<()>>)> = Vec::new();
         for member in 0..TOTAL {
@@ -864,16 +861,16 @@ mod tests {
         let chains = VoiceChains::default();
         let chain = chains.lock_for(GUILD, 1, 0);
         chains.remove_after_leave(GUILD, 1, &chain);
-        assert!(chains.is_empty(), "full leave drops the chain");
+        assert_eq!(chains.len(), 0, "full leave drops the chain");
 
-        // A frame inside the critical section keeps the entry: removal waits.
+        // Another frame's handle (inside the critical section or queued on it) keeps the entry.
         let chain = chains.lock_for(GUILD, 2, 0);
-        let _guard = chain.lock().expect("voice chain");
+        let other = chains.lock_for(GUILD, 2, 0);
         chains.remove_after_leave(GUILD, 2, &chain);
         assert_eq!(chains.len(), 1, "contended chain survives the leave");
-        drop(_guard);
+        drop(other);
         chains.remove_after_leave(GUILD, 2, &chain);
-        assert!(chains.is_empty(), "uncontended retry drops it");
+        assert_eq!(chains.len(), 0, "uncontended retry drops it");
 
         // A recreated entry is a different chain and is never dropped by a
         // stale leave for the old one.
