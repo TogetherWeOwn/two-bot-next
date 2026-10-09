@@ -55,9 +55,11 @@ Read-only specification: TogetherWeOwn/two-bot `src/announcements/service.ts`,
   the shared REST sanitizer would rewrite (raw or obfuscated mass mentions) are
   filtered during XML parsing rather than changing `@` to `%40`, which could alter
   their destination. The match is a prefix match, so profile handles that begin
-  with `here` or `everyone` (for example `/@heresy/`) are filtered too. On every
-  pass that skips any, the managed poller logs the relay id and the count under
-  the message `feed items skipped: item URL contains @everyone or @here text`;
+  with `here` or `everyone` (for example `/@heresy/`) are filtered too. URLs
+  containing `](`, which opens a Discord masked link, are filtered the same way.
+  On every pass that skips any, the managed poller logs the relay id and the
+  count under the message
+  `feed items skipped: item URL has mass-mention text or masked-link syntax`;
   check for it when a relay polls cleanly but never posts. Other `@` data remains
   unchanged. URL budgets apply to the canonical URL. Posts require empty
   allowed_mentions and enforce_nonce.

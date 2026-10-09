@@ -975,11 +975,12 @@ fn feed_posts_escape_untrusted_titles_and_preserve_item_url_previews() {
 }
 
 #[test]
-fn mass_mention_item_urls_are_filtered_before_delivery() {
+fn unsafe_item_urls_are_filtered_before_delivery() {
     let feed = relay(FeedKind::Rss);
     for url in [
         "https://example.org/@everyone",
         "https://example.org/notice?search=@here",
+        "https://example.org/x](https://evil.example)",
     ] {
         let xml = format!(
             "<rss><channel><item><guid>key</guid><title>x</title><link>{url}</link></item></channel></rss>"
@@ -992,56 +993,67 @@ fn mass_mention_item_urls_are_filtered_before_delivery() {
                 &feed,
                 &FeedItem {
                     url: url.into(),
-                    ..item("unsafe-mention-url")
+                    ..item("unsafe-url")
                 }
             ),
             Err(FeedError::InvalidItemUrl)
         ));
     }
 
-    let url = "https://example.org/%40everyone";
-    let xml = format!(
-        "<rss><channel><item><guid>key</guid><title>x</title><link>{url}</link></item></channel></rss>"
-    );
-    let items = parse_xml_feed_for_kind(&xml, FeedKind::Rss).unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].url, url);
+    for url in [
+        "https://example.org/%40everyone",
+        "https://en.wikipedia.org/wiki/Foo_(bar)",
+    ] {
+        let xml = format!(
+            "<rss><channel><item><guid>key</guid><title>x</title><link>{url}</link></item></channel></rss>"
+        );
+        let items = parse_xml_feed_for_kind(&xml, FeedKind::Rss).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].url, url);
 
-    let post = plan_post(
-        &feed,
-        &FeedItem {
-            url: url.into(),
-            ..item("encoded-mention-url")
-        },
-    )
-    .unwrap();
-    assert!(post.content.ends_with(url));
-    assert_eq!(
-        two_bot_core::message_safety::content(&post.content),
-        post.content
-    );
+        let post = plan_post(
+            &feed,
+            &FeedItem {
+                url: url.into(),
+                ..item("kept-url")
+            },
+        )
+        .unwrap();
+        assert!(post.content.ends_with(url));
+        assert_eq!(
+            two_bot_core::message_safety::content(&post.content),
+            post.content
+        );
+    }
 }
 
 #[test]
-fn parse_report_counts_only_items_filtered_for_mass_mention_urls() {
+fn parse_report_counts_only_items_filtered_for_unsafe_urls() {
     let entry = |key: &str, url: &str| {
         format!("<item><guid>{key}</guid><title>x</title><link>{url}</link></item>")
     };
-    // Literal mentions and handles that merely start with `here`/`everyone`
-    // are filtered and counted; a plain handle, an invalid URL and a
-    // credentialed URL are dropped or kept without touching the count.
+    // Literal mentions, handles that merely start with `here`/`everyone` and
+    // `](` masked links are filtered and counted; a plain handle, a path with
+    // parentheses, an invalid URL and a credentialed URL are kept or dropped
+    // without touching the count.
     let xml = format!(
-        "<rss><channel>{}{}{}{}{}</channel></rss>",
+        "<rss><channel>{}{}{}{}{}{}{}</channel></rss>",
         entry("a", "https://example.org/@everyone"),
         entry("b", "https://mastodon.social/@heresy/1"),
         entry("c", "https://mastodon.social/@alice/1"),
         entry("d", "not a url"),
         entry("e", "https://user@example.org/@here"),
+        entry("f", "https://example.org/x](https://evil.example)"),
+        entry("g", "https://en.wikipedia.org/wiki/Foo_(bar)"),
     );
     let parsed = parse_xml_feed_report(&xml, FeedKind::Rss).unwrap();
-    assert_eq!(parsed.mention_urls_filtered, 2);
-    assert_eq!(parsed.items.len(), 1);
+    assert_eq!(parsed.unsafe_urls_filtered, 3);
+    assert_eq!(parsed.items.len(), 2);
     assert_eq!(parsed.items[0].url, "https://mastodon.social/@alice/1");
+    assert_eq!(
+        parsed.items[1].url,
+        "https://en.wikipedia.org/wiki/Foo_(bar)"
+    );
     assert_eq!(
         parse_xml_feed_for_kind(&xml, FeedKind::Rss).unwrap(),
         parsed.items

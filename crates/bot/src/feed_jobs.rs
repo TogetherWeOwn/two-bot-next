@@ -143,11 +143,11 @@ fn parse_fetched(
         return Err(ErrorClass::Feed);
     }
     let parsed = parse_xml_feed_report(&fetched.body, feed.kind).map_err(|_| ErrorClass::Feed)?;
-    if parsed.mention_urls_filtered > 0 {
+    if parsed.unsafe_urls_filtered > 0 {
         // Not an audit row: the entries stay in the feed, so a row per pass
         // would repeat. One line per pass lets an operator find a silent relay.
-        tracing::warn!(job = NAME, feed_id = %feed.id, filtered = parsed.mention_urls_filtered,
-            "feed items skipped: item URL contains @everyone or @here text");
+        tracing::warn!(job = NAME, feed_id = %feed.id, filtered = parsed.unsafe_urls_filtered,
+            "feed items skipped: item URL has mass-mention text or masked-link syntax");
     }
     Ok(parsed.items)
 }
