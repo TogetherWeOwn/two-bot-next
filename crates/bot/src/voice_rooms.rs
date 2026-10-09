@@ -697,6 +697,35 @@ fn observe_voice_operation(op: &'static str, outcome: &'static str) {
     }
 }
 
+/// Minimum seconds between `voice actor load failed` warns; every failure
+/// still bumps `two_bot_db_errors_total{op="other"}`.
+const VOICE_ACTOR_LOAD_WARN_INTERVAL_SECS: u64 = 300;
+/// Last wall-clock second a load-failure warn was emitted.
+static VOICE_ACTOR_LOAD_WARN_LAST_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// A failed `GuildRoomWorker::load` must not silently drop the guild actor:
+/// count it and warn (throttled). The actor respawns on the next gateway
+/// event via `UnboundedSender::is_closed`.
+fn observe_voice_actor_load_failure(guild: Snowflake, error: &StoreError) {
+    metrics::global().db_error("other");
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let last = VOICE_ACTOR_LOAD_WARN_LAST_SECS.load(Ordering::Relaxed);
+    if now_secs.wrapping_sub(last) >= VOICE_ACTOR_LOAD_WARN_INTERVAL_SECS
+        && VOICE_ACTOR_LOAD_WARN_LAST_SECS
+            .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        warn!(
+            guild_id = guild.to_string(),
+            error = %error,
+            "voice actor load failed; actor respawns on the next event"
+        );
+    }
+}
+
 /// Where one operator notice is delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeTarget {
@@ -1104,7 +1133,7 @@ fn wall_ms() -> u64 {
 }
 
 #[derive(Debug, Default)]
-struct LiveState {
+pub(crate) struct LiveState {
     ready: bool,
     generation: u64,
     next_transition: u64,
@@ -1305,20 +1334,34 @@ impl LiveGuild {
         }
     }
 
+    /// Read the live snapshot, recovering from a poisoned lock instead of
+    /// panicking the gateway dispatch worker. A poisoned lock means a
+    /// previous holder panicked mid-write; the recovered state is the last
+    /// committed one, which the gateway keeps treating as evidence.
+    pub(crate) fn read_state(&self) -> std::sync::RwLockReadGuard<'_, LiveState> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Write the live snapshot, recovering from a poisoned lock instead of
+    /// panicking the gateway dispatch worker. See [`LiveGuild::read_state`].
+    pub(crate) fn write_state(&self) -> std::sync::RwLockWriteGuard<'_, LiveState> {
+        self.inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Add configured infrastructure IDs, independently of room provenance.
     /// Keep this in shared state so a write awaiting a rate limit sees updates.
     pub fn protect_channels(&self, channels: impl IntoIterator<Item = Snowflake>) {
-        self.inner
-            .write()
-            .expect("live voice lock")
-            .protected_channels
-            .extend(channels);
+        self.write_state().protected_channels.extend(channels);
     }
 
     /// Shorten the empty-room grace for offline fixtures that exercise
     /// unrelated lifecycle races. Production keeps the 60 s default.
     pub fn set_empty_grace(&self, grace: Duration) {
-        self.inner.write().expect("live voice lock").empty_grace = Some(grace);
+        self.write_state().empty_grace = Some(grace);
     }
 
     pub fn publish(&self, snapshot: GuildSnapshot) -> bool {
@@ -1330,7 +1373,7 @@ impl LiveGuild {
             self.disconnect();
             return false;
         }
-        let mut live = self.inner.write().expect("live voice lock");
+        let mut live = self.write_state();
         live.generation += 1;
         live.channels = snapshot
             .channels
@@ -1369,7 +1412,7 @@ impl LiveGuild {
     }
 
     pub fn disconnect(&self) {
-        let mut live = self.inner.write().expect("live voice lock");
+        let mut live = self.write_state();
         live.ready = false;
         live.generation += 1;
         live.empty_since.clear();
@@ -1383,7 +1426,7 @@ impl LiveGuild {
     /// the guild owner and Administrator roles never have findings.
     #[must_use]
     pub fn permission_findings(&self, creators: &[Snowflake]) -> Vec<PermissionFinding> {
-        let live = self.inner.read().expect("live voice lock");
+        let live = self.read_state();
         let Some(bot) = live.bot.as_ref() else {
             return Vec::new();
         };
@@ -1441,7 +1484,7 @@ impl LiveGuild {
     /// unchanged: role edits do not invalidate in-flight tickets, they only
     /// affect the next guard evaluation.
     pub fn refresh_bot(&self, access: BotAccess) {
-        self.inner.write().expect("live voice lock").bot = Some(access);
+        self.write_state().bot = Some(access);
     }
 
     /// Validate logging targets against the live cache, not resolved picker data.
@@ -1450,7 +1493,7 @@ impl LiveGuild {
         interaction: &Interaction,
         action: &LoggingAction,
     ) -> Result<(), &'static str> {
-        let live = self.inner.read().expect("live voice lock");
+        let live = self.read_state();
         if !live.ready {
             return Err("Voice state is syncing right now. Try again shortly.");
         }
@@ -1530,7 +1573,7 @@ impl LiveGuild {
         // survives a gateway reconnect, so a due notice still reaches the
         // configured channel with its mention instead of leaking to the
         // system channel. Absent evidence fails the lookups below on its own.
-        let live = self.inner.read().expect("live voice lock");
+        let live = self.read_state();
         id != self.guild_id
             && live.bot.as_ref().is_some_and(|bot| {
                 bot.roles
@@ -1542,7 +1585,7 @@ impl LiveGuild {
     fn text_notice_channel(&self, id: Snowflake) -> bool {
         // No readiness gate here either: see `safe_notice_role`. An uncached
         // channel fails the lookup below on its own.
-        let live = self.inner.read().expect("live voice lock");
+        let live = self.read_state();
         live.channels.get(&id).is_some_and(|channel| {
             channel.guild_id.map(Id::get) == Some(self.guild_id)
                 && channel.kind == ChannelType::GuildText
@@ -1552,7 +1595,7 @@ impl LiveGuild {
     /// System channel and owner for V10 notice routing; `None` until the bot
     /// evidence is published.
     fn notice_context(&self) -> Option<(Option<Snowflake>, Snowflake)> {
-        let state = self.inner.read().expect("live voice lock");
+        let state = self.read_state();
         let bot = state.bot.as_ref()?;
         Some((bot.system_channel_id, bot.guild_owner_id))
     }
@@ -1578,7 +1621,7 @@ impl LiveGuild {
         bot: Option<bool>,
         now_ms: u64,
     ) -> Option<JoinTicket> {
-        let mut live = self.inner.write().expect("live voice lock");
+        let mut live = self.write_state();
         let previous_channel = live
             .members
             .get(&member)
@@ -1620,7 +1663,7 @@ impl LiveGuild {
 
     pub fn upsert_channel(&self, channel: Channel) {
         if channel.guild_id.map(Id::get) == Some(self.guild_id) {
-            let mut live = self.inner.write().expect("live voice lock");
+            let mut live = self.write_state();
             let id = channel.id.get();
             live.next_channel_revision += 1;
             let revision = live.next_channel_revision;
@@ -1631,7 +1674,7 @@ impl LiveGuild {
     }
 
     pub fn remove_channel(&self, channel: Snowflake) {
-        let mut live = self.inner.write().expect("live voice lock");
+        let mut live = self.write_state();
         live.channel_revisions.remove(&channel);
         live.channels.remove(&channel);
         live.empty_since.remove(&channel);
@@ -1640,7 +1683,7 @@ impl LiveGuild {
     /// REST completion must never roll back gateway evidence or resurrect a
     /// deleted channel, even after an identical-looking reconnect snapshot.
     fn publish_owner_overwrites(&self, channel: Channel, generation: u64, revision: u64) -> bool {
-        let mut live = self.inner.write().expect("live voice lock");
+        let mut live = self.write_state();
         let id = channel.id.get();
         if !live.ready
             || live.generation != generation
@@ -1676,7 +1719,7 @@ impl LiveGuild {
         let permission_failure = Arc::new(Mutex::new(None));
         let observed = Arc::clone(&permission_failure);
         let check = Arc::new(move || {
-            let state = live.inner.read().expect("live voice lock");
+            let state = live.read_state();
             // Lost authority or a member who left is not a permission finding.
             if !state.ticket_valid(ticket) {
                 return false;
@@ -1709,7 +1752,7 @@ impl LiveGuild {
     fn room_guard(&self, channel: Snowflake) -> WriteGuard {
         let live = self.clone();
         Arc::new(move || {
-            let state = live.inner.read().expect("live voice lock");
+            let state = live.read_state();
             state.ready && state.channels.contains_key(&channel)
         })
     }
@@ -1721,7 +1764,7 @@ impl LiveGuild {
     fn member_in_room_guard(&self, channel: Snowflake, member: Snowflake) -> WriteGuard {
         let live = self.clone();
         Arc::new(move || {
-            let state = live.inner.read().expect("live voice lock");
+            let state = live.read_state();
             state.ready
                 && state
                     .members
@@ -2166,12 +2209,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         if self.halted
             || !may_create_room(&self.access)
             || !self.creators.contains_key(&ticket.creator_id)
-            || !self
-                .live
-                .inner
-                .read()
-                .expect("live voice lock")
-                .ticket_valid(ticket)
+            || !self.live.read_state().ticket_valid(ticket)
             || self
                 .accepted
                 .get(&ticket.member_id)
@@ -2289,7 +2327,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         if !settings.enabled {
             return;
         }
-        let live = self.live.inner.read().expect("live voice lock");
+        let live = self.live.read_state();
         let Some(channel) = live.channels.get(&channel_id) else {
             return;
         };
@@ -2333,7 +2371,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         if self.halted {
             return;
         }
-        let live = self.live.inner.read().expect("live voice lock");
+        let live = self.live.read_state();
         if !live.ready {
             return;
         }
@@ -2505,7 +2543,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return false;
         }
         let (room, occupants) = {
-            let live = self.live.inner.read().expect("live voice lock");
+            let live = self.live.read_state();
             if !live.ready {
                 return false;
             }
@@ -2584,7 +2622,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             },
         };
         let (channel, room, occupants) = {
-            let live = self.live.inner.read().expect("live voice lock");
+            let live = self.live.read_state();
             if !live.ready {
                 return "The voice worker isn't warmed up yet — try again in a moment.".to_owned();
             }
@@ -2691,7 +2729,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         self.ownership_queued
             .retain(|channel| self.rooms.contains_key(channel));
         let due: Vec<_> = {
-            let live = self.live.inner.read().expect("live voice lock");
+            let live = self.live.read_state();
             if !live.ready || self.halted {
                 return;
             }
@@ -2731,7 +2769,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         owner_id: Snowflake,
     ) -> Result<(), RoomHttpError> {
         let (overwrites, changed, expected_overwrites, generation, revision) = {
-            let live = self.live.inner.read().expect("live voice lock");
+            let live = self.live.read_state();
             if !live.ready {
                 return Err(RoomHttpError::Cancelled);
             }
@@ -2811,7 +2849,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
         let live = self.live.clone();
         let guard: WriteGuard = Arc::new(move || {
-            let state = live.inner.read().expect("live voice lock");
+            let state = live.read_state();
             state.ready
                 && state.generation == generation
                 && state.channel_revisions.get(&channel_id) == Some(&revision)
@@ -2851,7 +2889,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         if !self.rooms.contains_key(&channel) {
             return None;
         }
-        let live = self.live.inner.read().expect("live voice lock");
+        let live = self.live.read_state();
         let current = live
             .channels
             .get(&channel)?
@@ -2867,7 +2905,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// voice, or when their channel is not a tracked room. The router claim
     /// check uses this to tell vote-kick targets from moderation targets.
     pub fn kick_room_of(&self, member: Snowflake) -> Option<Snowflake> {
-        let live = self.live.inner.read().expect("live voice lock");
+        let live = self.live.read_state();
         if !live.ready || self.halted {
             return None;
         }
@@ -2881,7 +2919,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         &self,
         room_id: Snowflake,
     ) -> Result<(Snowflake, Snowflake, Vec<Snowflake>), KickRefusal> {
-        let live = self.live.inner.read().expect("live voice lock");
+        let live = self.live.read_state();
         if !live.ready || self.halted {
             return Err(KickRefusal::Unavailable);
         }
@@ -3102,7 +3140,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         if self.active_votes.is_empty() {
             return Vec::new();
         }
-        let ready = self.live.inner.read().expect("live voice lock").ready;
+        let ready = self.live.read_state().ready;
         if !ready || self.halted {
             return Vec::new();
         }
@@ -3348,7 +3386,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     }
 
     fn prepare(&self, ticket: JoinTicket) -> Result<RoomChannelAttributes, RoomPlanError> {
-        let live = self.live.inner.read().expect("live voice lock");
+        let live = self.live.read_state();
         if !live.ticket_valid(ticket) {
             return Err(RoomHttpError::Cancelled.into());
         }
@@ -3408,7 +3446,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// Executes at most one write, releasing the guild lane on every outcome.
     /// `now_ms` is a monotonic actor clock, not a wall-clock timestamp.
     pub async fn dispatch_one(&mut self, now_ms: u64) -> bool {
-        if self.halted || !self.live.inner.read().expect("live voice lock").ready {
+        if self.halted || !self.live.read_state().ready {
             return false;
         }
         for (channel_id, name) in self.renames.take_due(now_ms) {
@@ -3561,13 +3599,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 observe_voice_operation("create", "success");
                                 self.observe_voice_state();
                                 self.enqueue_companion_create(channel_id);
-                                if self
-                                    .live
-                                    .inner
-                                    .read()
-                                    .expect("live voice lock")
-                                    .ticket_valid(creation.ticket)
-                                {
+                                if self.live.read_state().ticket_valid(creation.ticket) {
                                     self.moves.insert(channel_id, creation.ticket);
                                     self.queue.enqueue(
                                         self.live.guild_id,
@@ -3634,19 +3666,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     return true;
                 };
                 let guard = self.live.move_guard(ticket, channel_id);
-                let result = if !self
-                    .live
-                    .inner
-                    .read()
-                    .expect("live voice lock")
-                    .ticket_valid(ticket)
-                {
+                let result = if !self.live.read_state().ticket_valid(ticket) {
                     Err(RoomHttpError::Cancelled)
                 } else if !can_manage_room(
                     self.live
-                        .inner
-                        .read()
-                        .expect("live voice lock")
+                        .read_state()
                         .permissions(self.live.guild_id, channel_id),
                 ) {
                     Err(RoomHttpError::AccessDenied)
@@ -3751,7 +3775,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                 }
                 let guard: WriteGuard = Arc::new(move || {
-                    let state = live.inner.read().expect("live voice lock");
+                    let state = live.read_state();
                     state.ready
                         && !state.delete_protected(channel_id)
                         && state.humans(channel_id) == 0
@@ -3768,19 +3792,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 }
                             })
                 });
-                let present = self
-                    .live
-                    .inner
-                    .read()
-                    .expect("live voice lock")
-                    .channels
-                    .contains_key(&channel_id);
-                let protected = self
-                    .live
-                    .inner
-                    .read()
-                    .expect("live voice lock")
-                    .delete_protected(channel_id);
+                let present = self.live.read_state().channels.contains_key(&channel_id);
+                let protected = self.live.read_state().delete_protected(channel_id);
                 let result = if protected || (present && !guard()) {
                     Err(RoomHttpError::Cancelled)
                 } else if !present {
@@ -3892,7 +3905,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         );
                     }
                     Err(RoomHttpError::AccessDenied) => {
-                        let state = self.live.inner.read().expect("live voice lock");
+                        let state = self.live.read_state();
                         self.denied.insert(
                             channel_id,
                             (
@@ -3965,15 +3978,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 }
                 let live = self.live.clone();
                 let bot_id = live
-                    .inner
-                    .read()
-                    .expect("live voice lock")
+                    .read_state()
                     .bot
                     .as_ref()
                     .map(|bot| bot.member_id)
                     .unwrap_or(0);
                 let guard: WriteGuard = Arc::new(move || {
-                    let state = live.inner.read().expect("live voice lock");
+                    let state = live.read_state();
                     state.ready
                         && state.channels.contains_key(&room_channel_id)
                         && can_manage_room(state.permissions(live.guild_id, room_channel_id))
@@ -4172,9 +4183,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             } => {
                 let permissions = self
                     .live
-                    .inner
-                    .read()
-                    .expect("live voice lock")
+                    .read_state()
                     .permissions(self.live.guild_id, channel_id);
                 // What a clean `Ok` below means; each skip or partial write
                 // overrides it so the audit row says what Discord was asked.
@@ -4292,7 +4301,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             }
             RoomAction::RenameRoom { channel_id, name } => {
                 let valid = {
-                    let live = self.live.inner.read().expect("live voice lock");
+                    let live = self.live.read_state();
                     self.rooms.contains_key(&channel_id)
                         && self.desired_names.get(&channel_id) == Some(&name)
                         && live
@@ -4308,13 +4317,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 match self.http.rename(channel_id, &name).await {
                     Ok(()) => {
                         self.queue.mark_succeeded(&action);
-                        if let Some(channel) = self
-                            .live
-                            .inner
-                            .write()
-                            .expect("live voice lock")
-                            .channels
-                            .get_mut(&channel_id)
+                        if let Some(channel) = self.live.write_state().channels.get_mut(&channel_id)
                         {
                             channel.name = Some(name);
                         }
@@ -4351,7 +4354,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// worker's own live map, never the network. `None` means no such
     /// channel is visible yet.
     fn adopt_companion(&self, plan: &TextChannelPlan) -> Option<Snowflake> {
-        let live = self.live.inner.read().expect("live voice lock");
+        let live = self.live.read_state();
         live.channels
             .values()
             .filter(|channel| {
@@ -4448,9 +4451,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         };
         let present = self
             .live
-            .inner
-            .read()
-            .expect("live voice lock")
+            .read_state()
             .channels
             .contains_key(&text_channel_id);
         if present {
@@ -4460,7 +4461,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             let live = self.live.clone();
             let guild_id = self.live.guild_id;
             let guard: WriteGuard = Arc::new(move || {
-                let state = live.inner.read().expect("live voice lock");
+                let state = live.read_state();
                 state.ready
                     && !state.delete_protected(text_channel_id)
                     && state
@@ -4537,9 +4538,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         if grant {
             let present = self
                 .live
-                .inner
-                .read()
-                .expect("live voice lock")
+                .read_state()
                 .members
                 .get(&member_id)
                 .is_some_and(|member| member.channel_id == Some(room_channel_id));
@@ -4551,7 +4550,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let live = self.live.clone();
         let guild_id = self.live.guild_id;
         let guard: WriteGuard = Arc::new(move || {
-            let state = live.inner.read().expect("live voice lock");
+            let state = live.read_state();
             state.ready
                 && state.channels.contains_key(&text_channel_id)
                 && can_manage_room(state.permissions(guild_id, room_channel_id))
@@ -4663,11 +4662,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// Planner and final-guard refusals use their already-captured findings.
     fn record_refusal(&mut self, write: RefusedWrite, channel_id: Snowflake, error: RoomHttpError) {
         if error == RoomHttpError::AccessDenied {
-            let findings = write_permission_findings(
-                &self.live.inner.read().expect("live voice lock"),
-                self.live.guild_id,
-                channel_id,
-            );
+            let findings =
+                write_permission_findings(&self.live.read_state(), self.live.guild_id, channel_id);
             self.record(LifecycleFailure::MissingPermission {
                 write,
                 channel_id,
@@ -4947,7 +4943,7 @@ where
         let member = interaction.member.as_ref()?;
         let member_id = member.user.as_ref()?.id.get();
         let actor = self.live_actor(guild)?;
-        let live = actor.live.inner.read().expect("live voice lock");
+        let live = actor.live.read_state();
         if !live.ready {
             return None;
         }
@@ -5003,8 +4999,13 @@ where
         let name_policy = Arc::clone(&self.name_policy);
         tokio::spawn(async move {
             let (store, http) = make();
-            let Ok(worker) = GuildRoomWorker::load(live, store, http).await else {
-                return;
+            let guild_id = live.guild_id;
+            let worker = match GuildRoomWorker::load(live, store, http).await {
+                Ok(worker) => worker,
+                Err(error) => {
+                    observe_voice_actor_load_failure(guild_id, &error);
+                    return;
+                }
             };
             let mut worker = worker.with_name_policy(name_policy);
             run_actor(&mut worker, rx, tick).await;
@@ -6065,7 +6066,7 @@ where
     let Some(actor) = runtime.live_actor(guild_id) else {
         return Some(not_ready());
     };
-    let live = actor.live.inner.read().expect("live voice lock");
+    let live = actor.live.read_state();
     if !live.ready {
         return Some(not_ready());
     }
