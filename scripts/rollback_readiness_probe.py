@@ -11,7 +11,7 @@ Four checks, one PASS/FAIL line each; exit 1 if any fails, 0 if all pass:
                  `last_value`. A restore restarts allocators from the archive,
                  so anything less rewinds them (docs/cutover.md, allocator gate).
   readyz         the staging Worker answers /readyz with the bot's truthful
-                 process/gateway breakdown (wrangler/scripts/check-readyz.mjs).
+                 component breakdown (wrangler/scripts/check-readyz.mjs).
   deploy-config  each named environment in wrangler.toml declares the required
                  TWO_* vars, non-empty (vars are not inherited).
 
@@ -63,6 +63,15 @@ READYZ_BODY_CAP = 64 << 10
 # Cloudflare rejects the default "Python-urllib/x.y" agent at the edge with 403
 # (error 1010), so an explicit agent is required for the probe to reach the Worker.
 USER_AGENT = "two-bot-next-staging-rollout/1.0"
+# Component names from crates/bot/src/server.rs; the drift test pins them to the source.
+READYZ_STATES = ("ready", "starting", "down")
+READYZ_REQUIRED = ("process", "gateway")
+# 503 is parked, never acceptance: process ready and every not-ready component listed here in that state.
+READYZ_PARKED = {
+    "gateway": ("down", "starting"),
+    "database": ("down",),
+    "token_invalid": ("down",),
+}
 # Owned serial/identity sequences via pg_get_serial_sequence, plus the standalone
 # guild_settings_version_seq (guarded by to_regclass), mirroring the restore
 # (crates/core/src/backup/dump.rs). Also reports whether last_value is readable:
@@ -286,29 +295,41 @@ def fetch(url):
         return e.code, e.read(READYZ_BODY_CAP)
 
 
+def readyz_state(status, body):
+    try:
+        report = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        report = None
+    components = report.get("components") if isinstance(report, dict) else None
+    if (not isinstance(components, list) or "error" in report
+            or not all(isinstance(c, list) and len(c) == 2 and isinstance(c[0], str)
+                       and c[1] in READYZ_STATES for c in components)):
+        raise ProbeError(f"/readyz {status} without the bot's component breakdown "
+                         "(ownership refusal or broken deploy)")
+    state = dict(components)
+    if len(state) != len(components):
+        raise ProbeError(f"/readyz {status} repeats a component name")
+    missing = [name for name in READYZ_REQUIRED if name not in state]
+    if missing:
+        raise ProbeError(f"/readyz {status} lacks {', '.join(missing)}")
+    return state
+
+
 def check_readyz(url, fetch_fn):
     endpoint = staging_readyz_url(url)
     try:
         status, body = fetch_fn(endpoint)
     except (OSError, http.client.HTTPException) as e:
         raise ProbeError(f"{endpoint} did not respond ({e.__class__.__name__})")
-    try:
-        report = json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        report = None
-    components = report.get("components") if isinstance(report, dict) else None
-    if (not isinstance(components, list) or len(components) != 2
-            or not all(isinstance(c, list) and len(c) == 2 and isinstance(c[0], str) for c in components)
-            or report.get("error")):
-        raise ProbeError(f"/readyz {status} without the bot's process/gateway breakdown "
-                         "(ownership refusal or broken deploy)")
-    state = dict(components)
-    if len(state) == 2 and state.get("process") == "ready":
-        if status == 200 and state.get("gateway") == "ready":
-            return "/readyz 200: process and gateway ready"
-        if status == 503 and state.get("gateway") in ("down", "starting"):
-            return f"/readyz 503: process ready, gateway {state['gateway']} (parked, not E2E approval)"
-    raise ProbeError(f"/readyz {status} with unexpected components {components!r:.80}")
+    state = readyz_state(status, body)
+    not_ready = sorted((name, value) for name, value in state.items() if value != "ready")
+    if status == 200 and not not_ready:
+        return f"/readyz 200: all {len(state)} components ready"
+    if status == 503 and not_ready and all(value in READYZ_PARKED.get(name, ())
+                                           for name, value in not_ready):
+        summary = ", ".join(f"{name} {value}" for name, value in not_ready)
+        return f"/readyz 503: process ready, {summary} (parked, not E2E approval)"
+    raise ProbeError(f"/readyz {status} with unexpected components {list(state.items())!r:.80}")
 
 
 def check_deploy_config(config, envs, extra_keys):

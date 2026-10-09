@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -15,7 +16,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rollback_readiness_probe as probe  # noqa: E402
 
 STAGING = "https://two-bot-next-staging.example-sub.workers.dev"
-READY = (200, json.dumps({"components": [["process", "ready"], ["gateway", "ready"]]}).encode())
+def readyz_body(*components):
+    return json.dumps({"components": [list(c) for c in components], "jobs": {},
+                       "build_revision": "unknown", "build_id": "unknown"}).encode()
+
+
+# The bot's real /readyz bodies (crates/bot/src/server.rs), one per state the gate must classify.
+READYZ = {
+    "ready": (200, readyz_body(("process", "ready"), ("gateway", "ready"),
+                               ("database", "ready"), ("token_invalid", "ready"))),
+    "parked": (503, readyz_body(("process", "ready"), ("gateway", "starting"),
+                                ("database", "ready"), ("token_invalid", "ready"))),
+    "database down": (503, readyz_body(("process", "ready"), ("gateway", "ready"),
+                                       ("database", "down"), ("token_invalid", "ready"))),
+    "token invalid": (503, readyz_body(("process", "ready"), ("gateway", "ready"),
+                                       ("database", "ready"), ("token_invalid", "down"))),
+    "gateway and database down": (503, readyz_body(("process", "ready"), ("gateway", "down"),
+                                                   ("database", "down"), ("token_invalid", "ready"))),
+}
+READY = READYZ["ready"]
 CONFIG = """\
 [vars]
 BOT_PORT = "8080"
@@ -136,11 +155,69 @@ class RollbackReadinessProbeTests(unittest.TestCase):
         self.assertEqual(self.requested, [STAGING + "/readyz"])
         self.assertEqual(self.snapshot(), before, "the probe must never write")
 
+    def readyz(self, status, body):
+        _, results, _ = self.probe(fetch=self.fetch((status, body)))
+        return next(line for key, line in results.items() if key.endswith(" readyz"))
+
+    def test_every_real_server_state_is_accepted(self):
+        for label, response in READYZ.items():
+            with self.subTest(label):
+                self.assertTrue(self.readyz(*response).startswith("PASS readyz"))
+
     def test_parked_staging_gateway_is_a_truthful_response(self):
-        parked = (503, json.dumps({"components": [["process", "ready"], ["gateway", "starting"]]}).encode())
-        code, results, _ = self.probe(fetch=self.fetch(parked))
-        self.assertEqual(code, 0)
-        self.assertIn("gateway starting (parked, not E2E approval)", results["PASS readyz"])
+        self.assertIn("gateway starting (parked, not E2E approval)", self.readyz(*READYZ["parked"]))
+
+    def test_readyz_is_classified_by_component_name_and_status(self):
+        process, gateway = ("process", "ready"), ("gateway", "ready")
+        database, token = ("database", "ready"), ("token_invalid", "ready")
+        accepted = {
+            "200 without the optional components": (200, readyz_body(process, gateway)),
+            "200 with an unknown ready component": (200, readyz_body(process, gateway, database, token,
+                                                                     ("voice", "ready"))),
+            "503 with gateway starting and token invalid": (503, readyz_body(
+                process, ("gateway", "starting"), ("token_invalid", "down"))),
+            "503 with gateway and database down": (503, readyz_body(
+                process, ("gateway", "down"), ("database", "down"), token)),
+            "503 with database and token invalid down": (503, readyz_body(
+                process, gateway, ("database", "down"), ("token_invalid", "down"))),
+        }
+        rejected = {
+            "200 with gateway starting": (200, readyz_body(process, ("gateway", "starting"), database, token),
+                                          "unexpected components"),
+            "200 with database down": (200, readyz_body(process, gateway, ("database", "down"), token),
+                                       "unexpected components"),
+            "200 with token invalid down": (200, readyz_body(process, gateway, database, ("token_invalid", "down")),
+                                            "unexpected components"),
+            "200 with an unknown component down": (200, readyz_body(process, gateway, ("voice", "down")),
+                                                   "unexpected components"),
+            "500 with a complete body": (500, readyz_body(process, gateway, database, token),
+                                         "/readyz 500 with unexpected"),
+            "503 with every component ready": (503, readyz_body(process, gateway, database, token),
+                                               "unexpected components"),
+            "503 with process down": (503, readyz_body(("process", "down"), ("gateway", "down")),
+                                      "unexpected components"),
+            "503 with an unknown component down": (503, readyz_body(process, gateway, ("voice", "down")),
+                                                   "unexpected components"),
+            "missing process": (200, readyz_body(gateway, database), "lacks process"),
+            "missing gateway": (200, readyz_body(process, database), "lacks gateway"),
+            "empty breakdown": (200, readyz_body(), "lacks process, gateway"),
+            "duplicate component": (200, readyz_body(process, gateway, gateway), "repeats a component name"),
+            "status outside ready, starting, down": (200, readyz_body(process, ("gateway", "ok")),
+                                                     "without the bot's component breakdown"),
+            "row of the wrong length": (200, readyz_body(("process",)), "without the bot's component breakdown"),
+            "ownership refusal carrying components": (503, json.dumps(
+                {"error": "ownership_fenced", "components": [list(process), list(gateway)]}).encode(),
+                "without the bot's component breakdown"),
+            "non-JSON body": (503, b"<html>not the bot</html>", "without the bot's component breakdown"),
+        }
+        for label, (status, body) in accepted.items():
+            with self.subTest(label):
+                self.assertTrue(self.readyz(status, body).startswith("PASS readyz"))
+        for label, (status, body, reason) in rejected.items():
+            with self.subTest(label):
+                line = self.readyz(status, body)
+                self.assertTrue(line.startswith("FAIL readyz"), line)
+                self.assertIn(reason, line)
 
     def test_newest_archive_by_mtime_skips_decoys(self):
         self.fx.write_archive("two-funnel-zz-older.ndjson.gz", [b"not json"], mtime=1_000_000_000)
@@ -186,7 +263,7 @@ class RollbackReadinessProbeTests(unittest.TestCase):
                 {}, "sequences", "is not a JSON array"),
             "readyz ownership refusal": (
                 lambda: None, {"fetch": (503, b'{"error":"not owner"}')},
-                "readyz", "without the bot's process/gateway breakdown"),
+                "readyz", "without the bot's component breakdown"),
             "readyz broken deploy": (
                 lambda: None, {"fetch": (500, b"error code: 1101")},
                 "readyz", "/readyz 500 without"),
@@ -345,6 +422,19 @@ class RollbackReadinessProbeTests(unittest.TestCase):
     def test_repository_deploy_config_declares_required_keys(self):
         self.assertIn("TWO_GUILD_NAME",
                       probe.check_deploy_config(probe.DEFAULT_CONFIG, probe.DEFAULT_ENVS, []))
+
+
+class ServerComponentDriftTests(unittest.TestCase):
+    def test_gate_and_fixtures_name_exactly_the_components_the_server_serves(self):
+        source = (probe.ROOT / "crates/bot/src/server.rs").read_text()
+        served = set()
+        for fn in ("readiness_report", "with_token_state"):
+            match = re.search(rf"^fn {fn}\(.*?^\}}$", source, re.M | re.S)
+            self.assertIsNotNone(match, f"server.rs no longer defines fn {fn}; update this drift guard")
+            served.update(re.findall(r'"([a-z_]+)"\.to_owned\(\)', match.group(0)))
+        fixtures = {name for _, body in READYZ.values() for name, _ in json.loads(body)["components"]}
+        self.assertEqual(fixtures, served)
+        self.assertEqual({*probe.READYZ_REQUIRED, *probe.READYZ_PARKED}, served)
 
 
 class UserAgentTests(unittest.TestCase):

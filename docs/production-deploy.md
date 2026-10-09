@@ -100,7 +100,8 @@ whole watch so the rollback dispatch never has to hunt for it.
 | | | `error-class` | one fixed class below, no raw text | |
 | | | `rollback-decision` | GO / EXTEND / ROLLBACK + version-ID record | |
 
-- `readyz`: HTTP status and the two wired components (`process`, `gateway`).
+- `readyz`: HTTP status and the component breakdown (`process`, `gateway`,
+  `database`, `token_invalid`); 200 needs every component `ready`.
   503 parked is truthful, never acceptance; sustained 503 past the measured
   recovery budget is a rollback trigger.
 - `revision`: the exact compiled revision/build ID baked into the Rust
