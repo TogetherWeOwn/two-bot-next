@@ -268,8 +268,13 @@ timestamp stops advancing while the failure streak stays flat. Series
 contract: [metrics](metrics.md).
 
 ```promql
-time() - max by (job) (two_bot_job_last_success_timestamp_seconds{job=~"scheduled_messages|settings"})
+time() - max by (job) (two_bot_job_last_success_timestamp_seconds{job=~"scheduled_messages|settings"} > 0)
 ```
+
+The `> 0` filter drops never-succeeded series before subtraction, so boot
+and parked tickers are absent from the result instead of reading as
+billions of seconds stale — matching the Worker `ticker_stale` rule,
+which requires a positive timestamp before comparing age.
 
 A zero timestamp means the ticker never succeeded since start (boot) or
 was never registered (parked: `DATABASE_URL` unset, or the automations
