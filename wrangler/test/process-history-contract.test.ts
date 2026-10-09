@@ -868,7 +868,7 @@ test("skipped_slot_each_index: a gap is never bridged with the slot before it", 
   }
 });
 
-test("zero_anchor_each_index: an anchor of \"0\" on slot i-1 is not a usable clock, so slot i is NONADJACENT_CPU with no interval", () => {
+test("zero_anchor_each_index: an anchor of \"0\" or a missing system tick on slot i-1 is not usable, so slot i is NONADJACENT_CPU with no interval", () => {
   for (let e = 1; e < 120; e++) {
     const prev = clone(baseSlot(e - 1));
     obsOf(prev).cpu_anchor_mono_ns = "0";
@@ -879,6 +879,13 @@ test("zero_anchor_each_index: an anchor of \"0\" on slot i-1 is not a usable clo
     const zero = C.computeCpuInterval(e, baseSlot(e), prev);
     assert.equal(zero.flags, F.NONADJACENT_CPU, `e=${e}`);
     assert.ok(Object.values(zero.interval).every((v) => v === null), `e=${e}: no span measured from the epoch`);
+  }
+  for (let e = 1; e < 120; e++) {
+    const prev = clone(baseSlot(e - 1));
+    obsOf(prev).cpu_system_ticks = null;
+    const lost = C.computeCpuInterval(e, baseSlot(e), prev);
+    assert.equal(lost.flags, F.NONADJACENT_CPU, `e=${e}: a missing system tick on slot i-1`);
+    assert.ok(Object.values(lost.interval).every((v) => v === null), `e=${e}: no interval from a missing counter`);
   }
 });
 
@@ -1297,6 +1304,7 @@ test("seal_crash_and_denial: a first denial is absorbing for the writer; crashes
     assert.equal(fin.outcome, "unknown");
     assert.deepEqual([fin.seal_persisted, fin.manifest_persisted, fin.terminal_incident_persisted], [false, false, false]);
     assert.ok(has(fin.manifest.flags_mask, "OPEN_OR_UNSEALED", "AUTHORITY_MISSING", "COLLECTOR_STOP", "FAILED_WRITE"));
+    for (let j = k + 1; j < 120; j++) assert.ok(has(fin.manifest.entries[j]!.flags_mask, "COLLECTOR_STOP", "AUTHORITY_MISSING"), `k=${k} j=${j}: a slot not attempted after the denial`);
     assert.equal(writer.persistedIncidents().length, 0);
     assert.deepEqual(writer.localOnlyIncidents().map((e) => e.kind), ["authority"]);
     assert.equal(map.read(C.keyFor(DESC.run_alias, "writer-seal")).kind, "absent");
