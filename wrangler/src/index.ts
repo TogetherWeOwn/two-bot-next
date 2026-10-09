@@ -44,7 +44,13 @@ import {
   parseMappingsSnapshot,
 } from "./redirect-store.ts";
 import { connectPostgres } from "./redirect-db.ts";
-import { forwardedFlagVars, type ForwardedFlagEnv } from "./container-env.ts";
+import {
+  forwardedDiscordIdVars,
+  forwardedFlagVars,
+  isSnowflake,
+  type ForwardedDiscordIdEnv,
+  type ForwardedFlagEnv,
+} from "./container-env.ts";
 import {
   ACTIONS_PATH,
   CONTAINER_MARKER,
@@ -71,8 +77,11 @@ import {
   type MetricsAlertState,
 } from "./alert-rules.ts";
 
-/** Plus the optional reviewed TWO_* flags in container-env.ts (TOG-12020). */
-export interface Env extends ForwardedFlagEnv {
+/**
+ * Plus the optional reviewed TWO_* flags in container-env.ts (TOG-12020) and
+ * the optional reviewed DISCORD_* snowflake IDs there (TOG-19025, M3.6).
+ */
+export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_BOT: DurableObjectNamespace<TwoBotContainer>;
   /** Cloudflare version identity, never a client-supplied owner name. */
   CF_VERSION_METADATA?: { id: string };
@@ -84,9 +93,14 @@ export interface Env extends ForwardedFlagEnv {
   TWO_AUTOMATIONS?: string;
   TWO_TEXT_COMMANDS?: string;
   TWO_AUTOMOD?: string;
-  // Explicit: not a TWO_* flag, so outside the container-env allowlist.
+  // Explicit: not a TWO_* flag, so outside the flag allowlist. Validated as
+  // a snowflake before forwarding (see containerEnvVars below).
   DISCORD_APPLICATION_ID?: string;
-  /** Infrastructure ID protected from temporary-room deletion. */
+  /**
+   * Infrastructure ID protected from temporary-room deletion. Declared here
+   * for its doc comment; forwarded via FORWARDED_DISCORD_IDS like the other
+   * non-secret DISCORD_* IDs (TOG-19025).
+   */
   DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID?: string;
   BOT_PORT?: string;
   KEEPALIVE_SECONDS?: string;
@@ -264,12 +278,16 @@ function containerPort(raw: string | undefined): number {
 }
 
 // Non-TWO_* container input: application ID for command registry sync.
-// The TWO_* publication flags ride the reviewed container-env allowlist.
+// The TWO_* publication flags ride the reviewed container-env flag allowlist;
+// the non-secret DISCORD_* IDs ride FORWARDED_DISCORD_IDS there (TOG-19025).
 const APPLICATION_ID_KEY = "DISCORD_APPLICATION_ID" as const;
 
 /** Readonly view of the secrets/vars the DO forwards into the container. */
 function containerEnvVars(env: Env, port: number): Record<string, string> {
-  const vars: Record<string, string> = forwardedFlagVars(env);
+  const vars: Record<string, string> = {
+    ...forwardedFlagVars(env),
+    ...forwardedDiscordIdVars(env),
+  };
   if (env.DISCORD_TOKEN) vars["DISCORD_TOKEN"] = env.DISCORD_TOKEN;
   if (env.DATABASE_URL) vars["DATABASE_URL"] = env.DATABASE_URL;
   if (env.GUILD_ID) vars["GUILD_ID"] = env.GUILD_ID;
@@ -284,10 +302,14 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
   if (env.TWO_AUTOMOD !== undefined) {
     vars["TWO_AUTOMOD"] = env.TWO_AUTOMOD;
   }
+  // Application ID is a public snowflake, not a secret: forward it only when
+  // it parses as one, so a typo cannot fail the command registry sync closed
+  // with a confusing error. The session lobby ID rides FORWARDED_DISCORD_IDS
+  // above (already merged and validated).
   const applicationId = env[APPLICATION_ID_KEY];
-  if (applicationId !== undefined) vars[APPLICATION_ID_KEY] = applicationId;
-  const lobbyId = env.DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID;
-  if (lobbyId !== undefined) vars["DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID"] = lobbyId;
+  if (typeof applicationId === "string" && isSnowflake(applicationId)) {
+    vars[APPLICATION_ID_KEY] = applicationId;
+  }
   vars["LISTEN_ADDR"] = `0.0.0.0:${port}`;
   // Private internal-actions receiver (TOG-12980, bind TOG-16851). Dark unless
   // the Operator sets TWO_INTERNAL_ACTIONS to exactly "1"; any other value
