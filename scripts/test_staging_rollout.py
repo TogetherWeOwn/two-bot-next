@@ -1591,6 +1591,24 @@ class OrchestrationTests(OfflineTestCase):
                 self.assert_no_evidence()
         self.assert_no_secret_saved_or_printed()
 
+    def test_zero_instance_summary_keeps_first_and_last_poll_observations(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        zero = completed_row()
+        zero["health"]["instances"].update(active=0, healthy=0)
+        _, headers, _ = ready_response()
+        first = (503, headers, self.readyz_body(
+            None, components=[["process", "ready"], ["gateway", "down"]]))
+        last = (500, {"content-type": "application/json"},
+                b'{"ready":false,"error_class":"container_unavailable"}')
+        client = verify_client()
+        client.api_routes[DETAIL_PATH] = [zero]
+        client.request_routes[URL + "/readyz"] = [first, last]
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertIn("polls=2 first=readyz=503,identity=match,components=process:ready,gateway:down "
+                      "last=readyz=500,identity=absent,token=container_unavailable", client.observation)
+        self.assertNotIn(SENTINEL, client.observation)
+
     def test_zero_instance_timeout_diagnostic_drops_malformed_or_mismatched_readiness(self):
         self.prepare_baseline()
         self.write_deploy_output()
