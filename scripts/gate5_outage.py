@@ -7,38 +7,41 @@ outage must recover in **under 60 seconds**, measured from the actual outage
 start to verified recovery. This script never touches staging or production;
 it only reads a committed or piped JSONL fixture and prints the summary.
 
-Log format (one JSON object per line, in time order):
+Log format (one JSON object per line, in time order, one record per readiness
+tick, no more than MAX_GAP_S apart):
 
-    {"ts": "2026-10-01T00:00:01Z", "event": "readyz_ok"}
-    {"ts": "2026-10-01T00:00:02Z", "event": "readyz_fail", "status": 503}
-    {"ts": "2026-10-01T00:00:03Z", "event": "tick_missed"}
-    {"ts": "2026-10-01T00:01:00Z", "event": "readyz_ok"}
+    {"ts": "2026-10-01T00:00:00Z", "event": "readyz_ok", "status": 200}
+    {"ts": "2026-10-01T00:00:05Z", "event": "readyz_fail", "status": 503}
+    {"ts": "2026-10-01T00:00:10Z", "event": "tick_missed"}
+    {"ts": "2026-10-01T00:00:15Z", "event": "readyz_ok", "status": 200}
+    {"ts": "2026-10-01T00:00:20Z", "event": "readyz_ok", "status": 200}
+    {"ts": "2026-10-01T00:00:25Z", "event": "readyz_ok", "status": 200}
 
-Outage start is the first ``readyz_fail`` or ``tick_missed`` while healthy;
-recovery is the first ``readyz_ok`` after that. A repeated failure inside an
-open window does not move the start: the window always spans first failure
-to first recovery. Each recovered window carries ``outage_seconds`` rounded
-to 0.1 s, reusing the ``outage_seconds`` convention of
-``scripts/staging_container_drill.py`` (fence-to-first-ready). Any
-unrecognised ``event`` value or malformed line is preserved as an UNKNOWN
-interval, never silently dropped. Silence longer than ``MAX_GAP_S`` between
-records, a record timestamped before its predecessor (skipped), and a failure
-seen before the first ``readyz_ok`` (unbounded start, so UNKNOWN rather than
-recovered) are UNKNOWN too. The verdict is PASS only with evidence, no UNKNOWN
-intervals or windows, and no outage at or over budget.
+The actual outage starts after the last healthy record before the first
+``readyz_fail`` or ``tick_missed``, and at or before that failure. Recovery is
+the first of CONFIRM_OK consecutive ``readyz_ok`` records, matching the drill's
+first ready probe plus its confirmation probes; a failure restarts the run. A
+recovered window carries ``outage_seconds`` (first failure to recovery, a lower
+bound) and ``outage_seconds_max`` (last healthy record to recovery, an upper
+bound). A window with an unbounded start, or still open at the end of the log,
+is UNKNOWN with null seconds, never scored as zero.
 
-A window still open when the log ends stays explicitly UNKNOWN
-(``status: "unknown"``, ``end: null``, ``outage_seconds: null``): like
-``scripts/soak_evidence.py``, the outage length is unbounded there, so it is
-never scored as zero.
+PASS needs the declared acceptance interval (--expect-start, --expect-end)
+covered by records within MAX_GAP_S at each end, no UNKNOWN intervals or
+windows, and every ``outage_seconds_max`` under budget. Anything else is
+NEEDS WORK. Unrecognised events, malformed or non-UTF-8 lines, timestamps
+without a time of day, and records that contradict their own status are kept
+as UNKNOWN intervals, never silently dropped or trusted.
 
 Usage:
 
-    python3 scripts/gate5_outage.py path/to/tick-log.jsonl
+    python3 scripts/gate5_outage.py --expect-start 2026-10-01T00:00:00Z \\
+        --expect-end 2026-10-01T04:00:00Z path/to/tick-log.jsonl
 """
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -53,32 +56,62 @@ OUTAGE_BUDGET_S = 60
 TICK_CADENCE_S = 5
 MAX_GAP_S = 2 * TICK_CADENCE_S
 
+# The drill's first ready probe plus CONFIRM_PROBES = 2 agreeing probes.
+CONFIRM_OK = 3
+
 # Recovery signal; everything else that opens a window is a start signal.
 RECOVERY_EVENT = "readyz_ok"
-OUTAGE_START_EVENTS = ("readyz_fail", "tick_missed")
-KNOWN_EVENTS = (RECOVERY_EVENT, *OUTAGE_START_EVENTS)
+FAILURE_EVENT = "readyz_fail"
+OUTAGE_START_EVENTS = (FAILURE_EVENT, "tick_missed")
+
+TIME_OF_DAY = re.compile(r"[T ]\d{2}:\d{2}")
 
 
 def parse_ts(value):
-    """Parse an ISO-8601 UTC timestamp; raise ValueError when absent/garbled."""
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"missing ts: {value!r}")
+    """Parse an ISO-8601 UTC timestamp with a time of day; raise ValueError otherwise."""
+    if not isinstance(value, str) or not TIME_OF_DAY.search(value):
+        raise ValueError(f"missing ts or time of day: {value!r}")
     text = value.strip().replace("Z", "+00:00")
     moment = datetime.fromisoformat(text)
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(timezone.utc)
+    try:
+        return moment.astimezone(timezone.utc)
+    except OverflowError as exc:
+        raise ValueError(f"timestamp out of range: {value!r}") from exc
 
 
-def summarize(lines):
+def outage_window(outage, end):
+    """Window for an outage opened at (first failure, last healthy record or None)."""
+    first_failure, last_healthy = outage
+    window = {
+        "start": None,
+        "last_healthy": None,
+        "end": end.isoformat() if end is not None else None,
+        "outage_seconds": None,
+        "outage_seconds_max": None,
+        "status": "unknown",
+    }
+    if last_healthy is not None:
+        window["start"] = first_failure.isoformat()
+        window["last_healthy"] = last_healthy.isoformat()
+    if last_healthy is not None and end is not None:
+        window["outage_seconds"] = round((end - first_failure).total_seconds(), 1)
+        window["outage_seconds_max"] = round((end - last_healthy).total_seconds(), 1)
+        window["status"] = "recovered"
+    return window
+
+
+def summarize(lines, expect_start, expect_end):
     """Fold JSONL tick-log lines into the Gate 5 outage summary dict."""
     readyz_ok = readyz_fail = tick_missed = 0
     outage_windows = []
     unknowns = []
     first_ts = last_ts = None
-    healthy_seen = False
-    outage_open = False
-    outage_start = None  # first failure of the open window; None when unbounded
+    last_healthy = None  # latest readyz_ok seen outside an outage
+    outage = None  # (first failure, last healthy before it) while an outage is open
+    run_start = None  # first readyz_ok of the confirmation run in progress
+    run_len = 0
 
     def note_unknown(start, end, reason):
         unknowns.append({
@@ -88,6 +121,12 @@ def summarize(lines):
         })
 
     for lineno, raw in enumerate(lines, 1):
+        if isinstance(raw, bytes):
+            try:
+                raw = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                note_unknown(None, None, f"malformed line {lineno}: not UTF-8")
+                continue
         line = raw.strip()
         if not line:
             continue
@@ -116,60 +155,58 @@ def summarize(lines):
                              f"{gap:.1f} s without records exceeds {MAX_GAP_S} s")
         last_ts = ts
         event = record.get("event")
+        status = record.get("status")
+        if ((event == RECOVERY_EVENT and status not in (None, 200))
+                or (event == FAILURE_EVENT and status == 200)):
+            note_unknown(ts, ts, f"{event} contradicts status {status!r}")
+            continue
 
         if event == RECOVERY_EVENT:
             readyz_ok += 1
-            healthy_seen = True
-            if outage_open:
-                outage_open = False
-                if outage_start is None:
-                    outage_windows.append({
-                        "start": None,
-                        "end": ts.isoformat(),
-                        "outage_seconds": None,
-                        "status": "unknown",
-                    })
-                else:
-                    outage_windows.append({
-                        "start": outage_start.isoformat(),
-                        "end": ts.isoformat(),
-                        "outage_seconds": round((ts - outage_start).total_seconds(), 1),
-                        "status": "recovered",
-                    })
+            if outage is None:
+                last_healthy = ts
+            else:
+                if run_len == 0:
+                    run_start = ts
+                run_len += 1
+                if run_len == CONFIRM_OK:
+                    outage_windows.append(outage_window(outage, run_start))
+                    outage = None
+                    run_len = 0
         elif event in OUTAGE_START_EVENTS:
-            if event == "readyz_fail":
+            if event == FAILURE_EVENT:
                 readyz_fail += 1
             else:
                 tick_missed += 1
-            if not outage_open:
-                outage_open = True
-                outage_start = ts if healthy_seen else None
+            if outage is None:
+                outage = (ts, last_healthy)
+            run_len = 0
         else:
             note_unknown(ts, ts, f"unrecognised event {event!r}")
 
-    if outage_open:
+    if outage is not None:
         # Log ends while still down: the outage length is unbounded, so the
         # window stays explicitly UNKNOWN instead of being scored as zero.
-        outage_windows.append({
-            "start": outage_start.isoformat() if outage_start is not None else None,
-            "end": None,
-            "outage_seconds": None,
-            "status": "unknown",
-        })
+        outage_windows.append(outage_window(outage, None))
+    if first_ts is not None:
+        if (first_ts - expect_start).total_seconds() > MAX_GAP_S:
+            note_unknown(expect_start, first_ts, "no records from the declared start")
+        if (expect_end - last_ts).total_seconds() > MAX_GAP_S:
+            note_unknown(last_ts, expect_end, "no records to the declared end")
 
-    recovered = [window["outage_seconds"] for window in outage_windows
-                 if window["status"] == "recovered"]
-    max_outage = max(recovered) if recovered else None
+    recovered = [window for window in outage_windows if window["status"] == "recovered"]
+    max_outage = max((window["outage_seconds_max"] for window in recovered), default=None)
     unknown_windows = any(window["status"] == "unknown" for window in outage_windows)
-    over_budget = any(seconds >= OUTAGE_BUDGET_S for seconds in recovered)
+    possibly_over = any(window["outage_seconds_max"] >= OUTAGE_BUDGET_S
+                        for window in recovered)
     passed = (first_ts is not None and not unknowns and not unknown_windows
-              and not over_budget)
-    verdict = "PASS" if passed else "NEEDS WORK"
+              and not possibly_over)
     return {
         "schema_version": SCHEMA_VERSION,
+        "expected": {"start": expect_start.isoformat(), "end": expect_end.isoformat()},
         "window": {
-            "start": first_ts.isoformat() if first_ts else None,
-            "end": last_ts.isoformat() if last_ts else None,
+            "start": first_ts.isoformat() if first_ts is not None else None,
+            "end": last_ts.isoformat() if last_ts is not None else None,
         },
         "readyz_ok": readyz_ok,
         "readyz_fail": readyz_fail,
@@ -178,16 +215,22 @@ def summarize(lines):
         "unknown_intervals": unknowns,
         "max_outage_seconds": max_outage,
         "outage_budget_s": OUTAGE_BUDGET_S,
-        "verdict": verdict,
+        "verdict": "PASS" if passed else "NEEDS WORK",
     }
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", help="readiness tick log in JSONL format")
+    parser.add_argument("--expect-start", required=True, type=parse_ts,
+                        help="UTC start of the declared acceptance interval")
+    parser.add_argument("--expect-end", required=True, type=parse_ts,
+                        help="UTC end of the declared acceptance interval")
     args = parser.parse_args(argv)
-    with open(args.log, encoding="utf-8") as handle:
-        summary = summarize(handle)
+    if args.expect_end <= args.expect_start:
+        parser.error("--expect-end must be after --expect-start")
+    with open(args.log, "rb") as handle:
+        summary = summarize(handle, args.expect_start, args.expect_end)
     json.dump(summary, sys.stdout, indent=2)
     sys.stdout.write("\n")
     if summary["verdict"] != "PASS":
