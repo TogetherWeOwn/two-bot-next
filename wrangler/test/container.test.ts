@@ -875,6 +875,20 @@ test("same-owner exact-epoch takeover while recoveryFailed still destroys and cl
   assert.equal(h.runtime.destroys, destroys + 1);
 });
 
+test("same-owner exact-epoch takeover while recoveryFailed refuses an unconfirmed teardown", async (t) => {
+  const epoch2 = { ...ACTIVE_OWNER, epoch: 2, oldEpoch: 1 };
+  const h = await harness(t, WORKER_ENV, { owner: epoch2, stopError: true });
+  await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+  (h.bot as unknown as { recoveryFailed: boolean }).recoveryFailed = true;
+  const starts = h.starts.length;
+  const repeat = await h.bot.fetch(controlRequest({ action: "takeover", expectedEpoch: 2, actor: "fixture-operator" }));
+  assert.equal(repeat.status, 503, "a repeat must not report success over an unconfirmed teardown");
+  assert.equal((h.bot as unknown as { recoveryFailed: boolean }).recoveryFailed, true);
+  assert.equal((h.values.get(OWNER_KEY) as { phase: string }).phase, "fenced");
+  assert.equal((await h.bot.fetch(probeRequest("https://worker.invalid/health"))).status, 503);
+  assert.equal(h.starts.length, starts);
+});
+
 test("different-deployment takeover at the fresh epoch still commits", async (t) => {
   const h = await harness(t, { ...WORKER_ENV, CF_VERSION_METADATA: { id: "deployment-B" } });
   const asB = (body?: object) => {
