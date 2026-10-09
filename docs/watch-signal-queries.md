@@ -156,8 +156,9 @@ after the restart.
 
 Source: `two_bot_db_errors_total{op}` (storage-layer failures, not pool
 pressure). The `op` label is `admission` (send-admission SQL:
-admit/extend/complete) or `other` (every other store until its operation
-joins the allowlist; stays zero until then). Fixed cardinality: two series.
+admit/extend/complete) or `other` (currently voice guild-actor store load
+failures; other stores collapse here as they join the allowlist). Fixed
+cardinality: two series.
 Unknown operations collapse to `other`; no error text, query, or identifier
 is retained. Series contract: [metrics](metrics.md).
 

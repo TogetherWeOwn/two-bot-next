@@ -697,15 +697,17 @@ fn observe_voice_operation(op: &'static str, outcome: &'static str) {
     }
 }
 
-/// Minimum seconds between `voice actor load failed` warns; every failure
-/// still bumps `two_bot_db_errors_total{op="other"}`.
+/// Minimum seconds between `voice actor load failed` warns, process-wide
+/// (not per guild); every failure still bumps
+/// `two_bot_db_errors_total{op="other"}`.
 const VOICE_ACTOR_LOAD_WARN_INTERVAL_SECS: u64 = 300;
 /// Last wall-clock second a load-failure warn was emitted.
 static VOICE_ACTOR_LOAD_WARN_LAST_SECS: AtomicU64 = AtomicU64::new(0);
 
 /// A failed `GuildRoomWorker::load` must not silently drop the guild actor:
-/// count it and warn (throttled). The actor respawns on the next gateway
-/// event via `UnboundedSender::is_closed`.
+/// count it and warn (throttled). Only `publish_snapshot` reaches
+/// `ensure_actor`, so the actor respawns on the next `GuildCreate` snapshot
+/// or `RESUMED` replay; other gateway events only touch a live actor.
 fn observe_voice_actor_load_failure(guild: Snowflake, error: &StoreError) {
     metrics::global().db_error("other");
     let now_secs = SystemTime::now()
@@ -721,7 +723,7 @@ fn observe_voice_actor_load_failure(guild: Snowflake, error: &StoreError) {
         warn!(
             guild_id = guild.to_string(),
             error = %error,
-            "voice actor load failed; actor respawns on the next event"
+            "voice actor load failed; actor respawns on the next GuildCreate or RESUMED snapshot"
         );
     }
 }
@@ -4818,7 +4820,8 @@ pub type KickReply = Result<VoteKickUpdate, KickRefusal>;
 
 /// Per-guild actor registry. Actors spawn lazily on the first complete
 /// snapshot and exit when their guild leaves (sender dropped) or their store
-/// load fails (respawned on the next event via `UnboundedSender::is_closed`).
+/// load fails (respawned on the next `GuildCreate` snapshot or `RESUMED`
+/// replay via `UnboundedSender::is_closed`).
 /// How long an `/import` preview stays confirmable. Past that the Confirm
 /// button answers "expired" and writes nothing; the member uploads again.
 pub const PENDING_IMPORT_TTL: Duration = Duration::from_secs(15 * 60);

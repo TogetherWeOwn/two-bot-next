@@ -142,9 +142,9 @@ as dynamic labels.
 - `two_bot_voice_dead_letters_total{action}` — `action` is `create`, `move`,
   `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other`.
 - `two_bot_db_errors_total{op}` — `op` is `admission` or `other`. Recorded
-  by `Metrics::db_error`; currently only send-admission SQL
-  (admit/extend/complete storage failures) reports, so `other` stays zero
-  until another store's op joins the allowlist.
+  by `Metrics::db_error`; send-admission SQL (admit/extend/complete storage
+  failures) reports as `admission`, and failed voice guild-actor store loads
+  report as `other`.
 - `two_bot_send_admissions_total{outcome}` — `outcome` is `admitted`,
   `blocked`, `storage_error` or `other`. Recorded once per `admit()`
   decision by the Postgres admission gate; failed `complete()`/`extend()`

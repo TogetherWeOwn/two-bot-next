@@ -612,7 +612,10 @@ async fn actor_load_failure_bumps_counter_and_arms_warn_throttle() {
     let before = global_series(series);
     observe_voice_actor_load_failure(GUILD, &StoreError::Unavailable);
     observe_voice_actor_load_failure(GUILD, &StoreError::Unavailable);
-    assert_eq!(global_series(series), before + 2);
+    assert!(
+        global_series(series) >= before + 2,
+        "load failures bump the process-wide counter (parallel tests may add more)"
+    );
     // The first failure arms the throttle timestamp; the immediate second
     // call stays silent. (Warn text itself is covered by the observability
     // event catalog and its conformance allowlist entry.)

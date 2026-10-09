@@ -133,11 +133,13 @@ sink attaches to the gateway writer on the cutover path.
 | `voice_event="voice_creator_orphan"` | `crates/bot/src/voice_rooms.rs:4904` (`voice creator orphan needs manual deletion`) | Untracked creator-channel orphan needing manual deletion |
 
 Adjacent actor message without a `voice_event` field:
-`voice actor load failed; actor respawns on the next event`
+`voice actor load failed; actor respawns on the next GuildCreate or RESUMED snapshot`
 (`observe_voice_actor_load_failure` in `crates/bot/src/voice_rooms.rs`):
 the guild actor's store load failed. Every failure bumps
-`two_bot_db_errors_total{op="other"}`; the warn is throttled to one line per
-5 minutes. The actor respawns on the next gateway event for that guild.
+`two_bot_db_errors_total{op="other"}`; the warn is throttled process-wide to
+one line per 5 minutes. Only `publish_snapshot` reaches `ensure_actor`, so
+the actor respawns on the next `GuildCreate` snapshot or `RESUMED` replay;
+other gateway events only touch a live actor.
 
 ## Unknowns (TBD)
 

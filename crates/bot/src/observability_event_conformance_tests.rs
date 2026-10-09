@@ -171,7 +171,7 @@ const MAIN_RS_ADJACENT: [&str; 13] = [
 // session events.
 const VOICE_RS_ADJACENT: [&str; 11] = [
     "voice succession refused",
-    "voice actor load failed; actor respawns on the next event",
+    "voice actor load failed; actor respawns on the next GuildCreate or RESUMED snapshot",
     "voice notice settings unreadable",
     "voice notice had no working destination",
     "voice create reservation settle failed",
