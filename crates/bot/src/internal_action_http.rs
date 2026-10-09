@@ -24,18 +24,21 @@ use two_bot_core::{
     format_iso_millis,
     internal_action_config::InternalActionConfig,
     internal_action_store::{
-        AuditSubject, DiscordId, InternalActionStore, InternalClaim, RequestIdentity,
+        AuditSubject, DiscordId, EventOutcome, InternalActionStore, InternalClaim, RequestIdentity,
         TerminalFailure, TerminalResponse,
     },
     internal_actions::{
-        new_request_id, unmapped_event_key, validate_announcement, validate_event_key,
-        validate_idempotency_key, ActionError, AuthDecision, AuthHeaders, AuthenticatedRequest,
-        ErrorCode, InternalFlags, TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES, SKEW_SECONDS,
+        new_request_id, unmapped_event_key, validate_announcement, validate_event_input,
+        validate_event_key, validate_idempotency_key, ActionError, AuthDecision, AuthHeaders,
+        AuthenticatedRequest, ErrorCode, InternalFlags, TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES,
+        SKEW_SECONDS,
     },
     rejection_telemetry::{ActionLabel, KeyLabel, Rejection, RejectionRecord, RejectionTelemetry},
 };
-use two_bot_discord::internal_actions::{AnnouncementExecutor, ExecutionOutcome, Refusal};
-use two_bot_discord::{ActionExecutor, EventActionError, EventCall};
+use two_bot_discord::internal_actions::{
+    supports_event_mutation, AnnouncementExecutor, ExecutionOutcome, Refusal,
+};
+use two_bot_discord::{ActionExecutor, DiscordError, EventActionError, EventCall};
 
 const MAX_HEADER_BYTES: usize = 8192;
 const MAX_HEADERS: usize = 64;
@@ -65,6 +68,7 @@ impl ActionEffect for AnnouncementExecutor {
                     TerminalResponse::Success {
                         resource_id: Some(message_id),
                         affected: 1,
+                        outcome: None,
                     }
                 }
                 ExecutionOutcome::NoEffect(refusal) => TerminalResponse::Failure(match refusal {
@@ -138,11 +142,56 @@ impl EventReadEffect for EventReadExecutor {
     }
 }
 
+/// Mutating event effect: the receiver validates the body, enforces the
+/// env-only flag gate in `authorize`, commits the idempotency claim and
+/// resolves `event_key` to a trusted Discord id before invoking this. The call
+/// itself carries no website fields, only the trusted mapping result. Mirror
+/// writes are part of the mutation: a failed write after a Discord success is
+/// an unknown outcome, never a second attempt.
+trait EventMutateEffect: Send + Sync {
+    fn execute_mutation<'a>(
+        &'a self,
+        guild_id: &'a str,
+        call: &'a EventCall,
+        observed_at: &'a str,
+    ) -> BoxFuture<'a, Result<Value, EventActionError>>;
+}
+
+/// Production mutation effect: the shared event executor against the Postgres
+/// mirror. Shares the token-wide send-admission lane with the read path.
+pub struct EventMutationExecutor {
+    executor: ActionExecutor,
+    mirror: sqlx::PgPool,
+}
+
+impl EventMutationExecutor {
+    #[must_use]
+    pub fn new(executor: ActionExecutor, mirror: sqlx::PgPool) -> Self {
+        Self { executor, mirror }
+    }
+}
+
+impl EventMutateEffect for EventMutationExecutor {
+    fn execute_mutation<'a>(
+        &'a self,
+        guild_id: &'a str,
+        call: &'a EventCall,
+        observed_at: &'a str,
+    ) -> BoxFuture<'a, Result<Value, EventActionError>> {
+        Box::pin(async move {
+            self.executor
+                .execute_event(guild_id, call, &self.mirror, observed_at)
+                .await
+        })
+    }
+}
+
 struct ReceiverState {
     config: InternalActionConfig,
     store: InternalActionStore,
     effect: Arc<dyn ActionEffect>,
     event_read: Arc<dyn EventReadEffect>,
+    event_mutate: Arc<dyn EventMutateEffect>,
     clock: Mutex<ClockGuard>,
     buckets: Mutex<TokenBuckets>,
     telemetry: Mutex<RejectionTelemetry>,
@@ -155,12 +204,14 @@ impl ReceiverState {
         pool: sqlx::PgPool,
         effect: Arc<dyn ActionEffect>,
         event_read: Arc<dyn EventReadEffect>,
+        event_mutate: Arc<dyn EventMutateEffect>,
     ) -> Self {
         Self {
             config,
             store: InternalActionStore::new(pool),
             effect,
             event_read,
+            event_mutate,
             clock: Mutex::new(ClockGuard::new()),
             buckets: Mutex::new(TokenBuckets::new()),
             telemetry: Mutex::new(RejectionTelemetry::default()),
@@ -254,7 +305,8 @@ pub async fn bind(
             config,
             pool.clone(),
             Arc::new(executor),
-            Arc::new(EventReadExecutor::new(events, pool)),
+            Arc::new(EventReadExecutor::new(events.clone(), pool.clone())),
+            Arc::new(EventMutationExecutor::new(events, pool)),
         )),
     })
 }
@@ -431,6 +483,11 @@ async fn receive(state: &ReceiverState, request: Request, id: &str) -> Response 
     if decision.action == "event.read" {
         return read_event(state, &decision, id, key, action).await;
     }
+    // Mutating event verbs take the same durable claim/audit path as
+    // announcements below, with their own validation and key mapping.
+    if supports_event_mutation(&decision.action) {
+        return mutate_event(state, &decision, &raw, headers.idempotency, id, key, action).await;
+    }
     // This second fence is explicit: core phase-1 defaults are not capabilities.
     if !AnnouncementExecutor::supports(&decision.action) {
         return reject(Failure::code(ErrorCode::ActionNotAllowed), action);
@@ -534,6 +591,180 @@ fn event_read_response(result: Value, id: &str) -> Response {
     wire.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     wire
+}
+
+/// Mutating `event.upsert` / `event.cancel`: validate the caller's `event_key`
+/// (plus the full event input for upserts) and resolve it in the staging guild
+/// before taking the durable claim — the same order as the announcement
+/// channel-key check. An unmapped cancel key refuses before any claim or
+/// Discord call; an unmapped upsert key creates. The committed outcome makes
+/// replay byte-identical, including `created` after its key was registered.
+async fn mutate_event(
+    state: &ReceiverState,
+    decision: &AuthDecision,
+    raw: &[u8],
+    idempotency_header: Option<&str>,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let upsert = decision.action == "event.upsert";
+    let idempotency = match validate_idempotency_key(idempotency_header, &decision.action) {
+        Ok(key) => key,
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let event_key = match validate_event_key(&decision.body) {
+        Ok(key) => key.to_owned(),
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let input = if upsert {
+        match validate_event_input(&decision.body, state.config.channel_keys()) {
+            Ok(input) => Some(input),
+            Err(error) => return reject(Failure::from_action(error)),
+        }
+    } else {
+        None
+    };
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let mapped = match state.store.event_id_for_key(guild_id, &event_key).await {
+        Ok(mapped) => mapped,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    // Cancel names a mapped key, never a raw Discord id: no mapping means no
+    // Discord call, exactly like the read path.
+    let event_id = match (upsert, mapped) {
+        (true, mapped) => mapped,
+        (false, Some(event_id)) => Some(event_id),
+        (false, None) => return reject(Failure::from_action(unmapped_event_key(&event_key))),
+    };
+    let target_id = match event_id.as_deref() {
+        // Creates name no event yet: the guild alone is the audit subject.
+        None => None,
+        Some(id) => match DiscordId::new(id) {
+            Ok(id) => Some(id),
+            Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+        },
+    };
+    let (call, outcome) = if upsert {
+        let created = event_id.is_none();
+        (
+            EventCall::Upsert {
+                event_id,
+                input: input.expect("upsert validated its event input"),
+            },
+            if created {
+                EventOutcome::Created
+            } else {
+                EventOutcome::Updated
+            },
+        )
+    } else {
+        (
+            EventCall::Cancel {
+                event_id: event_id.expect("cancel resolved a mapping"),
+            },
+            EventOutcome::Cancelled,
+        )
+    };
+    let subject = AuditSubject {
+        guild_id: Some(DiscordId::new(guild_id).expect("staging guild ID")),
+        target_id,
+        ..AuditSubject::default()
+    };
+    let Some(caller) = state.config.caller_for(&decision.key_id) else {
+        return reject(Failure::code(ErrorCode::Internal));
+    };
+    let identity = match RequestIdentity::new(caller, idempotency, &decision.action, raw) {
+        Ok(identity) => identity,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let claim = match state.store.claim(&identity, &subject).await {
+        Ok(InternalClaim::Claimed(claim)) => claim,
+        Ok(InternalClaim::Replay(response)) => {
+            return state.terminal(response, true, id, key.clone(), action);
+        }
+        Ok(InternalClaim::Mismatch) => return reject(Failure::code(ErrorCode::VersionConflict)),
+        Ok(InternalClaim::InFlight) => return reject(Failure::code(ErrorCode::InProgress)),
+        Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation()),
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let observed_at = format_iso_millis(now_ms() as i64);
+    match state
+        .event_mutate
+        .execute_mutation(guild_id, &call, &observed_at)
+        .await
+    {
+        Ok(result) => {
+            let event_id = match result
+                .get("event_id")
+                .and_then(Value::as_str)
+                .map(DiscordId::new)
+            {
+                Some(Ok(event_id)) => event_id,
+                // The executor only returns normalized mirror rows, so an
+                // unreadable id is an unknown outcome, never a receipt.
+                _ => {
+                    let _ = state.store.mark_unknown(&claim).await;
+                    return reject(Failure::reconciliation());
+                }
+            };
+            // Upsert registers (or re-points) the key only after Discord
+            // confirms; cancel retains the mapping so a later edit cannot
+            // silently recreate the event.
+            if upsert
+                && state
+                    .store
+                    .put_event_key(guild_id, &event_key, event_id.as_str())
+                    .await
+                    .is_err()
+            {
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation());
+            }
+            let response = TerminalResponse::Success {
+                resource_id: Some(event_id),
+                affected: 1,
+                outcome: Some(outcome),
+            };
+            if state.store.finish(&claim, &response).await.is_err() {
+                // Do not return success before its audit/receipt is committed.
+                // An unavailable store leaves the existing claim occupied.
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation());
+            }
+            state.terminal(response, false, id, key.clone(), action)
+        }
+        Err(error) => {
+            // A local admission refusal proves nothing was sent, so the claim
+            // is released and the same key may retry. A 429 proves no effect
+            // and, like announcements, is recorded as a refusal, never resent.
+            // Anything uncertain retains the fence for reconciliation.
+            match error {
+                EventActionError::Discord(DiscordError::Guard(_)) => {
+                    let wire = error.action_error();
+                    if state.store.release_proven_not_sent(claim).await.is_err() {
+                        return reject(Failure::code(ErrorCode::Internal));
+                    }
+                    reject(Failure::from_action(wire))
+                }
+                EventActionError::Discord(
+                    DiscordError::RateLimited | DiscordError::Rejected(_),
+                ) => {
+                    let response = TerminalResponse::Failure(TerminalFailure::DiscordRejected);
+                    if state.store.finish(&claim, &response).await.is_err() {
+                        let _ = state.store.mark_unknown(&claim).await;
+                        return reject(Failure::reconciliation());
+                    }
+                    state.terminal(response, false, id, key.clone(), action)
+                }
+                _ => {
+                    let _ = state.store.mark_unknown(&claim).await;
+                    reject(Failure::reconciliation())
+                }
+            }
+        }
+    }
 }
 
 struct WireHeaders<'a> {
@@ -696,8 +927,19 @@ fn terminal_response(response: TerminalResponse, replayed: bool, id: &str) -> Re
         TerminalResponse::Success {
             resource_id: Some(message_id),
             affected: 1,
+            outcome: None,
         } => Json(json!({
             "ok": true, "result": {"message_id": message_id.as_str()}, "request_id": id,
+        }))
+        .into_response(),
+        TerminalResponse::Success {
+            resource_id: Some(event_id),
+            affected: 1,
+            outcome: Some(outcome),
+        } => Json(json!({
+            "ok": true,
+            "result": {"outcome": outcome.as_str(), "event_id": event_id.as_str()},
+            "request_id": id,
         }))
         .into_response(),
         TerminalResponse::Success { .. } => Failure::reconciliation().response(id),

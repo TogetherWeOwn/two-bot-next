@@ -5,7 +5,7 @@
 use sqlx::{PgPool, Row};
 use two_bot_core::clock_guard::ClockGuard;
 use two_bot_core::internal_action_store::{
-    AuditSubject, DiscordId, ExecutionClaim, InternalActionStore, InternalClaim,
+    AuditSubject, DiscordId, EventOutcome, ExecutionClaim, InternalActionStore, InternalClaim,
     InternalStoreError, ReconciliationEvidence, RequestIdentity, TerminalFailure, TerminalResponse,
 };
 use two_bot_core::secret::Secret;
@@ -600,6 +600,7 @@ fn success() -> TerminalResponse {
     TerminalResponse::Success {
         resource_id: Some(DiscordId::new("345678901234567890").unwrap()),
         affected: 2,
+        outcome: None,
     }
 }
 
@@ -1016,6 +1017,38 @@ async fn stale_and_unknown_claims_never_reexecute_and_reconciliation_is_terminal
         Err(InternalStoreError::TransitionRefused)
     );
     second.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn event_outcome_persists_and_replays_byte_identically() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    for (key, outcome) in [
+        ("outcome-create:123", EventOutcome::Created),
+        ("outcome-update:123", EventOutcome::Updated),
+        ("outcome-cancel:123", EventOutcome::Cancelled),
+    ] {
+        let id = identity(key, "event.upsert", b"{\"event_key\":\"launch\"}");
+        let claim = claimed(store.claim(&id, &subject()).await.unwrap());
+        let receipt = TerminalResponse::Success {
+            resource_id: Some(DiscordId::new("345678901234567890").unwrap()),
+            affected: 1,
+            outcome: Some(outcome),
+        };
+        store.finish(&claim, &receipt).await.unwrap();
+        assert!(
+            matches!(store.claim(&id, &subject()).await.unwrap(), InternalClaim::Replay(r) if r == receipt),
+            "replay must return the recorded outcome, never a re-derived one"
+        );
+    }
+    // Announcement receipts carry no outcome: NULL persists and replays as None.
+    let legacy = identity("outcome-legacy:123", "announcement.post", b"{}");
+    let claim = claimed(store.claim(&legacy, &subject()).await.unwrap());
+    store.finish(&claim, &success()).await.unwrap();
+    assert!(
+        matches!(store.claim(&legacy, &subject()).await.unwrap(), InternalClaim::Replay(r) if r == success())
+    );
     db.cleanup().await;
 }
 

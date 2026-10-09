@@ -79,10 +79,14 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
 committed intent/audit transaction before REST. Every later audit copies that
 original scalar, not a newly evaluated role map. Migration `0351` adds nullable
 columns; older intents remain NULL and must not be guessed from current config.
-`TerminalResponse` is `Success { resource_id: Option<DiscordId>, affected: u32 }`
-(HTTP 200) or `Failure(TerminalFailure)` with fixed codes/statuses:
-`Malformed`/400, `ActionNotAllowed`/403, `DiscordRejected`/422, `NoEffect`/502.
-Failure is definitive; timeout/transport uncertainty must use `mark_unknown`.
+`TerminalResponse` is `Success { resource_id: Option<DiscordId>, affected: u32,
+outcome: Option<EventOutcome> }` (HTTP 200) or `Failure(TerminalFailure)` with
+fixed codes/statuses: `Malformed`/400, `ActionNotAllowed`/403,
+`DiscordRejected`/422, `NoEffect`/502. `EventOutcome` is the closed legacy
+result word (`created`/`updated`/`cancelled`, migration `0423`): event intents
+always record one so replay returns the first result byte-identically, while
+announcement receipts stay `None` and render `message_id`. Failure is
+definitive; timeout/transport uncertainty must use `mark_unknown`.
 The adapter persists the whole typed response. It intentionally accepts neither
 `serde_json::Value` nor `ActionError` (which contains free-text log details).
 Receiver/executor follow-ups must map these typed scalars to their wire envelopes

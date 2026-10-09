@@ -165,11 +165,14 @@ Rejections use bounded closed scalar telemetry with periodic/shutdown flushes,
 never raw paths, bodies, signatures, secrets or unknown caller labels.
 
 After authentication, durable nonce burn and per-key admission, the receiver
-validates the announcement and original `Idempotency-Key`, then atomically
-claims its intent and audit record. Only a committed `Claimed` result permits
-an effect. Replay returns the stored terminal response; mismatched payloads,
-in-flight or reconciliation-required intents never send. The stable caller
-mapping preserves this ownership across distinct-key rotation and restart.
+validates the announcement or the event mutation (`event_key`, and the full
+event input plus staging-guild key resolution for upserts) and the original
+`Idempotency-Key`, then atomically claims its intent and audit record. Only a
+committed `Claimed` result permits an effect. Replay returns the stored
+terminal response; mismatched payloads, in-flight or reconciliation-required
+intents never send. The stable caller mapping preserves this ownership across
+distinct-key rotation and restart. Upserts register their key only after
+Discord confirms; cancels retain the mapping.
 
 Runtime constructs the single-attempt announcement adapter with
 `PgSendAdmission` over the same database/token authority as other governed
@@ -182,7 +185,9 @@ returned only after the receipt/audit transaction commits. See
 [the executor contract](internal-action-executor.md#single-attempt-and-safe-results).
 
 The website-compatible envelopes contain `ok`, `request_id`, and either
-`result.message_id` or `error.{code,message,retryable}`. Durable replay adds
+`result.message_id` (announcements), `result.{outcome,event_id}` (event
+upsert/cancel, with `outcome` replayed from the stored receipt, never
+re-derived) or `error.{code,message,retryable}`. Durable replay adds
 `Idempotent-Replay: true`; inbound bucket refusal carries `Retry-After`.
 Messages are fixed/redacted and all envelopes use `Cache-Control: no-store`.
 

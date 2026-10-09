@@ -1,7 +1,9 @@
 //! Callable internal-action effects, not an authenticated HTTP receiver.
 //!
 //! The caller must authorize and commit its durable execution claim first.
-//! Only `announcement.post` is implemented here; core feature flags are not
+//! `announcement.post` is implemented here; `event.upsert` and `event.cancel`
+//! run through [`ActionExecutor::execute_event`] (see [`crate::internal_events`])
+//! with the receiver-owned claim and key mapping. Core feature flags are not
 //! executor capabilities. No runtime flags, stores or listeners are installed.
 //! Every 429 feeds the caller-supplied per-token [`CooldownGovernor`].
 
@@ -27,7 +29,20 @@ use two_bot_core::send_admission::{
 mod governor;
 pub use governor::{Clock, CooldownGovernor, MAX_CHANNEL_HOLDS};
 
-pub const SUPPORTED_ACTIONS: &[&str] = &["announcement.post"];
+/// Every verb with a wired effect adapter. The announcement adapter below owns
+/// only `announcement.post`; the two event verbs run through
+/// [`ActionExecutor::execute_event`](crate::internal_events) behind the
+/// receiver's claim and key mapping. All other implemented verbs stay refused.
+pub const SUPPORTED_ACTIONS: &[&str] = &["announcement.post", "event.upsert", "event.cancel"];
+
+/// True for the two event verbs the receiver executes through
+/// [`ActionExecutor::execute_event`](crate::internal_events). The env-only
+/// flag gate itself stays with the receiver's `authorize` check: this only
+/// names which verbs have a wired mutation path.
+#[must_use]
+pub fn supports_event_mutation(action: &str) -> bool {
+    matches!(action, "event.upsert" | "event.cancel")
+}
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const BOT_USER_AGENT: &str = concat!(
     "DiscordBot (https://github.com/TogetherWeOwn/two-bot-next, ",
@@ -185,9 +200,13 @@ impl AnnouncementExecutor {
         Ok(self)
     }
 
+    /// This adapter owns only the announcement verb. Event verbs are listed in
+    /// [`SUPPORTED_ACTIONS`] but execute through
+    /// [`ActionExecutor::execute_event`](crate::internal_events); routing them
+    /// here would validate an event body as an announcement.
     #[must_use]
     pub fn supports(action: &str) -> bool {
-        SUPPORTED_ACTIONS.contains(&action)
+        action == "announcement.post"
     }
 
     /// Authorize first; this method intentionally owns neither the store claim

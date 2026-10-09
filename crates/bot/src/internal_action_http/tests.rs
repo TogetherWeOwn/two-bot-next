@@ -109,6 +109,7 @@ impl ActionEffect for MockEffect {
                     Effect::Terminal(TerminalResponse::Success {
                         resource_id: Some(DiscordId::new("444444444444444444").unwrap()),
                         affected: 1,
+                        outcome: None,
                     })
                 }
             }
@@ -125,7 +126,31 @@ fn state_with_reads(
     effect: Arc<MockEffect>,
     reads: Arc<MockEventRead>,
 ) -> Arc<ReceiverState> {
-    Arc::new(ReceiverState::new(config(), pool, effect, reads))
+    state_full(pool, effect, reads, Arc::new(MockEventMutate))
+}
+
+fn state_full(
+    pool: sqlx::PgPool,
+    effect: Arc<MockEffect>,
+    reads: Arc<MockEventRead>,
+    mutates: Arc<MockEventMutate>,
+) -> Arc<ReceiverState> {
+    Arc::new(ReceiverState::new(config(), pool, effect, reads, mutates))
+}
+
+/// Offline mutation placeholder for harnesses that never send event verbs: the
+/// auth/flag/validation fences refuse before this is ever called.
+struct MockEventMutate;
+
+impl EventMutateEffect for MockEventMutate {
+    fn execute_mutation<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a EventCall,
+        _: &'a str,
+    ) -> BoxFuture<'a, Result<Value, EventActionError>> {
+        Box::pin(async move { Ok(json!({"outcome": "updated", "event_id": READ_EVENT_ID})) })
+    }
 }
 
 /// Offline read double: the auth/key/flag fences must refuse before this is
@@ -158,7 +183,7 @@ impl EventReadEffect for MockEventRead {
 /// The receiver reads its enabled set from the process environment, so
 /// flag-dependent tests serialize on this lock and always restore the var.
 /// Async-aware: the guard is held across `.await` points by design.
-static EVENT_READ_FLAG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static INTERNAL_FLAG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn set_event_read_flag(on: bool) {
     if on {
@@ -166,6 +191,25 @@ fn set_event_read_flag(on: bool) {
     } else {
         std::env::remove_var("TWO_INTERNAL_ALLOW_EVENT_READ");
     }
+}
+
+fn set_event_cancel_flag(on: bool) {
+    if on {
+        std::env::set_var("TWO_INTERNAL_ALLOW_EVENT_CANCEL", "1");
+    } else {
+        std::env::remove_var("TWO_INTERNAL_ALLOW_EVENT_CANCEL");
+    }
+}
+
+fn upsert_payload(key: &str) -> String {
+    serde_json::json!({"action": "event.upsert", "event_key": key, "name": "Launch Night",
+        "starts_at": "2026-09-01T19:00:00Z", "ends_at": "2026-09-01T22:00:00Z",
+        "location": "The Hall"})
+    .to_string()
+}
+
+fn cancel_payload(key: &str) -> String {
+    serde_json::json!({"action": "event.cancel", "event_key": key}).to_string()
 }
 
 fn read_payload(key: &str) -> String {
@@ -685,41 +729,70 @@ struct MockEventApi {
 }
 
 const READ_EVENT_ID: &str = "100000000000000007";
+const CREATE_EVENT_ID: &str = "100000000000000011";
 
 fn staging_guild() -> &'static str {
     two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID
 }
 
 fn discord_event() -> Value {
+    discord_event_for(READ_EVENT_ID, 1)
+}
+
+fn discord_event_for(event_id: &str, status: i64) -> Value {
     json!({
-        "id": READ_EVENT_ID,
+        "id": event_id,
         "guild_id": staging_guild(),
         "name": "Launch Night",
         "scheduled_start_time": "2026-09-01T20:00:00.000Z",
         "channel_id": Value::Null,
         "description": Value::Null,
         "entity_metadata": {"location": "The Hall"},
-        "status": 1,
+        "status": status,
     })
+}
+
+/// One scripted Discord answer, consumed in request order. Exhaustion falls
+/// back to 500 so an unexpected second effect fails loudly, never silently.
+struct ScriptedEvent {
+    status: StatusCode,
+    body: Value,
 }
 
 impl MockEventApi {
     async fn start() -> Self {
+        Self::start_scripted(vec![ScriptedEvent {
+            status: StatusCode::OK,
+            body: discord_event(),
+        }])
+        .await
+    }
+
+    async fn start_scripted(scripts: Vec<ScriptedEvent>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
-        let reply = discord_event();
+        let replies = Arc::new(Mutex::new(scripts));
         let task = tokio::spawn(async move {
             axum::serve(
                 listener,
                 Router::new().fallback(|request: Request| async move {
-                    let (parts, _) = request.into_parts();
+                    let (parts, body) = request.into_parts();
+                    let raw = to_bytes(body, 8192).await.unwrap_or_default();
+                    let sent: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
                     seen.lock().unwrap().push(json!({
                         "method": parts.method.as_str(),
                         "path": parts.uri.path(),
+                        "body": sent,
                     }));
-                    (StatusCode::OK, Json(reply))
+                    let mut replies = replies.lock().unwrap();
+                    if replies.is_empty() {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, Json(Value::Null))
+                            .into_response();
+                    }
+                    let next = replies.remove(0);
+                    (next.status, Json(next.body)).into_response()
                 }),
             )
             .await
@@ -749,7 +822,30 @@ fn read_app(pool: sqlx::PgPool, api: &MockEventApi) -> Router {
             .unwrap();
     let reads: Arc<dyn EventReadEffect> = Arc::new(EventReadExecutor::new(executor, pool.clone()));
     let effect: Arc<dyn ActionEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
-    router(Arc::new(ReceiverState::new(config(), pool, effect, reads)))
+    router(Arc::new(ReceiverState::new(
+        config(),
+        pool,
+        effect,
+        reads,
+        Arc::new(MockEventMutate),
+    )))
+}
+
+fn mutate_app(pool: sqlx::PgPool, api: &MockEventApi) -> Router {
+    let executor =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(api.origin.clone()))
+            .unwrap();
+    let reads: Arc<dyn EventReadEffect> = Arc::new(MockEventRead::default());
+    let effect: Arc<dyn ActionEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    let mutates: Arc<dyn EventMutateEffect> =
+        Arc::new(EventMutationExecutor::new(executor, pool.clone()));
+    router(Arc::new(ReceiverState::new(
+        config(),
+        pool,
+        effect,
+        reads,
+        mutates,
+    )))
 }
 
 async fn map_launch(pool: &sqlx::PgPool) {
@@ -764,7 +860,7 @@ async fn event_read_forged_signature_is_unauthorized_before_any_effect() {
     let effect = Arc::new(MockEffect::new(MockOutcome::Success));
     let reads = Arc::new(MockEventRead::default());
     let state = state_with_reads(lazy_pool(), effect.clone(), reads.clone());
-    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
     set_event_read_flag(true);
     let mut request = signed_read(&read_payload("launch"), "old");
     request.headers_mut().insert(
@@ -783,7 +879,7 @@ async fn event_read_forged_signature_is_unauthorized_before_any_effect() {
 #[tokio::test]
 async fn event_read_mapped_key_returns_the_seven_fields_keyless() {
     let Some(db) = database().await else { return };
-    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
     set_event_read_flag(true);
     map_launch(db.pool()).await;
     let api = MockEventApi::start().await;
@@ -833,7 +929,7 @@ async fn event_read_mapped_key_returns_the_seven_fields_keyless() {
 #[tokio::test]
 async fn event_read_unmapped_key_is_refused_before_any_discord_call() {
     let Some(db) = database().await else { return };
-    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
     set_event_read_flag(true);
     let api = MockEventApi::start().await;
     let (status, _, body) = answer(
@@ -852,7 +948,7 @@ async fn event_read_unmapped_key_is_refused_before_any_discord_call() {
 #[tokio::test]
 async fn event_read_flag_off_is_refused_before_any_discord_call() {
     let Some(db) = database().await else { return };
-    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
     set_event_read_flag(false);
     map_launch(db.pool()).await;
     let api = MockEventApi::start().await;
@@ -870,7 +966,7 @@ async fn event_read_flag_off_is_refused_before_any_discord_call() {
 #[tokio::test]
 async fn event_read_malformed_key_is_refused_before_any_discord_call() {
     let Some(db) = database().await else { return };
-    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
     set_event_read_flag(true);
     let api = MockEventApi::start().await;
     let app = read_app(db.pool().clone(), &api);
@@ -891,7 +987,7 @@ async fn event_read_malformed_key_is_refused_before_any_discord_call() {
 #[tokio::test]
 async fn event_read_replayed_nonce_is_refused_without_a_second_discord_call() {
     let Some(db) = database().await else { return };
-    let _flag = EVENT_READ_FLAG_LOCK.lock().await;
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
     set_event_read_flag(true);
     map_launch(db.pool()).await;
     let api = MockEventApi::start().await;
@@ -906,6 +1002,329 @@ async fn event_read_replayed_nonce_is_refused_without_a_second_discord_call() {
     assert_eq!(refused["error"]["code"], "replayed");
     assert_eq!(refused["error"]["retryable"], false);
     assert_eq!(api.count(), 1, "the replay must not reach Discord again");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_upsert_create_registers_key_and_replays_created() {
+    let Some(db) = database().await else { return };
+    // Upsert is a phase-1 default: no event flag is needed for the create.
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_cancel_flag(false);
+    let api = MockEventApi::start_scripted(vec![ScriptedEvent {
+        status: StatusCode::CREATED,
+        body: discord_event_for(CREATE_EVENT_ID, 1),
+    }])
+    .await;
+    let app = mutate_app(db.pool().clone(), &api);
+    let raw = upsert_payload("fresh");
+    let (status, headers, first) = answer(app.clone(), signed(&raw, "old", "intent-create")).await;
+    set_event_cancel_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("idempotent-replay"));
+    assert_eq!(
+        first["result"],
+        json!({"outcome": "created", "event_id": CREATE_EVENT_ID})
+    );
+    assert_eq!(api.count(), 1, "one Discord POST for one create");
+    {
+        let seen = api.requests.lock().unwrap();
+        assert_eq!(seen[0]["method"], "POST");
+        assert_eq!(
+            seen[0]["path"],
+            format!("/api/v10/guilds/{}/scheduled-events", staging_guild())
+        );
+        assert_eq!(seen[0]["body"]["name"], "Launch Night");
+    }
+    let store = InternalActionStore::new(db.pool().clone());
+    assert_eq!(
+        store
+            .event_id_for_key(staging_guild(), "fresh")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(CREATE_EVENT_ID)
+    );
+    let mirrored: String = sqlx::query_scalar(
+        "SELECT name FROM scheduled_events WHERE guild_id = $1 AND event_id = $2",
+    )
+    .bind(staging_guild())
+    .bind(CREATE_EVENT_ID)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(mirrored, "Launch Night");
+    // Same key and bytes replay the stored receipt without a second effect —
+    // still `created` even though the key is now registered.
+    let (status, headers, replay) = answer(app, signed(&raw, "old", "intent-create")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["idempotent-replay"], "true");
+    assert_eq!(first["result"], replay["result"]);
+    assert_eq!(replay["result"]["outcome"], "created");
+    assert_eq!(api.count(), 1, "the replay must not reach Discord again");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_upsert_update_repoints_and_replays_updated() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_cancel_flag(false);
+    InternalActionStore::new(db.pool().clone())
+        .put_event_key(staging_guild(), "launch", READ_EVENT_ID)
+        .await
+        .unwrap();
+    let api = MockEventApi::start_scripted(vec![ScriptedEvent {
+        status: StatusCode::OK,
+        body: discord_event(),
+    }])
+    .await;
+    let app = mutate_app(db.pool().clone(), &api);
+    let raw = upsert_payload("launch");
+    let (status, _, first) = answer(app.clone(), signed(&raw, "old", "intent-update")).await;
+    set_event_cancel_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        first["result"],
+        json!({"outcome": "updated", "event_id": READ_EVENT_ID})
+    );
+    {
+        let seen = api.requests.lock().unwrap();
+        assert_eq!(seen[0]["method"], "PATCH");
+        assert_eq!(
+            seen[0]["path"],
+            format!(
+                "/api/v10/guilds/{}/scheduled-events/{READ_EVENT_ID}",
+                staging_guild()
+            )
+        );
+    }
+    let (status, headers, replay) = answer(app, signed(&raw, "old", "intent-update")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["idempotent-replay"], "true");
+    assert_eq!(first["result"], replay["result"]);
+    assert_eq!(api.count(), 1, "the replay must not reach Discord again");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_cancel_cancels_retains_mapping_and_replays() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_cancel_flag(true);
+    map_launch(db.pool()).await;
+    let api = MockEventApi::start_scripted(vec![ScriptedEvent {
+        status: StatusCode::OK,
+        body: discord_event_for(READ_EVENT_ID, 4),
+    }])
+    .await;
+    let app = mutate_app(db.pool().clone(), &api);
+    let raw = cancel_payload("launch");
+    let (status, _, first) = answer(app.clone(), signed(&raw, "old", "intent-cancel")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        first["result"],
+        json!({"outcome": "cancelled", "event_id": READ_EVENT_ID})
+    );
+    {
+        let seen = api.requests.lock().unwrap();
+        assert_eq!(seen[0]["method"], "PATCH");
+        assert_eq!(
+            seen[0]["path"],
+            format!(
+                "/api/v10/guilds/{}/scheduled-events/{READ_EVENT_ID}",
+                staging_guild()
+            )
+        );
+        assert_eq!(seen[0]["body"], json!({"status": 4}));
+    }
+    // Cancel retains the mapping so a later edit cannot silently recreate.
+    let store = InternalActionStore::new(db.pool().clone());
+    assert_eq!(
+        store
+            .event_id_for_key(staging_guild(), "launch")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(READ_EVENT_ID)
+    );
+    let mirrored: String = sqlx::query_scalar(
+        "SELECT status FROM scheduled_events WHERE guild_id = $1 AND event_id = $2",
+    )
+    .bind(staging_guild())
+    .bind(READ_EVENT_ID)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(mirrored, "cancelled");
+    let (status, headers, replay) = answer(app, signed(&raw, "old", "intent-cancel")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["idempotent-replay"], "true");
+    assert_eq!(first["result"], replay["result"]);
+    assert_eq!(api.count(), 1, "the replay must not reach Discord again");
+    // The flag stays on through the replay: replays pass `authorize` too.
+    set_event_cancel_flag(false);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_cancel_unmapped_key_refused_before_claim_or_discord() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_cancel_flag(true);
+    let api = MockEventApi::start_scripted(vec![]).await;
+    let (status, _, body) = answer(
+        mutate_app(db.pool().clone(), &api),
+        signed(&cancel_payload("ghost"), "old", "intent-cancel"),
+    )
+    .await;
+    set_event_cancel_flag(false);
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    assert_eq!(body["error"]["retryable"], false);
+    assert_eq!(api.count(), 0, "unmapped cancels never reach Discord");
+    let intents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM internal_idempotency")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(intents, 0, "unmapped cancels take no claim");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_cancel_flag_off_refused_before_any_discord_call() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_cancel_flag(false);
+    map_launch(db.pool()).await;
+    let api = MockEventApi::start_scripted(vec![]).await;
+    let (status, _, body) = answer(
+        mutate_app(db.pool().clone(), &api),
+        signed(&cancel_payload("launch"), "old", "intent-cancel"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    assert_eq!(api.count(), 0, "disabled cancels never reach Discord");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_mutation_malformed_bodies_refused_before_any_discord_call() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_cancel_flag(true);
+    let api = MockEventApi::start_scripted(vec![]).await;
+    let app = mutate_app(db.pool().clone(), &api);
+    let base = upsert_payload("launch");
+    let mut base_value: Value = serde_json::from_str(&base).unwrap();
+    let mut cases = vec![
+        // Missing and misshapen event keys.
+        serde_json::json!({"action": "event.upsert"}),
+        serde_json::json!({"action": "event.cancel", "event_key": "has space"}),
+    ];
+    for raw in [
+        // Ends before it starts.
+        upsert_payload("launch").replace("2026-09-01T22:00:00Z", "2026-09-01T18:00:00Z"),
+        // Both placements at once.
+        upsert_payload("launch").replace("\"location\"", "\"channel_key\":\"ann\",\"location\""),
+        // Unknown channel key.
+        upsert_payload("launch").replace("\"location\":\"The Hall\"", "\"channel_key\":\"nope\""),
+    ] {
+        cases.push(serde_json::from_str(&raw).unwrap());
+    }
+    // Empty description is a missing field, not an omitted one.
+    base_value["description"] = json!("");
+    cases.push(base_value);
+    for (index, case) in cases.into_iter().enumerate() {
+        let raw = case.to_string();
+        let expected = if index == 4 {
+            // Unknown channel keys are a policy refusal, not a shape refusal.
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        let (status, _, body) = answer(
+            app.clone(),
+            signed(&raw, "old", &format!("intent-malformed-{index}")),
+        )
+        .await;
+        assert_eq!(status, expected, "{raw}");
+        assert!(body["error"]["code"].is_string(), "{raw}");
+    }
+    // Mutations require an Idempotency-Key header; reads stay keyless.
+    let (status, _, body) =
+        answer(app.clone(), signed_read(&upsert_payload("launch"), "old")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "malformed");
+    let mut bad_key = signed(&upsert_payload("launch"), "old", "intent-ok");
+    bad_key
+        .headers_mut()
+        .insert("idempotency-key", HeaderValue::from_static("has space!"));
+    let (status, _, body) = answer(app, bad_key).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "malformed");
+    set_event_cancel_flag(false);
+    assert_eq!(api.count(), 0, "malformed mutations never reach Discord");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_cancel_already_cancelled_is_discord_rejected() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_cancel_flag(true);
+    map_launch(db.pool()).await;
+    // Legacy does not swallow an already-cancelled 400: idempotency is durable
+    // replay of the first result, not a new PATCH.
+    let api = MockEventApi::start_scripted(vec![ScriptedEvent {
+        status: StatusCode::BAD_REQUEST,
+        body: discord_event_for(READ_EVENT_ID, 4),
+    }])
+    .await;
+    let app = mutate_app(db.pool().clone(), &api);
+    let raw = cancel_payload("launch");
+    let (status, _, first) = answer(app.clone(), signed(&raw, "old", "intent-cancel")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(first["error"]["code"], "discord_rejected");
+    assert_eq!(first["error"]["retryable"], false);
+    let (_, headers, replay) = answer(app, signed(&raw, "old", "intent-cancel")).await;
+    assert_eq!(replay["error"]["code"], "discord_rejected");
+    assert_eq!(headers["idempotent-replay"], "true");
+    assert_eq!(api.count(), 1, "the replay must not reach Discord again");
+    // The flag stays on through the replay: replays pass `authorize` too.
+    set_event_cancel_flag(false);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_upsert_discord_500_needs_reconciliation_without_receipt() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_cancel_flag(true);
+    let api = MockEventApi::start_scripted(vec![ScriptedEvent {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        body: Value::Null,
+    }])
+    .await;
+    let app = mutate_app(db.pool().clone(), &api);
+    let raw = upsert_payload("fresh");
+    let (status, _, first) = answer(app.clone(), signed(&raw, "old", "intent-upsert")).await;
+    set_event_cancel_flag(false);
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(first["error"]["code"], "needs_reconciliation");
+    // No mapping and no receipt: the fence is retained, nothing is replayable.
+    let store = InternalActionStore::new(db.pool().clone());
+    assert_eq!(
+        store
+            .event_id_for_key(staging_guild(), "fresh")
+            .await
+            .unwrap(),
+        None
+    );
+    let (_, _, second) = answer(app, signed(&raw, "old", "intent-upsert")).await;
+    assert_eq!(second["error"]["code"], "needs_reconciliation");
+    assert_eq!(api.count(), 1, "uncertainty never resends the intent");
     db.close().await.unwrap();
 }
 

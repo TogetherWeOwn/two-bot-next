@@ -48,6 +48,7 @@ fn replay(action: &str, response: TerminalResponse) -> Result<MemberExecution, A
         TerminalResponse::Success {
             resource_id: None,
             affected,
+            outcome: None,
         } if affected <= 1 => match (action, affected) {
             ("role.assign", 1) => MemberOutcome::Assigned,
             ("role.assign", 0) => MemberOutcome::AlreadyHeld,
@@ -186,6 +187,7 @@ impl ActionExecutor {
                         &TerminalResponse::Success {
                             resource_id: None,
                             affected,
+                            outcome: None,
                         },
                     )
                     .await
