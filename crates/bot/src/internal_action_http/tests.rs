@@ -125,7 +125,54 @@ fn state_with_reads(
     effect: Arc<MockEffect>,
     reads: Arc<MockEventRead>,
 ) -> Arc<ReceiverState> {
-    Arc::new(ReceiverState::new(config(), pool, effect, reads))
+    state_full(pool, effect, reads, Arc::new(MockModeration::default()))
+}
+
+fn state_full(
+    pool: sqlx::PgPool,
+    effect: Arc<MockEffect>,
+    reads: Arc<MockEventRead>,
+    moderation: Arc<MockModeration>,
+) -> Arc<ReceiverState> {
+    Arc::new(ReceiverState::new(
+        config(),
+        pool,
+        effect,
+        reads,
+        moderation,
+    ))
+}
+
+/// Offline timeout double: the auth/key/flag fences must refuse before this
+/// is ever called, so deny-path tests assert `calls() == 0`.
+#[derive(Default)]
+struct MockModeration {
+    calls: AtomicUsize,
+}
+
+impl MockModeration {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl ModerationTimeoutEffect for MockModeration {
+    fn execute_timeout<'a>(
+        &'a self,
+        request: &'a InternalMemberRequest,
+        _: &'a str,
+        _: &'a str,
+        _: i64,
+    ) -> BoxFuture<'a, Result<TerminalResponse, ActionError>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let target = DiscordId::new(request.target_id()).expect("validated target");
+            Ok(TerminalResponse::Success {
+                resource_id: Some(target),
+                affected: 1,
+            })
+        })
+    }
 }
 
 /// Offline read double: the auth/key/flag fences must refuse before this is
@@ -166,6 +213,69 @@ fn set_event_read_flag(on: bool) {
     } else {
         std::env::remove_var("TWO_INTERNAL_ALLOW_EVENT_READ");
     }
+}
+
+/// The timeout flag gate needs BOTH vars: the internal allowlist plus the
+/// moderation publish gate. Tests serialize on their own lock and always
+/// restore both vars.
+static MODERATION_FLAG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn set_moderation_flags(on: bool) {
+    if on {
+        std::env::set_var("TWO_INTERNAL_ALLOW_MODERATION", "1");
+        std::env::set_var("TWO_MODERATION", "1");
+    } else {
+        std::env::remove_var("TWO_INTERNAL_ALLOW_MODERATION");
+        std::env::remove_var("TWO_MODERATION");
+    }
+}
+
+fn timeout_payload() -> String {
+    serde_json::json!({
+        "action": "moderation.timeout",
+        "actor_id": "111111111111111111",
+        "discord_id": "333333333333333333",
+        "reason": "spam",
+        "duration_seconds": 3600,
+    })
+    .to_string()
+}
+
+fn timeout_payload_with(extra: Value) -> String {
+    let mut body = serde_json::json!({
+        "action": "moderation.timeout",
+        "actor_id": "111111111111111111",
+        "discord_id": "333333333333333333",
+        "reason": "spam",
+        "duration_seconds": 3600,
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        body[key] = value.clone();
+    }
+    body.to_string()
+}
+
+/// Timeout signing without an `Idempotency-Key` header, for the missing-key
+/// refusal path.
+fn signed_timeout_without_key(raw: &str, key: &str) -> Request {
+    let timestamp = (now_ms() / 1000).to_string();
+    let nonce_value = nonce();
+    let signature = sign(
+        secret(usize::from(key == "new")).as_bytes(),
+        &timestamp,
+        &nonce_value,
+        raw.as_bytes(),
+    );
+    Request::builder()
+        .method(Method::POST)
+        .uri(ACTIONS_PATH)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-two-key-id", key)
+        .header("x-two-timestamp", timestamp)
+        .header("x-two-nonce", nonce_value)
+        .header("x-two-signature", signature)
+        .body(Body::from(raw.to_owned()))
+        .unwrap()
 }
 
 fn read_payload(key: &str) -> String {
@@ -749,7 +859,13 @@ fn read_app(pool: sqlx::PgPool, api: &MockEventApi) -> Router {
             .unwrap();
     let reads: Arc<dyn EventReadEffect> = Arc::new(EventReadExecutor::new(executor, pool.clone()));
     let effect: Arc<dyn ActionEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
-    router(Arc::new(ReceiverState::new(config(), pool, effect, reads)))
+    router(Arc::new(ReceiverState::new(
+        config(),
+        pool,
+        effect,
+        reads,
+        Arc::new(MockModeration::default()),
+    )))
 }
 
 async fn map_launch(pool: &sqlx::PgPool) {
@@ -906,6 +1022,166 @@ async fn event_read_replayed_nonce_is_refused_without_a_second_discord_call() {
     assert_eq!(refused["error"]["code"], "replayed");
     assert_eq!(refused["error"]["retryable"], false);
     assert_eq!(api.count(), 1, "the replay must not reach Discord again");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn moderation_timeout_flag_off_is_refused_before_any_effect() {
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let moderation = Arc::new(MockModeration::default());
+    let state = state_full(
+        lazy_pool(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+    );
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(false);
+    let (status, _, body) = answer(
+        router(state.clone()),
+        signed(&timeout_payload(), "old", "intent-timeout-flag-off"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    assert_eq!(body["error"]["retryable"], false);
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(moderation.calls(), 0);
+}
+
+#[tokio::test]
+async fn moderation_timeout_other_verbs_stay_refused_without_widening() {
+    let Some(db) = database().await else { return };
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let moderation = Arc::new(MockModeration::default());
+    let app = router(state_full(
+        db.pool().clone(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+    ));
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    for raw in [
+        r#"{"action":"moderation.ban","actor_id":"111111111111111111","discord_id":"333333333333333333","reason":"spam"}"#.to_owned(),
+        r#"{"action":"moderation.kick","actor_id":"111111111111111111","discord_id":"333333333333333333","reason":"spam"}"#.to_owned(),
+        r#"{"action":"moderation.warn","actor_id":"111111111111111111","discord_id":"333333333333333333","reason":"spam"}"#.to_owned(),
+        r#"{"action":"role.assign","discord_id":"111111111111111111","role_key":"fixture"}"#.to_owned(),
+    ] {
+        let (status, _, body) = answer(app.clone(), signed(&raw, "old", "intent-no-widen")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{raw}");
+        assert_eq!(body["error"]["code"], "action_not_allowed");
+        assert!(!body.to_string().contains("111111111111111111"));
+    }
+    set_moderation_flags(false);
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(moderation.calls(), 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn moderation_timeout_requires_a_valid_idempotency_key() {
+    let Some(db) = database().await else { return };
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let moderation = Arc::new(MockModeration::default());
+    let app = router(state_full(
+        db.pool().clone(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+    ));
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    let raw = timeout_payload();
+    let (status, _, missing) = answer(app.clone(), signed_timeout_without_key(&raw, "old")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(missing["error"]["code"], "malformed");
+    let mut bad = signed(&raw, "old", "short");
+    bad.headers_mut()
+        .insert("idempotency-key", HeaderValue::from_static("short"));
+    let (status, _, malformed) = answer(app.clone(), bad).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(malformed["error"]["code"], "malformed");
+    set_moderation_flags(false);
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(moderation.calls(), 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn moderation_timeout_malformed_bodies_are_refused_before_any_effect() {
+    let Some(db) = database().await else { return };
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let moderation = Arc::new(MockModeration::default());
+    let app = router(state_full(
+        db.pool().clone(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+    ));
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    for raw in [
+        timeout_payload_with(serde_json::json!({"duration_seconds": 59})),
+        timeout_payload_with(serde_json::json!({"duration_seconds": 28 * 24 * 60 * 60 + 1})),
+        timeout_payload_with(serde_json::json!({"duration_seconds": "3600"})),
+        timeout_payload_with(serde_json::json!({"reason": ""})),
+        timeout_payload_with(serde_json::json!({"actor_id": "not-a-snowflake"})),
+        timeout_payload_with(serde_json::json!({"discord_id": "00000000000000000"})),
+    ] {
+        let (status, _, body) =
+            answer(app.clone(), signed(&raw, "old", "intent-timeout-malformed")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{raw}");
+        assert_eq!(body["error"]["code"], "malformed");
+    }
+    set_moderation_flags(false);
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(moderation.calls(), 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn moderation_timeout_success_replays_and_mismatches_like_announcements() {
+    let Some(db) = database().await else { return };
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let moderation = Arc::new(MockModeration::default());
+    let app = router(state_full(
+        db.pool().clone(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+    ));
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    let raw = timeout_payload();
+    let (status, headers, first) =
+        answer(app.clone(), signed(&raw, "old", "intent-timeout-fixture")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("idempotent-replay"));
+    assert_eq!(first["result"], serde_json::json!({"outcome": "timed_out"}));
+    assert_eq!(first["request_id"].as_str().unwrap().len(), 26);
+    let restarted = router(state_full(
+        db.independent_pool().await.unwrap(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+    ));
+    let (status, headers, replay) = answer(
+        restarted.clone(),
+        signed(&raw, "new", "intent-timeout-fixture"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["idempotent-replay"], "true");
+    assert_eq!(first["result"], replay["result"]);
+    let changed = format!("{raw} ");
+    let (status, _, mismatch) =
+        answer(restarted, signed(&changed, "new", "intent-timeout-fixture")).await;
+    set_moderation_flags(false);
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(mismatch["error"]["retryable"], false);
+    assert_eq!(moderation.calls(), 1);
+    assert_eq!(effect.calls(), 0);
     db.close().await.unwrap();
 }
 
