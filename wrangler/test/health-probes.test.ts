@@ -189,7 +189,7 @@ test("/ops/metrics: short token 404s as not configured with one redacted log lin
   assert.ok(!errors[0]!.includes(short), "line never carries the token value");
 });
 
-test("/ops/metrics: repeated wrong bearers throttle per caller; correct bearer unaffected", async () => {
+test("/ops/metrics: repeated wrong bearers throttle per caller before comparison; other callers unaffected", async () => {
   const h = harness();
   const token = "synthetic-metrics-throttle-token-0123456789";
   const e = { ...h.env, METRICS_SCRAPE_TOKEN: token } as Env;
@@ -212,12 +212,18 @@ test("/ops/metrics: repeated wrong bearers throttle per caller; correct bearer u
   assert.ok(Number(throttled.headers.get("retry-after")) >= 1);
   assert.equal(await throttled.text(), "slow down\n");
   assert.equal(h.forwarded.length, 0, "failed scrapes never reach the container");
-  // Another caller's failures cannot throttle the correct bearer — and the
-  // correct bearer succeeds even from the throttled caller's address.
+  // A throttled caller is refused before the secret comparison: even the
+  // correct bearer from that address is 429 while the bucket is exhausted,
+  // so guessing cannot confirm a bearer. Buckets are per caller, so another
+  // caller's failures cannot throttle a correct bearer elsewhere.
+  const guessedRight = await get("10.7.7.7", `Bearer ${token}`);
+  assert.equal(guessedRight.status, 429, "throttled caller gets 429 without a comparison");
+  assert.ok(Number(guessedRight.headers.get("retry-after")) >= 1);
+  await guessedRight.text();
   const other = await get("10.7.7.8", "Bearer wrong-bearer-value");
   assert.equal(other.status, 401);
   await other.text();
-  const ok = await get("10.7.7.7", `Bearer ${token}`);
+  const ok = await get("10.7.7.8", `Bearer ${token}`);
   assert.equal(ok.status, 200);
   assert.equal(h.forwarded.length, 1);
   // No token value in any response body seen above.

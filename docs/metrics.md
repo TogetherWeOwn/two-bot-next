@@ -247,13 +247,17 @@ No Prometheus server, no new infrastructure.
   token must be reissued, never padded (none is provisioned today).
   Missing or wrong bearer → `401` (compared via SHA-256 digests);
   repeated failures from one caller → `429` + `retry-after` via the
-  existing per-caller bucket (10 burst, 1/sec); a correct bearer never
-  consults that bucket, so another caller's guessing cannot throttle it. Non-GET →
+  existing per-caller bucket (10 burst, 1/sec); a throttled caller is
+  refused before the secret comparison, so guessing cannot confirm a
+  bearer while exhausted — buckets are per caller, so another caller's
+  guessing cannot throttle a correct bearer elsewhere. Non-GET →
   `404`. Unauthenticated requests never reach the container. `/metrics`
   itself stays `404`. The ownership control path (`/internal/ownership`)
   keeps its own gate and shares neither this bucket nor its budget.
-  The DO container fetch aborts after 6 s (`504`, generic body) and the
-  upstream body is capped at 64 KiB (larger → `502`, generic body).
+  The DO container fetch aborts after 6 s (`504`, generic body — the SDK
+  resolves aborts as a 500 Response, which is mapped to 504 without
+  proxying its text) and the upstream body is capped at 64 KiB
+  (larger → `502`, generic body).
 - Rules live in `wrangler/src/alert-rules.ts`; each links to a
   [runbook](runbook.md#metrics-alerts) section (a test enforces the anchors):
 

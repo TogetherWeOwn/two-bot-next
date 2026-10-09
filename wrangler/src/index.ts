@@ -152,12 +152,16 @@ function missCacheFor(env: Env): RedirectMissCache {
 const healthBuckets = new TokenBuckets();
 
 // Failed-bearer cap for the authenticated /ops/metrics scrape. Only failed
-// attempts consume budget, so a correct bearer is never throttled by someone
-// else's failures (buckets are per caller, as with the probe cap). A correct
-// bearer from the same caller succeeds without consulting the bucket.
-// CONTROL_PATH deliberately shares nothing here: it is a separate ownership
-// gate whose token already requires 32 characters (see ownership.ts
-// authenticated()), and its lockout semantics belong to that fence.
+// attempts consume budget via take(), and a read-only peek() refuses
+// throttled callers before the secret comparison, so guessing cannot confirm
+// a bearer while the bucket is exhausted. Buckets are per caller (as with
+// the probe cap), so another caller's guessing cannot throttle a correct
+// bearer; a correct bearer from the same exhausted caller waits out the
+// retry-after like any other request. Successful bearers never consume
+// failure budget. CONTROL_PATH deliberately shares nothing here: it is a
+// separate ownership gate whose token already requires 32 characters (see
+// ownership.ts authenticated()), and its lockout semantics belong to that
+// fence.
 const metricsAuthBuckets = new TokenBuckets({ capacity: 10, refillPerSecond: 1 });
 // A short scrape token is an operator misconfiguration, not per-request
 // information: say so once per isolate so scanners cannot flood the logs.
@@ -434,16 +438,27 @@ export class TwoBotContainer extends Container<Env> {
         // Reached only through the Worker's bearer-token gate (see default export).
         if (url.pathname === OPS_METRICS_PATH) {
           await this.armKeepalive();
+          // The SDK resolves fetch failures (including the abort timeout) as
+          // a 500/503/429 Response, so a catch alone never fires. Treat an
+          // aborted signal or any non-2xx upstream as a 504 with a generic
+          // body, and drain the SDK error text instead of proxying it.
+          const fetchSignal = AbortSignal.timeout(METRICS_FETCH_TIMEOUT_MS);
+          const metricsUnavailable = (status: number) =>
+            new Response("metrics unavailable\n", {
+              status,
+              headers: { "content-type": "text/plain", "cache-control": "no-store" },
+            });
           let upstream: Response;
           try {
             upstream = await this.containerFetch("http://c/metrics", {
-              signal: AbortSignal.timeout(METRICS_FETCH_TIMEOUT_MS),
+              signal: fetchSignal,
             });
           } catch {
-            return new Response("metrics unavailable\n", {
-              status: 504,
-              headers: { "content-type": "text/plain", "cache-control": "no-store" },
-            });
+            return metricsUnavailable(504);
+          }
+          if (fetchSignal.aborted || !upstream.ok) {
+            await upstream.arrayBuffer().catch(() => {});
+            return metricsUnavailable(504);
           }
           let body: string | null;
           try {
@@ -908,10 +923,12 @@ export default {
     // shorter than the 32-character floor — same bar as the ownership
     // control token) → 404 (the route does not exist); missing/wrong
     // bearer → 401 with per-caller throttling of repeated failures (429 +
-    // retry-after). A correct bearer never consults the failure bucket, so
-    // someone else's guessing cannot throttle it. Exact path only.
-    // CONTROL_PATH keeps its own gate (ownership.ts authenticated()): it
-    // shares neither this bucket nor its budget.
+    // retry-after). A throttled caller is refused before the secret
+    // comparison, so guessing cannot confirm a bearer while exhausted;
+    // buckets are per caller, so someone else's guessing cannot throttle a
+    // correct bearer. Exact path only. CONTROL_PATH keeps its own gate
+    // (ownership.ts authenticated()): it shares neither this bucket nor its
+    // budget.
     if (url.pathname === OPS_METRICS_PATH) {
       if (!env.METRICS_SCRAPE_TOKEN || env.METRICS_SCRAPE_TOKEN.length < MIN_SCRAPE_TOKEN_LENGTH
         || request.method !== "GET") {
@@ -927,6 +944,19 @@ export default {
         return new Response("not found", { status: 404 });
       }
       const caller = request.headers.get("cf-connecting-ip") ?? "unknown";
+      // Refuse an exhausted caller before the secret comparison: no guess —
+      // right or wrong — is evaluated while throttled. Peek consumes nothing,
+      // so a correct bearer on a fresh budget is unaffected.
+      const precheck = metricsAuthBuckets.peek(caller);
+      if (!precheck.allowed) {
+        return new Response("slow down\n", {
+          status: 429,
+          headers: {
+            "content-type": "text/plain",
+            "retry-after": String(precheck.retryAfter),
+          },
+        });
+      }
       const m = /^Bearer (.+)$/.exec(request.headers.get("authorization") ?? "");
       if (!m || m[1]!.length > 4096 || !(await tokenMatches(m[1]!, env.METRICS_SCRAPE_TOKEN))) {
         const verdict = metricsAuthBuckets.take(caller);

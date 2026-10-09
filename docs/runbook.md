@@ -170,8 +170,9 @@ with `curl -H "Authorization: Bearer $METRICS_SCRAPE_TOKEN" "$WORKER_URL/ops/met
 `METRICS_SCRAPE_TOKEN` must be at least 32 characters; a shorter value leaves
 the route at `404` and a short staging token must be reissued (none is
 provisioned today). Repeated wrong bearers from one caller are throttled
-(`429` + `retry-after`); a correct bearer is never throttled by someone
-else's failures.
+(`429` + `retry-after`, refused before the secret comparison); buckets
+are per caller, so someone else's failures cannot throttle a correct
+bearer elsewhere.
 
 #### Alert: job stale
 

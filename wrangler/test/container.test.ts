@@ -884,15 +884,18 @@ test("DO /ops/metrics: hung container fetch aborts within the bound (504, generi
   const h = await harness(t);
   // Prove the 6 s bound without sleeping through it: the runner cancels
   // live waits near ~5 s, so shrink only the timer and assert the production
-  // code requested the full bound.
+  // code requested the full bound. The SDK resolves aborts as a 500
+  // Response (never a rejection), so the fixture mirrors that shape.
   const realTimeout = AbortSignal.timeout;
   const timeout = t.mock.method(AbortSignal, "timeout", (ms: number) =>
     realTimeout(ms === 6000 ? 50 : ms));
   t.mock.method(h.bot, "containerFetch", (...args: Parameters<TwoBotContainer["containerFetch"]>) => {
     const init = args[1] as RequestInit | undefined;
-    return new Promise<Response>((_resolve, reject) => {
-      if (init?.signal?.aborted) reject(new Error("fixture already aborted"));
-      else init?.signal?.addEventListener("abort", () => reject(new Error("fixture container hang aborted")));
+    return new Promise<Response>((resolve) => {
+      const sdkAbortBody = (message: string) =>
+        resolve(new Response(`Error proxying request to container: ${message}`, { status: 500 }));
+      if (init?.signal?.aborted) sdkAbortBody("fixture already aborted");
+      else init?.signal?.addEventListener("abort", () => sdkAbortBody("The operation was aborted due to timeout"));
     });
   });
   const started = Date.now();
@@ -905,6 +908,14 @@ test("DO /ops/metrics: hung container fetch aborts within the bound (504, generi
     "container fetch must request the 6 s abort bound",
   );
   assert.ok(elapsed < 5000, `hung fetch must return well within the bound, took ${elapsed}ms`);
+});
+
+test("DO /ops/metrics: rejected container fetch still returns 504 with a generic body", async (t) => {
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", async () => { throw new Error("fixture transport failure"); });
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/ops/metrics"));
+  assert.equal(response.status, 504);
+  assert.equal(await response.text(), "metrics unavailable\n");
 });
 
 test("DO /ops/metrics: oversized body returns 502 with a generic body", async (t) => {
