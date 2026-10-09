@@ -1226,6 +1226,19 @@ mod tests {
             ..ok.clone()
         };
         assert!(validate_request(&neon_pin).is_ok());
+        // PlanetScale staging uses the same pinned-host model: a direct
+        // `*.pg.psdb.cloud` host validates, while a `-pooler` host refuses.
+        let planetscale_pin = Request {
+            url: Some(
+                "postgresql://u@psdb-fixture-1.pg.psdb.cloud:5432/postgres?sslmode=require"
+                    .to_owned(),
+            ),
+            expected_host: "psdb-fixture-1.pg.psdb.cloud".to_owned(),
+            expected_database: "postgres".to_owned(),
+            ..ok.clone()
+        };
+        assert!(validate_request(&planetscale_pin).is_ok());
+        assert!(verify_target(&planetscale_pin).is_ok());
         let bad = [
             Request {
                 url: None,
@@ -1261,6 +1274,10 @@ mod tests {
             },
             Request {
                 expected_host: "ep-test-pooler.us-east-2.aws.neon.tech".to_owned(),
+                ..ok.clone()
+            },
+            Request {
+                expected_host: "psdb-fixture-1-pooler.pg.psdb.cloud".to_owned(),
                 ..ok.clone()
             },
             Request {
@@ -1431,6 +1448,24 @@ mod tests {
             Err(RunError::Refused(_))
         ));
         assert!(matches!(verify_target(&pooler), Err(RunError::Refused(_))));
+        // A PlanetScale pooler binding is refused even when the pins match it.
+        let ps_pooler = Request {
+            url: Some(
+                "postgresql://u@psdb-fixture-1-pooler.pg.psdb.cloud:5432/postgres?sslmode=require"
+                    .to_owned(),
+            ),
+            expected_host: "psdb-fixture-1-pooler.pg.psdb.cloud".to_owned(),
+            expected_database: "postgres".to_owned(),
+            ..base.clone()
+        };
+        assert!(matches!(
+            validate_request(&ps_pooler),
+            Err(RunError::Refused(_))
+        ));
+        assert!(matches!(
+            verify_target(&ps_pooler),
+            Err(RunError::Refused(_))
+        ));
     }
 
     #[test]
