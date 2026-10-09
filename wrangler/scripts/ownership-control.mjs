@@ -43,7 +43,7 @@ async function refusalReason(response) {
   }
 }
 
-// Wrangler's default deferred Durable Object code update keeps the old code answering 5xx for up to 300 s after deploy; retry 5xx only.
+// Wrangler's default deferred code update is expected to keep old code answering 5xx for up to 300 s (docs/runbook.md); retry 5xx only.
 function retryableTakeoverFailure(error) {
   return error instanceof HttpFailure && error.status >= 500 && error.status <= 599;
 }
