@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use libfuzzer_sys::fuzz_target;
 use two_bot_core::voice_config::{
     export_configuration, import_configuration, ChannelKind, ChannelReference, GuildInventory,
+    VoiceConfigError,
 };
 
 fn inventory() -> &'static GuildInventory {
@@ -53,9 +54,17 @@ fn inventory() -> &'static GuildInventory {
 fuzz_target!(|data: &[u8]| {
     // The inventory is trusted and fixed, never derived from uploaded JSON.
     if let Ok(config) = import_configuration(data, inventory()) {
-        let encoded = export_configuration(&config, inventory()).unwrap();
+        let encoded = match export_configuration(&config, inventory()) {
+            Ok(encoded) => encoded,
+            // Omitted optional fields export as null, so an upload near the cap can grow past it.
+            Err(VoiceConfigError::ExportTooLarge { .. }) => return,
+            Err(error) => panic!("an imported configuration must export: {error}"),
+        };
         let decoded = import_configuration(&encoded, inventory()).unwrap();
         assert_eq!(decoded, config);
-        assert_eq!(export_configuration(&decoded, inventory()).unwrap(), encoded);
+        assert_eq!(
+            export_configuration(&decoded, inventory()).unwrap(),
+            encoded
+        );
     }
 });
