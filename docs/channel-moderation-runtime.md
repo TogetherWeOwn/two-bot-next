@@ -36,9 +36,10 @@ executor and synchronizes once per process. Failed publication remains retryable
 on a later connection event. The current registry has no custom-command store;
 when that slice lands, its reader must join the shared full-set publication.
 
-Gateway dispatch admits tasks synchronously into five independently bounded
+Gateway dispatch admits tasks synchronously into six independently bounded
 lanes: 16 message workers, 16 interaction workers, one registry worker, eight
-reserved interaction workers and eight busy-reply workers. It never waits for
+reserved interaction workers, eight busy-reply workers and eight self-role
+reaction workers. It never waits for
 command SQL/REST or creates queued/spawned waiters. At saturation, events are not
 admitted and cannot cause effects.
 
