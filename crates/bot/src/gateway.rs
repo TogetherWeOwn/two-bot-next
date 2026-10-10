@@ -890,10 +890,10 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             // checkpoint deadline before the cursor commits. Without a
                             // leveling runtime the drain is a no-op.
                             let requests = match disposition {
-                                Some(disposition) => pipeline.collect_at_with_message_disposition(
+                                Some(verdict) => pipeline.collect_at_with_message_disposition(
                                     &dispatch.event,
                                     &dispatch.observed_at,
-                                    disposition,
+                                    verdict.funnel,
                                 ),
                                 None => pipeline.collect_at(
                                     &dispatch.event,
@@ -911,14 +911,18 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                     voice.disconnect();
                                 }
                             }
+                            let funnel = disposition.map(|verdict| verdict.funnel);
+                            let trigger = disposition.map(|verdict| verdict.trigger);
                             if automod_enabled
                                 && matches!(dispatch.event, Event::MessageCreate(_))
-                                && crate::automod_gateway::runs_text_automations(disposition)
+                                && crate::automod_gateway::runs_text_automations(funnel)
                             {
                                 if let Some(runtime) = command_runtime.as_ref() {
                                     // Detached spawn from the blocking worker needs the runtime.
+                                    // The verdict travels with the event; a missing
+                                    // verdict fails closed inside the trigger handler.
                                     let _guard = handle.enter();
-                                    runtime.dispatch(&dispatch.event);
+                                    runtime.dispatch_with_verdict(&dispatch.event, trigger);
                                 }
                             }
                             if !requests.is_empty() {

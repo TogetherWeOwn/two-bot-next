@@ -62,6 +62,7 @@ use twilight_model::{
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
+    automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
     feeds::{
         feed_list_text, feed_removed_text, plan_command, FeedCommand, FeedCommandContext,
@@ -838,6 +839,18 @@ impl CommandRuntime {
     /// Custom commands answer first and report ownership, so sticky/feed
     /// routing never sends a second response after an acknowledgement.
     pub fn dispatch(self: &Arc<Self>, event: &Event) -> bool {
+        self.dispatch_with_verdict(event, None)
+    }
+
+    /// Message dispatch with the automod verdict for this create. `None` keeps
+    /// the configured acceptance (the `TWO_AUTOMOD=0` fast path); the gateway
+    /// worker passes its verdict once automod has decided, and the trigger
+    /// handler fails a missing verdict closed.
+    pub fn dispatch_with_verdict(
+        self: &Arc<Self>,
+        event: &Event,
+        verdict: Option<FunnelDisposition>,
+    ) -> bool {
         if let Some(custom) = self.gateway_commands.get() {
             custom.observe(event);
         }
@@ -850,7 +863,7 @@ impl CommandRuntime {
                 let message = message.0.clone();
                 self.spawn(LANE_MESSAGES, async move {
                     if let Some(custom) = runtime.gateway_commands.get() {
-                        custom.handle_message(&message).await;
+                        custom.handle_message(&message, verdict).await;
                     }
                     runtime.on_message(&message).await;
                 })
