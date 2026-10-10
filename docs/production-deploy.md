@@ -345,13 +345,50 @@ acceptance.
 | REST 5xx and action latency | Single-attempt calls keep their 5 s body-read deadline; 429 `retry-after + 250 ms` honored, 5xx backoff 500…8000 ms across the bounded retry budget; moderation uses one timed attempt | Any uncertain send without a recorded disposition, or a route whose `job_consecutive_failures` reaches 3: freeze that writer and reconcile; roll back if the failing path shipped in this revision | [rest-guard.md](rest-guard.md); [pacing-backoff-acceptance.md](pacing-backoff-acceptance.md); [metrics.md](metrics.md#off-container-scrape-and-alert-rules) |
 | Bot token | Zero 401s on bot-authenticated endpoints | First latched `token_invalid`: stop retries, freeze writers; no rollback until provisioning is corrected through the governed path | [rest-guard.md](rest-guard.md) |
 | Unban queue | Sweep every 30 s (`UNBAN_SWEEP_INTERVAL_SECONDS`), at most 25 jobs claimed per sweep; no due unban left pending across sweeps without a named disposition | Any overdue sanction without a named disposition is a finding; zero unexplained overdue is required for GO at each checkpoint | [member-moderation.md](member-moderation.md); [cutover.md](cutover.md) §§T-minus, 48-hour watch |
-| Scheduled jobs | Last success within twice the job cadence; fewer than 3 consecutive failures | `job_stale` or 3 consecutive failures on a watch-critical job (unban sweep, session checkpoint): freeze the consumer, fix the dependency; roll back if the regression shipped in this revision | [metrics.md](metrics.md#off-container-scrape-and-alert-rules) |
+| Scheduled jobs | Scheduled jobs: last success within twice the cadence; fewer than 3 consecutive failures. Unban sweep and event-driven session checkpoint: manual checks below | Installed `job_stale` covers only registered cadences, `ticker_stale` covers the two 15 s tickers, and `job_consecutive_failures` covers labelled failed completions. **Unban sweep gap:** it shares `other`, which has no stale rule and a shared failure streak; no reliable per-sweep alert exists until the [job-label follow-up](https://github.com/TogetherWeOwn/two-bot-next/issues/788) lands. `session_checkpoint` is stale-exempt and records successes only in these job series. A manual failure/stall finding has the same response: freeze the consumer, fix the dependency; roll back if the regression shipped in this revision | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [manual checks](#scheduled-job-manual-checkpoints) |
 | DB pool | Idle connections above zero, below max | Pool at max with zero idle for 3 consecutive keepalive samples: do not restart to free it; freeze writers, fix the holder; roll back if a new query path holds checkouts | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [runbook.md](runbook.md) Alert: DB pool |
 | `db_errors` | Fewer than 3 storage failures between keepalive samples; a counter reset (process restart) skips the window, not proof of health; sustained low-rate failures surface through `job_consecutive_failures` | 3 or more storage failures between samples: correlate the `op` label and recent deploys; do not run SQL probes or restart to clear errors; escalate repeated bursts per the runbook, evaluate rollback if this revision introduced the failing writes | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [runbook.md](runbook.md#alert-db-errors) |
 | `send_admission_blocked` | Fewer than 3 consecutive keepalive samples with new admission refusals; a sample with no new refusals breaks the streak; admission SQL failures count in `db_errors`, not refusals | New admission refusals in 3 consecutive samples: investigate cooldowns and held lanes; do not replay uncertain sends or restart to free the lane; escalate persistent refusals per the runbook, evaluate rollback if this revision introduced the regression | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [runbook.md](runbook.md#alert-send-admission-blocked) |
 | RSS and placement | RSS near the B1 soak-measured floor (~140 MiB, under the ~200 MiB `lite` gate signal) on the shipped `basic` placement; image/binary sizes inside the B1 ceilings (25% image and 40% binary headroom policy) | Sustained RSS growth versus the B1 floor with no attribution, sustained use pressing the placement cap, or any OOM-kill: freeze writers, investigate or roll back | [b1-baseline.md](b1-baseline.md) (`basic` verdict, ceilings); [cutover.md](cutover.md) §48-hour watch; this is a separate production-watch signal, not B2's numeric RSS acceptance |
 | Event continuity | Zero unexplained gaps or duplicated effects versus independent moderator observations | Any unexplained gap or duplicated execution is a stop condition: freeze writers, evaluate rollback | [cutover.md](cutover.md) §48-hour watch; [staging-soak.md](staging-soak.md) acceptance |
 | Shutdown drain | SIGTERM drain completes inside 35 s (`SHUTDOWN_TIMEOUT_SECONDS` default) | `shutdown_deadline_exceeded` (exit 1): the restart reads the last committed checkpoint; repeated misses block GO until investigated | [configuration.md](configuration.md) |
+
+### Scheduled-job manual checkpoints
+
+At +15 min, +1 h, +6 h, +24 h and +48 h, inspect the current checkpoint's
+container logs with these exact JSON-field filters (not the `msg` envelope):
+
+```text
+message = "periodic job failed" AND job = "member_unban_sweep"
+message = "member unban sweep completed jobs"
+```
+
+Keep each failure's timestamp and bounded `error_class`; the completion line carries
+`completed` only when work was actually done. Do not copy guild/member IDs into
+the watch log. Zero-work successes emit no completion line, and a stalled
+attempt emits no failure until it finishes or times out, so **no matching log
+line is not success**. Inspect the saved `/readyz` response too:
+
+```sh
+jq '.jobs.member_unban_sweep | {running, parked, last_success, consecutive_failures}' readyz.json
+```
+
+`last_success` is Unix **milliseconds** (unlike metric timestamps). Compare it
+with the read timestamp and prior checkpoint: a parked/missing job is not an
+accepted sweep; three failures or no recent success needs a disposition. The
+30 s cadence is not an attempt deadline: a sweep may run for up to 180 s, so
+investigate a >60 s age with `running`/logs before declaring it stalled. Neither
+`job="member_unban_sweep"` (absent today) nor `job="other"` (shared with other
+producers) is valid per-sweep evidence. Once [the job-label follow-up](https://github.com/TogetherWeOwn/two-bot-next/issues/788)
+merges with proven rule coverage, replace this gap with the per-job alert.
+
+For the event-driven session checkpoint, use the
+[manual checkpoint queries](voice-cutover-rollback-triggers.md#manual-checkpoint-queries)
+for success age, commit traffic and commit failures; there is no periodic
+"two cadences" stale rule. For uninstalled multi-window burn alerts, evaluate
+[the manual burn windows](error-budget-alerts.md#manual-checkpoint-evaluation)
+at each checkpoint. Record missing history or signals as unknown, never green
+because an alert stayed silent.
 
 ## Deploy-timer mapping (parity §4)
 
