@@ -40,7 +40,8 @@ pub(crate) const USAGE: &str = "\
 
   two-bot reconcile-event --guild <id> --intent <n> --no-effect [--execute]
       Discord holds no such event: record a terminal no-effect failure
-      without touching mappings. Retrying then needs a new Idempotency-Key.
+      without touching mappings, for an upsert or a cancel intent alike.
+      Retrying then needs a new Idempotency-Key.
       Without --execute every resolution above prints DRY RUN and writes nothing.
 ";
 
@@ -260,6 +261,17 @@ fn describe(intent: i64, mode: &ResolveMode) -> String {
     }
 }
 
+/// The row action a resolution must match. Effect modes pin their own verb;
+/// a proven no-effect closes whatever the fenced row holds, so a cancel
+/// intent clears without recording a cancellation that never happened.
+fn expected_action<'a>(mode: &ResolveMode, unknown_action: Option<&'a str>) -> Option<&'a str> {
+    match mode {
+        ResolveMode::Created { .. } | ResolveMode::Updated { .. } => Some("event.upsert"),
+        ResolveMode::Cancelled { .. } => Some("event.cancel"),
+        ResolveMode::NoEffect => unknown_action,
+    }
+}
+
 async fn run(store: &InternalActionStore, guild: &str, command: &Command, execute: bool) -> i32 {
     match command {
         Command::List => match store.list_unknown_event_intents(guild).await {
@@ -292,19 +304,34 @@ async fn run(store: &InternalActionStore, guild: &str, command: &Command, execut
                 return 0;
             }
             let (response, evidence, mapping) = resolution_of(mode);
-            let expected_action = match mode {
-                ResolveMode::Cancelled { .. } => "event.cancel",
-                _ => "event.upsert",
+            // A no-effect closes the row's own verb: the listing names only
+            // fenced unknown intents, and `resolve_event_intent` re-checks
+            // the row under lock before writing, so a row that moved on is
+            // still refused below.
+            let looked_up;
+            let unknown_action = if matches!(mode, ResolveMode::NoEffect) {
+                match store.list_unknown_event_intents(guild).await {
+                    Ok(rows) => {
+                        looked_up = rows.into_iter().find(|row| row.intent_id == *intent);
+                        looked_up.as_ref().map(|row| row.action.as_str())
+                    }
+                    Err(_) => {
+                        eprintln!("reconcile-event: surface read failed (details redacted)");
+                        return 1;
+                    }
+                }
+            } else {
+                None
+            };
+            let Some(action) = expected_action(mode, unknown_action) else {
+                eprintln!(
+                    "reconcile-event: intent {intent} is not an unknown event intent \
+                     in this guild (details redacted); row stays fenced"
+                );
+                return 1;
             };
             match store
-                .resolve_event_intent(
-                    *intent,
-                    expected_action,
-                    guild,
-                    mapping,
-                    &response,
-                    evidence,
-                )
+                .resolve_event_intent(*intent, action, guild, mapping, &response, evidence)
                 .await
             {
                 Ok(()) => {
@@ -313,7 +340,7 @@ async fn run(store: &InternalActionStore, guild: &str, command: &Command, execut
                 }
                 Err(two_bot_core::internal_action_store::InternalStoreError::TransitionRefused) => {
                     eprintln!(
-                        "reconcile-event: intent {intent} is not an unknown {expected_action} \
+                        "reconcile-event: intent {intent} is not an unknown {action} \
                          intent in this guild (details redacted); row stays fenced"
                     );
                     1
@@ -480,5 +507,35 @@ mod tests {
         );
         assert_eq!(evidence, ReconciliationEvidence::DiscordConfirmedNoEffect);
         assert_eq!(mapping, None);
+    }
+
+    #[test]
+    fn expected_action_pins_effects_and_passes_through_no_effect() {
+        let created = ResolveMode::Created {
+            event_key: "launch".to_owned(),
+            event_id: "333333333333333333".to_owned(),
+        };
+        assert_eq!(expected_action(&created, None), Some("event.upsert"));
+        let updated = ResolveMode::Updated {
+            event_key: "launch".to_owned(),
+            event_id: "333333333333333333".to_owned(),
+        };
+        assert_eq!(expected_action(&updated, None), Some("event.upsert"));
+        let cancelled = ResolveMode::Cancelled {
+            event_id: "333333333333333333".to_owned(),
+        };
+        assert_eq!(expected_action(&cancelled, None), Some("event.cancel"));
+        // A proven no-effect closes the row's own verb, so a cancel intent
+        // clears without recording a cancellation that never happened; an
+        // intent with no fenced row stays refused.
+        assert_eq!(
+            expected_action(&ResolveMode::NoEffect, Some("event.cancel")),
+            Some("event.cancel")
+        );
+        assert_eq!(
+            expected_action(&ResolveMode::NoEffect, Some("event.upsert")),
+            Some("event.upsert")
+        );
+        assert_eq!(expected_action(&ResolveMode::NoEffect, None), None);
     }
 }
