@@ -109,11 +109,12 @@ class steady and never shed; growth means a lane is undersized or a burst
 needs the M2.1 alert rule, not a new label.
 
 Fatal-runner reasons are class `session` and O(1) bytes: both dispatch-join
-`map_err` sites in `crates/bot/src/gateway.rs` truncate the surfaced reason
-to `RUNNER_REASON_MAX_CHARS` (512 chars, char-boundary) via
-`bounded_runner_reason`. A join-error payload of any size yields at most one
-512-char `InvalidArgument` line; short supervisor reasons pass through
-unchanged.
+`map_err` sites in `crates/bot/src/gateway.rs` pass the surfaced reason
+through `bounded_runner_reason`, capped at `RUNNER_REASON_MAX_CHARS`
+(512 chars, char-boundary). Today every reason is one of six `&'static str`
+literals from `dispatch_bounded` (the `JoinError` payload is discarded
+there), so the type already bounds the output; the cap is a fence that holds
+even if a future supervisor returns a larger payload.
 
 Subscription facts that bound the top of the funnel: the bot never requests
 `GUILD_PRESENCES`, so presence arrives only through the hourly

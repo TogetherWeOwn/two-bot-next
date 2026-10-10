@@ -314,12 +314,14 @@ fn ingress_capacity_failure() -> sqlx::Error {
     sqlx::Error::InvalidArgument("gateway ingress capacity exhausted".into())
 }
 
-/// Fatal-runner reason bound: at most 512 chars of the dispatch-supervisor
+/// Fatal-runner reason fence: at most 512 chars of the dispatch-supervisor
 /// reason reach the surfaced runner error (logs + `operation`). Class
 /// `session` per `docs/log-volume-guard.md`: the runner fails at most a
-/// handful of times per process lifetime, so the output is O(1) bytes even
-/// when a join-error payload is arbitrarily large. Char-boundary truncation
-/// keeps the surfaced string valid UTF-8.
+/// handful of times per process lifetime. Today every reason is one of six
+/// `&'static str` literals from `dispatch_bounded` (the `JoinError` payload
+/// is discarded there), so the bound is defense in depth: it holds even if a
+/// future supervisor returns a larger payload. Char-boundary truncation keeps
+/// the surfaced string valid UTF-8.
 const RUNNER_REASON_MAX_CHARS: usize = 512;
 
 fn bounded_runner_reason(reason: &str) -> sqlx::Error {
@@ -1258,7 +1260,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             futures_util::pin_mut!(queue_worker);
             tokio::select! {
                 result = dispatch => {
-                    let result = result.map_err(|reason| bounded_runner_reason(reason));
+                    let result = result.map_err(bounded_runner_reason);
                     if result.is_ok() && error.lock().expect("gateway error lock").is_none() {
                         // Cooperative end with a healthy writer: the last
                         // commit may have raced the drain return before the
@@ -1291,9 +1293,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                 }
             }
         }
-        None => dispatch
-            .await
-            .map_err(|reason| bounded_runner_reason(reason)),
+        None => dispatch.await.map_err(bounded_runner_reason),
     };
     // Reception does not restart in this runner. Keep Draining sticky through
     // both successful shutdown and fatal exit, including any remaining writer.
@@ -2528,9 +2528,9 @@ mod tests {
         );
     }
 
-    /// Fatal-runner reasons stay O(1) bytes: an oversized join-error payload
-    /// is truncated to `RUNNER_REASON_MAX_CHARS`, while short reasons pass
-    /// through unchanged so the #659 typed errors keep their exact text.
+    /// Fatal-runner reason fence: an oversized payload is truncated to
+    /// `RUNNER_REASON_MAX_CHARS`, while short reasons pass through unchanged
+    /// so the #659 typed errors keep their exact text.
     #[test]
     fn gateway_runner_reason_is_bounded() {
         match bounded_runner_reason("dispatch backlog full") {
