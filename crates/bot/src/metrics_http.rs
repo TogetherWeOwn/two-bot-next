@@ -1,6 +1,6 @@
-//! Internal-only route on the existing listener; the Worker never proxies it.
+//! Private route on the existing listener; the Worker gates off-container scrapes.
 
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use axum::{http::header, routing::get, Router};
 use sqlx::PgPool;
@@ -17,11 +17,22 @@ pub(crate) fn register_pool(pool: PgPool) {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pool);
 }
 
+#[cfg(test)]
 pub(crate) fn router() -> Router {
-    Router::new().route("/metrics", get(scrape))
+    router_with_guard(two_bot_discord::ratelimit_guard::process_guard())
 }
 
-async fn scrape() -> ([(header::HeaderName, &'static str); 2], String) {
+pub(crate) fn router_with_guard(
+    guard: Arc<two_bot_discord::ratelimit_guard::RateLimitGuard>,
+) -> Router {
+    Router::new()
+        .route("/metrics", get(scrape))
+        .layer(axum::Extension(guard))
+}
+
+async fn scrape(
+    axum::Extension(guard): axum::Extension<Arc<two_bot_discord::ratelimit_guard::RateLimitGuard>>,
+) -> ([(header::HeaderName, &'static str); 2], String) {
     // SQLx exposes pool bookkeeping without SQL or acquiring a connection.
     // https://docs.rs/sqlx/0.9.0/sqlx/struct.Pool.html#method.size
     let pool = pool_slot()
@@ -39,7 +50,7 @@ async fn scrape() -> ([(header::HeaderName, &'static str); 2], String) {
             (header::CONTENT_TYPE, metrics::CONTENT_TYPE),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        metrics::global().render(sample),
+        metrics::global().render_with_rest_guard(sample, guard.snapshot().into()),
     )
 }
 
@@ -50,8 +61,117 @@ mod tests {
         body::{to_bytes, Body},
         http::{Request, StatusCode},
     };
-    use std::sync::Arc;
+    use std::time::Duration;
     use tower::ServiceExt as _;
+    use two_bot_discord::ratelimit_guard::{GuardConfig, GuardError, RateLimitGuard};
+
+    async fn scrape_text(app: &Router) -> String {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            metrics::CONTENT_TYPE
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        String::from_utf8(
+            to_bytes(response.into_body(), 65_536)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scrape_samples_the_injected_shared_guard_without_changing_readiness_policy() {
+        let guard = Arc::new(
+            RateLimitGuard::new(GuardConfig {
+                invalid_request_threshold: 2,
+                window: Duration::from_secs(10),
+            })
+            .unwrap(),
+        );
+        let state = crate::server::SharedState::new(
+            Arc::new(tokio::sync::RwLock::new(
+                crate::gateway::GatewayState::Unconfigured,
+            )),
+            None,
+        );
+        let app = crate::server::router_with_guard(
+            state,
+            crate::jobs::statuses(&[], true),
+            Arc::clone(&guard),
+        );
+        let fresh = scrape_text(&app).await;
+        for line in fresh
+            .lines()
+            .filter(|line| line.starts_with("two_bot_rest_guard_"))
+        {
+            assert!(line.ends_with(" 0"), "nonzero fresh guard: {line}");
+        }
+        guard.observe_status(403, true);
+        guard.observe_status(429, true);
+        assert_eq!(guard.admit(false).await, Err(GuardError::CircuitOpen));
+        let open = scrape_text(&app).await;
+        for sample in [
+            "two_bot_rest_guard_invalid_requests_in_window 2\n",
+            "two_bot_rest_guard_invalid_requests_total 2\n",
+            "two_bot_rest_guard_rejected_requests_total 1\n",
+            "two_bot_rest_guard_breaker_opens_total 1\n",
+            "two_bot_rest_guard_breaker_open 1\n",
+            "two_bot_rest_guard_token_invalid 0\n",
+        ] {
+            assert!(open.contains(sample), "missing {sample}");
+        }
+        tokio::time::advance(Duration::from_secs(10)).await;
+        guard.observe_global(Some(1.0));
+        let paused = scrape_text(&app).await;
+        for sample in [
+            "two_bot_rest_guard_invalid_requests_in_window 0\n",
+            "two_bot_rest_guard_breaker_closes_total 1\n",
+            "two_bot_rest_guard_breaker_open 0\n",
+            "two_bot_rest_guard_global_pauses_total 1\n",
+            "two_bot_rest_guard_global_paused 1\n",
+            "two_bot_rest_guard_global_pause_remaining_seconds 1.25\n",
+        ] {
+            assert!(paused.contains(sample), "missing {sample}");
+        }
+        tokio::time::advance(Duration::from_millis(1250)).await;
+        let cooled = scrape_text(&app).await;
+        assert!(cooled.contains("two_bot_rest_guard_global_paused 0\n"));
+        assert!(cooled.contains("two_bot_rest_guard_global_pause_remaining_seconds 0\n"));
+        guard.observe_status(401, true);
+        assert_eq!(guard.admit(true).await, Err(GuardError::TokenInvalid));
+        let invalid = scrape_text(&app).await;
+        assert!(invalid.contains("two_bot_rest_guard_token_invalid 1\n"));
+        assert!(invalid.contains("two_bot_rest_guard_invalid_requests_total 3\n"));
+        assert!(invalid.contains("two_bot_rest_guard_rejected_requests_total 2\n"));
+        let ready = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let report: serde_json::Value =
+            serde_json::from_slice(&to_bytes(ready.into_body(), 65_536).await.unwrap()).unwrap();
+        assert!(report["components"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(["token_invalid", "down"])));
+    }
 
     #[tokio::test]
     async fn existing_server_exposes_metrics_without_gateway_or_database() {

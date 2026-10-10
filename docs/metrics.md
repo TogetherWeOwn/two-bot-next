@@ -25,6 +25,17 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_gateway_events_total{event}` | Received dispatches, including replays/duplicates, plus heartbeat ACKs and closes; fixed type allowlist, remainder `other` |
 | `two_bot_handler_duration_seconds` | Cumulative histogram over nonduplicate dispatch parse/pipeline/durable commit, including failures; seconds |
 | `two_bot_rest_requests_total{route,result}` | Executor HTTP sends, including retries; result `2xx`, `3xx`, `4xx`, `429`, `5xx` at response headers or `transport` (failure/cancellation/timeout before headers); later body failures do not hide 429/5xx |
+| `two_bot_rest_guard_invalid_requests_total` | Shared guard observations of 401, 403 or 429 response headers, across guarded REST callers |
+| `two_bot_rest_guard_rejected_requests_total` | Shared guard local refusals from `admit` or `check_now`, before any REST wire attempt; excludes admission timeout/cancellation |
+| `two_bot_rest_guard_breaker_opens_total` | Invalid-request breaker transitions to open |
+| `two_bot_rest_guard_breaker_closes_total` | Invalid-request breaker transitions to closed |
+| `two_bot_rest_guard_global_pauses_total` | New global-pause episodes, not extensions or overlapping pending responses |
+| `two_bot_rest_guard_invalid_requests_in_window` | Invalid response observations still inside the configured rolling window |
+| `two_bot_rest_guard_breaker_open` | 1 when the invalid-request breaker is open, otherwise 0 |
+| `two_bot_rest_guard_token_invalid` | 1 after a bot-authenticated 401, otherwise 0; fatal until process restart |
+| `two_bot_rest_guard_pending_global_responses` | Global-header responses whose bodies are still unresolved |
+| `two_bot_rest_guard_global_paused` | 1 while a global deadline remains or any global response body is unresolved, otherwise 0 |
+| `two_bot_rest_guard_global_pause_remaining_seconds` | Finite nonnegative seconds until the longest global deadline; zero does not release unresolved response holds |
 | `two_bot_db_pool_configured` | Whether gateway initialization has registered a pool |
 | `two_bot_db_pool_connections` | Current pool size |
 | `two_bot_db_pool_idle_connections` | Current idle connections |
@@ -45,6 +56,31 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert when any lane's drops increase across consecutive keepalive samples; a single drop inside one burst is not paging. `reactions`-lane growth points at a hot member before an undersized lane |
 | `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch` and failed checkpoint clears: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert on any increase across consecutive keepalive samples; unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
 | `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert rule `receiver_refusals:<family>` fires when a family's refused outcomes rise in 3 consecutive keepalive samples (first sample and restarts clear the streak; one forged pre-auth probe in `other` stays silent) |
+
+## REST admission guard
+
+The eleven `two_bot_rest_guard_*` series have constant names and **no labels**.
+The private scrape samples `ratelimit_guard::process_guard()`, the same instance
+used by production REST executors and readiness, not a new guard or mirrored
+counter registry. Fresh/unconfigured guard state renders all eleven series at
+zero; counters reset on process restart. There is no reset/control endpoint.
+Snapshot sampling uses the guard's existing rolling-window refresh, without
+changing thresholds, clocks, admission decisions or readiness policy.
+
+Invalid-response counts cover HTTP 401, 403 and 429 headers across guarded REST
+callers, not just executor sends. Rejected counts include only refusals from
+`admit` or `check_now` (breaker, invalid bot token or late global pause), not
+admission timeouts or cancellations. These refusals and pre-wire admission
+wait timeouts happen before an HTTP send, so they are **not**
+`two_bot_rest_requests_total{route,result}` outcomes; they must not be added to
+that family's denominator as transport failures.
+
+Remaining duration is finite, nonnegative seconds, including fractional seconds.
+It can be zero while admission remains globally paused: unresolved global-header
+response bodies still hold admission until settled or dropped. Read remaining
+duration together with `global_paused` and `pending_global_responses`, not as a
+standalone readiness signal. This export adds no alert rule or threshold and
+leaves the existing Worker authentication gate and 64 KiB scrape cap intact.
 
 ## Job coverage and outcomes
 

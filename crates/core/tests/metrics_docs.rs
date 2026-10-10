@@ -185,6 +185,11 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_gateway_disconnects_total",
     "two_bot_gateway_missed_events_total",
     "two_bot_rest_requests_total",
+    "two_bot_rest_guard_invalid_requests_total",
+    "two_bot_rest_guard_rejected_requests_total",
+    "two_bot_rest_guard_breaker_opens_total",
+    "two_bot_rest_guard_breaker_closes_total",
+    "two_bot_rest_guard_global_pauses_total",
     "two_bot_job_runs_total",
     "two_bot_voice_operations_total",
     "two_bot_voice_reconcile_actions_total",
@@ -276,6 +281,53 @@ fn check_docs_against_exposition(doc: &str, exposition: &str) -> Result<(), Stri
 fn committed_metrics_docs_match_exposition() {
     let doc = std::fs::read_to_string(repository_root().join("docs/metrics.md")).unwrap();
     let exposition = Metrics::default().render(None);
+    check_docs_against_exposition(&doc, &exposition).unwrap();
+}
+
+#[test]
+fn rest_guard_fixture_and_all_doc_rows_match_live_renderer() {
+    let doc = std::fs::read_to_string(repository_root().join("docs/metrics.md")).unwrap();
+    let exposition = Metrics::default().render_with_rest_guard(
+        None,
+        two_bot_core::metrics::RestGuardSnapshot {
+            invalid_requests_in_window: 3,
+            invalid_requests_total: 12,
+            rejected_requests_total: 4,
+            breaker_opens_total: 2,
+            breaker_closes_total: 1,
+            global_pauses_total: 3,
+            breaker_open: true,
+            token_invalid: true,
+            global_pause_remaining: std::time::Duration::from_millis(1250),
+            pending_global_responses: 2,
+        },
+    );
+    let guard_text = exposition
+        .lines()
+        .filter(|line| line.contains("two_bot_rest_guard_"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_eq!(guard_text, include_str!("fixtures/rest_guard_metrics.prom"));
+    let families = parse_exposition(&guard_text);
+    assert_eq!(families.len(), 11);
+    let doc_names: BTreeSet<&str> = doc
+        .lines()
+        .filter(|line| line.starts_with("| `two_bot_rest_guard_"))
+        .map(|line| line.split('`').nth(1).unwrap())
+        .collect();
+    assert_eq!(doc_names, families.keys().map(String::as_str).collect());
+    for (name, family) in families {
+        assert!(family.label_keys.is_empty(), "no guard labels: {name}");
+        assert_eq!(
+            family.kind,
+            if name.ends_with("_total") {
+                "counter"
+            } else {
+                "gauge"
+            }
+        );
+    }
     check_docs_against_exposition(&doc, &exposition).unwrap();
 }
 
