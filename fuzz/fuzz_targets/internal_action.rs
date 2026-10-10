@@ -6,12 +6,13 @@ use std::sync::OnceLock;
 use libfuzzer_sys::fuzz_target;
 use serde_json::{Map, Value};
 use two_bot_core::internal_actions::{
-    authorize, body_hash, check_setting_value_size, is_snowflake, require_reason,
-    require_settings_key, require_snowflake, sign, validate_announcement, validate_event_input,
-    validate_guild_add_member, validate_moderation_numbers, validate_role_assign, AuthHeaders,
-    InternalFlags, KeyRing, NonceCache, SigningKey, TokenBuckets, NONCE_TTL_SECONDS, SKEW_SECONDS,
+    authorize, body_hash, check_setting_value_size, require_settings_key, sign,
+    validate_announcement, validate_event_input, validate_guild_add_member, validate_role_assign,
+    AuthHeaders, InternalFlags, KeyRing, NonceCache, SigningKey, TokenBuckets, NONCE_TTL_SECONDS,
+    SKEW_SECONDS,
 };
 use two_bot_core::ModerationAction;
+use two_bot_discord::internal_channel_moderation::InternalChannelRequest;
 
 fn keys() -> &'static KeyRing {
     static KEYS: OnceLock<KeyRing> = OnceLock::new();
@@ -43,9 +44,9 @@ fn validate_fields(body: &Map<String, Value>) {
 /// `moderation.lockdown`, `moderation.unlock`): snowflake actor/channel
 /// identities, audit reason, purge `count` 1–100 and slowmode `seconds`
 /// 0–6h. The receiver refuses before any channel effect unless every clause
-/// holds, so the composed production verdict must equal the independent
-/// oracle on every arbitrary body; any divergence (or panic) is a fuzz
-/// failure, filed as a fix card per the out-of-scope rule.
+/// holds, so the real receiver verdict (`InternalChannelRequest::from_body`)
+/// must equal the independent oracle on every arbitrary body; any divergence
+/// (or panic) is a fuzz failure, filed as a fix card per the out-of-scope rule.
 const CHANNEL_ACTIONS: [ModerationAction; 4] = [
     ModerationAction::Purge,
     ModerationAction::Slowmode,
@@ -53,22 +54,10 @@ const CHANNEL_ACTIONS: [ModerationAction; 4] = [
     ModerationAction::Unlock,
 ];
 
-/// Canonical nonzero u64 identity: `is_snowflake` (17–20 ASCII digits),
-/// tightened so ledger keys and REST identities never refer to different
-/// channels — no leading zeros, no all-zero, no u64 overflow.
-fn is_canonical_id(body: &Map<String, Value>, field: &str) -> bool {
-    body.get(field).is_some_and(|value| {
-        value.as_str().is_some_and(|text| {
-            is_snowflake(text)
-                && text
-                    .parse::<u64>()
-                    .is_ok_and(|id| id != 0 && id.to_string() == text)
-        })
-    })
-}
-
 /// Present numerics must be JSON integers: `"10"`, `1.5` and booleans are
-/// malformed, never coerced.
+/// malformed, never coerced. Oracle-only: the production verdict below calls
+/// the real receiver, so this helper must not run on the production side
+/// (it would make the `assert_eq!` vacuous).
 fn numeric_fields_are_integers(body: &Map<String, Value>) -> bool {
     ["duration_seconds", "count", "seconds"]
         .iter()
@@ -78,22 +67,11 @@ fn numeric_fields_are_integers(body: &Map<String, Value>) -> bool {
         })
 }
 
-/// Composed production verdict for one channel verb: every clause the
-/// receiver applies before any channel effect.
+/// Production verdict for one channel verb: the real receiver seam. Any
+/// regression in `InternalChannelRequest::from_body` (canonical-id
+/// tightening, integer coercion, new clauses) fails this fuzzer.
 fn channel_body_accepts(action: ModerationAction, body: &Map<String, Value>) -> bool {
-    require_snowflake(body, "actor_id").is_ok()
-        && is_canonical_id(body, "actor_id")
-        && require_snowflake(body, "channel_id").is_ok()
-        && is_canonical_id(body, "channel_id")
-        && require_reason(body.get("reason").unwrap_or(&Value::Null)).is_ok()
-        && validate_moderation_numbers(
-            action,
-            body.get("duration_seconds"),
-            body.get("count"),
-            body.get("seconds"),
-        )
-        .is_ok()
-        && numeric_fields_are_integers(body)
+    InternalChannelRequest::from_body(action.action_name(), body).is_ok()
 }
 
 fn oracle_canonical_id(value: &Value) -> bool {
