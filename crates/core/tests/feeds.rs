@@ -126,6 +126,38 @@ fn sources_reject_credentials_and_canonicalized_private_literals() {
 }
 
 #[test]
+fn source_length_bound_matches_published_utf16_limit_before_trimming() {
+    let base = "https://example.org/";
+    let at_limit = format!("{base}{}", "x".repeat(MAX_FEED_SOURCE_CHARS - base.len()));
+    assert_eq!(at_limit.encode_utf16().count(), MAX_FEED_SOURCE_CHARS);
+    assert!(validate_source(&at_limit).is_ok());
+    assert!(normalize_source(FeedKind::Twitch, &at_limit).is_ok());
+
+    let unicode_path = format!(
+        "{base}{}",
+        "😀".repeat((MAX_FEED_SOURCE_CHARS - base.encode_utf16().count()) / 2)
+    );
+    assert_eq!(unicode_path.encode_utf16().count(), MAX_FEED_SOURCE_CHARS);
+    assert!(matches!(
+        validate_source(&unicode_path),
+        Err(FetchError::InvalidSource)
+    ));
+
+    let over_limit = format!(
+        "{base}{}",
+        "x".repeat(MAX_FEED_SOURCE_CHARS - base.len() + 1)
+    );
+    assert!(matches!(
+        normalize_source(FeedKind::Twitch, &format!(" {over_limit} ")),
+        Err(FeedError::Fetch(FetchError::InvalidSource))
+    ));
+    assert!(matches!(
+        validate_source(&over_limit),
+        Err(FetchError::InvalidSource)
+    ));
+}
+
+#[test]
 fn dns_results_are_all_or_nothing_and_socket_targets_are_pinned() {
     let url = validate_source("https://example.org/feed").unwrap();
     let plan = PublicRequest::prepare(url.clone(), &[ip("8.8.8.8"), ip("1.1.1.1")]).unwrap();

@@ -35,9 +35,15 @@
 use std::collections::{HashMap, HashSet};
 
 use super::commands::{
-    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, OCCURRENCE_ID_MAX_CHARS,
-    PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
+    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, MAX_RESOURCE_ID_CHARS,
+    OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
 };
+use super::custom_commands::{
+    MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
+};
+use super::feeds_http::MAX_FEED_SOURCE_CHARS;
+use super::lfg::{MAX_ROLE_SPEC_CHARS, MAX_TITLE_CHARS};
+use super::scheduled::MAX_BODY_CHARS;
 
 /// Scorecard check-in command (parity #12). Keeps the `attendance` name; the
 /// RSVP-totals variant is the one that renames.
@@ -79,23 +85,27 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                     "Command name, a-z 0-9 _ -",
                     CommandOptionType::String,
                 )
-                .required(),
+                .required()
+                .max_length(MAX_COMMAND_NAME_CHARS as u32),
                 CommandOption::new(
                     "template",
                     "What the bot replies; {user} {username} {server} {channel}",
                     CommandOptionType::String,
                 )
-                .required(),
+                .required()
+                .max_length(MAX_TEMPLATE_CHARS as u32),
                 CommandOption::new(
                     "description",
                     "Shown in the command picker",
                     CommandOptionType::String,
-                ),
+                )
+                .max_length(MAX_DESCRIPTION_CHARS as u32),
                 CommandOption::new(
                     "text-trigger",
                     "Optional !trigger form, e.g. !faq",
                     CommandOptionType::String,
-                ),
+                )
+                .max_length(MAX_TEXT_TRIGGER_CHARS as u32),
             ]),
         CommandDefinition::new("command-remove", "Delete a custom command")
             .permissions(PERM_MANAGE_GUILD)
@@ -104,13 +114,16 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                 "Command to delete",
                 CommandOptionType::String,
             )
-            .required()]),
+            .required()
+            .max_length(MAX_COMMAND_NAME_CHARS as u32)]),
         CommandDefinition::new("command-list", "List this server's custom commands")
             .permissions(PERM_MANAGE_GUILD),
         CommandDefinition::new("schedule", "Schedule a message, once or recurring")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![
-                CommandOption::new("body", "Message text", CommandOptionType::String).required(),
+                CommandOption::new("body", "Message text", CommandOptionType::String)
+                    .required()
+                    .max_length(MAX_BODY_CHARS as u32),
                 CommandOption::new(
                     "in-minutes",
                     "Fire this many minutes from now",
@@ -131,13 +144,16 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                 "Scheduled message id",
                 CommandOptionType::String,
             )
-            .required()]),
+            .required()
+            .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
         CommandDefinition::new("schedule-list", "List scheduled messages for this server")
             .permissions(PERM_MANAGE_GUILD),
         CommandDefinition::new("sticky", "Set this channel's sticky message")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![
-                CommandOption::new("body", "Sticky text", CommandOptionType::String).required(),
+                CommandOption::new("body", "Sticky text", CommandOptionType::String)
+                    .required()
+                    .max_length(MAX_BODY_CHARS as u32),
                 CommandOption::new(
                     "debounce",
                     "Quiet seconds before re-posting (default 5, max 300)",
@@ -194,7 +210,8 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
             .permissions(PERM_MANAGE_EVENTS)
             .options(vec![
                 CommandOption::new("title", "Event or group title", CommandOptionType::String)
-                    .required(),
+                    .required()
+                    .max_length(MAX_TITLE_CHARS as u32),
                 CommandOption::new(
                     "starts-at",
                     "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
@@ -206,7 +223,8 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                     "Role slots as role:Label:count, comma-separated, e.g. tank:Tank:2,dps:DPS:6",
                     CommandOptionType::String,
                 )
-                .required(),
+                .required()
+                .max_length(MAX_ROLE_SPEC_CHARS as u32),
             ]),
         CommandDefinition::new("lfg-close", "Close a raid/LFG signup")
             .permissions(PERM_MANAGE_EVENTS)
@@ -215,7 +233,8 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                 "LFG id from the posted signup",
                 CommandOptionType::String,
             )
-            .required()]),
+            .required()
+            .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
         CommandDefinition::new(
             "feed-add",
             "Relay an RSS, YouTube, or Twitch feed into this channel",
@@ -243,7 +262,8 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                 "HTTPS URL or YouTube channel id",
                 CommandOptionType::String,
             )
-            .required(),
+            .required()
+            .max_length(MAX_FEED_SOURCE_CHARS as u32),
         ]),
         CommandDefinition::new("feed-remove", "Remove a feed relay")
             .permissions(PERM_MANAGE_GUILD)
@@ -252,7 +272,8 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                 "Feed id",
                 CommandOptionType::String,
             )
-            .required()]),
+            .required()
+            .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
         CommandDefinition::new("feed-list", "List this server's feed relays")
             .permissions(PERM_MANAGE_GUILD),
     ]
@@ -457,6 +478,23 @@ mod tests {
                 .expect("command exists")
         }
         let auto = automation_commands();
+        for (command, option, max_length) in [
+            ("command", 0, 32),
+            ("command", 1, 2000),
+            ("command", 2, 100),
+            ("command", 3, 33),
+            ("command-remove", 0, 32),
+            ("schedule", 0, 2000),
+            ("schedule-remove", 0, 128),
+            ("sticky", 0, 2000),
+        ] {
+            assert_eq!(
+                get(&auto, command).options[option].max_length,
+                Some(max_length),
+                "{command} option {} max_length",
+                get(&auto, command).options[option].name
+            );
+        }
         // /schedule: one timing option required, both bounded.
         let sched = get(&auto, "schedule").options.clone();
         assert!(sched[0].required == Some(true));
@@ -478,6 +516,20 @@ mod tests {
         assert!(sticky[1].required.is_none());
         // /rsvp status choices.
         let ann = announcement_commands();
+        for (command, option, max_length) in [
+            ("lfg", 0, 100),
+            ("lfg", 2, 2339),
+            ("lfg-close", 0, 128),
+            ("feed-add", 1, 2048),
+            ("feed-remove", 0, 128),
+        ] {
+            assert_eq!(
+                get(&ann, command).options[option].max_length,
+                Some(max_length),
+                "{command} option {} max_length",
+                get(&ann, command).options[option].name
+            );
+        }
         let status = get(&ann, "rsvp").options[1].clone();
         let values: Vec<_> = status.choices.iter().map(|c| c.value.as_str()).collect();
         assert_eq!(values, ["going", "interested", "declined"]);

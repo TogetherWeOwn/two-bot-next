@@ -15,6 +15,15 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("rsvp-attendance", "docs/parity.md §1 #25 copy"),
     ("lfg", "docs/parity.md §1 #26 copy"),
     ("lfg-close", "docs/parity.md §1 #27 copy"),
+    ("command", "docs/parity.md §1 #14 input bounds"),
+    ("command-remove", "docs/parity.md §1 #15 input bounds"),
+    ("schedule", "docs/parity.md §1 #17 input bounds"),
+    ("schedule-remove", "docs/parity.md §1 #18 input bounds"),
+    ("sticky", "docs/parity.md §1 #20 input bounds"),
+    ("lfg", "docs/parity.md §1 #26 input bounds"),
+    ("lfg-close", "docs/parity.md §1 #27 input bounds"),
+    ("feed-add", "docs/parity.md §1 #28 input bounds"),
+    ("feed-remove", "docs/parity.md §1 #29 input bounds"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -151,6 +160,44 @@ pub fn expected_registry() -> Value {
             .find(|c| c["name"] == name)
             .expect("copy exception names a published command");
         *command.pointer_mut(pointer).expect("copy field exists") = json!(value);
+    }
+    // New application-side input bounds add only `max_length`; the frozen
+    // legacy registry fixture remains untouched.
+    for (name, option_name, max_length) in [
+        ("command", "name", 32),
+        ("command", "template", 2000),
+        ("command", "description", 100),
+        ("command", "text-trigger", 33),
+        ("command-remove", "name", 32),
+        ("schedule", "body", 2000),
+        ("schedule-remove", "id", 128),
+        ("sticky", "body", 2000),
+        ("lfg", "title", 100),
+        ("lfg", "roles", 2339),
+        ("lfg-close", "id", 128),
+        ("feed-add", "source", 2048),
+        ("feed-remove", "id", 128),
+    ] {
+        let reference = INTENTIONAL_DIFFERENCES
+            .iter()
+            .find(|(command, _)| *command == name)
+            .expect("input bound has a documented command exception")
+            .1;
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == name)
+            .expect(reference);
+        let option = command["options"]
+            .as_array_mut()
+            .expect("command options array")
+            .iter_mut()
+            .find(|option| option["name"] == option_name)
+            .expect(reference);
+        assert!(
+            option["max_length"].is_null(),
+            "legacy {name}/{option_name}"
+        );
+        option["max_length"] = json!(max_length);
     }
     canonical_registry(json!(commands))
 }

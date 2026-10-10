@@ -19,6 +19,7 @@ use twilight_model::application::interaction::{
     application_command::CommandOptionValue, Interaction, InteractionData,
 };
 use two_bot_core::{
+    commands::MAX_RESOURCE_ID_CHARS,
     funnel::now_millis_for_test,
     message_safety,
     scheduled::{
@@ -186,6 +187,24 @@ pub(crate) async fn schedule_remove(
     interaction: &Interaction,
 ) {
     let prefix = schedule_remove_option(interaction).unwrap_or_default();
+    if prefix.is_empty() {
+        finish(executor, interaction, no_unique_match_text(&prefix)).await;
+        return;
+    }
+    if prefix
+        .encode_utf16()
+        .take(MAX_RESOURCE_ID_CHARS + 1)
+        .count()
+        > MAX_RESOURCE_ID_CHARS
+    {
+        finish(
+            executor,
+            interaction,
+            "No unique scheduled message matches that id. Use the full id from /schedule-list.",
+        )
+        .await;
+        return;
+    }
     let resolved = match resolve_scheduled_id_store(pool, guild_id, &prefix).await {
         Ok(resolved) => resolved,
         Err(err) => {
@@ -357,8 +376,8 @@ pub(crate) fn schedule_options(
     (body, in_minutes, every_minutes)
 }
 
-/// `/schedule-remove`'s `id` option; `None` resolves against an empty prefix,
-/// which matches nothing and gets the no-unique-match refusal.
+/// `/schedule-remove`'s optional `id` option; absent and empty values are
+/// refused before resolution, so they can never delete a schedule.
 pub(crate) fn schedule_remove_option(interaction: &Interaction) -> Option<String> {
     let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
         return None;

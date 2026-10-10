@@ -30,6 +30,8 @@ use crate::funnel::Snowflake;
 pub const MAX_CHANNEL_NAME_LEN: u32 = 100;
 /// Largest voice user limit (`/limit`, 0 = unlimited, max 99).
 pub const MAX_USER_LIMIT: i64 = 99;
+/// Longest `/inheritpermissions` source choice (`category`).
+pub const MAX_PERMISSION_SOURCE_CHARS: u32 = 8;
 /// Largest first room number (`/position first-number`): the V11 export codec
 /// stores it as `u32`, so anything above `u32::MAX` breaks `/export` and
 /// `/import` with "Could not read the voice configuration" and can overflow
@@ -1537,6 +1539,7 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::String,
             )
             .required()
+            .max_length(MAX_PERMISSION_SOURCE_CHARS)
             .choices(vec![
                 CommandChoice {
                     name: "Creator".to_owned(),
@@ -2748,6 +2751,7 @@ mod tests {
             ["channel", "source", "source-channel"]
         );
         assert!(inherit.options[1].required == Some(true));
+        assert_eq!(inherit.options[1].max_length, Some(8));
         // `/defaultlimit` bounds match the import validation (0-99).
         let limit = defs.iter().find(|def| def.name == "defaultlimit").unwrap();
         assert_eq!(limit.options[1].min_value, Some(0));

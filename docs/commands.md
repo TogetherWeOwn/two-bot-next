@@ -88,10 +88,10 @@ Define or replace a custom command
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `name` | string | true | — | — | — | — | Command name, a-z 0-9 _ - |
-| `template` | string | true | — | — | — | — | What the bot replies; {user} {username} {server} {channel} |
-| `description` | string | false | — | — | — | — | Shown in the command picker |
-| `text-trigger` | string | false | — | — | — | — | Optional !trigger form, e.g. !faq |
+| `name` | string | true | — | — | 32 | — | Command name, a-z 0-9 _ - |
+| `template` | string | true | — | — | 2000 | — | What the bot replies; {user} {username} {server} {channel} |
+| `description` | string | false | — | — | 100 | — | Shown in the command picker |
+| `text-trigger` | string | false | — | — | 33 | — | Optional !trigger form, e.g. !faq |
 
 ## `/command-list`
 
@@ -111,7 +111,7 @@ Delete a custom command
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `name` | string | true | — | — | — | — | Command to delete |
+| `name` | string | true | — | — | 32 | — | Command to delete |
 
 ## `/create`
 
@@ -155,7 +155,7 @@ Relay an RSS, YouTube, or Twitch feed into this channel
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `kind` | string | true | — | — | — | RSS = `"rss"`; YouTube = `"youtube"`; Twitch = `"twitch"` | Feed kind |
-| `source` | string | true | — | — | — | — | HTTPS URL or YouTube channel id |
+| `source` | string | true | — | — | 2048 | — | HTTPS URL or YouTube channel id |
 
 ## `/feed-list`
 
@@ -175,7 +175,7 @@ Remove a feed relay
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `id` | string | true | — | — | — | — | Feed id |
+| `id` | string | true | — | — | 128 | — | Feed id |
 
 ## `/group`
 
@@ -219,7 +219,7 @@ Set where new rooms copy permission overrides from
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
-| `source` | string | true | — | — | — | Creator = `"creator"`; Category = `"category"`; Channel = `"channel"` | Copy overrides from the creator, the category, or a channel |
+| `source` | string | true | — | — | 8 | Creator = `"creator"`; Category = `"category"`; Channel = `"channel"` | Copy overrides from the creator, the category, or a channel |
 | `source-channel` | channel | false | — | — | — | — | Channel to copy overrides from (only with source channel) |
 
 ## `/invite`
@@ -261,9 +261,9 @@ Post a raid/LFG signup with role slots
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `title` | string | true | — | — | — | — | Event or group title |
+| `title` | string | true | — | — | 100 | — | Event or group title |
 | `starts-at` | string | true | — | — | — | — | ISO-8601 start time, e.g. 2026-10-04T18:00:00Z |
-| `roles` | string | true | — | — | — | — | Role slots as role:Label:count, comma-separated, e.g. tank:Tank:2,dps:DPS:6 |
+| `roles` | string | true | — | — | 2339 | — | Role slots as role:Label:count, comma-separated, e.g. tank:Tank:2,dps:DPS:6 |
 
 ## `/lfg-close`
 
@@ -274,7 +274,7 @@ Close a raid/LFG signup
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `id` | string | true | — | — | — | — | LFG id from the posted signup |
+| `id` | string | true | — | — | 128 | — | LFG id from the posted signup |
 
 ## `/limit`
 
@@ -428,7 +428,7 @@ Schedule a message, once or recurring
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `body` | string | true | — | — | — | — | Message text |
+| `body` | string | true | — | — | 2000 | — | Message text |
 | `in-minutes` | integer | false | 1 | 525600 | — | — | Fire this many minutes from now |
 | `every-minutes` | integer | false | 60 | 525600 | — | — | Recur at this interval (60 min minimum) |
 
@@ -450,7 +450,7 @@ Cancel a scheduled message
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `id` | string | true | — | — | — | — | Scheduled message id |
+| `id` | string | true | — | — | 128 | — | Scheduled message id |
 
 ## `/setup`
 
@@ -482,7 +482,7 @@ Set this channel's sticky message
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `body` | string | true | — | — | — | — | Sticky text |
+| `body` | string | true | — | — | 2000 | — | Sticky text |
 | `debounce` | integer | false | 1 | 300 | — | — | Quiet seconds before re-posting (default 5, max 300) |
 
 ## `/sticky-remove`

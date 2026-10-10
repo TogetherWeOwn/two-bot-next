@@ -6,6 +6,8 @@ use thiserror::Error;
 use url::{Host, Url};
 
 pub const MAX_FEED_BYTES: usize = 2_000_000;
+/// Bound feed URLs before parsing or advertising them in command metadata.
+pub const MAX_FEED_SOURCE_CHARS: usize = 2048;
 pub const MAX_REDIRECT_HOPS: usize = 3;
 pub const FEED_READ_TIMEOUT_MS: u64 = 15_000;
 pub const FEED_USER_AGENT: &str = "Owen/1.0 (+https://two.gg)";
@@ -27,7 +29,24 @@ pub enum FetchError {
 }
 
 pub fn validate_source(source: &str) -> Result<Url, FetchError> {
+    if source
+        .encode_utf16()
+        .take(MAX_FEED_SOURCE_CHARS + 1)
+        .count()
+        > MAX_FEED_SOURCE_CHARS
+    {
+        return Err(FetchError::InvalidSource);
+    }
     let url = Url::parse(source.trim()).map_err(|_| FetchError::InvalidSource)?;
+    if url
+        .as_str()
+        .encode_utf16()
+        .take(MAX_FEED_SOURCE_CHARS + 1)
+        .count()
+        > MAX_FEED_SOURCE_CHARS
+    {
+        return Err(FetchError::InvalidSource);
+    }
     if url.scheme() != "https"
         || !url.username().is_empty()
         || url.password().is_some()

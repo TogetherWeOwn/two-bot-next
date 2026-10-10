@@ -119,6 +119,15 @@ pub async fn resolve_scheduled_id(
     guild_id: &str,
     id_or_prefix: &str,
 ) -> Result<Option<String>, sqlx::Error> {
+    if id_or_prefix.is_empty()
+        || id_or_prefix
+            .encode_utf16()
+            .take(crate::commands::MAX_RESOURCE_ID_CHARS + 1)
+            .count()
+            > crate::commands::MAX_RESOURCE_ID_CHARS
+    {
+        return Ok(None);
+    }
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT id FROM scheduled_messages
           WHERE guild_id = $1 AND starts_with(id, $2)
@@ -361,4 +370,31 @@ pub async fn audit_scheduled(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_and_overlong_prefixes_refuse_before_database_access() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+
+        assert_eq!(
+            resolve_scheduled_id(&pool, "guild", "").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_scheduled_id(
+                &pool,
+                "guild",
+                &"x".repeat(crate::commands::MAX_RESOURCE_ID_CHARS + 1)
+            )
+            .await
+            .unwrap(),
+            None
+        );
+    }
 }

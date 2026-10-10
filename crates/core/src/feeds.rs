@@ -1,7 +1,7 @@
 //! Framework-free feed commands, parsing and polling decisions.
 //! Side effects belong to the shared router/REST executor, not this module.
 
-use crate::feeds_http::{validate_source, FetchError, MAX_FEED_BYTES};
+use crate::feeds_http::{validate_source, FetchError, MAX_FEED_BYTES, MAX_FEED_SOURCE_CHARS};
 use roxmltree::{Document, Node, ParsingOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -163,6 +163,14 @@ fn validate_id(id: &str) -> Result<(), FeedError> {
 }
 
 pub fn normalize_source(kind: FeedKind, source: &str) -> Result<String, FeedError> {
+    if source
+        .encode_utf16()
+        .take(MAX_FEED_SOURCE_CHARS + 1)
+        .count()
+        > MAX_FEED_SOURCE_CHARS
+    {
+        return Err(FetchError::InvalidSource.into());
+    }
     let source = source.trim();
     if kind == FeedKind::Youtube
         && (20..=32).contains(&source.len())

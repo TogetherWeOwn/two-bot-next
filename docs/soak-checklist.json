@@ -241,7 +241,7 @@
         "row": [
           "14",
           "`/command`",
-          "`name` req, `template` req (`{user} {username} {server} {channel}`), `description` opt, `text-trigger` opt",
+          "`name` req ≤32, `template` req ≤2000 (`{user} {username} {server} {channel}`), `description` opt ≤100, `text-trigger` opt ≤33",
           "`ManageGuild` (builder + runtime)"
         ]
       },
@@ -257,7 +257,7 @@
         "row": [
           "15",
           "`/command-remove`",
-          "`name` req",
+          "`name` req ≤32",
           "`ManageGuild`"
         ]
       },
@@ -289,7 +289,7 @@
         "row": [
           "17",
           "`/schedule`",
-          "`body` req; `in-minutes` 1–525600 opt; `every-minutes` 60–525600 opt (one required)",
+          "`body` req ≤2000; `in-minutes` 1–525600 opt; `every-minutes` 60–525600 opt (one required)",
           "`ManageGuild`, runs in invoking channel"
         ]
       },
@@ -305,7 +305,7 @@
         "row": [
           "18",
           "`/schedule-remove`",
-          "`id` req (prefix-resolved)",
+          "non-empty `id` prefix req ≤128",
           "`ManageGuild`"
         ]
       },
@@ -337,7 +337,7 @@
         "row": [
           "20",
           "`/sticky`",
-          "`body` req, `debounce` 1–300 default 5 opt",
+          "`body` req ≤2000, `debounce` 1–300 default 5 opt",
           "`ManageGuild`, current channel"
         ]
       },
@@ -433,7 +433,7 @@
         "row": [
           "26",
           "`/lfg`",
-          "`title` req, `starts-at` ISO-8601 req, `roles` req (`tank:Tank:2,…`)",
+          "`title` req ≤100, `starts-at` ISO-8601 req, `roles` req ≤2339 UTF-16 units (`tank:Tank:2,…`)",
           "`ManageEvents` (builder + runtime)"
         ]
       },
@@ -449,7 +449,7 @@
         "row": [
           "27",
           "`/lfg-close`",
-          "`id` req",
+          "`id` req ≤128",
           "`ManageEvents`"
         ]
       },
@@ -465,7 +465,7 @@
         "row": [
           "28",
           "`/feed-add`",
-          "`kind` req (`rss`/`youtube`/`twitch`), `source` req",
+          "`kind` req (`rss`/`youtube`/`twitch`), `source` req ≤2048",
           "`ManageGuild`"
         ]
       },
@@ -481,7 +481,7 @@
         "row": [
           "29",
           "`/feed-remove`",
-          "`id` req",
+          "`id` req ≤128",
           "`ManageGuild`"
         ]
       },

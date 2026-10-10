@@ -573,7 +573,11 @@ impl InteractionRuntime {
             }
         };
         self.executor
-            .finish_interaction(interaction.application_id.get(), &interaction.token, &reply)
+            .edit_interaction_response_with_blocked_retry(
+                interaction.application_id.get(),
+                &interaction.token,
+                &reply,
+            )
             .await?;
         Ok(true)
     }
