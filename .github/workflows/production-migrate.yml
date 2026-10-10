@@ -1,15 +1,15 @@
-name: staging-migrate
+name: production-migrate
 
-# Manual, staging-only SQLx migration runner (TOG-11572). Never runs
-# automatically and has no production path. Refuses before any DDL unless the
-# operator names an independently reviewed source SHA that is already on main,
-# the verified non-secret staging identity, and the recovery/ACL references.
+# Manual, production SQLx migration runner. Never runs automatically.
+# Refuses before any DDL unless the operator names an independently reviewed
+# source SHA that is already on main, the verified non-secret production
+# identity (PlanetScale main `two_bot`), and the recovery/ACL references.
 # The per-mode bindings must already exist; this workflow never creates or
-# changes credentials. `plan` reads only TWO_BOT_STAGING_PLAN_DATABASE_URL (a
+# changes credentials. `plan` reads only TWO_BOT_PRODUCTION_PLAN_DATABASE_URL (a
 # login holding only two_bot_migrator_ro, physically read-only) from the
-# no-reviewer `staging-migrate-plan` environment and always runs; `apply`
-# reads only TWO_BOT_STAGING_MIGRATOR_DATABASE_URL from the reviewed
-# `staging-migrate-apply` environment and runs only for mode=apply, after a
+# no-reviewer `production-migrate-plan` environment and always runs; `apply`
+# reads only TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL from the reviewed
+# `production-migrate-apply` environment and runs only for mode=apply, after a
 # green plan. Both environments must exist before dispatch; a missing
 # environment fails the job instead of leaking a binding.
 on:
@@ -23,16 +23,12 @@ on:
       source_sha:
         description: Full 40-char reviewed commit on main
         required: true
-      staging_host:
-        description: Pinned staging endpoint host, non-secret (binding must match; prod-like refused)
+      production_host:
+        description: Pinned production endpoint host, non-secret (binding must match; staging hosts refused)
         required: true
-      staging_database:
-        description: Pinned staging database name, non-secret (binding must match; prod-like refused)
+      production_database:
+        description: Pinned production database name, non-secret (binding must match)
         required: true
-      staging_branch_id:
-        description: Pinned PlanetScale branch id, non-secret (required for *.psdb.cloud hosts; must match the binding username role.branch_id suffix; empty for Neon)
-        required: false
-        default: ''
       recovery_evidence_ref:
         description: Reference to approved recovery evidence (card/document, no URL secrets)
         required: true
@@ -55,21 +51,21 @@ on:
 permissions: {}
 
 concurrency:
-  group: staging-migrate
+  group: production-migrate
   cancel-in-progress: false
 
 jobs:
   plan:
-    name: staging-migrate (plan)
+    name: production-migrate (plan)
     permissions:
       contents: read
     # Dispatch from main only. The binding must be scoped to the
-    # staging-migrate-plan environment (no reviewer: this job only reads;
+    # production-migrate-plan environment (no reviewer: this job only reads;
     # main-only deployment branches) so a workflow edited on another branch
     # cannot read it.
     if: github.ref == 'refs/heads/main'
-    environment: staging-migrate-plan
-    # Runner routing (TOG-12339): same expression as every job in every
+    environment: production-migrate-plan
+    # Runner routing: same expression as every job in every
     # workflow; see the note on `check` in check.yml. A bare self-hosted
     # label would queue forever on the public repo.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'plan') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
@@ -94,13 +90,12 @@ jobs:
         run: cargo build -p two-bot-cutover --bin staging-migrate --locked
       - name: Run
         env:
-          # Must already exist as a staging-migrate-plan environment secret; absent means refusal.
+          # Must already exist as a production-migrate-plan environment secret; absent means refusal.
           # Read-only login (two_bot_migrator_ro): the runner refuses at validate when absent.
-          TWO_BOT_STAGING_PLAN_DATABASE_URL: ${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}
+          TWO_BOT_PRODUCTION_PLAN_DATABASE_URL: ${{ secrets.TWO_BOT_PRODUCTION_PLAN_DATABASE_URL }}
           SOURCE_SHA: ${{ inputs.source_sha }}
-          STAGING_HOST: ${{ inputs.staging_host }}
-          STAGING_DATABASE: ${{ inputs.staging_database }}
-          STAGING_BRANCH_ID: ${{ inputs.staging_branch_id }}
+          PRODUCTION_HOST: ${{ inputs.production_host }}
+          PRODUCTION_DATABASE: ${{ inputs.production_database }}
           RECOVERY_REF: ${{ inputs.recovery_evidence_ref }}
           ACL_REF: ${{ inputs.acl_plan_ref }}
           EXPECTED_PENDING: ${{ inputs.expected_pending }}
@@ -112,12 +107,11 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          ./target/debug/staging-migrate --target staging --plan --source-sha "$SOURCE_SHA" \
-            --staging-host "$STAGING_HOST" --staging-database "$STAGING_DATABASE" \
-            --staging-branch-id "$STAGING_BRANCH_ID" \
+          ./target/debug/staging-migrate --target production --plan --source-sha "$SOURCE_SHA" \
+            --production-host "$PRODUCTION_HOST" --production-database "$PRODUCTION_DATABASE" \
             --recovery-evidence-ref "$RECOVERY_REF" --acl-plan-ref "$ACL_REF" \
             --expected-pending "$EXPECTED_PENDING" \
-            | tee staging-migrate-manifest.json
+            | tee production-migrate-manifest.json
       - name: Upload plan manifest
         # The apply dispatch binds to this artifact by hash: the reviewer
         # reads plan_manifest_sha256/plan_run_id off this run, and the apply
@@ -127,14 +121,14 @@ jobs:
         # fails the apply fetch step before any DDL.
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: staging-migrate-manifest
-          path: staging-migrate-manifest.json
+          name: production-migrate-manifest
+          path: production-migrate-manifest.json
           if-no-files-found: error
           retention-days: 14
           # The protection-rule reader accepts stored ZIP entries, not deflate.
           compression-level: 0
   claim:
-    name: staging-migrate (claim)
+    name: production-migrate (claim)
     permissions:
       contents: read
     if: github.ref == 'refs/heads/main' && inputs.mode == 'apply'
@@ -154,15 +148,14 @@ jobs:
       - name: Fetch this dispatch's read-only plan
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: staging-migrate-manifest
+          name: production-migrate-manifest
           path: current-plan
       - name: Publish apply claim
         env:
           MODE: ${{ inputs.mode }}
           SOURCE_SHA: ${{ inputs.source_sha }}
-          STAGING_HOST: ${{ inputs.staging_host }}
-          STAGING_DATABASE: ${{ inputs.staging_database }}
-          STAGING_BRANCH_ID: ${{ inputs.staging_branch_id }}
+          PRODUCTION_HOST: ${{ inputs.production_host }}
+          PRODUCTION_DATABASE: ${{ inputs.production_database }}
           RECOVERY_REF: ${{ inputs.recovery_evidence_ref }}
           ACL_REF: ${{ inputs.acl_plan_ref }}
           EXPECTED_PENDING: ${{ inputs.expected_pending }}
@@ -171,19 +164,19 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          python3 scripts/ci/staging_migrate_claim.py \
-            --manifest current-plan/staging-migrate-manifest.json \
-            --output staging-migrate-apply-claim.json
+          python3 scripts/ci/production_migrate_claim.py \
+            --manifest current-plan/production-migrate-manifest.json \
+            --output production-migrate-apply-claim.json
       - name: Upload apply claim
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: staging-migrate-apply-claim
-          path: staging-migrate-apply-claim.json
+          name: production-migrate-apply-claim
+          path: production-migrate-apply-claim.json
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
   apply:
-    name: staging-migrate (apply)
+    name: production-migrate (apply)
     permissions:
       contents: read
       # Minimal grant for the provenance gate below: read-only fetch of the
@@ -192,13 +185,13 @@ jobs:
       # plan job keeps contents:read only because it produces the manifest.
       actions: read
     # Dispatch from main only, mode=apply only, and only after a green plan.
-    # The binding must be scoped to the staging-migrate-apply environment
+    # The binding must be scoped to the production-migrate-apply environment
     # (required reviewer, main-only deployment branches) so a workflow edited
     # on another branch cannot read it.
     if: github.ref == 'refs/heads/main' && inputs.mode == 'apply'
     needs: [plan, claim]
-    environment: staging-migrate-apply
-    # Runner routing (TOG-12339): same expression as every job in every
+    environment: production-migrate-apply
+    # Runner routing: same expression as every job in every
     # workflow; see the note on `check` in check.yml. A bare self-hosted
     # label would queue forever on the public repo.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'apply') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
@@ -222,7 +215,7 @@ jobs:
       - name: Build runner
         run: cargo build -p two-bot-cutover --bin staging-migrate --locked
       - name: Fetch producing plan manifest
-        # Provenance gate (TOG-15157 gap 2): the apply runner proves the bound
+        # Provenance gate: the apply runner proves the bound
         # plan_manifest_sha256 came from the reviewed plan run by parsing this
         # artifact and refuses when it cannot. Resolving plan_run_id to the
         # run's uploaded artifact needs the job's actions:read grant; a wrong
@@ -231,18 +224,17 @@ jobs:
         # ever starts. No continue-on-error: an unverified apply must not run.
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: staging-migrate-manifest
+          name: production-migrate-manifest
           path: producing-plan
           run-id: ${{ inputs.plan_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Run
         env:
-          # Must already exist as a staging-migrate-apply environment secret; absent means refusal.
-          TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: ${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}
+          # Must already exist as a production-migrate-apply environment secret; absent means refusal.
+          TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL: ${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}
           SOURCE_SHA: ${{ inputs.source_sha }}
-          STAGING_HOST: ${{ inputs.staging_host }}
-          STAGING_DATABASE: ${{ inputs.staging_database }}
-          STAGING_BRANCH_ID: ${{ inputs.staging_branch_id }}
+          PRODUCTION_HOST: ${{ inputs.production_host }}
+          PRODUCTION_DATABASE: ${{ inputs.production_database }}
           RECOVERY_REF: ${{ inputs.recovery_evidence_ref }}
           ACL_REF: ${{ inputs.acl_plan_ref }}
           EXPECTED_PENDING: ${{ inputs.expected_pending }}
@@ -256,11 +248,10 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          ./target/debug/staging-migrate --target staging --apply --source-sha "$SOURCE_SHA" \
-            --staging-host "$STAGING_HOST" --staging-database "$STAGING_DATABASE" \
-            --staging-branch-id "$STAGING_BRANCH_ID" \
+          ./target/debug/staging-migrate --target production --apply --source-sha "$SOURCE_SHA" \
+            --production-host "$PRODUCTION_HOST" --production-database "$PRODUCTION_DATABASE" \
             --recovery-evidence-ref "$RECOVERY_REF" --acl-plan-ref "$ACL_REF" \
             --expected-pending "$EXPECTED_PENDING" \
             --plan-manifest-sha256 "$PLAN_MANIFEST_SHA256" --plan-run-id "$PLAN_RUN_ID" \
-            --plan-manifest-path producing-plan/staging-migrate-manifest.json \
-            | tee staging-migrate-manifest.json
+            --plan-manifest-path producing-plan/production-migrate-manifest.json \
+            | tee production-migrate-manifest.json

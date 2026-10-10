@@ -13,8 +13,8 @@ import re
 import sys
 
 REPOSITORY = "TogetherWeOwn/two-bot-next"
-WORKFLOW_PATH = ".github/workflows/staging-migrate.yml"
-CLAIM_KIND = "staging-migrate-apply-claim"
+WORKFLOW_PATH = ".github/workflows/production-migrate.yml"
+CLAIM_KIND = "production-migrate-apply-claim"
 MAX_MANIFEST_BYTES = 1024 * 1024
 DECIMAL = re.compile(r"[1-9][0-9]{0,19}\Z")
 SHA40 = re.compile(r"[0-9a-f]{40}\Z")
@@ -100,8 +100,8 @@ def build_claim(manifest, env):
     require(projection_hash(manifest) == manifest.get("plan_manifest_sha256") == digest,
             "plan projection hash does not match the request")
     require(manifest.get("source_sha") == env.get("SOURCE_SHA"), "source SHA does not match the request")
-    require(manifest.get("migration_target", "staging") == "staging",
-            "manifest is not a staging plan")
+    require(manifest.get("migration_target") == "production",
+            "manifest is not a production plan")
     target = manifest.get("target")
     require(isinstance(target, dict) and set(target) == {"host", "database", "branch_id"},
             "plan target is invalid")
@@ -109,14 +109,14 @@ def build_claim(manifest, env):
             and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}", target["host"])
             and isinstance(target.get("database"), str)
             and re.fullmatch(r"[a-zA-Z0-9_.-]{1,63}", target["database"])
-            and isinstance(target.get("branch_id"), str)
-            and re.fullmatch(r"[A-Za-z0-9_-]{0,63}", target["branch_id"])
-            and all("prod" not in value.lower() for value in (target["host"], target["database"])),
-            "target is not a bare staging identity")
-    if target["host"].lower().endswith(".psdb.cloud"):
-        require(target["branch_id"] != "", "PlanetScale target must carry the pinned branch id")
-    require(target == {"host": env.get("STAGING_HOST"), "database": env.get("STAGING_DATABASE"),
-                       "branch_id": env.get("STAGING_BRANCH_ID", "")},
+            and target.get("branch_id") == ""
+            and "staging" not in target["host"].lower()
+            and "neon.tech" not in target["host"].lower()
+            and "agent-testdb" not in target["host"].lower()
+            and "-pooler" not in target["host"].lower(),
+            "target is not a bare production identity")
+    require(target == {"host": env.get("PRODUCTION_HOST"), "database": env.get("PRODUCTION_DATABASE"),
+                       "branch_id": ""},
             "plan target does not match the request")
     for key, env_key in (("recovery_evidence_ref", "RECOVERY_REF"), ("acl_plan_ref", "ACL_REF")):
         value = env.get(env_key, "")
@@ -142,7 +142,7 @@ def build_claim(manifest, env):
         "kind": CLAIM_KIND,
         "repository": REPOSITORY,
         "workflow_path": WORKFLOW_PATH,
-        "environment_name": "staging-migrate-apply",
+        "environment_name": "production-migrate-apply",
         "apply_run_id": env["GITHUB_RUN_ID"],
         "apply_run_attempt": env["GITHUB_RUN_ATTEMPT"],
         "workflow_head_sha": head,
@@ -178,7 +178,7 @@ def main():
             output.write(json.dumps(claim, indent=2) + "\n")
     except (OSError, UnicodeError, json.JSONDecodeError, Refused) as error:
         message = str(error) if isinstance(error, Refused) else "manifest or output is unavailable/invalid"
-        print(f"staging migration claim refused: {message}", file=sys.stderr)
+        print(f"production migration claim refused: {message}", file=sys.stderr)
         return 2
     return 0
 
