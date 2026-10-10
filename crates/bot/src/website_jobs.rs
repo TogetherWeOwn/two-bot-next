@@ -8,7 +8,6 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use tokio::sync::{watch, Mutex, OnceCell};
 use two_bot_core::{
-    activation::LiveCapability,
     build_community_snapshot, build_counter_reading,
     database_tls::{self, TlsPolicy},
     match_rank_roles, normalize_events, now_iso, plan_rank_heal, read_raid_windows, replace_events,
@@ -220,7 +219,7 @@ pub async fn serve(
                 // posting jobs, resolved once at boot (the token never changes
                 // at runtime). A refused identity keeps the old non-nested
                 // refusal and never grants.
-                let rank_heal = activation.permitted(LiveCapability::RankHeal);
+                let rank_heal = activation.rank_heal_permitted();
                 for (name, kind) in NAMES
                     .into_iter()
                     .zip([Kind::Counter, Kind::Rank, Kind::Events])
