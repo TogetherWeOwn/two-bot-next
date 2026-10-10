@@ -630,7 +630,13 @@ mod tests {
         let first = tokio::spawn(async move { put_rsvp(&first_pool, &going).await });
         let second_pool = pool.clone();
         let second = tokio::spawn(async move { put_rsvp(&second_pool, &interested).await });
-        let waiting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        // The queue wait is scheduling-sensitive on loaded CI runners: both
+        // spawned writers must be polled onto the advisory lock before the
+        // timeout. Attempt 1 of the PR's `rust tests` job elapsed the old 5 s
+        // budget here (`both concurrent writers queued on empty key:
+        // Elapsed(())`) with neither writer finished, so allow 30 s. The
+        // bypass panic below still catches a writer that never queues.
+        let waiting = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
                 let count: i64 = sqlx::query_scalar(
                     "SELECT COUNT(*) FROM pg_locks waiter
