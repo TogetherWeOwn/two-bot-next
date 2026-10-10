@@ -101,7 +101,11 @@ The existing pure `authorize` helper still burns an in-memory nonce synchronousl
 The receiver slice must preserve its ordering while introducing the async durable
 burn between signature/freshness and parsing/buckets; merely calling this store
 only after the entire helper is not the final receiver contract. Neither HTTP
-route nor this async seam is wired by this PR.
+route nor this async seam is wired by this PR. Re-checked at `86a6668a7`: the
+receiver has since landed — the route serves `POST /internal/actions`
+(`crates/bot/src/internal_action_http.rs:762`) and the seam runs durable burn
+(`:882`) before `authorize` (`:892`), then capability check, durable claim
+(`:959`) and execute/finish (`:971-982`).
 
 ## Crash and reconciliation semantics
 

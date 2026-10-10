@@ -13,12 +13,31 @@ a required value or an implemented consumer. Secret defaults are never rendered.
 
 - `env_only`: never dashboard-stored. Unknown names and `TWO_INTERNAL_*` fail closed.
 - `cold` / `hot`: legacy-catalog storage classes, not application promises.
-The Container startup (`crates/bot/src/main.rs`) constructs no settings
-cache/store, poller or reload consumer, so no stored (`guild_settings`)
-value is read at boot or on reload — including after a restart. A
-database-only value such as `TWO_AUTOMATIONS=1` stays disabled. Keys in
+The Container registers a `guild_settings` poll job
+(`crates/bot/src/website_jobs.rs:152`) publishing through
+`settings_jobs::live` (`crates/bot/src/settings_jobs.rs:53`), but no feature
+runtime reads that snapshot yet; direct stored reads happen only through
+per-runtime store refreshes (`raid_runtime.rs:136`,
+`containment_runtime.rs:186`, `join_risk_runtime.rs:198`) and onboarding's
+per-event refresh (`onboarding.rs:167`). Gateway feature gates still come
+from process environment only, so a database-only value such as
+`TWO_AUTOMATIONS=1` stays disabled (re-checked at `bce86a791`).
+Keys in
 legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`
 partition in `settings.rs`); every other storable key reports cold.
+
+The fourteen keys in `STORE_READ_KEYS`
+(`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”
+instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,
+`TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS` and `TWO_ANTI_NUKE_HEAT_THRESHOLD`
+(`crates/bot/src/containment_runtime.rs:61-67`, `:226`); join-risk applies
+`TWO_JOIN_RISK_THRESHOLD`, `TWO_JOIN_RISK_WINDOW_SECONDS` and
+`TWO_BULK_JOIN_WINDOW_UNTIL` (`crates/bot/src/join_risk_runtime.rs:66-70`,
+`:238`); raid applies `TWO_RAID_JOIN_THRESHOLD` and `TWO_RAID_WINDOW_SECONDS`
+(`crates/bot/src/raid_runtime.rs:45-46`, `:170`); onboarding merges its
+`CONFIG_KEYS` from the snapshot on each relevant
+event (`crates/bot/src/onboarding.rs:21-30`, `:175-182`). Every other
+storable row's stored value is unwired.
 
 Gateway boot reads process environment only, through a fixed set of loaders:
 `Config::from_env` (`DISCORD_TOKEN`, `DATABASE_URL`, `LISTEN_ADDR`, `GUILD_ID`),
@@ -28,7 +47,8 @@ Gateway boot reads process environment only, through a fixed set of loaders:
 and `intents_from_env` (`TWO_AUTOMOD`, `DISCORD_TICKET_CATEGORY_ID`,
 `DISCORD_TICKET_STAFF_ROLE_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID`), with
 `DISCORD_GATEWAY_URL` as a loopback-only test override. Rows for storable keys
-read this way say “env at boot”; every other storable row's stored value is
+read this way say “env at boot” (plus the live-refresh note where
+`STORE_READ_KEYS` applies); every remaining storable row's stored value is
 unwired, and `env_only` rows are never dashboard-stored.
 When voice is enabled, `build_production_runtime` also reads
 `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`, `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`,
@@ -82,16 +102,16 @@ Catalog entries: 122.
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
 | `CREDENTIALS_DIRECTORY` | env_only | Not specified in Next | environment only | Legacy credential-file directory; environment-only boot input. |
-| `DISCORD_ANCHOR_WELCOME_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Destination for anchor-mode welcomes. |
+| `DISCORD_ANCHOR_WELCOME_CHANNEL_ID` | hot | Not specified in Next | stored, applied live by runtime refresh | Destination for anchor-mode welcomes. |
 | `DISCORD_API_BASE` | env_only | Not specified in Next | environment only | Discord REST API origin; not dashboard-selectable. |
 | `DISCORD_AUDIT_LOG_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Discord audit mirror destination. |
 | `DISCORD_BOT_TOKEN` | env_only | Not rendered (secret) | environment only | Legacy Discord authentication token; never stored in guild settings. |
-| `DISCORD_GOODBYE_CHANNEL_IDS` | hot | Not specified in Next | stored unwired (reload-report hot) | Channels used for session-mode goodbye routing. |
+| `DISCORD_GOODBYE_CHANNEL_IDS` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Channels used for session-mode goodbye routing. |
 | `DISCORD_GUILD_ID` | env_only | Not specified in Next | environment only | Legacy managed guild identifier; distinct from Container GUILD_ID. |
-| `DISCORD_LANDING_CHANNEL_IDS` | hot | Not specified in Next | stored unwired (reload-report hot) | Onboarding landing destinations for game-picker routing. |
+| `DISCORD_LANDING_CHANNEL_IDS` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Onboarding landing destinations for game-picker routing. |
 | `DISCORD_MODERATION_LOG_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Destination for moderation logs. |
-| `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID` | hot | Not specified in Next | env at boot; stored unwired | Voice lobby offered by session onboarding. |
-| `DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Looking-to-play destination offered by session onboarding. |
+| `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID` | hot | Not specified in Next | env at boot; stored, applied live by runtime refresh | Voice lobby offered by session onboarding. |
+| `DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID` | hot | Not specified in Next | stored, applied live by runtime refresh | Looking-to-play destination offered by session onboarding. |
 | `DISCORD_STAFF_ALERT_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Destination for staff alerts. |
 | `DISCORD_STAGING_BOT_TOKEN` | env_only | Not rendered (secret) | environment only | Staging Discord authentication token; never rendered. |
 | `DISCORD_STAGING_GUILD_ID` | env_only | Not specified in Next | environment only | Staging guild boundary; no ID is embedded in the reference. |
@@ -105,12 +125,12 @@ Catalog entries: 122.
 | `TWO_ANNOUNCEMENTS` | cold | `false` | env at boot; stored unwired | Enable announcement command publication and routing. |
 | `TWO_ANTI_NUKE` | cold | Not specified in Next | stored unwired | Enable anti-nuke protection. |
 | `TWO_ANTI_NUKE_DRY_RUN` | cold | Not specified in Next | stored unwired | Observe anti-nuke decisions without executing protective writes. |
-| `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS` | hot | Not specified in Next | stored unwired | Maximum age of anti-nuke events considered for action. |
-| `TWO_ANTI_NUKE_HEAT_THRESHOLD` | hot | Not specified in Next | stored unwired | Heat threshold for anti-nuke decisions. |
+| `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS` | hot | Not specified in Next | stored, applied live by runtime refresh | Maximum age of anti-nuke events considered for action. |
+| `TWO_ANTI_NUKE_HEAT_THRESHOLD` | hot | Not specified in Next | stored, applied live by runtime refresh | Heat threshold for anti-nuke decisions. |
 | `TWO_ANTI_NUKE_PROTECTED_USER_IDS` | env_only | Not specified in Next | environment only | Accounts anti-nuke may not target; environment-only reach boundary. |
 | `TWO_ANTI_NUKE_SNAPSHOT_PATH` | env_only | Not specified in Next | environment only | Filesystem snapshot destination; never dashboard-selectable. |
 | `TWO_ANTI_NUKE_TRUSTED_USER_IDS` | env_only | Not specified in Next | environment only | Trusted accounts ignored by anti-nuke; environment-only reach boundary. |
-| `TWO_ANTI_NUKE_WINDOW_SECONDS` | hot | Not specified in Next | stored unwired | Aggregation window for anti-nuke heat. |
+| `TWO_ANTI_NUKE_WINDOW_SECONDS` | hot | Not specified in Next | stored, applied live by runtime refresh | Aggregation window for anti-nuke heat. |
 | `TWO_ASSISTANT_ENDPOINT` | env_only | Not specified in Next | environment only | Template-assistant OpenAI-compatible endpoint; environment-only destination boundary. |
 | `TWO_ASSISTANT_MODEL` | env_only | Not specified in Next | environment only | Template-assistant model name; environment-only so a web form cannot redirect it. |
 | `TWO_AUTOMATIONS` | cold | `false` | env at boot; stored unwired | Enable automation administration and custom command publication/routing. |
@@ -131,7 +151,7 @@ Catalog entries: 122.
 | `TWO_BACKUP_S3_PREFIX` | env_only | Not specified in Next | environment only | Backup object-key prefix; environment-only destination boundary. |
 | `TWO_BACKUP_S3_REGION` | env_only | Not specified in Next | environment only | Backup object-store region; environment-only destination boundary. |
 | `TWO_BACKUP_S3_SECRET_ACCESS_KEY` | env_only | Not rendered (secret) | environment only | Backup object-store secret credential; never rendered. |
-| `TWO_BULK_JOIN_WINDOW_UNTIL` | hot | Not specified in Next | stored unwired | End of the temporary bulk-join window. |
+| `TWO_BULK_JOIN_WINDOW_UNTIL` | hot | Not specified in Next | stored, applied live by runtime refresh | End of the temporary bulk-join window. |
 | `TWO_COMMUNITY_AUTOMATION_ACTOR_IDS` | hot | `[]` | stored unwired | Automation actors excluded from human community activity. |
 | `TWO_COMMUNITY_CLASSIFIER_VERSION` | hot | `"community-v1"` | stored unwired | Version label for community classification. |
 | `TWO_COMMUNITY_CORRECTION_CYCLES` | cold | `0` | stored unwired | Non-negative count of operator scorecard corrections. |
@@ -164,12 +184,12 @@ Catalog entries: 122.
 | `TWO_INTERNAL_CONTAINER` | env_only | Not specified in Next | environment only | Worker-set marker admitting a wildcard receiver bind; the container network is presumed private but unverified (TOG-16851). |
 | `TWO_INTERNAL_PORT` | env_only | Not specified in Next | environment only | Legacy split internal-action listener port; receiver configuration uses TWO_INTERNAL_BIND instead. |
 | `TWO_INTERNAL_ROLE_KEYS` | env_only | Not specified in Next | environment only | Logical role-key allowlist for internal actions. |
-| `TWO_JOIN_RISK_THRESHOLD` | hot | Not specified in Next | stored unwired | Join-risk threshold for protection decisions. |
-| `TWO_JOIN_RISK_WINDOW_SECONDS` | hot | Not specified in Next | stored unwired | Aggregation window for join-risk decisions. |
+| `TWO_JOIN_RISK_THRESHOLD` | hot | Not specified in Next | stored, applied live by runtime refresh | Join-risk threshold for protection decisions. |
+| `TWO_JOIN_RISK_WINDOW_SECONDS` | hot | Not specified in Next | stored, applied live by runtime refresh | Aggregation window for join-risk decisions. |
 | `TWO_MODERATION` | env_only | `false` | environment only | Enable moderation command publication/routing; enabled mode requires Owen ID. |
 | `TWO_MODERATION_AUDIT_SECRET` | env_only | Not rendered (secret) | environment only | Authentication secret for moderation audit handoff; never rendered. |
 | `TWO_MODERATION_PROTECTED_ROLE_IDS` | env_only | `[]` | environment only | Roles moderation may not target; environment-only reach boundary. |
-| `TWO_ONBOARDING_DRY_RUN` | hot | `false` | stored unwired | Suppress onboarding role writes, legacy/anchor welcomes and session goodbyes. |
+| `TWO_ONBOARDING_DRY_RUN` | hot | `false` | stored, applied live by runtime refresh | Suppress onboarding role writes, legacy/anchor welcomes and session goodbyes. |
 | `TWO_ONBOARDING_MODE` | env_only | `"legacy"` | environment only | Onboarding selector: legacy, session or anchor; session suppresses role writes. |
 | `TWO_ONBOARDING_ROTA_MEASUREMENT` | env_only | Not specified in Next | environment only | Dropped staging rota measurement gate; env-only refusal is retained. |
 | `TWO_ONBOARDING_ROTA_NOTICE` | env_only | Not specified in Next | environment only | Dropped staging rota notice gate; env-only refusal is retained. |
@@ -178,8 +198,8 @@ Catalog entries: 122.
 | `TWO_ONBOARDING_ROTA_READER_IDS` | env_only | Not specified in Next | environment only | Dropped staging rota reader boundary; env-only refusal is retained. |
 | `TWO_OWEN_USER_ID` | env_only | `""` | environment only | Owen bot identity, required and snowflake-validated when moderation is enabled. |
 | `TWO_PRESENCE_PROBE` | cold | Not specified in Next | stored unwired | Enable the presence-probe surface. |
-| `TWO_RAID_JOIN_THRESHOLD` | hot | Not specified in Next | stored unwired (reload-report hot) | Join count threshold for the raid watch. |
-| `TWO_RAID_WINDOW_SECONDS` | hot | Not specified in Next | stored unwired (reload-report hot) | Join aggregation window for the raid watch. |
+| `TWO_RAID_JOIN_THRESHOLD` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Join count threshold for the raid watch. |
+| `TWO_RAID_WINDOW_SECONDS` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Join aggregation window for the raid watch. |
 | `TWO_REDIRECT_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy redirect listener interface; environment-only network bind. |
 | `TWO_REDIRECT_FALLBACK_CODE` | hot | Not specified in Next | stored unwired | Fallback code for redirect routing. |
 | `TWO_REDIRECT_PORT` | env_only | Not specified in Next | environment only | Legacy redirect listener port; environment-only network bind. |

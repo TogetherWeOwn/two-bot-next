@@ -3,16 +3,18 @@
 ## Implementation and deployment boundary
 
 The container source integrates an opt-in private `POST /internal/actions`
-listener with the durable store, announcement executor, event-read, event-mutation,
-settings and moderation executors, nonce-commit authentication capability and
-strict receiver configuration. It supports `announcement.post`, the keyless
-`event.read` (behind `TWO_INTERNAL_ALLOW_EVENT_READ`), `event.upsert` and
-`event.cancel` (cancel behind `TWO_INTERNAL_ALLOW_EVENT_CANCEL`),
-`settings.get`/`settings.set` (behind `TWO_INTERNAL_ALLOW_SETTINGS`) and the
-restrictive member verbs
+listener with the durable store, announcement executor, event-read,
+event-mutation, settings, moderation and membership executors, nonce-commit
+authentication capability and strict receiver configuration. It supports
+`announcement.post`, the keyless `event.read` (behind
+`TWO_INTERNAL_ALLOW_EVENT_READ`), `event.upsert` and `event.cancel` (cancel
+behind `TWO_INTERNAL_ALLOW_EVENT_CANCEL`), `settings.get`/`settings.set`
+(behind `TWO_INTERNAL_ALLOW_SETTINGS`) and the restrictive member verbs
 `moderation.ban`, `moderation.tempban`, `moderation.kick`, `moderation.warn`
-and `moderation.timeout`, regardless of the core action catalogue's broader
-defaults. Every other verb stays refused by the per-effect fences.
+and `moderation.timeout`, and the membership pair (`role.assign` through the
+allowlisted role-key map, `guild.add_member` behind its own allowlist flag
+with a transient OAuth token), regardless of the core action catalogue's
+broader defaults. Every other verb stays refused by the per-effect fences.
 The public health/readiness/metrics router has no action route. A merged,
 deployed receiver is dark until the Operator enables it, and it is reachable
 only through the staging-only Worker ingress described in
@@ -56,6 +58,7 @@ lines, and only while `TWO_INTERNAL_ACTIONS` is exactly `1`:
 | `TWO_INTERNAL_CALLERS` | Worker secret, e.g. `web-staging:website-staging` |
 | `TWO_INTERNAL_CONTAINER` | Worker constant `1`: the Worker sets it to mark the process as running inside the container network, where the wildcard bind is reachable only via `containerFetch` and the startup port check. That network is presumed private but unverified. The marker is a deployment claim, not a proof: the bot trusts it only because the Worker (not the Operator) sets it. A wildcard bind without exactly this marker is refused. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | Worker secret, e.g. `smoke-throwaway:<channel snowflake in the TWO Staging guild>` |
+| `TWO_INTERNAL_ROLE_KEYS` | Worker secret, e.g. `member:<role snowflake in the TWO Staging guild>`; empty stages no role and every `role.assign` key refuses |
 | `TWO_INTERNAL_KEYS` | Worker secret `web-staging:<64 hex>`; never a var, never logged |
 
 Fixed receiver port: **8091** (health stays on `BOT_PORT` 8080, and the two may
@@ -76,7 +79,7 @@ Stage the secrets with `wrangler versions secret put --env staging` (a version
 that is not yet deployed), deploy that one version, then run the takeover once.
 
 1. Merge this change. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
-2. Operator stages `TWO_INTERNAL_CALLERS` and `TWO_INTERNAL_CHANNEL_KEYS` (plain values).
+2. Operator stages `TWO_INTERNAL_CALLERS`, `TWO_INTERNAL_CHANNEL_KEYS` and `TWO_INTERNAL_ROLE_KEYS` (plain values).
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
 4. Operator applies migrations `0423` (settings CAS) and `0424` (event outcome) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
 5. Rollback: stage deletion of `TWO_INTERNAL_ACTIONS` (`wrangler versions secret delete`), deploy and transfer ownership; or use the existing Worker-version rollback. The route is absent again and the next container start carries no receiver setting.
@@ -137,8 +140,9 @@ An enabled receiver requires all of these settings, without defaults:
 | `TWO_INTERNAL_KEYS` | Existing comma-separated `key-id:secret` signing specification; each secret is at least 32 bytes. At most 64 keys, with unique IDs and distinct secrets. |
 | `TWO_INTERNAL_CALLERS` | Comma-separated `key-id:caller` mappings. Exactly one entry for each signing key, no unknown entries. The caller is a stable logical identity, not a key-rotation version. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | Explicit nonempty comma-separated channel-key/Discord-ID map. Names are unique; IDs are canonical, nonzero, u64-representable snowflakes. |
+| `TWO_INTERNAL_ROLE_KEYS` | Optional comma-separated role-key/Discord-ID map, empty by default. Names are unique; IDs are canonical, nonzero, u64-representable snowflakes. An empty map refuses every `role.assign` key; a malformed entry is a boot error. |
 
-Key IDs, caller names and channel-key names are 1–128 ASCII alphanumeric,
+Key IDs, caller names, channel-key names and role-key names are 1–128 ASCII alphanumeric,
 period, underscore or hyphen characters. Multiple rotating keys may identify the
 same logical caller, but every key ID must have a distinct signing secret, even
 for that same caller. The shared parser refuses secret aliases: the key ID
@@ -222,7 +226,9 @@ unaffected. No production reconcile tool exists yet.
 The website-compatible envelopes contain `ok`, `request_id`, and either
 `result.message_id` (announcements), `result.{outcome,event_id}` (event
 upsert/cancel, with `outcome` replayed from the stored receipt, never
-re-derived) or `error.{code,message,retryable}`. Durable replay adds
+re-derived), `result.outcome` (membership: `assigned`/`already_held`,
+`added`/`already_member`) or `error.{code,message,retryable}`. Durable replay
+adds
 `Idempotent-Replay: true`; inbound bucket refusal carries `Retry-After`.
 Messages are fixed/redacted and all envelopes use `Cache-Control: no-store`.
 
@@ -241,6 +247,8 @@ Receiver tests use a module-private injected effect and guarded, migrated
 `TestDatabase` instances. They cover protocol caps and body deadlines, request
 capacity, redacted authentication failures, nonce-before-parse ordering,
 concurrent/restarted/key-rotated replay, byte mismatch, unsupported actions,
+membership happy-path/replay/refusal (allowlisted role assignment, OAuth-backed
+joins, redacted unknown-key/malformed refusals, dark add-member flag),
 cancellation/stale ownership, unknown/no-effect outcomes, unavailable stores,
 failed receipt finalization, event verb flags, malformed event bodies (including a
 101-character location), concurrent creates for one key, a gate-wait refusal before

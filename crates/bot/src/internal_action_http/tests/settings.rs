@@ -272,13 +272,21 @@ async fn settings_concurrent_save_with_stale_token_does_not_revert() {
 async fn unwired_membership_verb_stays_refused_with_settings_flag_on() {
     let Some(db) = database().await else { return };
     let _flag = SETTINGS_FLAG_LOCK.lock().await;
+    // `moderation.ban` and `guild.add_member` refuse on process-global flags
+    // owned by sibling tests; hold their locks so a parallel flag-mutating
+    // test cannot flip the verdict mid-assertion.
+    let _moderation_flag = MODERATION_FLAG_LOCK.lock().await;
+    let _add_member_flag = ADD_MEMBER_FLAG_LOCK.lock().await;
     set_settings_flag(true);
     let app = settings_app(db.pool().clone());
-    // The event union wired event.upsert/event.cancel and the moderation union
-    // wired all five moderation verbs: only a verb from another family
-    // (membership) still refuses here.
-    for raw in [r#"{"action":"role.assign","discord_id":"111111111111111111","role_key":"member"}"#]
-    {
+    // `role.assign` and `event.upsert` are wired and unconditional (Phase 1),
+    // so with the mocks they execute and no longer belong in the unwired set.
+    // `moderation.ban` and `guild.add_member` stay refused because their own
+    // allowlist flags are off (locks held above).
+    for raw in [
+        r#"{"action":"moderation.ban","discord_id":"111111111111111111","reason":"fixture reason for the ban"}"#,
+        r#"{"action":"guild.add_member","discord_id":"111111111111111111","access_token":"transient-token"}"#,
+    ] {
         let (status, _, body) =
             answer(app.clone(), signed(raw, "old", "intent-settings-unwired")).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{raw}");
