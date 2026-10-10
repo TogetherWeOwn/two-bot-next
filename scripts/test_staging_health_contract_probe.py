@@ -127,6 +127,7 @@ class HealthContractProbeTests(unittest.TestCase):
         self.assertEqual(receipt["build_revision"], "abc123")
         self.assertEqual(receipt["build_id"], "1-1")
         self.assertIsNone(receipt["gateway_failure_class"])
+        self.assertIsNone(receipt["gateway_failure_root_cause"])
         self.assertEqual([(check["check"], check["verdict"]) for check in receipt["checks"]],
                          [("health", "pass"), ("readyz", "pass"), ("build", "pass")])
 
@@ -148,19 +149,86 @@ class HealthContractProbeTests(unittest.TestCase):
         self.assert_only_failure("readyz", "truthful, not E2E approval", code, results)
         receipt = json.loads(Path(self.evidence).read_text())
         self.assertEqual(receipt["result"], "fail")
+        self.assertIsNone(receipt["gateway_failure_root_cause"])
 
-    def test_db_behind_binary_names_the_migration_signature(self):
-        lagging = dict(READY)
-        lagging["components"] = components(("process", "ready"), ("gateway", "starting"),
-                                           ("database", "ready"), ("token_invalid", "ready"))
-        lagging["gateway_failure"] = {"phase": "durable_gateway",
-                                      "class": "checkpoint_load_failed"}
+    def test_other_known_failure_keeps_the_parked_verdict_and_redaction(self):
+        parked = dict(READY)
+        parked["components"] = components(("process", "ready"), ("gateway", "down"),
+                                          ("database", "ready"), ("token_invalid", "ready"))
+        sentinel = "sensitive-fixture-detail"
+        parked["gateway_failure"] = {"phase": "durable_gateway",
+                                     "class": "gateway_runtime_failed", "detail": sentinel}
         routes = {STAGING + "/health": body({"status": "ok"}),
-                  STAGING + "/readyz": body(lagging, status=503)}
+                  STAGING + "/readyz": body(parked, status=503)}
         code, results, _ = self.drive(routes)
-        self.assert_only_failure("readyz", "db-behind-binary signature", code, results)
+        self.assert_only_failure("readyz", "truthful, not E2E approval", code, results)
         receipt = json.loads(Path(self.evidence).read_text())
+        self.assertEqual(receipt["gateway_failure_class"], "gateway_runtime_failed")
+        self.assertIsNone(receipt["gateway_failure_root_cause"])
+        self.assertNotIn(sentinel, "\n".join(results.values()))
+        self.assertNotIn(sentinel, json.dumps(receipt))
+
+    def test_checkpoint_read_failure_does_not_infer_a_root_cause(self):
+        failed_read = dict(READY)
+        failed_read["components"] = components(("process", "ready"), ("gateway", "starting"),
+                                               ("database", "ready"), ("token_invalid", "ready"))
+        failed_read["gateway_failure"] = {"phase": "durable_gateway",
+                                          "class": "checkpoint_load_failed"}
+        routes = {STAGING + "/health": body({"status": "ok"}),
+                  STAGING + "/readyz": body(failed_read, status=503)}
+        code, results, _ = self.drive(routes)
+        self.assert_only_failure("readyz", "checkpoint read failed", code, results)
+        self.assertIn("separate reviewed schema/ACL/connectivity evidence",
+                      results["FAIL readyz"])
+        receipt = json.loads(Path(self.evidence).read_text())
+        self.assertEqual(receipt["result"], "fail")
         self.assertEqual(receipt["gateway_failure_class"], "checkpoint_load_failed")
+        self.assertEqual(receipt["gateway_failure_root_cause"], "unverified")
+        self.assertEqual([(check["check"], check["verdict"]) for check in receipt["checks"]],
+                         [("health", "pass"), ("readyz", "fail"), ("build", "pass")])
+        for text in ("\n".join(results.values()), json.dumps(receipt)):
+            self.assertNotIn("db-behind-binary", text)
+            self.assertNotIn("migration-lag", text)
+            self.assertNotIn("migrate before", text)
+        self.assertEqual(self.requested, [STAGING + "/health", STAGING + "/readyz"])
+
+    def test_checkpoint_failure_drops_unreviewed_cause_and_details(self):
+        failed_read = dict(READY)
+        failed_read["components"] = components(("process", "ready"), ("gateway", "down"),
+                                               ("database", "ready"), ("token_invalid", "ready"))
+        sentinel = "sensitive-fixture-detail"
+        for claimed_cause in ("schema", "acl", "connectivity"):
+            with self.subTest(claimed_cause=claimed_cause):
+                failed_read["gateway_failure"] = {
+                    "phase": "durable_gateway", "class": "checkpoint_load_failed",
+                    "root_cause": claimed_cause, "detail": sentinel,
+                }
+                routes = {STAGING + "/health": body({"status": "ok"}),
+                          STAGING + "/readyz": body(failed_read, status=503)}
+                code, results, _ = self.drive(routes)
+                self.assert_only_failure("readyz", "checkpoint read failed", code, results)
+                receipt = json.loads(Path(self.evidence).read_text())
+                self.assertEqual(receipt["gateway_failure_root_cause"], "unverified")
+                self.assertNotIn(sentinel, "\n".join(results.values()))
+                self.assertNotIn(sentinel, json.dumps(receipt))
+
+    def test_unknown_failure_class_refuses_without_echoing_details(self):
+        unknown = dict(READY)
+        unknown["components"] = components(("process", "ready"), ("gateway", "down"),
+                                           ("database", "ready"), ("token_invalid", "ready"))
+        sentinel = "sensitive-fixture-detail"
+        unknown["gateway_failure"] = {"phase": "durable_gateway", "class": sentinel,
+                                      "detail": sentinel}
+        routes = {STAGING + "/health": body({"status": "ok"}),
+                  STAGING + "/readyz": body(unknown, status=503)}
+        code, results, _ = self.drive(routes)
+        self.assert_readyz_unreadable("outside the fixed vocabulary", code, results)
+        receipt = json.loads(Path(self.evidence).read_text())
+        self.assertEqual(receipt["result"], "fail")
+        self.assertIsNone(receipt["gateway_failure_class"])
+        self.assertIsNone(receipt["gateway_failure_root_cause"])
+        self.assertNotIn(sentinel, "\n".join(results.values()))
+        self.assertNotIn(sentinel, json.dumps(receipt))
 
     def test_readyz_200_with_down_component_contradicts_the_breakdown(self):
         lying = dict(READY)
@@ -170,6 +238,45 @@ class HealthContractProbeTests(unittest.TestCase):
                   STAGING + "/readyz": body(lying, status=200)}
         code, results, _ = self.drive(routes)
         self.assert_only_failure("readyz", "contradicts the component breakdown", code, results)
+
+    def test_contradictory_checkpoint_class_does_not_classify_a_failed_read(self):
+        for status, gateway, expected in ((200, "down", 503), (503, "ready", 200)):
+            with self.subTest(status=status, gateway=gateway):
+                contradictory = dict(READY)
+                contradictory["components"] = components(
+                    ("process", "ready"), ("gateway", gateway),
+                    ("database", "ready"), ("token_invalid", "ready"))
+                contradictory["gateway_failure"] = {
+                    "phase": "durable_gateway", "class": "checkpoint_load_failed",
+                    "root_cause": "schema", "detail": "sensitive-fixture-detail",
+                }
+                routes = {STAGING + "/health": body({"status": "ok"}),
+                          STAGING + "/readyz": body(contradictory, status=status)}
+                code, results, _ = self.drive(routes)
+                self.assert_only_failure(
+                    "readyz", f"contradicts the component breakdown (expected {expected})",
+                    code, results)
+                receipt = json.loads(Path(self.evidence).read_text())
+                self.assertEqual(receipt["result"], "fail")
+                self.assertEqual(receipt["gateway_failure_class"], "checkpoint_load_failed")
+                self.assertIsNone(receipt["gateway_failure_root_cause"])
+                for text in ("\n".join(results.values()), json.dumps(receipt)):
+                    self.assertNotIn("checkpoint read failed", text)
+                    self.assertNotIn("root cause unverified", text)
+                    self.assertNotIn("sensitive-fixture-detail", text)
+
+    def test_ready_checkpoint_class_does_not_classify_a_failed_read(self):
+        ready = dict(READY, gateway_failure={"phase": "durable_gateway",
+                                            "class": "checkpoint_load_failed"})
+        routes = {STAGING + "/health": body({"status": "ok"}),
+                  STAGING + "/readyz": body(ready)}
+        code, results, _ = self.drive(routes)
+        self.assertEqual(code, 0)
+        self.assertEqual(set(results), {"PASS health", "PASS readyz", "PASS build"})
+        receipt = json.loads(Path(self.evidence).read_text())
+        self.assertEqual(receipt["result"], "pass")
+        self.assertEqual(receipt["gateway_failure_class"], "checkpoint_load_failed")
+        self.assertIsNone(receipt["gateway_failure_root_cause"])
 
     def test_ownership_refusal_is_not_the_bot_breakdown(self):
         routes = {STAGING + "/health": body({"status": "ok"}),
