@@ -170,7 +170,8 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   watermark/classifier changed or the completion write was lost. A successfully
   persisted incomplete scorecard is terminal, not a transient failure.
   Before scoring, mark honest stream coverage for the captured streams only
-  (`CAPTURED_STREAMS`, today `event_attended`, `message_created`,
+  (`CAPTURED_STREAMS`, today all six streams: `event_attended`,
+  `voice_session_started`, `voice_session_ended`, `message_created`,
   `rules_accepted` and `member_joined`) from capture start through
   the closed week end; a mid-week start fails closed (`INGESTION_INCOMPLETE`,
   human numerators null). A Monday boot cannot claim closed-week coverage:
@@ -181,8 +182,16 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   `run_sweep`. Never DM, ping, or message from this outcome — any outbound
   contact needs CEO sign-off first.
 - Implement fact writes on the gateway handlers through the `FactsSink` seam,
-  classifying via `classify`. The `message_created` writer is live
+  classifying via `classify`. The voice writers are live
   (`DeferredCommunityFacts`, armed only when `TWO_COMMUNITY_SCORECARD=1`):
+  voice join/leave/move frames land via `voice_started_fact` /
+  `voice_ended_fact` + `record_fact`, keyed `voice-start:{session_key}` /
+  `voice-end:{session_key}` so duplicate delivery returns `false`; a move
+  stays one atomic end+start pair on the per-member chain and
+  mute/deafen/camera-only frames (no channel change) write nothing. End rows
+  carry `sessionKey`, `startedAt`, `durationSeconds`, `startKnown`; an end
+  without a seen start records `startKnown:false` with nulls, never a
+  fabricated start. The `message_created` writer is live on the same seam:
   gateway `MessageCreate` events land via `message_fact` + `record_fact`,
   keyed `discord-message:{message_id}` so duplicate delivery returns `false`;
   DMs never reach the sink (dropped in the pipeline) and bots, webhooks and
