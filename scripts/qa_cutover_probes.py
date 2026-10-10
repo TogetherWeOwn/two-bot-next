@@ -27,7 +27,17 @@ Probes and the code path each one checks:
                    Source: crates/bot/src/gateway.rs GatewayState::status,
                    crates/bot/src/server.rs readiness_after_ping.
   jobs-map         /readyz carries the informational jobs map (each entry
-                   with boolean parked/running). Jobs never flip readiness.
+                   with boolean parked/running). Jobs never flip readiness,
+                   but when the service reports ready (200) or --expect-ready
+                   is set, every unparked job with a known code-constant
+                   cadence must show a recent last_success: a job older than
+                   its max_last_success_age_seconds (2x cadence + timeout)
+                   fails and is named; a job with no success but failed
+                   attempts (consecutive_failures > 0, or a last_start older
+                   than the fail line) fails and is named. While degraded
+                   without --expect-ready the jobs map stays informational so
+                   a truthful parked 503 stays green. feeds is ungraded (its
+                   cadence is env-configured), as is any unknown job name.
                    Source: crates/bot/src/jobs.rs statuses,
                    crates/bot/src/server.rs failing_jobs test.
   fence-watch      the /readyz body is the container's breakdown, never a
@@ -36,9 +46,11 @@ Probes and the code path each one checks:
                    Source: wrangler/src/ownership.ts, wrangler/src/index.ts.
 
 A parked preview (503, gateway down, database down) is a PASS: the probe
-grades truthfulness, not service readiness. Pass --expect-ready when the
-cutover gate needs the service itself ready (200, gateway ready); then a
-parked-but-truthful server fails gateway-state.
+grades truthfulness, not service readiness, and the jobs map is not graded
+for freshness while degraded. Pass --expect-ready when the cutover gate
+needs the service itself ready (200, gateway ready); then a
+parked-but-truthful server fails gateway-state and stale/failing jobs fail
+jobs-map.
 
 Usage:
   python3 scripts/qa_cutover_probes.py --base-url URL [--expect-ready]
@@ -63,6 +75,60 @@ DEFAULT_TIMEOUT_SECONDS = 10
 USER_AGENT = "two-bot-next-staging-rollout/1.0"
 KNOWN_STATUSES = ("ready", "starting", "down")
 REQUIRED_COMPONENTS = ("process", "gateway")
+# Per-job last_success freshness bands, in seconds, derived from the jobs'
+# real cadences plus their per-attempt timeouts (a healthy sample's age runs
+# up to about one cadence plus runtime; last_success only advances on success,
+# crates/bot/src/jobs.rs record_completion). Warn is ~1x cadence + timeout
+# (one missed cycle is suspicious); max is ~2x cadence + timeout (two missed
+# cycles proves stuck, not jittered):
+#   counter: 60s cadence (LIVE_COUNTER_INTERVAL_MS, community_snapshots.rs:45)
+#     + 45s timeout (website_jobs.rs) -> warn 105, max 165
+#   member_unban_sweep: 30s cadence (UNBAN_SWEEP_INTERVAL_SECONDS,
+#     member_moderation.rs:69) + 180s timeout (SWEEP_TIMEOUT,
+#     member_runtime.rs:57) -> warn 210, max 240
+#   scheduled_messages: 15s cadence (SCHEDULER_TICK_MS, scheduled.rs:49)
+#     + 120s timeout (scheduled_jobs.rs) -> warn 135, max 150
+#   settings: 15s cadence (POLL_SECONDS, settings.rs:47) + 10s timeout
+#     (TIMEOUT, settings_jobs.rs:41) -> warn 25, max 40
+#   rank / scheduled_events: 600s cadence (RANK_SNAPSHOT_INTERVAL_MS,
+#     community_snapshots.rs:47; SCHEDULED_EVENTS_INTERVAL_MS,
+#     scheduled_events.rs:26) + 120s timeout (website_jobs.rs) ->
+#     warn 720, max 1320
+#   inactivity / presence_probe: 3600s cadence (INACTIVITY_SWEEP_INTERVAL_MS,
+#     inactivity.rs:27; PRESENCE_PROBE_INTERVAL_MS, presence.rs:36) + 120s
+#     timeout (community_jobs.rs) -> warn 3720, max 7320
+# feeds is deliberately ungraded: its cadence is env-configured
+# (TWO_FEED_POLL_SECONDS, default 300, validated 60-86400,
+# feature_commands.rs:337-359; 120s JOB_TIMEOUT, feed_jobs.rs:41), so the
+# probe cannot know the configured value and must not grade it.
+JOB_CADENCE_SECONDS = {
+    "counter": 60,
+    "member_unban_sweep": 30,
+    "scheduled_messages": 15,
+    "settings": 15,
+    "rank": 600,
+    "scheduled_events": 600,
+    "inactivity": 3600,
+    "presence_probe": 3600,
+}
+JOB_TIMEOUT_SECONDS = {
+    "counter": 45,
+    "member_unban_sweep": 180,
+    "scheduled_messages": 120,
+    "settings": 10,
+    "rank": 120,
+    "scheduled_events": 120,
+    "inactivity": 120,
+    "presence_probe": 120,
+}
+WARN_LAST_SUCCESS_AGE_SECONDS = {
+    name: JOB_CADENCE_SECONDS[name] + JOB_TIMEOUT_SECONDS[name]
+    for name in JOB_CADENCE_SECONDS
+}
+MAX_LAST_SUCCESS_AGE_SECONDS = {
+    name: 2 * JOB_CADENCE_SECONDS[name] + JOB_TIMEOUT_SECONDS[name]
+    for name in JOB_CADENCE_SECONDS
+}
 
 
 class ProbeError(Exception):
@@ -196,7 +262,36 @@ def check_gateway(state, status, expect_ready):
     raise ProbeError(f"gateway {gateway!r} disagrees with HTTP {status}")
 
 
-def check_jobs(report):
+def _field_age_seconds(entry, field, now_ms):
+    """Seconds since the entry's field, or None when absent/non-numeric.
+
+    A timestamp ahead of this clock clamps to 0, never negative.
+    """
+    last = entry.get(field)
+    if isinstance(last, bool) or not isinstance(last, (int, float)):
+        return None
+    return max(0, int(now_ms - last) // 1000)
+
+
+def job_age_seconds(entry, now_ms):
+    """Seconds since the entry's last_success, or None when unassessable.
+
+    None covers a job with no recorded success, an absent field, or a
+    non-numeric value from an older build. Whether that is evidence of stuck
+    is decided by check_jobs via consecutive_failures/last_start, not here.
+    """
+    return _field_age_seconds(entry, "last_success", now_ms)
+
+
+def consecutive_failures(entry):
+    """Non-negative failure count, tolerating absent/malformed values."""
+    failures = entry.get("consecutive_failures")
+    if isinstance(failures, bool) or not isinstance(failures, (int, float)):
+        return 0
+    return max(0, int(failures))
+
+
+def check_jobs(report, now_ms=None, enforce_freshness=True):
     jobs = report.get("jobs")
     if not isinstance(jobs, dict) or not jobs:
         raise ProbeError("/readyz carries no informational jobs map")
@@ -207,7 +302,71 @@ def check_jobs(report):
     if bad:
         shown = ", ".join(sorted(bad)[:3]) + ("..." if len(bad) > 3 else "")
         raise ProbeError(f"/readyz jobs map has malformed entries: {shown}")
-    return f"{len(jobs)} jobs reported (informational; never gates readiness)"
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    parked_while_degraded = sum(1 for entry in jobs.values()
+                                if entry.get("parked"))
+    if not enforce_freshness:
+        # Degraded without --expect-ready: the probe grades truthfulness, not
+        # scheduler progress, so a truthful parked 503 stays green.
+        return (f"{len(jobs)} jobs reported while degraded: freshness not "
+                f"graded ({parked_while_degraded} parked; informational, "
+                f"never gates readiness)")
+    stale, warns = [], []
+    parked, fresh, not_yet = 0, 0, 0
+    ungraded = []
+    for name in sorted(jobs):
+        entry = jobs[name]
+        if entry.get("parked"):
+            parked += 1
+            continue
+        limit = MAX_LAST_SUCCESS_AGE_SECONDS.get(name)
+        if limit is None:
+            # feeds (env-configured cadence) or a newer build's unknown job:
+            # not ours to grade, and never counted as verified fresh.
+            ungraded.append(name)
+            continue
+        age = job_age_seconds(entry, now_ms)
+        if age is None:
+            # No success recorded yet. A fresh boot (no attempts yet) is not
+            # evidence of stuck, but attempts that all failed are: a failed
+            # attempt leaves last_success unchanged (jobs.rs), and cutover
+            # runs right after a deploy, exactly when last_success is null.
+            failures = consecutive_failures(entry)
+            if failures > 0:
+                detail = f"{name}=no-success {failures} consecutive failures"
+                error = entry.get("last_error_class")
+                if isinstance(error, str) and error:
+                    detail += f" (last error {error})"
+                stale.append(detail)
+                continue
+            started = _field_age_seconds(entry, "last_start", now_ms)
+            if started is not None and started > limit:
+                stale.append(f"{name}=last_start {started}s ago with no "
+                             f"success (>{limit}s)")
+                continue
+            not_yet += 1
+            continue  # never ran yet; not evidence of stuck
+        if age > limit:
+            stale.append(f"{name}={age}s > {limit}s")
+        else:
+            fresh += 1
+            if age > WARN_LAST_SUCCESS_AGE_SECONDS[name]:
+                warns.append(f"{name}={age}s")
+    if stale:
+        shown = ", ".join(stale)
+        raise ProbeError(f"stale jobs past max_last_success_age_seconds or "
+                         f"failing with no success: {shown}")
+    parts = [f"{fresh} jobs fresh within cadence"]
+    if ungraded:
+        parts.append(f"{len(ungraded)} ungraded ({', '.join(sorted(ungraded))})")
+    if not_yet:
+        parts.append(f"{not_yet} not yet run")
+    parts.append(f"{parked} parked")
+    reason = ", ".join(parts) + " (informational; never gates readiness)"
+    if warns:
+        reason += f" [warn: {', '.join(warns)}]"
+    return reason
 
 
 def run(args, fetch_fn=None):
@@ -262,7 +421,9 @@ def run(args, fetch_fn=None):
                           f"{SRC_SERVER}, {SRC_HEALTH}"))
     record("gateway-state", SRC_GATEWAY, check_gateway, state,
            readyz_status, args.expect_ready)
-    record("jobs-map", SRC_JOBS, check_jobs, report)
+    enforce = readyz_status == 200 or bool(args.expect_ready)
+    record("jobs-map", SRC_JOBS,
+           lambda rep: check_jobs(rep, enforce_freshness=enforce), report)
     if isinstance(report, dict) and report.get("error"):
         results.append(Result("fence-watch", False,
                               f"container breakdown carries error {report.get('error')!r:.40}",

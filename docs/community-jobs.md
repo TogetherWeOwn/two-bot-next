@@ -55,12 +55,16 @@ cutover migrations, `web_v1` and the reviewed role plan before runtime starts;
 jobs never execute migration/view DDL using the DML-only runtime credential.
 Admission refusal sends no HTTP. Initialization errors are retried on the next attempt, never
 logged with a database URL. Guild members are fully paginated; rank-role names
-come from the guild object's `roles` array. Domain/store semantics are unchanged:
+come from the guild object's `roles` array. Domain/store semantics are unchanged
+except for the rank self-heal below, the one tick that writes to Discord:
 
 - Counter and rank ticks publish nothing when historical raid windows cannot
   be grounded in imported funnel history. A deliberate skip is a successful
   attempt, not evidence that a fresh snapshot was written.
-- Missing/ambiguous ladder roles or nonnested ranks refuse rank publication.
+- Missing/ambiguous ladder roles refuse rank publication. Non-nested ranks
+  self-heal when the live-identity fence permits the `rank_heal` capability:
+  the tick grants the missing lower rungs (bounded, hierarchy-fenced, with an
+  audit reason) and republishes; a refused identity keeps the old refusal.
 - Failed or malformed scheduled-event reads keep the previous mirror. Only a
   valid empty event array clears it.
 

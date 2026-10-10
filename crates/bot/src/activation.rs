@@ -58,6 +58,16 @@ impl BootActivation {
         )
     }
 
+    /// Rank-ladder self-heal fence: the rank tick is the only website job with
+    /// a Discord write path, so it heals only under a staging identity. Live
+    /// denial is the default until the cleared allowlist is reviewed and
+    /// widened. The rank tick calls this at boot; keep the capability choice
+    /// here so a widened clearance cannot slip past the tick tests.
+    #[must_use]
+    pub(crate) fn rank_heal_permitted(&self) -> bool {
+        self.permitted(LiveCapability::RankHeal)
+    }
+
     #[must_use]
     pub(crate) fn application_id(&self) -> Option<u64> {
         self.application_id.as_deref()?.parse().ok()
@@ -188,6 +198,23 @@ mod tests {
             assert_eq!(
                 live().permitted(capability),
                 capability == LiveCapability::SelfRoles
+            );
+        }
+    }
+
+    #[test]
+    fn rank_heal_is_staging_only() {
+        // The rank tick calls `rank_heal_permitted` once at boot: staging
+        // heals, and every other identity keeps the non-nested refusal with
+        // no role grants. Pinning the helper (not just the generic fence)
+        // fails if the capability choice widens; the boot call site stays a
+        // one-line delegation to this helper.
+        assert!(staging().rank_heal_permitted());
+        assert!(!live().rank_heal_permitted());
+        for (label, activation) in refused() {
+            assert!(
+                !activation.rank_heal_permitted(),
+                "{label} must not heal rank ladders"
             );
         }
     }

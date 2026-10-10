@@ -10293,3 +10293,17 @@ fn creator_status_templates_come_from_the_configuration() {
         Some("@@num@@ here")
     );
 }
+
+#[test]
+fn empty_grace_config_accepts_zero_to_ten_minutes_and_refuses_garbage() {
+    assert_eq!(configured_empty_grace(None), Ok(EMPTY_ROOM_GRACE));
+    assert_eq!(configured_empty_grace(Some(" ")), Ok(EMPTY_ROOM_GRACE));
+    assert_eq!(configured_empty_grace(Some("0")), Ok(Duration::ZERO));
+    assert_eq!(
+        configured_empty_grace(Some("600")),
+        Ok(Duration::from_secs(600))
+    );
+    assert_eq!(configured_empty_grace(Some("601")), Err(InvalidEmptyGrace));
+    assert_eq!(configured_empty_grace(Some("-1")), Err(InvalidEmptyGrace));
+    assert_eq!(configured_empty_grace(Some("1m")), Err(InvalidEmptyGrace));
+}
