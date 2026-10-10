@@ -763,9 +763,8 @@ async fn community_ticks_write_rows_and_stay_gated() {
     .unwrap();
     assert_eq!(rows, vec![(42, Some(2)), (43, None)]);
 
-    // Monday 06:15 UTC: four stream heartbeats (the captured
-    // `event_attended`, `message_created`, `rules_accepted` and
-    // `member_joined` streams are marked) then one run row. Completion
+    // Monday 06:15 UTC: six stream heartbeats (all captured streams are
+    // marked) then one run row. Completion
     // suppresses later ticks, including with a fresh process State.
     let monday = parse_iso_millis("2026-09-28T06:15:00.000Z").unwrap();
     run_once(Kind::Scorecard, &pool, &rest, guild, &state, monday)
@@ -805,7 +804,7 @@ async fn community_ticks_write_rows_and_stay_gated() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(beats, 4, "coverage marked only for the captured streams");
+    assert_eq!(beats, 6, "coverage marked only for the captured streams");
     run_once(
         Kind::Scorecard,
         &pool,
@@ -876,12 +875,11 @@ async fn community_ticks_write_rows_and_stay_gated() {
         .expect("drop disposable test database");
 }
 
-/// Only streams with a live writer are marked: one Monday tick with
-/// `event_attended`, `message_created`, `rules_accepted` and `member_joined`
-/// captured leaves four heartbeats, and the run fails closed — `incomplete`,
-/// never `complete` — naming the two uncaptured voice streams. Under
-/// production defaults the degraded run records one `INGESTION_INCOMPLETE`
-/// alert, and the retry tick does not duplicate it.
+/// Only streams with a live writer are marked: one Monday tick with all six
+/// streams captured leaves six heartbeats, and the run completes —
+/// `complete`, never `incomplete` — with no missing-stream errors. Under
+/// production defaults the complete run records no alert (insufficient
+/// evidence never notifies), and the retry tick does not duplicate the run.
 #[tokio::test]
 #[ignore = "needs a disposable test database; routed to a check.yml step"]
 async fn scorecard_marks_only_captured_streams() {
@@ -937,7 +935,9 @@ async fn scorecard_marks_only_captured_streams() {
             "event_attended",
             "member_joined",
             "message_created",
-            "rules_accepted"
+            "rules_accepted",
+            "voice_session_ended",
+            "voice_session_started"
         ]
     );
     let runs: i64 =
@@ -946,7 +946,7 @@ async fn scorecard_marks_only_captured_streams() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(runs, 1, "one degraded run across the retry tick");
+    assert_eq!(runs, 1, "one complete run across the retry tick");
     let (coverage_state, scorecard_json): (String, String) = sqlx::query_as(
         "SELECT coverage_state, scorecard_json FROM community_scorecard_runs WHERE guild_id=$1",
     )
@@ -954,26 +954,24 @@ async fn scorecard_marks_only_captured_streams() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(coverage_state, "incomplete");
+    assert_eq!(coverage_state, "complete");
     let scorecard: Value = serde_json::from_str(&scorecard_json).expect("valid JSON");
-    assert_eq!(scorecard["coverageState"], "incomplete");
-    assert!(scorecard["weeklyActiveHumans"].is_null());
+    assert_eq!(scorecard["coverageState"], "complete");
+    assert_eq!(scorecard["weeklyActiveHumans"], serde_json::json!(0));
     let errors = scorecard["ingestionErrors"]
         .as_array()
         .expect("ingestion errors array");
-    for stream in ["voice_session_started", "voice_session_ended"] {
-        assert!(
-            errors
-                .iter()
-                .any(|e| e == &json!(format!("missing_stream_coverage:{stream}"))),
-            "uncaptured {stream} is named"
-        );
-    }
+    assert!(
+        errors.is_empty(),
+        "all six streams captured, no missing-stream errors: {errors:?}"
+    );
     for stream in [
         "event_attended",
         "message_created",
         "rules_accepted",
         "member_joined",
+        "voice_session_started",
+        "voice_session_ended",
     ] {
         assert!(
             !errors
@@ -982,18 +980,19 @@ async fn scorecard_marks_only_captured_streams() {
             "the captured {stream} stream is not flagged"
         );
     }
-    assert_eq!(scorecard["intervention"]["code"], "INGESTION_INCOMPLETE");
+    assert_eq!(
+        scorecard["intervention"]["code"],
+        "none_insufficient_evidence"
+    );
     let alert_keys: Vec<String> =
         sqlx::query_scalar("SELECT alert_key FROM community_scorecard_alerts WHERE guild_id=$1")
             .bind(guild)
             .fetch_all(&pool)
             .await
             .unwrap();
-    let week = &scorecard["weekStart"].as_str().expect("week start")[..10];
-    assert_eq!(
-        alert_keys,
-        [format!("INGESTION_INCOMPLETE:{week}:contract")],
-        "one deduplicated alert across the retry tick"
+    assert!(
+        alert_keys.is_empty(),
+        "insufficient-evidence never notifies: {alert_keys:?}"
     );
 
     mock.shutdown().await;
