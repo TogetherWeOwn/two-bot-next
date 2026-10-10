@@ -108,7 +108,11 @@ Dispatch-lane saturation (TOG-19878) follows the same shed-meter shape: every
 attempted lane, while the `warn!` samples the first drop per 60 s per runtime.
 A burst is O(1) log lines with N counter increments. The six lane labels are
 class steady and never shed; growth means a lane is undersized or a burst
-needs the M2.1 alert rule, not a new label.
+needs the M2.1 alert rule, not a new label. The `reactions` lane additionally
+counts per-member fairness refusals (member at `PER_USER_IN_FLIGHT` slots with
+free lane slots), so `reactions` growth points at a hot member before an
+undersized lane; the M2.1 alert rule should treat `reactions` drops as
+member-hot until lane saturation is confirmed.
 
 Subscription facts that bound the top of the funnel: the bot never requests
 `GUILD_PRESENCES`, so presence arrives only through the hourly
