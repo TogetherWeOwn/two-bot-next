@@ -167,7 +167,7 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   persisted incomplete scorecard is terminal, not a transient failure.
   Before scoring, mark honest stream coverage for the captured streams only
   (`CAPTURED_STREAMS`, today `event_attended`, `voice_session_started`,
-  `voice_session_ended` and `message_created`) from capture start through
+  `voice_session_ended`, `message_created` and `rules_accepted`) from capture start through
   the closed week end; a mid-week start fails closed (`INGESTION_INCOMPLETE`,
   human numerators null). A Monday boot cannot claim closed-week coverage:
   leave missing heartbeats missing rather than inserting an inverted interval.
@@ -190,9 +190,14 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   gateway `MessageCreate` events land via `message_fact` + `record_fact`,
   keyed `discord-message:{message_id}` so duplicate delivery returns `false`;
   DMs never reach the sink (dropped in the pipeline) and bots, webhooks and
-  staff automation are captured but never funnel-counted. Keep `TWO_COMMUNITY_SCORECARD` off by default
-  and `TWO_PRESENCE_PROBE` on (legacy default); restrict enabling to staging.
-  No production guild or token was used to verify this slice.
+  staff automation are captured but never funnel-counted. The
+  `rules_accepted` writer shares the same sink: gate-clearings buffer raw and
+  drain through `rules_accepted_fact` + `record_fact` on the serial worker,
+  keyed `rules-accepted:{guild}:{member}` so repeat clears return `false`; a
+  failed drain only warns and the scorecard fails closed on the missing fact.
+  Keep `TWO_COMMUNITY_SCORECARD` off by default and `TWO_PRESENCE_PROBE` on
+  (legacy default); restrict enabling to staging. No production guild or
+  token was used to verify this slice.
 - The presence series is never published: no `web_v1` view may read
   `presence_probe`. The only reader is an operator trend report over
   `read_series` + `evaluate_trigger`.

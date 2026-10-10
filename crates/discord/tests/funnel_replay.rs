@@ -45,7 +45,8 @@ use two_bot_core::{
     VoiceEndedFact, VoiceInput, VoiceStartedFact, WEB_ONE_CLICK_SOURCE,
 };
 use two_bot_discord::{
-    JoinObservation, JoinObserver, MemPipeline, NoClassification, Pipeline, ScriptedInvites,
+    DeferredCommunityFacts, JoinObservation, JoinObserver, MemPipeline, NoClassification, Pipeline,
+    ScriptedInvites,
 };
 
 const GUILD: u64 = 100_000_000_000_000_001;
@@ -660,6 +661,132 @@ fn pipeline_gate_clear_on_pending_flip() {
         before,
         "non-transition update writes no funnel row"
     );
+}
+
+fn rules_pipeline() -> (
+    Pipeline<
+        two_bot_core::MemStore,
+        two_bot_core::NoopLeveling,
+        DeferredCommunityFacts,
+        ScriptedInvites,
+        NoClassification,
+    >,
+    DeferredCommunityFacts,
+) {
+    let buffer = DeferredCommunityFacts::new();
+    let pipeline = Pipeline::new(
+        two_bot_core::MemStore::new(),
+        Some(two_bot_core::NoopLeveling),
+        Some(buffer.clone()),
+        ScriptedInvites::new(),
+        NoClassification,
+    );
+    (pipeline, buffer)
+}
+
+fn member_update(member_id: u64, pending: bool, joined: &str, nick: Option<&str>) -> Event {
+    Event::MemberUpdate(Box::new(MemberUpdate {
+        avatar: None,
+        communication_disabled_until: None,
+        guild_id: Id::new(GUILD),
+        flags: None,
+        deaf: None,
+        joined_at: Some(ts(joined)),
+        mute: None,
+        nick: nick.map(str::to_owned),
+        pending,
+        premium_since: None,
+        roles: vec![],
+        user: user(member_id, false),
+    }))
+}
+
+/// Gate-clear buffers exactly one rules fact per member: the pending flip
+/// captures on the receipt stamp, and a burst of later updates adds nothing.
+#[test]
+fn pipeline_gate_clear_buffers_one_rules_fact_per_member() {
+    let (pipeline, buffer) = rules_pipeline();
+    let observed_at = stamp("12:35:00");
+
+    // Pending arrival buffers nothing.
+    pipeline.handle_at(&join_event(B, true, "12:30:00"), &observed_at);
+    assert!(buffer.is_empty());
+
+    // Pending true→false buffers one fact on the receipt stamp.
+    pipeline.handle_at(&member_update(B, false, "12:30:00", None), &observed_at);
+    assert_eq!(buffer.len(), 1);
+    let write = buffer.take().pop().expect("one buffered fact");
+    assert_eq!((write.guild_id, write.member_id), (GUILD, B));
+    assert!(!write.is_bot);
+    assert_eq!(write.occurred_at, observed_at);
+    assert_eq!(write.source, "gateway");
+    assert_eq!(write.source_event_id, format!("{GUILD}:{B}:rules"));
+
+    // A burst of non-transition updates buffers nothing more, and the funnel
+    // holds exactly one gate row for the member.
+    for nick in ["al", "bo"] {
+        pipeline.handle_at(
+            &member_update(B, false, "12:30:00", Some(nick)),
+            &observed_at,
+        );
+    }
+    assert!(buffer.is_empty());
+    assert_eq!(
+        pipeline
+            .handlers()
+            .store()
+            .rows()
+            .iter()
+            .filter(
+                |r| r.event_type == two_bot_core::EventType::GateCleared && r.member_id == Some(B)
+            )
+            .count(),
+        1,
+        "burst writes one funnel row"
+    );
+}
+
+/// The fastest members arrive with the gate already cleared: the fact carries
+/// Discord's `joined_at`, not the receipt time. Bots buffer too (captured,
+/// never funnel-counted).
+#[test]
+fn pipeline_instant_gate_clear_buffers_rules_fact_on_join_stamp() {
+    let (pipeline, buffer) = rules_pipeline();
+    let observed_at = stamp("12:10:00");
+    pipeline.handle_at(&join_event(A, false, "12:00:00"), &observed_at);
+    let mut bot_join = join_event(BOT, false, "12:00:30");
+    if let Event::MemberAdd(ref mut add) = bot_join {
+        add.member.user.bot = true;
+    }
+    pipeline.handle_at(&bot_join, &observed_at);
+
+    let writes = buffer.take();
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0].occurred_at, stamp("12:00:00"));
+    assert_eq!(writes[0].source, "gateway");
+    assert!(!writes[0].is_bot);
+    assert_eq!((writes[1].member_id, writes[1].is_bot), (BOT, true));
+    assert!(
+        pipeline
+            .handlers()
+            .store()
+            .rows()
+            .iter()
+            .all(|r| r.member_id != Some(BOT)),
+        "bots write no funnel rows"
+    );
+}
+
+/// A cleared member seen for the first time (no cache entry, never joined)
+/// still clears: the missing pre-update flag reads as pending.
+#[test]
+fn pipeline_first_sighting_of_cleared_member_buffers_rules_fact() {
+    let (pipeline, buffer) = rules_pipeline();
+    pipeline.handle_at(
+        &member_update(C, false, "12:30:00", None),
+        &stamp("12:35:00"),
+    );
+    assert_eq!(buffer.len(), 1);
 }
 
 #[test]

@@ -8,7 +8,7 @@ default-members = [".", "crates/core", "crates/discord", "crates/bot", "crates/c
 # library exposes release metadata; it is not a crates.io distribution.
 [package]
 name = "two-bot-next"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

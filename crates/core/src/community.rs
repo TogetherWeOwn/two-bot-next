@@ -44,16 +44,18 @@ pub const COMMUNITY_FACT_TYPES: [&str; 6] = [
 /// `rsvp_store::record_checkin`), `voice_session_started` /
 /// `voice_session_ended` (gateway voice frames via
 /// `community_store::record_voice_started_fact` /
-/// `community_store::record_voice_ended_fact`) and `message_created`
-/// (gateway `MessageCreate` via `community_store::record_message_fact`);
-/// join and rules capture land in later slices, one per stream. This must
+/// `community_store::record_voice_ended_fact`), `message_created`
+/// (gateway `MessageCreate` via `community_store::record_message_fact`) and
+/// `rules_accepted` (gate-clear drain via the community-facts sink); join
+/// capture lands in a later slice. This must
 /// always equal the `Some` rows of [`STREAM_WRITERS`]; the
 /// `captured_streams_match_live_writers` guard fails otherwise.
-pub const CAPTURED_STREAMS: [&str; 4] = [
+pub const CAPTURED_STREAMS: [&str; 5] = [
     "event_attended",
     "voice_session_started",
     "voice_session_ended",
     "message_created",
+    "rules_accepted",
 ];
 
 /// Capture registry: every fact stream with the production writer that appends
@@ -77,7 +79,10 @@ pub const STREAM_WRITERS: [(&str, Option<&str>); 6] = [
     ),
     ("member_joined", None),
     ("event_attended", Some("rsvp_store::record_checkin")),
-    ("rules_accepted", None),
+    (
+        "rules_accepted",
+        Some("leveling_runtime::DeferredCommunityFacts::drain"),
+    ),
 ];
 
 /// Exclusion buckets (legacy `COMMUNITY_CLASSIFICATIONS`). Contract

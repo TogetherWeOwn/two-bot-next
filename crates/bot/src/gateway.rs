@@ -620,11 +620,14 @@ fn apply_dispatch<I: InviteSource>(
                 voice.disconnect();
             }
         }
-        let funnel = disposition.map(|verdict| verdict.funnel);
         let trigger = disposition.map(|verdict| verdict.trigger);
+        // Text automations gate on the trigger verdict, not
+        // the funnel: a Bypassed create keeps funnel-Accept
+        // but its trigger is capture-only and must not run
+        // sticky (fail-closed; M2.19).
         if automod_enabled
             && matches!(dispatch.event, Event::MessageCreate(_))
-            && crate::automod_gateway::runs_text_automations(funnel)
+            && crate::automod_gateway::runs_text_automations(trigger)
         {
             if let Some(runtime) = command_runtime.as_ref() {
                 // Detached spawn from the blocking worker needs the runtime.
@@ -654,16 +657,14 @@ fn apply_dispatch<I: InviteSource>(
                 dispatch_error = Some(leveling_dispatch_failure());
             }
         }
-        // Community facts: drain buffered
-        // voice_session_started/ended and message_created
-        // writes on every dispatch, even when no XP award
-        // queued — bots, webhooks and staff automation
-        // capture facts but never awards, and a move's
-        // end+start pair buffers two rows for one frame,
-        // so gating on `requests` would leak the buffer.
-        // A failed write never stalls the worker (audit
-        // precedent): warn and continue; the scorecard
-        // fails closed on missing coverage.
+        // Community facts: drain buffered voice_session_started/ended,
+        // message_created and rules_accepted writes on every dispatch, even
+        // when no XP award queued — bots, webhooks and staff automation
+        // capture facts but never awards, and a move's end+start pair
+        // buffers two rows for one frame, so gating on `requests` would leak
+        // the buffer. A failed write never stalls the worker (audit
+        // precedent): warn and continue; the scorecard fails closed on
+        // missing coverage.
         match handle.block_on(tokio::time::timeout(deadline, pipeline.drain_facts())) {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => tracing::warn!(
