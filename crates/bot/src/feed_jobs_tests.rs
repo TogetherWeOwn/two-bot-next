@@ -364,7 +364,7 @@ async fn registration_parks_off_values_without_constructing_work() {
             vars.insert("TWO_ANNOUNCEMENTS".to_owned(), value.to_owned());
         }
         let gates = FeatureGates::from_map(&vars).unwrap();
-        assert!(register_gated(gates, action.clone()).is_none());
+        assert!(register_gated(gates, action.clone(), GUILD.to_owned()).is_none());
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let gates = FeatureGates::from_map(&std::collections::HashMap::from([
@@ -372,7 +372,7 @@ async fn registration_parks_off_values_without_constructing_work() {
         ("TWO_FEED_POLL_SECONDS".to_owned(), "60".to_owned()),
     ]))
     .unwrap();
-    let job = register_gated(gates, action).unwrap();
+    let job = register_gated(gates, action, GUILD.to_owned()).unwrap();
     assert_eq!(job.cadence, Duration::from_secs(60));
     assert_eq!(calls.load(Ordering::SeqCst), 0, "registration is lazy");
     (job.action)().await.unwrap();
@@ -403,7 +403,7 @@ async fn identity_fence_registers_the_poller_only_where_announcements_are_permit
     });
     let on = announcements(Some("1"));
 
-    let job = register_fenced(on, &fixtures::staging(), action.clone())
+    let job = register_fenced(on, &fixtures::staging(), action.clone(), GUILD.to_owned())
         .expect("staging identity registers the poller");
     assert_eq!(job.name, "feeds");
     (job.action)().await.unwrap();
@@ -411,7 +411,7 @@ async fn identity_fence_registers_the_poller_only_where_announcements_are_permit
 
     for (label, activation) in fixtures::refused() {
         assert!(
-            register_fenced(on, &activation, action.clone()).is_none(),
+            register_fenced(on, &activation, action.clone(), GUILD.to_owned()).is_none(),
             "{label} must not register the poller"
         );
     }
@@ -419,9 +419,13 @@ async fn identity_fence_registers_the_poller_only_where_announcements_are_permit
 
     // Identity never enables what the environment left off.
     for value in [None, Some("0")] {
-        assert!(
-            register_fenced(announcements(value), &fixtures::staging(), action.clone()).is_none()
-        );
+        assert!(register_fenced(
+            announcements(value),
+            &fixtures::staging(),
+            action.clone(),
+            GUILD.to_owned()
+        )
+        .is_none());
     }
 }
 

@@ -314,6 +314,61 @@ fn running_activation_applies_live_policy_without_restart() {
     );
 }
 
+/// One bad stored value does not take the whole policy down: the offending
+/// key falls back to its boot value while the other stored values still
+/// apply, so the refresh still reports a change.
+#[test]
+fn refresh_falls_back_per_key_on_a_bad_stored_value() {
+    crate::gateway::ensure_crypto_provider();
+    let deployment = vars(&[
+        ("TWO_AUTOMOD", "1"),
+        ("TWO_OWEN_USER_ID", OWEN),
+        ("TWO_MODERATION_PROTECTED_ROLE_IDS", ROLE),
+    ]);
+    let resolved = resolve(&deployment, GUILD)
+        .expect("boot resolves")
+        .expect("automod on");
+    let executor = ActionExecutor::with_proxy(
+        "test-token".to_owned(),
+        Some("http://127.0.0.1:9".to_owned()),
+    )
+    .expect("executor builds");
+    let activation = AutomodActivation::new(
+        AutomodRuntime::new(resolved.config, resolved.scope),
+        HangingLedger,
+        HangingFacts,
+        executor,
+    );
+
+    let guild = GUILD.to_string();
+    let (mut writer, live) = two_bot_core::settings::live_channel();
+    writer.publish(&two_bot_core::settings::SettingsSnapshot {
+        revision: 1,
+        rows: vec![
+            two_bot_core::settings::SettingRow {
+                guild_id: guild.clone(),
+                key: "TWO_AUTOMOD_BAD_WORDS".to_owned(),
+                value: json!(["spamword"]),
+                version: 1,
+            },
+            two_bot_core::settings::SettingRow {
+                guild_id: guild.clone(),
+                key: "TWO_AUTOMOD_REPEAT_COUNT".to_owned(),
+                value: json!(999),
+                version: 1,
+            },
+        ],
+    });
+    assert!(
+        refresh_live(&activation, &deployment, &guild, &live),
+        "the good stored value applies while the bad one falls back"
+    );
+    assert!(
+        !refresh_live(&activation, &deployment, &guild, &live),
+        "settled fallback refresh is a no-op"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_stalled_delivery_times_out_without_becoming_acceptance() {
     crate::gateway::ensure_crypto_provider();

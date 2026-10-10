@@ -123,6 +123,9 @@ pub(crate) fn layered_vars(
 
 /// Resolve with the live snapshot layered over the deployment environment.
 /// `None` live (poller parked/pre-first-poll) resolves purely from `vars`.
+/// Unit-test helper; production refreshes through [`refresh_live`] so one bad
+/// stored value cannot take the whole policy down.
+#[cfg(test)]
 pub(crate) fn resolve_with_live(
     vars: &HashMap<String, String>,
     guild_id: u64,
@@ -134,20 +137,47 @@ pub(crate) fn resolve_with_live(
     }
 }
 
-/// Apply the live policy to a running activation (store-first; an invalid
-/// live value keeps the last good policy with a warn). Returns true on change.
+/// The stored key behind a keyed gate error, if it names one. Sanctions-shape
+/// errors name no single key, so they keep the last good policy outright.
+fn live_key_of(error: &two_bot_core::AutomodGateError) -> Option<&'static str> {
+    match error {
+        two_bot_core::AutomodGateError::InvalidInteger(key, _, _) => Some(*key),
+        two_bot_core::AutomodGateError::InvalidSnowflakes(key) => Some(*key),
+        _ => None,
+    }
+}
+
+/// Apply the live policy to a running activation (store-first). A stored
+/// value that fails validation falls back to its boot value while the other
+/// stored values still apply; only an error that names no key keeps the last
+/// good policy. Every fallback carries the offending key. Returns true on
+/// change.
 pub(crate) fn refresh_live<L: AutomodClaimLedger, F: AutomodFacts>(
     activation: &AutomodActivation<L, F>,
     deployment: &HashMap<String, String>,
     guild_id: &str,
     live: &two_bot_core::settings::LiveSettings,
 ) -> bool {
-    let vars = layered_vars(deployment, guild_id, live);
-    match AutomodConfig::from_map(&vars) {
-        Ok(config) => activation.apply_live_config(&config),
-        Err(_) => {
-            warn!("automod live settings unusable; keeping the last good policy");
-            false
+    let mut vars = layered_vars(deployment, guild_id, live);
+    let mut reverted: Vec<&'static str> = Vec::new();
+    loop {
+        match AutomodConfig::from_map(&vars) {
+            Ok(config) => return activation.apply_live_config(&config),
+            Err(error) => match live_key_of(&error) {
+                Some(key) if !reverted.contains(&key) => {
+                    reverted.push(key);
+                    warn!(error = %error, key, "automod live setting unusable; falling back to the boot value");
+                    if let Some(boot) = deployment.get(key) {
+                        vars.insert(key.to_string(), boot.clone());
+                    } else {
+                        vars.remove(key);
+                    }
+                }
+                _ => {
+                    warn!(error = %error, "automod live settings unusable; keeping the last good policy");
+                    return false;
+                }
+            },
         }
     }
 }

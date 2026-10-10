@@ -161,6 +161,9 @@ impl Drop for ScheduleRun {
     }
 }
 
+/// Fixed-cadence constructor, kept for unit tests; production registers the
+/// live-aware [`scheduled_job_live`] through [`register_fenced`].
+#[cfg(test)]
 pub(crate) fn scheduled_job(seconds: u64, action: JobAction) -> Result<Job, ErrorClass> {
     let schedule = Arc::new(Mutex::new(
         FeedPollSchedule::new(seconds).map_err(|_| ErrorClass::Configuration)?,
@@ -278,17 +281,6 @@ pub(crate) fn register(context: Arc<Context>, activation: &BootActivation) -> Op
             return None;
         }
     };
-    let fenced = activation.constrain_features(gates);
-    if gates.announcements && !fenced.announcements {
-        tracing::warn!(
-            job = NAME,
-            capability = LiveCapability::Announcements.as_str(),
-            "feed poller parked: live activation refused"
-        );
-    }
-    if !fenced.announcements {
-        return None;
-    }
     let poller = Arc::new(FeedPoller::default());
     let guild = context.guild.clone();
     let action: JobAction = Arc::new(move || {
@@ -305,7 +297,7 @@ pub(crate) fn register(context: Arc<Context>, activation: &BootActivation) -> Op
                 .await
         })
     });
-    scheduled_job_live(fenced.feed_poll_seconds, action, guild).ok()
+    register_fenced(gates, activation, action, guild)
 }
 
 /// Identity can only narrow the env gate: the poller posts under the token's
@@ -314,6 +306,7 @@ pub(crate) fn register_fenced(
     gates: FeatureGates,
     activation: &BootActivation,
     action: JobAction,
+    guild: String,
 ) -> Option<Job> {
     let fenced = activation.constrain_features(gates);
     if gates.announcements && !fenced.announcements {
@@ -323,14 +316,14 @@ pub(crate) fn register_fenced(
             "feed poller parked: live activation refused"
         );
     }
-    register_gated(fenced, action)
+    register_gated(fenced, action, guild)
 }
 
-fn register_gated(gates: FeatureGates, action: JobAction) -> Option<Job> {
+fn register_gated(gates: FeatureGates, action: JobAction, guild: String) -> Option<Job> {
     if !gates.announcements {
         return None;
     }
-    scheduled_job(gates.feed_poll_seconds, action).ok()
+    scheduled_job_live(gates.feed_poll_seconds, action, guild).ok()
 }
 
 #[derive(Default)]
