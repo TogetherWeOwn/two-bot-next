@@ -85,6 +85,24 @@ The store functions above are persistence primitives, not permission checks.
 Exercise the actual interaction-to-store path with a disposable test database;
 a store-only happy-path test cannot establish RA-01 or RA-02.
 
+## Slash input bounds
+
+The input-bound fix (PR #694) closed four gaps found in an internal
+slash-command review: an unbounded `/lfg` role-key echo plus a raw reply
+path that could abandon the deferral, unbounded custom-command audit
+`target_key` values, empty/overlong schedule-id prefix matching, and
+published string options with no `max_length` while handlers enforce caps
+server-side. These rows record those gates so the next review does not
+start from zero. They change no bound; the code and tests cited are the
+implementation.
+
+| ID | Required control | Minimum regression evidence |
+| --- | --- | --- |
+| IN-01 | Bound the `/lfg` role-key echo to a 128-character prefix of the raw key and reject role specs over the published UTF-16 bound (`MAX_ROLE_SPEC_CHARS`, 2339) before parsing. Route the LFG failure reply through the sanitizing interaction edit (truncate to the message bound with neutral mentions, `allowed_mentions` parse `[]`) so the deferred interaction never hangs thinking and hostile mentions never echo. | `crates/core/src/lfg.rs::tests::role_key_errors_echo_only_a_bounded_raw_prefix` (echo capped at 128 chars) and `role_spec_rejects_input_over_the_published_utf16_bound` (ASCII and multibyte over-long refused); hostile tail of `crates/discord/tests/lfg_interactions.rs::router_runs_create_signup_full_switch_leave_close_with_audit` (reply is `PATCH`, content within `MAX_MESSAGE_CHARS`, no `@everyone`, `parse == []`). |
+| IN-02 | Cap custom-command audit `target_key` values at the command-name bound (`MAX_COMMAND_NAME_CHARS`, 32 chars) for put, reject, delete and run rows, so unbounded `/command name` input never lands raw in audit rows. | `crates/core/src/custom_commands.rs::tests::rejected_and_absent_audits_bound_untrusted_names` (overlong multibyte name bounded to 32 chars on reject and absent paths). |
+| IN-03 | Refuse empty and overlong (`MAX_RESOURCE_ID_CHARS`, 128 UTF-16 units) schedule-id prefixes before any store resolution, on `/schedule-remove`, the shared schedule resolver and `/lfg-close`. Refusals on the schedule surfaces return the shared no-unique-match outcome (the `/lfg-close` guard refuses with its own 1-to-128-characters message); all mutate nothing and make no database access. | `crates/core/tests/schedule_queue_order.rs::prefix_resolution_refuses_missing_and_ambiguous_ids` (empty and 129-char prefixes resolve `Missing`); `crates/core/src/scheduled_store.rs::tests::empty_and_overlong_prefixes_refuse_before_database_access` (lazy pool proves refusal happens before database access). |
+| IN-04 | Advertise `max_length` on published string options equal to the runtime caps: `/command` name 32, template 2000, description 100, text-trigger 33, `/command-remove` name 32; `/schedule` body 2000, `/schedule-remove` id 128, `/sticky` body 2000; `/lfg` title 100, roles 2339, `/lfg-close` id 128; `/feed-add` source 2048 bytes, `/feed-remove` id 128. Server-side validators stay authoritative; picker bounds only restrict what Discord sends. | `crates/core/src/feature_commands.rs` automation/announcement `max_length` assertions (each option pinned to its constant); `crates/core/tests/support/registry_parity.rs::expected_registry` caps plus `crates/core/tests/registry_golden.rs::diff_detects_each_kind_of_unlisted_drift_including_exception_bodies` (drift on any unlisted `max_length` change); `crates/core/tests/feeds.rs::source_length_bound_matches_published_byte_limit_before_trimming` (byte ceiling enforced before trimming, multibyte over-ceiling refused). |
+
 ## Wiring PR evidence contract
 
 Each wiring or hardening PR must:
