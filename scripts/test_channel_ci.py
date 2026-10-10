@@ -117,6 +117,16 @@ class ChannelCiTests(unittest.TestCase):
         # A failing diff never reports an empty successful change set: it runs the full suite.
         self.assertEqual(self.selected_jobs("pull_request", diff_fails=True), full)
 
+    def test_pr_check_keeps_nightly_coupled_guards(self):
+        # The nightly sweep no longer runs per PR, so its PR-time guards live in check.yml:
+        # the guarded-fixture routing check and rustdoc -D warnings.
+        check = (ROOT / ".github/workflows/check.yml").read_text()
+        self.assertIn("-p 'test_nightly_routing.py'", check)
+        doc = step(check, "cargo doc -D warnings")
+        self.assertIn("needs.job-inputs.outputs.rust != 'false'", doc)
+        self.assertIn("RUSTDOCFLAGS: -D warnings", doc)
+        self.assertIn("cargo doc --workspace --all-features --no-deps --locked", doc)
+
     def test_nightly_selection_defaults_to_full_coverage(self):
         full = {"rust": "true", "supply": "true"}
         for event in ["schedule", "workflow_dispatch", "push"]:
