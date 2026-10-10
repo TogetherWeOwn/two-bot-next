@@ -304,6 +304,24 @@ enum CheckpointFailure {
     Timeout,
 }
 
+/// Read one counter series from the process-global metrics exposition.
+/// Global counters are monotonic and shared with parallel tests, so callers
+/// assert `after >= before + expected`, never an exact value.
+fn global_series(prefix: &str) -> u64 {
+    two_bot_core::metrics::global()
+        .render(None)
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .map(|line| {
+            line.rsplit_once(' ')
+                .unwrap_or_else(|| panic!("bad sample: {line}"))
+                .1
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("bad sample: {line}"))
+        })
+        .sum()
+}
+
 async fn queued_commands(
     slow_database: bool,
     checkpoint_failure: Option<CheckpointFailure>,
@@ -394,6 +412,13 @@ async fn queued_commands(
     if graceful_shutdown {
         shutdown.send_replace(true);
     }
+    // Pin the counter wiring, not just the error text: a forced checkpoint
+    // failure must bump the `commit` series. Both fixtures fail the durable
+    // store write through the `apply_dispatch` Err arm, and the worker stops
+    // at the first failure, so this run contributes exactly one increment.
+    // The series is global and monotonic, hence the lower-bound assertion.
+    let commit_series = "two_bot_gateway_checkpoint_failures_total{stage=\"commit\"} ";
+    let commit_before = global_series(commit_series);
     match checkpoint_failure {
         Some(CheckpointFailure::Rejected) => {
             sqlx::raw_sql(
@@ -440,6 +465,10 @@ async fn queued_commands(
         }
         assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
         assert_eq!(db.count().await, 0);
+        assert!(
+            global_series(commit_series) > commit_before,
+            "a forced checkpoint failure must bump the `commit` counter"
+        );
         None
     } else if graceful_shutdown {
         tokio::time::timeout(Duration::from_secs(15), runner)
