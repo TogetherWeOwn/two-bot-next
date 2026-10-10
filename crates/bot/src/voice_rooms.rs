@@ -3033,7 +3033,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     }
 
     /// Who started a vote this session. Every vote the core knows began in
-    /// [`Self::kick_start`], so the fallback is unreachable.
+    /// [`Self::kick_start`], and the initiator stays fenced while the vote is
+    /// still in [`Self::active_votes`] or its enforcement is still queued, so
+    /// the fallback is unreachable.
     fn vote_initiator(&self, vote_id: Snowflake) -> Snowflake {
         self.vote_initiators.get(&vote_id).copied().unwrap_or(0)
     }
@@ -3043,10 +3045,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// The initiator stays while its enforcement is still queued, so the
     /// enforcement audit still names who started the vote (VK-03 fence); the
     /// queued action is the ground truth, and every terminal dispatch path
-    /// releases it in the same arm that audits, so the fence cannot leak.
+    /// releases it in the same arm that audits, so the fence cannot leak. It
+    /// also stays while the vote is still in [`Self::active_votes`]: a command
+    /// landing between reconnect and the first ready tick can reap a vote the
+    /// tick has not settled yet, and the tick's UnknownVote expiry backstop
+    /// audits the result row with this initiator.
     fn forget_vote_maps(&mut self, vote_id: Snowflake) {
         self.vote_refs.remove(&vote_id);
-        if self.queue.has_queued_kick(vote_id) {
+        if self.queue.has_queued_kick(vote_id)
+            || self.active_votes.iter().any(|vote| vote.id == vote_id)
+        {
             self.fenced_initiators.insert(vote_id);
         } else {
             self.vote_initiators.remove(&vote_id);
@@ -3058,13 +3066,17 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// `refresh` reap on their own pass and only report through the drain
     /// buffer, so waiting for the timer would leak these maps without bound.
     /// Fenced initiators are retried first: a fence released since the last
-    /// pass (its enforcement dispatched and audited) drops now.
+    /// pass (its enforcement dispatched and audited, and the vote settled out
+    /// of [`Self::active_votes`]) drops now.
     fn drop_evicted_vote_maps(&mut self) {
         let released: Vec<Snowflake> = self
             .fenced_initiators
             .iter()
             .copied()
-            .filter(|vote_id| !self.queue.has_queued_kick(*vote_id))
+            .filter(|vote_id| {
+                !self.queue.has_queued_kick(*vote_id)
+                    && !self.active_votes.iter().any(|vote| vote.id == *vote_id)
+            })
             .collect();
         for vote_id in released {
             self.fenced_initiators.remove(&vote_id);

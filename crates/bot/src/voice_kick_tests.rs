@@ -301,6 +301,44 @@ async fn start_before_first_ready_tick_does_not_swallow_the_expiry_audit() {
 }
 
 #[tokio::test]
+async fn two_commands_before_first_ready_tick_keep_the_expiry_initiator() {
+    // VK-03 review warning: two commands landing between reconnect and the
+    // first ready tick used to audit the reaped vote's expiry with initiator
+    // 0. The first command's pass lazily expires the vote with a backdated
+    // deadline; the second command's pass evicts it and dropped the worker's
+    // initiator while the vote was still in `active_votes`, so the tick's
+    // UnknownVote backstop synthesized the row with the fallback. The ballot
+    // path shares the same drain (`drop_evicted_vote_maps`), so two starts
+    // pin the fence for both.
+    let (mut worker, _) = setup().await;
+    worker.kick_start(VOTE, ROOM, VOTER_A, TARGET, 0).unwrap();
+    worker.live.disconnect();
+    let past_horizon = VOTE_KICK_TTL_MS + VOTE_KICK_COOLDOWN_MS + 1;
+    assert!(worker.kick_refresh(past_horizon).is_empty());
+    worker.live.publish(snapshot(&[ROOM], roster()));
+    worker
+        .kick_start(VOTE + 1, ROOM, VOTER_B, VOTER_C, past_horizon + 1)
+        .unwrap();
+    worker
+        .kick_start(VOTE + 2, ROOM, VOTER_C, VOTER_B, past_horizon + 1)
+        .unwrap();
+    let finished = worker.kick_refresh(past_horizon + 2);
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].vote.id, VOTE);
+    assert_eq!(finished[0].status, VoteKickStatus::Expired);
+    assert!(worker.flush_kick_audit(past_horizon + 3).await);
+    let rows = worker.store.kick_audit.lock().unwrap().clone();
+    let result = rows
+        .iter()
+        .find(|row| row.event == KickAuditEvent::VoteResult && row.vote_id == VOTE)
+        .expect("expiry row for the reaped vote");
+    assert_eq!(result.initiator_id, VOTER_A);
+    assert_eq!(result.target_id, TARGET);
+    // The fence releases once the tick settles the vote: no leak.
+    assert!(!worker.vote_initiators.contains_key(&VOTE));
+}
+
+#[tokio::test]
 async fn owner_original_creator_and_self_cannot_be_targeted() {
     let (mut worker, trace) = setup().await;
     assert_eq!(
