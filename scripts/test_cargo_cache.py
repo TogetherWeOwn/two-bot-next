@@ -1083,6 +1083,7 @@ class SharedPoolRetainTests(unittest.TestCase):
         # Same-filesystem deleted entry outside every slot path, with an
         # inode in no slot traversal: indistinguishable from a deleted slot
         # file held open, so the whole run still refuses with no mutation.
+        # Maps provenance, so device comparison could not exclude it anyway.
         pool_dev = os.stat(self.pool / 'slot-0' / 'target').st_dev
         (stale / 'maps').write_text(
             f'100-200 r--p 00000000 {os.major(pool_dev):x}:{os.minor(pool_dev):x} '
@@ -1092,32 +1093,46 @@ class SharedPoolRetainTests(unittest.TestCase):
         self.assertTrue((target / 'debug' / 'fixture').exists())
 
     def test_different_filesystem_deleted_excluded(self):
-        # Multi-tenant host shape: unrelated deleted artifacts on filesystems
-        # holding no slot output are provably unable to alias slot output, so
-        # they are excluded (and counted) instead of refusing the whole run.
-        stale = self.proc / '999'
-        stale.mkdir()
-        (stale / 'fd').mkdir()
-        (stale / 'stat').write_text('999 (fixture) S 1 999 999 0 -1 0\n')
-        (stale / 'cwd').symlink_to(self.root)
-        (stale / 'exe').symlink_to(sys.executable)
+        # Multi-tenant host shape: unrelated stat-backed (fd/cwd/exe) deleted
+        # artifacts on filesystems holding no slot output are provably unable
+        # to alias slot output, so they are excluded (and counted) instead of
+        # refusing the whole run.
         observed = {os.stat(self.pool / f'slot-{n}' / sub).st_dev
                     for n in range(2) for sub in ('target', 'scratch')}
         foreign = os.makedev(0xAB, 0xCD)
         self.assertNotIn(foreign, observed)
-        (stale / 'maps').write_text(
-            f'100-200 r--p 00000000 ab:cd 999999991 /other/tenant/stale.so (deleted)\n'
-            f'200-300 r--p 00000000 ab:cd 999999992 /other/tenant/old.so (deleted)\n')
-        receipt = self.retain()
+        with patch.object(cache, 'process_references',
+                          return_value=([], [('/other/tenant/stale.so', foreign, 999999991, True),
+                                             ('/other/tenant/old.so', foreign, 999999992, True)])):
+            receipt = self.retain()
         self.assertTrue(all(row['eligible'] for row in receipt['slots']))
         self.assertEqual(receipt['excluded_deleted_references'], 2)
         self.assertFalse((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_maps_deleted_never_device_excluded(self):
+        # Maps devices are kernel-printed superblock numbers, which need not
+        # equal the stat device for the same file (btrfs per-subvolume
+        # anon_dev, pre-6.8 overlayfs). A maps deleted entry whose device is
+        # in no slot output therefore proves nothing -- e.g. a replaced slot
+        # proc-macro .so still mapped by a live process -- so it stays
+        # fail-closed and refuses the whole run with no mutation.
+        target = self.pool / 'slot-0' / 'target'
+        observed = {os.stat(self.pool / f'slot-{n}' / sub).st_dev
+                    for n in range(2) for sub in ('target', 'scratch')}
+        foreign = os.makedev(0xAB, 0xCD)
+        self.assertNotIn(foreign, observed)
+        with patch.object(cache, 'process_references',
+                          return_value=([], [('/other/tenant/stale.so', foreign, 999999991, False)])):
+            with self.assertRaisesRegex(cache.Refusal, 'unresolved deleted'):
+                self.retain()
+        self.assertTrue((target / 'debug' / 'fixture').exists())
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
 
     def test_device_unknown_deleted_refuses_whole(self):
         # A deleted entry with no usable device identity cannot prove
         # non-aliasing, so it stays fail-closed and refuses the whole run.
         with patch.object(cache, 'process_references',
-                          return_value=([], [('/elsewhere/stale.so', None, 7)])):
+                          return_value=([], [('/elsewhere/stale.so', None, 7, True)])):
             with self.assertRaisesRegex(cache.Refusal, 'unresolved deleted'):
                 self.retain()
         self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())

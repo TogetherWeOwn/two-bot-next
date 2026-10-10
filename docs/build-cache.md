@@ -325,6 +325,23 @@ or live/referenced row, missing attestation, provenance veto in target or
 scratch, actual process reference, replaced lock) skips that slot and keeps
 its lease.
 
+```sh
+python3 scripts/cargo_cache.py retain \
+  --pool /paperclip/.cache/two-bot-next-bounded \
+  --inventory /RUN-SCRATCH/two-pool-inventory.json \
+  --proc-root /proc \
+  --evidence /RUN-SCRATCH/two-pool-retain-receipt.json
+```
+
+Output is JSON with `retain: true`, an `excluded_deleted_references` count,
+and a per-slot record (`eligible`, `before_bytes`/`after_bytes`/
+`reclaimed_bytes`, `lock_held_through_mutation`). The Operator holds TWO build/dispatch
+admission, re-exports a fresh inventory immediately before running, and
+retains the evidence receipt. Scratch has no Cargo-defined top-level names
+(temp files are arbitrary), so only protected directory/file/suffix vetoes
+apply there — but the attested classification is still required. Never turn
+this command into unattended cron cleanup.
+
 ### Deleted-reference evidence model (multi-tenant host)
 
 Per-slot checks veto on positive attribution only: a lexical path inside the
@@ -332,20 +349,24 @@ slot's `target`/`scratch`, or a `(device, inode)` identity in that slot's
 output. The whole-run check refuses a deleted entry attributable to no held
 slot, with one provable exception: **different-filesystem exclusion**. One
 filesystem's unlinked inode can never be another filesystem's file, so a
-deleted entry whose device appears in no held slot output is provably unable
-to reference slot output. Such entries are excluded and counted in the
-receipt as `excluded_deleted_references` — never silently dropped. Everything
-else stays fail-closed: same-filesystem unattributed entries (a deleted slot
-file held open is indistinguishable from an unrelated same-filesystem temp
-file), device-unknown entries, incomplete/denied scans, and any run where a
-held slot's output device is unreadable (then nothing is excluded).
+stat-backed (fd/cwd/exe) deleted entry whose device appears in no held slot
+output is provably unable to reference slot output. Such entries are excluded
+and counted in the receipt as `excluded_deleted_references` — never silently
+dropped. Maps entries are never device-excluded: the kernel prints the
+superblock device there, which need not equal the stat device for the same
+file (btrfs per-subvolume anon_dev, pre-6.8 overlayfs). Everything else stays
+fail-closed: same-filesystem unattributed entries (a deleted slot file held
+open is indistinguishable from an unrelated same-filesystem temp file),
+device-unknown entries, incomplete/denied scans, and any run where a held
+slot's output device is unreadable (then nothing is excluded).
 
 Limitations: unrelated deleted files on the *same* filesystem as slot output
-still refuse the whole run — quiesce same-filesystem writers or supply an
-independently verified exact-path process-reference receipt instead. Exclusion
-assumes no filesystem topology change under held slots during the bounded run
-(all locks are held throughout). The read-only legacy `audit` keeps the
-strict global rule; only `retain` partitions by device.
+still refuse the whole run — as do all maps deleted entries that attribute to
+no slot — quiesce writers or supply an independently verified exact-path
+process-reference receipt instead. Exclusion assumes no filesystem topology
+change under held slots during the bounded run (all locks are held
+throughout). The read-only legacy `audit` keeps the strict global rule; only
+`retain` partitions by device.
 
 ### Bounded TWO-only build/dispatch admission hold (and undo)
 
@@ -380,23 +401,6 @@ occurred; running workers were never touched. If `retain` mutated some slots
 and then must be rolled back, regenerable output rebuilds through the
 repaired bounded pool; source, secrets, services and archives have no
 rollback change here.
-
-```sh
-python3 scripts/cargo_cache.py retain \
-  --pool /paperclip/.cache/two-bot-next-bounded \
-  --inventory /RUN-SCRATCH/two-pool-inventory.json \
-  --proc-root /proc \
-  --evidence /RUN-SCRATCH/two-pool-retain-receipt.json
-```
-
-Output is JSON with `retain: true` and a per-slot record
-(`eligible`, `before_bytes`/`after_bytes`/`reclaimed_bytes`,
-`lock_held_through_mutation`). The Operator holds TWO build/dispatch
-admission, re-exports a fresh inventory immediately before running, and
-retains the evidence receipt. Scratch has no Cargo-defined top-level names
-(temp files are arbitrary), so only protected directory/file/suffix vetoes
-apply there — but the attested classification is still required. Never turn
-this command into unattended cron cleanup.
 
 ## /home available-byte alarm
 

@@ -319,6 +319,13 @@ def process_references(proc_root):
     so container mount path spellings need not match the host. cmdline entries
     that no longer stat are kept as lexical-only references (dev/ino None);
     any denied read aborts the whole scan.
+
+    Deleted entries are (path, device, inode, stat_backed): fd/cwd/exe
+    devices come from stat and compare directly with slot stat devices;
+    maps devices are kernel-printed superblock numbers, which need not equal
+    the stat device for the same file (btrfs per-subvolume anon_dev,
+    pre-6.8 overlayfs), so maps entries must never prove non-aliasing by
+    device alone.
     """
     references = []
     deleted = []
@@ -361,7 +368,7 @@ def process_references(proc_root):
                     raise
                 if name.endswith(' (deleted)'):
                     deleted.append((name.removesuffix(' (deleted)'),
-                                    info.st_dev, info.st_ino))
+                                    info.st_dev, info.st_ino, True))
                 elif name.startswith('/'):
                     references.append((name, info.st_dev, info.st_ino))
             for line in (entry / 'maps').read_text().splitlines():
@@ -369,9 +376,12 @@ def process_references(proc_root):
                 if len(fields) == 6 and fields[5].startswith('/'):
                     if fields[5].endswith(' (deleted)'):
                         major, minor = fields[3].split(':')
+                        # Kernel-printed superblock device: incomparable with
+                        # stat devices on some filesystems, so never
+                        # device-excludable (stat_backed=False).
                         deleted.append((fields[5].removesuffix(' (deleted)'),
                                         os.makedev(int(major, 16), int(minor, 16)),
-                                        int(fields[4])))
+                                        int(fields[4]), False))
                     else:
                         major, minor = fields[3].split(':')
                         references.append((fields[5],
@@ -781,7 +791,7 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
                     continue
                 if any(within(path, target) or within(path, scratch)
                        or (device is not None and (device, inode) in nodes)
-                       for path, device, inode in deleted):
+                       for path, device, inode, _stat_backed in deleted):
                     results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
                                      'reason': ('actual process reference (deleted artifact); '
                                                 'skipped, lease kept')}
@@ -797,12 +807,16 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
         # inode, so an entry attributable to no held slot refuses the whole
         # run -- EXCEPT provable different-filesystem exclusion. One
         # filesystem's unlinked inode can never be another filesystem's file,
-        # so a deleted entry whose device appears in no held slot output is
-        # provably unable to reference slot output and is excluded (counted
-        # in the receipt, never silently dropped). Same-filesystem and
-        # device-unknown unattributed entries still refuse: a deleted slot
-        # file held open carries the slot's device with an inode already gone
-        # from the traversal, which no scan can distinguish from an unrelated
+        # so a stat-backed (fd/cwd/exe) deleted entry whose device appears in
+        # no held slot output is provably unable to reference slot output and
+        # is excluded (counted in the receipt, never silently dropped). Maps
+        # entries are never device-excluded: their kernel-printed superblock
+        # device need not equal the stat device for the same file (btrfs
+        # per-subvolume anon_dev, pre-6.8 overlayfs), so a "foreign" maps
+        # device proves nothing. Same-filesystem and device-unknown
+        # unattributed entries still refuse: a deleted slot file held open
+        # carries the slot's device with an inode already gone from the
+        # traversal, which no scan can distinguish from an unrelated
         # same-filesystem temp file. Exclusion also needs complete device
         # knowledge: if any held slot's output device is unreadable, nothing
         # is excluded and the strict rule applies.
@@ -828,12 +842,12 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
                     devices_complete = False
         unresolved = []
         excluded_deleted = 0
-        for path, device, inode in deleted:
+        for path, device, inode, stat_backed in deleted:
             if any(within(path, Path(root)) for root in slot_roots):
                 continue  # lexical attribution, including skipped-slot paths
             if device is not None and (device, inode) in all_nodes:
                 continue  # inode attribution to pending slot output
-            if (devices_complete and device is not None
+            if (stat_backed and devices_complete and device is not None
                     and device not in slot_devices):
                 excluded_deleted += 1
                 continue
@@ -1078,7 +1092,7 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
         # so this is a false-negative reference finding, not a deletion
         # plan; no destructive deletion is demonstrated or authorized.
         if any(within(path, workspace) or (device, inode) in nodes
-               for path, device, inode in deleted):
+               for path, device, inode, _stat_backed in deleted):
             result['reason'] = 'actual process cwd/exe/fd/map reference (deleted artifact)'
             continue
         result.update(eligible=True, allocated_bytes=usage(target), reason='audit only; not deletion authority')
@@ -1088,7 +1102,7 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
     # exact-path process-reference receipt before any such audit clears.
     if any(not any(within(path, Path(root)) for root in real_workspaces)
            and (device, inode) not in all_nodes
-           for path, device, inode in deleted):
+           for path, device, inode, _stat_backed in deleted):
         raise Refusal('unresolved deleted process reference; '
                       'exact-path process-reference receipt required')
     if now - captured + time.monotonic() - started > max_age:
