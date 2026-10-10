@@ -77,6 +77,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "vote_kick"
+path = "fuzz_targets/vote_kick.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "vote_kick_reason"
 path = "fuzz_targets/vote_kick_reason.rs"
 test = false
