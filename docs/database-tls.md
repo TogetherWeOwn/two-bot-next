@@ -99,8 +99,9 @@ Fenced: every caller of `two_bot_cutover::connect`, the gateway store pool
 send-admission pools (`website_jobs::admission_pool_with_tls` for the website
 jobs, the preflight `admission_transport`, the commands CLI `executor`, and
 `two_bot_cutover::rest::RestClient::from_env` via `admission_connect_options`
-(with `from_url_with_tls` as the explicit URL/policy test constructor) for the
-`report`, `ghost_cleanup` and `backfill_messages` operator tools).
+(with `from_url_with_tls` as a public explicit URL/policy constructor used by
+tests) for the `report`, `ghost_cleanup`, `backfill_messages`, `backfill`,
+`capture` and `voice_config_apply` operator tools).
 
 Known gaps (not yet fenced): `staging_migrate::verify_target` plus `connect`
 (`crates/cutover/src/staging_migrate.rs`) pins the expected host and database
