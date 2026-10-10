@@ -931,6 +931,37 @@ async fn hostile_reasons_never_echo_in_refusals_errors_or_logs() {
         "~~",
         "||",
     ];
+    // Reason-derived echo probes: only substrings actually present in this
+    // hostile input. Bare "<@" / "<#" / "<:" prefixes are deliberately NOT
+    // probed: `failure_line` legitimately renders "<#ROOM>" channel mentions
+    // for real IDs, so a bare prefix cannot distinguish an echo from the
+    // fixed ID format. Mention-pill inputs are instead pinned by their
+    // hostile-specific snowflake, which never equals a test ID (ROOM=500,
+    // VOTE=7000, members in the 300s).
+    let assert_no_reason_echo = |hostile: &str, rendered: &str, where_: &str| {
+        let folded_rendered = rendered.to_lowercase();
+        let folded_hostile = hostile.to_lowercase();
+        for probe in PROBES {
+            if matches!(*probe, "<@" | "<#" | "<:") {
+                continue;
+            }
+            if !folded_hostile.contains(&probe.to_lowercase()) {
+                continue;
+            }
+            assert!(
+                !folded_rendered.contains(&probe.to_lowercase()),
+                "{hostile:?} probe {probe:?} in {where_}: {rendered:?}"
+            );
+        }
+        for needle in ["7654321", "987654321", "123456789"] {
+            if hostile.contains(needle) {
+                assert!(
+                    !rendered.contains(needle),
+                    "{hostile:?} id {needle:?} echoed in {where_}: {rendered:?}"
+                );
+            }
+        }
+    };
     let admission = two_bot_core::voice_create_admission::CreateAdmissionConfig::default();
     let admission_reasons = [
         two_bot_core::voice_create_admission::RefusalReason::UserCap,
@@ -1020,13 +1051,7 @@ async fn hostile_reasons_never_echo_in_refusals_errors_or_logs() {
                 !rendered.contains(hostile),
                 "{hostile:?} echoed in failure_line: {rendered:?}"
             );
-            let folded = rendered.to_lowercase();
-            for probe in PROBES {
-                assert!(
-                    !folded.contains(&probe.to_lowercase()),
-                    "{hostile:?} probe {probe:?} in failure_line: {rendered:?}"
-                );
-            }
+            assert_no_reason_echo(hostile, &rendered, "failure_line");
         }
         // Other failure families carry IDs and typed errors only.
         let others = vec![
@@ -1058,13 +1083,7 @@ async fn hostile_reasons_never_echo_in_refusals_errors_or_logs() {
                 !rendered.contains(hostile),
                 "{hostile:?} echoed in {failure:?}: {rendered:?}"
             );
-            let folded = rendered.to_lowercase();
-            for probe in PROBES {
-                assert!(
-                    !folded.contains(&probe.to_lowercase()),
-                    "{hostile:?} probe {probe:?} in {failure:?}: {rendered:?}"
-                );
-            }
+            assert_no_reason_echo(hostile, &rendered, "failure_line");
         }
 
         // Vote log sites: audit rows carry snowflakes and fixed codes only, and
@@ -1075,13 +1094,7 @@ async fn hostile_reasons_never_echo_in_refusals_errors_or_logs() {
                 !row.outcome.contains(hostile),
                 "{hostile:?} echoed in audit outcome: {row:?}"
             );
-            let folded = row.outcome.to_lowercase();
-            for probe in PROBES {
-                assert!(
-                    !folded.contains(&probe.to_lowercase()),
-                    "{hostile:?} probe {probe:?} in audit outcome: {row:?}"
-                );
-            }
+            assert_no_reason_echo(hostile, &row.outcome, "audit outcome");
             assert!(
                 row.outcome
                     .bytes()
