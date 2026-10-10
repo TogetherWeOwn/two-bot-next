@@ -187,6 +187,8 @@ jobs:
       # Tier 0 (pipeline review 2026-10-10): workflow logic was the largest class of review
       # findings a linter catches; zizmor covers security, actionlint covers syntax/expressions.
       - name: Lint GitHub Actions workflows (actionlint)
+        # The check job runs in a container whose default shell is sh (no pipefail).
+        shell: bash
         run: |
           set -euo pipefail
           curl -fsSL -o "$RUNNER_TEMP/actionlint.tgz" \
