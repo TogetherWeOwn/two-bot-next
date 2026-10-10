@@ -47,6 +47,28 @@ pub fn ensure_crypto_provider() {
     }
 }
 
+/// Worker decision for prefix triggers: `Some(trigger)` means the serial
+/// dispatch worker must call `dispatch_with_verdict(event, trigger)`, `None`
+/// means it must not. `trigger` is `disposition.map(|verdict| verdict.trigger)`;
+/// the text-automation gate stays on the trigger verdict, not the funnel: an
+/// uninspected create keeps funnel `Accept` but its trigger is capture-only
+/// and must not run sticky or prefix triggers (fail-closed).
+pub(crate) fn worker_prefix_trigger(
+    disposition: Option<crate::automod_gateway::WorkerVerdict>,
+    event: &Event,
+    automod_enabled: bool,
+) -> Option<Option<two_bot_core::automod_runtime::FunnelDisposition>> {
+    let trigger = disposition.map(|verdict| verdict.trigger);
+    if automod_enabled
+        && matches!(event, Event::MessageCreate(_))
+        && crate::automod_gateway::runs_text_automations(trigger)
+    {
+        Some(trigger)
+    } else {
+        None
+    }
+}
+
 /// Supervisor-visible gateway state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayState {
@@ -312,6 +334,21 @@ fn missing_ingress_ticket_failure() -> sqlx::Error {
 /// instead of queueing unbounded acknowledgement work.
 fn ingress_capacity_failure() -> sqlx::Error {
     sqlx::Error::InvalidArgument("gateway ingress capacity exhausted".into())
+}
+
+/// Fatal-runner reason fence: at most 512 chars of the dispatch-supervisor
+/// reason reach the surfaced runner error (logs + `operation`). Class
+/// `session` per `docs/log-volume-guard.md`: the runner fails at most a
+/// handful of times per process lifetime. Today every reason is one of six
+/// `&'static str` literals from `dispatch_bounded` (the `JoinError` payload
+/// is discarded there), so the bound is defense in depth: it holds even if a
+/// future supervisor returns a larger payload. Char-boundary truncation keeps
+/// the surfaced string valid UTF-8.
+const RUNNER_REASON_MAX_CHARS: usize = 512;
+
+fn bounded_runner_reason(reason: &str) -> sqlx::Error {
+    let bounded: String = reason.chars().take(RUNNER_REASON_MAX_CHARS).collect();
+    sqlx::Error::InvalidArgument(bounded)
 }
 
 /// Await one RSVP completion ticket on the dispatch worker. A dropped sender
@@ -620,14 +657,7 @@ fn apply_dispatch<I: InviteSource>(
                 voice.disconnect();
             }
         }
-        let trigger = disposition.map(|verdict| verdict.trigger);
-        // Text automations gate on the trigger verdict, not
-        // the funnel: a Bypassed create keeps funnel-Accept
-        // but its trigger is capture-only and must not run
-        // sticky (fail-closed; M2.19).
-        if automod_enabled
-            && matches!(dispatch.event, Event::MessageCreate(_))
-            && crate::automod_gateway::runs_text_automations(trigger)
+        if let Some(trigger) = worker_prefix_trigger(disposition, &dispatch.event, automod_enabled)
         {
             if let Some(runtime) = command_runtime.as_ref() {
                 // Detached spawn from the blocking worker needs the runtime.
@@ -1227,6 +1257,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                     committed,
                 ),
             };
+
             if let Err(error) = operation {
                 // Retain the original error without panicking away accepted
                 // commands or allowing a later checkpoint to leap past failure.
@@ -1250,7 +1281,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             futures_util::pin_mut!(queue_worker);
             tokio::select! {
                 result = dispatch => {
-                    let result = result.map_err(|reason| sqlx::Error::InvalidArgument(reason.into()));
+                    let result = result.map_err(bounded_runner_reason);
                     if result.is_ok() && error.lock().expect("gateway error lock").is_none() {
                         // Cooperative end with a healthy writer: the last
                         // commit may have raced the drain return before the
@@ -1283,9 +1314,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                 }
             }
         }
-        None => dispatch
-            .await
-            .map_err(|reason| sqlx::Error::InvalidArgument(reason.into())),
+        None => dispatch.await.map_err(bounded_runner_reason),
     };
     // Reception does not restart in this runner. Keep Draining sticky through
     // both successful shutdown and fatal exit, including any remaining writer.
@@ -2518,5 +2547,34 @@ mod tests {
                 "onboarding interaction missing ingress ticket; checkpoint committed",
             ]
         );
+    }
+
+    /// Fatal-runner reason fence: an oversized payload is truncated to
+    /// `RUNNER_REASON_MAX_CHARS`, while short reasons pass through unchanged
+    /// so the #659 typed errors keep their exact text.
+    #[test]
+    fn gateway_runner_reason_is_bounded() {
+        match bounded_runner_reason("dispatch backlog full") {
+            sqlx::Error::InvalidArgument(message) => {
+                assert_eq!(message, "dispatch backlog full");
+            }
+            error => panic!("runner reason must stay typed, got {error:?}"),
+        }
+        let oversized = "x".repeat(RUNNER_REASON_MAX_CHARS + 10_000);
+        match bounded_runner_reason(&oversized) {
+            sqlx::Error::InvalidArgument(message) => {
+                assert_eq!(message.len(), RUNNER_REASON_MAX_CHARS);
+                assert_eq!(message, "x".repeat(RUNNER_REASON_MAX_CHARS));
+            }
+            error => panic!("oversized reason must stay typed, got {error:?}"),
+        }
+        // Multi-byte chars truncate on a char boundary, never mid-codepoint.
+        let emoji = "🦀".repeat(RUNNER_REASON_MAX_CHARS + 10);
+        match bounded_runner_reason(&emoji) {
+            sqlx::Error::InvalidArgument(message) => {
+                assert_eq!(message.chars().count(), RUNNER_REASON_MAX_CHARS);
+            }
+            error => panic!("oversized reason must stay typed, got {error:?}"),
+        }
     }
 }

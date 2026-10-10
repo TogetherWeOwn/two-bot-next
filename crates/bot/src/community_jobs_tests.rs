@@ -726,9 +726,8 @@ async fn community_ticks_write_rows_and_stay_gated() {
     .unwrap();
     assert_eq!(rows, vec![(42, Some(2)), (43, None)]);
 
-    // Monday 06:15 UTC: five stream heartbeats (the captured
-    // `event_attended`, both voice streams, `message_created` and
-    // `rules_accepted`) then one run row. Completion
+    // Monday 06:15 UTC: six stream heartbeats (all captured streams are
+    // marked) then one run row. Completion
     // suppresses later ticks, including with a fresh process State.
     let monday = parse_iso_millis("2026-09-28T06:15:00.000Z").unwrap();
     run_once(Kind::Scorecard, &pool, &rest, guild, &state, monday)
@@ -768,7 +767,7 @@ async fn community_ticks_write_rows_and_stay_gated() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(beats, 5, "coverage marked only for the captured streams");
+    assert_eq!(beats, 6, "coverage marked only for the captured streams");
     run_once(
         Kind::Scorecard,
         &pool,
@@ -839,12 +838,11 @@ async fn community_ticks_write_rows_and_stay_gated() {
         .expect("drop disposable test database");
 }
 
-/// Only streams with a live writer are marked: one Monday tick with
-/// `event_attended`, both voice streams, `message_created` and
-/// `rules_accepted` captured leaves five heartbeats, and the run fails
-/// closed — `incomplete`, never `complete` — naming the one uncaptured
-/// stream. Under production defaults the degraded run records one
-/// `INGESTION_INCOMPLETE` alert, and the retry tick does not duplicate it.
+/// Only streams with a live writer are marked: one Monday tick with all six
+/// streams captured leaves six heartbeats, and the run completes —
+/// `complete`, never `incomplete` — with no missing-stream errors. Under
+/// production defaults the complete run records no alert (insufficient
+/// evidence never notifies), and the retry tick does not duplicate the run.
 #[tokio::test]
 #[ignore = "needs a disposable test database; routed to a check.yml step"]
 async fn scorecard_marks_only_captured_streams() {
@@ -898,6 +896,7 @@ async fn scorecard_marks_only_captured_streams() {
         beats,
         [
             "event_attended",
+            "member_joined",
             "message_created",
             "rules_accepted",
             "voice_session_ended",
@@ -910,7 +909,7 @@ async fn scorecard_marks_only_captured_streams() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(runs, 1, "one degraded run across the retry tick");
+    assert_eq!(runs, 1, "one complete run across the retry tick");
     let (coverage_state, scorecard_json): (String, String) = sqlx::query_as(
         "SELECT coverage_state, scorecard_json FROM community_scorecard_runs WHERE guild_id=$1",
     )
@@ -918,26 +917,22 @@ async fn scorecard_marks_only_captured_streams() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(coverage_state, "incomplete");
+    assert_eq!(coverage_state, "complete");
     let scorecard: Value = serde_json::from_str(&scorecard_json).expect("valid JSON");
-    assert_eq!(scorecard["coverageState"], "incomplete");
-    assert!(scorecard["weeklyActiveHumans"].is_null());
+    assert_eq!(scorecard["coverageState"], "complete");
+    assert_eq!(scorecard["weeklyActiveHumans"], serde_json::json!(0));
     let errors = scorecard["ingestionErrors"]
         .as_array()
         .expect("ingestion errors array");
-    {
-        let stream = "member_joined";
-        assert!(
-            errors
-                .iter()
-                .any(|e| e == &json!(format!("missing_stream_coverage:{stream}"))),
-            "uncaptured {stream} is named"
-        );
-    }
+    assert!(
+        errors.is_empty(),
+        "all six streams captured, no missing-stream errors: {errors:?}"
+    );
     for stream in [
         "event_attended",
         "message_created",
         "rules_accepted",
+        "member_joined",
         "voice_session_started",
         "voice_session_ended",
     ] {
@@ -948,21 +943,111 @@ async fn scorecard_marks_only_captured_streams() {
             "the captured {stream} stream is not flagged"
         );
     }
-    assert_eq!(scorecard["intervention"]["code"], "INGESTION_INCOMPLETE");
+    assert_eq!(
+        scorecard["intervention"]["code"],
+        "none_insufficient_evidence"
+    );
     let alert_keys: Vec<String> =
         sqlx::query_scalar("SELECT alert_key FROM community_scorecard_alerts WHERE guild_id=$1")
             .bind(guild)
             .fetch_all(&pool)
             .await
             .unwrap();
-    let week = &scorecard["weekStart"].as_str().expect("week start")[..10];
-    assert_eq!(
-        alert_keys,
-        [format!("INGESTION_INCOMPLETE:{week}:contract")],
-        "one deduplicated alert across the retry tick"
+    assert!(
+        alert_keys.is_empty(),
+        "insufficient-evidence never notifies: {alert_keys:?}"
     );
 
     mock.shutdown().await;
+    fixture
+        .close()
+        .await
+        .expect("drop disposable test database");
+}
+
+/// One gateway join persists exactly one `member_joined` fact: the
+/// invite-attributed source and inviter survive the round trip, and a
+/// redelivered burst loses the idempotency race (`record_fact` returns
+/// `false`), so retried joins never inflate counts.
+#[tokio::test]
+#[ignore = "needs a disposable test database; routed to a check.yml step"]
+async fn member_join_fact_round_trip_dedupes() {
+    use two_bot_core::community_store::{member_join_fact, member_join_metadata, record_fact};
+    use two_bot_core::{classify, ClassifyInput};
+
+    let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+        assert!(
+            std::env::var("GITHUB_ACTIONS").is_err(),
+            "CI must supply the guarded test database"
+        );
+        eprintln!("SKIP community job integration: TWO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("create migrated agent-testdb fixture");
+    let pool = fixture.pool().clone();
+    let guild = "3333";
+    let actor = ClassifyInput {
+        guild_id: guild.to_owned(),
+        actor_id: "7001".to_owned(),
+        is_bot: false,
+        webhook_id: None,
+        is_staff_automation: false,
+        is_raid: false,
+        is_staging: false,
+        is_test: false,
+    };
+    let config = ClassifierConfig::from_map(&HashMap::new());
+    let verdict = classify(&config, &actor);
+    assert_eq!(verdict.classification, "eligible_human");
+    // The gateway event id is `guild:member:joined_at`, mirroring the
+    // `MemberAdd` path in `two-bot-discord`'s pipeline.
+    let occurred_at = "2026-09-20T12:00:00.000Z";
+    let write = member_join_fact(
+        guild,
+        &actor,
+        occurred_at,
+        "3333:7001:2026-09-20T12:00:00.000Z",
+        "invite:abc",
+        verdict,
+        member_join_metadata(Some(9001)),
+    );
+    assert_eq!(
+        write.idempotency_key,
+        "member-join:3333:7001:2026-09-20T12:00:00.000Z",
+    );
+    assert!(
+        record_fact(&pool, &write)
+            .await
+            .expect("first join inserts"),
+        "first join wins the idempotency race"
+    );
+    assert!(
+        !record_fact(&pool, &write).await.expect("retry dedupes"),
+        "a redelivered burst returns false, never a second row"
+    );
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM community_facts WHERE guild_id=$1 AND event_type='member_joined'",
+    )
+    .bind(guild)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 1, "exactly one fact row for the join");
+    let (source, metadata): (String, Option<String>) =
+        sqlx::query_as("SELECT source, metadata FROM community_facts WHERE idempotency_key=$1")
+            .bind(&write.idempotency_key)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(source, "invite:abc");
+    assert_eq!(
+        metadata.as_deref(),
+        Some("{\"inviterId\":\"9001\"}"),
+        "the inviter attribution survives the round trip"
+    );
+
     fixture
         .close()
         .await

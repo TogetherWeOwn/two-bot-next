@@ -45,17 +45,20 @@ pub const COMMUNITY_FACT_TYPES: [&str; 6] = [
 /// `voice_session_ended` (gateway voice frames via
 /// `community_store::record_voice_started_fact` /
 /// `community_store::record_voice_ended_fact`), `message_created`
-/// (gateway `MessageCreate` via `community_store::record_message_fact`) and
-/// `rules_accepted` (gate-clear drain via the community-facts sink); join
-/// capture lands in a later slice. This must
+/// (gateway `MessageCreate` via `community_store::record_message_fact`),
+/// `rules_accepted` (gate-clear drain via the community-facts sink) and
+/// `member_joined` (gateway joins via `handlers::on_join`, buffered in the
+/// community-facts sink and persisted with `community_store::member_join_fact` +
+/// `record_fact`). This must
 /// always equal the `Some` rows of [`STREAM_WRITERS`]; the
 /// `captured_streams_match_live_writers` guard fails otherwise.
-pub const CAPTURED_STREAMS: [&str; 5] = [
+pub const CAPTURED_STREAMS: [&str; 6] = [
     "event_attended",
     "voice_session_started",
     "voice_session_ended",
     "message_created",
     "rules_accepted",
+    "member_joined",
 ];
 
 /// Capture registry: every fact stream with the production writer that appends
@@ -77,7 +80,7 @@ pub const STREAM_WRITERS: [(&str, Option<&str>); 6] = [
         "voice_session_ended",
         Some("community_store::record_voice_ended_fact"),
     ),
-    ("member_joined", None),
+    ("member_joined", Some("handlers::on_join")),
     ("event_attended", Some("rsvp_store::record_checkin")),
     (
         "rules_accepted",
