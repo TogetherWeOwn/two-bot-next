@@ -193,6 +193,12 @@ jobs:
       - name: Guard channel CI database routing and job isolation
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_channel_ci.py' -v
 
+      # The nightly sweep runs on schedule, not per PR, so its fixture-routing
+      # guard runs here: a new guarded #[ignore] fixture must get its broad-sweep
+      # --skip in the same PR (offline, milliseconds).
+      - name: Guarded fixture routing for the nightly sweep (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
+
       - name: Scratch drill schema provenance (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_restore_drill_schema.py' -v
 
@@ -208,6 +214,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_evidence.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_gate5_outage.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_watch_checkpoint_doc_conformance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_voice_config_apply_doc_conformance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_sanitize_evidence_rows.py' -v
 
       - name: staging E2E run-record template (offline)
@@ -296,6 +303,14 @@ jobs:
       - name: channel moderation store clippy
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
+
+      # Rustdoc warnings used to surface only in the nightly sweep, which no
+      # longer runs per PR; reuses the clippy build artifacts.
+      - name: cargo doc -D warnings
+        if: needs.job-inputs.outputs.rust != 'false'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --locked
 
       # NOTE: cargo-deny runs before the toolchain install and every compile
       # step (disk hygiene); do not re-add it later in this job.
@@ -712,6 +727,16 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test leveling_runtime -- --ignored --test-threads=1
+
+      - name: community voice fact capture (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test leveling_runtime community_voice_fact_capture_round_trip -- --ignored --test-threads=1
+
+      - name: community voice fact round trip (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-core --features db --locked --lib community_store::tests::voice_session_start_end_round_trip_is_idempotent -- --ignored
 
       - name: community message fact capture (CI service only)
         env:

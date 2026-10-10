@@ -249,6 +249,16 @@ pub fn companion_view_grant(member_id: Snowflake) -> Option<PermissionOverwrite>
 }
 
 /// Sanitized errors: never surface HTTP bodies/tokens/member data in diagnostics.
+/// Upper bound for one rename request (admission plus Discord round trip).
+pub const RENAME_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound for one voice-status request (send admission plus the
+/// Discord round trip).
+pub const VOICE_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Discord's voice channel status limit.
+pub const MAX_VOICE_STATUS_CHARS: usize = 500;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RoomHttpError {
     #[error("Discord rate limit; retry after {retry_after_ms}ms")]
@@ -968,6 +978,30 @@ impl RoomHttp {
         serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)
     }
 
+    /// Set (or clear with `""`) a voice channel's status line: Discord's
+    /// `PUT /channels/{channel.id}/voice-status`, which needs Set Voice Channel
+    /// Status. Bounded like renames; the caller keeps only the latest text.
+    pub async fn set_room_voice_status(
+        &self,
+        channel_id: Snowflake,
+        status: &str,
+    ) -> Result<(), RoomHttpError> {
+        if channel_id == 0 || status.chars().count() > MAX_VOICE_STATUS_CHARS {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let request = twilight_http::request::RequestBuilder::raw(
+            twilight_http::request::Method::Put,
+            format!("channels/{channel_id}/voice-status"),
+        )
+        .json(&serde_json::json!({ "status": status }))
+        .build()
+        .map_err(|_| RoomHttpError::InvalidRequest)?;
+        tokio::time::timeout(VOICE_STATUS_REQUEST_TIMEOUT, self.send(request, || true))
+            .await
+            .map_err(|_| RoomHttpError::RenameDeferred)??;
+        Ok(())
+    }
+
     pub async fn rename_room(
         &self,
         channel_id: Snowflake,
@@ -984,7 +1018,10 @@ impl RoomHttp {
             .map_err(classify_http_error)?;
         // Bounded even for a stalled transport: rename budgets are charged on
         // attempt, including an unknown outcome. The queue keeps its latest name.
-        tokio::time::timeout(Duration::from_secs(1), self.send(request, || true))
+        // The bound covers durable send admission plus the Discord round trip,
+        // which together exceed one second in production. The guild actor
+        // waits at most one second of it; the rest runs on its own task.
+        tokio::time::timeout(RENAME_REQUEST_TIMEOUT, self.send(request, || true))
             .await
             .map_err(|_| RoomHttpError::RenameDeferred)??;
         Ok(())

@@ -306,8 +306,9 @@ fn snapshot_succeeds_on_partial_input_with_explicit_marks() {
 #[test]
 fn snapshot_marks_non_nested_ladder_without_failing() {
     // A higher rank without every lower rung still builds; the snapshot
-    // carries nested=false and the publish layer maps it to
-    // RankSkip::RanksNotNested (writes nothing) instead of publishing.
+    // carries nested=false and the rank tick self-heals it (plan_rank_heal)
+    // before publishing. Only a ladder that is still bad afterwards maps
+    // to RankSkip::RanksNotNested (writes nothing) instead of publishing.
     let snapshot = build_community_snapshot(
         &[member(
             "broken",

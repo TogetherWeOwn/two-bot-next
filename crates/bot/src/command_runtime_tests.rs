@@ -1565,6 +1565,7 @@ async fn dispatch_remaining_ready_wakes_tickets_and_survives_failed_lookup() {
                 staff_role_id: "300".into(),
                 cooldown_seconds: 15,
             },
+            std::collections::HashMap::new(),
         )
         .unwrap(),
     );

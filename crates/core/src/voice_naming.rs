@@ -979,6 +979,21 @@ pub fn render<E: ExtensionPolicy>(template: &Template, ctx: &RoomContext, ext: &
     out
 }
 
+/// Render free text rather than a channel name (a voice status line): the
+/// same evaluation, trimmed and cut to `max_chars` characters, with no
+/// fallback, so the result may be empty.
+pub fn render_text<E: ExtensionPolicy>(
+    template: &Template,
+    ctx: &RoomContext,
+    ext: &E,
+    max_chars: usize,
+) -> String {
+    let rendered = Evaluation::new(ctx, ext).evaluate(template);
+    truncate_chars(rendered.trim(), max_chars)
+        .trim_end()
+        .to_string()
+}
+
 /// Parse and render in one step with the V5 passthrough extension policy.
 pub fn render_str(input: &str, ctx: &RoomContext) -> String {
     render(&parse(input), ctx, &PassthroughExtensions)
