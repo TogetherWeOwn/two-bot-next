@@ -61,15 +61,25 @@ totals after event cancellation or deletion, without requiring a live-event look
 | RA-02 | Resolve the supplied occurrence through a trusted, guild-scoped event/occurrence binding, not arbitrary caller text. Preserve runtime **Manage Events** authority for every `/attendance` host check-in, including when the actor selects themself, and verify the selected target's current guild membership. Selecting oneself must not create an unprivileged self-check-in path or downgrade `AttendanceProof::HostCheckin`. | Unknown/cross-event occurrences, forged user IDs, cross-guild targets and unauthorized host check-ins create no attendance or audit rows. Explicitly test unauthorized self and on-behalf refusals, and authorized self and on-behalf paths that retain HostCheckin proof. |
 | RA-03 | Bound admissions and storage growth even for valid events: pin per-user rate/cap limits and occurrence bounds, deduplicate retries, and define retention for RSVP and audit rows without deleting required recovery/audit evidence. Keep validation and writes race-safe. | Burst, duplicate and concurrent requests have bounded row counts. Event/occurrence removal or membership loss between lookup and write is refused under the chosen consistency contract; lookup/store errors do not become successful check-ins. |
 
-The current [`event-occurrence` command contract](commands.md#attendance) accepts
-a scheduled-event ID or a free-text occurrence ID. The
-[parity contract](parity.md) permits only the documented length bound and picker
-copy changes, not removal of those accepted formats. RA-02 therefore requires a
-hardening PR to define and test trusted event/occurrence resolution for both
-formats. Restricting input to Discord-derived IDs instead requires an explicit
-parity decision, a recorded intentional difference and coordinated command
-reference, fixture and regression updates. This checklist grants no such waiver
-and does not change the accepted formats.
+The current [`event-occurrence` command contract](commands.md#attendance) states
+the trusted rule: a bare scheduled-event id binds the event itself, any other
+text must anchor as `{event_id}:{label}`, and bare slugs refuse. The
+[parity contract](parity.md) records the bare-slug refusal as an intentional
+security difference; the anchored free-text format is preserved, not removed.
+Trusted resolution is defined and tested by the RA-02 hardening change, pinned
+by `crates/core/src/rsvp.rs::tests::attendance_occurrence_binds_every_format_to_a_live_event_anchor`
+(shape, refusal classes, no-echo refusal) and the
+`crates/discord/tests/rsvp_runtime.rs` acceptance battery
+(`unknown_and_cross_guild_occurrences_refuse_without_writes`,
+`host_checkin_authorized_self_and_on_behalf_retain_host_checkin_proof`,
+`permissions_gates_and_guild_fence_precede_store_access`,
+`malformed_inputs_and_failed_ack_do_not_write`,
+`non_member_and_unverifiable_targets_refuse_without_writes`), which assert zero
+attendance/audit writes on every refusal. Restricting input further to
+Discord-derived IDs alone would still require an explicit parity decision, a
+recorded intentional difference and coordinated command reference, fixture and
+regression updates. This checklist grants no such waiver and does not change
+the accepted formats.
 
 The store functions above are persistence primitives, not permission checks.
 Exercise the actual interaction-to-store path with a disposable test database;
