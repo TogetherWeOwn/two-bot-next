@@ -347,32 +347,49 @@ this command into unattended cron cleanup.
 Per-slot checks veto on positive attribution only: a lexical path inside the
 slot's `target`/`scratch`, or a `(device, inode)` identity in that slot's
 output. The whole-run check refuses a deleted entry attributable to no held
-slot, with one provable exception: **different-filesystem exclusion**. One
-filesystem's unlinked inode can never be another filesystem's file, so a
-stat-backed (fd/cwd/exe) deleted entry whose device appears in no held slot
-output is provably unable to reference slot output. Such entries are excluded
-and counted in the receipt as `excluded_deleted_references` — never silently
-dropped. Maps entries are never device-excluded: the kernel prints the
-superblock device there, which need not equal the stat device for the same
-file (btrfs per-subvolume anon_dev, pre-6.8 overlayfs). The one maps exception
-is identity, not device: a deleted path that cannot be a regular file at all —
-a `/SYSV<key>` shared-memory segment or `/dev/zero` — cannot alias slot output
-and is excluded by identity (PostgreSQL backends map both, so without this
-rule those ubiquitous shared-host mappings refuse every run). Everything else
-stays fail-closed: same-filesystem unattributed entries (a deleted slot file
-held open is indistinguishable from an unrelated same-filesystem temp file),
-device-unknown entries, incomplete/denied scans, and any run where a held
-slot's output device is unreadable (then nothing is device-excluded).
+slot, with two provable exceptions:
+
+- **Different-filesystem exclusion.** One filesystem's unlinked inode can
+  never be another filesystem's file, so a stat-backed deleted entry whose
+  device appears in no held slot output is provably unable to reference slot
+  output. fd/cwd/exe entries are stat-backed by construction. A file-backed
+  maps entry is re-grounded through `/proc/PID/map_files/<range>` — a symlink
+  to the mapped file itself whose fstat device/inode compare exactly like fd
+  stat — and becomes stat-backed too. Such entries are excluded and counted
+  in the receipt as `excluded_deleted_references` — never silently dropped.
+  Maps entries with no map_files stat (anonymous object, hidepid, exit/munmap
+  race) keep the kernel-printed superblock device, which need not equal the
+  stat device for the same file (btrfs per-subvolume anon_dev, pre-6.8
+  overlayfs), so a "foreign" maps device there proves nothing and stays
+  fail-closed.
+- **Non-file identity exclusion.** A deleted path that cannot be a regular
+  file at all cannot alias slot output and is excluded by identity: SYSV IPC
+  shared-memory segments (`/SYSV<key>`), `/dev/zero`, memfd anonymous RAM
+  files (`/memfd:<name>`), async-IO contexts (`[aio]`, container-spelled
+  `/[aio]`), `anon_inode:` objects, and bracketed anonymous kernel mappings
+  (`[heap]`, `[stack]`, `[anon:…]`). Browsers, PostgreSQL backends, and
+  language runtimes map these ubiquitously, so without this rule shared-host
+  mappings refuse every run. The bracket rule only matches a path whose whole
+  name past an optional leading slash is bracketed; slot outputs always carry
+  absolute paths under slot target/scratch directories (checked by lexical
+  attribution first), so no regular file can match.
+
+Everything else stays fail-closed: same-filesystem unattributed entries (a
+deleted slot file held open is indistinguishable from an unrelated
+same-filesystem temp file), device-unknown entries, incomplete/denied scans
+(including denied map_files reads), and any run where a held slot's output
+device is unreadable (then nothing is device-excluded).
 
 Limitations: unrelated deleted files on the *same* filesystem as slot output
-still refuse the whole run — as do all other maps deleted entries that
-attribute to no slot (including real tmpfs paths such as `/dev/shm` files,
-whose non-aliasing cannot be proven without mount-namespace analysis) —
-quiesce writers or supply an independently verified exact-path
-process-reference receipt instead. Exclusion assumes no filesystem topology
-change under held slots during the bounded run (all locks are held
-throughout). The read-only legacy `audit` keeps the strict global rule except
-for the same non-file identity exclusion; only `retain` partitions by device.
+still refuse the whole run — as do maps deleted entries with no map_files
+entry that attribute to no slot (including real tmpfs paths such as
+`/dev/shm` files, whose non-aliasing cannot be proven without
+mount-namespace analysis) — quiesce writers or supply an independently
+verified exact-path process-reference receipt instead. Exclusion assumes no
+filesystem topology change under held slots during the bounded run (all locks
+are held throughout). The read-only legacy `audit` keeps the strict global
+rule except for the same non-file identity exclusion; only `retain`
+partitions by device.
 
 ### Bounded TWO-only build/dispatch admission hold (and undo)
 
