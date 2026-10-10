@@ -25,19 +25,25 @@ DOC = ROOT / "docs/soak-entry-gates.md"
 TOOL = ROOT / "scripts/gate5_outage.py"
 
 
+def folded(section: str) -> str:
+    """Section with line wraps collapsed, so reflow alone never fails the pin."""
+    return re.sub(r"\s+", " ", section)
+
+
 def gate5_section() -> str:
-    """Gate 5 section text (from its heading to the next top-level heading)."""
+    """Gate 5 section text, wraps collapsed so reflow alone never fails the pin.
+
+    Markdown line breaks inside a code span render as a space, so the raw
+    section would fail on reflow-only edits. Folding here keeps every caller
+    reflow-insensitive; calling folded() again on the result is idempotent.
+    """
     text = DOC.read_text(encoding="utf-8")
     marker = "## Gate 5"
     start = text.index(marker)
     rest = text[start + len(marker):]
     end = rest.find("\n## ")
-    return rest if end == -1 else rest[:end]
-
-
-def folded(section: str) -> str:
-    """Section with line wraps collapsed, so reflow alone never fails the pin."""
-    return re.sub(r"\s+", " ", section)
+    raw = rest if end == -1 else rest[:end]
+    return folded(raw)
 
 
 def run_cli(content: bytes, *args: str):
