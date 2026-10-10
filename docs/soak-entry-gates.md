@@ -151,6 +151,25 @@ and historical records remain intact.
   actual outage start to verified recovery. Deploy-finish-to-first-ready remains
   a separate workflow interval and cannot substitute for that recovery
   measurement.
+- Measure outage-start-to-recovery offline with `scripts/gate5_outage.py`
+  (fixtures only; it never touches staging or production):
+  `python3 scripts/gate5_outage.py tick-log.jsonl --interval-start START --interval-end END`,
+  where `START`/`END` are the UTC acceptance-interval bounds from the approved
+  soak record. Input is JSONL, one object per line in time order, each with a
+  UTC-offset `ts` and an `event`: `readyz_ok` (recovery), `readyz_fail`
+  (outage start, with a non-200 `status`), or `tick_missed` (outage start).
+  Fail-closed: PASS needs declared-interval coverage (first record no more than
+  60 s after the interval start, last record at or after the interval end) with
+  no silent gap over 60 s and no unknown intervals; a window still open at the
+  log end stays UNKNOWN (`end: null`, `outage_seconds: null`, with
+  `outage_seconds_min` as the lower bound); missing evidence is NOT VERIFIED,
+  never PASS; a recovered outage at or over 60 s, or an open window already
+  reaching 60 s, is NEEDS WORK. Exit status is nonzero unless the verdict is
+  PASS, so CI and wrappers fail closed. The tool reads a committed JSONL tick
+  log; there is no live producer. A pass verifies offline reconciliation only;
+  it does not prove a deployed build, live event coverage or staging
+  acceptance, so the Gate 5 recovery measurement stays NOT VERIFIED until a
+  reviewed log source exists.
 - The staging deploy workflow documents a **95–139-second gateway drop per
   deploy**, and a separate historical staging note records a **92–139-second
   redeploy**. These are documented historical interruption ranges, not a

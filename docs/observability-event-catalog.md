@@ -29,6 +29,7 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `gateway leveling dispatch failed` | `crates/bot/src/gateway.rs:609` | Leveling funnel drain failed inside the checkpoint deadline |
 | `gateway community facts dispatch failed` | `crates/bot/src/gateway.rs:957` | Community facts drain failed; worker continues and the scorecard fails closed on missing coverage |
 | `gateway community facts dispatch timed out` | `crates/bot/src/gateway.rs:960` | Community facts drain missed the checkpoint deadline; worker continues and the scorecard fails closed on missing coverage |
+| `gateway onboarding job invalid` | `crates/bot/src/gateway.rs:1066` | Dispatch-worker durable onboarding payload failed to serialize; recorded as a typed error, checkpoint unchanged |
 | `onboarding interaction interrupted; member must reselect` | `crates/bot/src/gateway.rs:791` | Durable onboarding job recovered without callback credentials; kept as interruption receipt |
 | `invite counter read unavailable; retaining snapshot` | `crates/bot/src/gateway.rs:899` | REST invite read failed; persisted baseline kept instead of an empty listing |
 | `interaction acknowledgement blocked; advancing past lost callback` | `crates/bot/src/gateway.rs:287` | Ordered RSVP acknowledgement hit send-admission Blocked; checkpoint advances past the lost callback without replaying uncertain effects |
@@ -58,7 +59,7 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 
 ## Gateway metric event labels
 
-Fixed allowlist in `crates/core/src/metrics.rs:11-30`, observed in
+Fixed allowlist in `crates/core/src/metrics.rs:11-32`, observed in
 `crates/bot/src/gateway_metrics.rs:27-42`. Unknown dispatch types
 collapse to `other`; scrapers must match these exact spellings.
 
@@ -75,6 +76,8 @@ collapse to `other`; scrapers must match these exact spellings.
 | `MESSAGE_CREATE` | `two_bot_gateway_events_total` | Message created dispatch |
 | `MESSAGE_UPDATE` | `two_bot_gateway_events_total` | Message edited dispatch |
 | `MESSAGE_DELETE` | `two_bot_gateway_events_total` | Message deleted dispatch |
+| `MESSAGE_REACTION_ADD` | `two_bot_gateway_events_total` | Reaction added dispatch (self-role lane) |
+| `MESSAGE_REACTION_REMOVE` | `two_bot_gateway_events_total` | Reaction removed dispatch (self-role lane) |
 | `VOICE_STATE_UPDATE` | `two_bot_gateway_events_total` | Voice state changed dispatch |
 | `INVITE_CREATE` | `two_bot_gateway_events_total` | Invite created dispatch |
 | `INVITE_DELETE` | `two_bot_gateway_events_total` | Invite deleted dispatch |

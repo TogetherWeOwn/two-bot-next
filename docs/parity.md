@@ -26,7 +26,7 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 9 | `/slowmode` | `seconds` Int 0–21600 req, `reason` req | `ManageChannels` | **S4** |
 | 10 | `/lockdown` | `reason` req (current channel) | `ManageChannels` | **S4** |
 | 11 | `/unlock` | `reason` req (current channel) | `ManageChannels` | **S4** |
-| 12 | `/attendance` (scorecard) | `event-occurrence` String req, `member` User req | `ManageEvents` | **S4**. Known defect to fix in port: name collides with #25 — both land in `additionalBuiltins` and collide on `guild.commands.set` |
+| 12 | `/attendance` (scorecard) | `event-occurrence` String req, `member` User req | `ManageEvents` | **S4**. Known defect to fix in port: name collides with #25 — both land in `additionalBuiltins` and collide on `guild.commands.set`. Intentional security difference: a bare slug refuses — only a bare scheduled-event id (which binds the event itself) or `{event_id}:{label}` records; the anchored free-text format is otherwise preserved |
 | 13 | `/rota-acknowledge` | `message-link` String req | `ManageGuild` + must be configured primary actor | **DROP** — staging-only rota measurement experiment, never enabled in prod; re-enable on demand post-cutover |
 | 14 | `/command` | `name` req, `template` req (`{user} {username} {server} {channel}`), `description` opt, `text-trigger` opt | `ManageGuild` (builder + runtime) | **S4** |
 | 15 | `/command-remove` | `name` req | `ManageGuild` | **S4** |
@@ -79,7 +79,7 @@ golden exception or a claim of whole-baseline registry parity.
 | `timeout` | docs/parity.md §1 #6 duration ceiling | Advertise only `max_value` 2419200 on `duration_seconds`, matching Discord's 28-day cap; every other field stays legacy-identical. |
 | `rota-acknowledge` | docs/parity.md §1 #13 / §9 drop 1 | Remove the staging-only command; no replacement. |
 | `help` | docs/parity.md §1 help | Add the Next-only `/help` discovery command (no legacy counterpart): always published, open to everyone, guild-only, no options. Answers from the live publish set with grouped permission hints. |
-| `attendance` | docs/parity.md §1 #12 copy | Picker copy only: description names the scorecard check-in, and `event-occurrence` says where to find the id with an example. Options, bounds and permissions stay legacy-identical. |
+| `attendance` | docs/parity.md §1 #12 copy | Picker copy only: description names the scorecard check-in, and `event-occurrence` states the trusted occurrence rule (bare event id binds that event, other text anchors as `{event_id}:{label}`, bare slugs refuse) with an example. Options, bounds and permissions stay legacy-identical. |
 | `rsvp` | docs/parity.md §1 #24 copy | Picker copy only: `event-id` says where to find the id with an example. Options, bounds and permissions stay legacy-identical. |
 | `rsvp-attendance` | docs/parity.md §1 #25 copy | Picker copy only: description drops the legacy bot name, and `event-id` says where to find the id with an example. Options, bounds and permissions stay legacy-identical. |
 | `lfg` | docs/parity.md §1 #26 copy | Picker copy only: `starts-at` shows an ISO-8601 example and `roles` documents the `role:Label:count` format with an example. Options, bounds and permissions stay legacy-identical. |
