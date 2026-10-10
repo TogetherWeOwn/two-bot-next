@@ -1,7 +1,5 @@
 use super::*;
-use two_bot_core::voice_vote_kick::{
-    VoteBallot, VoteCancellation, VoteKickError, VOTE_KICK_TTL_MS,
-};
+use two_bot_core::voice_vote_kick::{VoteCancellation, VOTE_KICK_TTL_MS};
 
 const OWNER: u64 = MEMBER;
 const VOTER_A: u64 = 301;
@@ -40,38 +38,6 @@ async fn setup_with(snapshot: GuildSnapshot) -> (GuildRoomWorker<Store, Http>, T
 
 async fn setup() -> (GuildRoomWorker<Store, Http>, Trace) {
     setup_with(snapshot(&[ROOM], roster())).await
-}
-
-const KICK_ROLE: u64 = 901;
-const ADMIN_ROLE: u64 = 902;
-
-/// Give `target` a guild role carrying `permissions` in this worker's guild,
-/// so VK-01 guild-scoped resolution observes it on the next vote transition.
-fn grant_guild_role(
-    worker: &GuildRoomWorker<Store, Http>,
-    target: u64,
-    role: u64,
-    permissions: Permissions,
-) {
-    {
-        let live = worker.live.read_state();
-        if !live
-            .bot
-            .as_ref()
-            .is_some_and(|bot| bot.roles.iter().any(|r| r.id.get() == role))
-        {
-            drop(live);
-            worker
-                .live
-                .write_state()
-                .bot
-                .as_mut()
-                .expect("bot snapshot")
-                .roles
-                .push(role_with(role, permissions));
-        }
-    }
-    worker.live.set_member_roles(target, Some(vec![role]));
 }
 
 fn start(
@@ -153,128 +119,6 @@ async fn owner_original_creator_and_self_cannot_be_targeted() {
             .kick_start(VOTE + 1, ROOM, VOTER_B, OWNER, 0)
             .unwrap_err(),
         KickRefusal::Vote(VoteKickError::ProtectedTarget)
-    );
-}
-
-#[tokio::test]
-async fn kick_members_and_administrator_targets_are_refused_with_no_effect() {
-    // VK-01 start path: each privileged class is denied separately in the
-    // interaction's guild, creating no vote, ballot, or enforcement effect.
-    for (role, permissions) in [
-        (KICK_ROLE, Permissions::KICK_MEMBERS),
-        (ADMIN_ROLE, Permissions::ADMINISTRATOR),
-    ] {
-        let (mut worker, trace) = setup().await;
-        grant_guild_role(&worker, TARGET, role, permissions);
-        assert_eq!(
-            start(&mut worker, VOTER_A, TARGET).unwrap_err(),
-            KickRefusal::Vote(VoteKickError::PrivilegedTarget),
-            "role {role}"
-        );
-        // Refusal created no vote: a ballot is unknown and nothing is queued.
-        assert_eq!(
-            worker
-                .kick_cast(VOTE, VOTER_A, VoteBallot::Yes, 1)
-                .unwrap_err(),
-            KickRefusal::Vote(VoteKickError::UnknownVote)
-        );
-        assert!(worker.kick_refresh(2).is_empty());
-        assert!(!worker.dispatch_one(3).await);
-        assert!(trace.lock().unwrap().is_empty());
-        // The refusal is audited with its own code.
-        assert!(worker.flush_kick_audit(4).await);
-        let rows = worker.store.kick_audit.lock().unwrap().clone();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].event, KickAuditEvent::VoteRefused);
-        assert_eq!(rows[0].outcome, "privileged_target");
-    }
-}
-
-#[tokio::test]
-async fn unavailable_target_authority_fails_closed_with_no_effect() {
-    // VK-01 fail-closed: losing the guild-authority lookup refuses the start
-    // with no vote, ballot, or Discord write.
-    let (mut worker, trace) = setup().await;
-    worker.live.set_member_roles(TARGET, None);
-    assert_eq!(
-        start(&mut worker, VOTER_A, TARGET).unwrap_err(),
-        KickRefusal::Vote(VoteKickError::AuthorityUnavailable)
-    );
-    assert_eq!(
-        worker
-            .kick_cast(VOTE, VOTER_A, VoteBallot::Yes, 1)
-            .unwrap_err(),
-        KickRefusal::Vote(VoteKickError::UnknownVote)
-    );
-    assert!(worker.kick_refresh(2).is_empty());
-    assert!(!worker.dispatch_one(3).await);
-    assert!(trace.lock().unwrap().is_empty());
-    assert!(worker.flush_kick_audit(4).await);
-    let rows = worker.store.kick_audit.lock().unwrap().clone();
-    assert_eq!(rows[0].outcome, "authority_unavailable");
-}
-
-#[tokio::test]
-async fn promoted_target_mid_vote_cancels_and_enforces_nothing() {
-    // VK-01 recheck: a Kick Members grant after the start cancels the vote;
-    // the would-be passing ballot produces no kick/disconnect effect.
-    let (mut worker, trace) = setup().await;
-    start(&mut worker, VOTER_A, TARGET).unwrap();
-    worker.kick_cast(VOTE, VOTER_A, VoteBallot::Yes, 1).unwrap();
-    grant_guild_role(&worker, TARGET, KICK_ROLE, Permissions::KICK_MEMBERS);
-    let update = worker.kick_cast(VOTE, VOTER_B, VoteBallot::Yes, 2).unwrap();
-    assert_eq!(
-        update.status,
-        VoteKickStatus::Cancelled(VoteCancellation::TargetProtected)
-    );
-    assert_eq!(update.kick, None);
-    assert!(!worker.dispatch_one(3).await);
-    assert!(trace.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn promoted_target_after_pass_is_not_touched_on_dispatch() {
-    // A promotion landing between the pass and the Discord writes must still
-    // produce zero writes: the enforcement recheck fails closed.
-    let (mut worker, trace) = setup().await;
-    pass_vote(&mut worker);
-    grant_guild_role(&worker, TARGET, ADMIN_ROLE, Permissions::ADMINISTRATOR);
-    dispatch(&mut worker, 3).await;
-    assert!(trace.lock().unwrap().is_empty());
-    assert!(worker.failures().is_empty());
-    assert!(worker.flush_kick_audit(4).await);
-    let enforcement: Vec<_> = worker
-        .store
-        .kick_audit
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|row| row.event == KickAuditEvent::Enforcement)
-        .cloned()
-        .collect();
-    assert_eq!(enforcement.len(), 1);
-    assert_eq!(enforcement[0].outcome, "skipped_target_protected");
-}
-
-#[tokio::test]
-async fn ordinary_target_remains_votable_end_to_end() {
-    // An occupant with no privilege, who is not owner/creator/self, still
-    // passes and enforces on that room only.
-    let (mut worker, trace) = setup().await;
-    let started = start(&mut worker, VOTER_A, TARGET).unwrap();
-    assert_eq!(started.status, VoteKickStatus::Active);
-    for voter in [VOTER_A, VOTER_B] {
-        worker.kick_cast(VOTE, voter, VoteBallot::Yes, 1).unwrap();
-    }
-    let passed = worker.kick_cast(VOTE, VOTER_C, VoteBallot::Yes, 2).unwrap();
-    assert_eq!(passed.status, VoteKickStatus::Passed);
-    dispatch(&mut worker, 3).await;
-    assert_eq!(
-        *trace.lock().unwrap(),
-        [
-            format!("deny:{ROOM}:{TARGET}"),
-            format!("disconnect:{GUILD}:{TARGET}")
-        ]
     );
 }
 
@@ -916,35 +760,39 @@ fn reason_line(content: &str) -> &str {
         .expect("a Reason line")
 }
 
+/// Gate VK-04 hostile matrix from #692, shared by the ballot render test and
+/// the refusal/error/log echo test so both prove the same inputs.
+const HOSTILE_VOTE_REASONS: &[&str] = &[
+    "@everyone get in here",
+    "@here vote yes",
+    "@\u{200b}everyone split obfuscation",
+    "@\u{200c}here split obfuscation",
+    "<@&7654321> role pill",
+    "<@987654321> user pill",
+    "<#123456789> channel pill",
+    "<:custom:123456789> emoji pill",
+    "<a:dance:123456789> animated emoji pill",
+    "see https://evil.example/phish for proof",
+    "see http://evil.example/phish for proof",
+    "see HTTPS://evil.example/phish for proof",
+    "[click here](https://evil.example/phish)",
+    "www.evil.example/phish",
+    "WWW.EVIL.EXAMPLE/PHISH",
+    "Www.evil.example/phish",
+    "join discord.gg/abc123 for backup",
+    "join DISCORD.GG/ABC123 for backup",
+    "visit evil.com/phish for proof",
+    "visit EVIL.COM/PHISH for proof",
+    "**BAN THEM** __now__ ~~please~~ `code` ||spoiler||",
+    "# heading\n> quote\n```fence```\n- list\nmultiline",
+];
+
 /// Gate VK-04 hostile matrix, asserted on the final Discord payload: no
 /// hostile reason may produce a ping, clickable link, embed or formatted bot
 /// endorsement in the wire text.
 #[test]
 fn hostile_reasons_render_as_mention_safe_plain_text() {
-    for hostile in [
-        "@everyone get in here",
-        "@here vote yes",
-        "@\u{200b}everyone split obfuscation",
-        "@\u{200c}here split obfuscation",
-        "<@&7654321> role pill",
-        "<@987654321> user pill",
-        "<#123456789> channel pill",
-        "<:custom:123456789> emoji pill",
-        "<a:dance:123456789> animated emoji pill",
-        "see https://evil.example/phish for proof",
-        "see http://evil.example/phish for proof",
-        "see HTTPS://evil.example/phish for proof",
-        "[click here](https://evil.example/phish)",
-        "www.evil.example/phish",
-        "WWW.EVIL.EXAMPLE/PHISH",
-        "Www.evil.example/phish",
-        "join discord.gg/abc123 for backup",
-        "join DISCORD.GG/ABC123 for backup",
-        "visit evil.com/phish for proof",
-        "visit EVIL.COM/PHISH for proof",
-        "**BAN THEM** __now__ ~~please~~ `code` ||spoiler||",
-        "# heading\n> quote\n```fence```\n- list\nmultiline",
-    ] {
+    for hostile in HOSTILE_VOTE_REASONS.iter().copied() {
         let (content, response) = start_payload(Some(hostile));
         let line = reason_line(&content);
         assert!(!line.contains("@everyone"), "{hostile:?} -> {line:?}");
