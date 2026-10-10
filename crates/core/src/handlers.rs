@@ -922,10 +922,13 @@ mod tests {
         assert!(bot.event.is_none());
     }
 
+    /// One captured join fact: (source, inviter_id, source_event_id).
+    type JoinRecord = (String, Option<Snowflake>, String);
+
     /// Capturing scorecard sink: records every join fact, including bots.
     #[derive(Debug, Default, Clone)]
     struct JoinSpy {
-        joins: std::sync::Arc<Mutex<Vec<(String, Option<Snowflake>, String)>>>,
+        joins: std::sync::Arc<Mutex<Vec<JoinRecord>>>,
     }
 
     impl FactsSink for JoinSpy {
