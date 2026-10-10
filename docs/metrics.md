@@ -334,6 +334,7 @@ No Prometheus server, no new infrastructure.
 | `send_admission_blocked` | new admission refusals in 3 consecutive samples | [send admission blocked](runbook.md#alert-send-admission-blocked) |
 | `voice_failures` | room-op failures > 5% of >= 10 ops between samples, or any new dead-letter/orphan (restarts skip the window) | [voice failures](runbook.md#alert-voice-failures) |
 | `gateway_missed_events` | any increase of `two_bot_gateway_missed_events_total` between samples (first sample and restarts skip the window) | [gateway missed events](runbook.md#alert-gateway-missed-events) |
+| `gateway_unpaired_disconnect` | `two_bot_gateway_disconnects_total` grew and RESUMED plus fresh READY (`two_bot_gateway_events_total{event="READY"}`) have not caught up for 3 consecutive samples; clears when the unpaired count returns to zero (first sample sets the baseline, restarts re-baseline and hold a firing alert, invalid samples change nothing) | [gateway unpaired disconnect](runbook.md#alert-gateway-unpaired-disconnect) |
 | `ticker_stale:<job>` | 15 s ticker with no success for more than 10 minutes (never-succeeded is ignored) | [ticker stale](runbook.md#alert-ticker-stale) |
 | `receiver_refusals:<family>` | refused `two_bot_internal_actions_total` outcomes rising in 3 consecutive samples per family (first sample and restarts clear the streak) | [receiver refusals](runbook.md#alert-receiver-refusals) |
 
@@ -355,7 +356,7 @@ used on both sides of the B2 soak evidence seam. The Rust canonical list is
 is named `evidence-{ruleId}-{window}.json` (soak-ledger packets stamp the
 `soak_expected_committed` ledger identity), so the QA evidence table can
 attribute packets when several rules fire in one window. Both sides pin all
-ten spellings with tests; the payload shape is unchanged.
+eleven spellings with tests; the payload shape is unchanged.
 
 Known gaps: the DB error counter currently records only send-admission SQL,
 so non-admission stores still surface only through the pool proxy and the

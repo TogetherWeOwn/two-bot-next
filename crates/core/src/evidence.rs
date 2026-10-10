@@ -56,8 +56,8 @@ pub const SOAK_LEDGER_RULE_ID: &str = "soak_expected_committed";
 /// Rule ids the Worker alert rules can fire, in rule-table order. The Worker
 /// derives its fired-packet names from the same spellings via `ruleFor`, so
 /// this list must stay identical to `RULES` in `wrangler/src/alert-rules.ts`;
-/// the table test below and the Worker test both pin all ten.
-pub const ALERT_RULE_IDS: [&str; 10] = [
+/// the table test below and the Worker test both pin all eleven.
+pub const ALERT_RULE_IDS: [&str; 11] = [
     "job_stale",
     "job_consecutive_failures",
     "rest_429_rate",
@@ -66,6 +66,7 @@ pub const ALERT_RULE_IDS: [&str; 10] = [
     "send_admission_blocked",
     "voice_failures",
     "gateway_missed_events",
+    "gateway_unpaired_disconnect",
     "ticker_stale",
     "receiver_refusals",
 ];
@@ -927,7 +928,7 @@ mod tests {
 
     #[test]
     fn packet_filenames_carry_the_shared_rule_spelling() {
-        // Single shared spelling: the canonical core list must name all ten
+        // Single shared spelling: the canonical core list must name all eleven
         // Worker rules exactly (mirrored by `wrangler/test/alert-rules.test.ts`
         // and documented in `docs/metrics.md`).
         assert_eq!(
@@ -941,6 +942,7 @@ mod tests {
                 "send_admission_blocked",
                 "voice_failures",
                 "gateway_missed_events",
+                "gateway_unpaired_disconnect",
                 "ticker_stale",
                 "receiver_refusals",
             ]

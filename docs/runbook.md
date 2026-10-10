@@ -337,6 +337,42 @@ unpaired disconnects (no later RESUME or fresh READY), or when missed
 events rise with no disconnect at all — the gap is then unexplained and
 the fix belongs to the on-call engineer, not another redeploy.
 
+#### Alert: gateway unpaired disconnect
+
+`two_bot_gateway_disconnects_total` grew between keepalive samples and the
+recoveries (`two_bot_gateway_resumes_total` plus fresh READY from
+`two_bot_gateway_events_total{event="READY"}`) have not caught up for 3
+consecutive completed samples. Every disconnect should pair with a later
+RESUMED or fresh READY; an unpaired one means the gateway never came back.
+This is page severity (SEV-1 in the
+[watch escalation path](watch-escalation-path.md)).
+
+The bound is 3 samples. Samples arrive about every 60 s and a normal reconnect
+resumes within seconds. A RESUMED that lands before the next sample or the one
+after clears the unpaired count while the streak is at most 2, one short of
+the bound. The third consecutive unpaired sample comes about two to three
+minutes after the disconnect, so a reconnect that resumes within two samples
+never pages and a gateway that stays down does.
+
+Each valid window adds the disconnect growth and subtracts the recovery growth
+from an unpaired count that never drops below zero. The alert fires when that
+count stays above zero for 3 consecutive samples and resolves on the first
+sample where it returns to zero. The first sample only stores the baseline. A
+missing, duplicated, or non-numeric sample changes nothing and holds the current
+state. A counter that went backwards means the process restarted: that sample is
+not a window, the streak restarts, and a firing alert holds rather than
+clearing. The firing key is the constant `gateway_unpaired_disconnect`.
+
+First response: scrape `/ops/metrics` as described above and compare the
+disconnect and recovery counters with the previous scrape. Then read the
+container logs for `gateway reconnect failed; Twilight will retry` (the gateway
+is still retrying) and `gateway ready; checkpoint committed` (a recovery). If
+the logs show no `gateway ready` after the last disconnect, the gateway is still
+down: escalate to the on-call engineer through the watch escalation path. Do not
+restart the container to clear the alert. A restart re-baselines the counters
+without showing that the gateway came back, so confirm `gateway ready` in the
+new process's logs first.
+
 #### Alert: ticker stale
 
 A 15 s ticker (`scheduled_messages` or `settings`) recorded no successful
