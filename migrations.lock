@@ -320,6 +320,10 @@
     "crates/cutover/migrations/0422_voice_create_reservations.sql": {
       "sha256": "8c0d98f0b5dd3e45770a05b5fe211fcd29b67352a23b802658b5cf81b7e47883",
       "justification": "Durable voice room-create admission: one reservation row per accepted create, so burst and cooldown history survives room deletion and restarts."
+    },
+    "crates/cutover/migrations/0423_internal_actions_version_conflict.sql": {
+      "sha256": "43331694352efa7ba37848d2f17364fe8256058158388c24048ce2084c26f7c2",
+      "justification": "Settings CAS idempotency: admit version_conflict as a terminal 409 claim so a stale save replays the first result without a second write."
     }
   }
 }

@@ -467,6 +467,12 @@ async fn run(cli_args: &[String]) {
                                 step_failure(FailureClass::MilestonesLoadFailed, error)
                             })?,
                     );
+                    // Community message capture (TOG-19603): arm the Postgres
+                    // facts sink only when the scorecard job is enabled, so a
+                    // staging-gated rollout captures exactly while it scores.
+                    if std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|v| v == "1") {
+                        pipeline.enable_community_facts(pool.clone());
+                    }
                     // Join-burst watch is always on, as legacy raid watch was (TWO-56),
                     // and independent of the anti-nuke flags. It shares the command
                     // runtime's REST executor and runs behind the funnel's join row.

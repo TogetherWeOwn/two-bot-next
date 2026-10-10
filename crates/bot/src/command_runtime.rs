@@ -62,6 +62,7 @@ use twilight_model::{
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
+    automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
     feeds::{
         feed_list_text, feed_removed_text, plan_command, FeedCommand, FeedCommandContext,
@@ -143,12 +144,15 @@ pub type VoiceKickVote =
 /// `PRIVILEGED` is reserved for permission-gated slash commands from members who
 /// hold the permission; open interactions never enter it, so a burst of them
 /// cannot starve moderation. `BUSY` carries the one-call "busy" replies.
-const DISPATCH_LIMITS: [usize; 5] = [16, 16, 1, 8, 8];
-const LANE_MESSAGES: usize = 0;
+/// `REACTIONS` keeps self-role reaction bursts off the message lane, so neither
+/// burst can discard the other's automations.
+pub(crate) const DISPATCH_LIMITS: [usize; 6] = [16, 16, 1, 8, 8, 8];
+pub(crate) const LANE_MESSAGES: usize = 0;
 const LANE_INTERACTIONS: usize = 1;
 const LANE_REGISTRY: usize = 2;
 const LANE_PRIVILEGED: usize = 3;
 const LANE_BUSY: usize = 4;
+pub(crate) const LANE_REACTIONS: usize = 5;
 
 #[derive(Default)]
 struct DispatchTasks {
@@ -757,6 +761,25 @@ impl CommandRuntime {
         runtime
     }
 
+    /// Test-only lane depth: prunes finished tasks, then reports the live
+    /// count for `lane`. Reactions run on `LANE_REACTIONS`; the bound test
+    /// asserts this never exceeds `DISPATCH_LIMITS[LANE_REACTIONS]`.
+    #[cfg(test)]
+    pub(crate) fn lane_in_flight(&self, lane: usize) -> usize {
+        let mut tasks = self.tasks.lock().expect("command task scope");
+        tasks.lanes[lane].retain(|handle| !handle.is_finished());
+        tasks.lanes[lane].len()
+    }
+
+    /// Test-only lane occupant: holds one slot for `duration` so the bound
+    /// test can saturate the lane without database or REST work.
+    #[cfg(test)]
+    pub(crate) fn hold_lane_for_test(&self, lane: usize, duration: std::time::Duration) -> bool {
+        self.spawn(lane, async move {
+            tokio::time::sleep(duration).await;
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn with_tickets(
         pool: Pool<Postgres>,
@@ -816,6 +839,18 @@ impl CommandRuntime {
     /// Custom commands answer first and report ownership, so sticky/feed
     /// routing never sends a second response after an acknowledgement.
     pub fn dispatch(self: &Arc<Self>, event: &Event) -> bool {
+        self.dispatch_with_verdict(event, None)
+    }
+
+    /// Message dispatch with the automod verdict for this create. `None` keeps
+    /// the configured acceptance (the `TWO_AUTOMOD=0` fast path); the gateway
+    /// worker passes its verdict once automod has decided, and the trigger
+    /// handler fails a missing verdict closed.
+    pub fn dispatch_with_verdict(
+        self: &Arc<Self>,
+        event: &Event,
+        verdict: Option<FunnelDisposition>,
+    ) -> bool {
         if let Some(custom) = self.gateway_commands.get() {
             custom.observe(event);
         }
@@ -828,7 +863,7 @@ impl CommandRuntime {
                 let message = message.0.clone();
                 self.spawn(LANE_MESSAGES, async move {
                     if let Some(custom) = runtime.gateway_commands.get() {
-                        custom.handle_message(&message).await;
+                        custom.handle_message(&message, verdict).await;
                     }
                     runtime.on_message(&message).await;
                 })
@@ -863,14 +898,8 @@ impl CommandRuntime {
                     self.admit_interaction(interaction)
                 }
             }
-            Event::ReactionAdd(reaction) => {
-                self.dispatch_self_role_reaction(&reaction.0, false);
-                true
-            }
-            Event::ReactionRemove(reaction) => {
-                self.dispatch_self_role_reaction(&reaction.0, true);
-                true
-            }
+            Event::ReactionAdd(reaction) => self.dispatch_self_role_reaction(&reaction.0, false),
+            Event::ReactionRemove(reaction) => self.dispatch_self_role_reaction(&reaction.0, true),
             Event::Ready(ready) => {
                 // A READY-supplied application id never overwrites the boot
                 // pin on faith: arm identity only when the token-derived pin
@@ -928,19 +957,22 @@ impl CommandRuntime {
         }
     }
 
-    fn dispatch_self_role_reaction(&self, reaction: &GatewayReaction, remove: bool) {
+    /// Reactions run on their own lane: a reaction burst must consume neither
+    /// message automation capacity nor interaction acknowledgement capacity,
+    /// and saturation drops with only a log line, exactly like message bursts.
+    fn dispatch_self_role_reaction(&self, reaction: &GatewayReaction, remove: bool) -> bool {
         if !self.interactions.router.gates().self_roles {
-            return;
+            return true;
         }
         let Some(service) = self.self_roles.as_ref().cloned() else {
-            return;
+            return true;
         };
         let Some(input) = service.reaction_input(reaction, remove) else {
-            return;
+            return true;
         };
-        drop(tokio::spawn(async move {
+        self.spawn(LANE_REACTIONS, async move {
             let _ = service.handle(&input).await;
-        }));
+        })
     }
 
     async fn self_role_component(&self, interaction: &Interaction) {

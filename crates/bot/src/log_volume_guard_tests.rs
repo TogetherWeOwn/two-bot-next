@@ -220,11 +220,11 @@ const LOG_SCOPED_SOURCES: [(&str, &str); 6] = [
     ("voice_rooms.rs", include_str!("voice_rooms.rs")),
 ];
 
-/// (file, message) for the 30 catalog session-path rows: the 28 traced
+/// (file, message) for the 33 catalog session-path rows: the 31 traced
 /// messages plus the 2 drain outcomes that surface as error text. Every row
 /// is class `session` in the guard doc, so the table records presence, not
 /// a second class column. A cataloged line without a row here fails closed.
-const SESSION_LOG_CAPS: [(&str, &str); 30] = [
+const SESSION_LOG_CAPS: [(&str, &str); 33] = [
     (
         "gateway.rs",
         "cold resume committed; requesting voice snapshot via identify",
@@ -235,6 +235,9 @@ const SESSION_LOG_CAPS: [(&str, &str); 30] = [
     ),
     ("gateway.rs", "gateway shard loop started"),
     ("gateway.rs", "gateway leveling dispatch failed"),
+    ("gateway.rs", "gateway community facts dispatch failed"),
+    ("gateway.rs", "gateway community facts dispatch timed out"),
+    ("gateway.rs", "gateway onboarding job invalid"),
     ("gateway.rs", "gateway ready; checkpoint committed"),
     (
         "gateway.rs",
