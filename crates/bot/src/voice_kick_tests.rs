@@ -1101,6 +1101,15 @@ async fn the_audit_buffer_is_bounded_and_drops_the_oldest_row() {
 async fn counted_vote_kick_paths_emit_metric_covered_outcomes() {
     use two_bot_core::metrics::{Metrics, VOICE_VOTE_KICK_OUTCOMES};
 
+    // Worker->global wiring: deleting either `voice_vote_kick` increment must
+    // fail here. Global counters are monotonic, so assert `>= before + 1`
+    // (safe under parallel test threads, matching `global_series` callers).
+    let started_before = super::global_series("two_bot_voice_vote_kick_total{outcome=\"started\"}");
+    let refused_before =
+        super::global_series("two_bot_voice_vote_kick_total{outcome=\"active_vote_exists\"}");
+    let enforced_before = super::global_series(
+        "two_bot_voice_vote_kick_total{outcome=\"connect_denied_and_disconnected\"}",
+    );
     let (mut worker, _trace) = setup().await;
     // A start, a same-target refusal, and a terminal enforcement.
     start(&mut worker, VOTER_A, TARGET).unwrap();
@@ -1113,6 +1122,22 @@ async fn counted_vote_kick_paths_emit_metric_covered_outcomes() {
     let passed = worker.kick_cast(VOTE, VOTER_C, VoteBallot::Yes, 2).unwrap();
     assert_eq!(passed.status, VoteKickStatus::Passed);
     dispatch(&mut worker, 3).await;
+    assert!(
+        super::global_series("two_bot_voice_vote_kick_total{outcome=\"started\"}")
+            >= started_before + 1,
+        "kick_start success must advance the started series"
+    );
+    assert!(
+        super::global_series("two_bot_voice_vote_kick_total{outcome=\"active_vote_exists\"}")
+            >= refused_before + 1,
+        "kick_start refusal must advance its refusal series"
+    );
+    assert!(
+        super::global_series(
+            "two_bot_voice_vote_kick_total{outcome=\"connect_denied_and_disconnected\"}"
+        ) >= enforced_before + 1,
+        "terminal KickMember enforcement must advance its enforcement series"
+    );
     assert!(worker.flush_kick_audit(4).await);
     let counted: Vec<&'static str> = worker
         .store
