@@ -26,6 +26,7 @@ fn runtime(mock: &MockRest) -> (Arc<CommandRuntime>, Arc<TicketRuntime>) {
                 staff_role_id: "300".into(),
                 cooldown_seconds: 15,
             },
+            std::collections::HashMap::new(),
         )
         .unwrap(),
     );

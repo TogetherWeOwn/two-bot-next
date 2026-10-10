@@ -468,6 +468,9 @@ impl CommandRuntime {
                     pool.clone(),
                     executor.clone(),
                     config,
+                    std::env::vars()
+                        .filter(|(key, _)| crate::ticket_runtime::LIVE_KEYS.contains(&key.as_str()))
+                        .collect(),
                 ) {
                     Ok(runtime) => Some(Arc::new(runtime)),
                     Err(_) => return None,

@@ -234,6 +234,13 @@ pub const HOT_WIRED: &[&str] = &[
     "TWO_RAID_WINDOW_SECONDS",
     "DISCORD_LANDING_CHANNEL_IDS",
     "DISCORD_GOODBYE_CHANNEL_IDS",
+    "DISCORD_AUDIT_LOG_CHANNEL_ID",
+    "DISCORD_MODERATION_LOG_CHANNEL_ID",
+    "DISCORD_STAFF_ALERT_CHANNEL_ID",
+    "DISCORD_TICKET_CATEGORY_ID",
+    "DISCORD_TICKET_PANEL_CHANNEL_ID",
+    "DISCORD_TICKET_STAFF_ROLE_ID",
+    "DISCORD_VOICE_LOG_CHANNEL_ID",
     "TWO_AUTOMOD_REPEAT_COUNT",
     "TWO_AUTOMOD_ALLOWED_DOMAINS",
     "TWO_AUTOMOD_BAD_WORDS",
@@ -995,7 +1002,7 @@ mod tests {
 
     #[test]
     fn hot_wired_is_a_hot_subset() {
-        assert_eq!(HOT_WIRED.len(), 15);
+        assert_eq!(HOT_WIRED.len(), 22);
         for key in HOT_WIRED {
             assert_eq!(classify_key(key), Some(SettingClass::Hot), "{key}");
         }
