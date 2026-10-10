@@ -901,7 +901,10 @@ impl RoomWrites for Http {
         let name = name.to_owned();
         Some(Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(delay)).await;
-            trace.lock().unwrap().push(format!("rename:{channel}:{name}"));
+            trace
+                .lock()
+                .unwrap()
+                .push(format!("rename:{channel}:{name}"));
             Ok(())
         }))
     }
@@ -10141,7 +10144,11 @@ async fn consecutive_rename_timeouts_back_off() {
     let second = RENAME_DEFERRED_RETRY_MS;
     dispatch(&mut worker, second).await;
     // The second timeout doubles the wait.
-    assert!(!worker.dispatch_one(second + 2 * RENAME_DEFERRED_RETRY_MS - 1).await);
+    assert!(
+        !worker
+            .dispatch_one(second + 2 * RENAME_DEFERRED_RETRY_MS - 1)
+            .await
+    );
     dispatch(&mut worker, second + 2 * RENAME_DEFERRED_RETRY_MS).await;
     assert_eq!(trace.lock().unwrap().len(), 3);
 }

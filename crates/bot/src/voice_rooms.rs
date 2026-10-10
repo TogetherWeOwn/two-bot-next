@@ -979,7 +979,9 @@ impl RoomWrites for RoomHttp {
     fn detached_rename(&self, channel: Snowflake, name: &str) -> Option<DetachedRename> {
         let http = self.clone();
         let name = name.to_owned();
-        Some(Box::pin(async move { http.rename_room(channel, &name).await }))
+        Some(Box::pin(
+            async move { http.rename_room(channel, &name).await },
+        ))
     }
 
     async fn set_user_limit(
