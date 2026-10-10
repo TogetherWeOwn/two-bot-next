@@ -134,8 +134,13 @@ library code with no Discord dependency and can start immediately.
 - If it passes, the target is disconnected and denied Connect on **that room
   only**.
 - The owner and original creator can't be targeted, and members can't target
-  themselves. Only one active vote per target. If the target leaves, the vote is
-  cancelled.
+  themselves. Targets with effective Kick Members or Administrator permission
+  in the interaction's guild can't be targeted either; an unavailable
+  guild-authority lookup fails closed with no vote. Only one active vote per
+  target. If the target leaves, the vote is
+  cancelled. Protection is rechecked on every ballot/refresh and again
+  immediately before the disconnect/deny writes, so a promotion granted
+  mid-vote produces no kick/disconnect effect.
 
 ## V5: Naming template engine (core library)
 
