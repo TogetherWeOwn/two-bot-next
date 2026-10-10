@@ -4833,12 +4833,20 @@ async fn self_role_reactions_have_their_own_bounded_lane() {
         runtime.dispatch(&first),
         "message saturation must not block reactions"
     );
+    // Saturation held at dispatch time: the holders are fresh here, so a
+    // slow reaction cannot drain them first and flake this read.
+    assert_eq!(runtime.lane_in_flight(LANE_MESSAGES), message_cap);
     wait_for(
         || runtime.lane_in_flight(LANE_REACTIONS) == 0,
         "admitted reaction settles",
     )
     .await;
-    assert_eq!(runtime.lane_in_flight(LANE_MESSAGES), message_cap);
+    // Reaction work stays off the message lane: holders only drain, the
+    // depth never grows past the cap no matter how slow the reaction was.
+    assert!(
+        runtime.lane_in_flight(LANE_MESSAGES) <= message_cap,
+        "reaction work stays off the message lane"
+    );
     wait_for(
         || runtime.lane_in_flight(LANE_MESSAGES) == 0,
         "message holders drain",
