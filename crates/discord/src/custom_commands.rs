@@ -307,10 +307,27 @@ impl CustomCommandRuntime {
         guild_name: Option<&str>,
     ) -> Result<TextCommandOutcome, CustomCommandError> {
         // Verdict refusal is distinct telemetry from unmatched content: the
-        // automod verdict contained the create before any trigger lookup.
-        // Guild/webhook scope mismatches stay `Ignored` and never count here.
+        // automod verdict contained the create before any trigger lookup. The
+        // refusal arm still returns `Refused` for every contained create, but
+        // only prefix candidates increment the series: guild/webhook scope
+        // mismatches, bot authors, disabled gates and non-prefix content stay
+        // uncounted (docs/metrics.md).
         if !acceptance.permits_automations() {
-            two_bot_core::metrics::global().prefix_trigger_refused("verdict");
+            let in_scope = message.guild_id.is_some()
+                && message.guild_id.map(|id| id.get()) == self.router.gates().configured_guild
+                && message.webhook_id.is_none();
+            if in_scope
+                && accepted_text_trigger(
+                    self.router.gates().automations,
+                    text_commands_enabled,
+                    message.author.bot,
+                    &message.content,
+                    &builtin_command_names(),
+                )
+                .is_some()
+            {
+                two_bot_core::metrics::global().prefix_trigger_refused("verdict");
+            }
             return Ok(TextCommandOutcome::Refused);
         }
         if message.guild_id.is_none()

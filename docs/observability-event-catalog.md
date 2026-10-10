@@ -93,7 +93,7 @@ Scalar gateway series pair with the labels above:
 | `two_bot_gateway_disconnects_total` | Transport losses through the shard supervisor; each must pair with a later RESUME or fresh READY |
 | `two_bot_gateway_missed_events_total` | Sequence gaps inside one session; any nonzero increase fails the zero-missed-events acceptance |
 | `two_bot_gateway_latency_seconds` | Last heartbeat ACK round-trip; `NaN` until measured |
-| `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | Prefix candidates refused by the automod verdict before any trigger lookup (`crates/discord/src/custom_commands.rs` refusal arm, `TextCommandOutcome::Refused`); unmatched content never increments it |
+| `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | Prefix candidates refused by the automod verdict (`crates/discord/src/custom_commands.rs` refusal arm, `TextCommandOutcome::Refused`); the arm returns `Refused` for every contained create but only prefix candidates increment it — unmatched content, scope mismatches and the disabled fast path never do |
 
 ## Gateway failure classes (`/readyz` `gateway_failure`)
 

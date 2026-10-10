@@ -153,8 +153,9 @@ as dynamic labels.
   storage writes count only in `two_bot_db_errors_total`.
 - `two_bot_gateway_prefix_trigger_refused_total{reason}` — `reason` is
   `verdict` or `other`. Recorded once on the verdict-refusal arm in
-  `crates/discord/src/custom_commands.rs` before any trigger lookup; unmatched
-  content, scope mismatches and the disabled fast path never increment it.
+  `crates/discord/src/custom_commands.rs` for prefix candidates only: the arm
+  still returns `Refused` for every contained create, but unmatched content,
+  scope mismatches and the disabled fast path never increment it.
 - `two_bot_dispatch_drops_total{lane}` — `lane` is one of `messages`,
   `interactions`, `registry`, `privileged`, `busy` or `reactions`, in the
   bot's `DISPATCH_LIMITS` order (`crates/core/src/metrics.rs`
