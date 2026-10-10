@@ -690,7 +690,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s5-15: `community_facts`, `community_stream_heartbeats`, `community_scorecard_runs/alerts` — scorecard facts/runs/alerts
 
 - **Method:** `waived` (not an execution verdict).
-- **Action:** Run fact/heartbeat/weekly-scorecard fixtures on test DB with only the captured event-attended stream marked, excluding dropped rota extensions.
+- **Action:** Run fact/heartbeat/weekly-scorecard fixtures on test DB with only the captured event-attended, message-created and rules-accepted streams marked, excluding dropped rota extensions.
 - **Expected:** One weekly run/alert fails closed as incomplete and names the uncaptured streams; dropped rota tables are not required.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
@@ -821,7 +821,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s7-01: Config / env catalogue
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** With approved synthetic configs, attempt an attributed dashboard write to a wired hot key (TWO_RAID_JOIN_THRESHOLD), a cold key (TWO_FEED_POLL_SECONDS), an env_only key and an unknown key. Observe the hot change after the 15s poll; cold and hot-but-unwired changes wait for an approved restart. Never display secret values.
+- **Action:** With approved synthetic configs, attempt an attributed dashboard write to a wired hot key (TWO_RAID_JOIN_THRESHOLD or TWO_FEED_POLL_SECONDS), a cold key (TWO_TICKET_COOLDOWN_SECONDS), an env_only key and an unknown key. Observe the hot change after the 15s poll; cold and hot-but-unwired changes wait for an approved restart. Never display secret values.
 - **Expected:** Catalogued hot and cold keys are writable, versioned and audited; wired hot keys apply live, cold and hot-but-unwired keys are marked next-restart and do not apply live. Env_only and unknown writes are refused before persistence/audit; env-only values remain private.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 

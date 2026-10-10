@@ -47,6 +47,28 @@ pub fn ensure_crypto_provider() {
     }
 }
 
+/// Worker decision for prefix triggers: `Some(trigger)` means the serial
+/// dispatch worker must call `dispatch_with_verdict(event, trigger)`, `None`
+/// means it must not. `trigger` is `disposition.map(|verdict| verdict.trigger)`;
+/// the text-automation gate stays on the trigger verdict, not the funnel: an
+/// uninspected create keeps funnel `Accept` but its trigger is capture-only
+/// and must not run sticky or prefix triggers (fail-closed).
+pub(crate) fn worker_prefix_trigger(
+    disposition: Option<crate::automod_gateway::WorkerVerdict>,
+    event: &Event,
+    automod_enabled: bool,
+) -> Option<Option<two_bot_core::automod_runtime::FunnelDisposition>> {
+    let trigger = disposition.map(|verdict| verdict.trigger);
+    if automod_enabled
+        && matches!(event, Event::MessageCreate(_))
+        && crate::automod_gateway::runs_text_automations(trigger)
+    {
+        Some(trigger)
+    } else {
+        None
+    }
+}
+
 /// Supervisor-visible gateway state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayState {
@@ -312,6 +334,21 @@ fn missing_ingress_ticket_failure() -> sqlx::Error {
 /// instead of queueing unbounded acknowledgement work.
 fn ingress_capacity_failure() -> sqlx::Error {
     sqlx::Error::InvalidArgument("gateway ingress capacity exhausted".into())
+}
+
+/// Fatal-runner reason fence: at most 512 chars of the dispatch-supervisor
+/// reason reach the surfaced runner error (logs + `operation`). Class
+/// `session` per `docs/log-volume-guard.md`: the runner fails at most a
+/// handful of times per process lifetime. Today every reason is one of six
+/// `&'static str` literals from `dispatch_bounded` (the `JoinError` payload
+/// is discarded there), so the bound is defense in depth: it holds even if a
+/// future supervisor returns a larger payload. Char-boundary truncation keeps
+/// the surfaced string valid UTF-8.
+const RUNNER_REASON_MAX_CHARS: usize = 512;
+
+fn bounded_runner_reason(reason: &str) -> sqlx::Error {
+    let bounded: String = reason.chars().take(RUNNER_REASON_MAX_CHARS).collect();
+    sqlx::Error::InvalidArgument(bounded)
 }
 
 /// Await one RSVP completion ticket on the dispatch worker. A dropped sender
@@ -620,11 +657,7 @@ fn apply_dispatch<I: InviteSource>(
                 voice.disconnect();
             }
         }
-        let funnel = disposition.map(|verdict| verdict.funnel);
-        let trigger = disposition.map(|verdict| verdict.trigger);
-        if automod_enabled
-            && matches!(dispatch.event, Event::MessageCreate(_))
-            && crate::automod_gateway::runs_text_automations(funnel)
+        if let Some(trigger) = worker_prefix_trigger(disposition, &dispatch.event, automod_enabled)
         {
             if let Some(runtime) = command_runtime.as_ref() {
                 // Detached spawn from the blocking worker needs the runtime.
@@ -654,10 +687,11 @@ fn apply_dispatch<I: InviteSource>(
                 dispatch_error = Some(leveling_dispatch_failure());
             }
         }
-        // Community facts: drain buffered message_created writes on every
-        // dispatch, even when no XP award queued — bots, webhooks and staff
-        // automation capture facts but never awards, so gating on `requests`
-        // would leak the buffer. A failed write never stalls the worker
+        // Community facts: drain buffered message_created and rules_accepted
+        // writes on every dispatch, even when no XP award queued — bots,
+        // webhooks and staff automation capture facts but never awards, so
+        // gating on `requests` would leak the buffer. A failed write never
+        // stalls the worker
         // (audit precedent): warn and continue; the scorecard fails closed
         // on missing coverage.
         match handle.block_on(tokio::time::timeout(deadline, pipeline.drain_facts())) {
@@ -1222,6 +1256,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                     committed,
                 ),
             };
+
             if let Err(error) = operation {
                 // Retain the original error without panicking away accepted
                 // commands or allowing a later checkpoint to leap past failure.
@@ -1245,7 +1280,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             futures_util::pin_mut!(queue_worker);
             tokio::select! {
                 result = dispatch => {
-                    let result = result.map_err(|reason| sqlx::Error::InvalidArgument(reason.into()));
+                    let result = result.map_err(bounded_runner_reason);
                     if result.is_ok() && error.lock().expect("gateway error lock").is_none() {
                         // Cooperative end with a healthy writer: the last
                         // commit may have raced the drain return before the
@@ -1278,9 +1313,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                 }
             }
         }
-        None => dispatch
-            .await
-            .map_err(|reason| sqlx::Error::InvalidArgument(reason.into())),
+        None => dispatch.await.map_err(bounded_runner_reason),
     };
     // Reception does not restart in this runner. Keep Draining sticky through
     // both successful shutdown and fatal exit, including any remaining writer.
@@ -2329,6 +2362,173 @@ mod tests {
         );
     }
 
+    /// A failed community-facts drain never stalls serial dispatch: the worker
+    /// warns and still commits the cursor. The facts writer is broken here
+    /// with an unconnectable pool (short acquire timeout) while the session
+    /// store stays healthy, so a gate-clearing dispatch must return `Ok` with
+    /// the checkpoint committed and a `gateway community facts dispatch
+    /// failed` warn — no panic and no held cursor. Needs a migrated test
+    /// database; skips without one (CI supplies `TWO_TEST_DATABASE_URL`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_worker_community_facts_drain_failure_warns_and_commits() {
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            assert!(
+                std::env::var("GITHUB_ACTIONS").is_err(),
+                "CI must supply the guarded test database"
+            );
+            eprintln!("SKIP gateway_worker_community_facts_drain_failure_warns_and_commits: TWO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let db = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await
+        .expect("create migrated agent-testdb fixture");
+        let pool = db.pool().clone();
+        // Facts writer only: unconnectable with a short acquire timeout so
+        // the drain hits the write-failure arm (`dispatch failed`) inside
+        // the dispatch deadline instead of the timeout arm, without
+        // touching the healthy session store below.
+        let broken = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let pipeline = build_pipeline(vec![], None);
+        pipeline.enable_community_facts(broken);
+        // Gate-clearing join: `pending: false` buffers one `rules_accepted`
+        // fact via `on_gate_cleared`, so the drain has work to fail on. A
+        // `RESUMED` event would drain nothing and prove nothing.
+        let join = || {
+            use std::str::FromStr as _;
+            let stamp = twilight_model::util::Timestamp::from_str("2026-09-28T00:00:00.000+00:00")
+                .expect("fixture stamp");
+            Event::MemberAdd(Box::new(
+                twilight_model::gateway::payload::incoming::MemberAdd {
+                    guild_id: twilight_model::id::Id::new(22),
+                    member: twilight_model::guild::Member {
+                        avatar: None,
+                        avatar_decoration_data: None,
+                        banner: None,
+                        communication_disabled_until: None,
+                        deaf: false,
+                        flags: twilight_model::guild::MemberFlags::empty(),
+                        joined_at: Some(stamp),
+                        mute: false,
+                        nick: None,
+                        pending: false,
+                        premium_since: None,
+                        roles: vec![],
+                        user: twilight_model::user::User {
+                            accent_color: None,
+                            avatar: None,
+                            avatar_decoration: None,
+                            avatar_decoration_data: None,
+                            banner: None,
+                            bot: false,
+                            discriminator: 0,
+                            email: None,
+                            flags: None,
+                            global_name: None,
+                            id: twilight_model::id::Id::new(44),
+                            locale: None,
+                            mfa_enabled: None,
+                            name: "member".to_owned(),
+                            premium_type: None,
+                            primary_guild: None,
+                            public_flags: None,
+                            system: None,
+                            verified: None,
+                        },
+                    },
+                },
+            ))
+        };
+        // Pin the fixture precondition explicitly: the join must buffer a
+        // fact, or this test would exercise the empty-drain path instead of
+        // the failure site.
+        {
+            let scratch = build_pipeline(vec![], None);
+            scratch.enable_community_facts(pool.clone());
+            scratch.collect_at(
+                &join(),
+                &two_bot_core::now_iso(),
+                two_bot_discord::MessageEligibility::default(),
+            );
+            assert_eq!(
+                scratch.drain_facts().await.expect("scratch drain"),
+                1,
+                "fixture join must buffer one community fact"
+            );
+        }
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let state = RwLock::new(GatewayState::Armed);
+        let generation = AtomicU64::new(0);
+        let store = GatewaySessionStore::new(pool, "22".to_owned(), 1);
+        let checkpoint = GatewaySession {
+            session_id: "test-session".to_owned(),
+            sequence: 7,
+            resume_url: "ws://127.0.0.1:1".to_owned(),
+            updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
+        };
+        // The worker step blocks on the drain: run it the way the dispatch
+        // worker does, on a blocking thread.
+        let outcome = tokio::task::block_in_place(|| {
+            apply_dispatch(
+                &tokio::runtime::Handle::current(),
+                &state,
+                &generation,
+                &pipeline,
+                &store,
+                None,
+                None,
+                None,
+                None,
+                LiveInteractions::default(),
+                Arc::new(tokio::sync::Notify::new()),
+                Some(Box::new(ReceivedDispatch::new(join()))),
+                None,
+                checkpoint,
+                CHECKPOINT_IO_MAX,
+                0,
+                None,
+                None,
+            )
+        });
+        assert!(
+            outcome.is_ok(),
+            "facts drain failure must warn and continue, got {outcome:?}"
+        );
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("gateway community facts dispatch failed"),
+            "failed facts drain must warn, got: {output}"
+        );
+        assert_eq!(
+            store.load().await.expect("load").expect("session").sequence,
+            7,
+            "failed facts drain must still commit the cursor"
+        );
+    }
+
     /// The worker itself records a committed interaction job without an
     /// ingress ticket as a typed error. The commit already holds the durable
     /// job for bounded restart recovery, so the message says the checkpoint
@@ -2513,5 +2713,34 @@ mod tests {
                 "onboarding interaction missing ingress ticket; checkpoint committed",
             ]
         );
+    }
+
+    /// Fatal-runner reason fence: an oversized payload is truncated to
+    /// `RUNNER_REASON_MAX_CHARS`, while short reasons pass through unchanged
+    /// so the #659 typed errors keep their exact text.
+    #[test]
+    fn gateway_runner_reason_is_bounded() {
+        match bounded_runner_reason("dispatch backlog full") {
+            sqlx::Error::InvalidArgument(message) => {
+                assert_eq!(message, "dispatch backlog full");
+            }
+            error => panic!("runner reason must stay typed, got {error:?}"),
+        }
+        let oversized = "x".repeat(RUNNER_REASON_MAX_CHARS + 10_000);
+        match bounded_runner_reason(&oversized) {
+            sqlx::Error::InvalidArgument(message) => {
+                assert_eq!(message.len(), RUNNER_REASON_MAX_CHARS);
+                assert_eq!(message, "x".repeat(RUNNER_REASON_MAX_CHARS));
+            }
+            error => panic!("oversized reason must stay typed, got {error:?}"),
+        }
+        // Multi-byte chars truncate on a char boundary, never mid-codepoint.
+        let emoji = "🦀".repeat(RUNNER_REASON_MAX_CHARS + 10);
+        match bounded_runner_reason(&emoji) {
+            sqlx::Error::InvalidArgument(message) => {
+                assert_eq!(message.chars().count(), RUNNER_REASON_MAX_CHARS);
+            }
+            error => panic!("oversized reason must stay typed, got {error:?}"),
+        }
     }
 }

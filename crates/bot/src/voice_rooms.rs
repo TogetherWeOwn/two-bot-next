@@ -1104,6 +1104,10 @@ pub struct GuildSnapshot {
     pub channels: Vec<Channel>,
     pub members: Vec<VoiceMember>,
     pub bot: BotAccess,
+    /// Guild-scoped role IDs per member, for vote-kick target-authority
+    /// resolution (VK-01). A missing entry means the lookup is unavailable and
+    /// the vote must fail closed. Ordinary members carry an empty list.
+    pub member_roles: HashMap<Snowflake, Vec<Snowflake>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1143,6 +1147,9 @@ pub(crate) struct LiveState {
     channels: HashMap<Snowflake, Channel>,
     channel_revisions: HashMap<Snowflake, u64>,
     members: HashMap<Snowflake, MemberState>,
+    /// Guild-scoped role IDs per member, mirrored from the gateway cache.
+    /// Missing entries fail closed for target-authority checks.
+    member_roles: HashMap<Snowflake, Vec<Snowflake>>,
     bot: Option<BotAccess>,
     protected_channels: HashSet<Snowflake>,
     /// Continuous human-empty evidence in this authoritative gateway session.
@@ -1264,6 +1271,35 @@ impl LiveState {
             .collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// Guild-base permissions for one member (VK-01): guild owner and
+    /// Administrator resolve to all bits; channel overwrites are never
+    /// consulted. `None` means the guild-role snapshot or the member's role
+    /// list is incomplete, and the caller must fail closed.
+    fn guild_member_permissions(&self, guild: Snowflake, member: Snowflake) -> Option<Permissions> {
+        let bot = self.bot.as_ref()?;
+        let roles = self.member_roles.get(&member)?;
+        let member_roles: Vec<Id<RoleMarker>> = roles.iter().map(|id| Id::new(*id)).collect();
+        effective_permissions(
+            guild,
+            bot.guild_owner_id,
+            member,
+            &member_roles,
+            &bot.roles,
+            &[],
+        )
+    }
+
+    /// Whether the target holds effective Kick Members or Administrator in
+    /// this guild. `None` means the lookup is unavailable: no vote, no
+    /// disconnect, no permission edit.
+    fn target_privileged(&self, guild: Snowflake, target: Snowflake) -> Option<bool> {
+        let permissions = self.guild_member_permissions(guild, target)?;
+        Some(
+            permissions.contains(Permissions::KICK_MEMBERS)
+                || permissions.contains(Permissions::ADMINISTRATOR),
+        )
     }
 
     /// Current occupants of one room as a V2 ownership snapshot. Unknown
@@ -1403,6 +1439,7 @@ impl LiveGuild {
                 )
             })
             .collect();
+        live.member_roles = snapshot.member_roles;
         live.bot = Some(snapshot.bot);
         live.empty_since.clear();
         let channels: Vec<_> = live.channels.keys().copied().collect();
@@ -1487,6 +1524,20 @@ impl LiveGuild {
     /// affect the next guard evaluation.
     pub fn refresh_bot(&self, access: BotAccess) {
         self.write_state().bot = Some(access);
+    }
+
+    /// Track one member's guild-scoped roles for VK-01 target-authority checks.
+    /// `None` removes the entry so the next check fails closed.
+    pub fn set_member_roles(&self, member: Snowflake, roles: Option<Vec<Snowflake>>) {
+        let mut live = self.write_state();
+        match roles {
+            Some(roles) => {
+                live.member_roles.insert(member, roles);
+            }
+            None => {
+                live.member_roles.remove(&member);
+            }
+        }
     }
 
     /// Validate logging targets against the live cache, not resolved picker data.
@@ -2920,16 +2971,22 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     fn kick_facts(
         &self,
         room_id: Snowflake,
-    ) -> Result<(Snowflake, Snowflake, Vec<Snowflake>), KickRefusal> {
+        target_id: Snowflake,
+    ) -> Result<(Snowflake, Snowflake, Vec<Snowflake>, Option<bool>), KickRefusal> {
         let live = self.live.read_state();
         if !live.ready || self.halted {
             return Err(KickRefusal::Unavailable);
         }
         let room = self.rooms.get(&room_id).ok_or(KickRefusal::NotARoom)?;
+        // Guild-scoped authority in this worker's guild: the target's effective
+        // Kick Members / Administrator from guild roles only, never channel
+        // overwrites or another guild. `None` fails closed downstream.
+        let privileged = live.target_privileged(self.live.guild_id, target_id);
         Ok((
             room.owner_id,
             room.original_creator_id,
             live.occupants(room_id),
+            privileged,
         ))
     }
 
@@ -3089,13 +3146,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         target_id: Snowflake,
         now_ms: u64,
     ) -> Result<VoteKickUpdate, KickRefusal> {
-        let (owner_id, original_creator_id, occupants) = self.kick_facts(room_id)?;
+        let (owner_id, original_creator_id, occupants, target_privileged) =
+            self.kick_facts(room_id, target_id)?;
         let facts = VoteRoomFacts {
             guild_id: self.live.guild_id,
             room_id,
             owner_id,
             original_creator_id,
             occupants: &occupants,
+            target_privileged,
         };
         let update = self
             .votes
@@ -3120,13 +3179,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .vote_refs
             .get(&vote_id)
             .ok_or(KickRefusal::Vote(VoteKickError::UnknownVote))?;
-        let (owner_id, original_creator_id, occupants) = self.kick_facts(reference.room_id)?;
+        let (owner_id, original_creator_id, occupants, target_privileged) =
+            self.kick_facts(reference.room_id, reference.target_id)?;
         let facts = VoteRoomFacts {
             guild_id: self.live.guild_id,
             room_id: reference.room_id,
             owner_id,
             original_creator_id,
             occupants: &occupants,
+            target_privileged,
         };
         let update = self
             .votes
@@ -3148,8 +3209,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
         let mut finished = Vec::new();
         for reference in self.active_votes.clone() {
-            let (owner_id, original_creator_id, occupants) =
-                match self.kick_facts(reference.room_id) {
+            let (owner_id, original_creator_id, occupants, target_privileged) =
+                match self.kick_facts(reference.room_id, reference.target_id) {
                     Ok(facts) => facts,
                     // Evidence went stale mid-pass: leave the vote untouched.
                     Err(KickRefusal::Unavailable) => continue,
@@ -3162,6 +3223,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 owner_id,
                 original_creator_id,
                 occupants: &occupants,
+                target_privileged,
             };
             // A room that is gone has no occupants, so the core cancels the vote.
             let Ok(update) = self.votes.refresh(reference, facts, &ActorClock(now_ms)) else {
@@ -4187,15 +4249,28 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     .live
                     .read_state()
                     .permissions(self.live.guild_id, channel_id);
+                // Recheck guild authority immediately before enforcement (VK-01):
+                // a promotion granted after the vote passed, or an unavailable
+                // guild-authority lookup, must produce no Discord write.
+                // Statement-temporary guards: no named `RwLockReadGuard`
+                // (`!Send`) is held across the Discord awaits below, so this
+                // future stays `Send` for the actor spawn.
+                let privileged = self
+                    .live
+                    .read_state()
+                    .target_privileged(self.live.guild_id, member_id);
                 // What a clean `Ok` below means; each skip or partial write
                 // overrides it so the audit row says what Discord was asked.
                 let mut applied = EnforcementOutcome::ConnectDeniedAndDisconnected;
                 let result = if self.rooms.get(&channel_id).is_none_or(|room| {
                     member_id == room.owner_id || member_id == room.original_creator_id
-                }) {
+                }) || privileged != Some(false)
+                {
                     // Either the room is gone and its overwrites went with it, or
                     // ownership changed after the vote passed and the target is now
-                    // the owner or original creator: write nothing.
+                    // the owner, original creator, or a Kick Members /
+                    // Administrator holder (or the lookup is unavailable): write
+                    // nothing.
                     applied = if self.rooms.contains_key(&channel_id) {
                         EnforcementOutcome::SkippedTargetProtected
                     } else {
@@ -5351,6 +5426,20 @@ where
                 };
                 let member_id = update.user_id.get();
                 let bot = update.member.as_ref().map(|member| member.user.bot);
+                // Prefer the event's member roles when present; otherwise fall
+                // back to the cache. A member with no known roles stays absent
+                // and fails closed on the next authority check.
+                let roles: Option<Vec<Snowflake>> = update
+                    .member
+                    .as_ref()
+                    .map(|member| member.roles.iter().map(|id| id.get()).collect())
+                    .or_else(|| {
+                        let guild_key = Id::new(guild_id);
+                        let user_key = Id::new(member_id);
+                        cache
+                            .member(guild_key, user_key)
+                            .map(|member| member.roles().iter().map(|id| id.get()).collect())
+                    });
                 self.voice_frame(
                     guild_id,
                     member_id,
@@ -5358,6 +5447,9 @@ where
                     bot,
                     display_name(cache, guild_id, member_id),
                 );
+                if let Some(actor) = self.live_actor(guild_id) {
+                    actor.live.set_member_roles(member_id, roles);
+                }
             }
             Event::ChannelCreate(created) => {
                 if let Some(guild_id) = created.guild_id.map(|id| id.get()) {
@@ -5399,14 +5491,30 @@ where
                 }
             }
             Event::MemberUpdate(updated) => {
+                let guild_id = updated.guild_id.get();
                 if cache
                     .current_user()
                     .is_some_and(|bot| bot.id == updated.user.id)
                 {
-                    let guild_id = updated.guild_id.get();
                     if let Some(access) = bot_access_from_cache(cache, guild_id) {
                         self.update_live(guild_id, |live| live.refresh_bot(access));
                     }
+                }
+                // Keep VK-01 target authority current: a role granted after a
+                // vote started must be observed before enforcement.
+                let member_id = updated.user.id.get();
+                let roles: Option<Vec<Snowflake>> = {
+                    let guild_key = Id::new(guild_id);
+                    let user_key = Id::new(member_id);
+                    cache
+                        .member(guild_key, user_key)
+                        .map(|member| member.roles().iter().map(|id| id.get()).collect())
+                };
+                // Prefer the event's role list when the cache has not caught up.
+                let roles =
+                    roles.or_else(|| Some(updated.roles.iter().map(|id| id.get()).collect()));
+                if let Some(actor) = self.live_actor(guild_id) {
+                    actor.live.set_member_roles(member_id, roles);
                 }
             }
             // A warm RESUME replays missed dispatches before RESUMED; only then
@@ -5619,10 +5727,24 @@ fn snapshot_from_cache(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Opt
             })
         })
         .collect();
+    // Guild-scoped member roles for VK-01 target-authority checks. Only voice
+    // members are needed (a vote target must be an occupant); a member the
+    // cache has not populated yet stays absent and fails closed.
+    let mut member_roles = HashMap::new();
+    for member in &members {
+        let user_id = Id::new(member.member_id);
+        if let Some(cached) = cache.member(guild_key, user_id) {
+            member_roles.insert(
+                member.member_id,
+                cached.roles().iter().map(|id| id.get()).collect(),
+            );
+        }
+    }
     Some(GuildSnapshot {
         channels,
         members,
         bot: bot_access_from_cache(cache, guild_id)?,
+        member_roles,
     })
 }
 
@@ -7534,8 +7656,18 @@ fn kick_refusal_text(refusal: &KickRefusal) -> &'static str {
         KickRefusal::Vote(VoteKickError::ProtectedTarget) => {
             "The room owner and original creator cannot be voted out."
         }
+        KickRefusal::Vote(VoteKickError::PrivilegedTarget) => "That member cannot be voted out.",
+        KickRefusal::Vote(VoteKickError::AuthorityUnavailable) => {
+            "Could not verify that member's permissions. Try again shortly."
+        }
         KickRefusal::Vote(VoteKickError::ActiveVoteExists) => {
             "A vote is already active for that member."
+        }
+        KickRefusal::Vote(VoteKickError::Cooldown) => {
+            "A recent vote against that member is in cooldown. Try again shortly."
+        }
+        KickRefusal::Vote(VoteKickError::InitiatorLimited) => {
+            "You have started too many votes recently. Try again shortly."
         }
         KickRefusal::Vote(VoteKickError::ReusedVoteId) => {
             "That vote was already started. Try again."

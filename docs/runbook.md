@@ -310,6 +310,58 @@ identified, when a dead-letter or orphan names a stranded member, or when
 failures coincide with 429, DB-error or pool alerts — the fix then belongs
 to the on-call engineer, not another redeploy.
 
+#### Alert: gateway missed events
+
+`two_bot_gateway_missed_events_total` increased between two keepalive
+samples. These are dispatches Discord assigned but this process never
+received (sequence gaps inside one session). Any increase fails the
+zero-missed-events acceptance: the session continued, but part of the
+event stream is gone and RESUME does not replay it. The first sample after
+monitoring arms only stores the baseline and never fires, and a counter
+reset (process restart) skips the window rather than firing.
+
+First response: read the paired `two_bot_gateway_disconnects_total` counter
+via the authorized `/ops/metrics` scrape — a missed-events increase with no
+disconnect means the gap predates this instrumentation or the process
+restarted mid-window (re-baseline both scrapes after it); a rise next to
+disconnects means transport loss with sequence gaps. Correlate with recent
+deploys (a fresh deploy restarts the process and resets the counter) and
+the container logs for `gateway reconnect failed; Twilight will retry` and
+`gateway ready; checkpoint committed`. Do not restart the container to
+"clear" the counter; a replacement resets the baseline without recovering
+the missed dispatches.
+
+Escalate when the increase repeats across windows, when it coincides with
+unpaired disconnects (no later RESUME or fresh READY), or when missed
+events rise with no disconnect at all — the gap is then unexplained and
+the fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: ticker stale
+
+A 15 s ticker (`scheduled_messages` or `settings`) recorded no successful
+completion for more than 10 minutes
+(`two_bot_job_last_success_timestamp_seconds{job}`). These tickers wedge
+silently: skipped busy deadlines count neither as success nor failure, so
+neither `job_stale` nor `job_consecutive_failures` can see them. A job
+that never succeeded since start (timestamp zero) is not reported here:
+that covers both boot and parked tickers (never registered because
+`DATABASE_URL` is unset or the automations gate is off). If the Container
+restarted the series resets; wait one window before acting.
+
+First response: check the `jobs` map on `/readyz` for the ticker's
+`parked`, `last_success` and `consecutive_failures` fields, then read the
+Worker/container logs for `periodic job failed`. A parked ticker with a
+zero timestamp is configuration, not a wedge — confirm the expected
+`DATABASE_URL` binding and automations gating before touching the bot.
+Restart only after the logs show the ticker loop is wedged, per the
+[restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
+
+Escalate when staleness persists after the suspect deploy or dependency is
+identified, when it coincides with pool-saturation or DB-error alerts, or
+when a due schedule row or settings change stays unapplied past the
+window — the fix then belongs to the on-call engineer, not another
+redeploy.
+
 ## Persisted ownership control
 
 The Worker/DO fence is implemented, not implicitly released by deployment.
@@ -347,7 +399,12 @@ node wrangler/scripts/ownership-control.mjs status
 Refresh the epoch before **each** change. `fence` is a persisted parking owner
 (`deploymentId=null`, `phase=fenced`); health/readyz and stale schedules refuse.
 Takeover/fence increment the epoch and record actor, timestamp, old/new epoch and
-owner. Durable revocation is written before awaited native destruction;
+owner, except a same-version repeat takeover by the deployment that already owns
+the active singleton: the Worker returns the stored record unchanged (no write,
+no audit row, no teardown) and the client stops with "Ownership transition not
+confirmed; preserve maintenance". That is the safe direction; the normal staging
+deploy path mints a new version id, so the verify gate is unaffected.
+Durable revocation is written before awaited native destruction;
 `running=false` is required before active release. A crash, storage-write failure
 or unconfirmed shutdown leaves denial; do not assume a 503 stopped the old
 process. Preserve maintenance until teardown is confirmed. 401/auth failure is
@@ -422,12 +479,18 @@ Invocation (secret-free; each URL comes only from its existing binding):
 
 ```text
 staging-migrate --plan --source-sha <40hex> --staging-host <host> \
-  --staging-database <db> --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
+  --staging-database <db> [--staging-branch-id <branch>] \
+  --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
   [--expected-pending <ascending,comma-separated versions>]
 staging-migrate --apply <same flags> --expected-pending <list> \
   --plan-manifest-sha256 <64hex> --plan-run-id <run id> \
   --plan-manifest-path <producing run's downloaded manifest>
 ```
+
+`--staging-branch-id` pins the PlanetScale branch id (non-secret). It is
+required when `--staging-host` ends in `.psdb.cloud` (PlanetScale routes
+branches by the binding username's `{role}.{branch_id}` suffix); other hosts
+leave it empty.
 
 Reconcile is set-based: pending is every source version absent from the
 ledger, in source order, so a ledger may lag the source by any subset. `--plan`
@@ -470,8 +533,11 @@ string instead of failing the plan.
 
 It refuses (exit 2, before any DDL) when the binding is absent, the target does
 not equal the pinned staging host/database inputs, either pin is empty or looks
-like production, either host pin or the binding host is a pooler endpoint
-(session `SET ROLE` and the migrator lock need the direct endpoint), the login
+like production, either host pin or the binding host is a pooler endpoint,
+the binding uses a pooled port (anything but 5432) or a pooler-style `|` username
+(session `SET ROLE` and the migrator lock need the direct 5432 endpoint),
+a `*.psdb.cloud` pin has no `--staging-branch-id`, the pin is malformed, or the
+binding username's branch suffix does not match the pinned branch, the login
 cannot assume `two_bot_migrator` (apply) or `two_bot_migrator_ro` (plan), the
 plan login also holds `two_bot_migrator`, a reference is missing, `--apply` has no
 `--expected-pending` or it mismatches, `--apply` has no `plan_manifest_sha256`/

@@ -706,10 +706,74 @@ fn snowflakes(
 
 const MAX_TIMEOUT_SECONDS: u64 = 28 * 24 * 60 * 60;
 
+/// Parse one JSON-form sanction rung — the shape the configuration reference
+/// renders for the parsed default (e.g.
+/// `{"violations":1,"action":"delete","timeout_seconds":null}`). Ranges mirror
+/// the CSV form: a `timeout` rung without a usable value defaults to 600 s,
+/// any other out-of-range value fails with the matching CSV error.
+fn parse_json_sanction(value: &serde_json::Value) -> Result<AutomodSanction, AutomodGateError> {
+    let violations: u32 = value
+        .get("violations")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| (1..=100).contains(n))
+        .ok_or(AutomodGateError::InvalidSanctionThreshold)?;
+    let action = match value.get("action").and_then(serde_json::Value::as_str) {
+        Some("delete") => SanctionAction::Delete,
+        Some("warn") => SanctionAction::Warn,
+        Some("timeout") => SanctionAction::Timeout,
+        _ => return Err(AutomodGateError::InvalidSanctionAction),
+    };
+    let timeout_seconds = if action == SanctionAction::Timeout {
+        match value.get("timeout_seconds") {
+            None | Some(serde_json::Value::Null) => Some(600),
+            Some(raw) => Some(
+                raw.as_u64()
+                    .filter(|n| (60..=MAX_TIMEOUT_SECONDS).contains(n))
+                    .ok_or(AutomodGateError::InvalidSanctionTimeout)?,
+            ),
+        }
+    } else {
+        None
+    };
+    Ok(AutomodSanction {
+        violations,
+        action,
+        timeout_seconds,
+    })
+}
+
+/// Shared ladder validation: sort by threshold, then require a rung at
+/// violation 1 with unique thresholds.
+fn finish_sanctions(
+    mut sanctions: Vec<AutomodSanction>,
+) -> Result<Vec<AutomodSanction>, AutomodGateError> {
+    sanctions.sort_by_key(|s| s.violations);
+    if sanctions.first().is_none_or(|s| s.violations != 1) {
+        return Err(AutomodGateError::SanctionsMustStartAtOne);
+    }
+    for window in sanctions.windows(2) {
+        if window[0].violations == window[1].violations {
+            return Err(AutomodGateError::DuplicateSanctionThreshold);
+        }
+    }
+    Ok(sanctions)
+}
+
 fn parse_sanctions(value: Option<&str>) -> Result<Vec<AutomodSanction>, AutomodGateError> {
     let raw = value.map(str::trim).unwrap_or("");
     if raw.is_empty() {
         return Ok(DEFAULT_SANCTIONS.to_vec());
+    }
+    if raw.starts_with('[') {
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(raw).map_err(|_| AutomodGateError::InvalidSanctionThreshold)?;
+        return finish_sanctions(
+            parsed
+                .iter()
+                .map(parse_json_sanction)
+                .collect::<Result<_, _>>()?,
+        );
     }
     let mut sanctions = Vec::new();
     for part in raw.split(',') {
@@ -746,16 +810,7 @@ fn parse_sanctions(value: Option<&str>) -> Result<Vec<AutomodSanction>, AutomodG
             timeout_seconds,
         });
     }
-    sanctions.sort_by_key(|s| s.violations);
-    if sanctions.first().is_none_or(|s| s.violations != 1) {
-        return Err(AutomodGateError::SanctionsMustStartAtOne);
-    }
-    for window in sanctions.windows(2) {
-        if window[0].violations == window[1].violations {
-            return Err(AutomodGateError::DuplicateSanctionThreshold);
-        }
-    }
-    Ok(sanctions)
+    finish_sanctions(sanctions)
 }
 
 impl AutomodConfig {
@@ -1262,6 +1317,65 @@ mod tests {
         assert_eq!(
             parse_sanctions(Some("1:timeout:30")),
             Err(AutomodGateError::InvalidSanctionTimeout)
+        );
+    }
+
+    #[test]
+    fn sanction_parsing_accepts_the_reference_json_default() {
+        let rendered = r#"[{"violations":1,"action":"delete","timeout_seconds":null},{"violations":2,"action":"warn","timeout_seconds":null},{"violations":3,"action":"timeout","timeout_seconds":600}]"#;
+        assert_eq!(
+            parse_sanctions(Some(rendered)).expect("json parses"),
+            parse_sanctions(Some("1:delete,2:warn,3:timeout:600")).expect("csv parses")
+        );
+        assert_eq!(
+            parse_sanctions(Some(
+                r#"[{"violations":1,"action":"banhammer","timeout_seconds":null}]"#
+            )),
+            Err(AutomodGateError::InvalidSanctionAction)
+        );
+        assert_eq!(
+            parse_sanctions(Some(
+                r#"[{"violations":0,"action":"delete","timeout_seconds":null}]"#
+            )),
+            Err(AutomodGateError::InvalidSanctionThreshold)
+        );
+        assert_eq!(
+            parse_sanctions(Some(
+                r#"[{"violations":2,"action":"delete","timeout_seconds":null}]"#
+            )),
+            Err(AutomodGateError::SanctionsMustStartAtOne)
+        );
+        assert_eq!(
+            parse_sanctions(Some(
+                r#"[{"violations":1,"action":"timeout","timeout_seconds":30}]"#
+            )),
+            Err(AutomodGateError::InvalidSanctionTimeout)
+        );
+        assert_eq!(
+            parse_sanctions(Some(
+                r#"[{"violations":1,"action":"timeout","timeout_seconds":null}]"#
+            ))
+            .expect("null timeout defaults")[0]
+                .timeout_seconds,
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn sanction_parsing_accepts_a_dashboard_stored_real_array() {
+        // The dashboard may store the ladder as a real JSON array rather than
+        // a string. The live snapshot renders stored values through
+        // `settings::to_env_string`, which must hand the parser the JSON
+        // shape instead of comma-joined objects.
+        let stored = serde_json::json!([
+            {"violations": 1, "action": "delete", "timeout_seconds": null},
+            {"violations": 2, "action": "warn", "timeout_seconds": null},
+            {"violations": 3, "action": "timeout", "timeout_seconds": 600},
+        ]);
+        let rendered = crate::settings::to_env_string(&stored).expect("renders");
+        assert_eq!(
+            parse_sanctions(Some(&rendered)).expect("stored array parses"),
+            parse_sanctions(Some("1:delete,2:warn,3:timeout:600")).expect("csv parses")
         );
     }
 

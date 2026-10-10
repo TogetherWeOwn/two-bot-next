@@ -4933,6 +4933,204 @@ async fn self_role_reactions_have_their_own_bounded_lane() {
     mock.shutdown().await;
 }
 
+#[tokio::test]
+async fn self_role_reactions_enforce_per_member_fairness() {
+    use std::collections::HashSet;
+    use twilight_model::gateway::payload::incoming::{ReactionAdd, ReactionRemove};
+    use twilight_model::id::Id;
+    use two_bot_core::self_roles::{PanelMode, SelfRoleGates, SelfRoleOption, SelfRolePanel};
+    use two_bot_core::InteractionRouter;
+    use two_bot_cutover::self_role_store::SelfRoleStore;
+
+    use crate::command_runtime::{DISPATCH_LIMITS, LANE_REACTIONS};
+    use crate::interaction_admission::PER_USER_IN_FLIGHT;
+    use crate::self_role_handlers::SelfRoleService;
+    use crate::self_role_runtime::SelfRoleRuntime;
+
+    const SR_GUILD: u64 = 100_000_000_000_000_001;
+    const SR_CHANNEL: &str = "100000000000000007";
+    const SR_MESSAGE: &str = "100000000000000008";
+    const SR_BOT: &str = "100000000000000003";
+    const MEMBER_A: u64 = 100_000_000_000_000_002;
+    const MEMBER_B: u64 = 100_000_000_000_000_009;
+
+    // Closure, not a nested fn item, so the outer `use` imports stay in scope.
+    let reaction_for = |user: u64| {
+        let mut reaction = crate::self_role_handlers::tests::reaction();
+        reaction.user_id = Id::new(user);
+        reaction
+    };
+    // One fresh self-role runtime per phase; each phase holds its own mock,
+    // pool (lazy, never connected) and dispatch guard so phases never share
+    // lane depth or per-member counts.
+    macro_rules! fairness_runtime {
+        () => {{
+            let (mock, origin) = MockRest::start(Vec::new()).await;
+            let pool = PgPoolOptions::new()
+                .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+                .expect("lazy pool");
+            let executor = ActionExecutor::with_proxy("test-token".to_owned(), Some(origin))
+                .expect("mock executor");
+            let service_runtime = SelfRoleRuntime {
+                store: SelfRoleStore::new(pool.clone()),
+                executor: executor.clone(),
+                guild_id: SR_GUILD.to_string(),
+                bot_id: SR_BOT.to_owned(),
+            };
+            let panel = SelfRolePanel {
+                id: "games".into(),
+                channel_id: SR_CHANNEL.into(),
+                message_id: SR_MESSAGE.into(),
+                mode: PanelMode::Reaction,
+                exclusive: true,
+                color: false,
+                options: vec![SelfRoleOption {
+                    key: "new".into(),
+                    label: "New".into(),
+                    role_id: "100000000000000004".into(),
+                    permissions: "0".into(),
+                    emoji: Some("b".into()),
+                    description: None,
+                }],
+            };
+            let service = Arc::new(
+                SelfRoleService::new(
+                    service_runtime,
+                    SelfRoleGates {
+                        panels: vec![panel],
+                        dry_run: false,
+                    },
+                    &[SR_GUILD.to_string()].into_iter().collect::<HashSet<_>>(),
+                )
+                .expect("approved staging catalogue"),
+            );
+            let router = InteractionRouter::new(RouterGates {
+                configured_guild: Some(SR_GUILD),
+                scorecard: false,
+                automations: true,
+                announcements: false,
+                moderation: false,
+                voice: false,
+                voice_assistant: false,
+                tickets: false,
+                self_roles: true,
+                onboarding_picker: false,
+                session_picker: false,
+            });
+            let runtime = CommandRuntime::new_with_self_roles(
+                pool, executor, router, SR_GUILD, true, service,
+            );
+            (mock, runtime)
+        }};
+    }
+
+    let reaction_cap = DISPATCH_LIMITS[LANE_REACTIONS];
+    assert!(
+        PER_USER_IN_FLIGHT < reaction_cap,
+        "a single member burst must not fill the {reaction_cap}-slot reaction lane"
+    );
+
+    // Phase 1: member A at its per-member cap drops, member B still admits.
+    // Burst occupancy is pinned with synchronous slot holds, so no settle
+    // wait can flake this on a loaded runner.
+    {
+        let (mock, runtime) = fairness_runtime!();
+        let _guard = runtime.dispatch_guard();
+        let held: Vec<_> = (0..PER_USER_IN_FLIGHT)
+            .map(|_| {
+                runtime
+                    .acquire_user_slot_for_test(MEMBER_A)
+                    .expect("burst holds a slot")
+            })
+            .collect();
+        assert!(
+            runtime.acquire_user_slot_for_test(MEMBER_A).is_none(),
+            "burst holds the whole per-member budget"
+        );
+
+        let add_a = Event::ReactionAdd(Box::new(ReactionAdd(reaction_for(MEMBER_A))));
+        assert!(
+            !runtime.dispatch(&add_a),
+            "member at cap drops its excess reaction"
+        );
+        let remove_a = Event::ReactionRemove(Box::new(ReactionRemove(reaction_for(MEMBER_A))));
+        assert!(
+            !runtime.dispatch(&remove_a),
+            "removes share the same per-member budget"
+        );
+        assert_eq!(
+            runtime.lane_in_flight(LANE_REACTIONS),
+            0,
+            "dropped reactions spawn nothing"
+        );
+        assert_eq!(
+            runtime.dispatch_drops_total(LANE_REACTIONS),
+            2,
+            "fairness drops share the lane's drop counter"
+        );
+
+        let add_b = Event::ReactionAdd(Box::new(ReactionAdd(reaction_for(MEMBER_B))));
+        assert!(
+            runtime.dispatch(&add_b),
+            "other member still admits while the lane is hot"
+        );
+        assert!(
+            runtime.lane_in_flight(LANE_REACTIONS) <= reaction_cap,
+            "admitted reaction stays within the lane bound"
+        );
+        assert!(
+            mock.requests().is_empty(),
+            "fairness drops send no REST before settle"
+        );
+
+        drop(held);
+        assert!(
+            runtime.dispatch(&add_a),
+            "released per-member slots admit again"
+        );
+        assert_eq!(
+            runtime.dispatch_drops_total(LANE_REACTIONS),
+            2,
+            "admissions never increment the drop counter"
+        );
+        assert!(
+            runtime.lane_in_flight(LANE_REACTIONS) <= reaction_cap,
+            "readmitted reaction stays within the lane bound"
+        );
+        mock.shutdown().await;
+    }
+
+    // Phase 2: with fairness active, a hot saturated lane still drops excess
+    // through the same bounded path instead of spawning unbounded work.
+    {
+        let (mock, runtime) = fairness_runtime!();
+        let _guard = runtime.dispatch_guard();
+        for _ in 0..reaction_cap {
+            assert!(runtime.hold_lane_for_test(LANE_REACTIONS, Duration::from_secs(30)));
+        }
+        assert_eq!(runtime.lane_in_flight(LANE_REACTIONS), reaction_cap);
+
+        let mut admitted = 0usize;
+        let mut max_observed = 0usize;
+        for i in 0..200 {
+            let user = if i % 2 == 0 { MEMBER_A } else { MEMBER_B };
+            let event = Event::ReactionAdd(Box::new(ReactionAdd(reaction_for(user))));
+            if runtime.dispatch(&event) {
+                admitted += 1;
+            }
+            max_observed = max_observed.max(runtime.lane_in_flight(LANE_REACTIONS));
+        }
+        assert_eq!(admitted, 0, "saturated lane drops multi-member bursts");
+        assert!(
+            max_observed <= reaction_cap,
+            "in-flight {max_observed} exceeds lane cap {reaction_cap}"
+        );
+        assert_eq!(runtime.lane_in_flight(LANE_REACTIONS), reaction_cap);
+        assert!(mock.requests().is_empty(), "dropped reactions send no REST");
+        mock.shutdown().await;
+    }
+}
+
 /// Saturation drops count per lane while the log stays quiet (TOG-19878): a
 /// burst of N drops on one lane increments only that lane's counter and
 /// emits O(1) log lines. The busy lane is covered through the same
@@ -5009,4 +5207,165 @@ async fn saturated_lane_counts_drops_per_lane_and_quiets_logs() {
     );
     assert!(mock.requests().is_empty(), "dropped work sends no REST");
     mock.shutdown().await;
+}
+
+/// Worker call-site proof for the verdict-to-prefix-trigger plumbing: with
+/// automod enabled, driving `dispatch_with_verdict` with the worker decision
+/// (`gateway::worker_prefix_trigger`, exactly as `apply_dispatch` wires it)
+/// posts exactly one prefix reply for an `Accept` create and none for a
+/// `CaptureOnly` or unscreened (`None`) create.
+///
+/// Seeded `!faq` row on the isolated `TestDb`, loopback `MockRest`, the real
+/// trigger handler and the real render. A dispatch path that drops the
+/// verdict (`None`), forces `Accept`, or ignores the verdict for the
+/// configured acceptance posts zero or two-plus replies and fails the count;
+/// a worker that forwards the funnel disposition instead of the trigger
+/// verdict upgrades the capture-only create to a reply and fails it too.
+/// Requires the disposable agent-testdb/CI Postgres service (same as the
+/// gateway suite — never the runtime DATABASE_URL).
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb or CI service"]
+async fn worker_verdict_drives_prefix_trigger_from_call_site() {
+    use std::collections::HashMap;
+
+    use twilight_model::gateway::payload::incoming::MessageCreate;
+    use two_bot_core::automod_runtime::FunnelDisposition;
+    use two_bot_core::custom_commands::PutCommandInput;
+
+    use crate::automod_gateway::WorkerVerdict;
+    use crate::command_runtime::LANE_MESSAGES;
+    use crate::gateway::worker_prefix_trigger;
+    use crate::gateway_commands::GatewayCommandConfig;
+
+    fn verdict_message(id: u64, author: &str) -> Message {
+        serde_json::from_value(serde_json::json!({
+            "id": id.to_string(), "guild_id": "2222", "channel_id": "4444", "type": 0,
+            "author": {"id": author, "username": "tester", "discriminator": "0000", "avatar": null},
+            "content": "!faq please", "timestamp": "2026-09-30T12:00:00.000000+00:00",
+            "edited_timestamp": null,
+            "tts": false, "mention_everyone": false, "mentions": [], "mention_roles": [],
+            "attachments": [], "embeds": [], "pinned": false
+        }))
+        .expect("valid Twilight message fixture")
+    }
+
+    fn verdict_event(message: Message) -> Event {
+        Event::MessageCreate(Box::new(MessageCreate(message)))
+    }
+
+    let db = TestDb::new().await;
+    two_bot_core::custom_command_service::put(
+        &db.pool,
+        true,
+        GUILD_S,
+        "3333",
+        &PutCommandInput {
+            name: "faq".to_owned(),
+            description: "FAQ".to_owned(),
+            template: "Hi {user} {username} in {server} {channel}".to_owned(),
+            text_trigger: Some("!faq".to_owned()),
+        },
+        "seed-faq",
+        &two_bot_core::now_iso(),
+    )
+    .await
+    .expect("seed custom command");
+
+    // Bootstrap reads first: the application id, then the guild name.
+    let (mock, origin) = MockRest::start_script(vec![
+        RestResponse {
+            status: 200,
+            body: Some(r#"{"id":"1111"}"#.to_owned()),
+            delay: Duration::ZERO,
+        },
+        RestResponse {
+            status: 200,
+            body: Some(r#"{"id":"2222","name":"Test guild"}"#.to_owned()),
+            delay: Duration::ZERO,
+        },
+    ])
+    .await;
+    let runtime = CommandRuntime::new(
+        db.pool.clone(),
+        executor_at(origin),
+        router_with_commands(gates(true, true)),
+        GUILD,
+        true,
+    );
+    let _guard = runtime.dispatch_guard();
+    let vars = HashMap::from([
+        ("TWO_AUTOMATIONS".to_owned(), "1".to_owned()),
+        ("TWO_TEXT_COMMANDS".to_owned(), "1".to_owned()),
+        ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
+    ]);
+    runtime
+        .initialize_custom_commands(
+            GatewayCommandConfig::from_map(GUILD, &vars).expect("dispatch command config"),
+        )
+        .await
+        .expect("custom-command bootstrap (loopback REST, isolated DB)");
+
+    // The worker call site: the trigger verdict feeds `dispatch_with_verdict`.
+    let accept_event = verdict_event(verdict_message(61, "3333"));
+    let split_event = verdict_event(verdict_message(62, "3334"));
+    let unscreened_event = verdict_event(verdict_message(63, "3335"));
+    let accept = Some(WorkerVerdict {
+        funnel: FunnelDisposition::Accept,
+        trigger: FunnelDisposition::Accept,
+    });
+    let split = Some(WorkerVerdict {
+        funnel: FunnelDisposition::Accept,
+        trigger: FunnelDisposition::CaptureOnly,
+    });
+    let accept_trigger = worker_prefix_trigger(accept, &accept_event, true);
+    assert_eq!(
+        accept_trigger,
+        Some(Some(FunnelDisposition::Accept)),
+        "accepted create forwards its accept trigger"
+    );
+    // Fail-closed: the split create never dispatches, so it can post no
+    // reply and enqueue no sticky work; the `posts.len() == 1` assertion
+    // below proves it.
+    let split_trigger = worker_prefix_trigger(split, &split_event, true);
+    assert!(
+        split_trigger.is_none(),
+        "uninspected funnel-accept never dispatches prefix triggers"
+    );
+    let unscreened_trigger = worker_prefix_trigger(None, &unscreened_event, true);
+    assert_eq!(
+        unscreened_trigger,
+        Some(None),
+        "unscreened create dispatches without a verdict and fails closed downstream"
+    );
+    assert!(
+        runtime.dispatch_with_verdict(&accept_event, accept_trigger.expect("accept dispatches")),
+        "accept admits on the message lane"
+    );
+    assert!(
+        runtime.dispatch_with_verdict(
+            &unscreened_event,
+            unscreened_trigger.expect("unscreened dispatches")
+        ),
+        "unscreened create still admits; the missing verdict refuses it"
+    );
+    wait_for(
+        || runtime.lane_in_flight(LANE_MESSAGES) == 0,
+        "verdict prefix work settles",
+    )
+    .await;
+
+    let posts = mock.posts_to("/channels/4444/messages").await;
+    assert_eq!(
+        posts.len(),
+        1,
+        "only the accepted create posts a prefix reply, got {}",
+        posts.len()
+    );
+    let body: serde_json::Value = serde_json::from_slice(&posts[0].body).unwrap();
+    assert_eq!(
+        body["content"], "Hi <@3333> tester in Test guild <#4444>",
+        "accepted create renders and posts the seeded trigger reply"
+    );
+    mock.shutdown().await;
+    db.close().await;
 }

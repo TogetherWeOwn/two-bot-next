@@ -65,6 +65,24 @@ Scale to real traffic by replacing 10,000/hour with the observed
 - Both alerts reset when neither window exceeds its burn rate. A
   re-firing alert opens a new ticket; it never reopens a closed one.
 
+## Related immediate alerts (not burn)
+
+The fast/slow burn rules above stay silent on a single bad minute by
+design. Two Worker alert rules cover gaps the burn math cannot see, and
+page immediately rather than consuming budget:
+
+- `gateway_missed_events`: any increase of
+  `two_bot_gateway_missed_events_total` between two keepalive samples
+  pages at once (zero threshold), because a sequence gap fails the
+  zero-missed-events acceptance outright. Runbook:
+  [runbook](runbook.md#alert-gateway-missed-events).
+- `ticker_stale`: a 15 s ticker (`scheduled_messages`, `settings`) with no
+  success for more than 10 minutes pages at once, because skipped busy
+  deadlines are neither success nor failure and never spend burn budget.
+  Runbook: [runbook](runbook.md#alert-ticker-stale).
+
+Neither rule changes the burn thresholds, windows or budget above.
+
 ## Maintenance
 
 Thresholds, windows, the budget ratio and the worked example move with

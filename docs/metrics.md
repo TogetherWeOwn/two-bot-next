@@ -40,7 +40,8 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_tracked_rooms` | Rooms tracked in memory; compare with live Discord channels for ghosts |
 | `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
-| `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert when any lane's drops increase across consecutive keepalive samples; a single drop inside one burst is not paging |
+| `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert when any lane's drops increase across consecutive keepalive samples; a single drop inside one burst is not paging. `reactions`-lane growth points at a hot member before an undersized lane |
+| `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert when refused outcomes increase across consecutive keepalive samples; a single refusal inside one burst is not paging |
 
 ## Job coverage and outcomes
 
@@ -124,7 +125,8 @@ as dynamic labels.
   `DELETE /guilds/:guild/members/:member/roles/:role`,
   `POST /guilds/:guild/scheduled-events`,
   `PATCH /guilds/:guild/scheduled-events/:event`,
-  `DELETE /guilds/:guild/scheduled-events/:event`, `other`).
+  `DELETE /guilds/:guild/scheduled-events/:event`,
+  `POST /guilds/:guild/channels`, `DELETE /channels/:channel`, `other`).
 - `two_bot_job_runs_total{job,outcome}`,
   `two_bot_job_last_success_timestamp_seconds{job}` and
   `two_bot_job_consecutive_failures{job}` — `job` is one of
@@ -155,7 +157,23 @@ as dynamic labels.
   `interactions`, `registry`, `privileged`, `busy` or `reactions`, in the
   bot's `DISPATCH_LIMITS` order (`crates/core/src/metrics.rs`
   `DISPATCH_LANES`). Recorded on every `spawn_first` saturation refusal,
-  including the busy-lane path; scope-shutdown refusals are not drops.
+  including the busy-lane path, plus per-member fairness refusals on the
+  `reactions` lane (the `dispatch_self_role_reaction` per-member cap, via the
+  shared `record_drop` path); scope-shutdown refusals are not drops.
+- `two_bot_internal_actions_total{family,outcome}` — `family` is one of
+  `announcement`, `event`, `settings`, `moderation`, `membership` or
+  `other`, mapped from the signed `action` verb in
+  `crates/bot/src/internal_action_http.rs` (`announcement.post` →
+  `announcement`, `event.*` → `event`, `settings.*` → `settings`,
+  `moderation.*` → `moderation`, `role.assign`/`guild.add_member` →
+  `membership`, everything else → `other`). `outcome` is `executed` or one
+  of the bounded refusal classes (`auth_failure`, `unknown_key`,
+  `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`,
+  `action_disabled`, `malformed_body`, `conflict`, `upstream`, `internal`).
+  Recorded once per receiver request (`ReceiverState::reject` for refusals,
+  `ReceiverState::terminal` plus the keyless-read and settings/moderation
+  success envelopes for executions); no key id, token, body or request bytes
+  ever become labels.
 - Log fields (coordinated with blocked structured-log work, which owns JSON
   formatting): `voice_event="voice_operation"` with `op`/`outcome`,
   `voice_event="voice_reconcile"` with plan counts,
@@ -285,11 +303,19 @@ No Prometheus server, no new infrastructure.
 | `db_errors` | 3+ storage failures between samples (restarts skip the window) | [DB errors](runbook.md#alert-db-errors) |
 | `send_admission_blocked` | new admission refusals in 3 consecutive samples | [send admission blocked](runbook.md#alert-send-admission-blocked) |
 | `voice_failures` | room-op failures > 5% of >= 10 ops between samples, or any new dead-letter/orphan (restarts skip the window) | [voice failures](runbook.md#alert-voice-failures) |
+| `gateway_missed_events` | any increase of `two_bot_gateway_missed_events_total` between samples (first sample and restarts skip the window) | [gateway missed events](runbook.md#alert-gateway-missed-events) |
+| `ticker_stale:<job>` | 15 s ticker with no success for more than 10 minutes (never-succeeded is ignored) | [ticker stale](runbook.md#alert-ticker-stale) |
 
 `job_stale` uses `JOB_INTERVAL_SECONDS`, which must equal each scheduled job's
-Rust `*_INTERVAL_MS / 1000`. `invite_snapshot`, `session_checkpoint` and `other`
-have no cadence and are exempt. `wrangler/test/alert-job-catalog.test.ts` fails
-when a `JOBS` label has neither a matching cadence nor a reasoned exemption.
+Rust `*_INTERVAL_MS / 1000`. The 15 s tickers (`scheduled_messages`,
+`settings`) use `ticker_stale` with the explicit `TICKER_STALE_SECONDS` (600)
+window instead: at two intervals a 15 s cadence would flap on a single slow
+scrape, and skipped busy deadlines are neither success nor failure, so
+`job_stale` and `job_consecutive_failures` cannot see a wedged ticker.
+`invite_snapshot`, `session_checkpoint` and `other` have no cadence and are
+exempt; `audit_retry` stays exempt with its parked/halt reason.
+`wrangler/test/alert-job-catalog.test.ts` fails when a `JOBS` label has
+neither a matching cadence, ticker_stale coverage, nor a reasoned exemption.
 
 Packet identity (TOG-12100): rule ids above are the single shared spelling
 used on both sides of the B2 soak evidence seam. The Rust canonical list is
@@ -298,7 +324,7 @@ used on both sides of the B2 soak evidence seam. The Rust canonical list is
 is named `evidence-{ruleId}-{window}.json` (soak-ledger packets stamp the
 `soak_expected_committed` ledger identity), so the QA evidence table can
 attribute packets when several rules fire in one window. Both sides pin all
-seven spellings with tests; the payload shape is unchanged.
+nine spellings with tests; the payload shape is unchanged.
 
 Known gaps: the DB error counter currently records only send-admission SQL,
 so non-admission stores still surface only through the pool proxy and the

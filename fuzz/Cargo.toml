@@ -67,3 +67,10 @@ path = "fuzz_targets/rsvp.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "settings_map"
+path = "fuzz_targets/settings_map.rs"
+test = false
+doc = false
+bench = false

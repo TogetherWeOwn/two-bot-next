@@ -15,6 +15,34 @@ use two_bot_testsupport::TestDatabase;
 mod adapter;
 mod settings;
 
+/// Stored `internal_idempotency` receipt row: action, state, response code,
+/// status, resource, affected count, guild, actor, target, resolved role.
+type StoredReceiptRow = (
+    String,
+    String,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Terminal `internal_action_log` row: action, phase, response code, evidence
+/// code, status, guild, target, resolved role.
+type TerminalAuditRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 fn secret(index: usize) -> String {
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../core/tests/fixtures/internal-action-signing.json"
@@ -195,6 +223,22 @@ fn state_full(
     reads: Arc<MockEventRead>,
     moderation: Arc<MockModeration>,
 ) -> Arc<ReceiverState> {
+    state_full_with_channel(
+        pool,
+        effect,
+        reads,
+        moderation,
+        Arc::new(MockChannel::default()),
+    )
+}
+
+fn state_full_with_channel(
+    pool: sqlx::PgPool,
+    effect: Arc<MockEffect>,
+    reads: Arc<MockEventRead>,
+    moderation: Arc<MockModeration>,
+    channel: Arc<MockChannel>,
+) -> Arc<ReceiverState> {
     // The announcement double also stands in as the membership double:
     // membership tests share the mock and assert its calls, while moderation
     // tests never reach the member effect.
@@ -205,6 +249,7 @@ fn state_full(
         effect,
         reads,
         moderation,
+        channel,
     ))
 }
 
@@ -235,6 +280,53 @@ impl ModerationEffect for MockModeration {
             Ok(TerminalResponse::Success {
                 resource_id: Some(target),
                 affected: 1,
+            })
+        })
+    }
+}
+
+/// Offline channel-moderation double: the auth/key/flag fences must refuse
+/// before this is ever called, so deny-path tests assert `calls() == 0`.
+/// Success mirrors the planner outcomes (`purged` with its count,
+/// `slowmode_updated`, `locked_down`, `unlocked`) without touching Discord.
+#[derive(Default)]
+struct MockChannel {
+    calls: AtomicUsize,
+}
+
+impl MockChannel {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl ChannelModerationEffect for MockChannel {
+    fn execute_channel<'a>(
+        &'a self,
+        request: &'a InternalChannelRequest,
+        _: &'a str,
+        _: &'a str,
+        _: &'a str,
+    ) -> BoxFuture<'a, Result<InternalChannelResult, ActionError>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let (outcome, affected) = match request.action().action_name() {
+                "moderation.purge" => ("purged".to_owned(), Some(3)),
+                "moderation.slowmode" => ("slowmode_updated".to_owned(), None),
+                "moderation.lockdown" => ("locked_down".to_owned(), None),
+                "moderation.unlock" => ("unlocked".to_owned(), None),
+                _ => {
+                    return Err(ActionError::new(
+                        ErrorCode::ActionNotAllowed,
+                        "not a channel moderation action",
+                        "moderation_action_mismatch",
+                    ));
+                }
+            };
+            Ok(InternalChannelResult {
+                outcome,
+                affected,
+                replayed: false,
             })
         })
     }
@@ -332,6 +424,29 @@ fn moderation_payload_with(action: &str, extra: Value) -> String {
     {
         body["duration_seconds"] = serde_json::json!(3600);
     }
+    for (key, value) in extra.as_object().unwrap() {
+        body[key] = value.clone();
+    }
+    body.to_string()
+}
+
+fn channel_payload(action: &str) -> String {
+    let mut body = serde_json::json!({
+        "action": action,
+        "actor_id": "111111111111111111",
+        "channel_id": "222222222222222222",
+        "reason": "spam",
+    });
+    match action {
+        "moderation.purge" => body["count"] = serde_json::json!(10),
+        "moderation.slowmode" => body["seconds"] = serde_json::json!(30),
+        _ => {}
+    }
+    body.to_string()
+}
+
+fn channel_payload_with(action: &str, extra: Value) -> String {
+    let mut body = serde_json::from_str::<Value>(&channel_payload(action)).unwrap();
     for (key, value) in extra.as_object().unwrap() {
         body[key] = value.clone();
     }
@@ -859,6 +974,13 @@ async fn authenticated_membership_actions_succeed_and_refusals_stay_redacted() {
     assert_eq!(effect.calls(), 1);
 
     let add_ok = r#"{"action":"guild.add_member","discord_id":"111111111111111111","access_token":"fixture-oauth"}"#;
+    // Non-vacuous control: the raw signed bytes DO carry the token pre-persist,
+    // so the stored-state scan below would catch a leak instead of passing
+    // on empty input.
+    assert!(
+        add_ok.contains("fixture-oauth"),
+        "control: raw guild.add_member bytes must carry the token"
+    );
     let (status, _, add_first) = answer(app.clone(), signed(add_ok, "old", "intent-add-ok")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(add_first["result"], json!({"outcome": "added"}));
@@ -869,6 +991,92 @@ async fn authenticated_membership_actions_succeed_and_refusals_stay_redacted() {
     assert_eq!(headers["idempotent-replay"], "true");
     assert_eq!(add_replay["result"], json!({"outcome": "added"}));
     assert_eq!(effect.calls(), 2);
+    // Wire responses never echo the transient token, including the replay.
+    assert!(
+        !add_first.to_string().contains("fixture-oauth"),
+        "first guild.add_member response must not echo the token"
+    );
+    assert!(
+        !add_replay.to_string().contains("fixture-oauth"),
+        "replayed guild.add_member response must not echo the token"
+    );
+    // Stored-state evidence: the OAuth token is absent from every persisted
+    // record for the happy path — the idempotency claim plus its
+    // `store.finish` receipt (same row, now completed) and the audit rows.
+    let claim_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT row_to_json(i)::text FROM internal_idempotency i \
+         WHERE action = 'guild.add_member'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(claim_rows.len(), 1, "exactly one guild.add_member claim");
+    for row in &claim_rows {
+        assert!(
+            !row.contains("fixture-oauth"),
+            "OAuth token persisted in idempotency claim/receipt"
+        );
+    }
+    // The receipt is durable: completed success with the stored-member
+    // `affected = 1`, no resource, and still no token bytes.
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM internal_idempotency WHERE action = 'guild.add_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(state, "completed");
+    let response_code: String = sqlx::query_scalar(
+        "SELECT response_code FROM internal_idempotency WHERE action = 'guild.add_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(response_code, "success");
+    let affected: i64 = sqlx::query_scalar(
+        "SELECT affected FROM internal_idempotency WHERE action = 'guild.add_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(affected, 1);
+    let resource_id: Option<String> = sqlx::query_scalar(
+        "SELECT resource_id FROM internal_idempotency WHERE action = 'guild.add_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(resource_id, None);
+    let audit_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT row_to_json(a)::text FROM internal_action_log a \
+         WHERE intent_id IN (SELECT intent_id FROM internal_idempotency \
+         WHERE action = 'guild.add_member') ORDER BY audit_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(audit_rows.len(), 2, "intent + terminal audit rows");
+    for row in &audit_rows {
+        assert!(
+            !row.contains("fixture-oauth"),
+            "OAuth token persisted in audit row"
+        );
+    }
+    // Sweep every persisted internal-action record so a cross-row leak
+    // cannot hide outside the happy-path intent.
+    let persisted: Vec<String> = sqlx::query_scalar(
+        "SELECT row_to_json(i)::text FROM internal_idempotency i \
+         UNION ALL SELECT row_to_json(a)::text FROM internal_action_log a",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    for row in &persisted {
+        assert!(
+            !row.contains("fixture-oauth"),
+            "OAuth token persisted in stored internal-action record"
+        );
+    }
 
     // Refusal-before-effect: malformed shapes and unknown keys refuse cleanly
     // with no secret echo and no Discord call. Each uses a fresh intent so a
@@ -906,13 +1114,136 @@ async fn authenticated_membership_actions_succeed_and_refusals_stay_redacted() {
     assert_eq!(effect.calls(), 2, "refusals must not reach Discord");
 
     // Receipts are durable: both happy-path intents completed with the
-    // stored-member `None` + `affected` contract.
+    // stored-member `None` + `affected` contract. The stored rows carry the
+    // executed outcome (`affected` 1 renders as the verb's applied outcome)
+    // with the request linkage, so a receipt completing with the wrong
+    // outcome or linkage fails here, not just on the envelope.
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM internal_idempotency")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(total, 2, "replays and refusals create no extra intent rows");
     let completed: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM internal_idempotency WHERE state = 'completed'")
             .fetch_one(db.pool())
             .await
             .unwrap();
-    assert_eq!(completed, 2);
+    assert_eq!(completed, 2, "both membership intents complete");
+    // Stored receipt shape per verb, ordered by action so the linkage pins
+    // without echoing request bytes: `guild.add_member` sorts before
+    // `role.assign`. Only scalar linkage columns are selected; no hashes,
+    // tokens or raw bytes enter the assertion output.
+    let rows: Vec<StoredReceiptRow> = sqlx::query_as(
+        "SELECT action, state, response_code, http_status, resource_id, affected, \
+         guild_id, actor_id, target_id, resolved_role_id \
+         FROM internal_idempotency ORDER BY action",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2, "two stored membership receipts");
+    let guild = staging_guild();
+    // `guild.add_member`: applied `added` is `affected` 1 with member linkage
+    // and no resolved role.
+    assert_eq!(rows[0].0, "guild.add_member", "add receipt action");
+    assert_eq!(rows[0].1, "completed", "add receipt state");
+    assert_eq!(rows[0].2.as_deref(), Some("success"), "add receipt code");
+    assert_eq!(rows[0].3, Some(200), "add receipt status");
+    assert_eq!(rows[0].4, None, "add receipt has no message resource");
+    assert_eq!(rows[0].5, Some(1), "add receipt carries the applied effect");
+    assert_eq!(
+        rows[0].6.as_deref(),
+        Some(guild),
+        "add receipt guild linkage"
+    );
+    assert_eq!(rows[0].7, None, "add receipt has no actor linkage");
+    assert_eq!(
+        rows[0].8.as_deref(),
+        Some("111111111111111111"),
+        "add receipt target linkage"
+    );
+    assert_eq!(rows[0].9, None, "add receipt has no resolved role");
+    // `role.assign`: applied `assigned` is `affected` 1 with the allowlisted
+    // role pinned at claim time.
+    assert_eq!(rows[1].0, "role.assign", "assign receipt action");
+    assert_eq!(rows[1].1, "completed", "assign receipt state");
+    assert_eq!(rows[1].2.as_deref(), Some("success"), "assign receipt code");
+    assert_eq!(rows[1].3, Some(200), "assign receipt status");
+    assert_eq!(rows[1].4, None, "assign receipt has no message resource");
+    assert_eq!(
+        rows[1].5,
+        Some(1),
+        "assign receipt carries the applied effect"
+    );
+    assert_eq!(
+        rows[1].6.as_deref(),
+        Some(guild),
+        "assign receipt guild linkage"
+    );
+    assert_eq!(rows[1].7, None, "assign receipt has no actor linkage");
+    assert_eq!(
+        rows[1].8.as_deref(),
+        Some("111111111111111111"),
+        "assign receipt target linkage"
+    );
+    assert_eq!(
+        rows[1].9.as_deref(),
+        Some("222222222222222222"),
+        "assign receipt resolved-role linkage"
+    );
+    // The replayed envelopes above (`assigned` / `added` with
+    // `idempotent-replay`) return these stored rows: the stored `affected` 1
+    // is what renders each applied outcome, and the effect count proves no
+    // second dispatch ran.
+    assert_eq!(role_replay["result"], json!({"outcome": "assigned"}));
+    assert_eq!(add_replay["result"], json!({"outcome": "added"}));
+    // Terminal audit rows mirror the same outcome linkage with executor
+    // evidence, proving `store.finish` carried it to the ledger as well.
+    let logs: Vec<TerminalAuditRow> = sqlx::query_as(
+        "SELECT action, phase, response_code, evidence_code, http_status, \
+         guild_id, target_id, resolved_role_id \
+         FROM internal_action_log WHERE phase = 'terminal' ORDER BY action",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(logs.len(), 2, "two terminal audit rows");
+    assert_eq!(logs[0].0, "guild.add_member", "add audit action");
+    assert_eq!(logs[0].1, "terminal", "add audit phase");
+    assert_eq!(logs[0].2.as_deref(), Some("success"), "add audit code");
+    assert_eq!(logs[0].3.as_deref(), Some("executor"), "add audit evidence");
+    assert_eq!(logs[0].4, Some(200), "add audit status");
+    assert_eq!(logs[0].5.as_deref(), Some(guild), "add audit guild linkage");
+    assert_eq!(
+        logs[0].6.as_deref(),
+        Some("111111111111111111"),
+        "add audit target linkage"
+    );
+    assert_eq!(logs[0].7, None, "add audit has no resolved role");
+    assert_eq!(logs[1].0, "role.assign", "assign audit action");
+    assert_eq!(logs[1].1, "terminal", "assign audit phase");
+    assert_eq!(logs[1].2.as_deref(), Some("success"), "assign audit code");
+    assert_eq!(
+        logs[1].3.as_deref(),
+        Some("executor"),
+        "assign audit evidence"
+    );
+    assert_eq!(logs[1].4, Some(200), "assign audit status");
+    assert_eq!(
+        logs[1].5.as_deref(),
+        Some(guild),
+        "assign audit guild linkage"
+    );
+    assert_eq!(
+        logs[1].6.as_deref(),
+        Some("111111111111111111"),
+        "assign audit target linkage"
+    );
+    assert_eq!(
+        logs[1].7.as_deref(),
+        Some("222222222222222222"),
+        "assign audit resolved-role linkage"
+    );
     set_add_member_flag(false);
     db.close().await.unwrap();
 }
@@ -1037,6 +1368,7 @@ fn read_app(pool: sqlx::PgPool, api: &MockEventApi) -> Router {
         effect,
         reads,
         Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
     )))
 }
 
@@ -1387,6 +1719,397 @@ async fn moderation_success_replays_without_second_effect_but_changed_bytes_conf
     db.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn moderation_channel_flag_off_is_refused_before_any_effect() {
+    let Some(db) = database().await else { return };
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let moderation = Arc::new(MockModeration::default());
+    let channel = Arc::new(MockChannel::default());
+    let app = router(state_full_with_channel(
+        db.pool().clone(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+        channel.clone(),
+    ));
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(false);
+    for action in [
+        "moderation.purge",
+        "moderation.slowmode",
+        "moderation.lockdown",
+        "moderation.unlock",
+    ] {
+        let (status, _, body) = answer(
+            app.clone(),
+            signed(&channel_payload(action), "old", "intent-channel-flag-off"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{action}");
+        assert_eq!(body["error"]["code"], "action_not_allowed");
+        assert_eq!(body["error"]["retryable"], false);
+    }
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(moderation.calls(), 0);
+    assert_eq!(channel.calls(), 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn moderation_channel_happy_paths_emit_planner_outcomes() {
+    let Some(db) = database().await else { return };
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let moderation = Arc::new(MockModeration::default());
+    let channel = Arc::new(MockChannel::default());
+    let app = router(state_full_with_channel(
+        db.pool().clone(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+        channel.clone(),
+    ));
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    for (action, intent, expected, expected_affected) in [
+        (
+            "moderation.purge",
+            "intent-channel-purge",
+            serde_json::json!({"outcome": "purged", "affected": 3}),
+            3_i64,
+        ),
+        (
+            "moderation.slowmode",
+            "intent-channel-slowmode",
+            serde_json::json!({"outcome": "slowmode_updated"}),
+            1_i64,
+        ),
+        (
+            "moderation.lockdown",
+            "intent-channel-lockdown",
+            serde_json::json!({"outcome": "locked_down"}),
+            1_i64,
+        ),
+        (
+            "moderation.unlock",
+            "intent-channel-unlock",
+            serde_json::json!({"outcome": "unlocked"}),
+            1_i64,
+        ),
+    ] {
+        let (status, headers, body) =
+            answer(app.clone(), signed(&channel_payload(action), "old", intent)).await;
+        assert_eq!(status, StatusCode::OK, "{action}");
+        assert!(!headers.contains_key("idempotent-replay"), "{action}");
+        assert_eq!(body["result"], expected, "{action}");
+        assert_eq!(body["request_id"].as_str().unwrap().len(), 26, "{action}");
+        // The planner outcome renders on the wire (asserted above) while the
+        // persisted `store.finish` receipt carries it as the stored
+        // `affected` count plus the request linkage: moderated channel as both
+        // `resource_id` and `target_id`, actor and staging guild scalars.
+        // Reuses the canonical `StoredReceiptRow` shape so clippy's
+        // `type_complexity` stays quiet.
+        let row: StoredReceiptRow = sqlx::query_as(
+            "SELECT action, state, response_code, http_status, resource_id, affected, \
+             guild_id, actor_id, target_id, resolved_role_id FROM internal_idempotency \
+             WHERE action = $1",
+        )
+        .bind(action)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(row.0, action, "{action}");
+        assert_eq!(row.1, "completed", "{action}");
+        assert_eq!(row.2.as_deref(), Some("success"), "{action}");
+        assert_eq!(row.3, Some(200), "{action}");
+        assert_eq!(
+            row.4.as_deref(),
+            Some("222222222222222222"),
+            "{action}: stored channel linkage"
+        );
+        assert_eq!(
+            row.5,
+            Some(expected_affected),
+            "{action}: stored planner count"
+        );
+        assert_eq!(row.6.as_deref(), Some(staging_guild()), "{action}");
+        assert_eq!(row.7.as_deref(), Some("111111111111111111"), "{action}");
+        assert_eq!(row.8.as_deref(), Some("222222222222222222"), "{action}");
+        assert_eq!(row.9, None, "{action}: no resolved role");
+    }
+    set_moderation_flags(false);
+    assert_eq!(channel.calls(), 4);
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(moderation.calls(), 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn moderation_channel_bad_channel_keys_are_refused_before_any_effect() {
+    let Some(db) = database().await else { return };
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let moderation = Arc::new(MockModeration::default());
+    let channel = Arc::new(MockChannel::default());
+    let app = router(state_full_with_channel(
+        db.pool().clone(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+        channel.clone(),
+    ));
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    // Malformed actor/channel identities, out-of-range numbers and missing
+    // fields must refuse before the channel executor runs: the mock counts
+    // every entry, so any call here is a refusal-before-effect failure.
+    for (action, extra) in [
+        (
+            "moderation.purge",
+            serde_json::json!({"channel_id": "not-a-snowflake"}),
+        ),
+        (
+            "moderation.slowmode",
+            serde_json::json!({"channel_id": "00000000000000000"}),
+        ),
+        (
+            "moderation.lockdown",
+            serde_json::json!({"channel_id": "99999999999999999999"}),
+        ),
+        (
+            "moderation.unlock",
+            serde_json::json!({"channel_id": "022222222222222222"}),
+        ),
+        (
+            "moderation.purge",
+            serde_json::json!({"actor_id": "not-a-snowflake"}),
+        ),
+        ("moderation.purge", serde_json::json!({"count": 0})),
+        ("moderation.purge", serde_json::json!({"count": 101})),
+        ("moderation.purge", serde_json::json!({"count": "10"})),
+        ("moderation.slowmode", serde_json::json!({"seconds": 21601})),
+        ("moderation.slowmode", serde_json::json!({"seconds": "30"})),
+        ("moderation.lockdown", serde_json::json!({"reason": ""})),
+        (
+            "moderation.unlock",
+            serde_json::json!({"reason": "x".repeat(513)}),
+        ),
+    ] {
+        let raw = channel_payload_with(action, extra);
+        let (status, _, body) =
+            answer(app.clone(), signed(&raw, "old", "intent-channel-bad-key")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{action}: {raw}");
+        assert_eq!(body["error"]["code"], "malformed", "{action}: {raw}");
+    }
+    // A well-formed purge without its required count is malformed, not a
+    // default: the existing 1–100 path requires the field.
+    let missing_count = serde_json::json!({
+        "action": "moderation.purge",
+        "actor_id": "111111111111111111",
+        "channel_id": "222222222222222222",
+        "reason": "spam",
+    })
+    .to_string();
+    let (status, _, body) = answer(
+        app.clone(),
+        signed(&missing_count, "old", "intent-channel-bad-key"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "malformed");
+    set_moderation_flags(false);
+    assert_eq!(channel.calls(), 0);
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(moderation.calls(), 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn moderation_channel_success_replays_and_mismatches_like_announcements() {
+    let Some(db) = database().await else { return };
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let moderation = Arc::new(MockModeration::default());
+    let channel = Arc::new(MockChannel::default());
+    let app = router(state_full_with_channel(
+        db.pool().clone(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+        channel.clone(),
+    ));
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    let raw = channel_payload("moderation.lockdown");
+    let (status, headers, first) =
+        answer(app.clone(), signed(&raw, "old", "intent-channel-fixture")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("idempotent-replay"));
+    assert_eq!(
+        first["result"],
+        serde_json::json!({"outcome": "locked_down"})
+    );
+    assert_eq!(
+        channel.calls(),
+        1,
+        "first lockdown reaches the channel effect once"
+    );
+    let restarted = router(state_full_with_channel(
+        db.independent_pool().await.unwrap(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+        channel.clone(),
+    ));
+    let (status, headers, replay) = answer(
+        restarted.clone(),
+        signed(&raw, "new", "intent-channel-fixture"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["idempotent-replay"], "true");
+    assert_eq!(first["result"], replay["result"]);
+    assert_eq!(
+        channel.calls(),
+        1,
+        "idempotent replay returns the stored record without a second Discord call"
+    );
+    // The stored receipt keeps the planner linkage: completed success for the
+    // lockdown verb, moderated channel as resource and target, actor and guild.
+    let row: StoredReceiptRow = sqlx::query_as(
+        "SELECT action, state, response_code, http_status, resource_id, affected, \
+         guild_id, actor_id, target_id, resolved_role_id FROM internal_idempotency \
+         WHERE state = 'completed'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(row.0, "moderation.lockdown");
+    assert_eq!(row.1, "completed");
+    assert_eq!(row.2.as_deref(), Some("success"));
+    assert_eq!(row.3, Some(200));
+    assert_eq!(row.4.as_deref(), Some("222222222222222222"));
+    assert_eq!(row.5, Some(1));
+    assert_eq!(row.6.as_deref(), Some(staging_guild()));
+    assert_eq!(row.7.as_deref(), Some("111111111111111111"));
+    assert_eq!(row.8.as_deref(), Some("222222222222222222"));
+    assert_eq!(row.9, None, "lockdown receipt has no resolved role");
+    let changed = format!("{raw} ");
+    let (status, _, mismatch) =
+        answer(restarted, signed(&changed, "new", "intent-channel-fixture")).await;
+    set_moderation_flags(false);
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(mismatch["error"]["retryable"], false);
+    assert_eq!(
+        channel.calls(),
+        1,
+        "payload mismatch still performs no second Discord call"
+    );
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(moderation.calls(), 0);
+    db.close().await.unwrap();
+}
+
+/// Channel permission gates pin the live-snapshot check itself: purge needs
+/// Manage Messages, slowmode/lockdown/unlock need Manage Channels. Deleting
+/// the per-verb check turns these refusals into resolution successes.
+#[test]
+fn channel_required_permission_covers_purge_and_manage_channels_verbs() {
+    assert_eq!(
+        channel_required_permission(ModerationAction::Purge),
+        PERM_MANAGE_MESSAGES
+    );
+    for action in [
+        ModerationAction::Slowmode,
+        ModerationAction::Lockdown,
+        ModerationAction::Unlock,
+    ] {
+        assert_eq!(
+            channel_required_permission(action),
+            PERM_MANAGE_CHANNELS,
+            "{}",
+            action.action_name()
+        );
+    }
+}
+
+/// A disabled channel executor must bind despite invalid moderation gates:
+/// a bad `TWO_MODERATION_PROTECTED_ROLE_IDS` (or a stray `TWO_MODERATION=1`
+/// without `TWO_OWEN_USER_ID`) must not stop the receiver from starting while
+/// the channel verbs are off. Enabled misconfiguration stays fatal (next test).
+#[tokio::test]
+async fn channel_executor_disabled_tolerates_invalid_gates() {
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    let prev_allow = std::env::var("TWO_INTERNAL_ALLOW_MODERATION").ok();
+    let prev_mod = std::env::var("TWO_MODERATION").ok();
+    let prev_owen = std::env::var("TWO_OWEN_USER_ID").ok();
+    let prev_protected = std::env::var("TWO_MODERATION_PROTECTED_ROLE_IDS").ok();
+    // Stray moderation publish gate without the internal allowlist: the
+    // channel verbs are off, with both invalid-gate shapes present at once.
+    std::env::remove_var("TWO_INTERNAL_ALLOW_MODERATION");
+    std::env::set_var("TWO_MODERATION", "1");
+    std::env::remove_var("TWO_OWEN_USER_ID");
+    std::env::set_var("TWO_MODERATION_PROTECTED_ROLE_IDS", "not-a-snowflake");
+    let api = MockEventApi::start().await;
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(api.origin.clone()))
+            .unwrap();
+    let result = channel_executor_from_env(lazy_pool(), discord);
+    if let Some(value) = prev_allow {
+        std::env::set_var("TWO_INTERNAL_ALLOW_MODERATION", value);
+    } else {
+        std::env::remove_var("TWO_INTERNAL_ALLOW_MODERATION");
+    }
+    if let Some(value) = prev_mod {
+        std::env::set_var("TWO_MODERATION", value);
+    } else {
+        std::env::remove_var("TWO_MODERATION");
+    }
+    if let Some(value) = prev_owen {
+        std::env::set_var("TWO_OWEN_USER_ID", value);
+    } else {
+        std::env::remove_var("TWO_OWEN_USER_ID");
+    }
+    if let Some(value) = prev_protected {
+        std::env::set_var("TWO_MODERATION_PROTECTED_ROLE_IDS", value);
+    } else {
+        std::env::remove_var("TWO_MODERATION_PROTECTED_ROLE_IDS");
+    }
+    assert!(
+        result.is_ok(),
+        "disabled channel executor must bind despite invalid gates"
+    );
+}
+
+/// Enabled misconfiguration stays fatal: `TWO_MODERATION=1` with the channel
+/// verbs on but no valid `TWO_OWEN_USER_ID` must refuse the receiver bind.
+#[tokio::test]
+async fn channel_executor_enabled_rejects_invalid_gates() {
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    let prev_owen = std::env::var("TWO_OWEN_USER_ID").ok();
+    let prev_protected = std::env::var("TWO_MODERATION_PROTECTED_ROLE_IDS").ok();
+    set_moderation_flags(true);
+    std::env::remove_var("TWO_OWEN_USER_ID");
+    std::env::remove_var("TWO_MODERATION_PROTECTED_ROLE_IDS");
+    let api = MockEventApi::start().await;
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(api.origin.clone()))
+            .unwrap();
+    let result = channel_executor_from_env(lazy_pool(), discord);
+    set_moderation_flags(false);
+    if let Some(value) = prev_owen {
+        std::env::set_var("TWO_OWEN_USER_ID", value);
+    } else {
+        std::env::remove_var("TWO_OWEN_USER_ID");
+    }
+    if let Some(value) = prev_protected {
+        std::env::set_var("TWO_MODERATION_PROTECTED_ROLE_IDS", value);
+    } else {
+        std::env::remove_var("TWO_MODERATION_PROTECTED_ROLE_IDS");
+    }
+    assert!(
+        result.is_err(),
+        "enabled channel executor must refuse invalid gates"
+    );
+}
+
 /// A disabled moderation executor must bind despite invalid moderation
 /// settings: the executor never parses gates or secrets while the website
 /// verbs are off, so malformed settings must not stop the receiver from
@@ -1468,38 +2191,68 @@ async fn moderation_executor_enabled_rejects_invalid_gates() {
 }
 
 #[tokio::test]
-async fn unwired_moderation_verbs_stay_refused_with_flags_on() {
+async fn all_nine_moderation_verbs_pass_admission_with_flags_on() {
     let Some(db) = database().await else { return };
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let moderation = Arc::new(MockModeration::default());
+    let channel = Arc::new(MockChannel::default());
+    let app = router(state_full_with_channel(
+        db.pool().clone(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+        channel.clone(),
+    ));
     let _flag = MODERATION_FLAG_LOCK.lock().await;
     set_moderation_flags(true);
-    let moderation = Arc::new(MockModeration::default());
-    let app = moderation_app(db.pool().clone(), moderation.clone());
-    // The channel verbs belong to the channel family slice and stay refused.
-    for (verb, extra) in [
-        ("moderation.purge", serde_json::json!({"count": 10})),
-        ("moderation.slowmode", serde_json::json!({"seconds": 5})),
-        ("moderation.lockdown", serde_json::json!({})),
-        ("moderation.unlock", serde_json::json!({})),
+    // Both families are wired now: the five member verbs and the four
+    // channel verbs all pass the action_not_allowed gate. Per-verb outcomes
+    // live in the family happy-path tests; this pins the dispatch union so a
+    // future merge cannot silently drop a verb back to refused.
+    for action in [
+        "moderation.ban",
+        "moderation.tempban",
+        "moderation.kick",
+        "moderation.warn",
+        "moderation.timeout",
     ] {
         let (status, _, body) = answer(
             app.clone(),
             signed(
-                &moderation_payload_with(verb, extra),
+                &moderation_payload(action),
                 "old",
-                &format!("intent-unwired-{verb}"),
+                &format!("intent-all-wired-{action}"),
             ),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{verb}");
-        assert_eq!(body["error"]["code"], "action_not_allowed", "{verb}");
-        assert_eq!(body["error"]["retryable"], false, "{verb}");
+        assert_eq!(status, StatusCode::OK, "{action}");
+        assert_ne!(body["error"]["code"], "action_not_allowed", "{action}");
+    }
+    for action in [
+        "moderation.purge",
+        "moderation.slowmode",
+        "moderation.lockdown",
+        "moderation.unlock",
+    ] {
+        let (status, _, body) = answer(
+            app.clone(),
+            signed(
+                &channel_payload(action),
+                "old",
+                &format!("intent-all-wired-{action}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{action}");
+        assert_ne!(body["error"]["code"], "action_not_allowed", "{action}");
     }
     set_moderation_flags(false);
     assert_eq!(
         moderation.calls(),
-        0,
-        "unwired verbs never reach the effect"
+        5,
+        "member verbs reach the member effect"
     );
+    assert_eq!(channel.calls(), 4, "channel verbs reach the channel effect");
     db.close().await.unwrap();
 }
 
@@ -1747,6 +2500,7 @@ fn moderation_resolve_app(pool: sqlx::PgPool, mock: &MockMembers) -> Router {
         effect,
         Arc::new(MockEventRead::default()),
         moderation,
+        Arc::new(MockChannel::default()),
     )))
 }
 
@@ -1915,6 +2669,55 @@ async fn event_read_replayed_nonce_is_refused_without_a_second_discord_call() {
     assert_eq!(refused["error"]["retryable"], false);
     assert_eq!(api.count(), 1, "the replay must not reach Discord again");
     db.close().await.unwrap();
+}
+
+/// Authorize refusals recover the verb for both `ActionNotAllowed` and
+/// `RateLimited`: a rate-limited `guild.add_member` keeps the `membership`
+/// family instead of collapsing to `other`, so the counter series
+/// `membership`/`rate_limit` can increment. Earlier refusals stay unknown.
+#[test]
+fn authorize_refusals_recover_the_verb_for_disabled_and_rate_limited_actions() {
+    let member_body = br#"{"action":"guild.add_member"}"#;
+    let unknown_body = br#"{"action":"website.nonexistent"}"#;
+    let malformed_body = b"not json";
+    for (code, raw, expected) in [
+        (
+            ErrorCode::ActionNotAllowed,
+            member_body.as_slice(),
+            ActionLabel::Known("guild.add_member"),
+        ),
+        (
+            ErrorCode::RateLimited,
+            member_body.as_slice(),
+            ActionLabel::Known("guild.add_member"),
+        ),
+        (
+            ErrorCode::RateLimited,
+            unknown_body.as_slice(),
+            ActionLabel::Unknown,
+        ),
+        (
+            ErrorCode::RateLimited,
+            malformed_body.as_slice(),
+            ActionLabel::Unknown,
+        ),
+        (
+            ErrorCode::Malformed,
+            member_body.as_slice(),
+            ActionLabel::Unknown,
+        ),
+    ] {
+        let label = authorize_action_label(code, raw);
+        assert_eq!(label, expected, "code {code:?}");
+        assert_eq!(
+            internal_family(label),
+            match expected {
+                ActionLabel::Known("guild.add_member") => "membership",
+                _ => "other",
+            },
+            "code {code:?}"
+        );
+    }
 }
 
 #[tokio::test]

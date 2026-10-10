@@ -105,6 +105,16 @@ HTTP/durable-result integration belongs to the receiver slice. Re-checked at
 `crates/bot/src/internal_action_http.rs:1255-1310` (`write_setting`;
 `read_setting` at `:1228-1242`).
 
+Replaying a stored `settings.set` success rebuilds the value-free
+`{key,outcome}` result from the claimed body and re-reads the current CAS
+token for the `version` envelope metadata. A failed version side-read
+(unparsable claimed body or store error) fails closed with HTTP 409
+`needs_reconciliation` (`retryable: false`, no `idempotent-replay` marker),
+never a fabricated `version: 0` success. `version: 0` means only an absent
+override (for example after deletion), never an unknown store state. Pinned by
+`settings_set_replay_side_read_failure_needs_reconciliation` in
+`crates/bot/src/internal_action_http/tests/settings.rs`.
+
 ## Verification
 
 ```sh

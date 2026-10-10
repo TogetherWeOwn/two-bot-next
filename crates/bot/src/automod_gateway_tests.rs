@@ -6,8 +6,8 @@ use std::future::{pending, Future};
 use super::*;
 use serde_json::json;
 use two_bot_core::automod_runtime::{
-    AutomodMatch, DeliveryKey, LedgerClaim, MessageDeliveryKind, MessageSubject, StoredOutcome,
-    TargetFacts, ViolationRecord, STAGING_GUILD_ID,
+    AutomodMatch, CompletionKind, DeliveryKey, LedgerClaim, MessageDeliveryKind, MessageSubject,
+    StoredOutcome, TargetFacts, ViolationRecord, STAGING_GUILD_ID,
 };
 use two_bot_core::AutomodFilter;
 use two_bot_discord::automod_activation::{FetchedMessage, RetainReason};
@@ -190,6 +190,185 @@ fn delivery(kind: MessageDeliveryKind) -> MessageDelivery {
     }
 }
 
+/// TOG-19027: stored automod lists/thresholds reach the consumer through
+/// the live snapshot, without a restart. The poller publishes; the same
+/// process re-resolves and observes the stored values.
+#[test]
+fn live_snapshot_moves_automod_lists_and_thresholds_without_restart() {
+    let deployment = vars(&[
+        ("TWO_AUTOMOD", "1"),
+        ("TWO_OWEN_USER_ID", OWEN),
+        ("TWO_MODERATION_PROTECTED_ROLE_IDS", ROLE),
+    ]);
+    let boot = resolve_with_live(&deployment, GUILD, None)
+        .expect("boot resolves")
+        .expect("automod on");
+    assert!(boot.config.policy.bad_words.is_empty());
+    assert_eq!(boot.config.policy.repeated_message_count, 3);
+    assert_eq!(boot.config.policy.mention_limit, 5);
+    assert!(boot.config.dry_run, "absent ENFORCE stays dry-run");
+
+    let guild = GUILD.to_string();
+    let (mut writer, live) = two_bot_core::settings::live_channel();
+    writer.publish(&two_bot_core::settings::SettingsSnapshot {
+        revision: 1,
+        rows: vec![
+            two_bot_core::settings::SettingRow {
+                guild_id: guild.clone(),
+                key: "TWO_AUTOMOD_BAD_WORDS".to_owned(),
+                value: json!(["spamword"]),
+                version: 1,
+            },
+            two_bot_core::settings::SettingRow {
+                guild_id: guild.clone(),
+                key: "TWO_AUTOMOD_REPEAT_COUNT".to_owned(),
+                value: json!(7),
+                version: 1,
+            },
+            two_bot_core::settings::SettingRow {
+                guild_id: guild.clone(),
+                key: "TWO_AUTOMOD_MENTION_LIMIT".to_owned(),
+                value: json!(2),
+                version: 1,
+            },
+            two_bot_core::settings::SettingRow {
+                guild_id: guild.clone(),
+                key: "TWO_AUTOMOD_ENFORCE".to_owned(),
+                value: json!(true),
+                version: 1,
+            },
+        ],
+    });
+
+    let reloaded = resolve_with_live(&deployment, GUILD, Some(&live))
+        .expect("live resolves")
+        .expect("automod on");
+    assert_eq!(reloaded.config.policy.bad_words, vec!["spamword"]);
+    assert_eq!(reloaded.config.policy.repeated_message_count, 7);
+    assert_eq!(reloaded.config.policy.mention_limit, 2);
+    assert!(
+        !reloaded.config.dry_run,
+        "stored ENFORCE=1 arms enforcement"
+    );
+
+    // A deleted row hands the key back to the deployment environment.
+    writer.publish(&two_bot_core::settings::SettingsSnapshot {
+        revision: 2,
+        rows: vec![],
+    });
+    let reverted = resolve_with_live(&deployment, GUILD, Some(&live))
+        .expect("revert resolves")
+        .expect("automod on");
+    assert!(reverted.config.policy.bad_words.is_empty());
+    assert_eq!(reverted.config.policy.repeated_message_count, 3);
+}
+
+/// The running activation applies the live policy in place: the first
+/// refresh after a stored write reports a change, a repeat reports none, and
+/// repeat history is never rebuilt (no restart, no new activation).
+#[tokio::test]
+async fn running_activation_applies_live_policy_without_restart() {
+    crate::gateway::ensure_crypto_provider();
+    let deployment = vars(&[
+        ("TWO_AUTOMOD", "1"),
+        ("TWO_OWEN_USER_ID", OWEN),
+        ("TWO_MODERATION_PROTECTED_ROLE_IDS", ROLE),
+    ]);
+    let resolved = resolve(&deployment, GUILD)
+        .expect("boot resolves")
+        .expect("automod on");
+    let executor = ActionExecutor::with_proxy(
+        "test-token".to_owned(),
+        Some("http://127.0.0.1:9".to_owned()),
+    )
+    .expect("executor builds");
+    let activation = AutomodActivation::new(
+        AutomodRuntime::new(resolved.config, resolved.scope),
+        HangingLedger,
+        HangingFacts,
+        executor,
+    );
+
+    let guild = GUILD.to_string();
+    let (mut writer, live) = two_bot_core::settings::live_channel();
+    assert!(
+        !refresh_live(&activation, &deployment, &guild, &live),
+        "empty snapshot changes nothing"
+    );
+    writer.publish(&two_bot_core::settings::SettingsSnapshot {
+        revision: 1,
+        rows: vec![two_bot_core::settings::SettingRow {
+            guild_id: guild.clone(),
+            key: "TWO_AUTOMOD_BAD_WORDS".to_owned(),
+            value: json!(["spamword"]),
+            version: 1,
+        }],
+    });
+    assert!(
+        refresh_live(&activation, &deployment, &guild, &live),
+        "stored bad words move the running policy"
+    );
+    assert!(
+        !refresh_live(&activation, &deployment, &guild, &live),
+        "unchanged snapshot is a no-op"
+    );
+}
+
+/// One bad stored value does not take the whole policy down: the offending
+/// key falls back to its boot value while the other stored values still
+/// apply, so the refresh still reports a change.
+#[tokio::test]
+async fn refresh_falls_back_per_key_on_a_bad_stored_value() {
+    crate::gateway::ensure_crypto_provider();
+    let deployment = vars(&[
+        ("TWO_AUTOMOD", "1"),
+        ("TWO_OWEN_USER_ID", OWEN),
+        ("TWO_MODERATION_PROTECTED_ROLE_IDS", ROLE),
+    ]);
+    let resolved = resolve(&deployment, GUILD)
+        .expect("boot resolves")
+        .expect("automod on");
+    let executor = ActionExecutor::with_proxy(
+        "test-token".to_owned(),
+        Some("http://127.0.0.1:9".to_owned()),
+    )
+    .expect("executor builds");
+    let activation = AutomodActivation::new(
+        AutomodRuntime::new(resolved.config, resolved.scope),
+        HangingLedger,
+        HangingFacts,
+        executor,
+    );
+
+    let guild = GUILD.to_string();
+    let (mut writer, live) = two_bot_core::settings::live_channel();
+    writer.publish(&two_bot_core::settings::SettingsSnapshot {
+        revision: 1,
+        rows: vec![
+            two_bot_core::settings::SettingRow {
+                guild_id: guild.clone(),
+                key: "TWO_AUTOMOD_BAD_WORDS".to_owned(),
+                value: json!(["spamword"]),
+                version: 1,
+            },
+            two_bot_core::settings::SettingRow {
+                guild_id: guild.clone(),
+                key: "TWO_AUTOMOD_REPEAT_COUNT".to_owned(),
+                value: json!(999),
+                version: 1,
+            },
+        ],
+    });
+    assert!(
+        refresh_live(&activation, &deployment, &guild, &live),
+        "the good stored value applies while the bad one falls back"
+    );
+    assert!(
+        !refresh_live(&activation, &deployment, &guild, &live),
+        "settled fallback refresh is a no-op"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_stalled_delivery_times_out_without_becoming_acceptance() {
     crate::gateway::ensure_crypto_provider();
@@ -226,9 +405,11 @@ async fn a_stalled_delivery_times_out_without_becoming_acceptance() {
             delivery(MessageDeliveryKind::Update),
             "2026-10-02T00:00:00.000Z"
         )
-        .await
-        .funnel,
-        FunnelDisposition::None
+        .await,
+        WorkerVerdict {
+            funnel: FunnelDisposition::None,
+            trigger: FunnelDisposition::None,
+        }
     );
 }
 
@@ -245,6 +426,20 @@ fn uninspected_create_keeps_funnel_accept_with_capture_only_trigger() {
             trigger: FunnelDisposition::CaptureOnly,
         }
     );
+}
+
+#[test]
+fn bypassed_trigger_refuses_text_automations_while_funnel_would_allow() {
+    // M2.19: the worker gates text automations on the trigger verdict, so a
+    // Bypassed (uninspected) create posts no sticky automation even though its
+    // funnel disposition stays Accept for the ordinary funnel path.
+    let bypassed = Activation {
+        disposition: FunnelDisposition::Accept,
+        outcome: ActivationOutcome::Bypassed,
+    };
+    let verdict = verdict_of(&bypassed, MessageDeliveryKind::Create);
+    assert!(runs_text_automations(Some(verdict.funnel)));
+    assert!(!runs_text_automations(Some(verdict.trigger)));
 }
 
 #[test]
@@ -279,4 +474,432 @@ fn retained_completion_hands_triggers_a_capture_only_verdict() {
             trigger: FunnelDisposition::CaptureOnly,
         }
     );
+}
+
+#[test]
+fn verdict_mapping_covers_every_outcome_by_delivery_kind() {
+    fn clean_receipt() -> StoredOutcome {
+        StoredOutcome {
+            matched: false,
+            deleted: false,
+            outcome: CompletionKind::Accepted,
+        }
+    }
+
+    fn matched_deleted_receipt() -> StoredOutcome {
+        StoredOutcome {
+            matched: true,
+            deleted: true,
+            outcome: CompletionKind::Deleted,
+        }
+    }
+
+    fn matched_timed_out_receipt() -> StoredOutcome {
+        StoredOutcome {
+            matched: true,
+            deleted: true,
+            outcome: CompletionKind::TimedOut,
+        }
+    }
+
+    // Exhaustive expectation: every `ActivationOutcome` arm, every
+    // `RetainReason` arm and every `MessageDeliveryKind` arm is listed, so a
+    // future variant addition breaks this match instead of silently reusing a
+    // wildcard. Expected values are literals (never recomputed through
+    // `uncommitted_disposition` or `kind.funnel`) so a mapping change fails
+    // its named cell. The expectation reads the whole activation because a
+    // retained delivery keeps its own funnel disposition (see below).
+    fn expected_verdict(activation: &Activation, kind: MessageDeliveryKind) -> WorkerVerdict {
+        match &activation.outcome {
+            ActivationOutcome::Bypassed => match kind {
+                MessageDeliveryKind::Create => WorkerVerdict {
+                    funnel: FunnelDisposition::Accept,
+                    trigger: FunnelDisposition::CaptureOnly,
+                },
+                MessageDeliveryKind::Update => WorkerVerdict {
+                    funnel: FunnelDisposition::None,
+                    trigger: FunnelDisposition::CaptureOnly,
+                },
+            },
+            ActivationOutcome::Duplicate(None) => match kind {
+                MessageDeliveryKind::Create => WorkerVerdict {
+                    funnel: FunnelDisposition::CaptureOnly,
+                    trigger: FunnelDisposition::CaptureOnly,
+                },
+                MessageDeliveryKind::Update => WorkerVerdict {
+                    funnel: FunnelDisposition::None,
+                    trigger: FunnelDisposition::None,
+                },
+            },
+            ActivationOutcome::Duplicate(Some(receipt)) => match receipt.matched {
+                false => match kind {
+                    MessageDeliveryKind::Create => WorkerVerdict {
+                        funnel: FunnelDisposition::Accept,
+                        trigger: FunnelDisposition::Accept,
+                    },
+                    MessageDeliveryKind::Update => WorkerVerdict {
+                        funnel: FunnelDisposition::None,
+                        trigger: FunnelDisposition::None,
+                    },
+                },
+                true => match kind {
+                    MessageDeliveryKind::Create => WorkerVerdict {
+                        funnel: FunnelDisposition::CaptureOnly,
+                        trigger: FunnelDisposition::CaptureOnly,
+                    },
+                    MessageDeliveryKind::Update => WorkerVerdict {
+                        funnel: FunnelDisposition::None,
+                        trigger: FunnelDisposition::None,
+                    },
+                },
+            },
+            ActivationOutcome::Unavailable => match kind {
+                MessageDeliveryKind::Create => WorkerVerdict {
+                    funnel: FunnelDisposition::CaptureOnly,
+                    trigger: FunnelDisposition::CaptureOnly,
+                },
+                MessageDeliveryKind::Update => WorkerVerdict {
+                    funnel: FunnelDisposition::None,
+                    trigger: FunnelDisposition::None,
+                },
+            },
+            ActivationOutcome::Completed(receipt) => match receipt.matched {
+                false => match kind {
+                    MessageDeliveryKind::Create => WorkerVerdict {
+                        funnel: FunnelDisposition::Accept,
+                        trigger: FunnelDisposition::Accept,
+                    },
+                    MessageDeliveryKind::Update => WorkerVerdict {
+                        funnel: FunnelDisposition::None,
+                        trigger: FunnelDisposition::None,
+                    },
+                },
+                true => match kind {
+                    MessageDeliveryKind::Create => WorkerVerdict {
+                        funnel: FunnelDisposition::CaptureOnly,
+                        trigger: FunnelDisposition::CaptureOnly,
+                    },
+                    MessageDeliveryKind::Update => WorkerVerdict {
+                        funnel: FunnelDisposition::None,
+                        trigger: FunnelDisposition::None,
+                    },
+                },
+            },
+            // A retained delivery keeps its own funnel disposition while its
+            // trigger verdict is capture-only (`verdict_of` passes the
+            // disposition through for `Retained`). The disposition varies:
+            // the retain paths carry the matched funnel, but a clean
+            // accepted create whose receipt commit is refused settles as
+            // `Retained(CompletionRefused)` with an `Accept` disposition
+            // (`settle` keeps the funnel it was given), so the funnel arm
+            // matches the activation's own disposition explicitly. All seven
+            // reasons are listed so a new reason breaks this match instead
+            // of silently inheriting the capture-only trigger; the
+            // `unreachable!` arms name combinations `process` cannot
+            // produce (updates always carry `None`, creates never do), so a
+            // future path producing one fails loudly here.
+            ActivationOutcome::Retained(
+                RetainReason::Ledger
+                | RetainReason::PreserveRefused
+                | RetainReason::PlanUnavailable
+                | RetainReason::FenceRefused
+                | RetainReason::UncertainDelete
+                | RetainReason::UncertainTimeout
+                | RetainReason::CompletionRefused,
+            ) => match (activation.disposition, kind) {
+                (FunnelDisposition::CaptureOnly, MessageDeliveryKind::Create) => WorkerVerdict {
+                    funnel: FunnelDisposition::CaptureOnly,
+                    trigger: FunnelDisposition::CaptureOnly,
+                },
+                (FunnelDisposition::Accept, MessageDeliveryKind::Create) => WorkerVerdict {
+                    funnel: FunnelDisposition::Accept,
+                    trigger: FunnelDisposition::CaptureOnly,
+                },
+                (FunnelDisposition::None, MessageDeliveryKind::Update) => WorkerVerdict {
+                    funnel: FunnelDisposition::None,
+                    trigger: FunnelDisposition::CaptureOnly,
+                },
+                // Every remaining pair is listed so a future disposition or
+                // delivery-kind variant breaks this match at compile time
+                // instead of falling into a wildcard.
+                (FunnelDisposition::None, MessageDeliveryKind::Create)
+                | (FunnelDisposition::Accept, MessageDeliveryKind::Update)
+                | (FunnelDisposition::CaptureOnly, MessageDeliveryKind::Update) => {
+                    unreachable!(
+                        "retained delivery carries an unproducible disposition: {:?} for {:?}",
+                        activation.disposition, kind
+                    )
+                }
+            },
+        }
+    }
+
+    // Realistic dispositions as produced by `process`: duplicates restore the
+    // funnel from the receipt and carry `None`; everything else carries the
+    // funnel value that becomes the verdict's funnel, including the
+    // clean-accept create refused at receipt commit, which settles as
+    // `Retained(CompletionRefused)` with an `Accept` disposition (it matches
+    // the older `retained_completion_hands_triggers_a_capture_only_verdict`
+    // test, routed here through the shared expectation).
+    let cases: Vec<(Activation, MessageDeliveryKind, &str)> = vec![
+        (
+            Activation {
+                disposition: FunnelDisposition::Accept,
+                outcome: ActivationOutcome::Bypassed,
+            },
+            MessageDeliveryKind::Create,
+            "bypassed create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Bypassed,
+            },
+            MessageDeliveryKind::Update,
+            "bypassed update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Duplicate(None),
+            },
+            MessageDeliveryKind::Create,
+            "in-flight duplicate create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Duplicate(None),
+            },
+            MessageDeliveryKind::Update,
+            "in-flight duplicate update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Duplicate(Some(clean_receipt())),
+            },
+            MessageDeliveryKind::Create,
+            "settled-clean duplicate create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Duplicate(Some(clean_receipt())),
+            },
+            MessageDeliveryKind::Update,
+            "settled-clean duplicate update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Duplicate(Some(matched_deleted_receipt())),
+            },
+            MessageDeliveryKind::Create,
+            "settled-matched duplicate create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Duplicate(Some(matched_timed_out_receipt())),
+            },
+            MessageDeliveryKind::Update,
+            "settled-matched duplicate update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Unavailable,
+            },
+            MessageDeliveryKind::Create,
+            "unavailable create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Unavailable,
+            },
+            MessageDeliveryKind::Update,
+            "unavailable update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::Accept,
+                outcome: ActivationOutcome::Completed(clean_receipt()),
+            },
+            MessageDeliveryKind::Create,
+            "completed clean create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Completed(clean_receipt()),
+            },
+            MessageDeliveryKind::Update,
+            "completed clean update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Completed(matched_deleted_receipt()),
+            },
+            MessageDeliveryKind::Create,
+            "completed matched create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Completed(matched_timed_out_receipt()),
+            },
+            MessageDeliveryKind::Update,
+            "completed matched update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Retained(RetainReason::Ledger),
+            },
+            MessageDeliveryKind::Create,
+            "retained ledger create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Retained(RetainReason::Ledger),
+            },
+            MessageDeliveryKind::Update,
+            "retained ledger update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Retained(RetainReason::PreserveRefused),
+            },
+            MessageDeliveryKind::Create,
+            "retained preserve-refused create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Retained(RetainReason::PreserveRefused),
+            },
+            MessageDeliveryKind::Update,
+            "retained preserve-refused update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Retained(RetainReason::PlanUnavailable),
+            },
+            MessageDeliveryKind::Create,
+            "retained plan-unavailable create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Retained(RetainReason::PlanUnavailable),
+            },
+            MessageDeliveryKind::Update,
+            "retained plan-unavailable update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Retained(RetainReason::FenceRefused),
+            },
+            MessageDeliveryKind::Create,
+            "retained fence-refused create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Retained(RetainReason::FenceRefused),
+            },
+            MessageDeliveryKind::Update,
+            "retained fence-refused update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Retained(RetainReason::UncertainDelete),
+            },
+            MessageDeliveryKind::Create,
+            "retained uncertain-delete create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Retained(RetainReason::UncertainDelete),
+            },
+            MessageDeliveryKind::Update,
+            "retained uncertain-delete update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Retained(RetainReason::UncertainTimeout),
+            },
+            MessageDeliveryKind::Create,
+            "retained uncertain-timeout create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Retained(RetainReason::UncertainTimeout),
+            },
+            MessageDeliveryKind::Update,
+            "retained uncertain-timeout update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Retained(RetainReason::CompletionRefused),
+            },
+            MessageDeliveryKind::Create,
+            "retained completion-refused create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::Accept,
+                outcome: ActivationOutcome::Retained(RetainReason::CompletionRefused),
+            },
+            MessageDeliveryKind::Create,
+            "retained completion-refused clean-accept create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Retained(RetainReason::CompletionRefused),
+            },
+            MessageDeliveryKind::Update,
+            "retained completion-refused update",
+        ),
+    ];
+
+    assert_eq!(
+        cases.len(),
+        29,
+        "outcome x delivery-kind matrix stays complete"
+    );
+    for (activation, kind, name) in &cases {
+        let verdict = verdict_of(activation, *kind);
+        assert_eq!(verdict, expected_verdict(activation, *kind), "{name}");
+        // `None` triggers belong to edits, never creates: a create carrying
+        // one is unexpected, so `acceptance_for_verdict` refuses it like a
+        // match (`gateway_commands.rs`). Pin the assumption here.
+        match kind {
+            MessageDeliveryKind::Create => {
+                assert!(
+                    verdict.trigger != FunnelDisposition::None,
+                    "{name}: create trigger is never None"
+                );
+            }
+            MessageDeliveryKind::Update => {
+                assert!(
+                    verdict.trigger != FunnelDisposition::Accept,
+                    "{name}: update trigger is never Accept"
+                );
+            }
+        }
+    }
 }

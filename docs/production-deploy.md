@@ -62,13 +62,27 @@ After the reviewer approves (or the automated approval passes), the job:
 4. gates on `/health` 200 and on `/readyz` reporting this SHA (see
    [Build identity and the `/readyz` gate](#build-identity-and-the-readyz-gate)).
 
-**Roll back.** Dispatch again with `rollback` set to the previous version ID
-from the failed run's summary. Set `sha` to the commit that version was built
+**Roll back.** This dispatch is the single production rollback method.
+Dispatch again with `rollback` set to the previous version ID
+from the failed run's summary and `takeover: true`. Set `sha` to the commit that version was built
 from. It is recorded as the rollback message, and the `/readyz` gate after the
 rollback must report that revision, or a pre-stamp version (see below). The
 rollback passes the same guard and the same Environment approval. It then runs
 `wrangler rollback <version-id> --message <sha> --yes` and fails unless that
-version serves 100% of traffic.
+version serves 100% of traffic. Without the takeover the fence stays held,
+fenced answers carry no build fields, and the gate fails without being a
+rollback signal. When the Rust image itself is the fault,
+dispatch in deploy mode with `takeover: true` and the prior good SHA instead; a standalone full
+redeploy outside this workflow is superseded as a production rollback path.
+Coverage: the rehearsal log in
+[cutover-rollback-runbook.md](cutover-rollback-runbook.md#7-staging-rehearsal-log)
+is a dry-walk that checked this route without executing a rollback or deploy;
+the staging rollback drill
+([ci-security.md](ci-security.md#staging-rollback-drill-manual)) rehearses
+fence, unforced deployment with immediate Durable Object update, takeover and
+restore, which differs from this dispatch's `rollback --yes` with deferred
+Durable Object default. The deploy-mode path with a prior good SHA has no
+production drill record.
 
 ## Build identity and the `/readyz` gate
 
@@ -83,7 +97,9 @@ the head of `main`, which can be newer than the commit being deployed.
 Production renders its own config instead of calling `staging_rollout.py
 prepare`. That path also snapshots the staging Cloudflare application and
 checks the staging ownership receipt, which production does not use. Ownership
-takeover is roadmap item M1.5 and out of scope here. `scripts/production_deploy.py
+takeover runs as the P2–P4 steps in
+[Production ownership takeover](#production-ownership-takeover-p2p4) below.
+`scripts/production_deploy.py
 render` reads the checked-in `wrangler/wrangler.toml`, makes its paths absolute
 because the rendered file lives outside `wrangler/`, and sets `image_vars` on the
 single production container. Nothing else changes, and
@@ -123,6 +139,70 @@ reports, so `sha` must be that version's commit. A version built before this
 change reports `unknown` for both fields. The gate records that as a pre-stamp
 version and does not fail the rollback. Any other revision fails it.
 
+## Production ownership takeover (P2–P4)
+
+Implements P2–P4 of the approved design
+([cutover-production-takeover-design.md](cutover-production-takeover-design.md)).
+Staging keeps its own client and behavior; nothing here renames, repoints, or
+relaxes the staging gate. This step never activates production: GO stays the
+cutover lead's separate decision on the B4 execution card
+([cutover-sequence.md](cutover-sequence.md) §§4–5).
+
+**Requesting it.** Dispatch with `takeover: true` (default `false`). The guard
+validates the flag and records `Takeover: requested/not requested` in the run
+summary. With `false` the job deploys and stops: the fence stays held, fenced
+answers carry no build fields, and the gate fails without being a rollback
+signal.
+
+**Order inside the `production` job** (same Environment approval as the deploy):
+
+1. `Require production ownership-control configuration`: `preflight` through
+   `wrangler/scripts/production-ownership-control.mjs` before anything is
+   replaced. It refuses a missing/short control token or a non-production
+   origin before the deploy.
+2. Deploy (or rollback) runs as before. `Record the Worker version and SHA`
+   exports the single Worker version serving 100% as `NEW_VERSION`, and
+   refuses the takeover when traffic is split or unreadable.
+3. P2 `Read production ownership state without starting`: authenticated GET
+   against the production Worker URL. It confirms the serving deployment is
+   the recorded `NEW_VERSION` with `running=false`; any mismatch is NO-GO
+   and the run stops before any POST. The full response is tee'd to the run
+   log as the P2 receipt.
+4. P3 `Take over production ownership at the read epoch`: one POST with
+   exactly `{"action":"takeover","expectedEpoch":<P2 epoch>,"actor":...}`.
+   The actor is `github-actions:<run id>:<guarded SHA>` (audit label only;
+   authentication is the bearer token). The explicit release (`true` only in
+   these steps) authorizes unparking; a routine deploy never unparks. Only
+   5xx POSTs retry inside a bounded window with the epoch re-read first; a
+   5xx after a committed takeover is confirmed by GET, never re-posted.
+   401, 400, 405 and 409 never retry. Every refused state answers with the
+   design's documented code (401/400/405 outside the fence vocabulary, 409
+   on epoch conflict, otherwise 503 `ownership_fenced` with `no-store`).
+5. P4: the `/health` + `/readyz` gate above runs the first owned probes
+   (one container start, revision/build-ID match, single gateway session),
+   then `Re-read the active production version after takeover` plus
+   `Confirm the taken-over version still serves` prove the taken-over
+   version still serves 100%.
+
+**Secrets.** GitHub `production` Environment only — no host-held secrets, no
+new secret surface. `PRODUCTION_OWNERSHIP_CONTROL_TOKEN` (Environment
+secret, ≥32 chars; provisioning/rotation is a separate governed step, never
+part of takeover) is read only inside the `production`-gated job and never
+forwarded into the container. `PRODUCTION_WORKER_URL` (Environment variable,
+non-secret) must be `https://` and differ from `STAGING_WORKER_URL`; the job
+and the client both refuse otherwise, and the client never follows redirects.
+Receipts, logs and cards name only bindings, version IDs and fixed refusal
+words — never secret values.
+
+**Rollback.** On any failed gate, follow the ordered checklist in
+[cutover-rollback-runbook.md §4](cutover-rollback-runbook.md#4-ordered-rollback-steps)
+and the full procedure in [cutover.md §Rollback](cutover.md#rollback-preserve-next-window-writes-before-reopening-legacy):
+fence the singleton first (`fence` action of the same client, with the
+current readback epoch and the explicit release), reconcile before
+reopening, then revert traffic with a `rollback=<previous version-id>`
+dispatch from the watch header. The same guard, Environment approval and
+takeover order apply to the revert.
+
 ## `PRODUCTION_AUTO_APPROVE`
 
 The repository variable `PRODUCTION_AUTO_APPROVE` is unset by default. Only the
@@ -146,13 +226,29 @@ Read the variable and the Environment's reviewers again before each dispatch.
 
 ## 48-hour watch log (TOG-9699)
 
-The cutover executor copies this template onto the execution card at `T_0`
-(first `/readyz` 200 on the production revision) and fills it in through the
-watch deadline `T_0 + 48 h`. Watch checkpoints at +15 min, +1 h, +6 h, +24 h
-and +48 h follow [cutover.md](cutover.md) §48-hour watch. Poll read-only on a
-short cadence (suggested 60 s); record findings, not every healthy poll.
+The cutover executor records each checkpoint with
+`scripts/cutover_watch_checkpoint.py` — one checkpoint per call — and pastes
+the emitted row onto the execution card at `T_0` (first `/readyz` 200 on the
+production revision) through the watch deadline `T_0 + 48 h`:
 
-### Watch header (fill once at T_0)
+```sh
+python3 scripts/cutover_watch_checkpoint.py --checkpoint +15m \
+    --expected-sha <40-hex> --expected-build-id <run-id>-<attempt> \
+    --production-url https://<production-worker>/
+```
+
+`--checkpoint` is one of the five labels `+15m`, `+1h`, `+6h`, `+24h`,
+`+48h`, matching the five checkpoint rows below; `--expected-sha` is the
+deployed commit from the watch header and `--expected-build-id` is that
+deploy run's `<run id>-<attempt>` from the run summary. The script is
+read-only: one GET to `/readyz`, no writes, migrates, or DB connections. It
+emits GO only on a 200 with every component ready and an exact
+revision/build-ID match; anything short of a full match is EXTEND, never
+GO, and a ROLLBACK decision stays human. Checkpoints follow
+[cutover.md](cutover.md) §48-hour watch. Poll read-only on a short cadence
+(suggested 60 s); record findings, not every healthy poll.
+
+### Watch header (record once at T_0)
 
 | Field | Value |
 |---|---|
