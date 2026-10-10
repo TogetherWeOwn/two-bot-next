@@ -612,7 +612,7 @@ async fn write_setting(
     let claim = match state.store.claim(&identity, &subject).await {
         Ok(InternalClaim::Claimed(claim)) => claim,
         Ok(InternalClaim::Replay(response)) => {
-            return replay_setting(state, &decision.body, response, id, key, action);
+            return replay_setting(state, &decision.body, response, id, key, action).await;
         }
         Ok(InternalClaim::Mismatch) => return reject(Failure::code(ErrorCode::VersionConflict)),
         Ok(InternalClaim::InFlight) => return reject(Failure::code(ErrorCode::InProgress)),
@@ -631,7 +631,7 @@ async fn write_setting(
                 let _ = state.store.mark_unknown(&claim).await;
                 return reject(Failure::reconciliation());
             }
-            settings_write_response(outcome.result, id, false)
+            settings_write_response(outcome.result, outcome.observed_version, id, false)
         }
         Err(error) => {
             let terminal = match error.code {
@@ -661,7 +661,7 @@ async fn write_setting(
 /// Success rebuilds the value-free `{key,outcome}` result from the claimed
 /// body (the payload hash guarantees it matches the first execution); failures
 /// reuse the generic terminal envelope with the replay marker.
-fn replay_setting(
+async fn replay_setting(
     state: &ReceiverState,
     body: &Map<String, Value>,
     response: TerminalResponse,
@@ -678,10 +678,28 @@ fn replay_setting(
                     json!({"key": command.key(), "outcome": outcome})
                 })
                 .unwrap_or_else(|_| json!({"key": "", "outcome": "saved"}));
-            settings_write_response(rebuilt, id, true)
+            let version = current_setting_version(state, body).await;
+            settings_write_response(rebuilt, version, id, true)
         }
         TerminalResponse::Failure(_) => state.terminal(response, true, id, key, action),
     }
+}
+
+/// CAS token the replayed save committed. The claim stores no version, so
+/// report the key's current token: identical absent a later save, and a later
+/// save's token otherwise, which a blind retry must see rather than revert.
+async fn current_setting_version(state: &ReceiverState, body: &Map<String, Value>) -> i64 {
+    let Ok(command) = SettingsCommand::parse("settings.set", body) else {
+        return 0;
+    };
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let store = SettingsStore::new(state.store.pool());
+    store
+        .get(guild_id, command.key())
+        .await
+        .ok()
+        .and_then(|stored| stored.map(|(_, version)| version))
+        .unwrap_or(0)
 }
 
 /// Legacy `result` (`key`/`value`/`source`) plus the CAS `version` as envelope
@@ -698,10 +716,14 @@ fn settings_read_response(result: Value, version: i64, id: &str) -> Response {
     wire
 }
 
-fn settings_write_response(result: Value, id: &str, replayed: bool) -> Response {
+/// Successful saves carry the committed CAS `version` beside `result`, like
+/// reads: the website feeds it back as `expected_version` instead of
+/// re-reading first, so a save that landed in between cannot be silently
+/// reverted by a blind retry.
+fn settings_write_response(result: Value, version: i64, id: &str, replayed: bool) -> Response {
     let mut wire = (
         StatusCode::OK,
-        Json(json!({"ok": true, "result": result, "request_id": id})),
+        Json(json!({"ok": true, "result": result, "version": version, "request_id": id})),
     )
         .into_response();
     if replayed {

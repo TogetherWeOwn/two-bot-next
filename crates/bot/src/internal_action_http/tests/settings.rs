@@ -99,6 +99,11 @@ async fn settings_set_persists_with_flags_on_and_refused_with_flags_off() {
         .unwrap()
         .expect("persisted override");
     assert_eq!(stored.0, json!("9"));
+    assert_eq!(
+        body["version"],
+        json!(stored.1),
+        "saves return the committed CAS token"
+    );
     set_settings_flag(false);
     let off = set_payload(SETTINGS_KEY, json!("10"), None);
     let (status, _, refused) = answer(app, signed(&off, "old", "intent-settings-flag-off")).await;
@@ -155,6 +160,11 @@ async fn settings_set_replay_returns_first_result_without_second_bump() {
         .unwrap()
         .expect("first save")
         .1;
+    assert_eq!(
+        first["version"],
+        json!(first_version),
+        "first save returns the committed CAS token"
+    );
     let audits: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM guild_settings_audit WHERE guild_id = $1 AND key = $2",
     )
@@ -170,6 +180,10 @@ async fn settings_set_replay_returns_first_result_without_second_bump() {
     assert_eq!(second_status, StatusCode::OK);
     assert_eq!(second_headers["idempotent-replay"], "true");
     assert_eq!(second["result"], first["result"]);
+    assert_eq!(
+        second["version"], first["version"],
+        "replay returns the first save's CAS token"
+    );
     let second_version = store
         .get(staging_guild(), SETTINGS_KEY)
         .await
@@ -214,6 +228,17 @@ async fn settings_concurrent_save_with_stale_token_does_not_revert() {
     assert_eq!(
         saved["result"],
         json!({"key": SETTINGS_KEY, "outcome": "saved"})
+    );
+    let winner_version: i64 = two_bot_cutover::settings::SettingsStore::new(db.pool())
+        .get(staging_guild(), SETTINGS_KEY)
+        .await
+        .unwrap()
+        .expect("winner save")
+        .1;
+    assert_eq!(
+        saved["version"],
+        json!(winner_version),
+        "winner save returns its committed CAS token"
     );
     let stale = set_payload(SETTINGS_KEY, json!("10"), Some(token));
     let (status, _, conflict) =
