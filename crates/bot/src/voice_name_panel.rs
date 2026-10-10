@@ -258,6 +258,10 @@ const NAME_SETTINGS_RELOAD_MS: u64 = 300_000;
 /// template renders with the "member" fallback.
 pub(super) const NAME_WAIT_MS: u64 = 60_000;
 const NAME_SETTINGS_RETRY_MS: u64 = 60_000;
+/// How many of the guild's latest first names a new room avoids.
+pub(super) const RECENT_NAME_MEMORY: usize = 3;
+/// Seeds tried for a fresh first name before keeping the drawn one.
+const FRESH_SEED_TRIES: u64 = 8;
 
 /// Least time between two voice status writes for one room.
 pub(super) const STATUS_MIN_INTERVAL_MS: u64 = 10_000;
@@ -428,6 +432,89 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     Err(refusal) => NameReply::Refused(refusal.to_string()),
                 }
             }
+        }
+    }
+
+    /// Pick the new room's seed so its first template name repeats neither
+    /// a live voice channel nor the guild's last [`RECENT_NAME_MEMORY`] first
+    /// names. The first name is rendered as the room will see it: the joiner
+    /// alone with their presence, still in the creator channel. When no tried
+    /// seed is fresh (a tiny pool), the drawn seed is kept.
+    pub(super) fn fresh_name_seed(
+        &mut self,
+        creator_id: Snowflake,
+        owner_id: Snowflake,
+        seed: u64,
+    ) -> u64 {
+        let Some(template) = self
+            .creators
+            .get(&creator_id)
+            .map(|creator| creator.name_template.clone())
+            .filter(|template| !template.trim().is_empty())
+        else {
+            return seed;
+        };
+        let command = NameCommand {
+            actor_id: owner_id,
+            is_admin: true,
+            request: NameInteraction::Panel,
+            settings: self.name_settings.clone(),
+            directory: self.name_directory.clone(),
+            policy: Arc::clone(&self.name_policy),
+        };
+        let mut probe = VoiceRoom {
+            guild_id: self.live.guild_id,
+            channel_id: creator_id,
+            creator_channel_id: creator_id,
+            owner_id,
+            original_creator_id: owner_id,
+            name_seed: seed,
+            created_at: String::new(),
+        };
+        let mut first = None;
+        for attempt in 0..FRESH_SEED_TRIES {
+            probe.name_seed = if attempt == 0 {
+                seed
+            } else {
+                reseed(seed, attempt)
+            };
+            let facts = self.name_facts(&probe, &command);
+            let checks = NameChecks {
+                policy: &command.policy,
+                filter: &facts.filter,
+                unique_names: false,
+                other_voice_names: &facts.other_names,
+            };
+            let render = RenderFacts {
+                context: &facts.context,
+                conditions: &facts.conditions,
+                fallback_name: &facts.fallback,
+            };
+            let Ok(name) = decide_template_name(&template, &render, &checks) else {
+                return seed;
+            };
+            let key = name.to_lowercase();
+            let taken = self.recent_names.iter().any(|recent| *recent == key)
+                || facts
+                    .other_names
+                    .iter()
+                    .any(|other| other.to_lowercase() == key);
+            if !taken {
+                self.remember_name(key);
+                return probe.name_seed;
+            }
+            first.get_or_insert(key);
+        }
+        if let Some(key) = first {
+            self.remember_name(key);
+        }
+        seed
+    }
+
+    fn remember_name(&mut self, key: String) {
+        self.recent_names.push_back(key);
+        while self.recent_names.len() > RECENT_NAME_MEMORY {
+            self.recent_names.pop_front();
         }
     }
 
@@ -1153,4 +1240,13 @@ pub(super) fn modal_response(room_id: Snowflake, prefill: Option<&str>) -> Inter
             ..Default::default()
         }),
     }
+}
+
+/// A further seed derived from the drawn one (SplitMix64 finalizer), so
+/// re-rolls stay spread over the whole range.
+fn reseed(seed: u64, attempt: u64) -> u64 {
+    let mut z = seed.wrapping_add(attempt.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
