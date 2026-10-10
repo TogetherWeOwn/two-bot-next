@@ -79,6 +79,7 @@ dispatch types collapse to `other`; scrapers must match these exact spellings.
 | `MESSAGE_REACTION_ADD` | `two_bot_gateway_events_total` | Reaction added dispatch (self-role lane) |
 | `MESSAGE_REACTION_REMOVE` | `two_bot_gateway_events_total` | Reaction removed dispatch (self-role lane) |
 | `VOICE_STATE_UPDATE` | `two_bot_gateway_events_total` | Voice state changed dispatch |
+| `PRESENCE_UPDATE` | `two_bot_gateway_events_total` | Member presence changed (only with `TWO_VOICE_PRESENCE=1`) |
 | `INVITE_CREATE` | `two_bot_gateway_events_total` | Invite created dispatch |
 | `INVITE_DELETE` | `two_bot_gateway_events_total` | Invite deleted dispatch |
 | `INTERACTION_CREATE` | `two_bot_gateway_events_total` | Interaction received dispatch |
@@ -95,7 +96,7 @@ Scalar gateway series pair with the labels above:
 | `two_bot_gateway_disconnects_total` | Transport losses through the shard supervisor; each must pair with a later RESUME or fresh READY |
 | `two_bot_gateway_missed_events_total` | Sequence gaps inside one session; any nonzero increase fails the zero-missed-events acceptance |
 | `two_bot_gateway_latency_seconds` | Last heartbeat ACK round-trip; `NaN` until measured |
-| `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | Prefix candidates refused by the automod verdict (`handle_message` refusal arm, `TextCommandOutcome::Refused`); the arm returns `Refused` for every contained create but only prefix candidates increment it — unmatched content, scope mismatches and the disabled fast path never do |
+| `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | In-scope prefix candidates refused by the automod verdict; the worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content, scope mismatches, bot/webhook messages and disabled text-command gates never increment it |
 
 ## Gateway failure classes (`/readyz` `gateway_failure`)
 
