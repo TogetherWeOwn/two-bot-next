@@ -2061,7 +2061,7 @@ mod tests {
             "postgresql://migrator@abc-useast1-1.horizon.psdb.cloud:5432/two_bot?sslmode=require"
                 .to_owned(),
         );
-        for gate in [validate_request(&req), verify_target(&req)] {
+        for gate in [validate_request(&req), verify_target(&req).map(|_| ())] {
             let err = gate.unwrap_err().to_string();
             assert!(
                 err.contains("production branch pin"),
