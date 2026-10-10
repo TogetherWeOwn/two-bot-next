@@ -215,7 +215,10 @@ pub(crate) async fn record_all(events: &[AuditEvent]) {
 }
 
 /// [`record_all`] against an explicit runtime (the tests inject a double).
-pub(crate) async fn record_into<M: AuditMirror>(runtime: &AuditRuntime<M>, events: &[AuditEvent]) {
+pub(crate) async fn record_into<M: AuditMirror + Clone>(
+    runtime: &AuditRuntime<M>,
+    events: &[AuditEvent],
+) {
     for event in events {
         if runtime.record(event).await.is_err() {
             tracing::warn!(entry_id = %event.entry_id, "audit_gateway_store_failed");

@@ -32,8 +32,12 @@ names a missing Environment makes GitHub create it with no protection, so the
 guard checks before the deploy job can run. This repository is public, so
 required reviewers work on every plan; no Enterprise plan is needed.
 
-**Deploy.** Dispatch with `sha` set to a full 40-character commit that is on
-`main`. That commit needs successful, completed `ci-ok` and `worker check`
+**Deploy.** Leave `sha` empty to promote the commit of the latest successful
+`deploy-staging` run on `main` (the normal case: merges keep superseding pending
+staging runs, so the newest `main` commit is often not staged). The guard then
+applies every rule below to that commit and refuses it if its `ci-ok` or
+`worker check` has not finished green. To deploy a specific commit, dispatch
+with `sha` set to a full 40-character commit that is on `main`. That commit needs successful, completed `ci-ok` and `worker check`
 runs from GitHub Actions and a successful `deploy-staging` run. `ci-ok` is the
 full verdict over lint, worker checks and every selected Rust/DB test lane;
 a green lint-only `check` job is not enough. The guard enumerates `check.yml`
@@ -47,7 +51,7 @@ pagination and a run/attempt change during validation fail closed. If a partial
 rerun omits a required job from the current attempt, rerun **all jobs**; do not
 reuse the earlier attempt's receipt. The summary records the admitted run/attempt.
 Staging runs queue in a single concurrency group, so an intermediate commit may
-never stage. Pick one that did. A push to `main` that touches only docs, root
+never stage; the empty-`sha` promotion picks the latest one that did. A push to `main` that touches only docs, root
 markdown or repository chrome (the `paths-ignore` list in `deploy-staging.yml`)
 starts no staging run either, so the newest `main` commit may have no
 `deploy-staging` run: pin the latest commit that changes runtime inputs, or
@@ -62,7 +66,10 @@ After the reviewer approves (or the automated approval passes), the job:
 4. gates on `/health` 200 and on `/readyz` reporting this SHA (see
    [Build identity and the `/readyz` gate](#build-identity-and-the-readyz-gate)).
 
-**Roll back.** This dispatch is the single production rollback method.
+**Roll back.** This dispatch is the single production rollback method. A rollback,
+and a redeploy of a prior good commit, must always set `sha` explicitly: an empty
+`sha` promotes the latest staged commit, which during an incident is usually the
+build that just broke production (the guard refuses a rollback without `sha`).
 Dispatch again with `rollback` set to the previous version ID
 from the failed run's summary and `takeover: true`. Set `sha` to the commit that version was built
 from. It is recorded as the rollback message, and the `/readyz` gate after the

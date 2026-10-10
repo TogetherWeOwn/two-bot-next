@@ -100,6 +100,8 @@ def build_claim(manifest, env):
     require(projection_hash(manifest) == manifest.get("plan_manifest_sha256") == digest,
             "plan projection hash does not match the request")
     require(manifest.get("source_sha") == env.get("SOURCE_SHA"), "source SHA does not match the request")
+    require(manifest.get("migration_target", "staging") == "staging",
+            "manifest is not a staging plan")
     target = manifest.get("target")
     require(isinstance(target, dict) and set(target) == {"host", "database", "branch_id"},
             "plan target is invalid")

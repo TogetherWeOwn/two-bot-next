@@ -38,12 +38,23 @@ jobs:
           set -euo pipefail
           rust=true supply=true
           if [ "$EVENT_NAME" = "pull_request" ] \
-            && [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ] \
-            && result=$(python3 scripts/job-inputs.py \
-              --base-ref "$BASE_SHA" --head-ref "$HEAD_SHA"); then
-            rust=$(printf '%s' "$result" | sed -n 's/^rust=//p')
-            supply=$(printf '%s' "$result" | sed -n 's/^supply=//p')
-            rust=${rust:-true} supply=${supply:-true}
+            && [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
+            # The nightly suite runs on its schedule, not per PR: the required
+            # `check` matrix already runs the affected suites on every PR, and
+            # this 45-minute sweep on each push cost ~170 runs/day (most of them
+            # cancelled by the next push). A PR runs it only when it changes
+            # the nightly wiring or trips a CI-standard Rule 4 full-run trigger
+            # (.github/**, Cargo manifests/lock, toolchain, deny config); job-level
+            # gating keeps this workflow free of workflow-level paths filters.
+            # CI standard: --no-renames -z, and a diff error fails closed (full run).
+            if ! changed=$(git diff --name-only --no-renames -z "$BASE_SHA" "$HEAD_SHA" | tr '\0' '\n'); then
+              :
+            elif printf '%s\n' "$changed" \
+              | grep -qxE '\.github/.*|(.*/)?Cargo\.(toml|lock)|rust-toolchain(\.toml)?|\.cargo/.*|deny\.toml|scripts/(job-inputs|test_nightly_routing)\.py'; then
+              :
+            else
+              rust=false supply=false
+            fi
           fi
           printf 'rust=%s\nsupply=%s\n' "$rust" "$supply" >>"$GITHUB_OUTPUT"
 

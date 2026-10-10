@@ -112,7 +112,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          ./target/debug/staging-migrate --plan --source-sha "$SOURCE_SHA" \
+          ./target/debug/staging-migrate --target staging --plan --source-sha "$SOURCE_SHA" \
             --staging-host "$STAGING_HOST" --staging-database "$STAGING_DATABASE" \
             --staging-branch-id "$STAGING_BRANCH_ID" \
             --recovery-evidence-ref "$RECOVERY_REF" --acl-plan-ref "$ACL_REF" \
@@ -256,7 +256,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          ./target/debug/staging-migrate --apply --source-sha "$SOURCE_SHA" \
+          ./target/debug/staging-migrate --target staging --apply --source-sha "$SOURCE_SHA" \
             --staging-host "$STAGING_HOST" --staging-database "$STAGING_DATABASE" \
             --staging-branch-id "$STAGING_BRANCH_ID" \
             --recovery-evidence-ref "$RECOVERY_REF" --acl-plan-ref "$ACL_REF" \

@@ -14,18 +14,21 @@ import uuid
 
 MIB = 1024 * 1024
 IMAGE_MAX_BYTES = 112 * MIB
-# Recalibrated for the linked S4 self-role runtime (TOG-10292): PR head
-# measured 10,805,344 bytes (10.30 MiB) on the ephemeral runner vs main
+# Recalibrated for the linked S4 self-role runtime: PR head measured
+# 10,805,344 bytes (10.30 MiB) on the ephemeral runner vs main
 # baseline 10,377,112 bytes (9.90 MiB) at ec49663. Growth is linked
 # runtime/handlers/REST + previously-dead domain/store code, no new
 # dependencies; release profile already minimal (opt-level=z, lto, strip).
 # Per b1-baseline calibration (measured * 1.4 rounded up to the next MiB):
 # 10.30 * 1.4 = 14.42 -> 15 MiB. Image still within budget (101.61/112).
-# Rebumped for the internal-actions families (event executors plus the
-# channel-moderation union): CI measured 15,741,344 bytes (15.01 MiB) on the
-# event-executors head vs the 15 MiB budget — 12,704 bytes (0.08%) over, no
-# new dependencies. 16 MiB restores a working tripwire with room for the
-# queued reconcile tooling; revisit if the binary approaches it.
+# 16 MiB holds for the landed slices: the internal-actions families (event
+# executors plus channel-moderation union) measured 15,741,344 bytes
+# (15.01 MiB), and the RSVP bound-admissions slice (PR 709) measured
+# 15,734,960 bytes (15.01 MiB) vs main 15,712,080 bytes — each a few tens of
+# KiB over the old 15 MiB budget with no new dependencies. The settings
+# hot-reload head measured 15,730,600 bytes (15.00 MiB), also below this
+# limit. 16 MiB restores a working tripwire with headroom; revisit if the
+# binary approaches it.
 BINARY_MAX_BYTES = 16 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
