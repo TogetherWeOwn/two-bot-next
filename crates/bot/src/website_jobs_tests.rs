@@ -1078,3 +1078,85 @@ async fn concurrent_publications_keep_newest_counter(pool: &PgPool, roles: Value
     assert_eq!(mock.requests().len(), 4);
     mock.shutdown().await;
 }
+
+/// A ladder missing the top rung refuses with `Configuration`, writes
+/// nothing, sends no Discord write, and names the failing rung by its fixed
+/// label. Uses the process-wide capture: a scoped capture can miss the tick's
+/// warn when sibling tests run on other threads.
+#[tokio::test]
+async fn rank_tick_missing_rung_names_the_rung_and_writes_nothing() {
+    let capture = tracing_capture::global();
+    let start = capture.text().len();
+    let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+        assert!(
+            std::env::var("GITHUB_ACTIONS").is_err(),
+            "CI must supply the guarded test database"
+        );
+        eprintln!("SKIP rank ladder diagnostic: TWO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("create migrated agent-testdb fixture");
+    let pool = fixture.pool().clone();
+    apply_web_contract(&pool).await.unwrap();
+    let guild = "2222";
+    for (index, anomaly) in two_bot_core::RAID_ANOMALIES.iter().enumerate() {
+        let (start, _) = two_bot_core::window_bounds(anomaly.start, anomaly.end).unwrap();
+        sqlx::query("INSERT INTO members (guild_id, member_id, joined_at, is_bot) VALUES ($1,$2,$3::timestamptz,FALSE)")
+            .bind(guild).bind((9100 + index).to_string()).bind(start).execute(&pool).await.unwrap();
+    }
+    // Distinctive fixture ids plus injection text: none may reach the log.
+    // Note: the probe id is a short numeric id so `snowflake()` parses it
+    // while the snowflake gate (only 17-20 digit literals) stays clean.
+    let probe_id = "79999";
+    let probe_name = "ladder-probe-evil-<script>alert(1)</script>";
+    let members = json!([member(1000, false, &["11"])]);
+    let roles = json!({"roles": [
+        {"id": "11", "name": "Prospect"},
+        {"id": "12", "name": "Member"},
+        {"id": "13", "name": "Soldier"},
+        {"id": "14", "name": "Veteran"},
+        {"id": probe_id, "name": probe_name},
+    ]});
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, members),
+            ScriptedResponse::json(200, roles),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let observation = Mutex::new(());
+    let outcome = tick(Kind::Rank, &pool, &executor(&mock), guild, &observation).await;
+    assert_eq!(outcome, Err(ErrorClass::Configuration));
+    for query in [
+        "SELECT count(*) FROM rank_snapshots WHERE guild_id=$1",
+        "SELECT count(*) FROM member_ranks WHERE guild_id=$1",
+        "SELECT count(*) FROM member_exclusions WHERE guild_id=$1",
+    ] {
+        let rows: i64 = sqlx::query_scalar(query)
+            .bind(guild)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "{query} wrote on a refused ladder");
+    }
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2, "roster plus guild reads only");
+    for request in &requests {
+        assert_eq!(request.method, "GET", "refused tick sends no Discord write");
+    }
+    mock.shutdown().await;
+    fixture
+        .close()
+        .await
+        .expect("drop disposable test database");
+    let logs = capture.text().split_off(start);
+    for expected in ["Legend", "missing", "matches=0"] {
+        assert!(logs.contains(expected), "missing {expected:?} in logs");
+    }
+    for leaked in [probe_id, probe_name] {
+        assert!(!logs.contains(leaked), "logs leaked {leaked:?}");
+    }
+}
