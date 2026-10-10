@@ -167,8 +167,11 @@ enum Membership {
 }
 
 async fn guild_membership(executor: &ActionExecutor, guild_id: &str, user_id: &str) -> Membership {
+    // Mutation-free evidence: a pre-wire admission-Blocked attempt waits out
+    // brief governed-lane occupancy (mixed RSVP/custom contention) instead of
+    // refusing. Every other outcome keeps the RA-01 fail-closed mapping.
     match executor
-        .get_json_strict(&format!("/guilds/{guild_id}/members/{user_id}"))
+        .get_json_strict_with_blocked_retry(&format!("/guilds/{guild_id}/members/{user_id}"))
         .await
     {
         Ok(Some(member))

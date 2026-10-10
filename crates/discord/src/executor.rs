@@ -1777,6 +1777,35 @@ impl ActionExecutor {
         }
     }
 
+    /// Membership-evidence read for the RSVP pre-write gate and post-write
+    /// fence. Same fail-closed mapping as [`Self::get_json_strict`] (only 404
+    /// is absence), but a provably pre-wire admission-Blocked attempt waits
+    /// out brief governed-lane occupancy inside the receipt budget instead of
+    /// refusing the command — the same posture as [`Self::get_scheduled_event`].
+    /// A Blocked attempt never reached the wire, so retrying it cannot
+    /// double-apply anything; every other error returns immediately.
+    pub async fn get_json_strict_with_blocked_retry(
+        &self,
+        path: &str,
+    ) -> Result<Option<serde_json::Value>, DiscordError> {
+        let route = raw_get_route(path).map_err(DiscordError::Rejected)?;
+        let request = Request::from_route(&route);
+        // Guard admission and pacing run inside bounded attempts.
+        let (res, _) = self
+            .retry_admission_blocked(|timeout| async {
+                self.send_with_timeout_for(&request, Some(false), timeout)
+                    .await
+            })
+            .await?;
+        match res.status {
+            200..=299 => serde_json::from_slice(&res.body)
+                .map(Some)
+                .map_err(|_| DiscordError::Unavailable("invalid JSON response".into())),
+            404 => Ok(None),
+            _ => Err(throw_for_status(&res)),
+        }
+    }
+
     /// One paced GET without retries. Bounded roster scans use this so the
     /// page budget is also a wire-request budget, including 429/5xx responses.
     pub async fn get_json_once(&self, path: &str) -> Result<Option<serde_json::Value>, String> {

@@ -362,7 +362,7 @@ async fn queued_commands(
             .await
             .unwrap();
     }
-    wait_requests(&rest, 5).await;
+    wait_requests(&rest, 6).await;
     let requests = rest.requests();
     // Index 5: boot application id, registry PUT, first defer, pre-write
     // membership read, held event read, then the second command's defer.
@@ -483,11 +483,22 @@ async fn queued_commands(
         2
     );
     let requests = rest.requests();
-    assert_eq!(requests.len(), 8);
-    for (index, content) in [(5, "RSVP saved: going."), (7, "RSVP saved: interested.")] {
-        assert_eq!(requests[index].method, "PATCH");
+    // Fourteen: boot application id + registry PUT, then per RSVP one defer,
+    // pre-write membership/event reads, fence membership/event re-reads and
+    // the completion edit. Completes serialize in dispatch order, so filter
+    // the edits by token instead of pinning positions.
+    assert_eq!(requests.len(), 14);
+    for (token, content) in [
+        ("mock-rsvp-2", "RSVP saved: going."),
+        ("mock-rsvp-3", "RSVP saved: interested."),
+    ] {
+        let edits: Vec<_> = requests
+            .iter()
+            .filter(|request| request.method == "PATCH" && request.path.contains(token))
+            .collect();
+        assert_eq!(edits.len(), 1, "one completion edit for {token}");
         assert_eq!(
-            serde_json::from_slice::<Value>(&requests[index].body).unwrap()["content"],
+            serde_json::from_slice::<Value>(&edits[0].body).unwrap()["content"],
             content
         );
     }
@@ -498,7 +509,7 @@ async fn queued_commands(
             .unwrap();
         ws.send(Message::text(leave(7).to_string())).await.unwrap();
         wait_sequence(&db.store, 7).await;
-        assert_eq!(rest.requests().len(), 8);
+        assert_eq!(rest.requests().len(), 14);
         shutdown.send_replace(true);
         runner.await.unwrap().unwrap();
     }
@@ -577,7 +588,9 @@ async fn sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending() {
     for command in &commands {
         ws.send(Message::text(command.to_string())).await.unwrap();
     }
-    wait_requests(&rest, 8).await;
+    // Nine: boot application id + registry PUT, defer + pre-write
+    // membership/event reads, then both validation defers with edits.
+    wait_requests(&rest, 9).await;
     let requests = rest.requests();
     for sequence in [3, 4] {
         let suffix = format!("/interactions/{sequence}/mock-rsvp-{sequence}/callback");
