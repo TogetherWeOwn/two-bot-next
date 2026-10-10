@@ -88,7 +88,9 @@ use two_bot_discord::{
 };
 
 use crate::activation::BootActivation;
-use crate::interaction_admission::{accepts_busy_reply, is_privileged, UserSlots, BUSY_REPLY};
+use crate::interaction_admission::{
+    accepts_busy_reply, is_privileged, UserSlots, BUSY_REPLY, PER_USER_IN_FLIGHT,
+};
 
 /// Audit-log reason for retiring the previous sticky (legacy audits carry a
 /// free-text reason; kept short — `audit_reason` caps at 512 chars).
@@ -153,6 +155,14 @@ const LANE_REGISTRY: usize = 2;
 const LANE_PRIVILEGED: usize = 3;
 const LANE_BUSY: usize = 4;
 pub(crate) const LANE_REACTIONS: usize = 5;
+
+// A single member's reaction burst must leave room for other members: the
+// per-member budget stays strictly below the lane cap, so fairness holds even
+// before the saturation drop is reached.
+const _: () = assert!(
+    PER_USER_IN_FLIGHT < DISPATCH_LIMITS[LANE_REACTIONS],
+    "per-member reaction budget must leave room for other members"
+);
 
 #[derive(Default)]
 struct DispatchTasks {
@@ -780,6 +790,17 @@ impl CommandRuntime {
         })
     }
 
+    /// Test-only per-member occupancy: claims one [`PER_USER_IN_FLIGHT`] slot
+    /// for `user` without touching any lane, so the fairness test can pin a
+    /// single-member burst deterministically instead of racing task settle.
+    #[cfg(test)]
+    pub(crate) fn acquire_user_slot_for_test(
+        &self,
+        user: u64,
+    ) -> Option<crate::interaction_admission::UserSlot> {
+        self.user_slots.acquire(user)
+    }
+
     #[cfg(test)]
     pub(crate) fn with_tickets(
         pool: Pool<Postgres>,
@@ -960,6 +981,11 @@ impl CommandRuntime {
     /// Reactions run on their own lane: a reaction burst must consume neither
     /// message automation capacity nor interaction acknowledgement capacity,
     /// and saturation drops with only a log line, exactly like message bursts.
+    /// Per-member fairness mirrors the interaction lane: one member holds at
+    /// most [`PER_USER_IN_FLIGHT`] reaction slots, so a single-member burst
+    /// cannot fill `LANE_REACTIONS` and starve other members. Excess reactions
+    /// drop (`false`) through the same saturated path; no busy reply exists on
+    /// the reaction path, which carries no interaction token.
     fn dispatch_self_role_reaction(&self, reaction: &GatewayReaction, remove: bool) -> bool {
         if !self.interactions.router.gates().self_roles {
             return true;
@@ -970,7 +996,12 @@ impl CommandRuntime {
         let Some(input) = service.reaction_input(reaction, remove) else {
             return true;
         };
+        let Some(slot) = self.user_slots.acquire(reaction.user_id.get()) else {
+            warn!("reaction per-member cap reached; event not admitted");
+            return false;
+        };
         self.spawn(LANE_REACTIONS, async move {
+            let _slot = slot;
             let _ = service.handle(&input).await;
         })
     }
