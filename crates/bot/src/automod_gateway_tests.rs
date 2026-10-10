@@ -10,7 +10,7 @@ use two_bot_core::automod_runtime::{
     TargetFacts, ViolationRecord, STAGING_GUILD_ID,
 };
 use two_bot_core::AutomodFilter;
-use two_bot_discord::automod_activation::FetchedMessage;
+use two_bot_discord::automod_activation::{FetchedMessage, RetainReason};
 
 const OWEN: &str = "123456789012345678";
 const ROLE: &str = "234567890123456789";
@@ -215,7 +215,10 @@ async fn a_stalled_delivery_times_out_without_becoming_acceptance() {
             "2026-10-02T00:00:00.000Z"
         )
         .await,
-        FunnelDisposition::CaptureOnly
+        WorkerVerdict {
+            funnel: FunnelDisposition::CaptureOnly,
+            trigger: FunnelDisposition::CaptureOnly,
+        }
     );
     assert_eq!(
         process(
@@ -223,7 +226,57 @@ async fn a_stalled_delivery_times_out_without_becoming_acceptance() {
             delivery(MessageDeliveryKind::Update),
             "2026-10-02T00:00:00.000Z"
         )
-        .await,
+        .await
+        .funnel,
         FunnelDisposition::None
+    );
+}
+
+#[test]
+fn uninspected_create_keeps_funnel_accept_with_capture_only_trigger() {
+    let bypassed = Activation {
+        disposition: FunnelDisposition::Accept,
+        outcome: ActivationOutcome::Bypassed,
+    };
+    assert_eq!(
+        verdict_of(&bypassed, MessageDeliveryKind::Create),
+        WorkerVerdict {
+            funnel: FunnelDisposition::Accept,
+            trigger: FunnelDisposition::CaptureOnly,
+        }
+    );
+}
+
+#[test]
+fn settled_clean_create_hands_its_accept_to_triggers() {
+    let clean = Activation {
+        disposition: FunnelDisposition::CaptureOnly,
+        outcome: ActivationOutcome::Duplicate(Some(StoredOutcome {
+            matched: false,
+            deleted: false,
+            outcome: two_bot_core::automod_runtime::CompletionKind::Accepted,
+        })),
+    };
+    assert_eq!(
+        verdict_of(&clean, MessageDeliveryKind::Create),
+        WorkerVerdict {
+            funnel: FunnelDisposition::Accept,
+            trigger: FunnelDisposition::Accept,
+        }
+    );
+}
+
+#[test]
+fn retained_completion_hands_triggers_a_capture_only_verdict() {
+    let retained = Activation {
+        disposition: FunnelDisposition::Accept,
+        outcome: ActivationOutcome::Retained(RetainReason::CompletionRefused),
+    };
+    assert_eq!(
+        verdict_of(&retained, MessageDeliveryKind::Create),
+        WorkerVerdict {
+            funnel: FunnelDisposition::Accept,
+            trigger: FunnelDisposition::CaptureOnly,
+        }
     );
 }
