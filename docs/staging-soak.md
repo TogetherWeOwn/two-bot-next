@@ -129,10 +129,12 @@ environment. Names only — values never go in cards, logs, or PRs:
 - Keep the **95–139-second documented per-deploy gateway-drop range** and the
   **92–139-second historical redeploy record** labelled historical/estimated.
   Both exceed 60 seconds if a planned redeploy is in scope; neither provides an
-  exact outage-start-to-verified-recovery measurement — produce that measurement
-  offline with `scripts/gate5_outage.py` (Gate 5 in
-  [soak-entry-gates.md](soak-entry-gates.md)). Classification remains
-  unresolved as above.
+  exact outage-start-to-verified-recovery measurement — measure it offline with
+  `scripts/gate5_outage.py` (Gate 5 in
+  [soak-entry-gates.md](soak-entry-gates.md)), which reads a committed JSONL
+  tick log; there is no live producer. An offline pass verifies offline
+  reconciliation only; it does not prove a deployed build, live event coverage
+  or staging acceptance. Classification remains unresolved as above.
 
 The approved exercise set—three redeploys, two drops, Neon idle-hit and actual
 429 categories—still requires exact reviewed budgets, an independent stop and
