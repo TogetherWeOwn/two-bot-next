@@ -101,9 +101,15 @@ Known gaps (not yet fenced): `two_bot_cutover::rest::RestClient::from_env`
 (`crates/cutover/src/rest.rs`) builds a send-admission pool from
 `TWO_DATABASE_URL` with raw `connect_options` for the `report`,
 `ghost_cleanup` and `backfill_messages` operator tools, so the TLS policy is
-not enforced there; and `staging_migrate::verify_target` plus `connect`
+not enforced there; `staging_migrate::verify_target` plus `connect`
 (`crates/cutover/src/staging_migrate.rs`) pins the expected host and database
-but never calls `database_tls::enforce`/`apply` and sets no timeouts. Their
+but never calls `database_tls::enforce`/`apply` and sets no timeouts; the
+`legacy_copy` binary (`crates/cutover/src/bin/legacy_copy.rs`) builds its
+source/target pools with raw `PgPoolOptions::connect_with` from operator URLs
+without calling `database_tls::enforce`/`apply`; and the `legacy_verify`
+binary (`crates/cutover/src/bin/legacy_verify.rs`) builds its source/target
+`PgConnectOptions` via `connection_options` from operator URLs without calling
+`database_tls::enforce`/`apply`. Their
 refusals already use fixed strings with no URL, host or credential.
 
 F6 stays open until the deployment card records a non-secret TLS receipt.

@@ -38,6 +38,9 @@ use super::commands::{
     CommandChoice, CommandDefinition, CommandOption, CommandOptionType, OCCURRENCE_ID_MAX_CHARS,
     PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
 };
+use super::custom_commands::{
+    MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
+};
 
 /// Scorecard check-in command (parity #12). Keeps the `attendance` name; the
 /// RSVP-totals variant is the one that renames.
@@ -79,23 +82,27 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                     "Command name, a-z 0-9 _ -",
                     CommandOptionType::String,
                 )
-                .required(),
+                .required()
+                .max_length(MAX_COMMAND_NAME_CHARS as u32),
                 CommandOption::new(
                     "template",
                     "What the bot replies; {user} {username} {server} {channel}",
                     CommandOptionType::String,
                 )
-                .required(),
+                .required()
+                .max_length(MAX_TEMPLATE_CHARS as u32),
                 CommandOption::new(
                     "description",
                     "Shown in the command picker",
                     CommandOptionType::String,
-                ),
+                )
+                .max_length(MAX_DESCRIPTION_CHARS as u32),
                 CommandOption::new(
                     "text-trigger",
                     "Optional !trigger form, e.g. !faq",
                     CommandOptionType::String,
-                ),
+                )
+                .max_length(MAX_TEXT_TRIGGER_CHARS as u32),
             ]),
         CommandDefinition::new("command-remove", "Delete a custom command")
             .permissions(PERM_MANAGE_GUILD)
@@ -104,7 +111,8 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                 "Command to delete",
                 CommandOptionType::String,
             )
-            .required()]),
+            .required()
+            .max_length(MAX_COMMAND_NAME_CHARS as u32)]),
         CommandDefinition::new("command-list", "List this server's custom commands")
             .permissions(PERM_MANAGE_GUILD),
         CommandDefinition::new("schedule", "Schedule a message, once or recurring")
@@ -496,6 +504,121 @@ mod tests {
             score.options[0].max_length,
             Some(OCCURRENCE_ID_MAX_CHARS as u32)
         );
+    }
+
+    #[test]
+    fn custom_command_option_lengths_match_runtime_caps() {
+        use crate::custom_commands::{validate_put_input, validate_template, PutCommandInput};
+        use std::collections::HashSet;
+
+        // Pinned literals: tampering with any shared bound trips this test.
+        // A const change must update the slash-option advertisement, the
+        // validators and docs/commands.md together.
+        assert_eq!(MAX_COMMAND_NAME_CHARS, 32);
+        assert_eq!(MAX_TEMPLATE_CHARS, 2000);
+        assert_eq!(MAX_DESCRIPTION_CHARS, 100);
+        assert_eq!(MAX_TEXT_TRIGGER_CHARS, 33);
+        assert_eq!(MAX_TEXT_TRIGGER_CHARS, MAX_COMMAND_NAME_CHARS + 1);
+
+        fn get<'a>(defs: &'a [CommandDefinition], name: &str) -> &'a CommandDefinition {
+            defs.iter()
+                .find(|d| d.name == name)
+                .expect("command exists")
+        }
+        fn option<'a>(
+            defs: &'a [CommandDefinition],
+            command: &str,
+            option: &str,
+        ) -> &'a crate::commands::CommandOption {
+            get(defs, command)
+                .options
+                .iter()
+                .find(|o| o.name == option)
+                .expect("option exists")
+        }
+        let auto = automation_commands();
+        // Advertised bounds come from the same constants the validators use.
+        assert_eq!(
+            option(&auto, "command", "name").max_length,
+            Some(MAX_COMMAND_NAME_CHARS as u32)
+        );
+        assert_eq!(
+            option(&auto, "command", "template").max_length,
+            Some(MAX_TEMPLATE_CHARS as u32)
+        );
+        assert_eq!(
+            option(&auto, "command", "description").max_length,
+            Some(MAX_DESCRIPTION_CHARS as u32)
+        );
+        assert_eq!(
+            option(&auto, "command", "text-trigger").max_length,
+            Some(MAX_TEXT_TRIGGER_CHARS as u32)
+        );
+        assert_eq!(
+            option(&auto, "command-remove", "name").max_length,
+            Some(MAX_COMMAND_NAME_CHARS as u32)
+        );
+        // Pinned wire values: a silent advertisement change trips here too.
+        assert_eq!(option(&auto, "command", "name").max_length, Some(32));
+        assert_eq!(option(&auto, "command", "template").max_length, Some(2000));
+        assert_eq!(
+            option(&auto, "command", "description").max_length,
+            Some(100)
+        );
+        assert_eq!(
+            option(&auto, "command", "text-trigger").max_length,
+            Some(33)
+        );
+        assert_eq!(option(&auto, "command-remove", "name").max_length, Some(32));
+
+        // Runtime agrees at the boundary: name shape, trigger shape, template
+        // ceiling and description bounds.
+        assert!(crate::leveling::valid_command_name(
+            &"a".repeat(MAX_COMMAND_NAME_CHARS)
+        ));
+        assert!(!crate::leveling::valid_command_name(
+            &"a".repeat(MAX_COMMAND_NAME_CHARS + 1)
+        ));
+        let trigger_at_ceiling = format!("!{}", "a".repeat(MAX_COMMAND_NAME_CHARS));
+        let trigger_past_ceiling = format!("!{}", "a".repeat(MAX_COMMAND_NAME_CHARS + 1));
+        assert!(crate::leveling::valid_text_trigger(&trigger_at_ceiling));
+        assert!(!crate::leveling::valid_text_trigger(&trigger_past_ceiling));
+        assert_eq!(MAX_TEXT_TRIGGER_CHARS, trigger_at_ceiling.len());
+        validate_template(&"x".repeat(MAX_TEMPLATE_CHARS)).expect("ceiling ok");
+        assert!(validate_template(&"x".repeat(MAX_TEMPLATE_CHARS + 1)).is_err());
+
+        // End-to-end through the shared validator: ceilings pass, one past
+        // any ceiling fails. A tampered constant that moves the advertisement
+        // without moving validation (or vice versa) trips either the pinned
+        // literals above or these boundary rejections.
+        let builtins = HashSet::new();
+        let ceiling = PutCommandInput {
+            name: "a".repeat(MAX_COMMAND_NAME_CHARS),
+            description: "x".repeat(MAX_DESCRIPTION_CHARS),
+            template: "x".repeat(MAX_TEMPLATE_CHARS),
+            text_trigger: Some(trigger_at_ceiling.clone()),
+        };
+        assert!(validate_put_input(&ceiling, &builtins).is_ok());
+        for tampered in [
+            PutCommandInput {
+                name: "a".repeat(MAX_COMMAND_NAME_CHARS + 1),
+                ..ceiling.clone()
+            },
+            PutCommandInput {
+                description: "x".repeat(MAX_DESCRIPTION_CHARS + 1),
+                ..ceiling.clone()
+            },
+            PutCommandInput {
+                template: "x".repeat(MAX_TEMPLATE_CHARS + 1),
+                ..ceiling.clone()
+            },
+            PutCommandInput {
+                text_trigger: Some(trigger_past_ceiling.clone()),
+                ..ceiling.clone()
+            },
+        ] {
+            assert!(validate_put_input(&tampered, &builtins).is_err());
+        }
     }
 
     #[test]

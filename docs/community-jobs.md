@@ -165,10 +165,11 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   On retry, any existing output for the closed week is terminal, even if its
   watermark/classifier changed or the completion write was lost. A successfully
   persisted incomplete scorecard is terminal, not a transient failure.
-  Before scoring, mark honest stream coverage from capture start through the
-  closed week end; a mid-week start fails closed (`INGESTION_INCOMPLETE`, human
-  numerators null). A Monday boot cannot claim closed-week coverage: leave
-  missing heartbeats missing rather than inserting an inverted interval.
+  Before scoring, mark honest stream coverage for the captured streams only
+  (`CAPTURED_STREAMS`, today just `event_attended`) from capture start through
+  the closed week end; a mid-week start fails closed (`INGESTION_INCOMPLETE`,
+  human numerators null). A Monday boot cannot claim closed-week coverage:
+  leave missing heartbeats missing rather than inserting an inverted interval.
   Apply the reviewed database-role plan after migration 0312; the object matrix
   includes the private scheduler table, with no website reader grant.
 - Drive the inactivity sweep every `INACTIVITY_SWEEP_INTERVAL_MS` (1 h) via

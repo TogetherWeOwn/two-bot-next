@@ -7,8 +7,9 @@ listener with the durable store, announcement executor, nonce-commit
 authentication capability and strict receiver configuration. It supports only
 `announcement.post`, `event.upsert`, and `event.cancel` (behind
 `TWO_INTERNAL_ALLOW_EVENT_CANCEL`), plus the keyless `event.read` (behind
-`TWO_INTERNAL_ALLOW_EVENT_READ`), regardless of the core action catalogue's
-broader defaults; every other verb is refused.
+`TWO_INTERNAL_ALLOW_EVENT_READ`), and `moderation.timeout`, regardless of the
+core action catalogue's broader defaults; every other verb stays refused by
+the per-effect fences.
 The public health/readiness/metrics router has no action route. A merged,
 deployed receiver is dark until the Operator enables it, and it is reachable
 only through the staging-only Worker ingress described in

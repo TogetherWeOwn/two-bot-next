@@ -228,7 +228,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return NameReply::Refused(PAUSED.to_owned());
         }
         let room_id = {
-            let live = self.live.inner.read().expect("live voice lock");
+            let live = self.live.read_state();
             if !live.ready {
                 return NameReply::Refused(NOT_WARM.to_owned());
             }
@@ -360,7 +360,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     }
 
     fn panel_text(&self, room_id: Snowflake) -> String {
-        let live = self.live.inner.read().expect("live voice lock");
+        let live = self.live.read_state();
         let current = live
             .channels
             .get(&room_id)
@@ -380,7 +380,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// The room's naming context from the live snapshot. Display names come
     /// from the directory; a member missing there renders as "member".
     fn name_facts(&self, room: &VoiceRoom, command: &NameCommand) -> NameFacts {
-        let live = self.live.inner.read().expect("live voice lock");
+        let live = self.live.read_state();
         let occupants = live.occupants(room.channel_id);
         let user_limit = live
             .channels

@@ -211,16 +211,18 @@ test("/ops/metrics: 404 without a configured token, 401 without/with a wrong bea
     TWO_BOT: { getByName: () => ({ fetch: async (r: Request) => { calls.push(r); return new Response("ok"); } }) },
   }) as unknown as Env;
   const ctx = {} as ExecutionContext;
+  const token = "synthetic-alert-rules-scrape-token-0123456789";
   const get = (e: Env, auth?: string) =>
     worker.fetch(new Request("https://w.invalid/ops/metrics", { headers: auth ? { authorization: auth } : {} }), e, ctx);
   assert.equal((await get(env(), "Bearer anything")).status, 404);
-  assert.equal((await get(env("s3cret"))).status, 401);
-  assert.equal((await get(env("s3cret"), "Bearer nope")).status, 401);
-  assert.equal((await get(env("s3cret"), "Basic s3cret")).status, 401);
+  assert.equal((await get(env("short"))).status, 404, "short token is not configured");
+  assert.equal((await get(env(token))).status, 401);
+  assert.equal((await get(env(token), "Bearer nope")).status, 401);
+  assert.equal((await get(env(token), "Basic nope")).status, 401);
   assert.equal(calls.length, 0, "unauthenticated requests never reach the container");
-  const ok = await get(env("s3cret"), "Bearer s3cret");
+  const ok = await get(env(token), `Bearer ${token}`);
   assert.equal(ok.status, 200);
   assert.equal(calls.length, 1);
-  const post = await worker.fetch(new Request("https://w.invalid/ops/metrics", { method: "POST", headers: { authorization: "Bearer s3cret" } }), env("s3cret"), ctx);
+  const post = await worker.fetch(new Request("https://w.invalid/ops/metrics", { method: "POST", headers: { authorization: `Bearer ${token}` } }), env(token), ctx);
   assert.equal(post.status, 404);
 });
