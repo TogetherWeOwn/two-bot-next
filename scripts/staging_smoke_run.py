@@ -280,7 +280,11 @@ def build_record(args, run, started, ended):
 
 
 def validate_record(record):
-    schema = json.loads(check_run_record.DEFAULT_SCHEMA.read_text(encoding="utf-8"))
+    try:
+        schema = check_run_record.load_json(
+            check_run_record.DEFAULT_SCHEMA.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, check_run_record.DuplicateKeyError) as error:
+        return [f"cannot load schema: {error}"]
     return check_run_record.validate(record, schema)
 
 

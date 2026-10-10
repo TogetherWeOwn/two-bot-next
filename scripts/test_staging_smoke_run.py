@@ -7,7 +7,7 @@ import re
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -62,7 +62,7 @@ class SmokeRunTests(unittest.TestCase):
             self.addCleanup(guard.stop)
         self.health_requested = []
         self.discord_requested = []
-        tmp = tempfile.TemporaryDirectory()
+        tmp = tempfile.TemporaryDirectory(dir=os.getenv("PAPERCLIP_RUN_SCRATCH_DIR"))
         self.addCleanup(tmp.cleanup)
         self.record = Path(tmp.name) / "record.json"
 
@@ -349,6 +349,45 @@ class SmokeRunTests(unittest.TestCase):
                 self.assertNotIn(TOKEN, out)
                 if self.record.exists():
                     self.assertNotIn(TOKEN, self.record.read_text(encoding="utf-8"))
+
+    def test_invalid_record_never_echoes_secret_shaped_tester(self):
+        for prefix in ("gh" + "p_", "xox" + "b-", "BEGIN " + "PRIVATE KEY "):
+            with self.subTest(kind=prefix.split()[0]):
+                sentinel = prefix + "SyntheticPayloadNeverEcho42"
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    code, out = self.drive(extra=("--tester", sentinel))
+                self.assertEqual(code, 1)
+                self.assertIn("record invalid: $.tester.identity: public-safety scan hit ", out)
+                for text in (out, err.getvalue()):
+                    self.assertFalse(sentinel in text, "secret-shaped sentinel leaked")
+                    self.assertFalse("SyntheticPayloadNeverEcho42" in text, "secret payload leaked")
+                self.assertFalse(self.record.exists())
+                record = smoke.build_record(smoke.parse_args([
+                    "--guild-id", STAGING_GUILD, "--tester", sentinel,
+                    "--expected-sha", SHA, "--deploy-run-id", "42",
+                ]), smoke.Run(), smoke.utc(), smoke.utc())
+                errors = smoke.validate_record(record)
+                self.assertFalse(sentinel in "\n".join(errors), "returned errors leaked sentinel")
+
+    def test_duplicate_schema_fails_without_echo_or_record_write(self):
+        sentinel = "gh" + "p_" + "SyntheticPayloadNeverEcho42"
+        schema = self.record.with_name("schema.json")
+        schema.write_text('{"properties":{"notes":{"type":' + json.dumps(sentinel)
+                          + ',"type":"string"}}}', encoding="utf-8")
+        err = io.StringIO()
+        with mock.patch.object(check_run_record, "DEFAULT_SCHEMA", schema), redirect_stderr(err):
+            errors = smoke.validate_record({})
+            code, out = self.drive()
+        self.assertEqual(errors, [
+            "cannot load schema: $.properties.notes.type: duplicate object key",
+        ])
+        self.assertEqual(code, 1)
+        self.assertIn("record invalid: " + errors[0], out)
+        for text in (out, err.getvalue(), "\n".join(errors)):
+            self.assertFalse(sentinel in text, "secret-shaped sentinel leaked")
+            self.assertFalse("SyntheticPayloadNeverEcho42" in text, "secret payload leaked")
+        self.assertFalse(self.record.exists())
 
     def test_record_is_public_safe(self):
         self.drive(extra=("--expected-sha", SHA))
