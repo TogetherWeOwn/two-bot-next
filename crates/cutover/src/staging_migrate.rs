@@ -51,12 +51,10 @@ pub const READ_ONLY_ROLE: &str = "two_bot_migrator_ro";
 /// SQLx library version this runner is pinned to (asserted against Cargo.lock).
 pub const SQLX_VERSION: &str = "0.9.0";
 pub const RUNNER_VERSION: u32 = 1;
-/// Target pool shape: max 2 connections with a 15 s statement timeout and a
-/// 10 s acquire timeout (store/admission parity, threat-model F6). The
-/// statement timeout rides the connection options; the acquire timeout bounds
-/// pool checkout so a dead host fails the run instead of hanging it.
+/// Target pool shape: max 2 connections with a 10 s acquire timeout, so a dead
+/// host fails the run instead of hanging pool checkout. Unlike application
+/// pools, this pool adds no statement timeout: migration DDL can exceed 15 s.
 pub const TARGET_POOL_MAX: u32 = 2;
-pub const TARGET_STATEMENT_TIMEOUT_MS: u64 = 15_000;
 pub const TARGET_ACQUIRE_TIMEOUT_SECS: u64 = 10;
 
 /// Read-only audit inputs: the matrix and verifier compiled from the source SHA
@@ -587,7 +585,8 @@ fn tls_policy_from_env() -> Result<TlsPolicy, RunError> {
 /// Verify the secret binding points at the pinned target identity and fence
 /// it with the `TWO_DATABASE_TLS` policy (unset means `required`): validate
 /// before SQLx can WARN-log query values, enforce the TLS policy, then apply
-/// the effective mode. The statement timeout rides the returned options.
+/// the effective mode. Preserve operator-supplied statement settings; do not
+/// add an application-style deadline to migration DDL.
 /// Failures are fixed strings; nothing echoes the URL, host or credential.
 fn verify_target(req: &Request, tls: TlsPolicy) -> Result<PgConnectOptions, RunError> {
     let binding = binding_env(req);
@@ -602,12 +601,6 @@ fn verify_target(req: &Request, tls: TlsPolicy) -> Result<PgConnectOptions, RunE
     let options = two_bot_core::database_url::connect_options(url)
         .map_err(|_| RunError::Refused(format!("{binding} value is not a valid database URL")))?;
     let options = database_tls::apply(options, tls);
-    // Statement timeout rides the connection options (server-side setting
-    // per connection), so no per-connection SET is needed.
-    let options = options.options([(
-        "statement_timeout",
-        format!("{TARGET_STATEMENT_TIMEOUT_MS}ms"),
-    )]);
     let host = options.get_host().to_ascii_lowercase();
     let database = options.get_database().unwrap_or_default();
     if host.contains("-pooler") {
@@ -868,9 +861,7 @@ async fn connect(
 ) -> Result<PgPool, RunError> {
     PgPoolOptions::new()
         .max_connections(TARGET_POOL_MAX)
-        // `statement_timeout` only guards statements; a stuck TCP connect
-        // needs its own bound so a dead host fails the run instead of
-        // hanging it.
+        // Bound pool checkout, not the duration of migration statements.
         .acquire_timeout(Duration::from_secs(TARGET_ACQUIRE_TIMEOUT_SECS))
         .after_connect(move |conn, _meta| {
             let verified = Arc::clone(&verified);
@@ -2318,11 +2309,11 @@ mod tests {
         }
     }
 
-    /// Threat-model F6 happy path: fenced options carry the effective SQLx
-    /// mode plus the statement timeout, and a lazy pool from them opens no
-    /// socket, so no database is needed.
+    /// Threat-model F6 happy path: preserve the effective TLS mode without
+    /// capping migration statements in either plan or apply. A lazy pool opens
+    /// no socket, so no database is needed.
     #[tokio::test]
-    async fn target_fence_applies_verify_full_and_statement_timeout() {
+    async fn target_fence_applies_tls_without_capping_migration_statements() {
         use sqlx::postgres::{PgPoolOptions, PgSslMode};
         // `LocalOnly` loopback keeps the URL mode as written.
         let local = Request {
@@ -2343,13 +2334,6 @@ mod tests {
             plan_run_id: None,
             plan_manifest_path: None,
         };
-        let options = verify_target(&local, TlsPolicy::LocalOnly).unwrap();
-        assert!(matches!(options.get_ssl_mode(), PgSslMode::Disable));
-        let debug = format!("{options:?}");
-        assert!(
-            debug.contains("statement_timeout") && debug.contains("15000ms"),
-            "fenced options must carry the statement timeout: {debug}"
-        );
         // `Required` upgrades a remote `require` URL to `verify-full`.
         let remote = Request {
             url: Some(
@@ -2360,13 +2344,29 @@ mod tests {
             expected_database: "fixture-db".to_owned(),
             ..local.clone()
         };
+        for (request, policy, expected_mode) in [
+            (&local, TlsPolicy::LocalOnly, PgSslMode::Disable),
+            (&remote, TlsPolicy::Required, PgSslMode::VerifyFull),
+        ] {
+            for apply in [false, true] {
+                let mut req = request.clone();
+                req.apply = apply;
+                let options = verify_target(&req, policy).unwrap();
+                assert_eq!(options.get_ssl_mode(), expected_mode);
+                assert_eq!(options.get_options(), None);
+
+                // Keep an explicit operator budget, rather than overwriting
+                // it with an application-pool deadline (or disabling it).
+                req.url
+                    .as_mut()
+                    .unwrap()
+                    .push_str("&options%5Bstatement_timeout%5D=90000");
+                let options = verify_target(&req, policy).unwrap();
+                assert_eq!(options.get_ssl_mode(), expected_mode);
+                assert_eq!(options.get_options(), Some("-c statement_timeout=90000"));
+            }
+        }
         let options = verify_target(&remote, TlsPolicy::Required).unwrap();
-        assert!(matches!(options.get_ssl_mode(), PgSslMode::VerifyFull));
-        let debug = format!("{options:?}");
-        assert!(
-            debug.contains("statement_timeout") && debug.contains("15000ms"),
-            "fenced options must carry the statement timeout: {debug}"
-        );
         // A lazy pool from fenced options opens no socket.
         let pool = PgPoolOptions::new()
             .max_connections(1)
@@ -2375,14 +2375,10 @@ mod tests {
         pool.close().await;
     }
 
-    /// Target pool shape: max 2 connections with a 15 s statement timeout on
-    /// the options and a 10 s acquire timeout on the pool (`connect` wires
-    /// both constants; the options half is proven by
-    /// `target_fence_applies_verify_full_and_statement_timeout`).
+    /// Target pool shape: max 2 connections and a 10 s acquire timeout.
     #[test]
-    fn target_pool_shape_pins_timeouts() {
+    fn target_pool_shape_pins_acquire_timeout() {
         assert_eq!(TARGET_POOL_MAX, 2);
-        assert_eq!(TARGET_STATEMENT_TIMEOUT_MS, 15_000);
         assert_eq!(TARGET_ACQUIRE_TIMEOUT_SECS, 10);
     }
 
