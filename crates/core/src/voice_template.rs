@@ -45,8 +45,8 @@
 
 use crate::voice_conditions::{ConditionFacts, Conditions};
 use crate::voice_naming::{
-    parse, render_text, resolve_room_name_with, Evaluation, ExtensionPolicy, RoomContext,
-    Template, MAX_TEMPLATE_BYTES,
+    parse, render_text, resolve_room_name_with, Evaluation, ExtensionPolicy, RoomContext, Template,
+    MAX_TEMPLATE_BYTES,
 };
 use crate::voice_style::{apply_chain, parse_modes};
 
