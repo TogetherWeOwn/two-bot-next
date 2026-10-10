@@ -442,11 +442,15 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
     // name and routes by the username's `{role}.{branch_id}` suffix, so the
     // host+database pin alone cannot fix the branch. A `*.psdb.cloud` pin
     // requires the non-secret branch id; other hosts accept an empty pin.
+    // (Production takes no branch pin yet; its fail-closed refusal lives
+    // after the pooled-shape check below so pooled bindings keep the pooled
+    // refusal in both gates, mirroring `verify_target`.)
     let branch = req.expected_branch_id.trim();
     if !branch.is_empty() && !branch_id_valid(branch) {
         return refuse("staging branch id is not a bare branch pin");
     }
-    if branch.is_empty() && is_planetscale_host(&req.expected_host) {
+    if branch.is_empty() && req.target == Target::Staging && is_planetscale_host(&req.expected_host)
+    {
         return refuse("PlanetScale hosts require --staging-branch-id");
     }
     match &req.expected_pending {
@@ -521,6 +525,20 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
             check_binding_shape(req, &options)?;
         }
     }
+    // The production target takes no branch pin yet, so a production dispatch
+    // aimed at a `*.psdb.cloud` host fails closed here until the production
+    // branch-pin follow-up lands. After the pooled-shape check so pooled
+    // bindings keep the pooled refusal, mirroring `verify_target`; the
+    // message must not name `--staging-branch-id`, which production rejects.
+    if req.target == Target::Production
+        && req.expected_branch_id.trim().is_empty()
+        && is_planetscale_host(&req.expected_host)
+    {
+        return refuse(
+            "production PlanetScale dispatch needs a production branch pin, \
+             which is not supported yet; refusing",
+        );
+    }
     Ok(())
 }
 
@@ -594,8 +612,17 @@ fn verify_target(req: &Request) -> Result<sqlx::postgres::PgConnectOptions, RunE
     }
     // Fail-closed PlanetScale pin: a `*.psdb.cloud` binding without a pinned
     // branch id refuses even when host+database match, so a dispatch that
-    // forgets `--staging-branch-id` cannot reach an unpinned branch.
+    // forgets the branch pin cannot reach an unpinned branch. Production
+    // takes no branch pin yet and fails closed here until the production
+    // branch-pin follow-up lands; its refusal must not name
+    // `--staging-branch-id`, which the production target rejects.
     if req.expected_branch_id.trim().is_empty() && is_planetscale_host(&host) {
+        if req.target == Target::Production {
+            return refuse(
+                "production PlanetScale dispatch needs a production branch pin, \
+                 which is not supported yet; refusing",
+            );
+        }
         return refuse("PlanetScale hosts require --staging-branch-id");
     }
     check_binding_shape(req, &options)?;
@@ -2020,6 +2047,31 @@ mod tests {
         direct.url = Some("postgres://u@prod-host.invalid:5432/two_bot?sslmode=require".to_owned());
         assert!(validate_request(&direct).is_ok());
         assert!(verify_target(&direct).is_ok());
+    }
+
+    #[test]
+    fn production_planetscale_refuses_without_a_production_pin() {
+        // Production takes no branch pin yet: even the direct PlanetScale
+        // endpoint refuses in both gates until the production branch-pin
+        // follow-up lands. The refusal must name the missing production
+        // pin and never `--staging-branch-id`, which production rejects.
+        let mut req = production_plan();
+        req.expected_host = "abc-useast1-1.horizon.psdb.cloud".to_owned();
+        req.url = Some(
+            "postgresql://migrator@abc-useast1-1.horizon.psdb.cloud:5432/two_bot?sslmode=require"
+                .to_owned(),
+        );
+        for gate in [validate_request(&req), verify_target(&req)] {
+            let err = gate.unwrap_err().to_string();
+            assert!(
+                err.contains("production branch pin"),
+                "production PlanetScale refusal must name the production pin, got: {err}"
+            );
+            assert!(
+                !err.contains("--staging-branch-id"),
+                "production refusal must not name the staging pin, got: {err}"
+            );
+        }
     }
 
     #[test]

@@ -648,10 +648,13 @@ actions, routed runner, pipefail shell, and artifact names
 retention, stored ZIP entries). The `claim` job runs
 `scripts/ci/production_migrate_claim.py`, which binds the same projection hash
 but requires the production workflow path, environment, and
-`PRODUCTION_HOST`/`PRODUCTION_DATABASE` pins. Both environments and both
-secrets must exist before dispatch; the host provisions them after this change
-merges. The cutover itself does not need this path: the fresh `two_bot`
-bootstrap uses the tested provisioner flow.
+`PRODUCTION_HOST`/`PRODUCTION_DATABASE` pins. The production target takes no
+branch pin yet, so a production dispatch aimed at a PlanetScale host refuses
+closed (exit 2) until the production branch-pin follow-up lands; point the
+production host at a non-PlanetScale endpoint until then. Both environments
+and both secrets must exist before dispatch; the host provisions them after
+this change merges. The cutover itself does not need this path: the fresh
+`two_bot` bootstrap uses the tested provisioner flow.
 
 ### Redeploy the approved revision
 

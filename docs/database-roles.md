@@ -204,8 +204,10 @@ their login status or silently removing memberships. It contains no passwords.
    reads 0 findings. For later migrations, the order is fixed: (a) dispatch the
    matching migration workflow plan (`staging-migrate.yml` with
    `--target staging` for staging, `production-migrate.yml` with
-   `--target production` for PlanetScale main `two_bot`) and review the pending
-   set; (b) dispatch apply through the reviewed environment so the dedicated
+   `--target production` for PlanetScale main `two_bot`; production takes no
+   branch pin yet, so a production dispatch aimed at a PlanetScale host
+   refuses closed until the production branch-pin follow-up lands) and review
+   the pending set; (b) dispatch apply through the reviewed environment so the dedicated
    migrator login creates objects with `SET ROLE two_bot_migrator` from the
    start: creator-specific default ACLs belong to the group, not automatically
    to a member login; (c) the provisioning identity reapplies the reviewed full
