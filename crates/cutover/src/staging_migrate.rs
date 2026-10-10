@@ -1966,9 +1966,8 @@ mod tests {
         // `validation_refuses_before_connecting`.
         let mut pooled_port = production_plan();
         pooled_port.expected_host = "prod-host.invalid".to_owned();
-        pooled_port.url = Some(
-            "postgres://u@prod-host.invalid:6432/two_bot?sslmode=require".to_owned(),
-        );
+        pooled_port.url =
+            Some("postgres://u@prod-host.invalid:6432/two_bot?sslmode=require".to_owned());
         let err = validate_request(&pooled_port).unwrap_err().to_string();
         assert!(
             err.contains("direct"),
@@ -1999,9 +1998,7 @@ mod tests {
         // The direct endpoint on the same host still verifies.
         let mut direct = production_plan();
         direct.expected_host = "prod-host.invalid".to_owned();
-        direct.url = Some(
-            "postgres://u@prod-host.invalid:5432/two_bot?sslmode=require".to_owned(),
-        );
+        direct.url = Some("postgres://u@prod-host.invalid:5432/two_bot?sslmode=require".to_owned());
         assert!(validate_request(&direct).is_ok());
         assert!(verify_target(&direct).is_ok());
     }
