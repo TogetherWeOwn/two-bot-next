@@ -135,58 +135,43 @@ test("gateway missed events fire on any increase, never on the first sample or a
   assert.deepEqual(ev([`two_bot_gateway_missed_events_total 2`], restart.state).firing, ["gateway_missed_events"]);
 });
 
-test("receiver refusals need three growing windows, never one bad tick or a reset", () => {
+test("receiver refusals fire on any per-family increase, never on the first sample or a reset", () => {
   const refused = (family: string, outcome: string, n: number) =>
     `two_bot_internal_actions_total{family="${family}",outcome="${outcome}"} ${n}`;
   const executed = (family: string, n: number) =>
     `two_bot_internal_actions_total{family="${family}",outcome="executed"} ${n}`;
-  const mod = (n: number, x = 10) => [
-    refused("moderation", "auth_failure", n),
-    refused("moderation", "rate_limit", 2),
-    executed("moderation", x),
-  ];
   // First sample only stores the baseline, even with nonzero refusals.
-  const first = ev(mod(5));
+  const first = ev([
+    refused("moderation", "auth_failure", 5),
+    refused("moderation", "rate_limit", 2),
+    executed("moderation", 10),
+  ]);
   assert.deepEqual(first.firing, []);
-  // One growing window never pages: a single forged request stays quiet.
-  const one = ev(mod(6, 100), first.state);
-  assert.deepEqual(one.firing, []);
-  // Two growing windows still stay quiet; executed growth alone never counts.
-  const two = ev(mod(7, 1000), one.state);
-  assert.deepEqual(two.firing, []);
-  // The third consecutive growing window fires with the family subject.
-  const fire = ev(mod(8), two.state);
+  // A per-family increase fires with the family subject; executed growth alone stays silent.
+  const fire = ev([
+    refused("moderation", "auth_failure", 6),
+    refused("moderation", "rate_limit", 2),
+    executed("moderation", 100),
+  ], first.state);
   assert.deepEqual(fire.firing, ["receiver_refusals:moderation"]);
-  // A flat window recovers (streak resets, no fire).
-  const flat = ev(mod(8, 1001), fire.state);
-  assert.deepEqual(flat.firing, []);
-  assert.equal(flat.state.receiverRefusalStreaks["moderation"], 0);
-  // A slow trickle (growth every other window) never pages and never flaps.
-  const trickle1 = ev(mod(9), flat.state);
-  assert.deepEqual(trickle1.firing, []);
-  const trickleFlat = ev(mod(9), trickle1.state);
-  assert.deepEqual(trickleFlat.firing, []);
-  const trickle2 = ev(mod(10), trickleFlat.state);
-  assert.deepEqual(trickle2.firing, []);
-  // Other families streak independently: membership fires while moderation is flat.
-  const mem = (n: number) => [
-    refused("moderation", "auth_failure", 10),
-    refused("membership", "unknown_key", n),
+  // A flat window recovers (no increase, no fire).
+  assert.deepEqual(ev([
+    refused("moderation", "auth_failure", 6),
+    refused("moderation", "rate_limit", 2),
+    executed("moderation", 101),
+  ], fire.state).firing, []);
+  // Other families fire independently.
+  const mixed = ev([
+    refused("moderation", "auth_failure", 6),
+    refused("membership", "unknown_key", 1),
     executed("membership", 3),
-  ];
-  const m1 = ev(mem(1), trickle2.state);
-  const m2 = ev(mem(2), m1.state);
-  assert.deepEqual(m2.firing, []);
-  const m3 = ev(mem(3), m2.state);
-  assert.deepEqual(m3.firing, ["receiver_refusals:membership"]);
+  ], fire.state);
+  assert.deepEqual(mixed.firing, ["receiver_refusals:membership"]);
   // A counter that went backwards means the process restarted: no window.
-  const restart = ev([refused("moderation", "auth_failure", 1)], m3.state);
+  const restart = ev([refused("moderation", "auth_failure", 1)], fire.state);
   assert.deepEqual(restart.firing, []);
-  // The post-restart baseline needs three growing windows before re-firing.
-  const r1 = ev([refused("moderation", "auth_failure", 2)], restart.state);
-  const r2 = ev([refused("moderation", "auth_failure", 3)], r1.state);
-  assert.deepEqual(r2.firing, []);
-  assert.deepEqual(ev([refused("moderation", "auth_failure", 4)], r2.state).firing, ["receiver_refusals:moderation"]);
+  // The post-restart baseline fires again on the next increase.
+  assert.deepEqual(ev([refused("moderation", "auth_failure", 2)], restart.state).firing, ["receiver_refusals:moderation"]);
 });
 
 test("ticker stale fires past 10 minutes, ignores boot, parked and fresh tickers", () => {
@@ -288,12 +273,12 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   firing.push(
     ...ev([`two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} ${NOW - 601}`]).firing,
   );
-  // Receiver refusals need three consecutive growing windows (single bad ticks stay quiet).
-  let refused = EMPTY_STATE;
-  for (let i = 0; i <= 3; i++) {
-    refused = ev([`two_bot_internal_actions_total{family="moderation",outcome="auth_failure"} ${i}`], refused).state;
-  }
-  firing.push(...refused.firing);
+  firing.push(
+    ...ev(
+      [`two_bot_internal_actions_total{family="moderation",outcome="auth_failure"} 1`],
+      ev([`two_bot_internal_actions_total{family="moderation",outcome="auth_failure"} 0`]).state,
+    ).firing,
+  );
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);
   assert.equal(packets.length, RULES.length);

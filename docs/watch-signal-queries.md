@@ -303,10 +303,7 @@ sum by (family) (increase(two_bot_internal_actions_total{outcome="executed"}[48h
 
 Read the `family` label before acting: a rising `moderation` or
 `membership` refusal share points at website-action abuse or a caller
-misconfiguration, not at Discord or the database. A rising `other`
-share is pre-auth noise — bad signatures, unknown keys, malformed
-headers that never parsed a body — and never names the abused family;
-scope those from the `outcome` labels instead. A rising `executed`
+misconfiguration, not at Discord or the database. A rising `executed`
 count next to refusals means the receiver is still serving legitimate
 traffic while refusing the surge. Correlate with the container logs for
 `internal action refused` warn lines (sampled summaries keyed by
@@ -314,11 +311,10 @@ traffic while refusing the surge. Correlate with the container logs for
 zero between scrapes means the process restarted; it does not mean the
 window was quiet.
 
-Alert rule: the Worker `receiver_refusals:<family>` rule fires when a
-family's refused outcomes grow in 3 consecutive keepalive samples (the
-first sample and counter resets skip the window rather than firing), so
-one forged request never pages and a slow trickle cannot flap the
-alert. Runbook:
+Alert rule: the Worker `receiver_refusals:<family>` rule implements the
+zero threshold above — it fires on any per-family increase of refused
+outcomes between two keepalive samples (the first sample and counter
+resets skip the window rather than firing). Runbook:
 [runbook](runbook.md#alert-receiver-refusals).
 
 ## What this pack does not do
