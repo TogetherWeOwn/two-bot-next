@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -200,6 +201,9 @@ class FakeClient:
         self.request_routes = copy.deepcopy(request_routes or {})
         self.deadline = deadline
         self.observation = None
+        self.zero_instance_polls = 0
+        self.zero_instance_first = None
+        self.zero_instance_last = None
         self.calls = []
 
     def respond(self, routes, key):
@@ -794,13 +798,26 @@ class ClientSanitizationTests(OfflineTestCase):
                 client.opener.open.side_effect = HTTPError(URL, 503, "x", headers, io.BytesIO(body))
                 self.assertEqual(client.request(URL + "/readyz"), (503, headers, body))
         for code, headers in [(503, {"content-type": "text/plain"}), (503, {}),
-                              (500, {"content-type": "application/json"}),
-                              (429, {"content-type": "application/json"})]:
+                              (500, {"content-type": "text/plain"}),
+                              (429, {"content-type": "application/json"}),
+                              (409, {"content-type": "application/json"})]:
             with self.subTest(code=code, headers=headers):
                 client = rollout.Client(ACCOUNT, SENTINEL)
                 client.opener.open.side_effect = HTTPError(
                     URL, code, SENTINEL, headers, io.BytesIO(SENTINEL.encode()))
                 self.assertEqual(client.request(URL + "/readyz"), (code, {}, b""))
+
+    def test_unauthenticated_json_500_readyz_body_is_retained_only_for_readyz(self):
+        body = b'{"ready":false,"error_class":"container_unavailable"}'
+        client = rollout.Client(ACCOUNT, SENTINEL)
+        client.opener.open.side_effect = HTTPError(
+            URL + "/readyz", 500, "x", {"content-type": "application/json"}, io.BytesIO(body))
+        self.assertEqual(client.request(URL + "/readyz"), (500, {"content-type": "application/json"}, body))
+
+        client = rollout.Client(ACCOUNT, SENTINEL)
+        client.opener.open.side_effect = HTTPError(
+            URL + "/health", 500, "x", {"content-type": "application/json"}, io.BytesIO(body))
+        self.assertEqual(client.request(URL + "/health"), (500, {}, b""))
 
     def test_unauthenticated_json_503_body_is_size_bounded_and_read_errors_discard_it(self):
         client = rollout.Client(ACCOUNT, SENTINEL)
@@ -904,10 +921,42 @@ class DeploymentWiringTests(unittest.TestCase):
         self.assertIn("--env staging", deploy[0])
         self.assertIn('${{ env.ROLLOUT_DIR }}/staging-deploy.json', deploy[0])
         self.assertIn('--evidence "$ROLLOUT_DIR/evidence.json"', verify[0])
+        # Takeover pin: the client must be pinned to the receipt-validated
+        # Worker version, so a retry answered by a stale version refuses while
+        # the old-to-new handover still re-posts. Deleting either side must
+        # redden this suite.
+        self.assertIn("set -euo pipefail", takeover[0])
+        self.assertNotRegex(takeover[0], r"(?m)^\s*(?:if|continue-on-error):")
+        self.assertIn("OWNERSHIP_EXPECTED_DEPLOYMENT", takeover[0])
+        self.assertIn("receipt.json", takeover[0])
+        self.assertIn("worker_version", takeover[0])
+        client = (root / "wrangler" / "scripts" / "ownership-control.mjs").read_text()
+        self.assertIn("process.env.OWNERSHIP_EXPECTED_DEPLOYMENT", client)
+        self.assertIn("expectedDeploymentId", client)
         executable_lines = "\n".join(line for line in source.splitlines()
                                       if line.strip() and not line.lstrip().startswith("#"))
         self.assertNotRegex(executable_lines, r"\b503\b")
         self.assertNotIn("curl", executable_lines)
+
+    @unittest.skipUnless(shutil.which("node"), "Node runtime not installed")
+    def test_takeover_pin_env_reaches_control_client_cli(self):
+        # CLI-level: the script runs with the pin env set and the mapping at
+        # ownership-control.mjs:163 passes it through. Preflight needs a valid
+        # URL/token but no network, so it proves the env is accepted end to end.
+        import json
+        import subprocess
+        root = Path(__file__).resolve().parent.parent
+        script = root / "wrangler" / "scripts" / "ownership-control.mjs"
+        env = dict(os.environ)
+        env.update({
+            "STAGING_WORKER_URL": "https://two-bot-next-staging.5150.workers.dev/",
+            "OWNERSHIP_CONTROL_TOKEN": "x" * 32,
+            "OWNERSHIP_EXPECTED_DEPLOYMENT": "123e4567-e89b-12d3-a456-426614174000",
+        })
+        completed = subprocess.run(["node", str(script), "preflight"],
+                                   env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout), {"configured": True})
 
     def test_required_worker_ci_runs_this_offline_suite(self):
         root = Path(__file__).resolve().parent.parent
@@ -1287,8 +1336,8 @@ class OrchestrationTests(OfflineTestCase):
         client = verify_client()
         client.api_routes[DETAIL_PATH] = [pending]
         self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
-        self.assertEqual(client.observation,
-                         "rollout=progressing instances=active:1,healthy:0,failed:0,starting:1")
+        self.assertIn("readyz=200 identity=match", client.observation)
+        self.assertNotIn(SENTINEL, client.observation)
         self.assert_no_secret_saved_or_printed()
 
     def readyz_body(self, failure, **extra):
@@ -1372,8 +1421,87 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(
             client.observation,
             "rollout=progressing instances=active:0,healthy:0,failed:0,starting:1,scheduling:0 "
-            "gateway_failure=durable_gateway:automod_config_invalid")
+            "readyz=503 identity=match gateway_failure=durable_gateway:automod_config_invalid")
         self.assert_no_evidence()
+
+    def test_unconverged_mismatch_fence_and_unavailable_polls_are_classified(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        cases = [
+            ((503, {"x-two-worker-version": OLD_VERSION},
+              json.dumps({"build_revision": REVISION, "build_id": BUILD_ID}).encode()),
+             "readyz=503 identity=mismatch"),
+            ((503, {"content-type": "application/json"},
+              b'{"error":"ownership_fenced","reason":"not_owner"}'),
+             "readyz=503 identity=absent token=not_owner"),
+            ((500, {"content-type": "application/json"},
+              b'{"ready":false,"error_class":"container_unavailable"}'),
+             "readyz=500 identity=absent token=container_unavailable"),
+            ((503, {"content-type": "application/json"},
+              b'{"error":"ownership_fenced","reason":"shutdown_unconfirmed"}'),
+             "readyz=503 identity=absent token=shutdown_unconfirmed"),
+            ((503, {"content-type": "application/json"},
+              b'{"error":"ownership_fenced","reason":"storage_unavailable"}'),
+             "readyz=503 identity=absent token=storage_unavailable"),
+            ((503, {"content-type": "application/json"},
+              b'{"error":"ownership_fenced","reason":"storage_invalid"}'),
+             "readyz=503 identity=absent token=storage_invalid"),
+            ((503, {"content-type": "application/json"},
+              b'{"error":"ownership_fenced","reason":"deployment_id_missing"}'),
+             "readyz=503 identity=absent token=deployment_id_missing"),
+            ((503, {"content-type": "application/json"},
+              b'{"error":"ownership_fenced","reason":"operation_failed"}'),
+             "readyz=503 identity=absent token=operation_failed"),
+            ((503, {"x-two-worker-version": SENTINEL, "content-type": "application/json"},
+              json.dumps({"error": SENTINEL, "reason": SENTINEL}).encode()),
+             "readyz=503 identity=mismatch"),
+            ((600, {}, b"{}"), "readyz=unknown identity=absent"),
+        ]
+        for response, expected in cases:
+            with self.subTest(expected=expected):
+                self.clock.now = 100
+                client = self.unconverged_client(response)
+                self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+                self.assertIn(expected, client.observation)
+                self.assertNotIn("gateway_failure=", client.observation)
+                self.assertNotIn(SENTINEL, client.observation)
+                self.assert_no_evidence()
+
+    def test_readiness_token_still_recognises_defensive_epoch_conflict(self):
+        # Parser-level only: the live client drops 409 bodies (pinned above),
+        # so this token never prints end to end; it stays recognised here.
+        self.assertEqual(
+            rollout.readiness_token(
+                {"error": "ownership_fenced", "reason": "epoch_conflict"}),
+            "epoch_conflict")
+        self.assertIsNone(rollout.readiness_token(
+            {"error": SENTINEL, "reason": SENTINEL}))
+
+    def test_diagnostic_only_change_preserves_the_three_recorded_run_verdict_shapes(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+
+        pending = completed_row()
+        pending["status"] = "progressing"
+        pending["health"]["instances"].update(active=0, healthy=0, starting=1)
+        client = verify_client()
+        client.api_routes[DETAIL_PATH] = [pending]
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+
+        stale = app(OLD_IMAGE)
+        client = verify_client()
+        client.deadline = 200
+        client.api_routes[APP_PATH] = [[stale], [app()]]
+        rollout.verify(self.args, client)
+        self.assertTrue(Path(self.args.evidence).exists())
+        Path(self.args.evidence).unlink()
+
+        zero = completed_row()
+        zero["health"]["instances"].update(active=0, healthy=0)
+        client = verify_client()
+        client.api_routes[DETAIL_PATH] = [zero]
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assert_no_secret_saved_or_printed()
 
     def test_unconverged_rollout_ignores_a_failure_from_another_worker_or_image(self):
         self.prepare_baseline()
@@ -1391,8 +1519,9 @@ class OrchestrationTests(OfflineTestCase):
                 self.clock.now = 100
                 client = self.unconverged_client((503, headers, body))
                 self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
-                self.assertEqual(client.observation,
-                                 "rollout=progressing instances=active:0,healthy:0,failed:0,starting:1,scheduling:0")
+                self.assertIn("readyz=503 identity=", client.observation)
+                self.assertNotIn("gateway_failure=", client.observation)
+                self.assertNotIn(SENTINEL, client.observation)
         self.assert_no_secret_saved_or_printed()
 
     def test_completed_zero_instance_timeout_prints_bounded_diagnostic_and_stays_failed(self):
@@ -1421,11 +1550,58 @@ class OrchestrationTests(OfflineTestCase):
             "starting:0,scheduling:0 readyz=503 identity=match "
             "components=process:ready,gateway:starting "
             "gateway_failure=durable_gateway:checkpoint_load_failed "
-            "phase=rollout reason=zero_instances elapsed_s=10",
+            "phase=rollout reason=zero_instances elapsed_s=10 polls=2 "
+            "first=readyz=503,identity=match,components=process:ready,gateway:starting "
+            "last=readyz=503,identity=match,components=process:ready,gateway:starting",
         ])
         self.assertEqual(client.calls.count(("request", URL + "/readyz")), 2)
         self.assertEqual(client.calls.count(("request", URL + "/health")), 2)
         self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_zero_instance_first_last_summary_drops_a_stale_gateway_failure(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        zero = completed_row()
+        zero["health"]["instances"].update(active=0, healthy=0)
+        _, headers, _ = ready_response()
+        first = (503, headers, self.readyz_body(
+            {"phase": "durable_gateway", "class": "checkpoint_load_failed"},
+            components=[["process", "ready"], ["gateway", "starting"]]))
+        last = (503, headers, self.readyz_body(
+            None, components=[["process", "ready"], ["gateway", "ready"]]))
+        client = verify_client()
+        client.api_routes[DETAIL_PATH] = [zero]
+        client.request_routes[URL + "/readyz"] = [first, last]
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertIn(
+            "polls=2 first=readyz=503,identity=match,components=process:ready,gateway:starting "
+            "last=readyz=503,identity=match,components=process:ready,gateway:ready",
+            client.observation)
+        self.assertNotIn("gateway_failure=", client.observation)
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_converged_rollout_fence_and_unavailable_polls_keep_identity_and_token(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        cases = [
+            ((503, {"content-type": "application/json"},
+              b'{"error":"ownership_fenced","reason":"not_owner"}'),
+             "rollout=converged readyz=503 identity=absent token=not_owner"),
+            ((500, {"content-type": "application/json"},
+              b'{"ready":false,"error_class":"container_unavailable"}'),
+             "rollout=converged readyz=500 identity=absent token=container_unavailable"),
+        ]
+        for response, expected in cases:
+            with self.subTest(expected=expected):
+                self.clock.now = 100
+                client = verify_client()
+                client.request_routes[URL + "/readyz"] = [response]
+                self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+                self.assertEqual(client.observation, expected)
+                self.assertNotIn("body=unreadable", client.observation)
+                self.assert_no_evidence()
         self.assert_no_secret_saved_or_printed()
 
     def test_zero_instance_timeout_diagnostic_survives_an_in_flight_probe_timeout(self):
@@ -1514,6 +1690,24 @@ class OrchestrationTests(OfflineTestCase):
                 self.assert_no_evidence()
         self.assert_no_secret_saved_or_printed()
 
+    def test_zero_instance_summary_keeps_first_and_last_poll_observations(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        zero = completed_row()
+        zero["health"]["instances"].update(active=0, healthy=0)
+        _, headers, _ = ready_response()
+        first = (503, headers, self.readyz_body(
+            None, components=[["process", "ready"], ["gateway", "down"]]))
+        last = (500, {"content-type": "application/json"},
+                b'{"ready":false,"error_class":"container_unavailable"}')
+        client = verify_client()
+        client.api_routes[DETAIL_PATH] = [zero]
+        client.request_routes[URL + "/readyz"] = [first, last]
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertIn("polls=2 first=readyz=503,identity=match,components=process:ready,gateway:down "
+                      "last=readyz=500,identity=absent,token=container_unavailable", client.observation)
+        self.assertNotIn(SENTINEL, client.observation)
+
     def test_zero_instance_timeout_diagnostic_drops_malformed_or_mismatched_readiness(self):
         self.prepare_baseline()
         self.write_deploy_output()
@@ -1532,10 +1726,12 @@ class OrchestrationTests(OfflineTestCase):
                 client.api_routes[DETAIL_PATH] = [zero]
                 client.request_routes[URL + "/readyz"] = [response]
                 self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+                identity = "mismatch" if response[1].get("x-two-worker-version") == OLD_VERSION else "absent"
                 self.assertEqual(
                     client.observation,
                     "rollout=completed instances=active:0,healthy:0,failed:0,starting:0,scheduling:0 "
-                    "phase=rollout reason=zero_instances elapsed_s=10",
+                    f"readyz=503 identity={identity} phase=rollout reason=zero_instances elapsed_s=10 "
+                    f"polls=2 first=readyz=503,identity={identity} last=readyz=503,identity={identity}",
                 )
                 self.assert_no_evidence()
         self.assert_no_secret_saved_or_printed()

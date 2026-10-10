@@ -650,6 +650,22 @@ fn apply_dispatch<I: InviteSource>(
                 dispatch_error = Some(leveling_dispatch_failure());
             }
         }
+        // Community facts: drain buffered message_created writes on every
+        // dispatch, even when no XP award queued — bots, webhooks and staff
+        // automation capture facts but never awards, so gating on `requests`
+        // would leak the buffer. A failed write never stalls the worker
+        // (audit precedent): warn and continue; the scorecard fails closed
+        // on missing coverage.
+        match handle.block_on(tokio::time::timeout(deadline, pipeline.drain_facts())) {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(
+                error = %error,
+                "gateway community facts dispatch failed"
+            ),
+            Err(_) => {
+                tracing::warn!("gateway community facts dispatch timed out");
+            }
+        }
         // A Blocked receipt-callback exhaustion leaves the command
         // never-acknowledged: hold the cursor instead of
         // silently passing it. The error path below releases

@@ -3,9 +3,13 @@
 ## Implementation and deployment boundary
 
 The container source integrates an opt-in private `POST /internal/actions`
-listener with the durable store, announcement executor, nonce-commit
-authentication capability and strict receiver configuration. It supports only
-`announcement.post`, regardless of the core action catalogue's broader defaults.
+listener with the durable store, announcement executor, event-read, settings
+and moderation executors, nonce-commit authentication capability and strict
+receiver configuration. It supports `announcement.post`, `event.read`,
+`settings.get`, `settings.set` and the restrictive member verbs
+`moderation.ban`, `moderation.tempban`, `moderation.kick`, `moderation.warn`
+and `moderation.timeout`, regardless of the core action catalogue's broader
+defaults. Every other verb stays refused by the per-effect fences.
 The public health/readiness/metrics router has no action route. A merged,
 deployed receiver is dark until the Operator enables it, and it is reachable
 only through the staging-only Worker ingress described in

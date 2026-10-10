@@ -98,7 +98,7 @@
           "required": true,
           "min_value": null,
           "max_value": null,
-          "max_length": null,
+          "max_length": 32,
           "choices": []
         },
         {
@@ -108,7 +108,7 @@
           "required": true,
           "min_value": null,
           "max_value": null,
-          "max_length": null,
+          "max_length": 2000,
           "choices": []
         },
         {
@@ -118,7 +118,7 @@
           "required": false,
           "min_value": null,
           "max_value": null,
-          "max_length": null,
+          "max_length": 100,
           "choices": []
         },
         {
@@ -128,7 +128,7 @@
           "required": false,
           "min_value": null,
           "max_value": null,
-          "max_length": null,
+          "max_length": 33,
           "choices": []
         }
       ],
@@ -151,7 +151,7 @@
           "required": true,
           "min_value": null,
           "max_value": null,
-          "max_length": null,
+          "max_length": 32,
           "choices": []
         }
       ],
