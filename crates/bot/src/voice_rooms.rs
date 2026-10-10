@@ -752,6 +752,16 @@ pub trait RoomWrites: Send + Sync {
         channel: Snowflake,
         guard: WriteGuard,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// Bulk channel reorder (`PATCH /guilds/{id}/channels`) run before a
+    /// create that needs a free position. Writers without one accept it.
+    fn reorder_channels(
+        &self,
+        guild: Snowflake,
+        positions: &[(Snowflake, u64)],
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send {
+        let _ = (guild, positions);
+        async { Ok(()) }
+    }
     /// V4 vote-kick enforcement: disconnect the member from voice
     /// (`channel_id: null`); 404 (already left) is success.
     fn disconnect(
@@ -995,6 +1005,14 @@ impl RoomWrites for RoomHttp {
 
     async fn rename(&self, channel: Snowflake, name: &str) -> Result<(), RoomHttpError> {
         self.rename_room(channel, name).await
+    }
+
+    async fn reorder_channels(
+        &self,
+        guild: Snowflake,
+        positions: &[(Snowflake, u64)],
+    ) -> Result<(), RoomHttpError> {
+        RoomHttp::reorder_channels(self, guild, positions).await
     }
 
     fn detached_rename(&self, channel: Snowflake, name: &str) -> Option<DetachedRename> {
@@ -1846,6 +1864,17 @@ impl LiveGuild {
             generation: live.generation,
             transition,
         })
+    }
+
+    /// Apply a bulk reorder Discord accepted, before its CHANNEL_UPDATEs
+    /// arrive, so the next placement plans from the real positions.
+    pub fn set_channel_positions(&self, positions: &[(Snowflake, u64)]) {
+        let mut live = self.write_state();
+        for (id, position) in positions {
+            if let Some(channel) = live.channels.get_mut(id) {
+                channel.position = i32::try_from(*position).ok();
+            }
+        }
     }
 
     pub fn upsert_channel(&self, channel: Channel) {
@@ -4013,6 +4042,28 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         }
                     },
                 };
+                let mut attributes = attributes;
+                if !attributes.respace.is_empty() {
+                    let respace = std::mem::take(&mut attributes.respace);
+                    match self
+                        .http
+                        .reorder_channels(self.live.guild_id, &respace)
+                        .await
+                    {
+                        Ok(()) => self.live.set_channel_positions(&respace),
+                        // Refused: nothing moved, so tie with the channel
+                        // above the slot, or take no position.
+                        Err(
+                            RoomHttpError::RateLimited { .. }
+                            | RoomHttpError::Rejected { .. }
+                            | RoomHttpError::AccessDenied
+                            | RoomHttpError::InvalidRequest,
+                        ) => attributes.position = attributes.fallback_position,
+                        // Unknown: the reorder may have landed, so neither
+                        // the old nor the new positions are safe to use.
+                        Err(_) => attributes.position = None,
+                    }
+                }
                 let guard = self.live.join_guard(creation.ticket);
                 match self
                     .http

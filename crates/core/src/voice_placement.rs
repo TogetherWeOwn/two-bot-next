@@ -263,10 +263,12 @@ pub struct CreateSlot {
     /// at `index`: every listed channel with its new position. Empty when the
     /// slot is free already.
     pub respace: Vec<(Snowflake, u64)>,
-    /// Position to fall back to when the reorder fails: the channel above the
-    /// slot, so the tie (broken by the newer, larger id) still renders the
-    /// room on the correct side of it.
-    pub fallback: u64,
+    /// Position to fall back to when the reorder is refused: the channel
+    /// above the slot, so the tie (broken by the newer, larger id) still
+    /// renders the room on the correct side of it. `None` when nothing is
+    /// above the slot: a tie there would sort the room below its neighbour,
+    /// so the room is created without a position instead.
+    pub fallback: Option<u64>,
 }
 
 /// The create position for slot `index` (as returned by [`plan_placement`]).
@@ -290,7 +292,7 @@ pub fn create_slot(category_order: &[CategoryChannel], index: usize) -> CreateSl
         return CreateSlot {
             position,
             respace: Vec::new(),
-            fallback: position,
+            fallback: Some(position),
         };
     };
     if upper - lower > 1 {
@@ -298,7 +300,7 @@ pub fn create_slot(category_order: &[CategoryChannel], index: usize) -> CreateSl
         return CreateSlot {
             position,
             respace: Vec::new(),
-            fallback: position,
+            fallback: Some(position),
         };
     }
     let respace = sorted
@@ -312,7 +314,7 @@ pub fn create_slot(category_order: &[CategoryChannel], index: usize) -> CreateSl
     CreateSlot {
         position: (index as u64 + 1) * POSITION_STEP,
         respace,
-        fallback: clamp(lower.max(0)),
+        fallback: (lower >= 0).then(|| clamp(lower)),
     }
 }
 

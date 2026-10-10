@@ -137,10 +137,12 @@ pub struct RoomChannelAttributes {
     pub user_limit: u16,
     /// Create-time sorting position (V8 placement); `None` lets Discord append.
     pub position: Option<u64>,
-    /// Bulk reorder of the category's channels to apply first, opening a free
-    /// `position` (empty when it is free already).
+    /// Bulk reorder of the category's channels the caller applies first,
+    /// opening a free `position` (empty when it is free already). Not sent
+    /// by `create_room`.
     pub respace: Vec<(Snowflake, u64)>,
-    /// Position used instead of `position` when that reorder fails.
+    /// Position the caller uses instead of `position` when that reorder is
+    /// refused (`None`: create without a position).
     pub fallback_position: Option<u64>,
     /// Empty means "include no overrides": the room syncs to its category.
     pub overwrites: Vec<PermissionOverwrite>,
@@ -559,17 +561,6 @@ impl RoomHttp {
         if guild_id == 0 || attributes.parent_id == Some(0) || attributes.user_limit > 99 {
             return Err(RoomHttpError::InvalidRequest);
         }
-        // A re-space that fails leaves the room tied with the channel above
-        // its slot rather than failing the create over placement.
-        let mut position = attributes.position;
-        if !attributes.respace.is_empty()
-            && self
-                .reorder_channels(guild_id, &attributes.respace)
-                .await
-                .is_err()
-        {
-            position = attributes.fallback_position.or(position);
-        }
         let mut request = self
             .http
             .create_guild_channel(Id::new(guild_id), name)
@@ -581,7 +572,7 @@ impl RoomHttp {
         if !attributes.overwrites.is_empty() {
             request = request.permission_overwrites(&attributes.overwrites);
         }
-        if let Some(position) = position {
+        if let Some(position) = attributes.position {
             request = request.position(position);
         }
         if let Some(parent_id) = attributes.parent_id {

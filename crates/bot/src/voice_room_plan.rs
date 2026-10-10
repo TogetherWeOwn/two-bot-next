@@ -411,7 +411,7 @@ pub(crate) fn plan_room_diagnosed(
     attributes.user_limit = u16::from(initial.user_limit);
     if let Some(slot) = placement(input) {
         attributes.position = Some(slot.position);
-        attributes.fallback_position = Some(slot.fallback);
+        attributes.fallback_position = slot.fallback;
         attributes.respace = slot.respace;
     }
     Ok(attributes)
