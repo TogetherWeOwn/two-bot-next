@@ -52,7 +52,7 @@ test("status reads without starting and refuses deployment or running mismatches
   // window: NO-GO, no POST.
   const moved = sender({ epoch: 3, deploymentId: "B", phase: "active" }, "C");
   await assert.rejects(control({ ...args, action: "status" }, moved.send, async () => {}), /deployment mismatch/);
-  assert.equal(moved.calls.length, 13);
+  assert.equal(moved.calls.length, 34);
   assert.ok(moved.calls.every((call) => call.method === "GET"));
   // Container already running before takeover: NO-GO.
   const running = sender({ epoch: 3, deploymentId: "B", phase: "active" }, "B", true);
@@ -172,7 +172,7 @@ test("status waits out deploy propagation, then reads the new version", async ()
   }, async (ms: number) => { waits.push(ms); });
   assert.equal(state.deploymentId, "B");
   assert.equal(calls.length, 3);
-  assert.deepEqual(waits, [5000, 5000]);
+  assert.deepEqual(waits, [10000, 10000]);
 });
 
 test("status never retries other refusals", async () => {
