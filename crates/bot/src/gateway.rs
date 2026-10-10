@@ -47,6 +47,27 @@ pub fn ensure_crypto_provider() {
     }
 }
 
+/// Worker decision for prefix triggers: `Some(trigger)` means the serial
+/// dispatch worker must call `dispatch_with_verdict(event, trigger)`, `None`
+/// means it must not. `trigger` is `disposition.map(|verdict| verdict.trigger)`;
+/// the text-automation gate stays on the funnel disposition.
+pub(crate) fn worker_prefix_trigger(
+    disposition: Option<crate::automod_gateway::WorkerVerdict>,
+    event: &Event,
+    automod_enabled: bool,
+) -> Option<Option<two_bot_core::automod_runtime::FunnelDisposition>> {
+    let funnel = disposition.map(|verdict| verdict.funnel);
+    let trigger = disposition.map(|verdict| verdict.trigger);
+    if automod_enabled
+        && matches!(event, Event::MessageCreate(_))
+        && crate::automod_gateway::runs_text_automations(funnel)
+    {
+        Some(trigger)
+    } else {
+        None
+    }
+}
+
 /// Supervisor-visible gateway state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayState {
@@ -911,11 +932,8 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                     voice.disconnect();
                                 }
                             }
-                            let funnel = disposition.map(|verdict| verdict.funnel);
-                            let trigger = disposition.map(|verdict| verdict.trigger);
-                            if automod_enabled
-                                && matches!(dispatch.event, Event::MessageCreate(_))
-                                && crate::automod_gateway::runs_text_automations(funnel)
+                            if let Some(trigger) =
+                                worker_prefix_trigger(disposition, &dispatch.event, automod_enabled)
                             {
                                 if let Some(runtime) = command_runtime.as_ref() {
                                     // Detached spawn from the blocking worker needs the runtime.

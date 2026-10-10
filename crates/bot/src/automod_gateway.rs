@@ -140,7 +140,7 @@ pub(crate) struct WorkerVerdict {
     pub(crate) trigger: FunnelDisposition,
 }
 
-fn verdict_of(activation: &Activation, kind: MessageDeliveryKind) -> WorkerVerdict {
+pub(crate) fn verdict_of(activation: &Activation, kind: MessageDeliveryKind) -> WorkerVerdict {
     let funnel = activation.uncommitted_disposition(kind);
     let trigger = match activation.outcome {
         ActivationOutcome::Bypassed | ActivationOutcome::Retained(_) => {
