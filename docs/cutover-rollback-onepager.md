@@ -33,12 +33,20 @@ kept for the whole watch:
   image digest plus commit with its configuration. The legacy
   Coolify image, configuration and recovery points stay warm for the
   whole 48-hour watch and are never removed at watch close.
-- A Worker-version rollback does not rebuild the container image or
-  rewind data. When the Rust image is the fault, redeploy the
-  known-good reviewed source and image pair through the full deploy
-  path, only after confirming it supports the current schema and
-  bindings. Never roll back to a pre-fence wrapper version: it ignores
-  the persisted ownership record.
+- The production workflow dispatch with `takeover: true`
+  ([runbook §5](cutover-rollback-runbook.md#5-cloudflare-revert-no-dns-change))
+  is the single production rollback method; coverage:
+  [runbook §7](cutover-rollback-runbook.md#7-staging-rehearsal-log)
+  is a dry-walk with no executed dispatch, and the staging drill differs
+  (unforced deployment, immediate Durable Object update).
+  A Worker-version rollback does not rebuild the container image or
+  rewind data. A standalone full redeploy of a known-good pair is
+  superseded as a production rollback path: when the Rust image is the
+  fault, dispatch the same workflow in deploy mode with `takeover: true`
+  and the prior good SHA under the same guard, takeover order and
+  `/readyz` build-identity gate; that deploy-mode path has no production
+  drill record. Never roll back to a pre-fence wrapper version: it
+  ignores the persisted ownership record.
 
 ## 2. Backout sequence (document order)
 

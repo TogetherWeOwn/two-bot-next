@@ -91,6 +91,118 @@ pub(crate) fn resolve(
     }))
 }
 
+/// Automod keys served from the live settings snapshot (TOG-19027). The
+/// enable gate (`TWO_AUTOMOD`) stays cold (boot-time); every list, threshold
+/// and the enforce flag reload without a restart.
+pub(crate) const LIVE_KEYS: [&str; 10] = [
+    "TWO_AUTOMOD_ALLOWED_DOMAINS",
+    "TWO_AUTOMOD_BAD_WORDS",
+    "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS",
+    "TWO_AUTOMOD_BYPASS_ROLE_IDS",
+    "TWO_AUTOMOD_ENFORCE",
+    "TWO_AUTOMOD_EXEMPT_CHANNEL_IDS",
+    "TWO_AUTOMOD_MENTION_LIMIT",
+    "TWO_AUTOMOD_REPEAT_COUNT",
+    "TWO_AUTOMOD_REPEAT_WINDOW_SECONDS",
+    "TWO_AUTOMOD_SANCTIONS",
+];
+
+/// Layer the live snapshot over the deployment environment (store-first, like
+/// the raid/join-risk/containment runtimes): stored rows win, deleted rows
+/// fall back to the boot value.
+pub(crate) fn layered_vars(
+    deployment: &HashMap<String, String>,
+    guild_id: &str,
+    live: &two_bot_core::settings::LiveSettings,
+) -> HashMap<String, String> {
+    let mut vars = deployment.clone();
+    vars.extend(
+        live.env_snapshot(Some(guild_id))
+            .into_iter()
+            .filter(|(key, _)| LIVE_KEYS.contains(&key.as_str())),
+    );
+    vars
+}
+
+/// Resolve with the live snapshot layered over the deployment environment.
+/// `None` live (poller parked/pre-first-poll) resolves purely from `vars`.
+/// Unit-test helper; production refreshes through [`refresh_live`] so one bad
+/// stored value cannot take the whole policy down.
+#[cfg(test)]
+pub(crate) fn resolve_with_live(
+    vars: &HashMap<String, String>,
+    guild_id: u64,
+    live: Option<&two_bot_core::settings::LiveSettings>,
+) -> Result<Option<Resolved>, &'static str> {
+    match live {
+        Some(live) => resolve(&layered_vars(vars, &guild_id.to_string(), live), guild_id),
+        None => resolve(vars, guild_id),
+    }
+}
+
+/// The stored key behind a keyed gate error, if it names one. Sanctions-shape
+/// errors name no single key, so they keep the last good policy outright.
+fn live_key_of(error: &two_bot_core::AutomodGateError) -> Option<&'static str> {
+    match error {
+        two_bot_core::AutomodGateError::InvalidInteger(key, _, _) => Some(*key),
+        two_bot_core::AutomodGateError::InvalidSnowflakes(key) => Some(*key),
+        _ => None,
+    }
+}
+
+/// Apply the live policy to a running activation (store-first). A stored
+/// value that fails validation falls back to its boot value while the other
+/// stored values still apply; only an error that names no key (such as a
+/// sanctions-shape error) keeps the last good policy. Keyed fallbacks name
+/// the offending key in the warn. Returns true on change.
+pub(crate) fn refresh_live<L: AutomodClaimLedger, F: AutomodFacts>(
+    activation: &AutomodActivation<L, F>,
+    deployment: &HashMap<String, String>,
+    guild_id: &str,
+    live: &two_bot_core::settings::LiveSettings,
+) -> bool {
+    let mut vars = layered_vars(deployment, guild_id, live);
+    let mut reverted: Vec<&'static str> = Vec::new();
+    loop {
+        match AutomodConfig::from_map(&vars) {
+            Ok(config) => return activation.apply_live_config(&config),
+            Err(error) => match live_key_of(&error) {
+                Some(key) if !reverted.contains(&key) => {
+                    reverted.push(key);
+                    warn!(error = %error, key, "automod live setting unusable; falling back to the boot value");
+                    if let Some(boot) = deployment.get(key) {
+                        vars.insert(key.to_string(), boot.clone());
+                    } else {
+                        vars.remove(key);
+                    }
+                }
+                _ => {
+                    warn!(error = %error, "automod live settings unusable; keeping the last good policy");
+                    return false;
+                }
+            },
+        }
+    }
+}
+
+/// Per-delivery refresh from the poller-published snapshot (TOG-19027): the
+/// deployment environment is the base, the live snapshot overlays stored
+/// lists/thresholds. Parked or pre-first-poll readers layer nothing, so the
+/// rebuild is a no-op until the first publish moves.
+fn refresh_from_poller<L: AutomodClaimLedger, F: AutomodFacts>(
+    activation: &AutomodActivation<L, F>,
+    guild_id: Option<&str>,
+) {
+    let Some(guild_id) = guild_id else {
+        return;
+    };
+    let Some(live) = crate::settings_jobs::live() else {
+        return;
+    };
+    let deployment: HashMap<String, String> = std::env::vars().collect();
+    refresh_live(activation, &deployment, guild_id, &live);
+}
+
 pub(crate) fn build(
     resolved: Resolved,
     pool: PgPool,
@@ -158,6 +270,7 @@ pub(crate) async fn process<L: AutomodClaimLedger, F: AutomodFacts>(
     delivery: MessageDelivery,
     at_iso: &str,
 ) -> WorkerVerdict {
+    refresh_from_poller(activation, delivery.guild_id.as_deref());
     let kind = delivery.kind;
     match tokio::time::timeout(PROCESS_MAX, activation.process(delivery, at_iso)).await {
         Ok(result) => verdict_of(&result, kind),

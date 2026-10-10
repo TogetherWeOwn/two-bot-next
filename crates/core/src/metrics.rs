@@ -172,6 +172,49 @@ pub const DISPATCH_LANES: &[&str] = &[
     "busy",
     "reactions",
 ];
+/// Website-action receiver families for
+/// `two_bot_internal_actions_total{family,outcome}` (TOG-20119, roadmap
+/// M4.23). The signed receiver (`crates/bot/src/internal_action_http.rs`)
+/// maps each bounded `action` verb to one family: `announcement.post` to
+/// `announcement`, `event.*` to `event`, `settings.*` to `settings`,
+/// `moderation.*` to `moderation`, `role.assign`/`guild.add_member` to
+/// `membership`; anything else (including unwired catalog verbs and unknown
+/// verbs) collapses to `other`. No key id, token, body or request bytes ever
+/// become a family label.
+///
+/// Alert-threshold hook for M2.1: alert when refused outcomes increase
+/// across consecutive scrapes (exact rule lands with M2.1 once TOG-18943
+/// unblocks); a single refusal inside one burst is not paging.
+pub const INTERNAL_ACTION_FAMILIES: &[&str] = &[
+    "announcement",
+    "event",
+    "settings",
+    "moderation",
+    "membership",
+    "other",
+];
+/// Receiver outcomes for `two_bot_internal_actions_total{family,outcome}`:
+/// `executed` for every terminal success envelope (including idempotent
+/// replays served without a second effect), otherwise the bounded refusal
+/// class matching `RejectionClass::as_str` (`auth_failure`, `unknown_key`,
+/// `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`,
+/// `action_disabled`, `malformed_body`, `conflict`, `upstream`, `internal`).
+/// Each request counts exactly once. No secret, token, key id or raw request
+/// bytes ever become an outcome label.
+pub const INTERNAL_ACTION_OUTCOMES: &[&str] = &[
+    "executed",
+    "auth_failure",
+    "unknown_key",
+    "clock_skew",
+    "nonce_replay",
+    "rate_limit",
+    "unknown_action",
+    "action_disabled",
+    "malformed_body",
+    "conflict",
+    "upstream",
+    "internal",
+];
 const BUCKETS_MICROS: &[u64] = &[
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
@@ -246,6 +289,7 @@ struct Values {
     db_errors: [u64; DB_ERROR_OPS.len()],
     send_admissions: [u64; SEND_ADMISSION_OUTCOMES.len()],
     dispatch_drops: [u64; DISPATCH_LANES.len()],
+    internal_actions: [[u64; INTERNAL_ACTION_OUTCOMES.len()]; INTERNAL_ACTION_FAMILIES.len()],
 }
 
 /// All storage is fixed-size. Unknown labels collapse to `other`, including hostile input.
@@ -474,6 +518,23 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter = &mut values.dispatch_drops[bounded_index(lane, DISPATCH_LANES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One signed website-action receiver execution (TOG-20119). Call exactly
+    /// once per request from the receiver: `executed` for every terminal
+    /// success envelope (including idempotent replays), otherwise the bounded
+    /// refusal class. Unknown families and outcomes collapse to `other` and
+    /// `internal` respectively only when the allowlists grow; today every
+    /// caller passes a member, so those slots stay zero unless hostile input
+    /// arrives. No IDs, tokens, key ids or bodies are retained.
+    pub fn internal_action(&self, family: &str, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.internal_actions[bounded_index(family, INTERNAL_ACTION_FAMILIES)]
+            [bounded_index(outcome, INTERNAL_ACTION_OUTCOMES)];
         *counter = counter.saturating_add(1);
     }
 
@@ -711,6 +772,21 @@ impl Metrics {
             )
             .unwrap();
         }
+        header(
+            &mut out,
+            "two_bot_internal_actions_total",
+            "counter",
+            "Signed website-action receiver executions by bounded family and outcome; refusals share the warn-summary classes.",
+        );
+        for (family, outcomes) in INTERNAL_ACTION_FAMILIES.iter().zip(values.internal_actions) {
+            for (outcome, count) in INTERNAL_ACTION_OUTCOMES.iter().zip(outcomes) {
+                writeln!(
+                    out,
+                    "two_bot_internal_actions_total{{family=\"{family}\",outcome=\"{outcome}\"}} {count}"
+                )
+                .unwrap();
+            }
+        }
         let (size, idle, max) = pool.unwrap_or_default();
         scalar(
             &mut out,
@@ -794,6 +870,7 @@ mod tests {
             metrics.send_admission(&hostile);
             metrics.dispatch_drop(&hostile);
             metrics.voice_vote_kick(&hostile);
+            metrics.internal_action(&hostile, &hostile);
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
@@ -990,6 +1067,49 @@ mod tests {
         for id in 0..100 {
             let hostile = format!("{id}\"\\\nsecret=value");
             metrics.dispatch_drop(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn internal_actions_count_executed_and_refused_per_family() {
+        let metrics = Metrics::default();
+        // Executed membership action (role.assign served through the signed
+        // receiver) and a refused unknown verb (other family, unknown_action).
+        metrics.internal_action("membership", "executed");
+        metrics.internal_action("membership", "executed");
+        metrics.internal_action("other", "unknown_action");
+        metrics.internal_action("announcement", "executed");
+        let text = metrics.render(None);
+        assert!(text.contains(
+            "two_bot_internal_actions_total{family=\"membership\",outcome=\"executed\"} 2\n"
+        ));
+        assert!(text.contains(
+            "two_bot_internal_actions_total{family=\"other\",outcome=\"unknown_action\"} 1\n"
+        ));
+        assert!(text.contains(
+            "two_bot_internal_actions_total{family=\"announcement\",outcome=\"executed\"} 1\n"
+        ));
+        assert!(text
+            .contains("two_bot_internal_actions_total{family=\"event\",outcome=\"executed\"} 0\n"));
+        // Fixed cardinality: six families by twelve outcomes.
+        let mut series = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(series.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn internal_action_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.internal_action(&hostile, &hostile);
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
