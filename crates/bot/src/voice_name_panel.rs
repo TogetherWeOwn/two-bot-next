@@ -28,10 +28,12 @@ use twilight_model::{
     channel::message::component::{Label, TextInput, TextInputStyle},
 };
 use two_bot_core::{
+    voice_alias::AliasTable,
     voice_conditions::ConditionFacts,
     voice_custom_id::{name_custom_custom_id, name_modal_custom_id, name_restore_custom_id},
     voice_name_filter::{filter_channel_name, NameFilterContext},
-    voice_naming::RoomContext,
+    voice_naming::{GameOptions, RoomContext},
+    voice_presence::{apply_room_presence, OccupantPresence},
     voice_room_name::{
         decide_custom_name, decide_template_name, NameChecks, RenderFacts, MAX_CUSTOM_NAME_CHARS,
         NAME_INPUT_ID,
@@ -174,6 +176,10 @@ pub(super) struct NameSettings {
     pub unique_names: bool,
     pub no_game_label: String,
     pub lists: HashMap<String, Vec<String>>,
+    /// `/alias` pairs (activity key → shown title) for `@@game_name@@`.
+    pub aliases: Vec<(String, String)>,
+    pub force_single_game: bool,
+    pub count_members_without_activity: bool,
 }
 
 impl NameSettings {
@@ -186,6 +192,13 @@ impl NameSettings {
                 .iter()
                 .map(|list| (list.name.clone(), list.choices.clone()))
                 .collect(),
+            aliases: config
+                .aliases
+                .iter()
+                .map(|alias| (alias.game.clone(), alias.alias.clone()))
+                .collect(),
+            force_single_game: config.settings.force_single_game,
+            count_members_without_activity: config.settings.count_members_without_activity,
         }
     }
 }
@@ -245,6 +258,39 @@ pub(super) struct NameSignature {
     user_limit: u32,
     room_number: u32,
     members: Vec<String>,
+    /// Presence-derived inputs: a game or stream change re-renders.
+    game_name: String,
+    members_playing: u32,
+    live_count: u32,
+    stream_title: String,
+    parties: usize,
+    presence_conditions: (bool, bool, bool, u32, u32),
+}
+
+impl NameSignature {
+    fn of(facts: &NameFacts) -> Self {
+        Self {
+            owner_name: facts.context.owner_name.clone(),
+            original_creator_name: facts.context.original_creator_name.clone(),
+            member_count: facts.context.member_count,
+            owner_present: facts.context.owner_present,
+            user_limit: facts.context.user_limit,
+            room_number: facts.context.room_number,
+            members: facts.conditions.member_ids.clone(),
+            game_name: facts.context.game_name.clone(),
+            members_playing: facts.context.members_playing,
+            live_count: facts.context.live_count,
+            stream_title: facts.context.stream_title.clone(),
+            parties: facts.context.parties.len(),
+            presence_conditions: (
+                facts.conditions.owner_playing,
+                facts.conditions.owner_live_discord,
+                facts.conditions.owner_live_external,
+                facts.conditions.live_discord_count,
+                facts.conditions.live_external_count,
+            ),
+        }
+    }
 }
 
 /// Everything one name decision needs from the live guild.
@@ -426,15 +472,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             command.actor_id = room.owner_id;
             command.request = NameInteraction::Restore { room_id };
             let facts = self.name_facts(&room, &command);
-            let signature = NameSignature {
-                owner_name: facts.context.owner_name.clone(),
-                original_creator_name: facts.context.original_creator_name.clone(),
-                member_count: facts.context.member_count,
-                owner_present: facts.context.owner_present,
-                user_limit: facts.context.user_limit,
-                room_number: facts.context.room_number,
-                members: facts.conditions.member_ids.clone(),
-            };
+            let signature = NameSignature::of(&facts);
             if self.name_signatures.get(&room_id) == Some(&signature) {
                 continue;
             }
@@ -479,6 +517,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let live = self.live.read_state();
         live.next_transition.hash(&mut hasher);
         live.generation.hash(&mut hasher);
+        live.presence_revision.hash(&mut hasher);
         let mut rooms: Vec<_> = self
             .rooms
             .values()
@@ -631,7 +670,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         if filter_channel_name(&fallback, &command.policy, &filter).is_err() {
             fallback = room_name("member");
         }
-        NameFacts {
+        let mut facts = NameFacts {
             context: RoomContext {
                 room_number: u32::try_from(first + rank).unwrap_or(u32::MAX),
                 owner_name: owner_name.to_owned(),
@@ -664,7 +703,42 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 })
                 .filter_map(|channel| channel.name.clone())
                 .collect(),
-        }
+        };
+        // Game and stream tokens/conditions from gateway presences (empty
+        // without TWO_VOICE_PRESENCE, which leaves the no-game label).
+        let occupants: Vec<OccupantPresence<'_>> = live
+            .occupant_presences(room.channel_id, room.owner_id)
+            .into_iter()
+            .map(|(presence, live_discord, is_owner)| OccupantPresence {
+                presence,
+                live_discord,
+                is_owner,
+            })
+            .collect();
+        // Stored aliases were validated on save/import; a table that no
+        // longer loads shows raw titles rather than failing the render.
+        let aliases = AliasTable::from_entries(
+            command
+                .settings
+                .aliases
+                .iter()
+                .map(|(game, alias)| (game.as_str(), alias.as_str())),
+        )
+        .unwrap_or_default();
+        let options = GameOptions {
+            force_single: command.settings.force_single_game,
+            count_idle_toward_majority: command.settings.count_members_without_activity,
+            no_game_label: facts.context.game_name.clone(),
+            ..GameOptions::default()
+        };
+        apply_room_presence(
+            &mut facts.context,
+            &mut facts.conditions,
+            &occupants,
+            &aliases,
+            &options,
+        );
+        facts
     }
 
     /// Persist the override through the urgent lane: the in-memory entry is

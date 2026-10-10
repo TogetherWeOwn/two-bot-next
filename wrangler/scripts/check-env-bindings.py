@@ -45,6 +45,11 @@ BOOT_PUBLISH_ENVS = {"staging"}
 # Operator-approved Worker binding, never a committed var.
 VOICE_GATE_VAR = "TWO_VOICE"
 VOICE_GATE_ENVS = {"staging"}
+# Privileged GUILD_PRESENCES for room-name facts (docs/voice-presence.md):
+# staging-only like the voice gate it depends on; production is an
+# Operator-set Worker binding after the app's Presence Intent is on.
+VOICE_PRESENCE_VAR = "TWO_VOICE_PRESENCE"
+VOICE_PRESENCE_ENVS = {"staging"}
 
 
 def check(path: Path) -> list[str]:
@@ -86,6 +91,13 @@ def check(path: Path) -> list[str]:
             )
         if variables.get(VOICE_GATE_VAR, "1") != "1":
             errors.append(f'{prefix}: {VOICE_GATE_VAR} must be exactly "1" or absent')
+        if VOICE_PRESENCE_VAR in variables and env_name not in VOICE_PRESENCE_ENVS:
+            errors.append(
+                f"{prefix}: {VOICE_PRESENCE_VAR} is staging-only "
+                "(top-level vars are required in every env; production presences are Operator-approved)"
+            )
+        if variables.get(VOICE_PRESENCE_VAR, "1") != "1":
+            errors.append(f'{prefix}: {VOICE_PRESENCE_VAR} must be exactly "1" or absent')
         for key in sorted(k for k in variables if k.startswith(RECEIVER_CONFIG_PREFIX)):
             errors.append(f"{prefix}: {key} is an Operator-set Worker secret, never a wrangler.toml var")
         threshold = variables.get("UNREADY_ALERT_FAILURES")

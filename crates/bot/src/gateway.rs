@@ -147,7 +147,14 @@ pub fn intents_from_env(activation: &crate::activation::BootActivation) -> Inten
             &var("TWO_AUTOMATIONS"),
             &var("TWO_TEXT_COMMANDS"),
         );
-    base | gateway_intents(text_commands)
+    // Voice-room presence facts (game/stream tokens) need privileged
+    // GUILD_PRESENCES; off unless explicitly enabled, so a bot whose app lacks
+    // the Presence Intent grant never closes with 4014.
+    let presences = two_bot_discord::intents::needs_voice_presences(
+        &var("TWO_VOICE"),
+        &var("TWO_VOICE_PRESENCE"),
+    );
+    two_bot_discord::intents::with_presences(base | gateway_intents(text_commands), presences)
 }
 
 fn intents_for_settings(
@@ -581,6 +588,22 @@ fn apply_dispatch<I: InviteSource>(
     acknowledgement: Option<tokio::sync::oneshot::Receiver<bool>>,
     committed: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), sqlx::Error> {
+    // Presence updates (TWO_VOICE_PRESENCE) only feed in-memory voice-room
+    // name facts: no funnel, audit or durable effect. They stay in gateway
+    // order with GUILD_CREATE (whose presence snapshot this worker applies)
+    // but skip the checkpoint commit, one Postgres transaction per dispatch.
+    // The next committed dispatch carries the cursor past them, and a RESUME
+    // replays them idempotently; reception already advanced, so no gap.
+    if let Some(ReceivedDispatch {
+        event: Event::PresenceUpdate(update),
+        ..
+    }) = dispatch.as_deref()
+    {
+        if let Some(voice) = worker_voice.as_ref() {
+            voice.presence(update);
+        }
+        return Ok(());
+    }
     let timer = crate::gateway_metrics::DispatchTimer::start();
     let mut connected: Option<&str> = None;
     let mut onboarding_job = None;
@@ -2246,6 +2269,85 @@ mod tests {
             GatewayState::Armed,
             "a failed dispatch must leave the checkpoint where it was"
         );
+    }
+
+    /// `PRESENCE_UPDATE` reaches the voice sink in gateway order on the
+    /// dispatch worker and never commits: the lazy pool below can never
+    /// connect, so any checkpoint attempt would surface as an error here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_worker_applies_presence_without_a_checkpoint_commit() {
+        struct Presences(std::sync::Mutex<Vec<u64>>);
+        impl VoiceEventSink for Presences {
+            fn handle(&self, _: &Event, _: &twilight_cache_inmemory::DefaultInMemoryCache) {
+                panic!("presence must not take the full voice handler path");
+            }
+            fn presence(
+                &self,
+                update: &twilight_model::gateway::payload::incoming::PresenceUpdate,
+            ) {
+                let id = match &update.0.user {
+                    twilight_model::gateway::presence::UserOrId::User(user) => user.id.get(),
+                    twilight_model::gateway::presence::UserOrId::UserId { id } => id.get(),
+                };
+                self.0.lock().unwrap().push(id);
+            }
+            fn disconnect(&self) {}
+            fn needs_bootstrap(&self, _: &twilight_cache_inmemory::DefaultInMemoryCache) -> bool {
+                false
+            }
+        }
+        let pipeline = build_pipeline(vec![], None);
+        let state = RwLock::new(GatewayState::Armed);
+        let generation = AtomicU64::new(0);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let store = GatewaySessionStore::new(pool, "test-guild".to_owned(), 1);
+        let sink = Arc::new(Presences(std::sync::Mutex::new(Vec::new())));
+        let update: twilight_model::gateway::payload::incoming::PresenceUpdate =
+            serde_json::from_value(serde_json::json!({
+                "user": {"id": "42"},
+                "guild_id": "22",
+                "status": "online",
+                "activities": [{"type": 0, "name": "Apex Legends"}],
+                "client_status": {"desktop": "online"}
+            }))
+            .expect("presence");
+        let dispatch = ReceivedDispatch::new(Event::PresenceUpdate(Box::new(update)));
+        let checkpoint = GatewaySession {
+            session_id: "test-session".to_owned(),
+            sequence: 8,
+            resume_url: "ws://127.0.0.1:1".to_owned(),
+            updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
+        };
+        let voice: Arc<dyn VoiceEventSink> = sink.clone();
+        let outcome = tokio::task::block_in_place(|| {
+            apply_dispatch(
+                &tokio::runtime::Handle::current(),
+                &state,
+                &generation,
+                &pipeline,
+                &store,
+                None,
+                None,
+                Some(voice),
+                None,
+                LiveInteractions::default(),
+                Arc::new(tokio::sync::Notify::new()),
+                Some(Box::new(dispatch)),
+                None,
+                checkpoint,
+                CHECKPOINT_IO_MAX,
+                0,
+                None,
+                None,
+            )
+        });
+        assert!(
+            outcome.is_ok(),
+            "presence must not attempt a commit: {outcome:?}"
+        );
+        assert_eq!(*sink.0.lock().unwrap(), [42]);
     }
 
     /// The worker itself — not just the error constructor — records a failed

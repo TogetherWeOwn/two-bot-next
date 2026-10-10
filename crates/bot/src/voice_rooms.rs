@@ -50,6 +50,7 @@ use twilight_model::{
         Id,
     },
 };
+use two_bot_core::voice_presence::MemberPresence;
 use two_bot_core::{
     evaluate_permissions as evaluate_health, metrics, now_iso,
     voice_access::{
@@ -1157,7 +1158,20 @@ pub(crate) struct LiveState {
     empty_since: HashMap<Snowflake, tokio::time::Instant>,
     /// Fixture-only override of [`EMPTY_ROOM_GRACE`]; production never sets it.
     empty_grace: Option<Duration>,
+    /// Game/stream facts per member for room-name tokens. Only non-empty
+    /// entries are kept, at most [`MAX_TRACKED_PRESENCES`]; empty without
+    /// the `TWO_VOICE_PRESENCE` gateway intent.
+    presences: HashMap<Snowflake, MemberPresence>,
+    /// Members streaming through Discord (voice state `self_stream`).
+    self_streaming: HashSet<Snowflake>,
+    /// Bumped whenever a voice occupant's presence facts change, so the
+    /// template-name pass sees new inputs.
+    presence_revision: u64,
 }
+
+/// Upper bound on remembered member presences; past it, new members are not
+/// tracked (existing entries still update and clear).
+const MAX_TRACKED_PRESENCES: usize = 100_000;
 
 /// Ordinary empty rooms get a full reconnect grace. Failed-create compensation
 /// has exact in-hand provenance and bypasses only this deadline, not occupancy.
@@ -1271,6 +1285,24 @@ impl LiveState {
             .collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// Presence facts for a room's human occupants, owner flagged.
+    fn occupant_presences(
+        &self,
+        channel: Snowflake,
+        owner: Snowflake,
+    ) -> Vec<(Option<&MemberPresence>, bool, bool)> {
+        self.occupants(channel)
+            .into_iter()
+            .map(|member| {
+                (
+                    self.presences.get(&member),
+                    self.self_streaming.contains(&member),
+                    member == owner,
+                )
+            })
+            .collect()
     }
 
     /// Guild-base permissions for one member (VK-01): guild owner and
@@ -1528,6 +1560,51 @@ impl LiveGuild {
 
     /// Track one member's guild-scoped roles for VK-01 target-authority checks.
     /// `None` removes the entry so the next check fails closed.
+    /// Record a member's game/stream facts. Returns the voice channel the
+    /// member is in when the facts changed, so the caller can ask that room
+    /// to re-render its name.
+    pub fn set_presence(&self, member: Snowflake, presence: MemberPresence) -> Option<Snowflake> {
+        let mut live = self.write_state();
+        let changed = if presence.is_empty() {
+            live.presences.remove(&member).is_some()
+        } else if live.presences.get(&member) == Some(&presence)
+            || (live.presences.len() >= MAX_TRACKED_PRESENCES
+                && !live.presences.contains_key(&member))
+        {
+            false
+        } else {
+            live.presences.insert(member, presence);
+            true
+        };
+        if !changed {
+            return None;
+        }
+        let room = live.members.get(&member).and_then(|state| state.channel_id);
+        if room.is_some() {
+            live.presence_revision += 1;
+        }
+        room
+    }
+
+    /// Record whether a member streams through Discord (`self_stream`). Same
+    /// return contract as [`LiveGuild::set_presence`].
+    pub fn set_self_stream(&self, member: Snowflake, streaming: bool) -> Option<Snowflake> {
+        let mut live = self.write_state();
+        let changed = if streaming {
+            live.self_streaming.insert(member)
+        } else {
+            live.self_streaming.remove(&member)
+        };
+        if !changed {
+            return None;
+        }
+        let room = live.members.get(&member).and_then(|state| state.channel_id);
+        if room.is_some() {
+            live.presence_revision += 1;
+        }
+        room
+    }
+
     pub fn set_member_roles(&self, member: Snowflake, roles: Option<Vec<Snowflake>>) {
         let mut live = self.write_state();
         match roles {
@@ -4802,6 +4879,10 @@ pub trait VoiceEventSink: Send + Sync {
     ) {
     }
     fn handle(&self, event: &Event, cache: &DefaultInMemoryCache);
+    /// One `PRESENCE_UPDATE` (`TWO_VOICE_PRESENCE`), fed by the dispatch worker
+    /// in gateway order (after any earlier `GUILD_CREATE` snapshot) without a
+    /// checkpoint commit: it only updates in-memory room-name facts.
+    fn presence(&self, _update: &twilight_model::gateway::payload::incoming::PresenceUpdate) {}
     /// Invalidate occupancy immediately on connection loss, including while an
     /// actor is awaiting SQL, HTTP or token-global rate-limit backoff.
     fn disconnect(&self);
@@ -4846,6 +4927,8 @@ enum ActorCommand {
     /// Test probe: the worker's naming settings and known display names.
     #[cfg(test)]
     NamingProbe(oneshot::Sender<(NameSettings, NameDirectory)>),
+    /// An occupant's game or stream changed: the room's name inputs moved.
+    RoomFactsChanged(Snowflake),
     Join {
         ticket: JoinTicket,
         /// The joiner's display name; the worker renders and filters the room
@@ -5328,6 +5411,25 @@ where
         }
     }
 
+    /// Feed one member's presence facts; a change for a member in voice asks
+    /// that room to re-render its name.
+    fn presence_frame(&self, guild: Snowflake, member: Snowflake, facts: MemberPresence) {
+        if let Some(actor) = self.live_actor(guild) {
+            if let Some(room) = actor.live.set_presence(member, facts) {
+                let _ = actor.tx.send(ActorCommand::RoomFactsChanged(room));
+            }
+        }
+    }
+
+    /// Feed one member's Discord stream flag, under the same contract.
+    fn stream_frame(&self, guild: Snowflake, member: Snowflake, streaming: bool) {
+        if let Some(actor) = self.live_actor(guild) {
+            if let Some(room) = actor.live.set_self_stream(member, streaming) {
+                let _ = actor.tx.send(ActorCommand::RoomFactsChanged(room));
+            }
+        }
+    }
+
     fn update_live(&self, guild: Snowflake, update: impl FnOnce(&LiveGuild)) {
         if let Some(actor) = self.live_actor(guild) {
             update(&actor.live);
@@ -5487,13 +5589,24 @@ where
             .expect("voice identity lock") = identities;
     }
 
+    fn presence(&self, update: &twilight_model::gateway::payload::incoming::PresenceUpdate) {
+        if !self.enabled {
+            return;
+        }
+        self.presence_frame(
+            update.0.guild_id.get(),
+            presence::member_id(&update.0),
+            presence::facts(&update.0),
+        );
+    }
+
     fn handle(&self, event: &Event, cache: &DefaultInMemoryCache) {
         if !self.enabled {
             return;
         }
         match event {
             Event::GuildCreate(gc) => {
-                if let twilight_model::gateway::payload::incoming::GuildCreate::Available(_) =
+                if let twilight_model::gateway::payload::incoming::GuildCreate::Available(guild) =
                     gc.as_ref()
                 {
                     let guild_id = gc.id().get();
@@ -5501,7 +5614,28 @@ where
                         self.publish_snapshot(guild_id, snapshot);
                         self.seed_display_names(cache, guild_id);
                     }
+                    for member in &guild.presences {
+                        self.presence_frame(
+                            guild_id,
+                            presence::member_id(member),
+                            presence::facts(member),
+                        );
+                    }
+                    for state in &guild.voice_states {
+                        self.stream_frame(
+                            guild_id,
+                            state.user_id.get(),
+                            state.self_stream && state.channel_id.is_some(),
+                        );
+                    }
                 }
+            }
+            Event::PresenceUpdate(update) => {
+                self.presence_frame(
+                    update.0.guild_id.get(),
+                    presence::member_id(&update.0),
+                    presence::facts(&update.0),
+                );
             }
             Event::VoiceStateUpdate(update) => {
                 let Some(guild_id) = update.guild_id.map(|id| id.get()) else {
@@ -5533,6 +5667,11 @@ where
                 if let Some(actor) = self.live_actor(guild_id) {
                     actor.live.set_member_roles(member_id, roles);
                 }
+                self.stream_frame(
+                    guild_id,
+                    member_id,
+                    update.self_stream && update.channel_id.is_some(),
+                );
             }
             Event::ChannelCreate(created) => {
                 if let Some(guild_id) = created.guild_id.map(|id| id.get()) {
@@ -5691,6 +5830,7 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         ActorCommand::NamingProbe(reply) => {
             let _ = reply.send((worker.name_settings.clone(), worker.name_directory.clone()));
         }
+        ActorCommand::RoomFactsChanged(room) => worker.room_facts_changed(room, now_ms),
         ActorCommand::Join {
             ticket,
             display,
@@ -9441,6 +9581,7 @@ where
 
 #[path = "voice_rooms_limit.rs"]
 mod limit;
+mod presence;
 pub use limit::{LimitArg, LimitCommand};
 mod private_runtime;
 pub use private_runtime::PrivacyCommand;
