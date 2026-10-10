@@ -58,18 +58,35 @@ persistence, timer task or room-lifecycle runtime are introduced.
 - Only an Active-to-Passed transition returns `kick: Some(RoomKickDecision)`.
   Its scope is the target's disconnect and Connect denial on that room only,
   never a guild kick or ban. Replayed buttons/refreshes expose terminal status
-  with `kick: None`; replayed start IDs are rejected, including after expiry or
-  cancellation. A fresh vote starts with no inherited ballots.
+  with `kick: None` while the vote is retained; replayed start IDs are rejected
+  through the post-terminal cooldown horizon inclusive. Past that horizon
+  `VoteKickCore::prune` reaps the vote and the ID may start a new vote (VK-03;
+  safe because Discord interaction IDs are unique per interaction). A fresh
+  vote starts with no inherited ballots.
 
 ## Residual parent integration (not parity evidence)
 
 The parent still owns slash/button routing, ephemeral replies and reason text,
 authoritative fact gathering, ordered event delivery, target-leave notifications,
 scheduled expiry, durable/restart reconciliation and replay-ledger retention.
-The in-memory core retains finished IDs for its lifetime; do not treat recreating
-it as durable replay protection. Runtime wiring must preserve unique vote IDs and
-reject unknown/stale buttons after restart, rather than reconstructing a vote
-from button data.
+The in-memory core retains finished votes (and their IDs) only through the
+post-terminal cooldown horizon inclusive, and initiator starts only through the
+10-minute sliding window. The parent timer must call `VoteKickCore::prune` so
+expired entries are reaped even with no new starts, and must collect evicted
+IDs after every core call (`drain_evicted`; `prune` returns them for the timer
+pass, while `start`/`cast`/`refresh` report only through the drain) and drop
+its own per-vote maps for them; do not treat recreating the core as durable
+replay protection. The timer must reap only when it can also settle — gate on
+authoritative evidence, settle every live vote first, then prune — and must
+keep a vote's initiator while its enforcement is still queued or the worker
+still tracks the vote as live (a command's pass can reap it between ticks),
+so pruning never drops an unaudited terminal or an unresolved fence. The lazy sweep
+backdates expiry to the deadline, so a vote refreshed later in the same pass
+can already sit past the horizon: a refresh that returns UnknownVote for a vote
+the worker still tracks as live must audit it as expired (best-effort progress
+from current facts) instead of dropping the result row. Runtime wiring
+must preserve unique vote IDs and reject unknown/stale buttons after restart,
+rather than reconstructing a vote from button data.
 
 The parent must independently gate and idempotently deliver permission-bearing
 actions, check effective room permissions and target presence/protection again
@@ -91,4 +108,8 @@ guild/room/target binding,
 roster and ballot deduplication, strict-majority thresholds for odd/even totals,
 abstention/No, current-membership changes, exact expiry boundaries, target
 leave/rejoin cancellation, one room-scoped passing decision and terminal replay.
+Bounded retention (VK-03) is pinned by `expired_cooldown_entries_reaped_without_new_starts`
+and `retained_state_stays_bounded_across_sustained_churn`: sustained starts and
+terminal transitions keep memory proportional to the live window, and expired
+entries are reaped by `prune` with no new start.
 No network, Discord, database, credentials or sleep is needed.
