@@ -56,7 +56,7 @@ fn community_jobs_have_no_discord_write_path() {
     }
 }
 
-/// TOG-20441 exception to the pin above: the rank tick is the one website job
+/// Rank self-healing exception to the pin above: the rank tick is the one website job
 /// with a Discord write path (the ladder self-heal grants missing lower rungs
 /// and reads the bot hierarchy first). This pins the exception instead: exactly
 /// the two heal verbs, nothing else, and the heal sits behind the
