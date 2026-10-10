@@ -162,7 +162,7 @@ pub struct KickAuditRow {
 mod tests {
     use super::*;
 
-    const REFUSALS: [VoteKickError; 13] = [
+    const REFUSALS: [VoteKickError; 15] = [
         VoteKickError::InitiatorNotOccupant,
         VoteKickError::TargetNotOccupant,
         VoteKickError::SelfTarget,
