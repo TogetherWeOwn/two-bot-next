@@ -182,6 +182,24 @@ mod tests {
     }
 
     #[test]
+    fn planetscale_production_shapes_validate() {
+        // Synthetic PlanetScale production shapes: dotted `{role}.{branch_id}`
+        // logins on the direct `*.pg.psdb.cloud:5432` and
+        // `*.horizon.psdb.cloud:5432` endpoints with allowlisted keys only.
+        // Synthetic hostnames: no real cluster id, host or credential.
+        for raw in [
+            "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres?sslmode=require",
+            "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres?sslmode=verify-full",
+            "postgresql://fixture-role.cnfixture02:fixture-password@psdb-fixture-2.pg.psdb.cloud:5432/two_bot?sslmode=require&channel_binding=require",
+            "postgresql://migrator.cnfixture01@psdb-fixture-1.horizon.psdb.cloud:5432/postgres?sslmode=require",
+            "postgres://fixture-role.cnfixture02:fixture-password@psdb-fixture-2.horizon.psdb.cloud/db?sslmode=verify-ca",
+            "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres?sslmode=require&options[statement_timeout]=5000",
+        ] {
+            assert!(validate(raw).is_ok(), "{raw}");
+        }
+    }
+
+    #[test]
     fn neon_channel_binding_is_removed_without_changing_sslmode() {
         for query in [
             "sslmode=require&channel_binding=require",

@@ -1,7 +1,8 @@
 # Database TLS policy
 
-Threat-model [F6](threat-model.md) requires authenticated TLS for Neon. The
-`two_bot_core::database_tls` module fences the database URL before SQLx parses
+Threat-model [F6](threat-model.md) requires authenticated TLS for PlanetScale
+(`*.psdb.cloud`, production and any staging host bound to it) and Neon
+(`*.neon.tech`). The `two_bot_core::database_tls` module fences the database URL before SQLx parses
 it. `two_bot_cutover::connect` (cutover CLIs, `two-bot db roles verify` and the
 bot's website/community job pool) calls it after the `database_url` key
 allowlist and before `connect_options`. The three bot-side send-admission pools
@@ -41,7 +42,7 @@ would fall back to `PGHOST` or a local default.
 
 | Class | Examples | `Required` | `LocalOnly` |
 | --- | --- | --- | --- |
-| Remote | `ep-<id>.<region>.aws.neon.tech`, `203.0.113.7`, `[2001:db8::7]`, any dotted name | allowed | refused |
+| Remote | `ep-<id>.<region>.aws.neon.tech`, `psdb-fixture-1.pg.psdb.cloud`, `psdb-fixture-1.horizon.psdb.cloud`, `203.0.113.7`, `[2001:db8::7]`, any dotted name | allowed | refused |
 | Loopback | `localhost`, `127.0.0.0/8`, `[::1]`, `[::ffff:127.0.0.1]` | refused | allowed |
 | CI service | one DNS label starting with a letter: `agent-testdb`, `postgres` | refused | allowed |
 | Unix socket | `%2Fvar%2Frun%2Fpostgresql` authority, `host=/path` | refused | allowed |
@@ -120,7 +121,8 @@ F6 stays open until the deployment card records a non-secret TLS receipt.
 
 - `crates/core/src/database_tls.rs` contains table tests over every sslmode ×
   policy × host class. They also cover query-host overrides, repeated and
-  percent-encoded keys, the Neon default URL and the effective SQLx mode.
+  percent-encoded keys, the Neon default URL, synthetic PlanetScale production
+  shapes (`*.pg.psdb.cloud`, `*.horizon.psdb.cloud`) and the effective SQLx mode.
 - Each fenced path has a refusal proof mirroring
   `crates/cutover/tests/secret_connection.rs`: a remote `sslmode=disable` URL
   (and the other refusal cases) fails with the same fixed string before SQLx
