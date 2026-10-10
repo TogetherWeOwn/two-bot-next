@@ -1325,10 +1325,11 @@ impl MockMembers {
         let seen = requests.clone();
         let guild_id = staging_guild().to_owned();
         let task = tokio::spawn(async move {
-            // Non-move closure like the sibling doubles: the async block only
-            // borrows the shared log and copies the small config per request.
-            let app = Router::new().fallback(|request: Request| {
+            // `fallback` needs a 'static handler: take ownership with `move`
+            // and clone the shared log and guild id per request.
+            let app = Router::new().fallback(move |request: Request| {
                 let guild_id = guild_id.clone();
+                let seen = seen.clone();
                 async move {
                     let (parts, _) = request.into_parts();
                     let path = parts.uri.path().to_owned();
