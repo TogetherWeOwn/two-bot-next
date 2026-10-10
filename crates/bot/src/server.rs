@@ -459,7 +459,10 @@ mod tests {
             ),
         ] {
             let uri: Uri = raw.parse().unwrap();
-            assert_eq!(redacted_path(&uri), expected, "uri {raw}");
+            assert!(
+                redacted_path(&uri) == expected,
+                "request path redaction failed"
+            );
         }
     }
 
@@ -532,7 +535,7 @@ mod tests {
                         )
                         .await
                         .unwrap();
-                    assert_eq!(response.status(), expected, "status for {uri}");
+                    assert_eq!(response.status(), expected, "request status changed");
                     let _ = axum::body::to_bytes(response.into_body(), 65536)
                         .await
                         .unwrap();
@@ -541,23 +544,18 @@ mod tests {
             });
         });
         let text = recorder.text();
+        // A failed redaction assertion must not dump the captured data itself.
         assert!(
             text.contains("capture remains active"),
-            "recorder saw no events:\n{text}"
+            "recorder saw no events"
         );
-        assert!(
-            text.contains("span request"),
-            "http trace span missing:\n{text}"
-        );
-        assert!(
-            text.contains("http.request.method=GET"),
-            "method missing:\n{text}"
-        );
+        assert!(text.contains("span request"), "http trace span missing");
+        assert!(text.contains("http.request.method=GET"), "method missing");
         for known in ["/health", "/healthz", "/readyz", "/metrics"] {
             assert!(
                 text.lines()
                     .any(|l| l.ends_with(&format!("http.request.path={known}"))),
-                "known route {known} missing:\n{text}"
+                "known route missing"
             );
         }
         let spans = text
@@ -568,10 +566,10 @@ mod tests {
             .lines()
             .filter(|l| l.ends_with("http.request.path=[REDACTED]"))
             .count();
-        assert_eq!(spans, cases.len(), "one span per request:\n{text}");
-        assert_eq!(marked, 9, "unknown paths must carry the marker:\n{text}");
+        assert_eq!(spans, cases.len(), "one span per request");
+        assert_eq!(marked, 9, "unknown paths must carry the marker");
         for secret in SENTINELS {
-            assert!(!text.contains(secret), "{secret} reached traces:\n{text}");
+            assert!(!text.contains(secret), "credential reached traces");
         }
     }
 
