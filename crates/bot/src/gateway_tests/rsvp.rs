@@ -364,14 +364,24 @@ async fn queued_commands(
     }
     wait_requests(&rest, 6).await;
     let requests = rest.requests();
-    // Index 5: boot application id, registry PUT, first defer, pre-write
-    // membership read, held event read, then the second command's defer.
-    assert!(requests[5]
-        .path
-        .ends_with("/interactions/3/mock-rsvp-3/callback"));
-    assert!(requests[5].received_at.duration_since(delivered) < Duration::from_secs(3));
+    // Six arrivals regardless of interleave: boot application id, registry
+    // PUT, first defer, pre-write membership/event reads, and the second
+    // command's defer. The defer travels the unpaced interaction lane while
+    // the second paced read waits out the 110 ms lane gap, so the defer is
+    // usually recorded before the held event read: filter by token suffix
+    // instead of pinning the arrival index.
+    let defer: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request
+                .path
+                .ends_with("/interactions/3/mock-rsvp-3/callback")
+        })
+        .collect();
+    assert_eq!(defer.len(), 1, "one prompt defer for the queued command");
+    assert!(defer[0].received_at.duration_since(delivered) < Duration::from_secs(3));
     assert_eq!(
-        serde_json::from_slice::<Value>(&requests[5].body).unwrap()["type"],
+        serde_json::from_slice::<Value>(&defer[0].body).unwrap()["type"],
         5
     );
     assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
