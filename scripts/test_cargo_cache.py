@@ -1224,6 +1224,65 @@ class SharedPoolRetainTests(unittest.TestCase):
         self.assertTrue((target / 'debug' / 'fixture').exists())
         self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
 
+    @contextlib.contextmanager
+    def map_files_denied(self):
+        real_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            if 'map_files' in path.parts:
+                raise PermissionError('map_files needs CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE')
+            return real_stat(path, *args, **kwargs)
+
+        with patch.object(Path, 'stat', stat):
+            yield
+
+    def test_map_files_resolves_zero_padded_maps_range(self):
+        # /proc/PID/maps zero-pads ranges to 8 hex digits, but the kernel names
+        # map_files entries unpadded and rejects the padded spelling (ENOENT).
+        pid = self.fake_pid()
+        backing = self.root / 'node'
+        backing.write_bytes(b'n' * 64)
+        info = backing.stat()
+        (pid / 'map_files').mkdir()
+        (pid / 'map_files' / '400000-420000').symlink_to(backing)
+        pool_dev = os.stat(self.pool / 'slot-0' / 'target').st_dev
+        (pid / 'maps').write_text(
+            f'00400000-00420000 r-xp 00000000 {os.major(pool_dev):x}:{os.minor(pool_dev):x} '
+            f'123456789 /usr/local/bin/node (deleted)\n')
+        _refs, deleted = cache.process_references(self.proc)
+        self.assertEqual(deleted, [('/usr/local/bin/node', info.st_dev, info.st_ino, True)])
+
+    def test_denied_map_files_keeps_unproven_identity_without_aborting(self):
+        # Denied map_files reads are a capability limit, not lost visibility:
+        # the entry keeps the kernel-printed identity (stat_backed=False).
+        pid = self.fake_pid()
+        backing = self.root / 'backing.so'
+        backing.write_bytes(b'y' * 64)
+        (pid / 'map_files').mkdir()
+        (pid / 'map_files' / '100-200').symlink_to(backing)
+        pool_dev = os.stat(self.pool / 'slot-0' / 'target').st_dev
+        (pid / 'maps').write_text(
+            f'100-200 r--p 00000000 {os.major(pool_dev):x}:{os.minor(pool_dev):x} '
+            f'123456789 /elsewhere/stale.so (deleted)\n')
+        with self.map_files_denied():
+            _refs, deleted = cache.process_references(self.proc)
+        self.assertEqual(deleted, [('/elsewhere/stale.so', pool_dev, 123456789, False)])
+
+    def test_denied_map_files_vetoes_only_attributed_slot(self):
+        pid = self.fake_pid()
+        target = self.pool / 'slot-0' / 'target'
+        pool_dev = os.stat(target).st_dev
+        (pid / 'map_files').mkdir()
+        (pid / 'map_files' / '100-200').symlink_to(target / 'debug' / 'fixture')
+        (pid / 'maps').write_text(
+            f'100-200 r--p 00000000 {os.major(pool_dev):x}:{os.minor(pool_dev):x} '
+            f'123456789 {target}/debug/gone.so (deleted)\n')
+        with self.map_files_denied():
+            by_slot = self.by_slot(self.retain())
+        self.assertFalse(by_slot['slot-0']['eligible'])
+        self.assertIn('deleted artifact', by_slot['slot-0']['reason'])
+        self.assertTrue(by_slot['slot-1']['eligible'])
+
     def test_map_files_stat_enables_foreign_filesystem_exclusion(self):
         # End-to-end multi-tenant shape: a map_files-backed maps deleted
         # entry on a filesystem holding no slot output is provably unable to

@@ -318,7 +318,7 @@ def process_references(proc_root):
     Scans cwd/exe/fd/maps plus cmdline argv tokens. Inodes are compared too,
     so container mount path spellings need not match the host. cmdline entries
     that no longer stat are kept as lexical-only references (dev/ino None);
-    any denied read aborts the whole scan.
+    any other denied read aborts the whole scan.
 
     Deleted entries are (path, device, inode, stat_backed): fd/cwd/exe
     devices come from stat and compare directly with slot stat devices;
@@ -327,7 +327,9 @@ def process_references(proc_root):
     pre-6.8 overlayfs), so a maps entry must never prove non-aliasing by
     device alone -- UNLESS its identity was re-grounded through
     /proc/PID/map_files/<range> (a symlink to the mapped file itself, whose
-    fstat device/inode compare exactly like fd stat; stat_backed=True).
+    fstat device/inode compare exactly like fd stat; stat_backed=True). A
+    missing or denied map_files stat keeps the kernel-printed identity
+    (stat_backed=False) instead of refusing the scan.
     Deleted paths that cannot be regular files at all
     (is_non_file_reference: SYSV shm segments, /dev/zero, memfd anonymous
     files, bracketed anonymous kernel mappings such as [aio]/[heap]/[stack])
@@ -394,27 +396,23 @@ def process_references(proc_root):
                         # File-backed mapping: re-ground identity through
                         # /proc/PID/map_files/<start>-<end>, whose symlink
                         # stat reports the mapped file's real device/inode
-                        # even when deleted (kernel proc docs: map_files
-                        # holds "symbolic links which represent memory mapped
-                        # files", meant to replace maps parsing and to
-                        # compare "inode numbers"). A stat device compares
-                        # exactly with slot stat devices, unlike the
-                        # kernel-printed maps superblock device. Missing
-                        # entries (anonymous object, hidepid, exit/munmap
-                        # race) keep the kernel-printed identity and stay
-                        # fail-closed; denied reads refuse the whole scan.
+                        # even when deleted. The kernel names these entries
+                        # unpadded, while maps zero-pads the range.
+                        start, end = fields[0].split('-')
+                        map_name = f'{int(start, 16):x}-{int(end, 16):x}'
                         try:
-                            info = (entry / 'map_files' / fields[0]).stat()
-                        except FileNotFoundError:
+                            info = (entry / 'map_files' / map_name).stat()
+                        except OSError:
+                            # Missing entry (anonymous object, hidepid, exit or
+                            # munmap race) or denied read (needs CAP_SYS_ADMIN
+                            # or CAP_CHECKPOINT_RESTORE): keep the
+                            # kernel-printed superblock identity, which is
+                            # incomparable with stat devices on some
+                            # filesystems, so never device-excludable.
                             major, minor = fields[3].split(':')
-                            # Kernel-printed superblock device: incomparable
-                            # with stat devices on some filesystems, so never
-                            # device-excludable (stat_backed=False).
                             deleted.append((pathname,
                                             os.makedev(int(major, 16), int(minor, 16)),
                                             int(fields[4]), False))
-                        except (PermissionError, OSError):
-                            raise Refusal(f'incomplete process visibility: pid {entry.name}')
                         else:
                             deleted.append((pathname, info.st_dev, info.st_ino, True))
                     else:

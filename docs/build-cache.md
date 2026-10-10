@@ -357,11 +357,14 @@ slot, with two provable exceptions:
   to the mapped file itself whose fstat device/inode compare exactly like fd
   stat — and becomes stat-backed too. Such entries are excluded and counted
   in the receipt as `excluded_deleted_references` — never silently dropped.
-  Maps entries with no map_files stat (anonymous object, hidepid, exit/munmap
-  race) keep the kernel-printed superblock device, which need not equal the
-  stat device for the same file (btrfs per-subvolume anon_dev, pre-6.8
-  overlayfs), so a "foreign" maps device there proves nothing and stays
-  fail-closed.
+  The maps range is normalised to the unpadded name the kernel uses (maps
+  zero-pads it, for example `00400000-…`). Following a map_files link needs
+  CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE; a denied read is not a scan
+  failure. Maps entries with no usable map_files stat (anonymous object,
+  hidepid, exit/munmap race, or denied without the capability) keep the
+  kernel-printed superblock device, which need not equal the stat device for
+  the same file (btrfs per-subvolume anon_dev, pre-6.8 overlayfs), so a
+  "foreign" maps device there proves nothing and stays fail-closed.
 - **Non-file identity exclusion.** A deleted path that cannot be a regular
   file at all cannot alias slot output and is excluded by identity: SYSV IPC
   shared-memory segments (`/SYSV<key>`), `/dev/zero`, memfd anonymous RAM
@@ -376,13 +379,13 @@ slot, with two provable exceptions:
 
 Everything else stays fail-closed: same-filesystem unattributed entries (a
 deleted slot file held open is indistinguishable from an unrelated
-same-filesystem temp file), device-unknown entries, incomplete/denied scans
-(including denied map_files reads), and any run where a held slot's output
-device is unreadable (then nothing is device-excluded).
+same-filesystem temp file), device-unknown entries, incomplete or denied
+process scans (denied fd, cwd, exe, maps, or cmdline reads), and any run where
+a held slot's output device is unreadable (then nothing is device-excluded).
 
 Limitations: unrelated deleted files on the *same* filesystem as slot output
-still refuse the whole run — as do maps deleted entries with no map_files
-entry that attribute to no slot (including real tmpfs paths such as
+still refuse the whole run — as do maps deleted entries with no usable
+map_files stat that attribute to no slot (including real tmpfs paths such as
 `/dev/shm` files, whose non-aliasing cannot be proven without
 mount-namespace analysis) — quiesce writers or supply an independently
 verified exact-path process-reference receipt instead. Exclusion assumes no
