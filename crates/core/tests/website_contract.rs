@@ -914,6 +914,108 @@ async fn event_mirror_keeps_newer_rows_across_mutation_and_poller_writes() {
     fixture.close().await.expect("drop test database");
 }
 
+/// Call-site stamp order (TOG-20273 finding): the store primitives take
+/// explicit stamps, so this test replays the production order with explicit
+/// instants — the poller stamps *before* its GET, the mutation executor
+/// stamps *after* Discord returns — and asserts the mirror outcome at each
+/// step. A late-arriving snapshot of the pre-mutation row must not clobber
+/// the mutation's newer row, and a later snapshot that genuinely observed the
+/// mutation must still apply.
+#[tokio::test]
+async fn event_mirror_applies_writes_in_call_site_stamp_order() {
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
+
+    // Poller stamps S0 before its GET; the GET is served from the
+    // pre-mutation row, so the snapshot carries the old name.
+    const S0: &str = "2026-08-25T20:00:00.000Z";
+    // Mutation PATCH returns after the poller's fetch; the executor stamps
+    // the mirror write at completion, strictly newer than the in-flight fetch.
+    const M1: &str = "2026-08-25T20:00:00.400Z";
+    // Later poller stamps S2 before a GET that observes the mutated row.
+    const S2: &str = "2026-08-25T20:05:00.000Z";
+
+    fn mirror_event(id: &str, name: &str, status: EventStatus) -> ScheduledEvent {
+        ScheduledEvent {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            starts_at: "2026-09-06T17:30:00.000Z".to_owned(),
+            channel_id: Some("voice-1".to_owned()),
+            description: None,
+            status,
+        }
+    }
+
+    async fn mirror_row(pool: &Pool<Postgres>, event_id: &str) -> Option<(String, String, String)> {
+        sqlx::query_as::<_, (String, String, String)>(
+            "SELECT name, status, updated_at FROM scheduled_events
+              WHERE guild_id = $1 AND event_id = $2",
+        )
+        .bind(GUILD)
+        .bind(event_id)
+        .fetch_optional(pool)
+        .await
+        .expect("read mirror row")
+    }
+
+    // Snapshot S0 seeds the pre-mutation row.
+    replace_events(
+        &pool,
+        GUILD,
+        S0,
+        &[mirror_event("a", "A poller", EventStatus::Scheduled)],
+    )
+    .await
+    .expect("seed snapshot");
+
+    // Mutation completes after the fetch began, so its post-return stamp is
+    // newer and the write applies despite the older in-flight snapshot.
+    upsert_event(
+        &pool,
+        GUILD,
+        M1,
+        &mirror_event("a", "A mutation", EventStatus::Active),
+    )
+    .await
+    .expect("mutation applies");
+    assert_eq!(
+        mirror_row(&pool, "a").await,
+        Some(("A mutation".to_owned(), "active".to_owned(), M1.to_owned()))
+    );
+
+    // The in-flight snapshot's write arrives late with its pre-fetch stamp:
+    // it must neither delete nor overwrite the newer mutation row.
+    replace_events(
+        &pool,
+        GUILD,
+        S0,
+        &[mirror_event("a", "A poller", EventStatus::Scheduled)],
+    )
+    .await
+    .expect("late snapshot");
+    assert_eq!(
+        mirror_row(&pool, "a").await,
+        Some(("A mutation".to_owned(), "active".to_owned(), M1.to_owned())),
+        "late pre-fetch snapshot must not clobber the newer mutation row"
+    );
+
+    // A later snapshot that observed the mutation still applies.
+    replace_events(
+        &pool,
+        GUILD,
+        S2,
+        &[mirror_event("a", "A mutation", EventStatus::Active)],
+    )
+    .await
+    .expect("fresh snapshot");
+    assert_eq!(
+        mirror_row(&pool, "a").await,
+        Some(("A mutation".to_owned(), "active".to_owned(), S2.to_owned()))
+    );
+
+    fixture.close().await.expect("drop test database");
+}
+
 /// Seed one funnel `events` row (mirrors the cutover `record_event` column
 /// list; `occurred_at` binds as text and casts to timestamptz).
 async fn seed_funnel_event(

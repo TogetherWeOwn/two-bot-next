@@ -273,12 +273,12 @@ pub async fn write_rank_snapshot(
 /// Ordering against event mutations (TOG-20273): every mirror row carries the
 /// writer's UTC-millis `observed_at` in `updated_at`, and all writers use the
 /// same fixed-width rendering (`format_iso_millis` / `now_iso`), so TEXT
-/// comparison is chronological. The snapshot only deletes rows at or below its
-/// own `observed_at` and only overwrites rows at or below it: a mutation that
-/// landed after the snapshot's fetch keeps its row (and a legitimately removed
-/// event is still deleted once the snapshot observing the removal is the
-/// newest writer). A stale snapshot replayed after a newer write changes
-/// nothing.
+/// comparison is chronological. Stamps describe when the observation began:
+/// the poller stamps before its GET and the mutation executor stamps after
+/// Discord returns, so a mutation that lands while a snapshot GET is in flight
+/// keeps its newer row (and a legitimately removed event is still deleted once
+/// the snapshot observing the removal is the newest writer). A stale snapshot
+/// replayed after a newer write changes nothing.
 pub async fn replace_events(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -325,11 +325,14 @@ pub async fn replace_events(
 ///
 /// Ordering against the poller (TOG-20273): the row is only overwritten when
 /// the stored `updated_at` is at or below this mutation's `observed_at` (same
-/// fixed-width UTC-millis rendering, so TEXT comparison is chronological). A
-/// stale mutation whose mirror write loses the race against a newer poller
-/// snapshot (or a newer mutation) becomes a silent no-op: the Discord effect
-/// already happened, so this still returns `Ok` — the mirror simply keeps the
-/// newer row. Inserts (no conflicting row) always apply.
+/// fixed-width UTC-millis rendering, so TEXT comparison is chronological).
+/// The executor stamps after Discord returns, so the instant is the mutation's
+/// own completion — never a pre-send reading that a newer snapshot could beat
+/// despite landing earlier. A stale mutation whose mirror write loses the race
+/// against a newer poller snapshot (or a newer mutation) becomes a silent
+/// no-op: the Discord effect already happened, so this still returns `Ok` —
+/// the mirror simply keeps the newer row. Inserts (no conflicting row) always
+/// apply.
 pub async fn upsert_event(
     pool: &Pool<Postgres>,
     guild_id: &str,

@@ -15,10 +15,15 @@ raw website `event_id`. The receiver retains/records the key mapping and owns
 terminal result replay; these executors neither add an HTTP route nor implement
 that mapping/replay policy. A replay must not invoke the executor again.
 
-Pass the caller's UTC-millisecond clock value as `observed_at`. After each valid
-Discord response the executor awaits `ScheduledEventMirror::upsert` before
-acknowledging. The `PgPool` implementation writes one `(guild_id, event_id)` row
-via `website_store::upsert_event`; it never runs the poller's full-guild swap.
+Pass a stamp callback rendering UTC milliseconds (`now_iso`). After each valid
+Discord response the executor calls it once, and that reading serves both the
+mirror row and the read response, then awaits `ScheduledEventMirror::upsert`
+before acknowledging. Stamping after the return (never a pre-send reading) keeps
+last-observed-wins honest: a slow PATCH wins over a snapshot whose GET was
+served from the pre-mutation row, while the poller stamps before its GET so a
+late-arriving fetch cannot clobber a newer mutation. The `PgPool`
+implementation writes one `(guild_id, event_id)` row via
+`website_store::upsert_event`; it never runs the poller's full-guild swap.
 Null channel/description values replace older values. Unrelated rows survive.
 
 ## Legacy parity and strict mirror handling

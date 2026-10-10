@@ -711,7 +711,6 @@ trait EventReadEffect: Send + Sync {
         &'a self,
         guild_id: &'a str,
         event_id: &'a str,
-        observed_at: &'a str,
     ) -> BoxFuture<'a, Result<Value, EventActionError>>;
 }
 
@@ -735,7 +734,6 @@ impl EventReadEffect for EventReadExecutor {
         &'a self,
         guild_id: &'a str,
         event_id: &'a str,
-        observed_at: &'a str,
     ) -> BoxFuture<'a, Result<Value, EventActionError>> {
         Box::pin(async move {
             self.executor
@@ -745,7 +743,7 @@ impl EventReadEffect for EventReadExecutor {
                         event_id: event_id.to_owned(),
                     },
                     &self.mirror,
-                    observed_at,
+                    two_bot_core::now_iso,
                 )
                 .await
         })
@@ -763,7 +761,6 @@ trait EventMutateEffect: Send + Sync {
         &'a self,
         guild_id: &'a str,
         call: &'a EventCall,
-        observed_at: &'a str,
     ) -> BoxFuture<'a, Result<Value, EventActionError>>;
 }
 
@@ -786,11 +783,10 @@ impl EventMutateEffect for EventMutationExecutor {
         &'a self,
         guild_id: &'a str,
         call: &'a EventCall,
-        observed_at: &'a str,
     ) -> BoxFuture<'a, Result<Value, EventActionError>> {
         Box::pin(async move {
             self.executor
-                .execute_event(guild_id, call, &self.mirror, observed_at)
+                .execute_event(guild_id, call, &self.mirror, two_bot_core::now_iso)
                 .await
         })
     }
@@ -1423,12 +1419,7 @@ async fn read_event(
         Ok(None) => return reject(Failure::from_action(unmapped_event_key(&event_key))),
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
-    let observed_at = format_iso_millis(now_ms() as i64);
-    match state
-        .event_read
-        .execute_read(guild_id, &event_id, &observed_at)
-        .await
-    {
+    match state.event_read.execute_read(guild_id, &event_id).await {
         Ok(result) => event_read_response(result, id),
         Err(error) => reject(Failure::from_action(error.action_error())),
     }
@@ -2192,12 +2183,10 @@ async fn mutate_event(
         Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation()),
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
-    let observed_at = format_iso_millis(now_ms() as i64);
-    match state
-        .event_mutate
-        .execute_mutation(guild_id, &call, &observed_at)
-        .await
-    {
+    // No `observed_at` here: the executor stamps the mirror write after
+    // Discord returns, so a slow PATCH is never recorded under a pre-send
+    // instant and never loses last-observed-wins to a newer poller snapshot.
+    match state.event_mutate.execute_mutation(guild_id, &call).await {
         Ok(result) => {
             let event_id = match result
                 .get("event_id")

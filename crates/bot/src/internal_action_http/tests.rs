@@ -245,7 +245,6 @@ impl EventMutateEffect for MockEventMutate {
         &'a self,
         _: &'a str,
         _: &'a EventCall,
-        _: &'a str,
     ) -> BoxFuture<'a, Result<Value, EventActionError>> {
         Box::pin(async move { Ok(json!({"outcome": "updated", "event_id": READ_EVENT_ID})) })
     }
@@ -347,7 +346,6 @@ impl MockEventRead {
 impl EventReadEffect for MockEventRead {
     fn execute_read<'a>(
         &'a self,
-        _: &'a str,
         _: &'a str,
         _: &'a str,
     ) -> BoxFuture<'a, Result<Value, EventActionError>> {
@@ -2919,7 +2917,6 @@ impl EventMutateEffect for ScriptedEventMutate {
         &'a self,
         _: &'a str,
         _: &'a EventCall,
-        _: &'a str,
     ) -> BoxFuture<'a, Result<Value, EventActionError>> {
         Box::pin(async move { self.replies.lock().unwrap().remove(0) })
     }
@@ -3180,7 +3177,6 @@ impl EventMutateEffect for DelayedEventMutate {
         &'a self,
         _: &'a str,
         _: &'a EventCall,
-        _: &'a str,
     ) -> BoxFuture<'a, Result<Value, EventActionError>> {
         Box::pin(async move {
             self.entered.notify_one();

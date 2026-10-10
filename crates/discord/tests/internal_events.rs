@@ -24,6 +24,12 @@ const EVENT: &str = "100000000000000002";
 const CHANNEL: &str = "100000000000000003";
 const OBSERVED: &str = "2026-09-01T18:00:00.000Z";
 
+/// Fixed clock for the executor's post-return stamp: offline tests assert
+/// exact mirror rows, while production passes `two_bot_core::now_iso`.
+fn stamp() -> String {
+    OBSERVED.to_owned()
+}
+
 fn input(voice: bool) -> EventInput {
     let mut body = json!({
         "name": "Launch Night",
@@ -168,7 +174,7 @@ async fn create_update_cancel_and_read_refresh_before_acknowledging() {
                 input: input(false),
             },
             &mirror,
-            OBSERVED,
+            stamp,
         )
         .await
         .unwrap();
@@ -187,7 +193,7 @@ async fn create_update_cancel_and_read_refresh_before_acknowledging() {
                 input: input(true),
             },
             &mirror,
-            OBSERVED,
+            stamp,
         )
         .await
         .unwrap();
@@ -204,7 +210,7 @@ async fn create_update_cancel_and_read_refresh_before_acknowledging() {
                 event_id: EVENT.to_owned(),
             },
             &mirror,
-            OBSERVED,
+            stamp,
         )
         .await
         .unwrap();
@@ -220,7 +226,7 @@ async fn create_update_cancel_and_read_refresh_before_acknowledging() {
                 event_id: EVENT.to_owned(),
             },
             &mirror,
-            OBSERVED,
+            stamp,
         )
         .await
         .unwrap();
@@ -281,7 +287,7 @@ async fn read_external_location_and_all_four_statuses() {
                     event_id: EVENT.to_owned(),
                 },
                 &mirror,
-                OBSERVED,
+                stamp,
             )
             .await
             .unwrap();
@@ -337,7 +343,7 @@ async fn already_cancelled_404_and_other_failures_do_not_retry_or_refresh() {
                     event_id: EVENT.to_owned(),
                 },
                 &mirror,
-                OBSERVED,
+                stamp,
             )
             .await
             .unwrap_err();
@@ -374,7 +380,7 @@ async fn already_cancelled_404_and_other_failures_do_not_retry_or_refresh() {
             .await;
             let mirror = MemoryMirror::default();
             let error = executor(&rest)
-                .execute_event(GUILD, &call, &mirror, OBSERVED)
+                .execute_event(GUILD, &call, &mirror, stamp)
                 .await
                 .unwrap_err();
             assert_eq!(error.action_error().code.as_str(), "discord_rejected");
@@ -418,7 +424,7 @@ async fn malformed_or_mismatched_success_never_becomes_retry_safe() {
                     input: input(false),
                 },
                 &mirror,
-                OBSERVED,
+                stamp,
             )
             .await
             .unwrap_err();
@@ -450,7 +456,7 @@ async fn missing_create_identity_failed_write_and_bad_local_id_fail_closed() {
                     input: input(false),
                 },
                 &MemoryMirror::default(),
-                OBSERVED,
+                stamp,
             )
             .await
             .unwrap_err();
@@ -476,7 +482,7 @@ async fn missing_create_identity_failed_write_and_bad_local_id_fail_closed() {
                 input: input(false),
             },
             &mirror,
-            OBSERVED,
+            stamp,
         )
         .await
         .unwrap_err();
@@ -494,7 +500,7 @@ async fn missing_create_identity_failed_write_and_bad_local_id_fail_closed() {
                 input: bad_input,
             },
             &MemoryMirror::default(),
-            OBSERVED,
+            stamp,
         )
         .await
         .unwrap_err();
@@ -534,7 +540,7 @@ async fn acknowledgement_waits_for_the_mirror_write() {
                     input: input(false),
                 },
                 worker_mirror.as_ref(),
-                OBSERVED,
+                stamp,
             )
             .await
     });
@@ -743,7 +749,7 @@ mod database {
                     input: input(false),
                 },
                 &db.pool,
-                OBSERVED,
+                stamp,
             )
             .await
             .unwrap();
@@ -756,7 +762,7 @@ mod database {
                     input: input(true),
                 },
                 &db.pool,
-                OBSERVED,
+                stamp,
             )
             .await
             .unwrap();
@@ -770,7 +776,7 @@ mod database {
                     input: input(false),
                 },
                 &db.pool,
-                OBSERVED,
+                stamp,
             )
             .await
             .unwrap();
@@ -782,7 +788,7 @@ mod database {
                     event_id: EVENT.to_owned(),
                 },
                 &db.pool,
-                OBSERVED,
+                stamp,
             )
             .await
             .unwrap();
@@ -795,7 +801,7 @@ mod database {
                     event_id: EVENT.to_owned(),
                 },
                 &db.pool,
-                refreshed,
+                || refreshed.to_owned(),
             )
             .await
             .unwrap();
@@ -809,7 +815,7 @@ mod database {
             },
         ] {
             assert!(executor
-                .execute_event(GUILD, &call, &db.pool, OBSERVED)
+                .execute_event(GUILD, &call, &db.pool, stamp)
                 .await
                 .is_err());
             db.assert_row("cancelled", None, None, refreshed).await;

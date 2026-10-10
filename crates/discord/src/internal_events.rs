@@ -157,16 +157,26 @@ pub fn event_status_name(status: &Value) -> Option<String> {
 
 impl ActionExecutor {
     /// Execute one event call, then await its single-row mirror refresh before
-    /// returning the legacy result. `observed_at` is the caller's UTC-millis
-    /// clock reading; it is injected so offline tests can assert exact rows.
-    /// The receiver stores/replays the result; replay must not call this again.
-    pub async fn execute_event<M: ScheduledEventMirror>(
+    /// returning the legacy result. `stamp` supplies UTC-millis clock readings
+    /// in the shared fixed-width rendering (`now_iso`); it is called once,
+    /// after the Discord response returns, and that reading serves both the
+    /// mirror row and the read response — so a slow PATCH is never recorded
+    /// under a pre-send instant (a stale-dated mutation row would lose the
+    /// last-observed-wins race against a newer poller snapshot and serve the
+    /// old row until the next poll). Production passes `now_iso`; offline
+    /// tests pass a fixed stamp to assert exact rows. The receiver
+    /// stores/replays the result; replay must not call this again.
+    pub async fn execute_event<M, S>(
         &self,
         guild_id: &str,
         call: &EventCall,
         mirror: &M,
-        observed_at: &str,
-    ) -> Result<Value, EventActionError> {
+        stamp: S,
+    ) -> Result<Value, EventActionError>
+    where
+        M: ScheduledEventMirror,
+        S: Fn() -> String + Send,
+    {
         let guild = snowflake::<GuildMarker>(guild_id)?;
         let (route, body, expected_id, outcome) = match call {
             EventCall::Upsert { event_id, input } => {
@@ -255,8 +265,13 @@ impl ActionExecutor {
         // the retained permit and keeps the token-wide lane held (fail
         // closed) instead of authorizing a replay onto another resource.
         response.complete().await;
+        // Stamp the mirror write after Discord returned, not at the call
+        // site: the row's `updated_at` participates in last-observed-wins
+        // against the poller, so a mutation that took 400 ms must win over a
+        // snapshot whose GET was served from the pre-mutation row.
+        let observed_at = stamp();
         mirror
-            .upsert(guild_id, observed_at, &event)
+            .upsert(guild_id, &observed_at, &event)
             .await
             .map_err(|_| EventActionError::Mirror)?;
         if matches!(call, EventCall::Read { .. }) {
