@@ -16,6 +16,7 @@ workflow currently exists, so no scheduled smoke/service is added.
 | `guild_config_snapshot` | Restore CLI's JSON object/version gate, `verify_snapshot_integrity`, `canonical_snapshot`, `snapshot_counts`, `plan_restore` | Seal round-trip invariant and pure restore-plan decoding against an in-memory current guild. No restore apply/Discord call. This is not a full schema/authenticity check. |
 | `voice_config` | `voice_config::import_configuration`, `export_configuration` | Strict decoding, same-/cross-guild references against a **fixed trusted inventory**, lossless/deterministic round trips. Templates are not compiled or run. |
 | `rsvp` | `rsvp::partition_rsvps`, `checkin_classification`, `checkin_idempotency_key` (+ `checkin_source_event_id`, `checkin_source`, `checkin_metadata_json`) | Arbitrary NUL/newline-separated field sequences (capped at 64 fields, 16 records, 256 chars per field) with forced user-id reuse over a 4-id synthetic pool and legacy-order status cycling. Partition total/count/order invariants, classification exact-value and determinism pins, idempotency exact-format/determinism/byte-bounded checks with a metadata JSON round-trip. No database, Discord client, network or secret. |
+| `vote_kick_reason` | `voice_rooms::sanitize_vote_reason`, `message_safety::neutralize_mentions` | Arbitrary UTF-8 vote-kick reasons (invalid UTF-8 discarded). VK-04 invariants on every output: at most `VOTE_KICK_PUBLIC_REASON_LIMIT` chars, single line, no `@everyone`/`@here`, no `<@`/`<#`/`<:`/`<a:` pills, no `://`; the neutralizer half is pinned too (no raw mass mention, neutralize-twice stable). Seeds mirror the hostile matrix. No database, Discord client, network or secret. |
 
 All seeds use synthetic IDs/text; no token, environment secret, database,
 Discord client or network is needed at runtime. MEE6's crate currently has SQLx
@@ -52,7 +53,7 @@ set -euo pipefail
 : "${FUZZ_OUTPUT_DIR:?set an absolute non-source output directory}"
 FUZZ_SECONDS=${FUZZ_SECONDS:-300}
 mkdir -p "$FUZZ_OUTPUT_DIR/target" "$FUZZ_OUTPUT_DIR/logs"
-for target in internal_action automod prefix_trigger mee6_export guild_config_snapshot voice_config rsvp; do
+for target in internal_action automod prefix_trigger mee6_export guild_config_snapshot voice_config rsvp vote_kick_reason; do
   mkdir -p "$FUZZ_OUTPUT_DIR/corpus/$target" "$FUZZ_OUTPUT_DIR/artifacts/$target"
   cargo +nightly fuzz run --target-dir "$FUZZ_OUTPUT_DIR/target" \
     "$target" "$FUZZ_OUTPUT_DIR/corpus/$target" "fuzz/corpus/$target" -- \
