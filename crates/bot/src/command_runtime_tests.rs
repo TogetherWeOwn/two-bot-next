@@ -5323,11 +5323,13 @@ async fn worker_verdict_drives_prefix_trigger_from_call_site() {
         Some(Some(FunnelDisposition::Accept)),
         "accepted create forwards its accept trigger"
     );
+    // Fail-closed: the split create never dispatches, so it can post no
+    // reply and enqueue no sticky work; the `posts.len() == 1` assertion
+    // below proves it.
     let split_trigger = worker_prefix_trigger(split, &split_event, true);
-    assert_eq!(
-        split_trigger,
-        Some(Some(FunnelDisposition::CaptureOnly)),
-        "uninspected funnel-accept still forwards capture-only to triggers"
+    assert!(
+        split_trigger.is_none(),
+        "uninspected funnel-accept never dispatches prefix triggers"
     );
     let unscreened_trigger = worker_prefix_trigger(None, &unscreened_event, true);
     assert_eq!(
@@ -5338,10 +5340,6 @@ async fn worker_verdict_drives_prefix_trigger_from_call_site() {
     assert!(
         runtime.dispatch_with_verdict(&accept_event, accept_trigger.expect("accept dispatches")),
         "accept admits on the message lane"
-    );
-    assert!(
-        runtime.dispatch_with_verdict(&split_event, split_trigger.expect("split dispatches")),
-        "capture-only still admits; the trigger handler refuses it"
     );
     assert!(
         runtime.dispatch_with_verdict(

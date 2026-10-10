@@ -50,17 +50,18 @@ pub fn ensure_crypto_provider() {
 /// Worker decision for prefix triggers: `Some(trigger)` means the serial
 /// dispatch worker must call `dispatch_with_verdict(event, trigger)`, `None`
 /// means it must not. `trigger` is `disposition.map(|verdict| verdict.trigger)`;
-/// the text-automation gate stays on the funnel disposition.
+/// the text-automation gate stays on the trigger verdict, not the funnel: an
+/// uninspected create keeps funnel `Accept` but its trigger is capture-only
+/// and must not run sticky or prefix triggers (fail-closed).
 pub(crate) fn worker_prefix_trigger(
     disposition: Option<crate::automod_gateway::WorkerVerdict>,
     event: &Event,
     automod_enabled: bool,
 ) -> Option<Option<two_bot_core::automod_runtime::FunnelDisposition>> {
-    let funnel = disposition.map(|verdict| verdict.funnel);
     let trigger = disposition.map(|verdict| verdict.trigger);
     if automod_enabled
         && matches!(event, Event::MessageCreate(_))
-        && crate::automod_gateway::runs_text_automations(funnel)
+        && crate::automod_gateway::runs_text_automations(trigger)
     {
         Some(trigger)
     } else {

@@ -363,7 +363,7 @@ mod tests {
 
     /// Worker decision coverage for the verdict-to-trigger plumbing
     /// (offline): pins `gateway::worker_prefix_trigger` (the text-automation
-    /// gate stays on the funnel disposition, the forwarded value is the
+    /// gate stays on the trigger verdict, the forwarded value is the
     /// trigger verdict) and the verdict-to-acceptance mapping, then proves
     /// both directions through the real trigger handler: the denied path
     /// early-returns `Ignored` (no POST, no DB), the accepted path passes the
@@ -464,8 +464,9 @@ mod tests {
         assert_eq!(config.acceptance, AutomationMessageAcceptance::Unavailable);
         assert!(!config.acceptance.permits_automations());
 
-        // Worker plumbing on the real helper: the gate stays on `funnel`, the
-        // forwarded verdict is `trigger` (not `funnel`).
+        // Worker plumbing on the real helper: the gate stays on `trigger`
+        // (fail-closed, so an uninspected funnel-accept never dispatches),
+        // the forwarded value is the trigger verdict (not `funnel`).
         let accept_disposition = Some(WorkerVerdict {
             funnel: FunnelDisposition::Accept,
             trigger: FunnelDisposition::Accept,
@@ -485,14 +486,13 @@ mod tests {
             Some(Some(FunnelDisposition::Accept)),
             "accepted create forwards its accept trigger"
         );
-        assert_eq!(
-            worker_prefix_trigger(split_disposition, &split_event, true),
-            Some(Some(FunnelDisposition::CaptureOnly)),
-            "uninspected funnel-accept still forwards capture-only to triggers"
+        assert!(
+            worker_prefix_trigger(split_disposition, &split_event, true).is_none(),
+            "uninspected funnel-accept never dispatches prefix triggers"
         );
         assert!(
             worker_prefix_trigger(contained_disposition, &split_event, true).is_none(),
-            "contained funnel never dispatches prefix triggers"
+            "contained trigger never dispatches prefix triggers"
         );
         assert!(
             worker_prefix_trigger(accept_disposition, &accept_event, false).is_none(),
