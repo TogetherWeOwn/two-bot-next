@@ -440,3 +440,84 @@ async fn gateway_reward_and_interaction_executor_errors_propagate() {
     mock.shutdown().await;
     db.close().await;
 }
+
+/// Gateway voice capture (TOG-19605): a human join inserts one
+/// `voice_session_started` fact keyed `voice-start:{session_key}`, the leave
+/// inserts one honestly-measured `voice_session_ended` fact (330 s for the
+/// 5.5-minute session) carrying `sessionKey`, `startedAt`,
+/// `durationSeconds` and `startKnown:true`, and a redelivered join at the
+/// original stamp dedupes to zero inserts.
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or credential-free CI service"]
+async fn community_voice_fact_capture_round_trip() {
+    let db = TestDb::new().await;
+    let pipeline = OrderedLevelingPipeline::new(MemStore::new(), None);
+    pipeline.enable_community_facts(db.pool.clone());
+    const VOICE_CHANNEL: u64 = 300000000000000002;
+
+    // Join: one start fact, and the durable session key travels with it.
+    let requests = pipeline.collect_at(
+        &voice(Some(VOICE_CHANNEL)),
+        &at(10),
+        MessageEligibility::default(),
+    );
+    pipeline.drain(requests).await.unwrap();
+    assert_eq!(pipeline.drain_facts().await.unwrap(), 1);
+    let (session_key, metadata): (String, String) = sqlx::query_as(
+        "SELECT source_event_id, metadata FROM community_facts WHERE guild_id = $1 AND event_type = 'voice_session_started'",
+    )
+    .bind(GUILD.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        session_key.starts_with(&format!("{GUILD}:{MEMBER}:")),
+        "session key binds guild and member: {session_key}"
+    );
+    assert!(
+        session_key.ends_with(&format!(":{VOICE_CHANNEL}")),
+        "session key binds channel: {session_key}"
+    );
+    assert!(
+        metadata.contains(&format!("\"sessionKey\":\"{session_key}\"")),
+        "start carries its session key: {metadata}"
+    );
+
+    // Leave 330 s later: one measured end with honest duration math.
+    let requests = pipeline.collect_at(&voice(None), &at(340), MessageEligibility::default());
+    pipeline.drain(requests).await.unwrap();
+    assert_eq!(pipeline.drain_facts().await.unwrap(), 1);
+
+    // Redelivered join at the original stamp reuses the same session key, so
+    // the `voice-start:{session_key}` row dedupes to zero inserts (a
+    // same-channel frame without a leave would never reach the sink at all).
+    let requests = pipeline.collect_at(
+        &voice(Some(VOICE_CHANNEL)),
+        &at(10),
+        MessageEligibility::default(),
+    );
+    pipeline.drain(requests).await.unwrap();
+    assert_eq!(pipeline.drain_facts().await.unwrap(), 0);
+    let row: (String, String, String) = sqlx::query_as(
+        "SELECT event_type, source_event_id, metadata FROM community_facts WHERE guild_id = $1 AND event_type = 'voice_session_ended'",
+    )
+    .bind(GUILD.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.1, session_key, "end reuses the start's session key");
+    for field in [
+        format!("\"sessionKey\":\"{session_key}\"").as_str(),
+        "\"durationSeconds\":330",
+        "\"startKnown\":true",
+    ] {
+        assert!(row.2.contains(field), "end carries {field}: {}", row.2);
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM community_facts")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2, "one start plus one end, no double row");
+    db.close().await;
+}
