@@ -86,14 +86,16 @@ fn app(pool: sqlx::PgPool, mock: &MockDiscord) -> Router {
     let effect = adapter(pool.clone())
         .with_loopback_test_origin(&mock.origin)
         .unwrap();
-    // Announcement-only harness: event.read and moderation.timeout never
-    // arrive here, so both doubles only assert they stay uncalled.
+    // Announcement-only harness: event.read, moderation.timeout and the
+    // channel-moderation verbs never arrive here, so the doubles only assert
+    // they stay uncalled.
     router(Arc::new(ReceiverState::new(
         config(),
         pool.clone(),
         Arc::new(effect),
         Arc::new(MockEventRead::default()),
         Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
     )))
 }
 
