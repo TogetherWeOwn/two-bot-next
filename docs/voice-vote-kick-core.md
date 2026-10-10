@@ -14,6 +14,15 @@ persistence, timer task or room-lifecycle runtime are introduced.
   and original creator, and permits only one active vote per guild/target. Use
   the unique initiating interaction ID as the vote ID. Starting is not a Yes
   ballot: V4 says votes are cast with buttons.
+- After `Passed`, `Expired` or either `Cancelled` outcome, a fresh vote against
+  the same guild/target fails with `Cooldown` until `VOTE_KICK_COOLDOWN_MS`
+  (300,000 ms) after the terminal transition; expiry counts from the deadline,
+  not from a late observation. Each initiator may succeed at most
+  `VOTE_KICK_INITIATOR_LIMIT` (3) starts per `VOTE_KICK_INITIATOR_WINDOW_MS`
+  (600,000 ms) per guild, across targets and rooms, else `InitiatorLimited`.
+  Only successful starts consume the cap. Refusal order is `ActiveVoteExists`,
+  then `Cooldown`, then `InitiatorLimited`; every refusal creates no vote,
+  ballot, enforcement decision or cap entry, and reuses no interaction ID.
 - `cast` accepts one Yes or No ballot per current eligible occupant. Neither a
   repeated ballot nor a different button from the same member counts again.
   Both abstention and No leave the Yes count unchanged; the denominator is the
