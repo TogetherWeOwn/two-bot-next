@@ -1,8 +1,8 @@
 # Database TLS policy
 
 Threat-model [F6](threat-model.md) requires authenticated TLS for PlanetScale
-(production and staging) and Neon (earlier staging). The
-`two_bot_core::database_tls` module fences the database URL before SQLx parses
+(`*.psdb.cloud`, production and any staging host bound to it) and Neon
+(`*.neon.tech`). The `two_bot_core::database_tls` module fences the database URL before SQLx parses
 it. `two_bot_cutover::connect` (cutover CLIs, `two-bot db roles verify` and the
 bot's website/community job pool) calls it after the `database_url` key
 allowlist and before `connect_options`. The three bot-side send-admission pools
