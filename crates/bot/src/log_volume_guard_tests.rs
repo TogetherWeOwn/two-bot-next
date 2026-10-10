@@ -580,6 +580,16 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         "dispatch-lane family changed the budget"
     );
     let text = metrics::Metrics::default().render(None);
+    let help_headers = text
+        .lines()
+        .filter(|line| line.starts_with("# HELP "))
+        .count();
+    let type_headers = text
+        .lines()
+        .filter(|line| line.starts_with("# TYPE "))
+        .count();
+    assert_eq!(help_headers, 26, "rendered HELP family count changed");
+    assert_eq!(type_headers, 26, "rendered TYPE family count changed");
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
         series, 361,
