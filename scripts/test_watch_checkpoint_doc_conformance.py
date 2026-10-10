@@ -1,7 +1,10 @@
 """Watch-checkpoint doc invocation conformance: offline, no network or databases.
 
-Pins `docs/cutover-sequence.md` section 5 to the
-`scripts/cutover_watch_checkpoint.py` argparse so flag drift fails CI.
+Pins the `scripts/cutover_watch_checkpoint.py` invocation blocks in
+`docs/cutover-sequence.md` section 5 AND `docs/production-deploy.md`
+"48-hour watch log" (the two copies operators read) to the script
+argparse, so flag drift in either copy fails CI. Every fence that names
+the script is checked, not just the first.
 """
 
 import re
@@ -10,7 +13,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DOC = ROOT / "docs/cutover-sequence.md"
+PROD_DOC = ROOT / "docs/production-deploy.md"
 SCRIPT = ROOT / "scripts/cutover_watch_checkpoint.py"
+PINNED_SECTIONS = (
+    (DOC, "## 5. Watch handoff"),
+    (PROD_DOC, "## 48-hour watch log"),
+)
 
 EXPECTED_FLAGS = ("--checkpoint", "--expected-sha", "--expected-build-id", "--production-url")
 EXPECTED_CHECKPOINTS = ("+15m", "+1h", "+6h", "+24h", "+48h")
@@ -19,14 +27,24 @@ ARG_RE = re.compile(r'add_argument\(\s*"(--[^"]+)"')
 FENCE_RE = re.compile(r"```sh(.*?)```", re.DOTALL)
 
 
-def section5_text(doc_text=None):
-    text = doc_text if doc_text is not None else DOC.read_text()
-    start = text.index("## 5. Watch handoff")
+def section_text(doc_path, heading, doc_text=None):
+    text = doc_text if doc_text is not None else doc_path.read_text()
+    start = text.index(heading)
     try:
-        end = text.index("\n## ", start + len("## 5. Watch handoff"))
+        end = text.index("\n## ", start + len(heading))
     except ValueError:
         end = len(text)
     return text[start:end]
+
+
+def section5_text(doc_text=None):
+    return section_text(DOC, "## 5. Watch handoff", doc_text)
+
+
+def invocation_blocks(section):
+    """Every fence in a section that names the script (never just the first)."""
+    return [block for block in FENCE_RE.findall(section)
+            if "cutover_watch_checkpoint.py" in block]
 
 
 def section5_fences(section=None):
@@ -35,10 +53,20 @@ def section5_fences(section=None):
 
 
 def doc_invocation_text(section=None):
-    fences = section5_fences(section)
-    hits = [block for block in fences if "cutover_watch_checkpoint.py" in block]
+    hits = invocation_blocks(section if section is not None else section5_text())
     assert hits, "section 5 names no cutover_watch_checkpoint.py invocation block"
     return hits[0]
+
+
+def all_invocation_blocks():
+    """(doc name, block) for every pinned fence across both operator docs."""
+    found = []
+    for doc_path, heading in PINNED_SECTIONS:
+        section = section_text(doc_path, heading)
+        blocks = invocation_blocks(section)
+        assert blocks, f"{doc_path.name} {heading} names no invocation block"
+        found.extend((f"{doc_path.name} {heading}", block) for block in blocks)
+    return found
 
 
 def flags_in_order(text):
@@ -65,23 +93,29 @@ def check_invocation(doc_flags, code_flags):
 
 
 class WatchCheckpointDocConformanceTests(unittest.TestCase):
-    def test_section5_invocation_flags_match_script_argparse(self):
-        invocation = doc_invocation_text()
-        doc_flags = flags_in_order(invocation)
+    def test_every_pinned_invocation_matches_script_argparse(self):
+        blocks = all_invocation_blocks()
+        self.assertGreaterEqual(len(blocks), 2,
+                                "both operator docs must pin an invocation block")
         code_flags = script_flags()
-        self.assertEqual(tuple(doc_flags), EXPECTED_FLAGS,
-                         "doc section 5 invocation must list the four flags in argparse order")
         self.assertEqual(tuple(code_flags), EXPECTED_FLAGS,
                          "script argparse must keep exactly the four documented flags")
-        check_invocation(doc_flags, code_flags)
+        for doc_name, block in blocks:
+            with self.subTest(doc=doc_name):
+                doc_flags = flags_in_order(block)
+                self.assertEqual(tuple(doc_flags), EXPECTED_FLAGS,
+                                 f"{doc_name} invocation must list the four flags "
+                                 "in argparse order")
+                check_invocation(doc_flags, code_flags)
 
     def test_section5_states_one_checkpoint_per_call(self):
         section = section5_text()
         collapsed = re.sub(r"\s+", " ", section)
         self.assertIn("one checkpoint per call", collapsed)
-        invocation = doc_invocation_text(section)
-        self.assertEqual(invocation.count("--checkpoint"), 1,
-                         "doc invocation records one checkpoint per call")
+        for doc_name, block in all_invocation_blocks():
+            with self.subTest(doc=doc_name):
+                self.assertEqual(block.count("--checkpoint"), 1,
+                                 f"{doc_name} invocation records one checkpoint per call")
         source = SCRIPT.read_text()
         self.assertNotIn("nargs", source,
                          "script takes a single --checkpoint per invocation, never nargs")
@@ -123,6 +157,32 @@ class WatchCheckpointDocConformanceTests(unittest.TestCase):
         added = [*EXPECTED_FLAGS, "--verbose"]
         with self.assertRaisesRegex(AssertionError, "--verbose"):
             check_invocation(added, code_flags)
+
+    def test_second_drifted_block_in_section_fails_named(self):
+        """Guards a hits[0]-only collector: a drifted second block must fail."""
+        section = section5_text()
+        blocks = invocation_blocks(section)
+        self.assertGreaterEqual(len(blocks), 1)
+        drifted = blocks[0].replace("--expected-sha", "--sha")
+        self.assertIn("--sha", flags_in_order(drifted))
+        code_flags = script_flags()
+        with self.assertRaisesRegex(AssertionError, r"--expected-sha|--sha"):
+            for block in [*blocks, drifted]:
+                check_invocation(flags_in_order(block), code_flags)
+
+    def test_production_doc_drift_fails_named(self):
+        """The production-deploy.md copy is pinned too, not just section 5."""
+        prod_section = section_text(PROD_DOC, "## 48-hour watch log")
+        blocks = invocation_blocks(prod_section)
+        self.assertGreaterEqual(len(blocks), 1,
+                                "production-deploy.md watch log names an invocation block")
+        code_flags = script_flags()
+        for doc_name, block in all_invocation_blocks():
+            with self.subTest(doc=doc_name):
+                check_invocation(flags_in_order(block), code_flags)
+        drifted = blocks[0].replace("--expected-sha", "--sha")
+        with self.assertRaisesRegex(AssertionError, r"--expected-sha|--sha"):
+            check_invocation(flags_in_order(drifted), code_flags)
 
 
 if __name__ == "__main__":
