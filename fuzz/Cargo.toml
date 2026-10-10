@@ -16,9 +16,9 @@ resolver = "2"
 [dependencies]
 libfuzzer-sys = "=0.4.13"
 serde_json = { version = "1", features = ["preserve_order"] }
-two-bot-core = { version = "0.3.0", path = "../crates/core", default-features = false } # x-release-please-version
-two-bot-cutover = { version = "0.3.0", path = "../crates/cutover" } # x-release-please-version
-two-bot = { version = "0.3.0", path = "../crates/bot" } # x-release-please-version
+two-bot-core = { version = "0.4.0", path = "../crates/core", default-features = false } # x-release-please-version
+two-bot-cutover = { version = "0.4.0", path = "../crates/cutover" } # x-release-please-version
+two-bot = { version = "0.4.0", path = "../crates/bot" } # x-release-please-version
 
 [[bin]]
 name = "internal_action"
@@ -65,6 +65,13 @@ bench = false
 [[bin]]
 name = "rsvp"
 path = "fuzz_targets/rsvp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "settings_map"
+path = "fuzz_targets/settings_map.rs"
 test = false
 doc = false
 bench = false

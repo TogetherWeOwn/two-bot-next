@@ -20,6 +20,11 @@ on:
         required: false
         type: string
         default: ""
+      takeover:
+        description: "Run the P2/P3 ownership takeover after the change (B4 cutover execution only; a routine deploy leaves the fence held)"
+        required: false
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -41,6 +46,7 @@ jobs:
       sha: ${{ steps.guard.outputs.sha }}
       mode: ${{ steps.guard.outputs.mode }}
       version: ${{ steps.guard.outputs.version }}
+      takeover: ${{ steps.guard.outputs.takeover }}
     steps:
       - name: Refuse unverified SHA or unprotected Environment
         id: guard
@@ -49,6 +55,7 @@ jobs:
           # Inputs travel through env, never into the script text.
           SHA: ${{ inputs.sha }}
           ROLLBACK: ${{ inputs.rollback }}
+          TAKEOVER: ${{ inputs.takeover }}
           # Exactly "true" replaces the human Environment reviewer with
           # automated evidence (latest deploy-staging run on the SHA is green).
           AUTO_APPROVE: ${{ vars.PRODUCTION_AUTO_APPROVE }}
@@ -86,6 +93,11 @@ jobs:
               r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", version
           ):
               refuse("rollback must be a Worker version ID (UUID)")
+          # Dispatch booleans arrive as "true"/"false" strings. Anything else
+          # fails closed: an unparsed takeover flag must never unpark the fence.
+          takeover = os.environ.get("TAKEOVER", "")
+          if takeover not in ("true", "false"):
+              refuse("takeover must be true or false")
           if os.environ.get("GITHUB_REF") != "refs/heads/main":
               refuse("dispatch this workflow from main only")
 
@@ -218,7 +230,7 @@ jobs:
               refuse("check.yml latest run/attempt changed during validation; retry after CI completes")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write(f"sha={sha}\nmode={mode}\nversion={version}\n")
+              out.write(f"sha={sha}\nmode={mode}\nversion={version}\ntakeover={takeover}\n")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write(
                   f"### Production {mode} guard passed\n\n"
@@ -230,6 +242,9 @@ jobs:
                   )
                   + f"- Environment: `production`, {reviewers} required reviewer(s), main only\n"
                   + (f"- Rollback target: `{version}`\n" if version else "")
+                  + ("- Takeover: requested (P2/P3 run after the change; B4 cutover execution)\n"
+                     if takeover == "true"
+                     else "- Takeover: not requested (the ownership fence stays held)\n")
               )
           print(f"guard passed: {mode} {sha}")
 
@@ -250,6 +265,7 @@ jobs:
       SHA: ${{ needs.guard.outputs.sha }}
       MODE: ${{ needs.guard.outputs.mode }}
       TARGET_VERSION: ${{ needs.guard.outputs.version }}
+      TAKEOVER: ${{ needs.guard.outputs.takeover }}
     defaults:
       run:
         working-directory: wrangler
@@ -285,6 +301,17 @@ jobs:
           # Deploys must not consume caches populated by untrusted PR checks.
           package-manager-cache: false
       - run: npm ci
+      # Validate the production control binding BEFORE replacing a healthy
+      # deployment, and only when the takeover was requested. Missing
+      # credentials are not permission to auto-claim an owner: preflight
+      # refuses a short/absent token or a non-production origin.
+      - name: Require production ownership-control configuration
+        if: env.TAKEOVER == 'true'
+        env:
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}
+        run: node scripts/production-ownership-control.mjs preflight
       # The version serving before the change is the rollback target. The
       # first production deploy has none, so this step may fail.
       - name: Read the active production version
@@ -366,6 +393,7 @@ jobs:
               return ", ".join(f"`{vid}` ({pct}%)" for vid, pct in found) or "none"
 
           sha, mode, target = os.environ["SHA"], os.environ["MODE"], os.environ["TARGET_VERSION"]
+          takeover = os.environ.get("TAKEOVER", "false") == "true"
           before = versions(os.environ.get("BEFORE", ""))
           after = versions(os.environ.get("AFTER", ""))
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
@@ -386,6 +414,47 @@ jobs:
           if mode == "deploy" and after == before:
               print("::error::the active production version did not change")
               sys.exit(1)
+          # The takeover steps below pin to the single version serving 100% of
+          # traffic. Anything else (split traffic, unreadable status) refuses
+          # the takeover rather than handing ownership to an unknown version.
+          if takeover:
+              if len(after) != 1 or after[0][1] != 100:
+                  print("::error::takeover requested but no single Worker version serves 100% of traffic")
+                  sys.exit(1)
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+                  env_file.write(f"NEW_VERSION={after[0][0]}\n")
+      # P2/P3 (docs/cutover-production-takeover-design.md): read control state
+      # without starting, then take over at exactly the read epoch. Both run
+      # only when the dispatch requested the takeover; a routine deploy leaves
+      # the fence held and the gate below keeps failing on fenced answers.
+      - name: Read production ownership state without starting
+        if: env.TAKEOVER == 'true'
+        env:
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}
+          OWNERSHIP_EXPECTED_DEPLOYMENT: ${{ env.NEW_VERSION }}
+        run: |
+          set -euo pipefail
+          test -n "${OWNERSHIP_EXPECTED_DEPLOYMENT:?takeover needs the recorded new Worker version}"
+          node scripts/production-ownership-control.mjs status | tee "$RUNNER_TEMP/production-ownership-status.json"
+      - name: Take over production ownership at the read epoch
+        if: env.TAKEOVER == 'true'
+        env:
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}
+          OWNERSHIP_ACTOR: github-actions:${{ github.run_id }}:${{ needs.guard.outputs.sha }}
+          OWNERSHIP_RELEASE_FENCE: "true"
+          OWNERSHIP_EXPECTED_DEPLOYMENT: ${{ env.NEW_VERSION }}
+        run: |
+          set -euo pipefail
+          test -n "${OWNERSHIP_EXPECTED_DEPLOYMENT:?takeover needs the recorded new Worker version}"
+          epoch="$(python3 -c 'import json, os; state = json.load(open(os.environ["RUNNER_TEMP"] + "/production-ownership-status.json")); owner = state["owner"]; print(owner["epoch"] if owner else 0)')"
+          case "$epoch" in
+            ''|*[!0-9]*) echo "::error::takeover needs the numeric epoch read in the previous step"; exit 1 ;;
+          esac
+          node scripts/production-ownership-control.mjs takeover "$epoch"
       # Same contract as staging, plus the build identity: /health
       # must be 200, which proves the Container/DO bindings are wired. /readyz
       # must answer with its component breakdown and this run's build identity:
@@ -444,3 +513,38 @@ jobs:
           cat "$readyz" || true
           echo "$state"
           echo "- /health 200, /readyz $code ($state)" >> "$GITHUB_STEP_SUMMARY"
+      # P4 (docs/cutover-production-takeover-design.md): re-read the
+      # rollout/Worker control-plane state after the owned probes, so the run
+      # proves the taken-over version still serves 100% of traffic.
+      - name: Re-read the active production version after takeover
+        id: reread
+        if: env.TAKEOVER == 'true'
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
+        with:
+          workingDirectory: wrangler
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          environment: production
+          quiet: true
+          command: deployments status --json
+      - name: Confirm the taken-over version still serves
+        if: env.TAKEOVER == 'true'
+        env:
+          REREAD: ${{ steps.reread.outputs.command-output }}
+          NEW_VERSION: ${{ env.NEW_VERSION }}
+        shell: python3 {0}
+        run: |
+          import json, os, sys
+
+          raw = os.environ.get("REREAD", "")
+          try:
+              deployment = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
+              found = [(v["version_id"], v["percentage"]) for v in deployment["versions"]]
+          except (ValueError, KeyError, TypeError):
+              found = []
+          expected = os.environ.get("NEW_VERSION", "")
+          if not expected or found != [(expected, 100)]:
+              print("::error::the taken-over version does not serve 100% of traffic after the probes")
+              sys.exit(1)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(f"- Takeover confirmed: `{expected}` still serves 100% after the owned probes\n")
