@@ -23,9 +23,9 @@ tested and reviewable.
   100 characters, no trailing period. Types: `feat`, `fix`, `perf`, `refactor`,
   `test`, `docs`, `build`, `ci`, `chore`, `revert`, `style`, `security`. Release
   automation reads these headers, so write them for the changelog.
-- Fill in every section of the PR template, in short, active sentences: Thinking
-  Path, Linked Issues or Issue Description, What Changed, Verification, Risks,
-  Model Used, Checklist.
+- Use the PR template, in short, active sentences. Required: Linked Issues or
+  Issue Description, and Verification (commands run and their results). What
+  Changed and Notes for reviewers are optional.
 - Keep references public-safe. Put no secret, token, private URL or internal
   tracker ID (`TOG-`, `PAP-`) in any title, body, commit, comment or branch name.
   Link public GitHub issues as `Closes #123`.

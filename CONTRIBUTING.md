@@ -15,21 +15,20 @@ contributors. Every change lands through a PR; nobody pushes to `main`.
   `test`, `docs`, `build`, `ci`, `chore`, `revert`, `style`, `security`. The
   scope names the area of the code (`gateway`, `automod`, `store`). The release
   automation below reads these headers.
-- **Body.** Fill in every section of the
-  [PR template](.github/pull_request_template.md), in short, active sentences:
-  Thinking Path, Linked Issues or Issue Description, What Changed, Verification,
-  Risks, Model Used, Checklist. A PR created through the API gets no template,
-  so paste it in. `docs`, `chore`, `build`, `ci`, `style`, `test` and `revert`
-  PRs need no linked issue and no duplicate-search tick. The `pr-lint` check
-  fails an empty body; the other body rules warn until open PRs migrate.
+- **Body.** Use the [PR template](.github/pull_request_template.md), in short,
+  active sentences. `pr-lint` requires two sections: Linked Issues or Issue
+  Description, and Verification (the commands you ran and their results).
+  What Changed and Notes for reviewers are optional. A PR created through the
+  API gets no template, so paste it in. `docs`, `chore`, `build`, `ci`, `style`,
+  `test` and `revert` PRs need no linked issue. The `pr-lint` check fails an
+  empty body; the other body rules warn until open PRs migrate.
 - **Search first.** Look for an open or recent PR that touches the same area,
-  and link what you find. Tick the duplicate-search line in the checklist.
+  and link what you find.
 - **No internal references.** This repo is public: put no internal ticket id,
   instance link, localhost URL or private host in any title, body, commit,
   comment or branch name. Link public GitHub issues as `Closes #123` and say
   the rest in plain words. `pr-lint` warns when it sees one.
-- **Honest disclosure.** Name the exact model ID in Model Used, or write "None —
-  human-authored". Report only test runs you saw, and say what you did not run.
+- **Honest disclosure.** Report only test runs you saw, and say what you did not run.
 - **Review.** Address every review finding, or reply with why it does not apply.
   Re-request review after you push.
 - **Credit.** Credit the contributors whose work you build on.
