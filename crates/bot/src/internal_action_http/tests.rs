@@ -1737,10 +1737,13 @@ fn moderation_resolve_app(pool: sqlx::PgPool, mock: &MockMembers) -> Router {
     )
     .unwrap();
     let moderation: Arc<dyn ModerationEffect> = Arc::new(ModerationExecutor::new(inner, discord));
-    let effect: Arc<dyn ActionEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    // The membership double shares the announcement mock: deny-path tests refuse
+    // before any member effect runs, matching `state_full`.
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
     router(Arc::new(ReceiverState::new(
         config(),
         pool,
+        effect.clone(),
         effect,
         Arc::new(MockEventRead::default()),
         moderation,
