@@ -579,3 +579,51 @@ async fn bot_member_role_assignment_resumes_room_and_removal_revokes_access() {
         actor.live.inner.read().unwrap().permissions(GUILD, CREATOR)
     ));
 }
+
+#[tokio::test]
+async fn poisoned_live_lock_does_not_restart_the_gateway() {
+    let (store, http, _) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    bootstrap(&runtime, &pipeline, &[]);
+    let actor = runtime.live_actor(GUILD).unwrap();
+    // Poison the room lock from another thread: panic while holding the
+    // write guard, as a crashed holder would.
+    let live = actor.live.clone();
+    std::thread::spawn(move || {
+        let _guard = live.write_state();
+        panic!("poison the live voice lock for test");
+    })
+    .join()
+    .expect_err("poisoning thread must panic");
+    // The dispatch worker (`gateway.rs` `voice.handle(...)`) still returns.
+    feed(&runtime, &pipeline, voice_event(MEMBER, Some(CREATOR)));
+    feed(&runtime, &pipeline, voice_event(MEMBER, None));
+    // The recovered lock still serves reads and writes.
+    assert!(actor.live.read_state().ready);
+    actor.live.disconnect();
+    assert!(!actor.live.read_state().ready);
+    status(&runtime).await;
+}
+
+#[tokio::test]
+async fn actor_load_failure_bumps_counter_and_arms_warn_throttle() {
+    let series = "two_bot_db_errors_total{op=\"other\"} ";
+    let before = global_series(series);
+    observe_voice_actor_load_failure(GUILD, &StoreError::Unavailable);
+    observe_voice_actor_load_failure(GUILD, &StoreError::Unavailable);
+    // Global counters are monotonic and shared with parallel tests, so assert
+    // a lower bound, not an exact value (see `global_series` convention).
+    assert!(
+        global_series(series) >= before + 2,
+        "two load failures bump the `other` counter"
+    );
+    // The first failure arms the throttle timestamp; the immediate second
+    // call stays silent. (Warn text itself is covered by the observability
+    // event catalog and its conformance allowlist entry.)
+    assert_ne!(
+        super::super::VOICE_ACTOR_LOAD_WARN_LAST_SECS.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "first failure arms the warn throttle"
+    );
+}

@@ -620,6 +620,7 @@ impl DumpWriter {
 // no-replace rename instead: even racing publishers cannot destroy a good dump.
 // https://man7.org/linux/man-pages/man2/rename.2.html (RENAME_NOREPLACE)
 #[cfg(all(any(feature = "db", test), target_os = "linux"))]
+#[allow(unsafe_code)]
 fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -638,8 +639,13 @@ fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     };
     let source = path(source)?;
     let destination = path(destination)?;
-    // Linux UAPI: AT_FDCWD=-100; RENAME_NOREPLACE=1. CString pointers remain
-    // alive through the call; this function neither reads nor owns Rust memory.
+    // Linux UAPI: AT_FDCWD=-100; RENAME_NOREPLACE=1.
+    // SAFETY: the `renameat2` declaration matches the Linux UAPI
+    // (`int renameat2(int, const char *, int, const char *, unsigned int)`).
+    // Both pointers come from live `CString`s that outlive the call, so they
+    // are valid NUL-terminated strings; the kernel only reads path bytes and
+    // never takes ownership of Rust memory. `last_os_error` is read before any
+    // other syscall on the failure path.
     let result = unsafe { renameat2(-100, source.as_ptr(), -100, destination.as_ptr(), 1) };
     if result == 0 {
         Ok(())

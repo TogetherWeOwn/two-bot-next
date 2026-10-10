@@ -660,6 +660,30 @@ describe("idle buckets expire but throttles never reset", () => {
     assert.ok(buckets.take("hot").allowed);
   });
 
+  test("peek reports exhaustion without consuming or minting entries", async () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 2, refillPerSecond: 1 },
+      () => now,
+    );
+    // Unknown callers peek allowed without minting an entry.
+    assert.ok(buckets.peek("fresh").allowed);
+    assert.equal(buckets.size, 0);
+    // Peek on a fresh budget consumes nothing: two takes still succeed.
+    assert.ok(buckets.peek("fresh").allowed);
+    assert.ok(buckets.take("fresh").allowed);
+    assert.ok(buckets.take("fresh").allowed);
+    // Exhausted: peek denies with a retry-after and consumes nothing further.
+    const denied = buckets.peek("fresh");
+    assert.ok(!denied.allowed);
+    assert.ok(denied.retryAfter >= 1);
+    assert.ok(!buckets.take("fresh").allowed);
+    assert.ok(!buckets.peek("fresh").allowed);
+    now += 1_100;
+    assert.ok(buckets.peek("fresh").allowed);
+    assert.ok(buckets.take("fresh").allowed);
+  });
+
   test("a sub-refill idle TTL is clamped to the full-refill window", async () => {
     let now = 1_000_000;
     const buckets = new TokenBuckets(

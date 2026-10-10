@@ -1,6 +1,9 @@
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use two_bot_core::commands::{CommandDefinition, HELP_DESCRIPTION, OCCURRENCE_ID_MAX_CHARS};
+use two_bot_core::custom_commands::{
+    MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
+};
 use two_bot_core::router::{InteractionRouter, RouterGates};
 
 pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
@@ -15,6 +18,8 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("rsvp-attendance", "docs/parity.md §1 #25 copy"),
     ("lfg", "docs/parity.md §1 #26 copy"),
     ("lfg-close", "docs/parity.md §1 #27 copy"),
+    ("command", "docs/parity.md §1 #14 caps"),
+    ("command-remove", "docs/parity.md §1 #15 caps"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -89,6 +94,56 @@ pub fn expected_registry() -> Value {
         assert_eq!(duration["min_value"], json!(60));
         assert!(duration["max_value"].is_null());
         duration["max_value"] = json!(max);
+    }
+    // Custom-command caps: advertise ONLY max_length matching the runtime
+    // validators; every other field stays legacy-identical.
+    for (name, option_name, max, reference) in [
+        (
+            "command",
+            "name",
+            MAX_COMMAND_NAME_CHARS,
+            "docs/parity.md §1 #14 caps",
+        ),
+        (
+            "command",
+            "template",
+            MAX_TEMPLATE_CHARS,
+            "docs/parity.md §1 #14 caps",
+        ),
+        (
+            "command",
+            "description",
+            MAX_DESCRIPTION_CHARS,
+            "docs/parity.md §1 #14 caps",
+        ),
+        (
+            "command",
+            "text-trigger",
+            MAX_TEXT_TRIGGER_CHARS,
+            "docs/parity.md §1 #14 caps",
+        ),
+        (
+            "command-remove",
+            "name",
+            MAX_COMMAND_NAME_CHARS,
+            "docs/parity.md §1 #15 caps",
+        ),
+    ] {
+        let command = commands
+            .iter_mut()
+            .find(|c| c["name"] == name)
+            .expect(reference);
+        let opt = command["options"]
+            .as_array_mut()
+            .expect("legacy options array")
+            .iter_mut()
+            .find(|o| o["name"] == option_name)
+            .expect(reference);
+        assert!(
+            opt.get("max_length").is_none(),
+            "legacy has no max_length on {name} {option_name}"
+        );
+        opt["max_length"] = json!(max);
     }
     let rota = commands
         .iter()
