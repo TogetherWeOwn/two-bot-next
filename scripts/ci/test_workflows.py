@@ -25,6 +25,7 @@ JOB_INVENTORY = {
     "release.yml": {"release-please", "dispatch-checks", "sbom-target", "release-sbom",
                     "attach-sbom"},
     "staging-migrate.yml": {"plan", "claim", "apply"},
+    "production-migrate.yml": {"plan", "claim", "apply"},
     # TOG-14008: manual staging-only Worker rollback drill; pinned shape below.
     "staging-rollback-drill.yml": {"drill"},
     # Container-image backout/restore drill: manual, staging-only, pinned shape below.
@@ -173,11 +174,23 @@ def staging_dispatch_errors(workflow):
     return errors
 
 
-def staging_claim_errors(claim):
-    """Claim transport must complete before the protected apply job waits."""
+def staging_claim_errors(claim, name="staging-migrate.yml",
+                           job_name="staging-migrate (claim)",
+                           manifest="staging-migrate-manifest",
+                           claim_artifact="staging-migrate-apply-claim",
+                           script="scripts/ci/staging_migrate_claim.py",
+                           host_env="STAGING_HOST", host_input="staging_host",
+                           db_env="STAGING_DATABASE", db_input="staging_database",
+                           branch_env="STAGING_BRANCH_ID", branch_input="staging_branch_id"):
+    """Claim transport must complete before the protected apply job waits.
+
+    Parametrized by workflow name, job identity, artifact names, publisher
+    script and host/database/branch env/input names so the production mirror
+    pins the same shape with its own names (production passes no branch pin).
+    """
     errors = []
-    prefix = "staging-migrate.yml:claim:"
-    if claim.get("name") != "staging-migrate (claim)":
+    prefix = f"{name}:claim:"
+    if claim.get("name") != job_name:
         errors.append(f"{prefix} consumer job identity changed")
     if "environment" in claim or "secrets." in str(claim) or "uses" in claim:
         errors.append(f"{prefix} must be unprotected with no secrets or reusable job")
@@ -196,28 +209,50 @@ def staging_claim_errors(claim):
             or checkout.get("with") != {"persist-credentials": "false", "ref": "${{ github.sha }}"}):
         errors.append(f"{prefix} checkout must pin the workflow head without persisted credentials")
     if (not str(fetch.get("uses", "")).startswith("actions/download-artifact@")
-            or fetch.get("with") != {"name": "staging-migrate-manifest", "path": "current-plan"}):
+            or fetch.get("with") != {"name": manifest, "path": "current-plan"}):
         errors.append(f"{prefix} must read this dispatch's plan artifact, not an arbitrary run")
-    expected_env = {key: "${{ inputs." + value + " }}" for key, value in (
-        ("MODE", "mode"), ("SOURCE_SHA", "source_sha"), ("STAGING_HOST", "staging_host"),
-        ("STAGING_DATABASE", "staging_database"), ("RECOVERY_REF", "recovery_evidence_ref"),
-        ("ACL_REF", "acl_plan_ref"), ("EXPECTED_PENDING", "expected_pending"),
-        ("PLAN_MANIFEST_SHA256", "plan_manifest_sha256"), ("PLAN_RUN_ID", "plan_run_id"))}
+    pairs = [("MODE", "mode"), ("SOURCE_SHA", "source_sha"), (host_env, host_input),
+             (db_env, db_input)]
+    if branch_env is not None and branch_input is not None:
+        pairs.append((branch_env, branch_input))
+    pairs.extend([("RECOVERY_REF", "recovery_evidence_ref"),
+                  ("ACL_REF", "acl_plan_ref"), ("EXPECTED_PENDING", "expected_pending"),
+                  ("PLAN_MANIFEST_SHA256", "plan_manifest_sha256"),
+                  ("PLAN_RUN_ID", "plan_run_id")])
+    expected_env = {key: "${{ inputs." + value + " }}" for key, value in pairs}
     if publish.get("env") != expected_env or publish.get("shell") != "bash":
         errors.append(f"{prefix} must pass exactly the dispatch fields via env, in bash")
-    script = str(publish.get("run", ""))
-    for pin in ("set -o pipefail", "python3 scripts/ci/staging_migrate_claim.py",
-                "--manifest current-plan/staging-migrate-manifest.json",
-                "--output staging-migrate-apply-claim.json"):
-        if pin not in script:
+    script_text = str(publish.get("run", ""))
+    for pin in ("set -o pipefail", f"python3 {script}",
+                f"--manifest current-plan/{manifest}.json",
+                f"--output {claim_artifact}.json"):
+        if pin not in script_text:
             errors.append(f"{prefix} missing publisher pin {pin}")
     if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
         errors.append(f"{prefix} must upload the claim")
     options = upload.get("with", {})
-    if options != {"name": "staging-migrate-apply-claim", "path": "staging-migrate-apply-claim.json",
+    if options != {"name": claim_artifact, "path": f"{claim_artifact}.json",
                    "if-no-files-found": "error", "retention-days": "14", "compression-level": "0"}:
         errors.append(f"{prefix} must publish the named claim with stored ZIP entries and fail if absent")
     return errors
+
+
+def production_claim_errors(claim):
+    """Production mirror of the claim transport (production-migrate.yml)."""
+    return staging_claim_errors(
+        claim,
+        name="production-migrate.yml",
+        job_name="production-migrate (claim)",
+        manifest="production-migrate-manifest",
+        claim_artifact="production-migrate-apply-claim",
+        script="scripts/ci/production_migrate_claim.py",
+        host_env="PRODUCTION_HOST",
+        host_input="production_host",
+        db_env="PRODUCTION_DATABASE",
+        db_input="production_database",
+        branch_env=None,
+        branch_input=None,
+    )
 
 
 def job_env_text(job):
@@ -226,34 +261,38 @@ def job_env_text(job):
                     + [str(step.get("env", "")) for step in job.get("steps", [])])
 
 
-def staging_migrate_errors(workflow):
-    """Manual staging-only SQLx migration runner (TOG-11572).
+def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
+                     migrator_secret, host_input, db_input, manifest,
+                     target_flag, host_flag, db_flag, other_host_flag,
+                     other_db_flag, other_plan_secret, other_migrator_secret,
+                     branch_input="staging_branch_id", branch_flag="--staging-branch-id",
+                     other_branch_flag=None):
+    """Parametrized migration-runner shape (staging and production mirrors).
 
-    Dispatch-only with exactly the nine reviewed inputs (plan/apply
-    defaulting to plan, the six identity/evidence inputs required, the
-    plan-bound expected_pending list optional at dispatch but required by the
-    runner for apply, and the plan_manifest_sha256/plan_run_id pair optional
-    at dispatch but required by the runner for apply). Three jobs: `plan` always
-    runs through the no-reviewer staging-migrate-plan environment, reads only
-    the read-only TWO_BOT_STAGING_PLAN_DATABASE_URL binding, and uploads
-    the manifest artifact; unprotected `claim` transports the apply request;
-    `apply` runs only for mode=apply after a green plan and claim
-    through the reviewed staging-migrate-apply environment, reads only the
-    migrator TWO_BOT_STAGING_MIGRATOR_DATABASE_URL binding, and passes the
-    plan-bound inputs to the runner. Each job pins main-branch dispatch, its
-    own routed runner, and the pipefail Run step. No push/pull_request/schedule
-    trigger, no production path, no wrangler/probe markers: anything else is
-    an activation route and must fail closed.
+    Dispatch-only with exactly the reviewed inputs (staging carries the
+    PlanetScale branch pin, production does not yet), three jobs
+    (plan always runs through the no-reviewer plan environment, unprotected
+    claim transports the apply request, apply runs only for mode=apply after a
+    green plan and claim through the reviewed apply environment), each job with
+    its own routed runner and pipefail Run step. No push/pull_request/schedule
+    trigger, no wrangler/probe markers. The caller supplies the workflow file
+    name, environment names, secret names, host/database/branch input names,
+    artifact prefix, runner target/host/database/branch flags and the other
+    target's flags and secrets (which must never appear). A None branch pin
+    skips the branch assertions for that target.
     """
-    name = "staging-migrate.yml"
     errors = []
     on = workflow.get("on") or {}
     if set(on) != {"workflow_dispatch"}:
         errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
     inputs = ((on.get("workflow_dispatch") or {}).get("inputs") or {})
-    expected = {"mode", "source_sha", "staging_host", "staging_database",
+    optional = {"mode", "expected_pending", "plan_manifest_sha256", "plan_run_id"}
+    expected = {"mode", "source_sha", host_input, db_input,
                 "recovery_evidence_ref", "acl_plan_ref", "expected_pending",
                 "plan_manifest_sha256", "plan_run_id"}
+    if branch_input is not None:
+        expected.add(branch_input)
+        optional.add(branch_input)
     if set(inputs) != expected:
         errors.append(f"{name}: workflow_dispatch inputs must be exactly {sorted(expected)}")
     else:
@@ -262,10 +301,17 @@ def staging_migrate_errors(workflow):
                 or set(mode.get("options") or []) != {"plan", "apply"}
                 or mode.get("default") != "plan"):
             errors.append(f"{name}: mode must be plan/apply defaulting to plan")
-        for key in expected - {"mode", "expected_pending", "plan_manifest_sha256", "plan_run_id"}:
+        for key in expected - optional:
             field = inputs.get(key) or {}
             if str(field.get("required")).lower() != "true":
                 errors.append(f"{name}: input {key} must be required")
+        if branch_input is not None:
+            branch = inputs.get(branch_input) or {}
+            if (str(branch.get("required")).lower() != "false"
+                    or branch.get("default") != ""
+                    or "branch" not in str(branch.get("description")).lower()):
+                errors.append(f"{name}: {branch_input} must stay optional, default empty, "
+                              "and documented as the PlanetScale branch pin")
         pending = inputs.get("expected_pending") or {}
         if (str(pending.get("required")).lower() != "false"
                 or pending.get("default") != ""
@@ -285,20 +331,22 @@ def staging_migrate_errors(workflow):
         if "bare" not in str(acl.get("description")).lower():
             errors.append(f"{name}: acl_plan_ref must document the bare reference contract "
                           "(refused before any DDL otherwise)")
+        host_desc = inputs.get(host_input) or {}
+        if "binding must match" not in str(host_desc.get("description")).lower():
+            errors.append(f"{name}: {host_input} must document the binding-match contract")
     jobs = workflow.get("jobs") or {}
     if set(jobs) != {"plan", "claim", "apply"}:
         errors.append(f"{name}: jobs must be exactly plan, claim and apply")
         return errors
     plan, claim, apply = jobs.get("plan", {}), jobs.get("claim", {}), jobs.get("apply", {})
-    errors.extend(staging_claim_errors(claim))
-    if plan.get("environment") != "staging-migrate-plan":
-        errors.append(f"{name}:plan: must read the staging-migrate-plan Environment binding")
-    if apply.get("environment") != "staging-migrate-apply":
-        errors.append(f"{name}:apply: must read the staging-migrate-apply Environment binding")
-    # Token-permission check (TOG-15157 gap 2): the plan job produces the
-    # manifest with contents:read only, while apply additionally needs
-    # actions:read -- and nothing more -- to fetch the producing plan run's
-    # manifest artifact for the provenance gate.
+    if name == "staging-migrate.yml":
+        errors.extend(staging_claim_errors(claim))
+    else:
+        errors.extend(production_claim_errors(claim))
+    if plan.get("environment") != plan_env:
+        errors.append(f"{name}:plan: must read the {plan_env} Environment binding")
+    if apply.get("environment") != apply_env:
+        errors.append(f"{name}:apply: must read the {apply_env} Environment binding")
     if plan.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:plan: must keep contents:read only (it produces the manifest)")
     if apply.get("permissions") != {"contents": "read", "actions": "read"}:
@@ -323,31 +371,43 @@ def staging_migrate_errors(workflow):
             if step.get("shell") != "bash" or "set -o pipefail" not in str(step.get("run", "")):
                 errors.append(f"{name}:{job_id}: Run step must use a pipefail shell so a "
                               "migrator refusal/failure fails the job instead of reporting green")
-    # Whole-job scope (job `env` plus every step `env`): a secret exported at
-    # job level reaches every step, so a step-only scan would miss it.
-    plan_env = job_env_text(plan)
-    apply_env = job_env_text(apply)
-    # Plan is physically read-only: it reads only the RO binding and must never
-    # see the migrator credential; apply reads only the migrator binding. The
-    # absence checks scan the entire job mapping (env, run, with, ...), since
-    # secret names are case-insensitive and any key can carry a `secrets.*`.
+    plan_env_text = job_env_text(plan)
+    apply_env_text = job_env_text(apply)
     plan_job, apply_job = str(plan).lower(), str(apply).lower()
-    if "TWO_BOT_STAGING_PLAN_DATABASE_URL" not in plan_env:
-        errors.append(f"{name}:plan: must read only the TWO_BOT_STAGING_PLAN_DATABASE_URL binding")
-    if "two_bot_staging_migrator_database_url" in plan_job:
-        errors.append(f"{name}:plan: must never read the migrator TWO_BOT_STAGING_MIGRATOR_DATABASE_URL binding")
-    if "TWO_BOT_STAGING_MIGRATOR_DATABASE_URL" not in apply_env:
-        errors.append(f"{name}:apply: must read only the TWO_BOT_STAGING_MIGRATOR_DATABASE_URL binding")
-    if "two_bot_staging_plan_database_url" in apply_job:
-        errors.append(f"{name}:apply: must never read the plan TWO_BOT_STAGING_PLAN_DATABASE_URL binding")
+    if plan_secret not in plan_env_text:
+        errors.append(f"{name}:plan: must read only the {plan_secret} binding")
+    if migrator_secret.lower() in plan_job:
+        errors.append(f"{name}:plan: must never read the migrator {migrator_secret} binding")
+    if migrator_secret not in apply_env_text:
+        errors.append(f"{name}:apply: must read only the {migrator_secret} binding")
+    if plan_secret.lower() in apply_job:
+        errors.append(f"{name}:apply: must never read the plan {plan_secret} binding")
+    # Cross-target isolation: a staging job never reads a production binding
+    # and a production job never reads a staging binding, in any case or key.
+    for other in (other_plan_secret.lower(), other_migrator_secret.lower()):
+        if other in plan_job:
+            errors.append(f"{name}:plan: must never read the other target's {other} binding")
+        if other in apply_job:
+            errors.append(f"{name}:apply: must never read the other target's {other} binding")
     for job_id, text in (("plan", plan_job), ("apply", apply_job)):
         if "tojson(secrets" in text.replace(" ", "") or "secrets[" in text.replace(" ", ""):
             errors.append(f"{name}:{job_id}: must name each secret explicitly "
                           "(no toJSON(secrets) or indexed secrets access)")
     plan_runs = " ".join(str(step.get("run", "")) for step in plan.get("steps", []))
     apply_runs = " ".join(str(step.get("run", "")) for step in apply.get("steps", []))
-    # Match the standalone mode flag: the plan-binding flags
-    # (--plan-manifest-sha256, --plan-run-id) share the --plan prefix.
+    if target_flag not in plan_runs or target_flag not in apply_runs:
+        errors.append(f"{name}: must run the migrator with {target_flag} on both jobs")
+    if other_host_flag in plan_runs or other_host_flag in apply_runs:
+        errors.append(f"{name}: must never pass the other target's {other_host_flag} flag")
+    if other_db_flag in plan_runs or other_db_flag in apply_runs:
+        errors.append(f"{name}: must never pass the other target's {other_db_flag} flag")
+    if other_branch_flag is not None and (other_branch_flag in plan_runs
+                                          or other_branch_flag in apply_runs):
+        errors.append(f"{name}: must never pass the other target's {other_branch_flag} flag")
+    if host_flag not in plan_runs or host_flag not in apply_runs:
+        errors.append(f"{name}: must pass {host_flag} to the runner on both jobs")
+    if db_flag not in plan_runs or db_flag not in apply_runs:
+        errors.append(f"{name}: must pass {db_flag} to the runner on both jobs")
     if "--plan " not in plan_runs or "--apply" in plan_runs:
         errors.append(f"{name}:plan: must run the migrator with --plan only")
     if "--apply " not in apply_runs or "--plan " in apply_runs:
@@ -356,16 +416,19 @@ def staging_migrate_errors(workflow):
         errors.append(f"{name}:apply: must pass the plan-bound manifest hash and run id to the runner")
     if "--plan-manifest-sha256" in plan_runs or "--plan-run-id" in plan_runs:
         errors.append(f"{name}:plan: must not take plan-bound inputs (it produces the manifest)")
-    # Provenance anchor (TOG-15157 gap 2): apply fetches the producing plan
-    # run's manifest artifact by run id and hands it to the runner, which
-    # refuses unless the artifact carries the bound hash. The fetch must fail
-    # the job (no continue-on-error) so a wrong run id or missing artifact
-    # fails before the runner -- and before any DDL -- ever starts. Plan must
-    # not fetch by run id: it produces the manifest.
     if "--plan-manifest-path" not in apply_runs:
         errors.append(f"{name}:apply: must pass the producing run's downloaded manifest to the runner")
     if "--plan-manifest-path" in plan_runs:
         errors.append(f"{name}:plan: must not take the provenance manifest path (it produces the manifest)")
+    # PlanetScale branch pin: a target that declares the pin passes the
+    # non-secret branch id to the runner on both jobs; the runner requires it
+    # for `*.psdb.cloud` hosts and refuses pooled ports, `|bouncer` usernames
+    # and branch mismatches before any DDL.
+    if branch_flag is not None:
+        if branch_flag not in plan_runs:
+            errors.append(f"{name}:plan: must pass the staging branch pin to the runner")
+        if branch_flag not in apply_runs:
+            errors.append(f"{name}:apply: must pass the staging branch pin to the runner")
     apply_fetch = [step for step in apply.get("steps", [])
                    if str(step.get("uses", "")).startswith("actions/download-artifact@")]
     if len(apply_fetch) != 1:
@@ -373,26 +436,71 @@ def staging_migrate_errors(workflow):
     else:
         fetch = apply_fetch[0]
         fetch_with = fetch.get("with", {})
-        if fetch_with.get("name") != "staging-migrate-manifest":
-            errors.append(f"{name}:apply: must fetch the staging-migrate-manifest artifact")
+        if fetch_with.get("name") != manifest:
+            errors.append(f"{name}:apply: must fetch the {manifest} artifact")
         if "plan_run_id" not in str(fetch_with.get("run-id", "")):
             errors.append(f"{name}:apply: must fetch the artifact from the plan_run_id run")
         if fetch.get("continue-on-error") is True:
             errors.append(f"{name}:apply: the provenance fetch must fail the job, never continue-on-error")
     plan_uses = [step.get("uses", "") for step in plan.get("steps", [])]
     if not any(str(u).startswith("actions/upload-artifact@") for u in plan_uses):
-        errors.append(f"{name}:plan: must upload the staging-migrate-manifest.json run artifact")
+        errors.append(f"{name}:plan: must upload the {manifest}.json run artifact")
     if any(str(step.get("uses", "")).startswith("actions/download-artifact@")
            for step in plan.get("steps", [])):
         errors.append(f"{name}:plan: must not fetch artifacts by run id (it produces the manifest)")
     plan_text = str(plan.get("steps", []))
-    if "staging-migrate-manifest" not in plan_text:
-        errors.append(f"{name}:plan: must name the staging-migrate-manifest artifact")
+    if manifest not in plan_text:
+        errors.append(f"{name}:plan: must name the {manifest} artifact")
     uploads = [step for step in plan.get("steps", [])
                if str(step.get("uses", "")).startswith("actions/upload-artifact@")]
     if len(uploads) != 1 or uploads[0].get("with", {}).get("compression-level") != "0":
         errors.append(f"{name}:plan: must upload the manifest with stored ZIP entries")
     return errors
+
+
+def staging_migrate_errors(workflow, name="staging-migrate.yml",
+                           plan_env="staging-migrate-plan", apply_env="staging-migrate-apply",
+                           plan_secret="TWO_BOT_STAGING_PLAN_DATABASE_URL",
+                           migrator_secret="TWO_BOT_STAGING_MIGRATOR_DATABASE_URL",
+                           host_input="staging_host", db_input="staging_database",
+                           manifest="staging-migrate-manifest",
+                           target_flag="--target staging", host_flag="--staging-host",
+                           db_flag="--staging-database", other_host_flag="--production-host",
+                           other_db_flag="--production-database",
+                           other_plan_secret="TWO_BOT_PRODUCTION_PLAN_DATABASE_URL",
+                           other_migrator_secret="TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL"):
+    """Manual staging-only SQLx migration runner. Parametrized by name,
+    environments and secret names so the production mirror pins the same shape.
+    """
+    return migrate_errors(workflow, name=name, plan_env=plan_env, apply_env=apply_env,
+                          plan_secret=plan_secret, migrator_secret=migrator_secret,
+                          host_input=host_input, db_input=db_input, manifest=manifest,
+                          target_flag=target_flag, host_flag=host_flag, db_flag=db_flag,
+                          other_host_flag=other_host_flag, other_db_flag=other_db_flag,
+                          other_plan_secret=other_plan_secret,
+                          other_migrator_secret=other_migrator_secret)
+
+
+def production_migrate_errors(workflow):
+    """Production mirror of the migration-runner shape.
+
+    Production declares no branch pin yet (the runner fails closed on
+    `*.psdb.cloud` hosts until a production branch pin lands), so the
+    branch assertions are skipped for this target.
+    """
+    return migrate_errors(workflow, name="production-migrate.yml",
+                          plan_env="production-migrate-plan", apply_env="production-migrate-apply",
+                          plan_secret="TWO_BOT_PRODUCTION_PLAN_DATABASE_URL",
+                          migrator_secret="TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL",
+                          host_input="production_host", db_input="production_database",
+                          manifest="production-migrate-manifest",
+                          target_flag="--target production", host_flag="--production-host",
+                          db_flag="--production-database", other_host_flag="--staging-host",
+                          other_db_flag="--staging-database",
+                          other_plan_secret="TWO_BOT_STAGING_PLAN_DATABASE_URL",
+                          other_migrator_secret="TWO_BOT_STAGING_MIGRATOR_DATABASE_URL",
+                          branch_input=None, branch_flag=None,
+                          other_branch_flag="--staging-branch-id")
 
 
 ROLLBACK_DRILL_ENV = {
@@ -767,10 +875,16 @@ def workflow_policy_errors(workflows):
             errors.extend(staging_events_read_errors(workflow))
             continue
         if name == "staging-migrate.yml":
-            # Manual runner (TOG-11572): pinned shape above, not the
+            # Manual runner: pinned shape above, not the
             # staging-deploy policy. The generic environment/marker scan
             # below would flag its staging-migrate Environment binding.
             errors.extend(staging_migrate_errors(workflow))
+            continue
+        if name == "production-migrate.yml":
+            # Manual production runner: pinned shape above, not the
+            # staging-deploy policy. The generic environment/marker scan
+            # below would flag its production-migrate Environment binding.
+            errors.extend(production_migrate_errors(workflow))
             continue
         for job_id, job in jobs.items():
             if name == "deploy-staging.yml" and job_id == "deploy":
@@ -1139,6 +1253,135 @@ class WorkflowTests(unittest.TestCase):
                     w["jobs"][job_id]["permissions"] = permissions
                 self.assertTrue(mutated(change))
 
+    def test_production_migrate_runner_shape_is_pinned(self):
+        # Production mirror of the staging runner: same three jobs, same pinned
+        # actions, routed runner, pipefail and provenance gates, with
+        # production names, environments, secrets and --target production.
+        migrate = self.workflows["production-migrate.yml"]
+        self.assertEqual(production_migrate_errors(migrate), [])
+        self.assertEqual(staging_migrate_errors(self.workflows["staging-migrate.yml"]), [])
+        self.assertEqual(workflow_policy_errors(self.workflows), [])
+
+        def mutated(change):
+            workflow = deepcopy(migrate)
+            change(workflow)
+            return production_migrate_errors(workflow)
+
+        for trigger in ("push", "pull_request", "schedule", "workflow_call"):
+            with self.subTest(trigger=trigger):
+                self.assertTrue(mutated(lambda w, t=trigger: w["on"].update({t: ""})))
+        for missing in ("acl_plan_ref", "plan_manifest_sha256", "plan_run_id",
+                        "production_host", "production_database"):
+            with self.subTest(missing=missing):
+                def drop(w, missing=missing):
+                    del w["on"]["workflow_dispatch"]["inputs"][missing]
+                self.assertTrue(mutated(drop))
+        # Staging inputs must not appear on the production workflow.
+        for staging_input in ("staging_host", "staging_database", "staging_branch_id"):
+            with self.subTest(staging_input=staging_input):
+                def add(w, staging_input=staging_input):
+                    w["on"]["workflow_dispatch"]["inputs"][staging_input] = {"required": True}
+                self.assertTrue(mutated(add))
+        with self.subTest(mode="apply-default"):
+            def widen(w):
+                w["on"]["workflow_dispatch"]["inputs"]["mode"]["default"] = "apply"
+            self.assertTrue(mutated(widen))
+        with self.subTest(missing="apply-job"):
+            def drop(w):
+                del w["jobs"]["apply"]
+            self.assertTrue(mutated(drop))
+        for job_id in ("plan", "apply"):
+            for key, value in (("environment", None),
+                               ("environment", "staging-migrate-plan"),
+                               ("environment", "staging-migrate-apply"),
+                               ("if", None), ("if", "${{ always() }}"),
+                               ("runs-on", "ubuntu-latest")):
+                with self.subTest(job=job_id, job_key=key, value=value):
+                    def change(w, key=key, value=value, job_id=job_id):
+                        job = w["jobs"][job_id]
+                        if value is None:
+                            job.pop(key, None)
+                        else:
+                            job[key] = value
+                    self.assertTrue(mutated(change))
+        # Target isolation: the runner flag and host/database flags must be
+        # production, never staging; dropping them or swapping them fails.
+        with self.subTest(target="missing"):
+            def drop_target(w):
+                for job in w["jobs"].values():
+                    for step in job.get("steps", []):
+                        if "--target production" in str(step.get("run", "")):
+                            step["run"] = step["run"].replace("--target production", "")
+            self.assertTrue(mutated(drop_target))
+        for wrong in ("--target staging", "--staging-host", "--staging-database"):
+            with self.subTest(wrong=wrong):
+                def widen(w, wrong=wrong):
+                    for step in w["jobs"]["plan"]["steps"]:
+                        if "tee" in str(step.get("run", "")):
+                            step["run"] = step["run"].replace("--production-host", wrong) \
+                                if "host" in wrong else step["run"].replace("--target production", wrong)
+                self.assertTrue(mutated(widen))
+        # Credential split holds for the whole job mapping, including
+        # cross-target leaks: a production job never reads a staging binding.
+        prod_migrator = "${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}"
+        prod_plan = "${{ secrets.TWO_BOT_PRODUCTION_PLAN_DATABASE_URL }}"
+        staging_migrator = "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"
+        staging_plan = "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}"
+        for job_id, wrong_secret in (("plan", prod_migrator), ("apply", prod_plan),
+                                     ("plan", staging_migrator), ("plan", staging_plan),
+                                     ("apply", staging_migrator), ("apply", staging_plan)):
+            with self.subTest(job=job_id, wrong_binding="leak"):
+                def leak(w, job_id=job_id, wrong_secret=wrong_secret):
+                    w["jobs"][job_id].setdefault("env", {})["LEAK"] = wrong_secret
+                self.assertTrue(mutated(leak))
+        with self.subTest(plan="no-own-binding"):
+            def drop(w):
+                job = w["jobs"]["plan"]
+                for step in job["steps"]:
+                    step.get("env", {}).pop("TWO_BOT_PRODUCTION_PLAN_DATABASE_URL", None)
+            self.assertTrue(mutated(drop))
+        with self.subTest(apply="no-needs"):
+            def drop(w):
+                del w["jobs"]["apply"]["needs"]
+            self.assertTrue(mutated(drop))
+        with self.subTest(environments="swapped"):
+            def swap(w):
+                w["jobs"]["plan"]["environment"] = "production-migrate-apply"
+                w["jobs"]["apply"]["environment"] = "production-migrate-plan"
+            self.assertTrue(mutated(swap))
+        with self.subTest(apply="no-plan-hash-flag"):
+            def drop_hash(w):
+                for step in w["jobs"]["apply"]["steps"]:
+                    if "--plan-manifest-sha256" in str(step.get("run", "")):
+                        step["run"] = step["run"].replace("--plan-manifest-sha256 \"$PLAN_MANIFEST_SHA256\" ", "")
+            self.assertTrue(mutated(drop_hash))
+        with self.subTest(apply="no-provenance-fetch"):
+            def drop_fetch(w):
+                w["jobs"]["apply"]["steps"] = [
+                    step for step in w["jobs"]["apply"]["steps"]
+                    if "download-artifact" not in str(step.get("uses", ""))
+                ]
+            self.assertTrue(mutated(drop_fetch))
+        with self.subTest(apply="no-provenance-path-flag"):
+            def drop_path(w):
+                for step in w["jobs"]["apply"]["steps"]:
+                    if "--plan-manifest-path" in str(step.get("run", "")):
+                        step["run"] = step["run"].replace(
+                            " --plan-manifest-path producing-plan/production-migrate-manifest.json", "")
+            self.assertTrue(mutated(drop_path))
+        # Production and staging stay mirrors: same job ids, same step counts,
+        # same pinned actions and container, differing only by the documented
+        # production prefix (names, envs, secrets, artifacts, flags).
+        staging = self.workflows["staging-migrate.yml"]
+        self.assertEqual(set(migrate["jobs"]), set(staging["jobs"]))
+        for job_id in ("plan", "claim", "apply"):
+            with self.subTest(mirror=job_id):
+                prod_job, stag_job = migrate["jobs"][job_id], staging["jobs"][job_id]
+                self.assertEqual(len(prod_job.get("steps", [])), len(stag_job.get("steps", [])))
+                self.assertEqual(prod_job.get("permissions"), stag_job.get("permissions"))
+                self.assertEqual(prod_job.get("if"), stag_job.get("if"))
+                self.assertEqual(prod_job.get("runs-on"), stag_job.get("runs-on").replace("staging", "production") if "staging" in str(stag_job.get("runs-on")) else stag_job.get("runs-on"))
+
     def test_staging_rollback_drill_shape_is_pinned(self):
         workflows = self.workflows
         self.assertEqual(staging_rollback_drill_errors(workflows["staging-rollback-drill.yml"]), [])
@@ -1378,8 +1621,9 @@ class WorkflowTests(unittest.TestCase):
                     expected = {"contents": "read"}
                     if (name, job_id) == ("supply-chain.yml", "pr-lint"):
                         expected["pull-requests"] = "read"
-                    elif (name, job_id) == ("staging-migrate.yml", "apply"):
-                        # TOG-15157: read-only fetch of the producing plan
+                    elif (name, job_id) in (("staging-migrate.yml", "apply"),
+                                                 ("production-migrate.yml", "apply")):
+                        # Read-only fetch of the producing plan
                         # run's manifest artifact for the provenance gate.
                         expected = {"contents": "read", "actions": "read"}
                     elif (name, job_id) == ("deploy-production.yml", "guard"):

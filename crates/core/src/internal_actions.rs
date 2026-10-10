@@ -82,6 +82,7 @@ pub const MAX_MESSAGE_CHARS: usize = 2000;
 pub const MAX_EVENT_NAME_CHARS: usize = 100;
 /// Discord's own event-description ceiling.
 pub const MAX_EVENT_DESCRIPTION_CHARS: usize = 1000;
+pub const MAX_EVENT_LOCATION_CHARS: usize = 100;
 /// Ceiling on one stored setting: a dashboard field needing more is not a
 /// setting, and the cap keeps one signed request from filling the table.
 pub const MAX_SETTING_VALUE_BYTES: usize = 8192;
@@ -1233,7 +1234,15 @@ pub fn validate_event_input(
             }
         }
     } else {
-        EventPlace::Location(require_field_str(body, "location")?.to_owned())
+        let location = require_field_str(body, "location")?;
+        if utf16_len(location) > MAX_EVENT_LOCATION_CHARS {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                format!(r#""location" is longer than {MAX_EVENT_LOCATION_CHARS} characters"#),
+                "location_too_long",
+            ));
+        }
+        EventPlace::Location(location.to_owned())
     };
     Ok(EventInput {
         name: name.to_owned(),
@@ -2739,14 +2748,15 @@ mod tests {
 
     #[test]
     fn catalog_counts_match_legacy_census() {
-        // Shared legacy census: hot 41 / cold 28 / env_only 48, plus the
+        // Shared legacy census: hot 42 / cold 27 / env_only 48, plus the
         // receiver's combined bind, caller mapping and container marker
         // (all env-only), plus the two template-assistant endpoint keys
         // (both env-only). Count actual entries, not just representatives
-        // of each class.
+        // of each class. TOG-19027 moves TWO_FEED_POLL_SECONDS from cold
+        // to hot, shifting one entry between those classes.
         for (class, expected) in [
-            (SettingClass::Hot, 41),
-            (SettingClass::Cold, 28),
+            (SettingClass::Hot, 42),
+            (SettingClass::Cold, 27),
             (SettingClass::EnvOnly, 53),
         ] {
             assert_eq!(

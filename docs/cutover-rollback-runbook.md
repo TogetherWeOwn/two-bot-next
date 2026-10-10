@@ -131,17 +131,37 @@ come from [cutover.md](cutover.md) §§Registry swap and Rollback.
   and container images. The checked-in Worker configuration declares no
   custom routes or domains; the invite-redirect snapshot is Worker
   configuration, not DNS.
-- Revert by dispatching the production workflow with the previous Worker
-  version ID recorded in the watch header. The guard requires a full
-  commit on the main branch with green checks and a successful staging
-  run, plus reviewer approval; the workflow fails unless the target
-  version serves 100% of traffic, then re-runs the `/health` 200 and
-  truthful-`/readyz` gate.
+- The production workflow dispatch below is the single production
+  rollback method. Revert by dispatching the production workflow with
+  `takeover: true` and the previous Worker version ID recorded in the
+  watch header. The guard requires a full commit on the main branch
+  with green checks and a successful staging run, plus reviewer
+  approval; the workflow fails unless the target version serves 100%
+  of traffic, then re-runs the `/health` 200 and the build-identity
+  `/readyz` gate. The gate proves the rolled-back revision serves only
+  after the takeover order releases the fence: fenced answers carry no
+  build fields and fail the gate by design
+  ([production-deploy.md](production-deploy.md#build-identity-and-the-readyz-gate)).
+  Coverage: §7 below is a dry-walk that checked this route without
+  executing a rollback or deploy; the staging rollback drill
+  ([ci-security.md](ci-security.md#staging-rollback-drill-manual),
+  [runbook.md](runbook.md#worker-version-rollback)) rehearses fence,
+  unforced deployment with immediate Durable Object update, takeover
+  and restore, which differs from production's `rollback --yes`
+  (auto-confirms the changed-secrets prompt) with deferred Durable
+  Object default.
 - A Worker-version rollback does **not** rebuild the container image or
-  rewind data. When the Rust image is the fault, redeploy the
-  known-good reviewed source and image pair with the full deploy path,
-  only after confirming it supports the current schema and bindings,
-  then confirm the running image separately.
+  rewind data. A standalone full redeploy of a known-good pair is
+  **superseded as a production rollback path**: when the Rust image is
+  the fault, dispatch the same production workflow in deploy mode with
+  `takeover: true` and the prior good SHA (guard, takeover order and
+  `/readyz` build-identity gate apply unchanged), only after confirming
+  it supports the current schema and bindings, then confirm the running
+  image separately. That deploy-mode path has no production drill
+  record; the closest analogue is the digest-pinned full-rollout
+  staging container drill in
+  [runbook.md](runbook.md#worker-version-rollback), which is not a
+  production dispatch.
 - Never roll back to a pre-fence wrapper version: it ignores the
   persisted ownership record and can restart an unauthorized gateway.
   Keep a reviewed fence-capable known-good pair recorded before rollout.
@@ -158,9 +178,20 @@ come from [cutover.md](cutover.md) §§Registry swap and Rollback.
   completion or claim state, including Next-created records with no
   legacy counterpart. An unsupported mapping blocks reopening; it never
   permits dropping those records.
-- **Maximum accepted loss: zero acknowledged committed writes** over the
-  whole Next window. Restoring to the freeze baseline alone loses that
-  window and is not an acceptable rollback.
+- **Maximum accepted loss (pre-cutover rule): zero acknowledged committed
+  writes** over the whole Next window. Restoring to the freeze baseline
+  alone loses that window and is not an acceptable rollback. Once the
+  cutover lead declares production live, Decision D5 below supersedes this
+  gate for rollback inside the 2-hour window.
+- **Decision D5 (live cutover, declared by the cutover lead in the
+  live-cutover declaration with its recorded reason and loss statement —
+  see §1 Decider):** the production cutover is live. Production
+  is the PlanetScale main database `two_bot`. Writes made during the Next
+  window are accepted as lost on rollback, bounded by a 2-hour rollback
+  decision window; during that window this decision supersedes the
+  zero-loss gate above. After that window it is forward-fix only, never
+  rollback. Mitigation is the pre-cutover PlanetScale backup plus the
+  untouched Coolify `twobot` database. See [cutover.md](cutover.md#rollback-preserve-next-window-writes-before-reopening-legacy).
 - **Allocator gate:** reconcile every imported generated-key allocator,
   including high-water marks, deleted IDs and sequence semantics, and
   prove the next allocation cannot collide before releasing any writer.

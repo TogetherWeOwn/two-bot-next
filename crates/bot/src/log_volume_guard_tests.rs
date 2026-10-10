@@ -28,7 +28,7 @@ struct EventCap {
 }
 
 /// One row per `metrics::EVENTS` entry, in the same order.
-const EVENT_CAPS: [EventCap; 20] = [
+const EVENT_CAPS: [EventCap; 21] = [
     EventCap {
         label: "READY",
         class: VolumeClass::Session,
@@ -100,6 +100,11 @@ const EVENT_CAPS: [EventCap; 20] = [
         shed_order: Some(4),
     },
     EventCap {
+        label: "PRESENCE_UPDATE",
+        class: VolumeClass::Hot,
+        shed_order: Some(8),
+    },
+    EventCap {
         label: "INVITE_CREATE",
         class: VolumeClass::Steady,
         shed_order: None,
@@ -127,7 +132,7 @@ const EVENT_CAPS: [EventCap; 20] = [
     EventCap {
         label: "other",
         class: VolumeClass::Hot,
-        shed_order: Some(8),
+        shed_order: Some(9),
     },
 ];
 
@@ -206,6 +211,66 @@ const DISPATCH_LANE_CAPS: [&str; 6] = [
     "busy",
     "reactions",
 ];
+/// One row per `metrics::VOICE_VOTE_KICK_OUTCOMES` entry, in the same order.
+/// A new vote-kick outcome fails here until it gets a budget row in the guard
+/// doc.
+const VOTE_KICK_CAP_OUTCOMES: [&str; 26] = [
+    "started",
+    "evidence_unavailable",
+    "not_a_room",
+    "initiator_not_occupant",
+    "target_not_occupant",
+    "self_target",
+    "protected_target",
+    "privileged_target",
+    "authority_unavailable",
+    "active_vote_exists",
+    "cooldown",
+    "initiator_limited",
+    "reused_vote_id",
+    "unknown_vote",
+    "wrong_vote_boundary",
+    "ineligible_voter",
+    "repeated_vote",
+    "invalid_time",
+    "connect_denied_and_disconnected",
+    "connect_denied_target_absent",
+    "skipped_room_gone",
+    "skipped_target_protected",
+    "permission_missing",
+    "discord_error",
+    "gave_up",
+    "other",
+];
+/// One row per `metrics::INTERNAL_ACTION_FAMILIES` entry, in the same order.
+/// A new receiver family fails here until it gets a budget row in the guard
+/// doc. Unknown verbs collapse to the trailing `other`.
+const INTERNAL_ACTION_CAP_FAMILIES: [&str; 6] = [
+    "announcement",
+    "event",
+    "settings",
+    "moderation",
+    "membership",
+    "other",
+];
+/// One row per `metrics::INTERNAL_ACTION_OUTCOMES` entry, in the same order.
+/// A new receiver outcome fails here until it gets a budget row in the guard
+/// doc. Unknown outcomes collapse to the trailing `internal`, never to a
+/// dynamic label or secret.
+const INTERNAL_ACTION_CAP_OUTCOMES: [&str; 12] = [
+    "executed",
+    "auth_failure",
+    "unknown_key",
+    "clock_skew",
+    "nonce_replay",
+    "rate_limit",
+    "unknown_action",
+    "action_disabled",
+    "malformed_body",
+    "conflict",
+    "upstream",
+    "internal",
+];
 
 #[test]
 fn storage_and_send_gate_labels_match_their_caps() {
@@ -223,6 +288,21 @@ fn storage_and_send_gate_labels_match_their_caps() {
         metrics::DISPATCH_LANES,
         &DISPATCH_LANE_CAPS[..],
         "DISPATCH_LANES grew without a budget row; update docs/log-volume-guard.md"
+    );
+    assert_eq!(
+        metrics::VOICE_VOTE_KICK_OUTCOMES,
+        &VOTE_KICK_CAP_OUTCOMES[..],
+        "VOICE_VOTE_KICK_OUTCOMES grew without a budget row; update docs/log-volume-guard.md"
+    );
+    assert_eq!(
+        metrics::INTERNAL_ACTION_FAMILIES,
+        &INTERNAL_ACTION_CAP_FAMILIES[..],
+        "INTERNAL_ACTION_FAMILIES grew without a budget row; update docs/log-volume-guard.md"
+    );
+    assert_eq!(
+        metrics::INTERNAL_ACTION_OUTCOMES,
+        &INTERNAL_ACTION_CAP_OUTCOMES[..],
+        "INTERNAL_ACTION_OUTCOMES grew without a budget row; update docs/log-volume-guard.md"
     );
 }
 
@@ -366,8 +446,8 @@ fn hot_events_shed_first_and_session_events_never_shed() {
     shed.sort_unstable();
     assert_eq!(
         shed,
-        vec![1, 2, 3, 4, 5, 6, 7, 8],
-        "hot shed orders must be unique priorities 1-8; see docs/log-volume-guard.md"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+        "hot shed orders must be unique priorities 1-9; see docs/log-volume-guard.md"
     );
     let first = EVENT_CAPS
         .iter()
@@ -469,6 +549,26 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         6,
         "dispatch-lane family grew; update the cardinality budget and the guard doc"
     );
+    assert_eq!(
+        metrics::VOICE_VOTE_KICK_OUTCOMES.len(),
+        26,
+        "vote-kick outcome family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::CHECKPOINT_FAILURE_STAGES.len(),
+        2,
+        "checkpoint-failure family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::INTERNAL_ACTION_FAMILIES.len(),
+        6,
+        "internal-action family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::INTERNAL_ACTION_OUTCOMES.len(),
+        12,
+        "internal-action outcome family grew; update the cardinality budget and the guard doc"
+    );
     for (allowlist, name) in [
         (metrics::EVENTS, "EVENTS"),
         (metrics::REST_ROUTES, "routes"),
@@ -476,6 +576,11 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         (metrics::VOICE_DEAD_ACTIONS, "dead-letter"),
         (metrics::DB_ERROR_OPS, "db-errors"),
         (metrics::SEND_ADMISSION_OUTCOMES, "send-admissions"),
+        (metrics::VOICE_VOTE_KICK_OUTCOMES, "vote-kick"),
+        (
+            metrics::INTERNAL_ACTION_FAMILIES,
+            "internal-action families",
+        ),
     ] {
         assert_eq!(
             allowlist.last(),
@@ -483,13 +588,18 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
             "{name} lost its `other` collapse trapdoor; unknowns must never become series"
         );
     }
+    assert_eq!(
+        metrics::INTERNAL_ACTION_OUTCOMES.last(),
+        Some(&"internal"),
+        "internal-action outcomes lost its `internal` collapse trapdoor; unknowns must never become series"
+    );
 }
 
 /// Any new series anywhere in the exposition fails here until the
 /// cardinality budget in the guard doc is updated with it.
 #[test]
 fn exposition_series_count_matches_the_cardinality_budget() {
-    assert_eq!(metrics::EVENTS.len(), 20, "event family changed the budget");
+    assert_eq!(metrics::EVENTS.len(), 21, "event family changed the budget");
     assert_eq!(
         metrics::REST_ROUTES.len(),
         26,
@@ -504,9 +614,9 @@ fn exposition_series_count_matches_the_cardinality_budget() {
     let text = metrics::Metrics::default().render(None);
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 287,
-        "exposition grew past the 287-sample budget (20 events + 4 scalars + 1 latency \
-         + 11 histogram + 156 rest + 48 jobs + 31 voice + 2 db-errors + 4 send-admissions + 6 dispatch-drops + 4 pool); \
+        series, 388,
+        "exposition grew past the 388-sample budget (21 events + 4 scalars + 1 latency \
+         + 11 histogram + 156 rest + 48 jobs + 31 voice + 26 vote-kick + 2 db-errors + 4 send-admissions + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 4 pool); \
          update docs/log-volume-guard.md with the new series"
     );
 }

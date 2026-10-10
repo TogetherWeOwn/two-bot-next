@@ -40,7 +40,10 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_tracked_rooms` | Rooms tracked in memory; compare with live Discord channels for ghosts |
 | `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
+| `two_bot_voice_vote_kick_total{outcome}` | Vote-kick starts, refusals and terminal enforcements; `outcome` is `started`, a refusal code (`evidence_unavailable`, `not_a_room`, `initiator_not_occupant`, `target_not_occupant`, `self_target`, `protected_target`, `privileged_target`, `authority_unavailable`, `active_vote_exists`, `cooldown`, `initiator_limited`, `reused_vote_id`, `unknown_vote`, `wrong_vote_boundary`, `ineligible_voter`, `repeated_vote`, `invalid_time`), an enforcement code (`connect_denied_and_disconnected`, `connect_denied_target_absent`, `skipped_room_gone`, `skipped_target_protected`, `permission_missing`, `discord_error`, `gave_up`) or `other`; vote results (`passed`/`expired`/`cancelled`) are audit-only and never counted |
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert when any lane's drops increase across consecutive keepalive samples; a single drop inside one burst is not paging. `reactions`-lane growth points at a hot member before an undersized lane |
+| `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch` and failed checkpoint clears: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert on any increase across consecutive keepalive samples; unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
+| `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert rule `receiver_refusals:<family>` fires when a family's refused outcomes rise in 3 consecutive keepalive samples (first sample and restarts clear the streak; one forged pre-auth probe in `other` stays silent) |
 
 ## Job coverage and outcomes
 
@@ -101,7 +104,7 @@ as dynamic labels.
   `GUILD_MEMBER_ADD`, `GUILD_MEMBER_REMOVE`, `GUILD_MEMBER_UPDATE`,
   `MESSAGE_CREATE`, `MESSAGE_UPDATE`, `MESSAGE_DELETE`,
   `MESSAGE_REACTION_ADD`, `MESSAGE_REACTION_REMOVE`,
-  `VOICE_STATE_UPDATE`, `INVITE_CREATE`, `INVITE_DELETE`,
+  `VOICE_STATE_UPDATE`, `PRESENCE_UPDATE`, `INVITE_CREATE`, `INVITE_DELETE`,
   `INTERACTION_CREATE`, `HEARTBEAT_ACK`, `GATEWAY_CLOSE`, `other`.
 - `two_bot_rest_requests_total{route,result}` — `result` is one of `2xx`,
   `3xx`, `4xx`, `429`, `5xx`, `transport`. `route` is one of the fixed
@@ -124,7 +127,8 @@ as dynamic labels.
   `DELETE /guilds/:guild/members/:member/roles/:role`,
   `POST /guilds/:guild/scheduled-events`,
   `PATCH /guilds/:guild/scheduled-events/:event`,
-  `DELETE /guilds/:guild/scheduled-events/:event`, `other`).
+  `DELETE /guilds/:guild/scheduled-events/:event`,
+  `POST /guilds/:guild/channels`, `DELETE /channels/:channel`, `other`).
 - `two_bot_job_runs_total{job,outcome}`,
   `two_bot_job_last_success_timestamp_seconds{job}` and
   `two_bot_job_consecutive_failures{job}` — `job` is one of
@@ -143,6 +147,20 @@ as dynamic labels.
   `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued`.
 - `two_bot_voice_dead_letters_total{action}` — `action` is `create`, `move`,
   `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other`.
+- `two_bot_voice_vote_kick_total{outcome}` — `outcome` is `started`,
+  `evidence_unavailable`, `not_a_room`, `initiator_not_occupant`,
+  `target_not_occupant`, `self_target`, `protected_target`,
+  `privileged_target`, `authority_unavailable`, `active_vote_exists`,
+  `cooldown`, `initiator_limited`, `reused_vote_id`, `unknown_vote`,
+  `wrong_vote_boundary`, `ineligible_voter`, `repeated_vote`, `invalid_time`,
+  `connect_denied_and_disconnected`, `connect_denied_target_absent`,
+  `skipped_room_gone`, `skipped_target_protected`, `permission_missing`,
+  `discord_error`, `gave_up` or `other` (`crates/core/src/metrics.rs`
+  `VOICE_VOTE_KICK_OUTCOMES`). Recorded once per `kick_start` decision
+  (`started` or the refusal code from `kick_refusal_outcome`) and once per
+  terminal `KickMember` enforcement (`EnforcementOutcome::as_str`); vote
+  results are audit-only. Refusal codes never become free-form text; unknown
+  outcomes collapse to `other`.
 - `two_bot_db_errors_total{op}` — `op` is `admission` or `other`. Recorded
   by `Metrics::db_error`; send-admission SQL (admit/extend/complete storage
   failures) reports as `admission`, and failed voice actor store loads
@@ -158,6 +176,28 @@ as dynamic labels.
   including the busy-lane path, plus per-member fairness refusals on the
   `reactions` lane (the `dispatch_self_role_reaction` per-member cap, via the
   shared `record_drop` path); scope-shutdown refusals are not drops.
+- `two_bot_gateway_checkpoint_failures_total{stage}` — `stage` is
+  `pre_commit` or `commit` (`crates/core/src/metrics.rs`
+  `CHECKPOINT_FAILURE_STAGES`). Recorded once per `apply_dispatch` Err arm
+  entry in `crates/bot/src/gateway.rs`, plus once per failed checkpoint
+  clear on the `ReceivedWork::Clear` path: `pre_commit` when the commit was
+  skipped after a funnel/leveling/acknowledgement failure, `commit` when the
+  durable store write itself failed (including a failed clear). Failure
+  causes are never labels.
+- `two_bot_internal_actions_total{family,outcome}` — `family` is one of
+  `announcement`, `event`, `settings`, `moderation`, `membership` or
+  `other`, mapped from the signed `action` verb in
+  `crates/bot/src/internal_action_http.rs` (`announcement.post` →
+  `announcement`, `event.*` → `event`, `settings.*` → `settings`,
+  `moderation.*` → `moderation`, `role.assign`/`guild.add_member` →
+  `membership`, everything else → `other`). `outcome` is `executed` or one
+  of the bounded refusal classes (`auth_failure`, `unknown_key`,
+  `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`,
+  `action_disabled`, `malformed_body`, `conflict`, `upstream`, `internal`).
+  Recorded once per receiver request (`ReceiverState::reject` for refusals,
+  `ReceiverState::terminal` plus the keyless-read and settings/moderation
+  success envelopes for executions); no key id, token, body or request bytes
+  ever become labels.
 - Log fields (coordinated with blocked structured-log work, which owns JSON
   formatting): `voice_event="voice_operation"` with `op`/`outcome`,
   `voice_event="voice_reconcile"` with plan counts,
@@ -216,6 +256,10 @@ controller's bounded cache pool was missing at implementation time.
 
 - Core unit tests: cumulative histogram, unique series, finite label sets,
   hostile labels, saturating job counters, status groups and missing latency.
+- Docs conformance (`crates/core/tests/metrics_docs.rs`): every counter row
+  in the table above renders in the exposition with its allowlisted labels,
+  and every exposition counter has a row here; deliberate-drift fixtures
+  prove both directions fail by name.
 - Supervisor fixtures (paused Tokio time, local `Metrics` registries): first
   success for every website/community registration, seconds conversion, returned
   failures, preserved success timestamps, streak reset, timeout/future/factory
@@ -285,6 +329,7 @@ No Prometheus server, no new infrastructure.
 | `voice_failures` | room-op failures > 5% of >= 10 ops between samples, or any new dead-letter/orphan (restarts skip the window) | [voice failures](runbook.md#alert-voice-failures) |
 | `gateway_missed_events` | any increase of `two_bot_gateway_missed_events_total` between samples (first sample and restarts skip the window) | [gateway missed events](runbook.md#alert-gateway-missed-events) |
 | `ticker_stale:<job>` | 15 s ticker with no success for more than 10 minutes (never-succeeded is ignored) | [ticker stale](runbook.md#alert-ticker-stale) |
+| `receiver_refusals:<family>` | refused `two_bot_internal_actions_total` outcomes rising in 3 consecutive samples per family (first sample and restarts clear the streak) | [receiver refusals](runbook.md#alert-receiver-refusals) |
 
 `job_stale` uses `JOB_INTERVAL_SECONDS`, which must equal each scheduled job's
 Rust `*_INTERVAL_MS / 1000`. The 15 s tickers (`scheduled_messages`,
@@ -304,7 +349,7 @@ used on both sides of the B2 soak evidence seam. The Rust canonical list is
 is named `evidence-{ruleId}-{window}.json` (soak-ledger packets stamp the
 `soak_expected_committed` ledger identity), so the QA evidence table can
 attribute packets when several rules fire in one window. Both sides pin all
-nine spellings with tests; the payload shape is unchanged.
+ten spellings with tests; the payload shape is unchanged.
 
 Known gaps: the DB error counter currently records only send-admission SQL,
 so non-admission stores still surface only through the pool proxy and the

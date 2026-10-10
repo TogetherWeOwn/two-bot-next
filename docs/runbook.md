@@ -362,6 +362,40 @@ when a due schedule row or settings change stays unapplied past the
 window — the fix then belongs to the on-call engineer, not another
 redeploy.
 
+#### Alert: receiver refusals
+
+Refused `two_bot_internal_actions_total` outcomes rose for one family in
+3 consecutive keepalive samples. Every outcome other than `executed`
+(`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`,
+`rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`,
+`conflict`, `upstream`, `internal`) counts as a refusal: the signed
+website-action receiver saw the request and refused it. The streak (not
+a single window) pages, because a receiver-abuse or refusal storm stays
+quiet through the burn math while one forged probe must not. The firing
+key names its family (`receiver_refusals:moderation`). The first sample
+after monitoring arms only stores the baseline and never fires, and a
+counter reset (process restart) clears that family's streak rather than
+firing. Family `other` holds every pre-auth refusal (bad signature,
+unknown key, clock skew, nonce replay map through `ActionLabel::Unknown`),
+so a lone `receiver_refusals:other` streak points at forged traffic
+before a wired-family misconfiguration.
+
+First response: scope the refusing family from the `family`/`outcome`
+labels on `two_bot_internal_actions_total` via the authorized
+`/ops/metrics` scrape; confirm no deploy is in progress (a fresh deploy
+restarts the process and resets the counter); then read the container logs
+for the matching `internal action refused` warn lines (sampled summaries
+with `kind`/`class`/`key`/`action`). A single historic refusal with no
+growth never re-pages. Do not retry-loop a signed request with a new
+nonce, rotate keys, or restart the container to "clear" the counter; a
+replacement resets the baseline without stopping the abusive caller.
+
+Escalate when refusals persist across windows after the suspect deploy or
+caller is identified, when they coincide with 429 or DB-error alerts, or
+when `executed` traffic for the same family collapses while refusals rise
+— the receiver may be refusing legitimate work and the fix belongs to the
+on-call engineer, not another redeploy.
+
 ## Persisted ownership control
 
 The Worker/DO fence is implemented, not implicitly released by deployment.
@@ -399,7 +433,12 @@ node wrangler/scripts/ownership-control.mjs status
 Refresh the epoch before **each** change. `fence` is a persisted parking owner
 (`deploymentId=null`, `phase=fenced`); health/readyz and stale schedules refuse.
 Takeover/fence increment the epoch and record actor, timestamp, old/new epoch and
-owner. Durable revocation is written before awaited native destruction;
+owner, except a same-version repeat takeover by the deployment that already owns
+the active singleton: the Worker returns the stored record unchanged (no write,
+no audit row, no teardown) and the client stops with "Ownership transition not
+confirmed; preserve maintenance". That is the safe direction; the normal staging
+deploy path mints a new version id, so the verify gate is unaffected.
+Durable revocation is written before awaited native destruction;
 `running=false` is required before active release. A crash, storage-write failure
 or unconfirmed shutdown leaves denial; do not assume a 503 stopped the old
 process. Preserve maintenance until teardown is confirmed. 401/auth failure is
@@ -473,13 +512,19 @@ other mode's binding, and an absent binding refuses before any connection.
 Invocation (secret-free; each URL comes only from its existing binding):
 
 ```text
-staging-migrate --plan --source-sha <40hex> --staging-host <host> \
-  --staging-database <db> --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
+staging-migrate --target staging --plan --source-sha <40hex> --staging-host <host> \
+  --staging-database <db> [--staging-branch-id <branch>] \
+  --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
   [--expected-pending <ascending,comma-separated versions>]
-staging-migrate --apply <same flags> --expected-pending <list> \
+staging-migrate --target staging --apply <same flags> --expected-pending <list> \
   --plan-manifest-sha256 <64hex> --plan-run-id <run id> \
   --plan-manifest-path <producing run's downloaded manifest>
 ```
+
+`--staging-branch-id` pins the PlanetScale branch id (non-secret). It is
+required when `--staging-host` ends in `.psdb.cloud` (PlanetScale routes
+branches by the binding username's `{role}.{branch_id}` suffix); other hosts
+leave it empty.
 
 Reconcile is set-based: pending is every source version absent from the
 ledger, in source order, so a ledger may lag the source by any subset. `--plan`
@@ -522,8 +567,11 @@ string instead of failing the plan.
 
 It refuses (exit 2, before any DDL) when the binding is absent, the target does
 not equal the pinned staging host/database inputs, either pin is empty or looks
-like production, either host pin or the binding host is a pooler endpoint
-(session `SET ROLE` and the migrator lock need the direct endpoint), the login
+like production, either host pin or the binding host is a pooler endpoint,
+the binding uses a pooled port (anything but 5432) or a pooler-style `|` username
+(session `SET ROLE` and the migrator lock need the direct 5432 endpoint),
+a `*.psdb.cloud` pin has no `--staging-branch-id`, the pin is malformed, or the
+binding username's branch suffix does not match the pinned branch, the login
 cannot assume `two_bot_migrator` (apply) or `two_bot_migrator_ro` (plan), the
 plan login also holds `two_bot_migrator`, a reference is missing, `--apply` has no
 `--expected-pending` or it mismatches, `--apply` has no `plan_manifest_sha256`/
@@ -587,6 +635,60 @@ pre-split runner, which looks for `TWO_BOT_STAGING_MIGRATOR_DATABASE_URL`; the
 `plan` job never exports that binding, so the old runner refuses before any
 connection (fail closed). Dispatch plan and apply with a `source_sha` at or
 after the split.
+
+### Production migration runner
+
+`.github/workflows/production-migrate.yml` (manual, production-only) is the
+exact mirror of the staging runner for post-cutover releases that carry a new
+migration. It runs the same `staging-migrate` binary with
+`--target production` from `crates/cutover/src/bin/staging_migrate.rs`, embeds
+the same crate migrations through SQLx **0.9.0**, keeps the same ledger and
+`SET ROLE` behavior, and keeps every staging refusal (pooler, `SET ROLE`
+membership, `expected_pending`, manifest hash, `plan_run_id` provenance).
+Invocation (secret-free; each URL comes only from its existing binding):
+
+```text
+staging-migrate --target production --plan --source-sha <40hex> \
+  --production-host <host> --production-database <db> \
+  --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
+  [--expected-pending <ascending,comma-separated versions>]
+staging-migrate --target production --apply <same flags> --expected-pending <list> \
+  --plan-manifest-sha256 <64hex> --plan-run-id <run id> \
+  --plan-manifest-path <producing run's downloaded manifest>
+```
+
+`--target` is explicit with no default: a run without it refuses, a staging
+run never reads a production pin or binding, and a production run never reads
+a staging pin or binding. Production reads only
+`TWO_BOT_PRODUCTION_PLAN_DATABASE_URL` (plan, read-only
+`two_bot_migrator_ro`) and `TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL` (apply,
+`two_bot_migrator`); staging keeps its own pair. The production target drops
+the `prod`-substring refusal (the production host and `two_bot` database are
+production-like by construction) and instead refuses any staging host pin
+(fixture hosts, any `staging` label, any Neon endpoint) at both validation and
+the binding-host check, so a mistaken production pin aimed at staging still
+fails closed before any DDL. The binding-host check additionally refuses any
+non-`5432` port and any pooled (`|…`) login on production, so a binding
+copied from the app's pooled connection string still fails closed (pooler
+`SET ROLE` and the migrator lock need the direct endpoint). The manifest carries `migration_target`
+(`staging` or `production`); the claim publisher requires the matching value.
+
+The workflow mirrors the staging shape with the `production-migrate-` prefix:
+three jobs (`plan`, `claim`, `apply`), environments
+`production-migrate-plan` (no reviewer, plan only) and
+`production-migrate-apply` (required reviewer, main-only), the same pinned
+actions, routed runner, pipefail shell, and artifact names
+(`production-migrate-manifest`, `production-migrate-apply-claim`, 14-day
+retention, stored ZIP entries). The `claim` job runs
+`scripts/ci/production_migrate_claim.py`, which binds the same projection hash
+but requires the production workflow path, environment, and
+`PRODUCTION_HOST`/`PRODUCTION_DATABASE` pins. The production target takes no
+branch pin yet, so a production dispatch refuses
+closed (exit 2) until the production branch-pin follow-up lands; the
+production path is unavailable until then. Both environments
+and both secrets must exist before dispatch; the host provisions them after
+this change merges. The cutover itself does not need this path: the fresh
+`two_bot` bootstrap uses the tested provisioner flow.
 
 ### Redeploy the approved revision
 
@@ -809,7 +911,7 @@ tokens, or redeploy with an unreviewed wiring change during this docs procedure.
 | Automations/announcements/text | `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`; text needs automations **and** `TWO_TEXT_COMMANDS=1`. | Per-feature gates, not operational containment. Verify the affected deployed handler; registry publishing or a periodic job alone does not prove a specific action is active. |
 | Onboarding | `TWO_ONBOARDING_MODE=legacy|session|anchor`, default legacy; `TWO_ONBOARDING_DRY_RUN=1`. | Mode/dry-run contracts are feature-scoped, not bot-wide stop controls. Verify the affected handler and staging evidence; a catalogue value alone is not a runtime activation or reload receipt. |
 | Community scorecard | `TWO_COMMUNITY_SCORECARD=1`; recommendations on unless `TWO_COMMUNITY_RECOMMENDATIONS=0`. | Conditionally registered supervised job; durable retry budget and completion rules apply. A successful/no-op tick is not fresh publication proof. See the [database playbook](#neon-or-hyperdrive-outage). |
-| Internal actions | Moderation requires `TWO_INTERNAL_ALLOW_MODERATION=1` **and** `TWO_MODERATION=1`; other verbs have allow flags. | Only the private `announcement.post` receiver exists, and only in staging: dark until the Operator sets the Worker secret `TWO_INTERNAL_ACTIONS` to `1` last; unset it to go dark again. Reachable solely through the staging Worker ingress for `POST /internal/actions`; production has none. The other allow flags still authorize nothing. See [staging ingress](internal-actions-receiver.md#staging-ingress-default-dark). |
+| Internal actions | `announcement.post`, `role.assign` and `event.upsert` are on whenever the receiver is; `event.cancel` needs `TWO_INTERNAL_ALLOW_EVENT_CANCEL=1`, `event.read` needs `TWO_INTERNAL_ALLOW_EVENT_READ=1`, `settings.get`/`settings.set` need `TWO_INTERNAL_ALLOW_SETTINGS=1`, `guild.add_member` needs `TWO_INTERNAL_ALLOW_ADD_MEMBER=1`, member and channel moderation need `TWO_INTERNAL_ALLOW_MODERATION=1` **and** `TWO_MODERATION=1`; remaining verbs stay refused. | Wired receivers are `announcement.post`, `role.assign` and `event.upsert` (no extra flag: contained only by the dark switch below), `event.cancel`, `event.read`, `settings.get`, `settings.set`, `guild.add_member`, `moderation.ban`, `moderation.tempban`, `moderation.kick`, `moderation.warn`, `moderation.timeout`, `moderation.purge`, `moderation.slowmode`, `moderation.lockdown`, `moderation.unlock`, staging only: dark until the Operator sets the Worker secret `TWO_INTERNAL_ACTIONS` to `1` last; unset it to go dark again. Reachable solely through the staging Worker ingress for `POST /internal/actions`; production has none. Unsetting an allow flag stops that verb. See [staging ingress](internal-actions-receiver.md#staging-ingress-default-dark) and the [receiver verb list](internal-actions-receiver.md). |
 | Settings hot reload | Typed catalogue/store with env-only secret/moderation keys. | Poller/runtime rebuilding remains follow-up; no promise of changes applying without restart. |
 
 Source: [`automod.rs`](../crates/core/src/automod.rs),
@@ -953,6 +1055,7 @@ or existing operator handoff; see [backup.md](backup.md) for unit contracts.
 | Reconnect / RESUME refused | Follow [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery); 4007/4009 force fresh IDENTIFY. Preserve the durable checkpoint, don't hand-edit sequence or start another shard. |
 | Discord REST 429 / suspected breaker | Separate token-wide durable admission, executor-local pacing, process-wide global pause/invalid-request breaker, and the private announcement governor. Refusal can precede HTTP; retry bounds vary by action. There is no manual reset endpoint. Do not hammer Discord, replay uncertain moderation writes or restart/delete state to clear a hold. Identify the actual writer and use verified containment; see the [Discord playbook](#discord-gateway-or-api-outage). |
 | Channel moderation lane stuck `in_progress` after an ambiguous write | No automatic retry/expiry. Quiesce original workers, establish old REST settlement, and read actual Discord overwrites/slowmode before using the inspection-first, explicitly confirmed operator CLI. It preserves recovery and audits the prior claim. See [channel lane reconciliation](channel-lane-reconciliation.md); never release a lane while a delayed unlock can still write. |
+| Website event action stuck `needs_reconciliation` after an ambiguous create | No automatic retry: re-submitting under a new key can make a second event. Read the actual guild scheduled events in Discord, then resolve the exact intent with the inspection-first, explicitly confirmed `two-bot reconcile-event` CLI (`--list`, then `--created`/`--updated`/`--cancelled`/`--no-effect` with `--execute`). See [the receiver contract](internal-actions-receiver.md); never re-submit the operation under a new key before reconciling. |
 | `POST /internal/actions` 404 on staging | The route is dark unless the Worker var `INTERNAL_ACTIONS_INGRESS` (staging env) **and** the secret `TWO_INTERNAL_ACTIONS` are both exactly `1`. Wrong method, a trailing slash or any query string is also 404 by design. Production is always 404. |
 | `POST /internal/actions` 503 `unavailable` | The container is not running (public ingress never starts it; wait for the probe or keepalive), the ownership fence refused this deployment, or the receiver answered something other than its JSON envelope. Check `/readyz` and ownership status; do not retry-loop a signed request with a new nonce. |
 | Ready but feature inactive | Gateway readiness says nothing about library-only commands/jobs/kill switches. Check [runtime boundaries](#containment-kill-switches-and-feature-flags), not extra environment guesses. |
