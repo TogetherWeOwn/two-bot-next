@@ -1641,7 +1641,9 @@ async fn write_setting(
 /// Replay a stored `settings.set` terminal without re-executing the write.
 /// Success rebuilds the value-free `{key,outcome}` result from the claimed
 /// body (the payload hash guarantees it matches the first execution); failures
-/// reuse the generic terminal envelope with the replay marker.
+/// reuse the generic terminal envelope with the replay marker. A version
+/// side-read failure fails closed to reconciliation like every other store
+/// failure on this path, never a fabricated `version: 0` success.
 async fn replay_setting(
     state: &ReceiverState,
     body: &Map<String, Value>,
@@ -1659,7 +1661,10 @@ async fn replay_setting(
                     json!({"key": command.key(), "outcome": outcome})
                 })
                 .unwrap_or_else(|_| json!({"key": "", "outcome": "saved"}));
-            let version = current_setting_version(state, body).await;
+            let version = match current_setting_version(state, body).await {
+                Ok(version) => version,
+                Err(()) => return state.reject(Failure::reconciliation(), key, action, id),
+            };
             settings_write_response(rebuilt, version, id, true)
         }
         TerminalResponse::Failure(_) => state.terminal(response, true, id, key, action),
@@ -1669,18 +1674,17 @@ async fn replay_setting(
 /// CAS token the replayed save committed. The claim stores no version, so
 /// report the key's current token: identical absent a later save, and a later
 /// save's token otherwise, which a blind retry must see rather than revert.
-async fn current_setting_version(state: &ReceiverState, body: &Map<String, Value>) -> i64 {
-    let Ok(command) = SettingsCommand::parse("settings.set", body) else {
-        return 0;
-    };
+/// Any failure to determine the token (unparsable claimed body or store
+/// error) fails closed: the caller reconciles instead of trusting `0`.
+async fn current_setting_version(
+    state: &ReceiverState,
+    body: &Map<String, Value>,
+) -> Result<i64, ()> {
+    let command = SettingsCommand::parse("settings.set", body).map_err(|_| ())?;
     let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
     let store = SettingsStore::new(state.store.pool());
-    store
-        .get(guild_id, command.key())
-        .await
-        .ok()
-        .and_then(|stored| stored.map(|(_, version)| version))
-        .unwrap_or(0)
+    let stored = store.get(guild_id, command.key()).await.map_err(|_| ())?;
+    Ok(stored.map(|(_, version)| version).unwrap_or(0))
 }
 
 /// Legacy `result` (`key`/`value`/`source`) plus the CAS `version` as envelope
