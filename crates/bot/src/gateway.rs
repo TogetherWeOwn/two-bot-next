@@ -2348,11 +2348,11 @@ mod tests {
 
     /// A failed community-facts drain never stalls serial dispatch: the worker
     /// warns and still commits the cursor. The facts writer is broken here
-    /// with an unconnectable pool while the session store stays healthy, so a
-    /// gate-clearing dispatch must return `Ok` with the checkpoint committed
-    /// and a `gateway community facts dispatch failed` (or timed-out) warn —
-    /// no panic and no held cursor. Needs a migrated test database; skips
-    /// without one (CI supplies `TWO_TEST_DATABASE_URL`).
+    /// with an unconnectable pool (short acquire timeout) while the session
+    /// store stays healthy, so a gate-clearing dispatch must return `Ok` with
+    /// the checkpoint committed and a `gateway community facts dispatch
+    /// failed` warn — no panic and no held cursor. Needs a migrated test
+    /// database; skips without one (CI supplies `TWO_TEST_DATABASE_URL`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gateway_worker_community_facts_drain_failure_warns_and_commits() {
         let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
@@ -2370,9 +2370,12 @@ mod tests {
         .await
         .expect("create migrated agent-testdb fixture");
         let pool = db.pool().clone();
-        // Facts writer only: unconnectable, so the drain fails fast without
+        // Facts writer only: unconnectable with a short acquire timeout so
+        // the drain hits the write-failure arm (`dispatch failed`) inside
+        // the dispatch deadline instead of the timeout arm, without
         // touching the healthy session store below.
         let broken = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
             .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
             .expect("lazy pool");
         let pipeline = build_pipeline(vec![], None);
@@ -2500,8 +2503,7 @@ mod tests {
         );
         let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
         assert!(
-            output.contains("gateway community facts dispatch failed")
-                || output.contains("gateway community facts dispatch timed out"),
+            output.contains("gateway community facts dispatch failed"),
             "failed facts drain must warn, got: {output}"
         );
         assert_eq!(
