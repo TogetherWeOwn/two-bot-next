@@ -559,20 +559,28 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// Render the room's voice status line and leave it pending when it
     /// differs from the line last written (no line counts as empty).
     fn refresh_voice_status(&mut self, room: &VoiceRoom, command: &NameCommand) {
-        let Some(template) = self
+        // A removed or blank template renders empty, which clears a line
+        // written earlier.
+        let template = self
             .name_settings
             .status_templates
             .get(&room.creator_channel_id)
             .cloned()
-        else {
-            return;
-        };
-        let facts = self.name_facts(room, command);
-        let status = render_voice_status(&template, &facts, &command.policy);
+            .unwrap_or_default();
         let current = self
             .room_status
             .get(&room.channel_id)
             .map_or("", String::as_str);
+        if template.is_empty() && current.is_empty() {
+            self.pending_status.remove(&room.channel_id);
+            return;
+        }
+        let status = if template.is_empty() {
+            String::new()
+        } else {
+            let facts = self.name_facts(room, command);
+            render_voice_status(&template, &facts, &command.policy)
+        };
         if current == status {
             self.pending_status.remove(&room.channel_id);
         } else {

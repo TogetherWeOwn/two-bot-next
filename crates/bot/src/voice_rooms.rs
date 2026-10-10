@@ -3806,11 +3806,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
         self.enqueue_owner_repairs(now_ms);
         let Some(action) = self.queue.pop_due(self.live.guild_id, now_ms) else {
-            // Status lines are the lowest priority: only when no lifecycle
-            // write is waiting and the guild is not rate limited.
-            if self.queue.pending_counts(self.live.guild_id).0 > 0
-                || self.queue.backed_off(self.live.guild_id, now_ms)
-            {
+            // Status lines are the lowest priority: only when no queued
+            // write is due and the guild is not rate limited.
+            if self.queue.backed_off(self.live.guild_id, now_ms) {
                 return false;
             }
             return self.dispatch_voice_status(now_ms).await;

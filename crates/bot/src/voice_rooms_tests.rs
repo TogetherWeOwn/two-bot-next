@@ -10210,6 +10210,33 @@ async fn a_status_line_keeps_up_to_500_characters() {
 }
 
 #[tokio::test]
+async fn a_suspended_lifecycle_write_does_not_hold_back_status_lines() {
+    let (live, store, http, trace) = status_worker_parts();
+    let mut worker = status_worker(live, store, http, "@@num@@ here").await;
+    worker
+        .queue
+        .enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 999 });
+    worker.queue.suspend(GUILD, 999);
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(*trace.lock().unwrap(), ["status:500:1 here"]);
+}
+
+#[tokio::test]
+async fn removing_the_status_template_clears_the_line() {
+    let (live, store, http, trace) = status_worker_parts();
+    let mut worker = status_worker(live, store, http, "@@num@@ here").await;
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    worker.name_settings.status_templates.clear();
+    worker.live.voice_update(MEMBER + 1, Some(500), Some(false));
+    worker.refresh_template_names(1);
+    dispatch(&mut worker, name_panel::STATUS_MIN_INTERVAL_MS).await;
+    assert_eq!(*trace.lock().unwrap(), ["status:500:1 here", "status:500:"]);
+    assert!(!worker.room_status.contains_key(&500) || worker.room_status[&500].is_empty());
+}
+
+#[tokio::test]
 async fn status_bookkeeping_is_dropped_with_the_room() {
     let (live, store, http, _) = status_worker_parts();
     let mut worker = status_worker(live, store, http, "@@num@@ here").await;
