@@ -24,8 +24,11 @@ evidence location, never in public GitHub or issue comments.
   an incomplete journal or an unreconciled registry map). The lead cannot
   waive the zero-loss gate below.
 - The production dispatch additionally needs a **production environment
-  reviewer** approval on the exact guarded commit. The executor performs
-  only separately authorized steps, one host step per operator handoff.
+  reviewer** approval on the exact guarded commit, unless the repository
+  variable `PRODUCTION_AUTO_APPROVE` is `true` and the Environment has no
+  reviewers ([production-deploy.md](production-deploy.md#production_auto_approve)).
+  The executor performs only separately authorized steps, one host step per
+  operator handoff.
 
 ## 2. Trigger conditions
 

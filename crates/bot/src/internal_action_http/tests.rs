@@ -13,6 +13,7 @@ use two_bot_discord::executor::member::MemberOutcome;
 use two_bot_testsupport::TestDatabase;
 
 mod adapter;
+mod settings;
 
 fn secret(index: usize) -> String {
     let fixture: Value = serde_json::from_str(include_str!(
