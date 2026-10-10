@@ -7156,7 +7156,7 @@ fn parse_kick_target(options: &[CommandDataOption]) -> Option<Snowflake> {
 /// initiator-supplied text ever reach the ballot message. Overlong input is cut
 /// at parse time and again after sanitizing at render, so the wire text always
 /// fits this bound; the ballot never grows with the input length.
-const VOTE_KICK_PUBLIC_REASON_LIMIT: usize = 512;
+pub const VOTE_KICK_PUBLIC_REASON_LIMIT: usize = 512;
 
 /// Render initiator-supplied vote-kick text as bounded plain text for the
 /// public ballot (gate VK-04). The ballot goes out under the bot's name, so a
@@ -7181,7 +7181,7 @@ const VOTE_KICK_PUBLIC_REASON_LIMIT: usize = 512;
 /// Applied once at the ballot render boundary; the escaped output is cut to
 /// [`VOTE_KICK_PUBLIC_REASON_LIMIT`] characters so the bound holds on the wire.
 #[must_use]
-fn sanitize_vote_reason(raw: &str) -> String {
+pub fn sanitize_vote_reason(raw: &str) -> String {
     let mut single_line = String::with_capacity(raw.len());
     for chunk in raw.split(['\r', '\n']) {
         if !single_line.is_empty() {
