@@ -111,10 +111,17 @@ route; no workflow dispatch is needed for this repair. The existing required
 job summary and fails above these calibrated ceilings. The measurements and
 headroom below are historical, not measurements of the current PR head:
 
-| Artifact | Historical definition | Measured | Maximum | Headroom |
+| Artifact | Metric / provenance | Measured | Maximum | Headroom |
 |---|---|---|---|---|
-| Runtime image | Docker image inspect `Size` (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
-| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 10.30 MiB / 10,805,344 bytes | 15 MiB / 15,728,640 bytes | 4.70 MiB / 45.6% |
+| Runtime image | Historical Docker image inspect `Size` from 2026-09-30 PR #78 (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
+| Release binary | `stat` of `/home/two-bot/two-bot` in the final image, event-executors head | 15.04 MiB / 15,770,928 bytes (2026-10-10; [event-executors CI smoke](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38062362788/job/114254309361)) | 16 MiB / 16,777,216 bytes | 0.96 MiB / 6.4% |
+
+The runtime-image row above is the historical inspect `Size` result, not the
+current gate metric. The linked event-executors job measured the current metric,
+summed uncompressed Docker history layers, at 43,481,068 bytes (41.47 MiB).
+Against the 112 MiB / 117,440,512-byte ceiling, that run had 73,959,444 bytes
+(70.53 MiB) of headroom. This is evidence for that source head, not a size claim
+for the current PR head.
 
 The baseline used the classic Docker image store. The gate now sums exact
 `docker image history --human=false --format '{{.Size}}'` layer bytes after
@@ -123,20 +130,32 @@ With the containerd store, inspect `Size` includes compressed blobs **plus**
 unpacked snapshots and is logged separately, not compared to that ceiling.
 See [Docker's store documentation](https://docs.docker.com/engine/storage/containerd/)
 and [Moby's layer-history implementation](https://github.com/moby/moby/blob/master/daemon/containerd/image_history.go).
-Neither the 112 MiB image nor the 10 MiB binary budget is increased.
+The 112 MiB image ceiling is unchanged. The binary budget was 15 MiB at the
+2026-10-01 calibration and is now 16 MiB; the 2026-10-10 measurements below
+explain the tighter tripwire.
 
 Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
-at source `307b50708ec42e8fc4744c1b804216a22a17625e`. Ceilings allow roughly
-25% image growth rounded up to the next 8 MiB, and roughly 40% binary growth
-rounded up to the next MiB. Base-image/toolchain changes must remeasure and
-justify any future budget increase. Recalibrated 2026-10-01 for the S4 self-role
-runtime (TOG-10292): PR head measured 10,805,344 bytes (10.30 MiB) on the
-ephemeral runner vs main baseline 10,377,112 bytes (9.90 MiB) at `ec49663`;
-growth is linked runtime/handlers/REST plus previously-dead domain/store code
-with no new dependencies, release profile already minimal (opt-level=z, lto,
-strip). Per calibration (measured * 1.4 rounded up to the next MiB):
-10.30 * 1.4 = 14.42 -> 15 MiB. Docker is not available in the controller
-workspace; offline fixture sizes are not measurements.
+at source `307b50708ec42e8fc4744c1b804216a22a17625e`. The 2026-09-30
+calibration allowed roughly 25% image growth and 40% binary growth, rounded up
+to the next 8 MiB and 1 MiB respectively. Base-image/toolchain changes must be
+remeasured and any future budget increase justified. The 2026-10-01 S4
+self-role runtime measured 10,805,344 bytes (10.30 MiB), against the main
+baseline of 10,377,112 bytes (9.90 MiB) at `ec49663`; growth was linked
+runtime/handlers/REST plus previously-dead domain/store code, with no new
+dependencies and the same minimal release profile (opt-level=z, lto, strip).
+Applying that historical binary calibration: 10.30 * 1.4 = 14.42 -> 15 MiB.
+Docker is not available in the controller workspace; offline fixture sizes are
+not measurements.
+
+The 2026-10-10 voice template-naming head measured 15,712,080 bytes
+(14.98 MiB) in its [container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38066321077/job/114254613820),
+16,560 bytes below the prior 15 MiB ceiling. A later event-executors head
+measured 15,770,928 bytes (15.04 MiB) in the [container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38062362788/job/114254309361),
+42,288 bytes above that ceiling. Main sets the binary budget to 16 MiB as a
+working tripwire with room for queued reconcile tooling, leaving 1,006,288
+bytes (0.96 MiB, 6.4%) of headroom. No new dependencies or release-profile
+changes; revisit if the binary approaches the limit. The 112 MiB image ceiling
+is unchanged.
 
 ### Docker history image measurement and immutable-ID pinning
 
@@ -174,9 +193,10 @@ The unused streamed-archive helper and its archive-specific builders/tests
 have been removed in favor of main's history metric; the smoke/runtime
 contract fixtures remain.
 
-The **112 MiB image and 10 MiB binary ceilings are unchanged**. Real current-head
-CI must still record the corrected image size and pass the runtime contract and
-both one-byte-budget negative checks; fixture success alone cannot establish
+The 112 MiB image ceiling is unchanged; the release-binary ceiling is 16 MiB
+(see the current calibration above). CI on this PR's exact head must still
+record the corrected image size and pass the runtime contract and both
+one-byte-budget negative checks; fixture success alone cannot establish
 compliance. No current-head image-fit claim is made here. This measurement
 repair does not change the Dockerfile, runtime base, CA assets or configured user.
 
