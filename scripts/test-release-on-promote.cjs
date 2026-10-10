@@ -105,11 +105,19 @@ assert.match(r.stdout, /## \[0\.5\.0\]/, 'an already tagged commit keeps its tag
 const config = path.join(dir, 'release-please-config.json');
 const base = JSON.parse(fs.readFileSync(config, 'utf8'));
 fs.writeFileSync(config, JSON.stringify({ packages: { '.': { ...base.packages['.'], 'release-as': '1.0.0' } } }));
+// release-as never tags a commit older than the newest release (a rollback),
+// even when release-as is above that release.
+r = run(fixSha);
+assert.equal(r.status, 0, r.stderr);
+assert.match(r.stdout, /older than v0\.5\.0; rollback promote, no new tag/);
 g('tag', '-d', 'v0.5.0');
 r = run(featSha);
 assert.equal(r.status, 0, r.stderr);
 assert.match(r.stdout, /## \[1\.0\.0\]\(https:\/\/github\.com\/o\/r\/compare\/v0\.4\.0\.\.\.v1\.0\.0\)/);
 g('tag', 'v1.0.0', featSha);
+r = run(fixSha);
+assert.equal(r.status, 0, r.stderr);
+assert.match(r.stdout, /older than v1\.0\.0; rollback promote, no new tag/);
 const later = commit('fix(voice): after cutover (#4)');
 g('update-ref', 'refs/remotes/origin/main', later);
 r = run(later);
