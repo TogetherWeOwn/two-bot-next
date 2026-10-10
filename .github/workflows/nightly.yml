@@ -38,12 +38,18 @@ jobs:
           set -euo pipefail
           rust=true supply=true
           if [ "$EVENT_NAME" = "pull_request" ] \
-            && [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ] \
-            && result=$(python3 scripts/job-inputs.py \
-              --base-ref "$BASE_SHA" --head-ref "$HEAD_SHA"); then
-            rust=$(printf '%s' "$result" | sed -n 's/^rust=//p')
-            supply=$(printf '%s' "$result" | sed -n 's/^supply=//p')
-            rust=${rust:-true} supply=${supply:-true}
+            && [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
+            # The nightly suite runs on its schedule, not per PR: the required
+            # `check` matrix already runs the affected suites on every PR, and
+            # this 45-minute sweep on each push cost ~170 runs/day (most of them
+            # cancelled by the next push). A PR runs it only when it changes
+            # the nightly wiring itself; job-level gating keeps this workflow
+            # free of workflow-level paths filters.
+            rust=false supply=false
+            if git diff --name-only "$BASE_SHA" "$HEAD_SHA" \
+              | grep -qxE '\.github/workflows/(nightly|pipeline-benchmark)\.yml|scripts/job-inputs\.py'; then
+              rust=true supply=true
+            fi
           fi
           printf 'rust=%s\nsupply=%s\n' "$rust" "$supply" >>"$GITHUB_OUTPUT"
 
