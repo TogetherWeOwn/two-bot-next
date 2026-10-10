@@ -586,7 +586,7 @@ fn apply_dispatch<I: InviteSource>(
         // Capture member state before the cache pipeline mutates it.
         onboarding_job = writer_onboarding
             .as_ref()
-            .and_then(|runtime| runtime.capture(&dispatch.event, &pipeline));
+            .and_then(|runtime| runtime.capture(&dispatch.event, pipeline));
         audit_events = crate::audit_gateway::translate(
             &dispatch.event,
             pipeline.cache(),
@@ -631,7 +631,7 @@ fn apply_dispatch<I: InviteSource>(
         }
         if !requests.is_empty() {
             let drain_outcome =
-                handle.block_on(checkpoint_io(&worker_state, &generation, deadline, async {
+                handle.block_on(checkpoint_io(worker_state, generation, deadline, async {
                     pipeline.drain(requests).await.map(drop).map_err(|error| {
                         // Runtime Display is sanitized; never
                         // log its SQL/HTTP source.
@@ -704,8 +704,8 @@ fn apply_dispatch<I: InviteSource>(
         ))
     } else {
         handle.block_on(checkpoint_io(
-            &worker_state,
-            &generation,
+            worker_state,
+            generation,
             deadline,
             store.commit_dispatch_with_job(
                 &checkpoint,
