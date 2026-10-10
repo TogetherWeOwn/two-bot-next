@@ -6,10 +6,11 @@
 //! caller supplies room facts and a clock, and the core emits a room-scoped
 //! kick decision at most once. Twelve input bytes drive one transition, so
 //! arbitrary fuzzer bytes become arbitrary sequences of starts, ballots,
-//! refreshes, roster changes and clock jumps. Small synthetic ID pools force
-//! vote-ID reuse, shared guild/target pairs and outsider actors, keeping the
-//! replay, active-vote and boundary rejections reachable instead of starving
-//! behind fresh IDs. No Discord client, database, secret or network is used.
+//! refreshes, roster changes, privilege evidence and clock jumps. Small
+//! synthetic ID pools force vote-ID reuse, shared guild/target pairs and
+//! outsider actors, keeping the replay, active-vote and boundary rejections
+//! reachable instead of starving behind fresh IDs. No Discord client,
+//! database, secret or network is used.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -58,6 +59,22 @@ fn occupants(byte: u8) -> Vec<u64> {
         }
     }
     ids
+}
+
+/// Target privilege evidence for [`VoteRoomFacts::target_privileged`].
+/// `Some(false)` allows the vote, `Some(true)` refuses it as
+/// `PrivilegedTarget`, and `None` fails closed as `AuthorityUnavailable` on
+/// start (or cancels an active vote as `TargetProtected`). Both spare high
+/// bits are free: the guild pick is `% 2`, so `facts_byte & 0x80` never moves
+/// it, and `0x80` is unused by the roster/ballot packing in `roster_byte`.
+fn target_privileged(facts_byte: u8, roster_byte: u8) -> Option<bool> {
+    if roster_byte & 0x80 != 0 {
+        None
+    } else if facts_byte & 0x80 != 0 {
+        Some(true)
+    } else {
+        Some(false)
+    }
 }
 
 fn apply_clock_jump(now: u64, mode: u8) -> u64 {
@@ -125,6 +142,7 @@ fn drive(data: &[u8]) {
             owner_id: pick(&ACTORS, step[8]),
             original_creator_id: pick(&ACTORS, step[9]),
             occupants: &room,
+            target_privileged: target_privileged(step[6], step[10]),
         };
         let actor = pick(&ACTORS, step[11]);
         let ballot = if step[10] & 0x40 != 0 {
