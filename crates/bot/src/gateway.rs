@@ -721,23 +721,29 @@ fn apply_dispatch<I: InviteSource>(
             None
         }
     };
-    let checkpoint_result = if let Some(error) = dispatch_error {
-        Err(error)
+    let (checkpoint_result, checkpoint_stage) = if let Some(error) = dispatch_error {
+        (Err(error), "pre_commit")
     } else if acknowledgement_held {
-        Err(sqlx::Error::InvalidArgument(
-            "interaction acknowledgement failed; checkpoint unchanged".into(),
-        ))
+        (
+            Err(sqlx::Error::InvalidArgument(
+                "interaction acknowledgement failed; checkpoint unchanged".into(),
+            )),
+            "pre_commit",
+        )
     } else {
-        handle.block_on(checkpoint_io(
-            worker_state,
-            generation,
-            deadline,
-            store.commit_dispatch_with_job(
-                &checkpoint,
-                pipeline.handlers().store().take_batch(),
-                durable_job,
-            ),
-        ))
+        (
+            handle.block_on(checkpoint_io(
+                worker_state,
+                generation,
+                deadline,
+                store.commit_dispatch_with_job(
+                    &checkpoint,
+                    pipeline.handlers().store().take_batch(),
+                    durable_job,
+                ),
+            )),
+            "commit",
+        )
     };
     // A failed checkpoint is recorded on `operation` (the
     // worker stops and accepted RSVP drains) instead of
@@ -799,6 +805,11 @@ fn apply_dispatch<I: InviteSource>(
             }
         }
         Err(error) => {
+            // Every failed checkpoint stops the worker; count it for the M2.1
+            // alert hook alongside the sibling failure surfaces. The stage is
+            // bounded (`pre_commit` when the commit was skipped, `commit` when
+            // the store write failed); causes are never labels.
+            two_bot_core::metrics::global().checkpoint_failure(checkpoint_stage);
             if let Some(committed) = committed {
                 let _ = committed.send(());
             }

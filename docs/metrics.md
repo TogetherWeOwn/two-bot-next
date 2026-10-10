@@ -41,6 +41,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert when any lane's drops increase across consecutive keepalive samples; a single drop inside one burst is not paging. `reactions`-lane growth points at a hot member before an undersized lane |
+| `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch`: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert on any increase across consecutive keepalive samples; unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
 
 ## Job coverage and outcomes
 
@@ -158,6 +159,12 @@ as dynamic labels.
   including the busy-lane path, plus per-member fairness refusals on the
   `reactions` lane (the `dispatch_self_role_reaction` per-member cap, via the
   shared `record_drop` path); scope-shutdown refusals are not drops.
+- `two_bot_gateway_checkpoint_failures_total{stage}` — `stage` is
+  `pre_commit` or `commit` (`crates/core/src/metrics.rs`
+  `CHECKPOINT_FAILURE_STAGES`). Recorded once per `apply_dispatch` Err arm
+  entry in `crates/bot/src/gateway.rs`: `pre_commit` when the commit was
+  skipped after a funnel/leveling/acknowledgement failure, `commit` when the
+  durable store write itself failed. Failure causes are never labels.
 - Log fields (coordinated with blocked structured-log work, which owns JSON
   formatting): `voice_event="voice_operation"` with `op`/`outcome`,
   `voice_event="voice_reconcile"` with plan counts,

@@ -136,6 +136,19 @@ pub const DISPATCH_LANES: &[&str] = &[
     "busy",
     "reactions",
 ];
+/// Checkpoint-failure stages for `two_bot_gateway_checkpoint_failures_total{stage}`.
+/// `pre_commit` is a commit skipped after a funnel/leveling/acknowledgement
+/// failure held in `dispatch_error` or `acknowledgement_held`; `commit` is the
+/// durable store write itself failing. Every failure stops the dispatch worker
+/// and is recorded on `operation`; the counter is the alertable signal.
+/// Failure causes are never labels (no reason strings); unknown stages collapse
+/// to the trailing `commit` slot only when the allowlist grows.
+///
+/// Alert-threshold hook for M2.1: alert on any increase across consecutive
+/// scrapes (exact rule lands with M2.1); unlike bursty dispatch drops, a
+/// single checkpoint failure stops the worker, so there is no
+/// benign-singleton case.
+pub const CHECKPOINT_FAILURE_STAGES: &[&str] = &["pre_commit", "commit"];
 const BUCKETS_MICROS: &[u64] = &[
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
@@ -209,6 +222,7 @@ struct Values {
     db_errors: [u64; DB_ERROR_OPS.len()],
     send_admissions: [u64; SEND_ADMISSION_OUTCOMES.len()],
     dispatch_drops: [u64; DISPATCH_LANES.len()],
+    checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
 }
 
 /// All storage is fixed-size. Unknown labels collapse to `other`, including hostile input.
@@ -423,6 +437,22 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter = &mut values.dispatch_drops[bounded_index(lane, DISPATCH_LANES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One failed gateway checkpoint commit from `apply_dispatch`: `pre_commit`
+    /// when the commit was skipped after a funnel/leveling/acknowledgement
+    /// failure, `commit` when the durable store write itself failed. Call once
+    /// per Err arm entry. Unknown stages collapse to `commit` only when the
+    /// allowlist grows; failure causes are never labels. No IDs, tokens or
+    /// bodies are retained.
+    pub fn checkpoint_failure(&self, stage: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.checkpoint_failures[bounded_index(stage, CHECKPOINT_FAILURE_STAGES)];
         *counter = counter.saturating_add(1);
     }
 
@@ -647,6 +677,22 @@ impl Metrics {
             )
             .unwrap();
         }
+        header(
+            &mut out,
+            "two_bot_gateway_checkpoint_failures_total",
+            "counter",
+            "Failed gateway checkpoint commits by bounded stage; every failure stops the dispatch worker.",
+        );
+        for (stage, count) in CHECKPOINT_FAILURE_STAGES
+            .iter()
+            .zip(values.checkpoint_failures)
+        {
+            writeln!(
+                out,
+                "two_bot_gateway_checkpoint_failures_total{{stage=\"{stage}\"}} {count}"
+            )
+            .unwrap();
+        }
         let (size, idle, max) = pool.unwrap_or_default();
         scalar(
             &mut out,
@@ -729,6 +775,7 @@ mod tests {
             metrics.db_error(&hostile);
             metrics.send_admission(&hostile);
             metrics.dispatch_drop(&hostile);
+            metrics.checkpoint_failure(&hostile);
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
@@ -869,6 +916,40 @@ mod tests {
             assert!(series.insert(key), "duplicate series: {key}");
             assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
         }
+    }
+
+    #[test]
+    fn checkpoint_failures_stay_bounded_and_saturate() {
+        let metrics = Metrics::default();
+        metrics.checkpoint_failure("pre_commit");
+        metrics.checkpoint_failure("commit");
+        metrics.checkpoint_failure("commit");
+        let text = metrics.render(None);
+        assert!(
+            text.contains("two_bot_gateway_checkpoint_failures_total{stage=\"pre_commit\"} 1\n")
+        );
+        assert!(text.contains("two_bot_gateway_checkpoint_failures_total{stage=\"commit\"} 2\n"));
+        // Fixed cardinality: two stages.
+        let mut series = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(series.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn checkpoint_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.checkpoint_failure(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+        assert!(text.contains("two_bot_gateway_checkpoint_failures_total{stage=\"commit\"} 100\n"));
     }
 
     #[test]
