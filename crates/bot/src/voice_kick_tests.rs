@@ -1,5 +1,7 @@
 use super::*;
-use two_bot_core::voice_vote_kick::{VoteCancellation, VOTE_KICK_TTL_MS};
+use two_bot_core::voice_vote_kick::{
+    VoteBallot, VoteCancellation, VoteKickError, VOTE_KICK_TTL_MS,
+};
 
 const OWNER: u64 = MEMBER;
 const VOTER_A: u64 = 301;
@@ -38,6 +40,38 @@ async fn setup_with(snapshot: GuildSnapshot) -> (GuildRoomWorker<Store, Http>, T
 
 async fn setup() -> (GuildRoomWorker<Store, Http>, Trace) {
     setup_with(snapshot(&[ROOM], roster())).await
+}
+
+const KICK_ROLE: u64 = 901;
+const ADMIN_ROLE: u64 = 902;
+
+/// Give `target` a guild role carrying `permissions` in this worker's guild,
+/// so VK-01 guild-scoped resolution observes it on the next vote transition.
+fn grant_guild_role(
+    worker: &GuildRoomWorker<Store, Http>,
+    target: u64,
+    role: u64,
+    permissions: Permissions,
+) {
+    {
+        let live = worker.live.read_state();
+        if !live
+            .bot
+            .as_ref()
+            .is_some_and(|bot| bot.roles.iter().any(|r| r.id.get() == role))
+        {
+            drop(live);
+            worker
+                .live
+                .write_state()
+                .bot
+                .as_mut()
+                .expect("bot snapshot")
+                .roles
+                .push(role_with(role, permissions));
+        }
+    }
+    worker.live.set_member_roles(target, Some(vec![role]));
 }
 
 fn start(
@@ -119,6 +153,128 @@ async fn owner_original_creator_and_self_cannot_be_targeted() {
             .kick_start(VOTE + 1, ROOM, VOTER_B, OWNER, 0)
             .unwrap_err(),
         KickRefusal::Vote(VoteKickError::ProtectedTarget)
+    );
+}
+
+#[tokio::test]
+async fn kick_members_and_administrator_targets_are_refused_with_no_effect() {
+    // VK-01 start path: each privileged class is denied separately in the
+    // interaction's guild, creating no vote, ballot, or enforcement effect.
+    for (role, permissions) in [
+        (KICK_ROLE, Permissions::KICK_MEMBERS),
+        (ADMIN_ROLE, Permissions::ADMINISTRATOR),
+    ] {
+        let (mut worker, trace) = setup().await;
+        grant_guild_role(&worker, TARGET, role, permissions);
+        assert_eq!(
+            start(&mut worker, VOTER_A, TARGET).unwrap_err(),
+            KickRefusal::Vote(VoteKickError::PrivilegedTarget),
+            "role {role}"
+        );
+        // Refusal created no vote: a ballot is unknown and nothing is queued.
+        assert_eq!(
+            worker
+                .kick_cast(VOTE, VOTER_A, VoteBallot::Yes, 1)
+                .unwrap_err(),
+            KickRefusal::Vote(VoteKickError::UnknownVote)
+        );
+        assert!(worker.kick_refresh(2).is_empty());
+        assert!(!worker.dispatch_one(3).await);
+        assert!(trace.lock().unwrap().is_empty());
+        // The refusal is audited with its own code.
+        assert!(worker.flush_kick_audit(4).await);
+        let rows = worker.store.kick_audit.lock().unwrap().clone();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event, KickAuditEvent::VoteRefused);
+        assert_eq!(rows[0].outcome, "privileged_target");
+    }
+}
+
+#[tokio::test]
+async fn unavailable_target_authority_fails_closed_with_no_effect() {
+    // VK-01 fail-closed: losing the guild-authority lookup refuses the start
+    // with no vote, ballot, or Discord write.
+    let (mut worker, trace) = setup().await;
+    worker.live.set_member_roles(TARGET, None);
+    assert_eq!(
+        start(&mut worker, VOTER_A, TARGET).unwrap_err(),
+        KickRefusal::Vote(VoteKickError::AuthorityUnavailable)
+    );
+    assert_eq!(
+        worker
+            .kick_cast(VOTE, VOTER_A, VoteBallot::Yes, 1)
+            .unwrap_err(),
+        KickRefusal::Vote(VoteKickError::UnknownVote)
+    );
+    assert!(worker.kick_refresh(2).is_empty());
+    assert!(!worker.dispatch_one(3).await);
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.flush_kick_audit(4).await);
+    let rows = worker.store.kick_audit.lock().unwrap().clone();
+    assert_eq!(rows[0].outcome, "authority_unavailable");
+}
+
+#[tokio::test]
+async fn promoted_target_mid_vote_cancels_and_enforces_nothing() {
+    // VK-01 recheck: a Kick Members grant after the start cancels the vote;
+    // the would-be passing ballot produces no kick/disconnect effect.
+    let (mut worker, trace) = setup().await;
+    start(&mut worker, VOTER_A, TARGET).unwrap();
+    worker.kick_cast(VOTE, VOTER_A, VoteBallot::Yes, 1).unwrap();
+    grant_guild_role(&worker, TARGET, KICK_ROLE, Permissions::KICK_MEMBERS);
+    let update = worker.kick_cast(VOTE, VOTER_B, VoteBallot::Yes, 2).unwrap();
+    assert_eq!(
+        update.status,
+        VoteKickStatus::Cancelled(VoteCancellation::TargetProtected)
+    );
+    assert_eq!(update.kick, None);
+    assert!(!worker.dispatch_one(3).await);
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn promoted_target_after_pass_is_not_touched_on_dispatch() {
+    // A promotion landing between the pass and the Discord writes must still
+    // produce zero writes: the enforcement recheck fails closed.
+    let (mut worker, trace) = setup().await;
+    pass_vote(&mut worker);
+    grant_guild_role(&worker, TARGET, ADMIN_ROLE, Permissions::ADMINISTRATOR);
+    dispatch(&mut worker, 3).await;
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.failures().is_empty());
+    assert!(worker.flush_kick_audit(4).await);
+    let enforcement: Vec<_> = worker
+        .store
+        .kick_audit
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|row| row.event == KickAuditEvent::Enforcement)
+        .cloned()
+        .collect();
+    assert_eq!(enforcement.len(), 1);
+    assert_eq!(enforcement[0].outcome, "skipped_target_protected");
+}
+
+#[tokio::test]
+async fn ordinary_target_remains_votable_end_to_end() {
+    // An occupant with no privilege, who is not owner/creator/self, still
+    // passes and enforces on that room only.
+    let (mut worker, trace) = setup().await;
+    let started = start(&mut worker, VOTER_A, TARGET).unwrap();
+    assert_eq!(started.status, VoteKickStatus::Active);
+    for voter in [VOTER_A, VOTER_B] {
+        worker.kick_cast(VOTE, voter, VoteBallot::Yes, 1).unwrap();
+    }
+    let passed = worker.kick_cast(VOTE, VOTER_C, VoteBallot::Yes, 2).unwrap();
+    assert_eq!(passed.status, VoteKickStatus::Passed);
+    dispatch(&mut worker, 3).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            format!("deny:{ROOM}:{TARGET}"),
+            format!("disconnect:{GUILD}:{TARGET}")
+        ]
     );
 }
 
@@ -760,6 +916,59 @@ fn reason_line(content: &str) -> &str {
         .expect("a Reason line")
 }
 
+/// Gate VK-04 hostile-matrix echo probes, shared by the ballot render test and
+/// the refusal/error/log echo test so both prove the same inputs.
+const HOSTILE_ECHO_PROBES: &[&str] = &[
+    "@everyone",
+    "@here",
+    "<@",
+    "<#",
+    "<:",
+    "://",
+    "www.",
+    "discord.gg",
+    ".gg/",
+    ".com/",
+    "**",
+    "__",
+    "~~",
+    "||",
+];
+
+/// Hostile snowflakes from the matrix above; none equals a test ID (ROOM=500,
+/// VOTE=7000, members in the 300s).
+const HOSTILE_ECHO_IDS: &[&str] = &["7654321", "987654321", "123456789"];
+
+/// Reason-derived echo probes: only substrings actually present in this hostile
+/// input. Bare "<@" / "<#" / "<:" prefixes are deliberately NOT probed:
+/// `failure_line` legitimately renders "<#ROOM>" channel mentions for real IDs,
+/// so a bare prefix cannot distinguish an echo from the fixed ID format.
+/// Mention-pill inputs are instead pinned by their hostile-specific snowflake.
+fn assert_no_reason_echo(hostile: &str, rendered: &str, where_: &str) {
+    let folded_rendered = rendered.to_lowercase();
+    let folded_hostile = hostile.to_lowercase();
+    for probe in HOSTILE_ECHO_PROBES {
+        if matches!(*probe, "<@" | "<#" | "<:") {
+            continue;
+        }
+        if !folded_hostile.contains(*probe) {
+            continue;
+        }
+        assert!(
+            !folded_rendered.contains(*probe),
+            "{hostile:?} probe {probe:?} in {where_}: {rendered:?}"
+        );
+    }
+    for needle in HOSTILE_ECHO_IDS.iter().copied() {
+        if hostile.contains(needle) {
+            assert!(
+                !rendered.contains(needle),
+                "{hostile:?} id {needle:?} echoed in {where_}: {rendered:?}"
+            );
+        }
+    }
+}
+
 /// Gate VK-04 hostile matrix from #692, shared by the ballot render test and
 /// the refusal/error/log echo test so both prove the same inputs.
 const HOSTILE_VOTE_REASONS: &[&str] = &[
@@ -915,51 +1124,6 @@ fn kick_refusals_never_echo_initiator_text() {
 /// passes through via `ordinary_reasons_render_intact_and_absent_reason_renders_no_line`.
 #[tokio::test]
 async fn hostile_reasons_never_echo_in_refusals_errors_or_logs() {
-    const PROBES: &[&str] = &[
-        "@everyone",
-        "@here",
-        "<@",
-        "<#",
-        "<:",
-        "://",
-        "www.",
-        "discord.gg",
-        ".gg/",
-        ".com/",
-        "**",
-        "__",
-        "~~",
-        "||",
-    ];
-    // Local helper: reason-derived echo probes, only substrings actually
-    // present in this hostile input. Bare "<@" / "<#" / "<:" prefixes are
-    // deliberately NOT probed: `failure_line` legitimately renders "<#ROOM>"
-    // channel mentions for real IDs, so a bare prefix cannot distinguish an
-    // echo from the fixed ID format. Mention-pill inputs are instead pinned by
-    // their hostile-specific snowflake, which never equals a test ID (ROOM=500,
-    // VOTE=7000, members in the 300s).
-    fn assert_no_reason_echo(hostile: &str, rendered: &str, where_: &str) {
-        for probe in PROBES {
-            if matches!(probe, "<@" | "<#" | "<:") {
-                continue;
-            }
-            if !hostile.to_lowercase().contains(probe) {
-                continue;
-            }
-            assert!(
-                !rendered.to_lowercase().contains(probe),
-                "{hostile:?} probe {probe:?} in {where_}: {rendered:?}"
-            );
-        }
-        for needle in ["7654321", "987654321", "123456789"] {
-            if hostile.contains(needle) {
-                assert!(
-                    !rendered.contains(needle),
-                    "{hostile:?} id {needle:?} echoed in {where_}: {rendered:?}"
-                );
-            }
-        }
-    }
     let admission = two_bot_core::voice_create_admission::CreateAdmissionConfig::default();
     let admission_reasons = [
         two_bot_core::voice_create_admission::RefusalReason::UserCap,
@@ -1014,7 +1178,112 @@ async fn hostile_reasons_never_echo_in_refusals_errors_or_logs() {
             "{hostile:?} echoed in active-vote refusal: {active_text:?}"
         );
         for text in [repeat_text, active_text] {
-            assert_no_reason_echo(hostile, &text, "refusal");
+            let folded = text.to_lowercase();
+            for probe in HOSTILE_ECHO_PROBES.iter().copied() {
+                assert!(
+                    !folded.contains(probe),
+                    "{hostile:?} probe {probe:?} in refusal: {text:?}"
+                );
+            }
+        }
+
+        // `failure_line`: `CreateRefused` carries only `reason.code()` plus IDs
+        // and fixed user text, never initiator free text.
+        for reason in admission_reasons {
+            let message = reason.user_message(&admission);
+            assert!(
+                !message.contains(hostile),
+                "{hostile:?} echoed in user_message for {reason:?}: {message:?}"
+            );
+            let failure = LifecycleFailure::CreateRefused {
+                creator_id: ROOM,
+                reason,
+                message,
+            };
+            let rendered = failure_line(&failure);
+            assert!(
+                rendered.contains(reason.code()),
+                "{hostile:?} must keep reason.code() for {reason:?}: {rendered:?}"
+            );
+            assert!(
+                rendered.contains(&ROOM.to_string()),
+                "{hostile:?} must keep IDs: {rendered:?}"
+            );
+            assert!(
+                !rendered.contains(hostile),
+                "{hostile:?} echoed in failure_line: {rendered:?}"
+            );
+            assert_no_reason_echo(hostile, &rendered, "failure_line");
+        }
+        // Other failure families carry IDs and typed errors only.
+        let others = [
+            LifecycleFailure::CategoryFull {
+                creator_id: ROOM,
+                message: "category is full".to_owned(),
+            },
+            LifecycleFailure::Discord {
+                channel_id: ROOM,
+                error: RoomHttpError::AccessDenied,
+            },
+            LifecycleFailure::Persistence {
+                channel_id: Some(ROOM),
+                error: StoreError::Unavailable,
+            },
+            LifecycleFailure::MissingPermission {
+                write: RefusedWrite::Create,
+                channel_id: ROOM,
+                findings: Vec::new(),
+            },
+            LifecycleFailure::NameBlocked {
+                creator_id: ROOM,
+                error: NameError::Empty,
+            },
+        ];
+        for failure in &others {
+            let rendered = failure_line(failure);
+            assert!(
+                !rendered.contains(hostile),
+                "{hostile:?} echoed in {failure:?}: {rendered:?}"
+            );
+            assert_no_reason_echo(hostile, &rendered, "failure_line");
+        }
+
+        // Vote log sites: audit rows carry snowflakes and fixed codes only, and
+        // follow-up ballot edits never interpolate the reason.
+        assert!(worker.flush_kick_audit(4).await, "{hostile:?}");
+        let rows = worker.store.kick_audit.lock().unwrap().clone();
+        for row in &rows {
+            assert!(
+                !row.outcome.contains(hostile),
+                "{hostile:?} echoed in audit outcome: {row:?}"
+            );
+            assert_no_reason_echo(hostile, row.outcome, "audit outcome");
+            assert!(
+                row.outcome
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "audit outcome must stay a fixed code: {row:?}"
+            );
+        }
+        let base = started_update();
+        for status in [
+            VoteKickStatus::Active,
+            VoteKickStatus::Passed,
+            VoteKickStatus::Expired,
+            VoteKickStatus::Cancelled(VoteCancellation::TargetLeft),
+            VoteKickStatus::Cancelled(VoteCancellation::TargetProtected),
+        ] {
+            let update = VoteKickUpdate { status, ..base };
+            let response = vote_update_message(&update);
+            let text = response
+                .data
+                .as_ref()
+                .and_then(|data| data.content.clone())
+                .unwrap_or_default();
+            assert!(
+                !text.contains(hostile),
+                "{hostile:?} echoed in vote update {status:?}: {text:?}"
+            );
         }
     }
 }
