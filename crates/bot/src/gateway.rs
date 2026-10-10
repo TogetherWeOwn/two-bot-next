@@ -47,6 +47,28 @@ pub fn ensure_crypto_provider() {
     }
 }
 
+/// Worker decision for prefix triggers: `Some(trigger)` means the serial
+/// dispatch worker must call `dispatch_with_verdict(event, trigger)`, `None`
+/// means it must not. `trigger` is `disposition.map(|verdict| verdict.trigger)`;
+/// the text-automation gate stays on the trigger verdict, not the funnel: an
+/// uninspected create keeps funnel `Accept` but its trigger is capture-only
+/// and must not run sticky or prefix triggers (fail-closed).
+pub(crate) fn worker_prefix_trigger(
+    disposition: Option<crate::automod_gateway::WorkerVerdict>,
+    event: &Event,
+    automod_enabled: bool,
+) -> Option<Option<two_bot_core::automod_runtime::FunnelDisposition>> {
+    let trigger = disposition.map(|verdict| verdict.trigger);
+    if automod_enabled
+        && matches!(event, Event::MessageCreate(_))
+        && crate::automod_gateway::runs_text_automations(trigger)
+    {
+        Some(trigger)
+    } else {
+        None
+    }
+}
+
 /// Supervisor-visible gateway state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayState {
@@ -529,33 +551,6 @@ fn voice_disconnected(voice: Option<&Arc<dyn VoiceEventSink>>) {
     }
 }
 
-/// Trigger-gated text-automation dispatch for the serial worker: only an
-/// inspected `Accept` trigger verdict dispatches (fail-closed). Extracted from
-/// `apply_dispatch` so worker-level tests drive the exact call-site gate
-/// (`gateway.rs` trigger path, M2.22): a Bypassed create keeps funnel-Accept
-/// but its trigger is capture-only and must not run sticky.
-fn dispatch_text_automations(
-    handle: &tokio::runtime::Handle,
-    command_runtime: Option<&Arc<crate::command_runtime::CommandRuntime>>,
-    automod_enabled: bool,
-    event: &Event,
-    trigger: Option<two_bot_core::automod_runtime::FunnelDisposition>,
-) -> bool {
-    if automod_enabled
-        && matches!(event, Event::MessageCreate(_))
-        && crate::automod_gateway::runs_text_automations(trigger)
-    {
-        if let Some(runtime) = command_runtime {
-            // Detached spawn from the blocking worker needs the runtime.
-            // The verdict travels with the event; a missing
-            // verdict fails closed inside the trigger handler.
-            let _guard = handle.enter();
-            return runtime.dispatch_with_verdict(event, trigger);
-        }
-    }
-    false
-}
-
 /// One blocking-worker dispatch step: run the funnel/leveling drain, await the
 /// interaction completion, serialize any onboarding job and commit the
 /// checkpoint — or record the first failure as a typed error and skip the
@@ -662,18 +657,16 @@ fn apply_dispatch<I: InviteSource>(
                 voice.disconnect();
             }
         }
-        let trigger = disposition.map(|verdict| verdict.trigger);
-        // Text automations gate on the trigger verdict, not
-        // the funnel: a Bypassed create keeps funnel-Accept
-        // but its trigger is capture-only and must not run
-        // sticky (fail-closed; M2.19, M2.22).
-        let _ = dispatch_text_automations(
-            handle,
-            command_runtime.as_ref(),
-            automod_enabled,
-            &dispatch.event,
-            trigger,
-        );
+        if let Some(trigger) = worker_prefix_trigger(disposition, &dispatch.event, automod_enabled)
+        {
+            if let Some(runtime) = command_runtime.as_ref() {
+                // Detached spawn from the blocking worker needs the runtime.
+                // The verdict travels with the event; a missing
+                // verdict fails closed inside the trigger handler.
+                let _guard = handle.enter();
+                runtime.dispatch_with_verdict(&dispatch.event, trigger);
+            }
+        }
         if !requests.is_empty() {
             let drain_outcome =
                 handle.block_on(checkpoint_io(worker_state, generation, deadline, async {
@@ -1263,6 +1256,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                     committed,
                 ),
             };
+
             if let Err(error) = operation {
                 // Retain the original error without panicking away accepted
                 // commands or allowing a later checkpoint to leap past failure.
@@ -2368,7 +2362,7 @@ mod tests {
         );
     }
 
-    /// M2.22: the worker's trigger gate (the exact `dispatch_text_automations`
+    /// M2.22: the worker's trigger gate (the exact `worker_prefix_trigger`
     /// call site above) posts no sticky automation for a Bypassed create while
     /// an inspected Accept through the same path still dispatches. Both verdicts
     /// come from the real worker function `automod_gateway::process` (not
@@ -2643,14 +2637,14 @@ mod tests {
                 .unwrap(),
             ))
         };
+        // The exact worker call site (`worker_prefix_trigger` decision plus the
+        // detached `dispatch_with_verdict` effect): Bypassed never dispatches
+        // (so `on_message` never runs and no sticky post is possible) while an
+        // inspected Accept through the same path still dispatches.
+        let bypassed_event = message_event("4000000000000000001", "42");
         assert!(
-            !dispatch_text_automations(
-                &handle,
-                Some(&runtime),
-                true,
-                &message_event("4000000000000000001", "42"),
-                Some(bypassed_verdict.trigger),
-            ),
+            crate::gateway::worker_prefix_trigger(Some(bypassed_verdict), &bypassed_event, true)
+                .is_none(),
             "Bypassed create must not dispatch text automations"
         );
         assert_eq!(
@@ -2658,15 +2652,19 @@ mod tests {
             0,
             "no message-lane work means no sticky side effect for Bypassed"
         );
+        let accept_event = message_event("4000000000000000002", STAGING_GUILD_ID);
+        let trigger =
+            crate::gateway::worker_prefix_trigger(Some(accept_verdict), &accept_event, true)
+                .expect("inspected Accept still dispatches text automations");
+        assert_eq!(
+            trigger,
+            Some(FunnelDisposition::Accept),
+            "the worker forwards the trigger verdict, not the funnel"
+        );
+        let _guard = handle.enter();
         assert!(
-            dispatch_text_automations(
-                &handle,
-                Some(&runtime),
-                true,
-                &message_event("4000000000000000002", STAGING_GUILD_ID),
-                Some(accept_verdict.trigger),
-            ),
-            "inspected Accept still dispatches text automations"
+            runtime.dispatch_with_verdict(&accept_event, trigger),
+            "inspected Accept dispatches through the worker call site"
         );
     }
 
