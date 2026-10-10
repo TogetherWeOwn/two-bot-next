@@ -158,6 +158,11 @@ can disable audit triggers without a superuser attribute. They are cluster-wide:
 the plan does not revoke them automatically; any correction needs an independently
 reviewed operator change.
 
+Functions in a schema a group cannot use (no USAGE) are not callable by it and are
+not drift. Managed Postgres installs extension helpers this way: PlanetScale puts
+`hypopg` in its own `pscale_extensions` schema with default PUBLIC EXECUTE and no
+USAGE for other roles. A USAGE grant on such a schema makes its functions count again.
+
 Normal PUBLIC catalog reads/functions remain available. No group may own a
 system-schema relation, function or schema (ownership grants implicit DDL and
 grant authority even when EXECUTE already belongs to PUBLIC), except the migrator's
