@@ -45,10 +45,14 @@ jobs:
             # cancelled by the next push). A PR runs it only when it changes
             # the nightly wiring itself; job-level gating keeps this workflow
             # free of workflow-level paths filters.
-            rust=false supply=false
-            if git diff --name-only "$BASE_SHA" "$HEAD_SHA" \
+            # CI standard: --no-renames -z, and a diff error fails closed (full run).
+            if ! changed=$(git diff --name-only --no-renames -z "$BASE_SHA" "$HEAD_SHA" | tr '\0' '\n'); then
+              :
+            elif printf '%s\n' "$changed" \
               | grep -qxE '\.github/workflows/(nightly|pipeline-benchmark)\.yml|scripts/job-inputs\.py'; then
-              rust=true supply=true
+              :
+            else
+              rust=false supply=false
             fi
           fi
           printf 'rust=%s\nsupply=%s\n' "$rust" "$supply" >>"$GITHUB_OUTPUT"
