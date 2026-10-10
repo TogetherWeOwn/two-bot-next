@@ -76,9 +76,10 @@ issue. Blank issues are off. Report a vulnerability privately; see
 
 ## Releases
 
-Each successful production promote tags the deployed commit `vX.Y.Z` and
-publishes a GitHub Release from the Conventional Commit subjects since the
-previous tag (`release.yml`, called by `deploy-production`). There is no release
+Each successful production promote dispatches `release.yml` in a separate run
+to tag the deployed commit `vX.Y.Z` and publish a GitHub Release from the
+Conventional Commit subjects since the previous tag. Release/SBOM work does
+not hold the production rollback lock. There is no release
 PR and no freeze. One flat `vX.Y.Z` tag covers the whole repository, not one
 release per crate. See [`docs/releases.md`](docs/releases.md). Never tag or
 release by hand.

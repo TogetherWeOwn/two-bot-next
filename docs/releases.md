@@ -7,7 +7,11 @@ crates are not released separately.
 
 A release is cut by the production promote itself. When `deploy-production`
 deploys (mode `deploy`, not `rollback`) and its readiness gate passes, its
-`release` job calls `.github/workflows/release.yml` with the exact guarded SHA:
+`release` job dispatches `.github/workflows/release.yml` on `main` with the exact
+guarded SHA. This two-minute, `actions: write`-only job does not check out code
+or wait for the release run. Tagging and the SBOM build/scans run independently,
+outside the `deploy-production` concurrency group, so they cannot hold up a
+production rollback. In that separate run:
 
 1. The `tag` job runs `.github/scripts/release-on-promote.cjs`. It refuses a
    SHA that is not on `origin/main` and finds the previous `vX.Y.Z` tag
@@ -49,7 +53,7 @@ review to land.
 ## Repair and dry run
 
 ```sh
-# A promote deployed but its release job failed: tag and publish that SHA (idempotent).
+# A promote deployed but dispatch/tagging failed: tag and publish that SHA (idempotent).
 gh workflow run release.yml --ref main -f sha=<deployed 40-hex SHA>
 # Repair SBOM assets on an existing release (skips tagging).
 gh workflow run release.yml --ref main -f release_tag=vX.Y.Z
@@ -63,7 +67,12 @@ gh workflow run release.yml --ref main -f dry_run=true
 rules and the note rendering. It also dry-runs the script on a throwaway git
 repository: the version, the rollback guard, the off-main refusal and an invalid
 SHA. `scripts/ci/test_workflows.py` and `scripts/test-deploy-production.py` pin
-the workflow shapes and the `contents: write` grant on the release jobs.
+the workflow shapes, the dispatch-only `actions: write` grant, and the
+`contents: write` grant on the tag/asset jobs. The production suite also executes
+the dispatch step with a fake `gh`, checking the exact SHA/repository/ref
+arguments and propagation of dispatch failures. No test dispatches a real run.
+A green production run proves dispatch acceptance, not release completion;
+check the separate `release` run for tagging and SBOM results.
 
 The root `src/lib.rs` release-metadata library was added for release-please's
 Rust strategy, which needed a root `[package]` version. It stays as is; nothing

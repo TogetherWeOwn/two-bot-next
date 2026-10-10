@@ -206,11 +206,37 @@ class StaticGuardTests(unittest.TestCase):
         # scripts/test-runner-routing.py pins the full expression (TOG-12339).
         self.assertEqual(list(JOBS), ["guard", "production", "release"])
         for name, job in JOBS.items():
-            if name == "release":
-                continue  # reusable call to release.yml; its jobs carry the routing
             runs_on = value(children(job[1:], 4)["runs-on"])
             self.assertTrue(runs_on.startswith("${{ fromJSON((!github.event.repository.private && "), name)
             self.assertIn(f"vars.CI_OVERFLOW_JOBS || '[]'), '{name}')", runs_on)
+
+    def test_release_only_dispatches_after_a_successful_deploy(self):
+        release = children(JOBS["release"][1:], 4)
+        # The implicit success() plus both needs prevents dispatch after a
+        # failed guard/deploy; rollback never creates a release.
+        self.assertEqual(value(release["needs"]), "[guard, production]")
+        self.assertEqual(value(release["if"]), "needs.guard.outputs.mode == 'deploy'")
+        self.assertEqual(value(release["timeout-minutes"]), "2")
+        self.assertNotIn("uses", release)
+        self.assertNotIn("continue-on-error", release)
+        dispatch = steps(JOBS["release"])
+        self.assertEqual(len(dispatch), 1)
+        self.assertEqual(dispatch[0][0], "      - name: Dispatch the release without waiting for SBOMs")
+        env = children(children(dispatch[0][1:], 8)["env"][1:], 10)
+        self.assertEqual({key: value(block) for key, block in env.items()}, {
+            "GH_TOKEN": "${{ github.token }}",
+            "GH_REPO": "${{ github.repository }}",
+            "RELEASE_SHA": "${{ needs.guard.outputs.sha }}",
+        })
+        # Pin the entire script: no build, scan, or gh run watch may extend
+        # the production lock beyond the bounded dispatch request.
+        self.assertEqual(inline_script("Dispatch the release without waiting for SBOMs"),
+                         'set -euo pipefail\n'
+                         'gh workflow run release.yml --repo "$GH_REPO" --ref main -f "sha=$RELEASE_SHA"')
+        release_top = children((ROOT / ".github/workflows/release.yml").read_text().splitlines(), 0)
+        self.assertEqual(list(children(release_top["on"][1:], 2)), ["workflow_dispatch"])
+        release_jobs = children(release_top["jobs"][1:], 2)
+        self.assertEqual(list(release_jobs), ["tag", "sbom-target", "release-sbom", "attach-sbom"])
 
     def test_permissions_are_least_privilege(self):
         self.assertEqual(value(TOP["permissions"]), "{}")
@@ -221,8 +247,8 @@ class StaticGuardTests(unittest.TestCase):
             }
             self.assertTrue(granted, name)
             if name == "release":
-                # Only the post-deploy release call writes: tag + GitHub Release.
-                self.assertEqual(granted, {"contents": "write"})
+                # Only dispatch here; release.yml has its own tag-writing token.
+                self.assertEqual(granted, {"actions": "write"})
                 continue
             self.assertEqual(set(granted.values()), {"read"}, name)
         self.assertEqual(
@@ -233,8 +259,6 @@ class StaticGuardTests(unittest.TestCase):
         uses = [line.split("uses:", 1)[1].strip() for line in LINES if "uses:" in line]
         self.assertTrue(uses)
         for ref in uses:
-            if ref.startswith("./.github/workflows/release.yml"):
-                continue  # same-repo reusable call, pinned to the checked-out commit
             self.assertRegex(ref, r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}(\s|$)", ref)
         staging = {
             line.split("uses:", 1)[1].split()[0]
@@ -341,6 +365,41 @@ class StaticGuardTests(unittest.TestCase):
         production = "\n".join(JOBS["production"])
         self.assertNotIn("inputs.takeover", production)
         self.assertIn("TAKEOVER: ${{ needs.guard.outputs.takeover }}", production)
+
+
+class ReleaseDispatchTests(unittest.TestCase):
+    def dispatch(self, exit_code):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            args_file = Path(tmp) / "args.json"
+            fake_gh = Path(tmp) / "gh"
+            fake_gh.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, sys\n"
+                "with open(os.environ['GH_ARGS_FILE'], 'w') as out:\n"
+                "    json.dump(sys.argv[1:], out)\n"
+                "sys.exit(int(os.environ['FAKE_GH_EXIT']))\n"
+            )
+            fake_gh.chmod(0o755)
+            # No inherited credentials or real gh: PATH contains only the stub.
+            result = subprocess.run(
+                ["/bin/bash", "--noprofile", "--norc", "-eo", "pipefail", "-c",
+                 inline_script("Dispatch the release without waiting for SBOMs")],
+                env={"PATH": tmp, "GH_TOKEN": "fixture", "GH_REPO": REPO,
+                     "RELEASE_SHA": SHA, "GH_ARGS_FILE": str(args_file),
+                     "FAKE_GH_EXIT": str(exit_code)},
+                capture_output=True, text=True, timeout=5,
+            )
+            return result.returncode, json.loads(args_file.read_text())
+
+    def test_dispatch_returns_without_waiting_on_release_and_sbom_jobs(self):
+        code, args = self.dispatch(0)
+        self.assertEqual(code, 0)
+        self.assertEqual(args, ["workflow", "run", "release.yml", "--repo", REPO,
+                                "--ref", "main", "-f", f"sha={SHA}"])
+
+    def test_dispatch_failure_is_not_reported_as_success(self):
+        code, _ = self.dispatch(7)
+        self.assertEqual(code, 7)
 
 
 class GuardBehaviourTests(unittest.TestCase):

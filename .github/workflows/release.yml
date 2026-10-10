@@ -1,7 +1,7 @@
 name: release
 
 # Release on production promote (replaces the release-please release PR).
-# deploy-production calls this after a successful production deploy with the
+# deploy-production dispatches this after a successful production deploy with the
 # exact deployed SHA. The `tag` job tags that commit vX.Y.Z and publishes a
 # GitHub Release whose notes come from the Conventional Commit subjects since
 # the previous tag (.github/scripts/release-on-promote.cjs). Bump rules and
@@ -11,12 +11,6 @@ name: release
 # Manual dispatch: `sha` repairs a missed release for a deployed commit;
 # `dry_run` / `release_tag` keep the SBOM dry-run and repair paths.
 on:
-  workflow_call:
-    inputs:
-      sha:
-        description: Deployed commit to tag
-        type: string
-        required: true
   workflow_dispatch:
     inputs:
       sha:
