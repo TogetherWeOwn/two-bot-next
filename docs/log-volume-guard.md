@@ -71,7 +71,7 @@ thresholds document for paging.
 
 ## Log-line classes (catalog traced messages)
 
-All 28 cataloged session-path messages plus the 2 drain outcomes are class
+All 30 cataloged session-path messages plus the 2 drain outcomes are class
 `session`: at most a handful per process lifetime, one per session or
 failure. More than ~10 of any one line in 5 minutes means a flap or failure
 storm, not traffic. They are never sampled. Per-command voice receipts and
