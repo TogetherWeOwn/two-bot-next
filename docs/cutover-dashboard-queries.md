@@ -49,15 +49,17 @@ curl --silent --show-error --max-time 10 --include "${WORKER_URL}/readyz"
 ```
 
 Expect `/health` 200 `{"status":"ok"}` (liveness only) and `/readyz` 200 with
-both wired components ready:
+every component ready (the bot serves four):
 
 ```json
-{"components": [["process", "ready"], ["gateway", "ready"]]}
+{"components": [["process", "ready"], ["gateway", "ready"], ["database", "ready"], ["token_invalid", "ready"]]}
 ```
 
-A 503 names the failing component (`starting` = connecting/bounded checkpoint
-I/O; `down` = parked prerequisites). A `token_invalid` component at `down`
-also returns 503 even with the gateway connected (see Panel 3). Never use the
+A 503 names the failing component. For the gateway, `starting` = connecting or
+bounded checkpoint I/O and `down` = parked prerequisites. A `database` or
+`token_invalid` component at `down` is a fault, never parked: the rollback gates
+refuse it, and `token_invalid` returns 503 even with the gateway connected (see
+Panel 3). Never use the
 invite redirect `/healthz` as gateway health. Source:
 [runbook](runbook.md#is-it-alive).
 
