@@ -1790,11 +1790,12 @@ impl ActionExecutor {
     ) -> Result<Option<serde_json::Value>, DiscordError> {
         let route = raw_get_route(path).map_err(DiscordError::Rejected)?;
         let request = Request::from_route(&route);
-        // Guard admission and pacing run inside bounded attempts.
+        // Guard admission and pacing run inside bounded attempts. The
+        // timeout travels by value into the attempt future (the same shape
+        // as the receipt-callback retry), so no borrow outlives the call.
         let (res, _) = self
-            .retry_admission_blocked(|timeout| async {
+            .retry_admission_blocked(|timeout| {
                 self.send_with_timeout_for(&request, Some(false), timeout)
-                    .await
             })
             .await?;
         match res.status {
