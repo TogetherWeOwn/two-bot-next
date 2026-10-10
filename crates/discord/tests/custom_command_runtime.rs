@@ -172,6 +172,23 @@ fn registry_receipt(count: usize, first_id: u64) -> ScriptedResponse {
     )
 }
 
+fn refused_verdict_total() -> u64 {
+    // Global counters are monotonic, so delta asserts stay safe under parallel
+    // test threads: refused must advance the series, unmatched must not.
+    two_bot_core::metrics::global()
+        .render(None)
+        .lines()
+        .find(|line| {
+            line.starts_with("two_bot_gateway_prefix_trigger_refused_total{reason=\"verdict\"} ")
+        })
+        .expect("refused series")
+        .rsplit_once(' ')
+        .expect("sample")
+        .1
+        .parse()
+        .expect("count")
+}
+
 #[tokio::test]
 async fn rejected_prefix_inputs_never_access_database_or_discord() {
     use AutomationMessageAcceptance::*;
@@ -186,7 +203,7 @@ async fn rejected_prefix_inputs_never_access_database_or_discord() {
                 .handle_message(&message(50, "!faq"), acceptance, true, None)
                 .await
                 .unwrap(),
-            TextCommandOutcome::Ignored
+            TextCommandOutcome::Refused
         );
     }
     for content in ["hello !faq", " !faq", "!", "! faq", "!RaNk ignored"] {
@@ -231,6 +248,48 @@ async fn rejected_prefix_inputs_never_access_database_or_discord() {
             .unwrap(),
         TextCommandOutcome::Ignored
     );
+    assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn verdict_refusal_counts_separately_from_unmatched() {
+    use AutomationMessageAcceptance::*;
+    let pool = PgPoolOptions::new().connect_lazy_with(test_options());
+    pool.close().await;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    // A verdict refusal returns a distinct outcome and bumps the refused
+    // counter; unmatched content stays `Ignored` with no increment.
+    let before = refused_verdict_total();
+    assert_eq!(
+        runtime
+            .handle_message(&message(70, "!faq"), Matched, true, None)
+            .await
+            .unwrap(),
+        TextCommandOutcome::Refused
+    );
+    assert_eq!(refused_verdict_total(), before + 1);
+    assert_eq!(
+        runtime
+            .handle_message(&message(71, "hello"), Unmatched, true, None)
+            .await
+            .unwrap(),
+        TextCommandOutcome::Ignored
+    );
+    assert_eq!(refused_verdict_total(), before + 1);
+    // Scope mismatches and disabled-gate silence stay `Ignored` and never
+    // count as verdict refusals.
+    let mut webhook = message(72, "!faq");
+    webhook.webhook_id = Some(Id::new(6666));
+    assert_eq!(
+        runtime
+            .handle_message(&webhook, Unmatched, true, None)
+            .await
+            .unwrap(),
+        TextCommandOutcome::Ignored
+    );
+    assert_eq!(refused_verdict_total(), before + 1);
     assert!(mock.requests().is_empty());
     mock.shutdown().await;
 }

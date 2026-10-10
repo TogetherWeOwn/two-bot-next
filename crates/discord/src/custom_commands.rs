@@ -56,6 +56,10 @@ pub enum CustomCommandError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextCommandOutcome {
     Ignored,
+    /// The automod verdict refused the create before any trigger lookup.
+    /// Telemetry counts this separately from [`Self::Ignored`]; dispatch
+    /// still sends nothing, like ignored.
+    Refused,
     /// A distinct candidate from this actor is within the local window.
     CoolingDown,
     /// A prior invocation may have sent a reply. Never resend automatically.
@@ -302,8 +306,14 @@ impl CustomCommandRuntime {
         text_commands_enabled: bool,
         guild_name: Option<&str>,
     ) -> Result<TextCommandOutcome, CustomCommandError> {
-        if !acceptance.permits_automations()
-            || message.guild_id.is_none()
+        // Verdict refusal is distinct telemetry from unmatched content: the
+        // automod verdict contained the create before any trigger lookup.
+        // Guild/webhook scope mismatches stay `Ignored` and never count here.
+        if !acceptance.permits_automations() {
+            two_bot_core::metrics::global().prefix_trigger_refused("verdict");
+            return Ok(TextCommandOutcome::Refused);
+        }
+        if message.guild_id.is_none()
             || message.guild_id.map(|id| id.get()) != self.router.gates().configured_guild
             || message.webhook_id.is_some()
         {

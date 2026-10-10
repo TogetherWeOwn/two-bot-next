@@ -113,6 +113,11 @@ pub const DB_ERROR_OPS: &[&str] = &["admission", "other"];
 /// `other`. Failed `complete()`/`extend()` storage writes count only in
 /// db_errors: the admit decision was already recorded.
 pub const SEND_ADMISSION_OUTCOMES: &[&str] = &["admitted", "blocked", "storage_error", "other"];
+/// Verdict-refused prefix triggers (TOG-19932): a prefix candidate refused by
+/// the automod verdict before any trigger lookup. `verdict` is the only
+/// production reason today; unknown reasons collapse to `other`. Unmatched
+/// content (no trigger) never increments this family.
+pub const PREFIX_TRIGGER_REFUSED_REASONS: &[&str] = &["verdict", "other"];
 const BUCKETS_MICROS: &[u64] = &[
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
@@ -185,6 +190,7 @@ struct Values {
     voice_orphans: u64,
     db_errors: [u64; DB_ERROR_OPS.len()],
     send_admissions: [u64; SEND_ADMISSION_OUTCOMES.len()],
+    prefix_trigger_refused: [u64; PREFIX_TRIGGER_REFUSED_REASONS.len()],
 }
 
 /// All storage is fixed-size. Unknown labels collapse to `other`, including hostile input.
@@ -384,6 +390,20 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter = &mut values.send_admissions[bounded_index(outcome, SEND_ADMISSION_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One verdict-refused prefix trigger (TOG-19932). Call once on the
+    /// refusal arm only: the automod verdict refused the create before any
+    /// trigger lookup. Unmatched content (no trigger) never calls this.
+    /// Unknown reasons collapse to `other`.
+    pub fn prefix_trigger_refused(&self, reason: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.prefix_trigger_refused
+            [bounded_index(reason, PREFIX_TRIGGER_REFUSED_REASONS)];
         *counter = counter.saturating_add(1);
     }
 
@@ -595,6 +615,22 @@ impl Metrics {
             )
             .unwrap();
         }
+        header(
+            &mut out,
+            "two_bot_gateway_prefix_trigger_refused_total",
+            "counter",
+            "Prefix candidates refused by the automod verdict before any trigger lookup, by bounded reason.",
+        );
+        for (reason, count) in PREFIX_TRIGGER_REFUSED_REASONS
+            .iter()
+            .zip(values.prefix_trigger_refused)
+        {
+            writeln!(
+                out,
+                "two_bot_gateway_prefix_trigger_refused_total{{reason=\"{reason}\"}} {count}"
+            )
+            .unwrap();
+        }
         let (size, idle, max) = pool.unwrap_or_default();
         scalar(
             &mut out,
@@ -676,6 +712,7 @@ mod tests {
             metrics.job_failure(&hostile);
             metrics.db_error(&hostile);
             metrics.send_admission(&hostile);
+            metrics.prefix_trigger_refused(&hostile);
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
@@ -789,6 +826,47 @@ mod tests {
         assert!(text.contains("two_bot_send_admissions_total{outcome=\"storage_error\"} 1\n"));
         assert!(text.contains("two_bot_send_admissions_total{outcome=\"other\"} 0\n"));
         // Fixed cardinality: 2 db-error ops + 4 admission outcomes.
+        let mut series = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(series.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn prefix_trigger_refusals_stay_bounded_and_saturate() {
+        // TOG-19932: verdict refusals count separately from unmatched content.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(
+            text.contains("two_bot_gateway_prefix_trigger_refused_total{reason=\"verdict\"} 0\n")
+        );
+        assert!(text.contains("two_bot_gateway_prefix_trigger_refused_total{reason=\"other\"} 0\n"));
+        metrics.prefix_trigger_refused("verdict");
+        metrics.prefix_trigger_refused("verdict");
+        metrics.prefix_trigger_refused("hostile\"\\\nlabel");
+        let text = metrics.render(None);
+        assert!(
+            text.contains("two_bot_gateway_prefix_trigger_refused_total{reason=\"verdict\"} 2\n")
+        );
+        assert!(text.contains("two_bot_gateway_prefix_trigger_refused_total{reason=\"other\"} 1\n"));
+        assert!(!text.contains("hostile"));
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.prefix_trigger_refused = [u64::MAX, u64::MAX];
+        }
+        metrics.prefix_trigger_refused("verdict");
+        metrics.prefix_trigger_refused("other");
+        let text = metrics.render(None);
+        assert!(text.contains(&format!(
+            "two_bot_gateway_prefix_trigger_refused_total{{reason=\"verdict\"}} {}\n",
+            u64::MAX
+        )));
+        assert!(text.contains(&format!(
+            "two_bot_gateway_prefix_trigger_refused_total{{reason=\"other\"}} {}\n",
+            u64::MAX
+        )));
         let mut series = std::collections::HashSet::new();
         for line in text.lines().filter(|line| !line.starts_with('#')) {
             let (key, value) = line.rsplit_once(' ').unwrap();

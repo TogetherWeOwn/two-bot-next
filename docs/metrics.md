@@ -31,6 +31,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_db_pool_max_connections` | Configured maximum |
 | `two_bot_db_errors_total{op}` | Storage-layer failures; `op` is `admission` (send-admission SQL) or `other` (every other store until its op joins the allowlist) |
 | `two_bot_send_admissions_total{outcome}` | Send-admission `admit()` decisions; `outcome` is `admitted`, `blocked`, `storage_error` (also counted in `two_bot_db_errors_total{op="admission"}`) or `other` |
+| `two_bot_gateway_prefix_trigger_refused_total{reason}` | Prefix candidates refused by the automod verdict before any trigger lookup; `reason` is `verdict` (contained, timed-out, uninspected, unrecorded or missing verdict) or `other`. Unmatched content (no trigger) never increments this family |
 | `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
 | `two_bot_job_last_success_timestamp_seconds{job}` | Last successful completion time in Unix seconds; zero means no success recorded |
 | `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
@@ -149,6 +150,10 @@ as dynamic labels.
   `blocked`, `storage_error` or `other`. Recorded once per `admit()`
   decision by the Postgres admission gate; failed `complete()`/`extend()`
   storage writes count only in `two_bot_db_errors_total`.
+- `two_bot_gateway_prefix_trigger_refused_total{reason}` — `reason` is
+  `verdict` or `other`. Recorded once on the verdict-refusal arm in
+  `crates/discord/src/custom_commands.rs` before any trigger lookup; unmatched
+  content, scope mismatches and the disabled fast path never increment it.
 - Log fields (coordinated with blocked structured-log work, which owns JSON
   formatting): `voice_event="voice_operation"` with `op`/`outcome`,
   `voice_event="voice_reconcile"` with plan counts,
