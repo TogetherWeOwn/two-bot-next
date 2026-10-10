@@ -151,6 +151,27 @@ function missCacheFor(env: Env): RedirectMissCache {
 // the Worker and is unaffected.
 const healthBuckets = new TokenBuckets();
 
+// Attempt cap for the authenticated /ops/metrics scrape. Every attempt takes
+// one token synchronously before the secret comparison, so a burst of
+// concurrent guesses cannot share a single token across many comparisons
+// (the comparison awaits digests, during which other in-flight requests would
+// otherwise all pass a read-only precheck). An exhausted caller is refused
+// without any comparison, so guessing cannot confirm a bearer while
+// throttled. Buckets are per caller (as with the probe cap), so another
+// caller's guessing cannot throttle a correct bearer — even a caller shed
+// only because the 10,000-entry table is full is still compared, so a scanner
+// flood cannot lock out the authenticated scraper; a correct bearer from
+// the same exhausted caller waits out the retry-after like any other request.
+// A correct bearer consumes one token per scrape, which the production
+// scraper (~1/15 s against a 10-burst/1-per-second bucket) never nears.
+// CONTROL_PATH deliberately shares nothing here: it is a separate ownership
+// gate whose token already requires 32 characters (see ownership.ts
+// authenticated()), and its lockout semantics belong to that fence.
+const metricsAuthBuckets = new TokenBuckets({ capacity: 10, refillPerSecond: 1 });
+// A short scrape token is an operator misconfiguration, not per-request
+// information: say so once per isolate so scanners cannot flood the logs.
+let metricsShortTokenLogged = false;
+
 // Store instances are request-scoped, but the lookup cache must survive
 // across requests to blunt repeated lookups — so it lives here beside the
 // miss cache, keyed (and reset) on the same configuration identity. A changed
@@ -198,6 +219,16 @@ const DEFAULT_UNREADY_SECONDS = 600;
 const READINESS_KEY = "two-bot:readiness";
 const METRICS_ALERT_KEY = "two-bot:metrics-alerts";
 const OPS_METRICS_PATH = "/ops/metrics";
+// The scrape token follows the ownership control token's floor: anything
+// shorter is treated as not configured. A short staging token must be
+// reissued, never padded (none is provisioned today).
+const MIN_SCRAPE_TOKEN_LENGTH = 32;
+// The DO serves the scrape from inside blockConcurrencyWhile, so the
+// container fetch must be bounded well below the 30s DO gate.
+const METRICS_FETCH_TIMEOUT_MS = 6000;
+// Prometheus exposition is small; cap the proxied body so a compromised or
+// wedged container cannot exhaust the isolate reading it.
+const MAX_METRICS_BODY_BYTES = 64 * 1024;
 
 /** Compare via digests so length/prefix timing does not leak the token. */
 async function tokenMatches(provided: string, expected: string): Promise<boolean> {
@@ -236,6 +267,32 @@ function isBotProbeResponse(response: Response): boolean {
 // warn. Strict tokens only: nothing else from the probe body is ever logged.
 const FAILURE_TOKEN = /^[a-z0-9_]{1,32}$/;
 const MAX_PROBE_BODY_BYTES = 64 * 1024;
+
+/**
+ * Read at most `limit` bytes as text. Returns null when the body is larger
+ * (drained first so the SDK proxy pipe is not left hanging), so an oversized
+ * container response can be refused without buffering it.
+ */
+async function readBoundedText(response: Response, limit: number): Promise<string | null> {
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > limit) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder().decode(bytes);
+}
 
 function gatewayFailure(body: ArrayBuffer): { phase: string; class: string } | null {
   if (body.byteLength > MAX_PROBE_BODY_BYTES) return null;
@@ -386,8 +443,46 @@ export class TwoBotContainer extends Container<Env> {
         // Reached only through the Worker's bearer-token gate (see default export).
         if (url.pathname === OPS_METRICS_PATH) {
           await this.armKeepalive();
-          const upstream = await this.containerFetch("http://c/metrics");
-          return new Response(await upstream.text(), {
+          // The SDK resolves fetch failures (including the abort timeout) as
+          // a 500/503/429 Response, so a catch alone never fires. Treat an
+          // aborted signal or any non-2xx upstream as a 504 with a generic
+          // body, and drain the SDK error text instead of proxying it.
+          const fetchSignal = AbortSignal.timeout(METRICS_FETCH_TIMEOUT_MS);
+          const metricsUnavailable = (status: number) =>
+            new Response("metrics unavailable\n", {
+              status,
+              headers: { "content-type": "text/plain", "cache-control": "no-store" },
+            });
+          let upstream: Response;
+          try {
+            upstream = await this.containerFetch("http://c/metrics", {
+              signal: fetchSignal,
+            });
+          } catch {
+            return metricsUnavailable(504);
+          }
+          if (fetchSignal.aborted || !upstream.ok) {
+            // Cancel without reading: a huge non-2xx body must not bypass
+            // the 64 KiB cap by being drained here.
+            await upstream.body?.cancel().catch(() => {});
+            return metricsUnavailable(504);
+          }
+          let body: string | null;
+          try {
+            body = await readBoundedText(upstream, MAX_METRICS_BODY_BYTES);
+          } catch {
+            return new Response("metrics unavailable\n", {
+              status: 504,
+              headers: { "content-type": "text/plain", "cache-control": "no-store" },
+            });
+          }
+          if (body === null) {
+            return new Response("metrics unavailable\n", {
+              status: 502,
+              headers: { "content-type": "text/plain", "cache-control": "no-store" },
+            });
+          }
+          return new Response(body, {
             status: upstream.status,
             headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8", "cache-control": "no-store" },
           });
@@ -831,12 +926,57 @@ export default {
       return result;
     }
 
-    // Authenticated off-container scrape path. No configured token → 404 (the
-    // route does not exist); missing/wrong bearer → 401. Exact path only.
+    // Authenticated off-container scrape path. No configured token (or one
+    // shorter than the 32-character floor — same bar as the ownership
+    // control token) → 404 (the route does not exist); missing/wrong
+    // bearer → 401, with per-caller throttling of attempts (429 +
+    // retry-after). Every attempt takes a token synchronously before the
+    // secret comparison, so concurrent guesses cannot share one token; a
+    // throttled caller is refused without any comparison, so guessing cannot
+    // confirm a bearer while exhausted. Buckets are per caller, so someone
+    // else's guessing cannot throttle a correct bearer — and a caller shed
+    // only because the caller table is full is still compared, so a scanner
+    // flood cannot lock out the authenticated scraper. Exact path only.
+    // CONTROL_PATH keeps its own gate (ownership.ts authenticated()): it
+    // shares neither this bucket nor its budget.
     if (url.pathname === OPS_METRICS_PATH) {
-      if (!env.METRICS_SCRAPE_TOKEN || request.method !== "GET") return new Response("not found", { status: 404 });
+      if (!env.METRICS_SCRAPE_TOKEN || env.METRICS_SCRAPE_TOKEN.length < MIN_SCRAPE_TOKEN_LENGTH
+        || request.method !== "GET") {
+        if (env.METRICS_SCRAPE_TOKEN && env.METRICS_SCRAPE_TOKEN.length < MIN_SCRAPE_TOKEN_LENGTH
+          && !metricsShortTokenLogged) {
+          metricsShortTokenLogged = true;
+          console.error(JSON.stringify({
+            event: "metrics_scrape_token_misconfigured",
+            reason: "token_below_minimum_length",
+            minimum_length: MIN_SCRAPE_TOKEN_LENGTH,
+          }));
+        }
+        return new Response("not found", { status: 404 });
+      }
+      const caller = request.headers.get("cf-connecting-ip") ?? "unknown";
+      // Take budget synchronously before the secret comparison: no guess —
+      // right or wrong — is evaluated while throttled, and concurrent
+      // guesses each consume their own token instead of sharing one across
+      // the awaited digest comparison below. A correct bearer on a fresh
+      // budget is unaffected (one token of a 10-burst).
+      const verdict = metricsAuthBuckets.take(caller);
+      if (!verdict.allowed && !metricsAuthBuckets.peek(caller).allowed) {
+        // Tracked caller out of budget (or in terminal hold): refuse without
+        // any comparison, so guessing cannot confirm a bearer while
+        // exhausted. peek is synchronous, so this cannot race the take above.
+        // An untracked caller denied only because the caller table is full
+        // falls through to the comparison below instead, so a flood of
+        // one-time scanners can never lock out the authenticated scraper.
+        return new Response("slow down\n", {
+          status: 429,
+          headers: {
+            "content-type": "text/plain",
+            "retry-after": String(verdict.retryAfter),
+          },
+        });
+      }
       const m = /^Bearer (.+)$/.exec(request.headers.get("authorization") ?? "");
-      if (!m || !(await tokenMatches(m[1]!, env.METRICS_SCRAPE_TOKEN))) {
+      if (!m || m[1]!.length > 4096 || !(await tokenMatches(m[1]!, env.METRICS_SCRAPE_TOKEN))) {
         return new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } });
       }
       try {
