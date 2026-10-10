@@ -2444,9 +2444,11 @@ mod tests {
                 },
             ))
         };
-        // Pin the fixture precondition explicitly: the join must buffer a
-        // fact, or this test would exercise the empty-drain path instead of
-        // the failure site.
+        // Pin the fixture precondition explicitly: the join must buffer
+        // facts, or this test would exercise the empty-drain path instead
+        // of the failure site. A gate-cleared join buffers two: the
+        // `member_joined` fact from `on_join` plus the `rules_accepted`
+        // fact from `on_gate_cleared`.
         {
             let scratch = build_pipeline(vec![], None);
             scratch.enable_community_facts(pool.clone());
@@ -2457,8 +2459,8 @@ mod tests {
             );
             assert_eq!(
                 scratch.drain_facts().await.expect("scratch drain"),
-                1,
-                "fixture join must buffer one community fact"
+                2,
+                "fixture join must buffer the join and gate-clear facts"
             );
         }
         #[derive(Clone)]
