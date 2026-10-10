@@ -64,7 +64,7 @@ Check in a verified human attendee for a scheduled event (scorecard)
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-occurrence` | string | true | — | — | 128 | — | Event id (number in the event URL) or occurrence id, e.g. 12345 or weekly-standup-2026-10-03 |
+| `event-occurrence` | string | true | — | — | 128 | — | Bare event id binds that event; else {event_id}:{label}. Bare slugs refuse, e.g. 12345:weekly |
 | `member` | user | true | — | — | — | — | Human member who attended. |
 
 ## `/ban`

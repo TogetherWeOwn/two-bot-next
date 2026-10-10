@@ -117,10 +117,44 @@ test("voice failures ignore trickles and restarts, fire on lone dead-letters/orp
   assert.deepEqual(ev([`two_bot_voice_orphans_total 1`], quiet.state).firing, ["voice_failures"]);
 });
 
+test("gateway missed events fire on any increase, never on the first sample or a reset", () => {
+  const base = ev([`two_bot_gateway_missed_events_total 0`]);
+  assert.deepEqual(base.firing, []);
+  // First sample with a nonzero counter only stores the baseline.
+  const first = ev([`two_bot_gateway_missed_events_total 5`]);
+  assert.deepEqual(first.firing, []);
+  // An increase between two samples fires.
+  const fire = ev([`two_bot_gateway_missed_events_total 6`], first.state);
+  assert.deepEqual(fire.firing, ["gateway_missed_events"]);
+  // A flat window recovers (no increase, no fire).
+  assert.deepEqual(ev([`two_bot_gateway_missed_events_total 6`], fire.state).firing, []);
+  // A counter that went backwards means the process restarted: no window.
+  const restart = ev([`two_bot_gateway_missed_events_total 1`], fire.state);
+  assert.deepEqual(restart.firing, []);
+  // The post-restart baseline fires again on the next increase.
+  assert.deepEqual(ev([`two_bot_gateway_missed_events_total 2`], restart.state).firing, ["gateway_missed_events"]);
+});
+
+test("ticker stale fires past 10 minutes, ignores boot, parked and fresh tickers", () => {
+  // Boot (never succeeded) and parked (never registered) stay zero: silent.
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} 0`]).firing, []);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="settings"} 0`]).firing, []);
+  // Fresh ticks are silent; a 10-minute-old success is stale.
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} ${NOW - 600}`]).firing, []);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} ${NOW - 601}`]).firing, ["ticker_stale:scheduled_messages"]);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="settings"} ${NOW - 601}`]).firing, ["ticker_stale:settings"]);
+  // Recovery: a fresh success after a stale window stops firing.
+  const stale = ev([`two_bot_job_last_success_timestamp_seconds{job="settings"} ${NOW - 601}`]);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="settings"} ${NOW - 1}`], stale.state).firing, []);
+  // Jobs outside TICKER_STALE_JOBS never fire this rule, however stale.
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="audit_retry"} ${NOW - 3600}`]).firing, []);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="rank"} ${NOW - 3600}`]).firing.filter((k) => k.startsWith("ticker_stale")), []);
+});
+
 test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   const window = "2026-10-09T20-11-06Z";
   // Single shared spelling with the Rust canonical list (ALERT_RULE_IDS in
-  // crates/core/src/evidence.rs); both sides pin all seven here and there.
+  // crates/core/src/evidence.rs); both sides pin all nine here and there.
   assert.deepEqual(RULES.map((r) => r.id), [
     "job_stale",
     "job_consecutive_failures",
@@ -129,6 +163,8 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "db_errors",
     "send_admission_blocked",
     "voice_failures",
+    "gateway_missed_events",
+    "ticker_stale",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
@@ -137,6 +173,8 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("db_errors", window), `evidence-db_errors-${window}.json`);
   assert.equal(packetFilename("send_admission_blocked", window), `evidence-send_admission_blocked-${window}.json`);
   assert.equal(packetFilename("voice_failures", window), `evidence-voice_failures-${window}.json`);
+  assert.equal(packetFilename("gateway_missed_events", window), `evidence-gateway_missed_events-${window}.json`);
+  assert.equal(packetFilename("ticker_stale:scheduled_messages", window), `evidence-ticker_stale-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
@@ -184,6 +222,15 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
       `two_bot_voice_operations_total{op="move",outcome="persistence"} 4`,
       `two_bot_voice_dead_letters_total{action="create"} 3`,
     ]).firing,
+  );
+  firing.push(
+    ...ev(
+      [`two_bot_gateway_missed_events_total 1`],
+      ev([`two_bot_gateway_missed_events_total 0`]).state,
+    ).firing,
+  );
+  firing.push(
+    ...ev([`two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} ${NOW - 601}`]).firing,
   );
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);

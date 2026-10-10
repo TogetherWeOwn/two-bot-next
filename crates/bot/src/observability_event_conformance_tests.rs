@@ -16,14 +16,15 @@ use std::collections::BTreeSet;
 // them to. The message string (last argument to the `tracing` macro) is the
 // event name; fields such as `sequence` or `guild_id` are context, not names.
 
-/// `crates/bot/src/gateway.rs`: all seventeen traced in the file are cataloged.
-const GATEWAY_RS_EVENTS: [&str; 17] = [
+/// `crates/bot/src/gateway.rs`: all eighteen traced in the file are cataloged.
+const GATEWAY_RS_EVENTS: [&str; 18] = [
     "cold resume committed; requesting voice snapshot via identify",
     "gateway reconnect failed; Twilight will retry",
     "gateway shard loop started",
     "gateway leveling dispatch failed",
     "gateway community facts dispatch failed",
     "gateway community facts dispatch timed out",
+    "gateway onboarding job invalid",
     "gateway ready; checkpoint committed",
     "onboarding interaction interrupted; member must reselect",
     "invite counter read unavailable; retaining snapshot",
@@ -94,7 +95,7 @@ const VOICE_EVENT_VALUES: [&str; 4] = [
 
 /// Metric event labels, in `two_bot_core::metrics::EVENTS` order. Unknown
 /// dispatch types collapse to `other`; scrapers match these spellings.
-const METRIC_EVENT_LABELS: [&str; 18] = [
+const METRIC_EVENT_LABELS: [&str; 20] = [
     "READY",
     "RESUMED",
     "GUILD_CREATE",
@@ -106,6 +107,8 @@ const METRIC_EVENT_LABELS: [&str; 18] = [
     "MESSAGE_CREATE",
     "MESSAGE_UPDATE",
     "MESSAGE_DELETE",
+    "MESSAGE_REACTION_ADD",
+    "MESSAGE_REACTION_REMOVE",
     "VOICE_STATE_UPDATE",
     "INVITE_CREATE",
     "INVITE_DELETE",

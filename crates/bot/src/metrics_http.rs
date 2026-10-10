@@ -151,6 +151,8 @@ mod tests {
             "two_bot_db_errors_total{op=\"other\"} ",
             "two_bot_send_admissions_total{outcome=\"admitted\"} ",
             "two_bot_send_admissions_total{outcome=\"blocked\"} ",
+            "two_bot_dispatch_drops_total{lane=\"messages\"} ",
+            "two_bot_dispatch_drops_total{lane=\"reactions\"} ",
         ] {
             assert!(text.contains(sample), "missing sample {sample}");
         }

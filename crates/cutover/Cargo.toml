@@ -1,6 +1,6 @@
 [package]
 name = "two-bot-cutover"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -19,8 +19,8 @@ workspace = true
 [dependencies]
 # `db` for shared durable admission and the redacting database URL helper.
 # sqlx is already a direct dependency, so no new driver burden.
-two-bot-core = { version = "0.3.0", path = "../core", features = ["db"] }
-two-bot-discord = { version = "0.3.0", path = "../discord" }
+two-bot-core = { version = "0.4.0", path = "../core", features = ["db"] }
+two-bot-discord = { version = "0.4.0", path = "../discord" }
 hex = { workspace = true }
 serde = { workspace = true }
 # Preserve JSON syntax kinds and exact numeric tokens during parity checks.
@@ -40,7 +40,7 @@ libc = "0.2.189"
 
 [dev-dependencies]
 rustls = { workspace = true }
-two-bot-testsupport = { version = "0.3.0", path = "../testsupport" }
+two-bot-testsupport = { version = "0.4.0", path = "../testsupport" }
 
 [[bin]]
 name = "legacy_verify"
