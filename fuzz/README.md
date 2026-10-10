@@ -15,6 +15,7 @@ workflow currently exists, so no scheduled smoke/service is added.
 | `mee6_export` | `mee6_xp::parse_mee6_export`, `mee6_rewards::parse_mee6_role_rewards`, `parse_roles_snapshot` | JSON export variants, row types, numeric boundaries, role references. No import planner or database. |
 | `guild_config_snapshot` | Restore CLI's JSON object/version gate, `verify_snapshot_integrity`, `canonical_snapshot`, `snapshot_counts`, `plan_restore` | Seal round-trip invariant and pure restore-plan decoding against an in-memory current guild. No restore apply/Discord call. This is not a full schema/authenticity check. |
 | `voice_config` | `voice_config::import_configuration`, `export_configuration` | Strict decoding, same-/cross-guild references against a **fixed trusted inventory**, lossless/deterministic round trips. Templates are not compiled or run. |
+| `settings_map` | Guild/assistant settings-map parsing including `AssistantConfig::from_map`, `FeatureGates`, `ModerationGates`, `VoiceGates`, `AutomodConfig`, `OnboardingGates`, `DisableGates`, `SelfRoleGates`, `InternalFlags`, `InternalActionConfig` and the settings catalogue | Arbitrary `KEY=VALUE` line maps with hostile strings, huge values, wrong types and unknown keys (max 32 entries, `-max_len=65536`). Invalid input fails closed (`None`/`Err`/disabled, never half-applied); unknown keys must not change outcomes. `Secret<T>` spot-checks assert constant `[REDACTED]` rendering on fuzz-derived values. No environment, network, database or secret use. |
 
 All seeds use synthetic IDs/text; no token, environment secret, database,
 Discord client or network is needed at runtime. MEE6's crate currently has SQLx
@@ -51,7 +52,7 @@ set -euo pipefail
 : "${FUZZ_OUTPUT_DIR:?set an absolute non-source output directory}"
 FUZZ_SECONDS=${FUZZ_SECONDS:-300}
 mkdir -p "$FUZZ_OUTPUT_DIR/target" "$FUZZ_OUTPUT_DIR/logs"
-for target in internal_action automod prefix_trigger mee6_export guild_config_snapshot voice_config; do
+for target in internal_action automod prefix_trigger mee6_export guild_config_snapshot voice_config settings_map; do
   mkdir -p "$FUZZ_OUTPUT_DIR/corpus/$target" "$FUZZ_OUTPUT_DIR/artifacts/$target"
   cargo +nightly fuzz run --target-dir "$FUZZ_OUTPUT_DIR/target" \
     "$target" "$FUZZ_OUTPUT_DIR/corpus/$target" "fuzz/corpus/$target" -- \
