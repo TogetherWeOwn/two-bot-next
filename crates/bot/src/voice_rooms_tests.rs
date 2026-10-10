@@ -9936,6 +9936,51 @@ async fn a_new_room_is_renamed_from_its_creator_template() {
     );
 }
 
+fn first_names(worker: &GuildRoomWorker<Store, Http>, template: &str) -> Vec<String> {
+    let mut creations: Vec<_> = worker.creations.iter().collect();
+    creations.sort_unstable_by_key(|(id, _)| **id);
+    creations
+        .into_iter()
+        .map(|(_, creation)| {
+            let context = two_bot_core::voice_naming::RoomContext {
+                seed: creation.spec.seed,
+                ..Default::default()
+            };
+            two_bot_core::voice_naming::render_str(template, &context)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn consecutive_rooms_never_repeat_a_recent_first_name() {
+    let template = "[[a/b/c/d/e/f]]";
+    let (live, store, http, _) = fixture();
+    store.creators.lock().unwrap()[0].name_template = template.to_owned();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Every join draws the same seed, so only the fresh-name pick can
+    // tell these rooms apart.
+    for member in 0..12 {
+        join(&mut worker, MEMBER + member);
+    }
+    let names = first_names(&worker, template);
+    assert_eq!(names.len(), 12);
+    for (index, name) in names.iter().enumerate() {
+        let recent = &names[index.saturating_sub(name_panel::RECENT_NAME_MEMORY)..index];
+        assert!(!recent.contains(name), "{index}: {name} repeats {recent:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_pool_too_small_to_vary_keeps_the_drawn_seed() {
+    let (live, store, http, _) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "[[only]]".to_owned();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    join(&mut worker, MEMBER + 1);
+    let seeds: Vec<u64> = worker.creations.values().map(|c| c.spec.seed).collect();
+    assert_eq!(seeds, [7, 7]);
+}
+
 #[tokio::test]
 async fn template_names_rerender_only_when_their_facts_change() {
     let (live, store, http, trace) = fixture();
