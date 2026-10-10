@@ -224,6 +224,11 @@ def check_readyz_shape(status, body):
                        and c[1] in KNOWN_STATUSES for c in components)):
         raise ProbeError(f"/readyz {status} without the components breakdown "
                          "(expected [[name, ready|starting|down], ...])")
+    # Reject duplicates before any readiness math: last-wins would let a
+    # later ready mask an earlier down.
+    names = [c[0] for c in components]
+    if len(set(names)) != len(names):
+        raise ProbeError(f"/readyz {status} repeats a component name")
     state = dict(components)
     missing = [name for name in REQUIRED_COMPONENTS if name not in state]
     if missing:

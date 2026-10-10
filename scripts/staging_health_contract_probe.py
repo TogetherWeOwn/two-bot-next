@@ -176,6 +176,11 @@ def parse_readyz(status, value):
                        and row[1] in STATUSES for row in components)):
         raise ProbeError(f"readyz {status} without the bot's component breakdown "
                          "(ownership refusal or broken deploy)")
+    # Reject duplicates before any readiness math: last-wins would let a
+    # later ready mask an earlier down.
+    names = [row[0] for row in components]
+    if len(set(names)) != len(names):
+        raise ProbeError(f"readyz {status} repeats a component name")
     state = dict(components)
     missing = [name for name in REQUIRED_COMPONENTS if name not in state]
     if missing:

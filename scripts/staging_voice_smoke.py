@@ -257,6 +257,28 @@ def option_named(detail, option_name, option_type=None):
     return None
 
 
+def parse_worker_readyz(status, report):
+    """Validate the Worker /readyz breakdown and return the component state.
+
+    Duplicate component names are refused before any readiness analysis so a
+    later entry cannot mask an earlier one (last-wins would conceal a down).
+    Raises SmokeError with a fixed vocabulary reason; the response body is
+    never echoed.
+    """
+    if isinstance(report, dict) and report.get("error"):
+        raise SmokeError(f"GET /readyz refused with error {report.get('error')!r:.40}")
+    components = report.get("components") if isinstance(report, dict) else None
+    if (not isinstance(components, list) or not components
+            or not all(isinstance(c, list) and len(c) == 2
+                       and isinstance(c[0], str) and c[0]
+                       and c[1] in ("ready", "starting", "down") for c in components)):
+        raise SmokeError("GET /readyz answered without the components breakdown")
+    names = [c[0] for c in components]
+    if len(set(names)) != len(names):
+        raise SmokeError("GET /readyz repeats a component name")
+    return dict(components)
+
+
 def check_worker(origin):
     """Read-only Worker liveness + readiness shape; refusals and lies fail."""
     try:
@@ -291,19 +313,11 @@ def check_worker(origin):
     except (ValueError, UnicodeDecodeError):
         results.append(Result("worker-readyz", "fail", "GET /readyz answered without JSON"))
         return results, None
-    if isinstance(report, dict) and report.get("error"):
-        results.append(Result("worker-readyz", "fail",
-                              f"GET /readyz refused with error {report.get('error')!r:.40}"))
+    try:
+        state = parse_worker_readyz(status, report)
+    except SmokeError as error:
+        results.append(Result("worker-readyz", "fail", str(error)))
         return results, None
-    components = report.get("components") if isinstance(report, dict) else None
-    if (not isinstance(components, list) or not components
-            or not all(isinstance(c, list) and len(c) == 2
-                       and isinstance(c[0], str) and c[0]
-                       and c[1] in ("ready", "starting", "down") for c in components)):
-        results.append(Result("worker-readyz", "fail",
-                              "GET /readyz answered without the components breakdown"))
-        return results, None
-    state = dict(components)
     ready = all(value == "ready" for value in state.values())
     expected = 200 if ready else 503
     if status != expected:

@@ -212,6 +212,58 @@ class HealthContractProbeTests(unittest.TestCase):
         self.assertIn("FAIL readyz", set(results))
         self.assertEqual(self.requested, [STAGING + "/health", STAGING + "/readyz"])
 
+    def dup_value(self, pairs, status=200):
+        value = dict(READY)
+        value["components"] = components(*pairs)
+        return status, value
+
+    def test_duplicate_down_then_ready_rejected_before_verdict(self):
+        _, value = self.dup_value((("process", "ready"), ("gateway", "down"),
+                                   ("database", "ready"), ("token_invalid", "ready"),
+                                   ("gateway", "ready")))
+        with self.assertRaisesRegex(probe.ProbeError, "repeats a component name"):
+            probe.parse_readyz(200, value)
+
+    def test_duplicate_ready_then_down_rejected_before_verdict(self):
+        _, value = self.dup_value((("process", "ready"), ("gateway", "ready"),
+                                   ("database", "ready"), ("token_invalid", "ready"),
+                                   ("gateway", "down")), status=503)
+        with self.assertRaisesRegex(probe.ProbeError, "repeats a component name"):
+            probe.parse_readyz(503, value)
+
+    def test_duplicate_same_value_rejected(self):
+        _, value = self.dup_value((("process", "ready"), ("gateway", "ready"),
+                                   ("database", "ready"), ("token_invalid", "ready"),
+                                   ("process", "ready")))
+        with self.assertRaisesRegex(probe.ProbeError, "repeats a component name"):
+            probe.parse_readyz(200, value)
+
+    def test_distinct_components_still_parse(self):
+        _, value = self.dup_value((("process", "ready"), ("gateway", "ready"),
+                                   ("database", "ready"), ("token_invalid", "ready")))
+        state, _ = probe.parse_readyz(200, value)
+        self.assertEqual(state["gateway"], "ready")
+
+    def test_duplicate_diagnostic_echoes_no_component_data(self):
+        sentinel = "SENTINEL_dup_health_abc123"
+        _, value = self.dup_value((("process", "ready"), ("gateway", "ready"),
+                                   ("database", "ready"), ("token_invalid", "ready"),
+                                   (sentinel, "ready"), (sentinel, "down")), status=503)
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.parse_readyz(503, value)
+        self.assertIn("repeats a component name", str(ctx.exception))
+        self.assertNotIn(sentinel, str(ctx.exception))
+
+    def test_duplicate_readyz_fails_closed_end_to_end(self):
+        dup = dict(READY)
+        dup["components"] = components(("process", "ready"), ("gateway", "down"),
+                                       ("database", "ready"), ("token_invalid", "ready"),
+                                       ("gateway", "ready"))
+        routes = {STAGING + "/health": body({"status": "ok"}),
+                  STAGING + "/readyz": body(dup, status=200)}
+        code, results, _ = self.drive(routes)
+        self.assert_readyz_unreadable("repeats a component name", code, results)
+
 
 if __name__ == "__main__":
     unittest.main()
