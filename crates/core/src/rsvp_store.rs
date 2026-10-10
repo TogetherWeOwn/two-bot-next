@@ -570,11 +570,24 @@ mod tests {
         };
         // Hold the empty key before either writer starts. Both must wait here,
         // not read an absent row then race their upserts with previous=None.
+        // The guard takes the event admission lock first, then the identity
+        // lock: `put_rsvp` always locks in that order (RA-03), so both
+        // writers queue on the guard's event lock and neither can slip past
+        // to the row while the waiter count below is settling.
         let mut guard = pool.begin().await.expect("guard transaction");
         let guard_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&mut *guard)
             .await
             .expect("guard pid");
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended(
+                jsonb_build_array($1::text, $2::text)::text, 0))",
+        )
+        .bind(&going.guild_id)
+        .bind(&going.event_id)
+        .execute(&mut *guard)
+        .await
+        .expect("hold empty event key");
         sqlx::query(
             "SELECT pg_advisory_xact_lock(hashtextextended(
                 jsonb_build_array($1::text, $2::text, $3::text)::text, 0))",
