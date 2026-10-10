@@ -74,13 +74,6 @@ async fn composition_rest(seen: Arc<AtomicBool>, hold: Duration) -> MockRest {
             }
             return ScriptedResponse::json(200, json!({"id":EVENT,"guild_id":GUILD,"status":1}));
         }
-        if request.method == "GET" && request.path.contains("/members/") {
-            // RA-01 membership echo: the live member must carry the queried
-            // user id or the RSVP path refuses before any write. Echo the
-            // trailing path segment so every test actor passes the gate.
-            let id = request.path.rsplit('/').next().unwrap_or("77");
-            return ScriptedResponse::json(200, json!({"user":{"id": id}}));
-        }
         if request.method == "GET" && request.path.ends_with("/applications/@me") {
             return ScriptedResponse::json(200, json!({"id":"1111"}));
         }
