@@ -8,7 +8,7 @@
   },
   "mode": "plan",
   "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "target": {"host": "staging.invalid", "database": "two_bot"},
+  "target": {"host": "staging.invalid", "database": "two_bot", "branch_id": ""},
   "recovery_evidence_ref": "recovery-review#decision",
   "acl_plan_ref": "acl-review#decision",
   "role": "two_bot_migrator_ro",

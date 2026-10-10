@@ -48,6 +48,10 @@ fn invocation(id: u64, user: u64, permissions: u64, data: Value, kind: u8) -> In
 }
 
 fn create(id: u64, permissions: u64) -> Interaction {
+    create_with_roles(id, permissions, "tank:Tank:1,dps:DPS:1")
+}
+
+fn create_with_roles(id: u64, permissions: u64, roles: &str) -> Interaction {
     invocation(
         id,
         3333,
@@ -55,7 +59,7 @@ fn create(id: u64, permissions: u64) -> Interaction {
         json!({"id": "1", "name": "lfg", "type": 1, "options": [
             {"type": 3, "name": "title", "value": "Friday raid @everyone"},
             {"type": 3, "name": "starts-at", "value": "2099-09-11T20:00:00Z"},
-            {"type": 3, "name": "roles", "value": "tank:Tank:1,dps:DPS:1"}
+            {"type": 3, "name": "roles", "value": roles}
         ]}),
         2,
     )
@@ -317,6 +321,20 @@ async fn router_runs_create_signup_full_switch_leave_close_with_audit() {
     assert_eq!(audits.len(), 12);
     assert!(audits.contains(&("lfg.signup".into(), "full".into())));
     assert!(audits.contains(&("lfg.close".into(), "closed".into())));
+
+    let bad_roles = format!("{}:Tank:1", "@everyone".repeat(200));
+    assert!(rt
+        .handle(&create_with_roles(7013, PERM_MANAGE_EVENTS, &bad_roles))
+        .await
+        .unwrap());
+    let requests = mock.requests();
+    let reply = body(requests.last().expect("deferred error reply"));
+    assert_eq!(requests.last().unwrap().method, "PATCH");
+    let content = reply["content"].as_str().expect("reply content");
+    assert!(content.encode_utf16().count() <= lfg::MAX_MESSAGE_CHARS);
+    assert!(!content.contains("@everyone"));
+    assert_eq!(reply["allowed_mentions"]["parse"], json!([]));
+
     mock.shutdown().await;
     drop(rt);
     db.cleanup().await;
