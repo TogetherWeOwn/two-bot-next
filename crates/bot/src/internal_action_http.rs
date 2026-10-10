@@ -1963,6 +1963,7 @@ async fn moderate_channel(
             let response = TerminalResponse::Success {
                 resource_id: Some(channel_id),
                 affected: stored_affected,
+                outcome: None,
             };
             if state.store.finish(&claim, &response).await.is_err() {
                 let _ = state.store.mark_unknown(&claim).await;
